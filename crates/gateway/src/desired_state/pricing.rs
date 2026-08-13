@@ -1284,6 +1284,14 @@ pub enum PricingError {
         expected: &'static str,
         found: String,
     },
+    /// A `schema` that is present and is not text, so the identifier deciding how
+    /// to read the rest of the body is itself unreadable. No release wrote one,
+    /// so the row is damage rather than another release's writing.
+    #[error(
+        "{reference} carries a `schema` that is not an identifier, which no release wrote; \
+         restore the row or republish the resource rather than changing build"
+    )]
+    DamagedSchema { reference: ResourceRef },
     #[error("{reference} is missing the `{field}` field")]
     MissingField {
         reference: ResourceRef,
@@ -1400,6 +1408,7 @@ impl PricingError {
             | Self::NotARecord { reference }
             | Self::Uncanonicalizable { reference, .. }
             | Self::Schema { reference, .. }
+            | Self::DamagedSchema { reference }
             | Self::MissingField { reference, .. }
             | Self::UnknownField { reference, .. }
             | Self::FieldType { reference, .. }
@@ -1457,9 +1466,11 @@ impl PricingError {
     /// encodes through the canonical form, so a body that form rejects is one no
     /// release produced.
     pub fn is_incompatible(&self) -> bool {
-        // Only the schema identifier itself, as for every other body: its
-        // absence is a body written before price books had one at all.
-        if let Self::MissingField { field, .. } | Self::FieldType { field, .. } = self {
+        // Only the absence of the schema identifier, as for every other body: a
+        // body written before price books had one at all is another release's
+        // writing, while a marker that is present and unreadable is
+        // `DamagedSchema`, which no release wrote.
+        if let Self::MissingField { field, .. } = self {
             return *field == SCHEMA_FIELD;
         }
         matches!(
@@ -1515,6 +1526,21 @@ fn declares_a_price_book(resource: &ResourceVersion) -> bool {
     })
 }
 
+/// Whether a price row carries a `schema` that is present and is not an
+/// identifier.
+///
+/// Such a row belongs to no slice: the marker deciding whose rules read it is
+/// itself unreadable, so skipping it as another slice's business would leave
+/// damage unreported by every reader.
+fn carries_a_damaged_schema(resource: &ResourceVersion) -> bool {
+    let ResourceBody::Inline(CanonicalValue::Map(fields)) = &resource.body else {
+        return false;
+    };
+    fields
+        .iter()
+        .any(|(field, value)| field == SCHEMA_FIELD && !matches!(value, CanonicalValue::String(_)))
+}
+
 /// The price books of one revision, resolved once.
 ///
 /// Built by [`PriceBooks::of`], which [`DesiredState::validate`] calls, so
@@ -1547,6 +1573,14 @@ impl PriceBooks {
             // them here would refuse a revision this build otherwise serves
             // correctly, and it bills nothing from them either way.
             if resource.scope != ResourceScope::Deployment && !declares_a_price_book(resource) {
+                // Unless there is no marker left to attribute it by, in which
+                // case no slice's rules claim the row and this reader is the one
+                // that saw it.
+                if carries_a_damaged_schema(resource) {
+                    return Err(PricingError::DamagedSchema {
+                        reference: resource.reference,
+                    });
+                }
                 continue;
             }
             // Before the body is read *and* before the scope is judged, so a
@@ -1751,6 +1785,10 @@ impl BodyError for PricingError {
             expected,
             found,
         }
+    }
+
+    fn damaged_schema(reference: ResourceRef) -> Self {
+        Self::DamagedSchema { reference }
     }
 
     fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
@@ -2379,6 +2417,39 @@ mod tests {
         assert!(books.snapshot_at(at(1)).is_none());
     }
 
+    /// But attribution needs a marker to read. A tenant's rate row whose `schema`
+    /// is present and is not an identifier names no slice at all, so skipping it
+    /// as another slice's business would leave the damage reported by nobody.
+    #[test]
+    fn a_tenant_rate_row_whose_marker_is_damaged_is_refused_here() {
+        let row = fixtures::price(&fixtures::tenant_id(1), 7, "acme-rate");
+        for marker in [
+            CanonicalValue::integer(1),
+            CanonicalValue::List(vec![CanonicalValue::string(PRICE_BOOK_SCHEMA)]),
+            CanonicalValue::map([(SCHEMA_FIELD, CanonicalValue::string(PRICE_BOOK_SCHEMA))]),
+        ] {
+            let mut state = fixtures::state();
+            state
+                .insert(ResourceVersion::new(
+                    row.reference,
+                    row.scope.clone(),
+                    row.slug.clone(),
+                    ResourceBody::Inline(CanonicalValue::map([(SCHEMA_FIELD, marker.clone())])),
+                ))
+                .expect("a distinct reference");
+
+            let error = PriceBooks::of(&state).expect_err("a marker no release wrote is refused");
+            assert!(
+                matches!(error, PricingError::DamagedSchema { .. }),
+                "{marker:?}: {error}"
+            );
+            assert!(
+                !error.is_incompatible(),
+                "storage to repair, not a build to roll forward: {error}"
+            );
+        }
+    }
+
     #[test]
     fn two_deployment_price_books_are_refused() {
         let body = fixtures::approved_price_book();
@@ -2487,9 +2558,10 @@ mod tests {
         assert!(matches!(unknown, PricingError::UnknownField { .. }));
         assert!(unknown.is_incompatible());
 
-        // The schema identifier is the one field whose absence — or whose type
-        // being wrong — is a body older than the identifier, exactly as it is for
-        // the tenancy and credential bodies.
+        // The schema identifier is the one field whose *absence* is a body older
+        // than the identifier, exactly as it is for the tenancy and credential
+        // bodies. A marker that is present and unreadable is damage instead, and
+        // the test below holds it to that.
         let untyped = read_without_field(SCHEMA_FIELD).expect_err("an untyped body is refused");
         assert!(matches!(
             untyped,
@@ -2499,22 +2571,25 @@ mod tests {
             }
         ));
         assert!(untyped.is_incompatible());
-
-        let mistyped_schema = read_with_field(SCHEMA_FIELD, CanonicalValue::integer(1))
-            .expect_err("a non-string schema is refused");
-        assert!(matches!(
-            mistyped_schema,
-            PricingError::FieldType {
-                field: SCHEMA_FIELD,
-                ..
-            }
-        ));
-        assert!(mistyped_schema.is_incompatible());
     }
 
     /// And every way a body can be *wrong* rather than newer.
     #[test]
     fn bodies_no_release_would_have_written_are_invalid_state() {
+        for marker in [
+            CanonicalValue::integer(1),
+            CanonicalValue::List(vec![CanonicalValue::string(PRICE_BOOK_SCHEMA)]),
+            CanonicalValue::map([(SCHEMA_FIELD, CanonicalValue::string(PRICE_BOOK_SCHEMA))]),
+        ] {
+            let damaged = read_with_field(SCHEMA_FIELD, marker.clone())
+                .expect_err("a schema marker that is not an identifier is refused");
+            assert!(
+                matches!(damaged, PricingError::DamagedSchema { .. }),
+                "{marker:?}: {damaged}"
+            );
+            assert!(!damaged.is_incompatible(), "{damaged}");
+        }
+
         let missing = read_without_field(CURRENCY_FIELD).expect_err("a missing field is refused");
         assert!(matches!(missing, PricingError::MissingField { .. }));
         assert!(!missing.is_incompatible());

@@ -138,6 +138,14 @@ pub enum TenancyError {
         expected: &'static str,
         found: String,
     },
+    /// A `schema` that is present and is not text, so the identifier deciding how
+    /// to read the rest of the body is itself unreadable. No release wrote one,
+    /// so the row is damage rather than another release's writing.
+    #[error(
+        "{reference} carries a `schema` that is not an identifier, which no release wrote; \
+         restore the row or republish the resource rather than changing build"
+    )]
+    DamagedSchema { reference: ResourceRef },
     #[error("{reference} has no `{field}`")]
     MissingField {
         reference: ResourceRef,
@@ -301,7 +309,10 @@ impl TenancyError {
     ///   a schema identifier is only reused for one field set (see the module
     ///   docs). The likely cause is a body rewritten underneath the gateway, not a
     ///   release skew, so it must not be reported as intact storage. A missing
-    ///   `schema` field is the legacy case and stays a compatibility refusal.
+    ///   `schema` field is the legacy case and stays a compatibility refusal,
+    ///   while a `schema` that is *present* and is not text is
+    ///   [`DamagedSchema`](Self::DamagedSchema): no release has ever written a
+    ///   marker that is not an identifier, so that row is damage too.
     ///
     /// The one exception is a display name, whose *rules* can tighten within one
     /// schema — this build refuses a byte-order mark an earlier one accepted — so
@@ -320,11 +331,10 @@ impl TenancyError {
             Self::Schema { .. } | Self::UnknownField { .. } | Self::MalformedDisplayName { .. } => {
                 true
             }
-            // Only the schema identifier itself: its absence is a body written
-            // before tenancy had one at all.
-            Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
-                *field == SCHEMA_FIELD
-            }
+            // Absence of the schema identifier only: a body written before
+            // tenancy had one at all is another release's writing, while a
+            // marker that is present and unreadable is `DamagedSchema` below.
+            Self::MissingField { field, .. } => *field == SCHEMA_FIELD,
             Self::UnknownVocabulary { .. } => true,
             // And its opposite: a spelling this build reads perfectly well, in a
             // position its schema does not put it. No release will accept it
@@ -332,7 +342,9 @@ impl TenancyError {
             // operator to upgrade would send them after a build that cannot
             // exist. The row was rewritten underneath the gateway.
             Self::ValueNotForSchema { .. } => false,
-            Self::Kind { .. }
+            Self::FieldType { .. }
+            | Self::DamagedSchema { .. }
+            | Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
             | Self::MalformedId { .. }
@@ -364,6 +376,7 @@ impl TenancyError {
             | Self::NotInline { reference }
             | Self::NotARecord { reference }
             | Self::Schema { reference, .. }
+            | Self::DamagedSchema { reference }
             | Self::MissingField { reference, .. }
             | Self::UnknownField { reference, .. }
             | Self::FieldType { reference, .. }
@@ -485,6 +498,10 @@ impl BodyError for TenancyError {
             expected,
             found,
         }
+    }
+
+    fn damaged_schema(reference: ResourceRef) -> Self {
+        Self::DamagedSchema { reference }
     }
 
     fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
@@ -1596,6 +1613,45 @@ mod tests {
             .is_incompatible(),
             "only the identifier's own absence is the legacy shape"
         );
+
+        // A marker that is *present* and is not an identifier is the other half of
+        // that boundary: no release wrote one, so it is a rewritten row rather
+        // than an older one, and the operator is sent to storage.
+        for marker in [
+            CanonicalValue::integer(1),
+            CanonicalValue::List(vec![CanonicalValue::string(TENANT_SCHEMA)]),
+            CanonicalValue::map([(SCHEMA_FIELD, CanonicalValue::string(TENANT_SCHEMA))]),
+        ] {
+            let rewritten = with_fields(&tenant_resource(), |fields| {
+                set(fields, SCHEMA_FIELD, marker.clone());
+            });
+            let error = TenantBody::read(&rewritten).expect_err("an unreadable marker");
+            assert_eq!(
+                error,
+                TenancyError::DamagedSchema {
+                    reference: rewritten.reference,
+                }
+            );
+            assert!(
+                !error.is_incompatible(),
+                "a marker no release wrote is damage: {error}"
+            );
+            assert!(
+                error.to_string().contains("restore the row"),
+                "the alert must name the repair: {error}"
+            );
+        }
+        let rewritten = with_fields(&project_resource(), |fields| {
+            set(fields, SCHEMA_FIELD, CanonicalValue::integer(1));
+        });
+        let error = ProjectBody::read(&rewritten).expect_err("an unreadable marker");
+        assert_eq!(
+            error,
+            TenancyError::DamagedSchema {
+                reference: rewritten.reference,
+            }
+        );
+        assert!(!error.is_incompatible(), "{error}");
 
         // Nor is a body that is no longer a record at all, or one under a kind that
         // does not match it. No release, typed or not, wrote a tenancy body as a

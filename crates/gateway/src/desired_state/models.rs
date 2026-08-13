@@ -100,7 +100,9 @@
 //! An *alias* row whose body declares no `schema` at all is a row written before
 //! these bodies were typed. It is skipped rather than refused, because hydration
 //! runs these rules and refusing such a row would stop an existing revision from
-//! loading on upgrade.
+//! loading on upgrade. The accommodation is that one shape only: a row that
+//! carries the key is read strictly, so a `schema` that is not text is a refusal
+//! rather than a row that skips the alias rules unreported.
 //!
 //! An *enablement* has no such history — no release ever wrote one — so an
 //! untyped enablement body is refused rather than skipped. Skipping it would be
@@ -154,6 +156,23 @@ const INPUT_MICROS_FIELD: &str = "input_micros_per_million";
 const OUTPUT_MICROS_FIELD: &str = "output_micros_per_million";
 const PRICE_ID_FIELD: &str = "price_id";
 const VERSION_FIELD: &str = "version";
+
+/// The field list of each nested record the two schemas define, so a sub-record
+/// is held to its schema the way the body around it is.
+const OBSERVED_PRICE_FIELDS: &[&str] = &[INPUT_MICROS_FIELD, OUTPUT_MICROS_FIELD];
+const APPROVED_PRICE_FIELDS: &[&str] = &[PRICE_ID_FIELD, VERSION_FIELD];
+const ALIAS_TARGET_FIELDS: &[&str] = &[ENABLEMENT_ID_FIELD, VERSION_FIELD];
+
+/// A value inside a nested record is named by its path, the way an unknown key
+/// inside one is, so a refusal names the value an operator has to go and fix
+/// rather than the record it sits in — and so `version` says which of the two
+/// records it belongs to.
+const OBSERVED_INPUT_PATH: &str = "observed_price.input_micros_per_million";
+const OBSERVED_OUTPUT_PATH: &str = "observed_price.output_micros_per_million";
+const APPROVED_PRICE_ID_PATH: &str = "approved_price.price_id";
+const APPROVED_VERSION_PATH: &str = "approved_price.version";
+const TARGET_ENABLEMENT_ID_PATH: &str = "targets.enablement_id";
+const TARGET_VERSION_PATH: &str = "targets.version";
 
 /// Why an offering identity could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -664,6 +683,14 @@ pub enum ModelError {
         expected: &'static str,
         found: String,
     },
+    /// A `schema` that is present and is not text, so the identifier deciding how
+    /// to read the rest of the body is itself unreadable. No release wrote one,
+    /// so the row is damage rather than another release's writing.
+    #[error(
+        "{reference} carries a `schema` that is not an identifier, which no release wrote; \
+         restore the row or republish the resource rather than changing build"
+    )]
+    DamagedSchema { reference: ResourceRef },
     #[error("{reference} has no `{field}`")]
     MissingField {
         reference: ResourceRef,
@@ -812,12 +839,13 @@ impl ModelError {
             | Self::UnknownField { .. }
             | Self::UnknownWireFamily { .. }
             | Self::UnknownLifecycle { .. } => true,
-            // Only the schema identifier itself: its absence is a body written
-            // before these bodies had one at all.
-            Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
-                *field == SCHEMA_FIELD
-            }
-            Self::Kind { .. }
+            // Absence of the schema identifier only: a body written before these
+            // bodies had one at all is another release's writing, while a marker
+            // that is present and unreadable is `DamagedSchema` below.
+            Self::MissingField { field, .. } => *field == SCHEMA_FIELD,
+            Self::FieldType { .. }
+            | Self::DamagedSchema { .. }
+            | Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
             | Self::MalformedId { .. }
@@ -846,6 +874,7 @@ impl ModelError {
             | Self::NotInline { reference }
             | Self::NotARecord { reference }
             | Self::Schema { reference, .. }
+            | Self::DamagedSchema { reference }
             | Self::MissingField { reference, .. }
             | Self::UnknownField { reference, .. }
             | Self::FieldType { reference, .. }
@@ -894,6 +923,10 @@ impl BodyError for ModelError {
             expected,
             found,
         }
+    }
+
+    fn damaged_schema(reference: ResourceRef) -> Self {
+        Self::DamagedSchema { reference }
     }
 
     fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
@@ -952,28 +985,21 @@ fn lifecycle(record: &ModelRecord<'_>) -> Result<ModelLifecycle, ModelError> {
     })
 }
 
-/// A field of a nested record, named for the outer field so a refusal an operator
-/// reads names the field the schema documents.
+/// A required value of a nested record, named by its `path` — `approved_price.price_id`
+/// rather than `approved_price` — so an absence names the value that is absent.
+///
+/// The sub-record itself is opened by [`Record::sub_record`], which holds it to its
+/// own field list, so a key a newer release added inside it is an unknown field
+/// rather than a value this build drops.
 fn nested<'a>(
-    record: &ModelRecord<'_>,
-    value: &'a CanonicalValue,
-    field: &'static str,
-    name: &str,
+    sub: &ModelRecord<'a>,
+    name: &'static str,
+    path: &'static str,
 ) -> Result<&'a CanonicalValue, ModelError> {
-    let CanonicalValue::Map(fields) = value else {
-        return Err(ModelError::FieldType {
-            reference: record.reference(),
-            field,
-        });
-    };
-    fields
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value)
-        .ok_or(ModelError::MissingField {
-            reference: record.reference(),
-            field,
-        })
+    sub.optional_value(name).ok_or(ModelError::MissingField {
+        reference: sub.reference(),
+        field: path,
+    })
 }
 
 fn integer(
@@ -1256,33 +1282,45 @@ impl ModelEnablementBody {
         let observed = match record.optional_value(OBSERVED_PRICE_FIELD) {
             None => None,
             Some(value) => {
-                let input = nested(&record, value, OBSERVED_PRICE_FIELD, INPUT_MICROS_FIELD)?;
-                let output = nested(&record, value, OBSERVED_PRICE_FIELD, OUTPUT_MICROS_FIELD)?;
+                let sub = record.sub_record(
+                    value,
+                    OBSERVED_PRICE_FIELD,
+                    MODEL_ENABLEMENT_SCHEMA,
+                    OBSERVED_PRICE_FIELDS,
+                )?;
+                let input = nested(&sub, INPUT_MICROS_FIELD, OBSERVED_INPUT_PATH)?;
+                let output = nested(&sub, OUTPUT_MICROS_FIELD, OBSERVED_OUTPUT_PATH)?;
                 Some(ObservedPrice::new(
-                    micros(&record, input, INPUT_MICROS_FIELD)?,
-                    micros(&record, output, OUTPUT_MICROS_FIELD)?,
+                    micros(&record, input, OBSERVED_INPUT_PATH)?,
+                    micros(&record, output, OBSERVED_OUTPUT_PATH)?,
                 ))
             }
         };
         let approved = match record.optional_value(APPROVED_PRICE_FIELD) {
             None => None,
             Some(value) => {
-                let price = nested(&record, value, APPROVED_PRICE_FIELD, PRICE_ID_FIELD)?;
-                let version = nested(&record, value, APPROVED_PRICE_FIELD, VERSION_FIELD)?;
+                let sub = record.sub_record(
+                    value,
+                    APPROVED_PRICE_FIELD,
+                    MODEL_ENABLEMENT_SCHEMA,
+                    APPROVED_PRICE_FIELDS,
+                )?;
+                let price = nested(&sub, PRICE_ID_FIELD, APPROVED_PRICE_ID_PATH)?;
+                let version = nested(&sub, VERSION_FIELD, APPROVED_VERSION_PATH)?;
                 let CanonicalValue::String(text) = price else {
                     return Err(ModelError::FieldType {
                         reference: resource.reference,
-                        field: PRICE_ID_FIELD,
+                        field: APPROVED_PRICE_ID_PATH,
                     });
                 };
                 let price = ResourceId::parse(text).map_err(|source| ModelError::MalformedId {
                     reference: resource.reference,
-                    field: PRICE_ID_FIELD,
+                    field: APPROVED_PRICE_ID_PATH,
                     source,
                 })?;
                 Some(ApprovedPrice::version(
                     price,
-                    version_number(&record, version, VERSION_FIELD)?,
+                    version_number(&record, version, APPROVED_VERSION_PATH)?,
                 ))
             }
         };
@@ -1563,23 +1601,29 @@ impl ModelAliasBody {
         let targets = targets
             .iter()
             .map(|target| {
-                let enablement = nested(&record, target, TARGETS_FIELD, ENABLEMENT_ID_FIELD)?;
-                let version = nested(&record, target, TARGETS_FIELD, VERSION_FIELD)?;
+                let sub = record.sub_record(
+                    target,
+                    TARGETS_FIELD,
+                    MODEL_ALIAS_SCHEMA,
+                    ALIAS_TARGET_FIELDS,
+                )?;
+                let enablement = nested(&sub, ENABLEMENT_ID_FIELD, TARGET_ENABLEMENT_ID_PATH)?;
+                let version = nested(&sub, VERSION_FIELD, TARGET_VERSION_PATH)?;
                 let CanonicalValue::String(text) = enablement else {
                     return Err(ModelError::FieldType {
                         reference: resource.reference,
-                        field: ENABLEMENT_ID_FIELD,
+                        field: TARGET_ENABLEMENT_ID_PATH,
                     });
                 };
                 let enablement =
                     ResourceId::parse(text).map_err(|source| ModelError::MalformedId {
                         reference: resource.reference,
-                        field: ENABLEMENT_ID_FIELD,
+                        field: TARGET_ENABLEMENT_ID_PATH,
                         source,
                     })?;
                 Ok(AliasTarget::new(
                     enablement,
-                    version_number(&record, version, VERSION_FIELD)?,
+                    version_number(&record, version, TARGET_VERSION_PATH)?,
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1851,9 +1895,7 @@ fn is_typed(resource: &ResourceVersion) -> bool {
     let ResourceBody::Inline(CanonicalValue::Map(fields)) = &resource.body else {
         return false;
     };
-    fields
-        .iter()
-        .any(|(field, value)| field == SCHEMA_FIELD && matches!(value, CanonicalValue::String(_)))
+    fields.iter().any(|(field, _)| field == SCHEMA_FIELD)
 }
 
 /// The snapshot an enablement pins must be a snapshot this revision carries, as a
@@ -2751,6 +2793,311 @@ mod tests {
                 "{error} should say what {field} is not"
             );
         }
+    }
+
+    /// Extend the nested record at `outer` with `field`, as a newer release that
+    /// added a key inside a sub-record would have written it.
+    fn extend_nested(resource: &ResourceVersion, outer: &str, field: &str) -> ResourceVersion {
+        with_fields(resource, |fields| {
+            let (_, value) = fields
+                .iter_mut()
+                .find(|(name, _)| name == outer)
+                .expect("the fixture body carries the nested field");
+            let CanonicalValue::Map(nested) = value else {
+                panic!("{outer} is a nested record");
+            };
+            nested.push((field.to_owned(), CanonicalValue::string("later")));
+        })
+    }
+
+    #[test]
+    fn a_field_a_newer_release_added_inside_a_nested_record_is_refused_too() {
+        // A sub-record is part of its schema, so extending one is the same skew as
+        // extending the body around it: refused, never read past and dropped.
+        let enablement = enablement_body(30, owner_tenant(), "gpt-4o")
+            .observing(observed_price())
+            .approving(approved_price(40))
+            .version(Slug::parse("gpt-4o").unwrap(), catalog_reference());
+        for (outer, field, schema) in [
+            (
+                OBSERVED_PRICE_FIELD,
+                "cached_input_micros_per_million",
+                MODEL_ENABLEMENT_SCHEMA,
+            ),
+            (
+                APPROVED_PRICE_FIELD,
+                "effective_from",
+                MODEL_ENABLEMENT_SCHEMA,
+            ),
+        ] {
+            let extended = extend_nested(&enablement, outer, field);
+            let error = ModelEnablementBody::read(&extended).expect_err("an extended sub-record");
+            assert_eq!(
+                error,
+                ModelError::UnknownField {
+                    reference: extended.reference,
+                    schema,
+                    field: format!("{outer}.{field}")
+                }
+            );
+            assert!(
+                error.is_incompatible(),
+                "a body a newer release wrote is a compatibility refusal: {error}"
+            );
+        }
+
+        let alias = typed_alias(
+            &tenant_id(1),
+            &project_id(2),
+            32,
+            "fast",
+            &[reference_of(30)],
+        );
+        let extended = with_first_target(&alias, |target| {
+            target.push(("weight".to_owned(), CanonicalValue::integer(1)));
+        });
+        let error = ModelAliasBody::read(&extended).expect_err("an extended target");
+        assert_eq!(
+            error,
+            ModelError::UnknownField {
+                reference: extended.reference,
+                schema: MODEL_ALIAS_SCHEMA,
+                field: format!("{TARGETS_FIELD}.weight")
+            }
+        );
+        assert!(error.is_incompatible());
+
+        // The revision refuses to validate at all, so nothing converges on a body
+        // it read only part of.
+        let error = state_replacing(extended)
+            .validate()
+            .expect_err("a revision carrying an extended sub-record is not valid");
+        assert!(
+            matches!(model_error(&error), Some(ModelError::UnknownField { .. })),
+            "{error}"
+        );
+    }
+
+    /// Rewrite the first target of a typed alias, as a body carrying a damaged
+    /// target would have been written.
+    fn with_first_target(
+        resource: &ResourceVersion,
+        mutate: impl FnOnce(&mut Vec<(String, CanonicalValue)>),
+    ) -> ResourceVersion {
+        with_fields(resource, |fields| {
+            let (_, value) = fields
+                .iter_mut()
+                .find(|(name, _)| name == TARGETS_FIELD)
+                .expect("a typed alias carries targets");
+            let CanonicalValue::List(targets) = value else {
+                panic!("targets is a list");
+            };
+            let CanonicalValue::Map(target) = &mut targets[0] else {
+                panic!("a target is a nested record");
+            };
+            mutate(target);
+        })
+    }
+
+    #[test]
+    fn a_value_missing_inside_a_nested_record_is_named_by_its_path() {
+        // An operator repairing a refused revision is told which value to write,
+        // so a sub-record's absence names the value rather than the record around
+        // it — and `version` says which record it belongs to.
+        let enablement = enablement_body(30, owner_tenant(), "gpt-4o")
+            .observing(observed_price())
+            .approving(approved_price(40))
+            .version(Slug::parse("gpt-4o").unwrap(), catalog_reference());
+        for (outer, field, path) in [
+            (
+                OBSERVED_PRICE_FIELD,
+                INPUT_MICROS_FIELD,
+                OBSERVED_INPUT_PATH,
+            ),
+            (
+                OBSERVED_PRICE_FIELD,
+                OUTPUT_MICROS_FIELD,
+                OBSERVED_OUTPUT_PATH,
+            ),
+            (APPROVED_PRICE_FIELD, PRICE_ID_FIELD, APPROVED_PRICE_ID_PATH),
+            (APPROVED_PRICE_FIELD, VERSION_FIELD, APPROVED_VERSION_PATH),
+        ] {
+            let damaged = with_fields(&enablement, |fields| {
+                let (_, value) = fields
+                    .iter_mut()
+                    .find(|(name, _)| name == outer)
+                    .expect("the fixture body carries the nested record");
+                let CanonicalValue::Map(nested) = value else {
+                    panic!("{outer} is a nested record");
+                };
+                nested.retain(|(name, _)| name != field);
+            });
+            let error = ModelEnablementBody::read(&damaged)
+                .expect_err("a sub-record missing a value is refused");
+            assert_eq!(
+                error,
+                ModelError::MissingField {
+                    reference: damaged.reference,
+                    field: path
+                }
+            );
+            assert!(
+                !error.is_incompatible(),
+                "a value this build reads is damage, not skew: {error}"
+            );
+        }
+
+        // A wrongly typed inner value is named by its path too, so the two
+        // refusals point at the same place.
+        let damaged = with_fields(&enablement, |fields| {
+            let (_, value) = fields
+                .iter_mut()
+                .find(|(name, _)| name == APPROVED_PRICE_FIELD)
+                .expect("the fixture body carries an approved price");
+            let CanonicalValue::Map(nested) = value else {
+                panic!("approved_price is a nested record");
+            };
+            set(nested, PRICE_ID_FIELD, CanonicalValue::integer(1));
+        });
+        assert_eq!(
+            ModelEnablementBody::read(&damaged).expect_err("a price id that is not text"),
+            ModelError::FieldType {
+                reference: damaged.reference,
+                field: APPROVED_PRICE_ID_PATH
+            }
+        );
+
+        let alias = typed_alias(
+            &tenant_id(1),
+            &project_id(2),
+            32,
+            "fast",
+            &[reference_of(30)],
+        );
+        for (field, path) in [
+            (ENABLEMENT_ID_FIELD, TARGET_ENABLEMENT_ID_PATH),
+            (VERSION_FIELD, TARGET_VERSION_PATH),
+        ] {
+            let damaged = with_first_target(&alias, |target| {
+                target.retain(|(name, _)| name != field);
+            });
+            assert_eq!(
+                ModelAliasBody::read(&damaged).expect_err("a target missing a value is refused"),
+                ModelError::MissingField {
+                    reference: damaged.reference,
+                    field: path
+                }
+            );
+        }
+        let damaged = with_first_target(&alias, |target| {
+            set(target, ENABLEMENT_ID_FIELD, CanonicalValue::integer(1));
+        });
+        assert_eq!(
+            ModelAliasBody::read(&damaged).expect_err("a target id that is not text"),
+            ModelError::FieldType {
+                reference: damaged.reference,
+                field: TARGET_ENABLEMENT_ID_PATH
+            }
+        );
+    }
+
+    #[test]
+    fn an_alias_whose_schema_marker_is_damaged_is_refused_rather_than_skipped() {
+        // The upgrade accommodation is a body with no `schema` key at all. A key
+        // that is present but is not text is damage, so reading it as a row
+        // predating this slice would let it skip the scope, target, reach, and
+        // wire-family rules with nothing reported.
+        //
+        // And damage is what it is *called*, too: no release wrote a marker that
+        // is not an identifier, so reporting it as skew would send an operator to
+        // roll a build forward when the row needs restoring.
+        let alias = typed_alias(
+            &tenant_id(1),
+            &project_id(2),
+            32,
+            "fast",
+            &[reference_of(30)],
+        );
+        for marker in [
+            CanonicalValue::integer(1),
+            CanonicalValue::List(vec![CanonicalValue::string(MODEL_ALIAS_SCHEMA)]),
+            CanonicalValue::map([(SCHEMA_FIELD, CanonicalValue::string(MODEL_ALIAS_SCHEMA))]),
+        ] {
+            let damaged = with_fields(&alias, |fields| {
+                set(fields, SCHEMA_FIELD, marker.clone());
+            });
+            let state = state_replacing(damaged.clone());
+
+            let error = Models::of(&state).expect_err("a damaged schema marker is refused");
+            assert_eq!(
+                error,
+                ModelError::DamagedSchema {
+                    reference: damaged.reference
+                }
+            );
+            assert!(
+                !error.is_incompatible(),
+                "a marker no release wrote is corruption, not skew: {error}"
+            );
+            let detail = error.to_string();
+            assert!(
+                detail.contains("no release wrote") && detail.contains("restore"),
+                "a corruption refusal must say what to do: {detail}"
+            );
+            let error = state
+                .validate()
+                .expect_err("a revision carrying a damaged alias is not valid");
+            assert!(
+                matches!(model_error(&error), Some(ModelError::DamagedSchema { .. })),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_damaged_alias_marker_hydrates_as_damage_not_skew() {
+        // The companion to
+        // `a_body_this_build_cannot_read_hydrates_as_an_incompatibility_not_corruption`:
+        // a marker naming a schema this build does not read is another release's
+        // revision, while a marker that is not an identifier at all is a row to
+        // repair. Hydration is where the two stop being the same alert.
+        let candidate = candidate(ExpectedRevision::Empty, "models", state_with_models());
+        let manifest =
+            RevisionManifest::of(revision_id(1), None, SystemTime::UNIX_EPOCH, &candidate)
+                .expect("the fixture state is publishable");
+
+        let mut damaged = DesiredState::new();
+        for blob in candidate.state.blobs() {
+            damaged.declare_blob(*blob);
+        }
+        for resource in candidate.state.resources() {
+            let resource = if resource.reference.kind == ResourceKind::Alias {
+                with_fields(resource, |fields| {
+                    set(fields, SCHEMA_FIELD, CanonicalValue::integer(1));
+                })
+            } else {
+                resource.clone()
+            };
+            damaged.insert(resource).expect("distinct references");
+        }
+        let error = LoadedRevision::assemble(manifest, damaged)
+            .expect_err("a damaged alias marker must not hydrate");
+        assert!(
+            matches!(
+                error,
+                IntegrityError::Invalid(ValidationError::Model(ref refusal))
+                    if matches!(**refusal, ModelError::DamagedSchema { .. })
+            ),
+            "{error}"
+        );
+        assert!(
+            !error.is_incompatible(),
+            "damaged storage is not a build to roll forward: {error}"
+        );
+        assert!(
+            error.to_string().contains("restore the row"),
+            "the alert must name the repair: {error}"
+        );
     }
 
     #[test]
