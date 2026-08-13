@@ -22,7 +22,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
-use crate::desired_state::{ProjectId, TenantId};
+use crate::desired_state::{ProjectId, SecretRef, TenantId};
 use crate::principals::Capability;
 use crate::usage::{BatchSettings, validate_table_name};
 
@@ -506,7 +506,22 @@ pub struct Target {
 pub struct Credential {
     pub namespace: String,
     pub provider: String,
-    pub env: String,
+    /// The env var the material is read from. Present for every credential a
+    /// *file* declares, and absent for one a revision projected — whose material
+    /// comes from the secret store by reference instead.
+    #[serde(default)]
+    pub env: Option<String>,
+    /// The exact secret version this credential's material is unwrapped from.
+    ///
+    /// Never read from TOML, for the reason [`Namespace::project`] is not: a file
+    /// has no secret store to reference, and durable material is not something a
+    /// process-local fact can name. A projection sets it, and
+    /// [`Credentials::resolve`](crate::credentials::Credentials::resolve) takes
+    /// the material from the set the candidate's compilation already unwrapped —
+    /// so this field is a *reference*, and the plaintext it names never appears in
+    /// a config value.
+    #[serde(skip)]
+    pub secret: Option<SecretRef>,
     /// Stable label for attribution. Defaults to the env-var *name*, which is a
     /// reference rather than a secret, so it is safe to log and to carry on a
     /// usage record.
@@ -520,8 +535,15 @@ pub struct Credential {
 
 impl Credential {
     /// The attribution label for this credential — never its value.
+    ///
+    /// A projected credential always carries an `id` (its resource slug), and a
+    /// declared one always carries an `env`; validation refuses a credential with
+    /// neither, so the fallback is unreachable rather than a silent default.
     pub fn label(&self) -> &str {
-        self.id.as_deref().unwrap_or(self.env.as_str())
+        self.id
+            .as_deref()
+            .or(self.env.as_deref())
+            .unwrap_or("unlabelled")
     }
 }
 
@@ -1892,11 +1914,26 @@ impl Config {
         self.validate_process_local_bounds()?;
         let mut labels: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
         for c in &self.credential {
-            if c.env.trim().is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "credential for namespace `{}` provider `{}` has an empty `env`",
-                    c.namespace, c.provider
-                )));
+            // Exactly one source of material. A file names an env var; a
+            // projection names an exact secret version. Both would be two
+            // authorities over one credential, and neither is a credential at all.
+            match (c.env.as_deref().map(str::trim), c.secret) {
+                (Some("") | None, None) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "credential for namespace `{}` provider `{}` has an empty `env`",
+                        c.namespace, c.provider
+                    )));
+                }
+                (Some(env), Some(reference)) if !env.is_empty() => {
+                    return Err(ConfigError::Invalid(format!(
+                        "credential `{}` for namespace `{}` provider `{}` names both env var \
+                         `{env}` and secret `{reference}`; material has one source",
+                        c.label(),
+                        c.namespace,
+                        c.provider
+                    )));
+                }
+                _ => {}
             }
             if c.weight == 0 {
                 return Err(ConfigError::Invalid(format!(

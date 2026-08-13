@@ -25,6 +25,8 @@ use secrecy::SecretString;
 use serde::Serialize;
 
 use crate::config::{Config, SelectionStrategy};
+use crate::convergence::secrets::{ResolvedSecrets, RetainedMaterial};
+use crate::desired_state::SecretRef;
 
 /// Which key served a request, for usage attribution (delta A3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +79,28 @@ pub enum CredentialError {
         id: String,
         env: String,
     },
+    /// A credential names neither an env var nor a secret version. Unreachable
+    /// through [`Config::validate_compiled`], and kept as a value rather than a
+    /// panic so a caller that skipped the gate still fails closed.
+    #[error(
+        "credential `{id}` for namespace `{namespace}` provider `{provider}` names no material source"
+    )]
+    NoSource {
+        namespace: String,
+        provider: String,
+        id: String,
+    },
+    /// A projected credential's exact version is not in the set the candidate's
+    /// compilation unwrapped. The *reference* is named, never the material.
+    #[error(
+        "credential `{id}` for namespace `{namespace}` provider `{provider}` pins secret `{reference}`, which this candidate did not resolve"
+    )]
+    Unresolved {
+        namespace: String,
+        provider: String,
+        id: String,
+        reference: SecretRef,
+    },
 }
 
 /// Per-credential circuit state, reported for observability.
@@ -125,10 +149,38 @@ enum Eligibility {
     Parked,
 }
 
+/// Where one pool entry's material came from, and what keeps it alive.
+///
+/// The distinction is the whole of #145 at this boundary. Env material is a
+/// process fact: it was read once at boot and changes only when the process is
+/// replaced. Store material is a *version*, unwrapped while this snapshot's
+/// candidate was compiled, and held here as the same reference-counted handle the
+/// snapshot holds — so rotating it publishes a new pool instead of mutating this
+/// one, and the old version is zeroized when the last snapshot that could lease
+/// it is dropped.
+enum Material {
+    /// Read from the captured boot environment (stateless mode).
+    Env(SecretString),
+    /// Unwrapped from the deployment's secret store during candidate
+    /// compilation, pinned to one exact version.
+    Store(RetainedMaterial),
+}
+
+impl Material {
+    /// The material for one attempt. A copy either way, because a lease outlives
+    /// the plan it came from; both copies zeroize when dropped.
+    fn lease(&self) -> SecretString {
+        match self {
+            Self::Env(secret) => secret.clone(),
+            Self::Store(retained) => SecretString::from(retained.expose().to_owned()),
+        }
+    }
+}
+
 struct PoolEntry {
     id: String,
     status_id: Option<String>,
-    secret: SecretString,
+    material: Material,
     weight: u32,
     health_key: String,
 }
@@ -267,30 +319,66 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    /// Build the snapshot from config + a captured environment map. A declared
-    /// credential whose env var is unset or empty is a boot failure, not a
-    /// request-time surprise (fail at boot, delta B2).
-    pub fn from_env(
+    /// Build the pools of a compiled snapshot: env-declared credentials from the
+    /// captured boot environment, projected ones from the material this
+    /// candidate's compilation already unwrapped.
+    ///
+    /// A declared credential whose env var is unset or empty is a boot failure,
+    /// not a request-time surprise (fail at boot, delta B2), and the stateless
+    /// path is this same call with an empty resolved set: no candidate was
+    /// compiled, so no durable material exists, and a config that came from a file
+    /// carries no secret reference to fill.
+    ///
+    /// Nothing here reaches a secret store. Resolution happened during
+    /// compilation, once, off the request path; this is the projection of that
+    /// result onto the pools a provider call leases from, and a version it cannot
+    /// find is a refusal rather than a pool with a hole in it.
+    pub fn resolve(
         config: &Config,
         env: &HashMap<String, String>,
+        secrets: &ResolvedSecrets,
     ) -> Result<Self, CredentialError> {
         let mut pools: HashMap<(String, String), Vec<PoolEntry>> = HashMap::new();
         for c in &config.credential {
-            let secret = env.get(&c.env).filter(|v| !v.is_empty()).ok_or_else(|| {
-                CredentialError::MissingEnv {
-                    namespace: c.namespace.clone(),
-                    provider: c.provider.clone(),
-                    id: c.label().to_string(),
-                    env: c.env.clone(),
+            let material = match (c.env.as_deref().filter(|name| !name.is_empty()), c.secret) {
+                (_, Some(reference)) => {
+                    let retained =
+                        secrets
+                            .get(reference)
+                            .ok_or_else(|| CredentialError::Unresolved {
+                                namespace: c.namespace.clone(),
+                                provider: c.provider.clone(),
+                                id: c.label().to_string(),
+                                reference,
+                            })?;
+                    Material::Store(retained.clone())
                 }
-            })?;
+                (Some(name), None) => {
+                    let secret = env.get(name).filter(|v| !v.is_empty()).ok_or_else(|| {
+                        CredentialError::MissingEnv {
+                            namespace: c.namespace.clone(),
+                            provider: c.provider.clone(),
+                            id: c.label().to_string(),
+                            env: name.to_owned(),
+                        }
+                    })?;
+                    Material::Env(SecretString::from(secret.clone()))
+                }
+                (None, None) => {
+                    return Err(CredentialError::NoSource {
+                        namespace: c.namespace.clone(),
+                        provider: c.provider.clone(),
+                        id: c.label().to_string(),
+                    });
+                }
+            };
             pools
                 .entry((c.namespace.clone(), c.provider.clone()))
                 .or_default()
                 .push(PoolEntry {
                     id: c.label().to_string(),
                     status_id: c.id.clone(),
-                    secret: SecretString::from(secret.clone()),
+                    material,
                     weight: c.weight,
                     health_key: health_key(&c.namespace, &c.provider, c.label()),
                 });
@@ -564,7 +652,7 @@ impl Credentials {
 fn lease(entry: &PoolEntry) -> CredentialLease {
     CredentialLease {
         id: entry.id.clone(),
-        secret: entry.secret.clone(),
+        secret: entry.material.lease(),
         health_key: entry.health_key.clone(),
     }
 }
@@ -623,7 +711,12 @@ id = "openai-b"
 "#;
 
     fn two_key_credentials(cfg: &Config) -> Credentials {
-        Credentials::from_env(cfg, &env(&[("K1", "sk-a"), ("K2", "sk-b")])).expect("credentials")
+        Credentials::resolve(
+            cfg,
+            &env(&[("K1", "sk-a"), ("K2", "sk-b")]),
+            &ResolvedSecrets::default(),
+        )
+        .expect("credentials")
     }
 
     #[test]
@@ -646,8 +739,12 @@ env = "K2"
 id = "public-platform"
 "#,
         );
-        let creds = Credentials::from_env(&cfg, &env(&[("K1", "sk-a"), ("K2", "sk-b")]))
-            .expect("credentials");
+        let creds = Credentials::resolve(
+            &cfg,
+            &env(&[("K1", "sk-a"), ("K2", "sk-b")]),
+            &ResolvedSecrets::default(),
+        )
+        .expect("credentials");
         let statuses = creds.status(&cfg, CredentialStatusView::Namespace("tenant"));
         let body = serde_json::to_value(statuses).expect("status JSON");
         let entries = body.as_array().expect("status list");
@@ -915,7 +1012,12 @@ provider = "openai"
 env = "K1"
 "#,
         );
-        let creds = Credentials::from_env(&no_key, &env(&[("K1", "sk-a")])).expect("credentials");
+        let creds = Credentials::resolve(
+            &no_key,
+            &env(&[("K1", "sk-a")]),
+            &ResolvedSecrets::default(),
+        )
+        .expect("credentials");
         assert!(creds.plan(&no_key, "acme", "openai").is_none());
     }
 
@@ -952,7 +1054,11 @@ namespace = "platform"
     #[test]
     fn a_dangling_credential_reference_fails_at_boot() {
         let cfg = config(TWO_PLATFORM_KEYS);
-        let Err(err) = Credentials::from_env(&cfg, &env(&[("K1", "sk-a"), ("K2", "")])) else {
+        let Err(err) = Credentials::resolve(
+            &cfg,
+            &env(&[("K1", "sk-a"), ("K2", "")]),
+            &ResolvedSecrets::default(),
+        ) else {
             panic!("an unset credential env var must refuse to boot");
         };
         assert!(matches!(err, CredentialError::MissingEnv { .. }), "{err:?}");

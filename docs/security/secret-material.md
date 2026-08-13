@@ -51,6 +51,7 @@ reconciler, the real publication seam, the real router, and — for durable stat
 | `lifecycle` | One-time disclosure, rotation overlapping an in-flight request, last-known-good retention on a failed resolution, destruction of retired material, and that the stateless environment-variable path still serves and still redacts. |
 | `request_path` | One served request's response, logs, spans, and usage record; a transport failure's error surfaces; a rejected caller's refusal; and the status projection of an unresolved secret. |
 | `journal` | Every row of every table in the control-plane schema, rendered as text, plus manifests, hydrated revisions, audit trails, and idempotency replays and conflicts. |
+| `stateful` | The zero-redeploy sequence against the *production* secret store: stage, activate, serve, rotate, roll back to the previous version, and a revoked version refusing a candidate while the last known good keeps serving — plus a sweep of every stored row and a cross-owner read that never reaches a pool. |
 
 Two properties of the suite are worth stating, because a redaction test that
 lacks either is theatre:
@@ -67,7 +68,8 @@ lacks either is theatre:
 
 ## Running it
 
-The journal tests need Postgres. Locally they skip when no DSN is configured:
+The `journal` and `stateful` tests need Postgres. Locally they skip when no DSN
+is configured:
 
 ```sh
 AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres \
@@ -84,11 +86,18 @@ Unwrapping is production code: the harness compiler resolves through
 `SecretMaterialization` and hands the resulting `ResolvedSecrets` to
 `ConfigSnapshot::build_with`, so retention, rotation overlap, and zeroization
 are asserted about the shipped seam and its `MaterialLedger` rather than about a
-mock. What the harness still supplies is the step that turns a resolved version
-into a credential pool entry: the projection that emits `[[credential]]` from
-typed credential bodies is not wired into `serve` yet, so these tests name the
-material with an env-var name of their own. When that projection lands, that one
-seam is what should be repointed at it.
+mock. Turning a resolved version into a credential pool entry is production code
+too: `RuntimeProjection` emits the `[[credential]]` entries a provider call
+leases from, each naming the exact version the candidate resolved, so a request
+that reaches the fake provider with the sentinel key proves the shipped path
+carried it there.
+
+Two seams the harness still supplies, neither touching material: an alias's
+targets, because projecting a catalogue is its own slice, and which namespace an
+inbound key binds to, because binding a caller to a projected namespace is
+#252's. A projected project is reached by a qualified id no `axond.toml` can
+declare, so the suite rebinds its bootstrap key to it rather than inventing an
+identity model. Stateful `serve` is still not wired for the same reason.
 
 The authenticated `/admin/v1` boundary is likewise not on this branch; the
 administrative reads that page is responsible for are asserted at the store
