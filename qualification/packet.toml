@@ -3,8 +3,8 @@
 # #156 asks for reproducible evidence in place of qualitative production claims,
 # and it decomposes into five slices — capacity, provider and backend faults,
 # stateful recovery, multi-replica rollout, and a long soak. Each has landed to a
-# different depth: one has a driver and retained runs, one has a driver and no
-# long run behind it, one has a committed contract and no driver, and two have
+# different depth: one has a driver and retained runs, two have a driver and no
+# heavy run behind them, one has a committed contract and no driver, and one has
 # neither. That spread is the whole point of this file. An epic whose children
 # are merged is not an epic whose question is answered, and the difference is
 # only reviewable if it is written down where it cannot rot.
@@ -111,19 +111,25 @@ blocked_on = [158]
 [[slice]]
 id = "rollout"
 issue = 220
-status = "unbuilt"
+status = "harnessed"
 question = """
 Whether two or more replicas behind an ingress can be replaced without losing \
 a request, a stream, or a usage row: drain on SIGTERM, readiness removal, \
 bounded stream cut, mixed-version serving, migration preflight, and rollback."""
 covers = ["sigterm_drain", "rolling_upgrade"]
+manifest = "qualification/rollout/manifest.toml"
+driver = "crates/gateway/tests/rollout.rs"
+contract = "docs/operations/rollout.md"
+adr = "docs/adr/0041-rollout-qualification-harness.md"
+reduced_lane = "cargo test --workspace"
+heavy_lane = ".github/workflows/rollout.yml"
+heavy_tier = "heavy"
 retained = []
 outstanding = """
-No manifest and no driver. Single-replica drain is already covered by \
-crates/gateway/tests/shutdown.rs; what is missing is a fleet, an ingress in \
-front of it, and the artifact-digest and migration metadata a rollout has to \
-retain."""
-blocked_on = [157, 158]
+The heavy tier has never been dispatched, so no run of a fleet under load is \
+retained; mixed-version serving across a migration still waits on a stateful \
+replica."""
+blocked_on = [158]
 
 # What closing #156 requires. `satisfied` is not an opinion: the contract test
 # derives it from the slices above, so it can only become true when every slice

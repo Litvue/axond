@@ -13,11 +13,11 @@ decomposes into five slices. They landed, and will land, at different depths:
 | `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Driver and committed mix; the smoke tier runs in CI. The 12–24 hour tier has never been dispatched. |
 | `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `declared` | A committed scenario contract and a test that keeps it honest. No driver: stateful serving is not assembled yet. |
 | `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `unbuilt` | Nothing. The fake upstream already injects the provider faults a matrix would drive. |
-| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `unbuilt` | Nothing multi-replica. Single-replica drain is covered by `crates/gateway/tests/shutdown.rs`. |
+| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver, committed scenarios, and a reduced tier in CI. The heavy tier has never been dispatched, and mixed-version serving waits on a stateful replica. |
 
 `qualification/packet.toml` is that table as data — question, inputs, lanes,
 retained runs, and what each slice still owes; see
-[ADR 0041](../adr/0041-qualification-packet-and-evidence-records.md) for why the
+[ADR 0045](../adr/0045-qualification-packet-and-evidence-records.md) for why the
 packet and the record are shaped this way. And
 `crates/gateway/tests/qualification_packet.rs` checks it against the tree on
 every run: a path that does not exist, a status a slice has not earned, a
@@ -26,10 +26,11 @@ the manifest it names is a test failure.
 
 ## What the packet may not be read as
 
-- **Not a claim that Axond is production-qualified.** Two of five slices have no
-  driver, one has no long run behind it, and no slice has been measured on a
-  fleet. #156 stays open until every slice is `evidenced`; `closure.satisfied`
-  in the packet is derived from the slices, so it cannot be set by hand.
+- **Not a claim that Axond is production-qualified.** One of five slices has no
+  driver, one has a contract and no driver, two have no heavy run behind them,
+  and no slice has retained a run of a fleet. #156 stays open until every slice
+  is `evidenced`; `closure.satisfied` in the packet is derived from the slices,
+  so it cannot be set by hand.
 - **Not evidence about stateful serving.** Everything measured so far is Tier 0:
   one process, no Redis, no Postgres, no control plane. See
   [recovery qualification](./recovery-qualification.md) for what stateful
@@ -128,5 +129,5 @@ number is a regression rather than a different machine.
   contract is committed before its driver.
 - [ADR 0040](../adr/0040-endurance-qualification-harness.md) — why the endurance
   harness measures its own accumulators before it measures the gateway.
-- [ADR 0041](../adr/0041-qualification-packet-and-evidence-records.md) — the
+- [ADR 0045](../adr/0045-qualification-packet-and-evidence-records.md) — the
   packet and evidence-record schemas, and the ladder derived from them.

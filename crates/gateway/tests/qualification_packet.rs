@@ -361,12 +361,8 @@ fn the_recovery_slice_waits_on_exactly_what_its_manifest_waits_on() {
     let manifest: BTreeSet<u32> = recovery::load()
         .scenarios
         .iter()
-        .flat_map(|scenario| {
-            scenario
-                .blocked_on
-                .iter()
-                .map(|dependency| dependency.issue)
-        })
+        .flat_map(|scenario| &scenario.stages)
+        .flat_map(|stage| stage.blocked_on.iter().map(|dependency| dependency.issue))
         .collect();
 
     assert_eq!(
