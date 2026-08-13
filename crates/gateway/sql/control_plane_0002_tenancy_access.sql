@@ -103,6 +103,14 @@ CREATE TABLE IF NOT EXISTS axond_cp_project (
     -- Deferred for the same reason as a tenant's name: two projects of one tenant
     -- may trade slugs in a single revision, and which one is written first is an
     -- id ordering rather than a decision.
+    --
+    -- Unconditional, where a tenant's is partial on lifecycle, because a project
+    -- has no lifecycle to publish: a project a revision stops declaring keeps its
+    -- row and its name, and the name is handed back by renaming that project in
+    -- the revision that drops it rather than by a state it transitions to. Giving
+    -- a project the lifecycle a tenant has changes the tenancy contract (#191)
+    -- every downstream slice reads, so it is follow-up work; the runbook states
+    -- the release path this schema does support.
     CONSTRAINT axond_cp_project_slug_unique UNIQUE (tenant_id, slug)
         DEFERRABLE INITIALLY DEFERRED
 );

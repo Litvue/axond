@@ -87,6 +87,15 @@ Two properties worth knowing before you plan capacity or retention:
   owners may also exchange names within one revision, and two principals may
   exchange sign-ins or keys, since uniqueness is judged on the state a revision
   declares rather than on the order its rows are written.
+- **A project's name has no release path yet.** A tenant's does, through
+  `lifecycle = "deleted"`; a project has no lifecycle, so once a revision stops
+  declaring a project its `(tenant, name)` stays taken for the life of the
+  deployment and re-using that name in that tenant is refused. Renaming the
+  retained project within the revision that drops it is the workaround: a project
+  that is still declared can be renamed, and uniqueness is judged on the declared
+  state. Giving a project the lifecycle a tenant has is a change to the tenancy
+  contract (#191) that its downstream consumers read, so it is follow-up work
+  rather than a widening smuggled into this slice.
 - **A disabled tenant serves nothing.** Only an active tenant's projects become
   servable namespaces. Disabling is what stops traffic; the rows stay for the
   history that points at them.

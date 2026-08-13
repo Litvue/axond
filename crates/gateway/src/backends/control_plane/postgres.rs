@@ -3430,6 +3430,62 @@ mod tests {
         );
     }
 
+    /// A project's name is reclaimed by renaming the project that holds it, which
+    /// is the release path a project has instead of a tenant's lifecycle.
+    ///
+    /// A tenant releases its name by publishing itself `deleted`; a project has no
+    /// lifecycle to publish, so a dropped project's name would otherwise be taken
+    /// for the life of the deployment. Renaming it while it is still declared —
+    /// uniqueness is judged on the declared state — hands the name back in the
+    /// same revision that stops using it. Giving projects a lifecycle of their own
+    /// is a tenancy-contract change, and follow-up work rather than this slice's.
+    #[tokio::test]
+    async fn a_projects_name_is_reclaimed_by_renaming_the_project_that_holds_it() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let tenant = tenant_id(1);
+        let mut before = state();
+        before
+            .insert(project(&tenant, 3, "edge"))
+            .expect("a tenant with a project");
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "acme", before.clone()))
+            .await
+            .expect("the original project publishes");
+
+        // One revision: the project holding the name is renamed, and a new project
+        // takes the name it gave up.
+        let mut reclaimed = before;
+        reclaimed
+            .supersede(project_body(3, 1, "Edge Retired").version_at(
+                Slug::parse("edge-retired").expect("a slug"),
+                ResourceVersionNumber::FIRST.next(),
+            ))
+            .and_then(|state| state.insert(project(&tenant, 4, "edge")))
+            .expect("renaming one project and naming another is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "reclaim",
+                reclaimed,
+                78,
+            ))
+            .await
+            .expect("a name its holder gave up in the same revision is free");
+
+        assert_eq!(
+            store
+                .column(&format!(
+                    "SELECT project_id FROM axond_cp_project WHERE slug = 'edge' \
+                     AND tenant_id = '{tenant}'"
+                ))
+                .await,
+            vec![project_id(4).to_string()],
+            "the new project holds the name"
+        );
+    }
+
     /// A workload's change is recordable: the vocabulary 0001 wrote as an inline
     /// column check admitted three actor kinds, and this publishes the fourth
     /// through the journal's own writer rather than asserting on the schema.
