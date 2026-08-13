@@ -1038,6 +1038,16 @@ impl Directory {
     /// write only the two deployment-wide surfaces it owns — the model catalogue
     /// and the price book it refreshes from upstream. It cannot touch a tenant's
     /// state, so a compromised refresher is not a compromised tenant.
+    ///
+    /// Neither of them skips step 2, and that ordering is the definition rather
+    /// than an accident: breakglass and system are *deployment-scoped* recovery.
+    /// A request that names a tenant this revision does not declare, or one that
+    /// has been deleted, is refused whoever asks — a tombstone is not a tenant
+    /// with a stricter door. Recovering from "the tenant is gone" means publishing
+    /// a revision that declares it again, at deployment scope, which breakglass
+    /// can always do; letting a tenant-scoped call resurrect it would make the
+    /// lifecycle advisory and put a deleted tenant's rows back in reach of an API
+    /// key rather than of a deliberate, reviewable publish.
     pub fn authorize(
         &self,
         tenancy: &Tenancy,
@@ -2098,6 +2108,55 @@ mod tests {
                 assert!(granted.is_breakglass());
                 assert_eq!(granted.actor(), &Actor::Breakglass);
             }
+        }
+    }
+
+    /// Breakglass is the way back into a *deployment*, not a way into a tenant
+    /// that no longer exists: the tenant gate runs before the caller is resolved,
+    /// so a tombstoned or undeclared tenant refuses every caller, and recovery is
+    /// a deployment-scoped publish that declares the tenant again.
+    #[test]
+    fn breakglass_and_the_gateway_recover_the_deployment_not_a_deleted_tenant() {
+        let tenant = tenant_id(1);
+        let mut state = state_with_directory();
+        let body =
+            super::super::fixtures::tenant_body(1, "Acme").in_lifecycle(TenantLifecycle::Deleted);
+        state
+            .supersede(body.version_at(
+                Slug::parse("acme").expect("a slug"),
+                ResourceVersionNumber::FIRST.next(),
+            ))
+            .expect("a later version of the same tenant");
+        let (tenancy, directory) = directory(&state);
+        let system = Caller::System {
+            component: "catalog-refresh".to_owned(),
+        };
+        for caller in [Caller::Breakglass, system] {
+            for scope in [
+                ResourceScope::Tenant(tenant),
+                ResourceScope::Tenant(tenant_id(97)),
+            ] {
+                let denial = directory
+                    .authorize(
+                        &tenancy,
+                        &caller,
+                        request(Surface::AuditTrail, Action::Read, scope),
+                    )
+                    .expect_err("a tombstone and a stranger are both closed");
+                assert!(matches!(
+                    denial.reason(),
+                    DenialReason::TenantNotAdministrable | DenialReason::UnknownTenant
+                ));
+                assert_eq!(denial.public_reason(), "forbidden");
+            }
+            // And the recovery path is the deployment one, which stays open.
+            directory
+                .authorize(
+                    &tenancy,
+                    &caller,
+                    request(Surface::Model, Action::Read, ResourceScope::Deployment),
+                )
+                .expect("deployment scope is where recovery happens");
         }
     }
 

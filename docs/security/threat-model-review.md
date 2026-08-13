@@ -460,6 +460,11 @@ containment: `a_caller_of_one_tenant_cannot_reach_another`,
 trigger 3's obligations too. Lifecycle and the mode boundary:
 `a_disabled_tenant_is_administrable_and_a_deleted_one_is_not`,
 `breakglass_is_allowed_everything_and_recorded_as_itself`,
+`breakglass_and_the_gateway_recover_the_deployment_not_a_deleted_tenant` — the
+recovery path is deployment-scoped on purpose: an undeclared or deleted tenant
+refuses every caller, breakglass included, and getting one back means publishing
+a revision that declares it again rather than reaching into a tombstone with a
+tenant-scoped call —
 `the_gateways_own_work_reads_anywhere_and_writes_only_its_catalogues`, and
 `a_deployment_with_no_published_directory_grants_nothing_but_breakglass` for the
 fail-closed floor: an empty directory authorizes nobody but the static
