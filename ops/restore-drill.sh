@@ -246,6 +246,14 @@ serve() {
     fi
     sleep 1
   done
+  # A replica that will not boot on a recovered database is the regression this
+  # drill exists to catch, so inside a stage it is recorded and the artifact is
+  # written before the run stops.
+  if [[ -n "$log" ]]; then
+    require "the_${name}_replica_becomes_reachable" reachable unreachable \
+      "a database no replica can boot on is not a recovered database"
+    close
+  fi
   fail "the ${name} replica did not become reachable: $(cat "$logfile")"
 }
 
@@ -536,8 +544,11 @@ serve recovered "$recovered_http"
 recovered_endpoint="$endpoint"
 mark "replica-booted" "a replica booted on the promoted cluster and opened /admin/v1"
 
-recovered_head="$(head_revision)"
-recovered_revisions="$(revision_count)"
+# Sentinels rather than bare reads: a recovered head the replica cannot answer
+# for has to become a failed check in this stage's artifact, not an abort before
+# the artifact exists.
+recovered_head="$(head_revision || echo unreadable)"
+recovered_revisions="$(revision_count || echo unreadable)"
 observe recovered_head_revision "$recovered_head"
 observe revisions_after_recovery "$recovered_revisions" count
 require "the_recovered_head_is_the_pre_target_revision" "$pre_target_head" "$recovered_head" \
