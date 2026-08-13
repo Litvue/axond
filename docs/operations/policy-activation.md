@@ -28,7 +28,7 @@ during one.
 | Check | Why | How |
 | --- | --- | --- |
 | `[budget] backend` is `redis` or `postgres` | A published spend cap is a fleet-wide statement; `in-memory` and `none` enforce a separate copy per replica, or nothing | `axond preflight` / read the bootstrap file |
-| `[rate_limit] backend` is `redis` | A published concurrency ceiling needs leases every replica shares | as above |
+| `[rate_limit] backend` is `redis` | Every document states a concurrency ceiling — `axond.policy.v1` has no spend-only form — and that needs leases every replica shares | as above |
 | `[budget] namespace_scope` matches the document | Whether ledger keys carry a scope-wide cap is a **durable layout** fact, not a value | see [Migrating the layout](#migrating-the-layout) |
 | Every projected namespace is governed | A namespace no document governs has **no enforceable cap**, and its requests are denied | publish a tenant-level document as the floor |
 | The budget backend's DSN is **not** the control plane's | The revision journal is not request-path state | compare `[budget] dsn_env` with `[control_plane] dsn_env` |
@@ -73,26 +73,33 @@ a request is checked against and the generation stamped on its hold come from a
 single read of that view, so a publication landing mid-admission can never grant
 one document's limits under another's name.
 
-### An ungoverned namespace denies, whatever `on_unavailable` says
+### A revision that would leave a namespace ungoverned is refused
 
-In a stateful deployment, a projected namespace with no document has **no
-enforceable cap**, and every request for it is denied — a `503`, with the
-namespace named in the log — *regardless* of `on_unavailable`. This is
-deliberate and is the one place the fail-open stance does not apply:
+In a stateful deployment, a namespace with no document has **no enforceable
+cap**, and a request for it would be denied — a `503` — *regardless* of
+`on_unavailable`. That stance is deliberate:
 
 - `on_unavailable = "allow"` answers the question "the store that holds the
-  limits is unreachable — admit anyway?". Here the store is fine; what is
+  limits is unreachable — admit anyway?". There the store is fine; what is
   missing is the limit itself.
 - An unenforced cap and an infinite one are indistinguishable to a caller, and
   only one of them is what an operator published. Admitting would spend real
   money against a cap nobody set.
 
-So during a rollout gap — the fleet is stateful, but the revision that publishes
-the documents has not landed — a fail-open deployment still 503s the projected
-namespaces. Publish a tenant-level document as the floor **before** projecting
-namespaces to it; the preflight table's "every projected namespace is governed"
-row is that check. Namespaces the bootstrap file declares are unaffected: they
-keep being governed by the file that declared them.
+But a replica does not *get* there by activating a revision. A candidate that
+would serve a namespace no document governs is refused before publication —
+reason `ungoverned`, the namespace named — so projecting a namespace before its
+tenant's floor exists costs you the revision, not the namespace's traffic; the
+last known good policy keeps serving. Publish a tenant-level document as the
+floor **before** projecting namespaces to it; the preflight table's "every
+projected namespace is governed" row is that check.
+
+A stateful bootstrap cannot declare a namespace at all (`[[namespace]]` is a
+boot error under `mode = "stateful"`), so there is no file-governed namespace to
+exempt: in stateful mode every namespace is governed by a published document, or
+the revision that introduced it is refused. That is also why `[budget]
+namespace_scope = true` — the layout whose *value* the file may not state —
+cannot strand a namespace against half-described caps.
 
 ## Classification: live, drain, migration, refused
 
@@ -101,7 +108,7 @@ keep being governed by the file that declared them.
 | `live` | Looser caps, longer TTLs, a higher token floor, a republication that changes nothing | Activates. New admissions use the new values |
 | `drain` | Tighter caps, shorter TTLs | Activates. New admissions use the new values; **what is already admitted keeps its own terms** until it finishes |
 | `migration-required` | Turning a scope-wide cap on or off | Refused. See [Migrating the layout](#migrating-the-layout) |
-| `refused` | A regressed epoch, changed content under an unchanged epoch, another scope's document, a lowered token floor, a document these backends cannot enforce, or withdrawing a document from a namespace still served | Refused. Nothing changes |
+| `refused` | A regressed epoch, changed content under an unchanged epoch, another scope's document, a lowered token floor (**including across a handover**), a document these backends cannot enforce, withdrawing a document from a namespace still served, or serving a namespace no document governs | Refused. Nothing changes |
 
 A publication is as disruptive as its worst field.
 
@@ -112,9 +119,17 @@ tenant's applies again — is a **handover**, not a withdrawal: the namespace ne
 stops being governed, so it is not refused. It is classified against the document
 it displaces rather than against the (absent) history of the scope that is new,
 so a project capping itself below its tenant is reported as a `drain` and its
-tenant's outstanding holds keep their terms. Only the epochs are not compared
-across the handover: an epoch orders one scope's own publications, and a
-project's first is not behind its tenant's tenth.
+tenant's outstanding holds keep their terms. Both directions are classified this
+way, and both are reported: dropping a project's document for a tighter tenant
+one drains too, so `draining` is a complete picture before a stop-the-fleet
+migration.
+
+Only the epochs are not compared across a handover: an epoch orders one scope's
+own publications, and a project's first is not behind its tenant's tenth. The
+*values* are compared in full, so the refusals still hold — in particular a
+handover cannot lower a namespace's `minimum_token_epoch`, which would restore
+tokens an operator revoked by changing nothing but which document states the
+floor.
 
 ### Why a drain is safe
 
@@ -194,6 +209,7 @@ would make already-revoked tokens work again; issue new credentials instead.
 | Revisions rejected with `migration` | The document and the ledger layout disagree | [Migrate the layout](#migrating-the-layout) |
 | Revisions rejected with `refused` | An epoch regression, a fork, or an unsafe field change | Read the refusal; publish forward under a higher epoch |
 | Revisions rejected with `withdrawn` | A document was removed from a namespace still being served | Delete the namespace, or publish a document for it |
-| Requests denied for one namespace only | No document governs it | Publish a tenant-level document |
+| Revisions rejected with `ungoverned` | The revision projects a namespace no document governs | Publish a tenant-level document as the floor, then project the namespace |
+| Requests denied for one namespace only | No document governs it — only reachable from a bootstrap gap, not from a publication | Publish a tenant-level document |
 | A tightening never finishes draining | Long-lived requests still hold the old generation | Wait, or drain the replica |
 | Control plane unreachable | Last-known-good policy keeps being enforced | Nothing; convergence resumes on its own |

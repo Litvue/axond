@@ -365,10 +365,12 @@ impl StatusReason {
             "snapshot" => Self::SnapshotRejected,
             "pricing" => Self::PricingRejected,
             "clock" => Self::ClockUnsynchronised,
-            // The four ways a published policy is refused before it is
-            // enforced. One code, because the operator's next move is the same
-            // in every case: read the refusal, which names it, in the log.
-            "unsupported" | "migration" | "refused" | "withdrawn" => Self::PolicyRejected,
+            // The ways a published policy is refused before it is enforced. One
+            // code, because the operator's next move is the same in every case:
+            // read the refusal, which names it, in the log.
+            "unsupported" | "migration" | "refused" | "withdrawn" | "ungoverned" => {
+                Self::PolicyRejected
+            }
             "not_found" => Self::NotConfigured,
             "denied" => Self::PermissionDenied,
             _ => Self::Unknown,

@@ -1231,13 +1231,20 @@ impl PolicyTransition {
         Self::of(Self::fields(from, to))
     }
 
-    /// See [`PolicyBody::displaced_by`]: the same field comparison, keeping only
-    /// what a namespace's outstanding holds care about.
+    /// See [`PolicyBody::displaced_by`]: the same field comparison, dropping
+    /// only the reasons a handover cannot be judged by.
+    ///
+    /// [`TransitionClass::Live`] reasons go, because a value that only loosens
+    /// strands nothing and the two scopes share no history to call it a
+    /// republication of. Everything that constrains the move stays: a drain is
+    /// still a drain when a different scope's document imposes it, and a
+    /// refusing value — a token floor that falls — is still restoring tokens an
+    /// operator revoked, whichever document lowers it.
     fn displacing(from: &PolicyBody, to: &PolicyBody) -> Self {
         Self::of(
             Self::fields(from, to)
                 .into_iter()
-                .filter(|reason| reason.class() == TransitionClass::Drain)
+                .filter(|reason| reason.class() != TransitionClass::Live)
                 .collect(),
         )
     }

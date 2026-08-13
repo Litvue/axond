@@ -62,7 +62,11 @@ requires, and no publication reconnects anything.
 A namespace no document governs has **no enforceable cap**, and a store that
 cannot answer "what is the cap here" denies rather than admitting: an unenforced
 cap and an infinite one are indistinguishable to a caller, and only one of them
-is something an operator published.
+is something an operator published. A publication is not allowed to create that
+state — a candidate serving a namespace no document governs is refused before it
+is installed — so the denial belongs to a bootstrap gap, not to a revision. In
+stateful mode the bootstrap file cannot declare a namespace at all, so "governed
+by a published document" is the only way a namespace is served.
 
 ### A hold carries the generation that granted it
 
@@ -100,8 +104,11 @@ Which document governs a namespace may itself change — a project publishing ov
 its tenant's, or dropping its own so the tenant's applies again. That is a
 handover: the namespace stays governed, so it is not a withdrawal, and it is
 classified against the values it displaces so a tightening handover drains rather
-than reporting as a scope's first binding. Epochs are not compared across it,
-because an epoch orders one scope's own publications.
+than reporting as a scope's first binding — in both directions, so `draining` is
+complete. Epochs are not compared across it, because an epoch orders one scope's
+own publications; the values are, in full, so a handover cannot lower a token
+floor an operator raised to revoke credentials. Changing which document states a
+value is not a way to make a refused change performable.
 
 ### Rolling back is publishing the old values forward
 
@@ -115,7 +122,13 @@ forked writer, and it fails closed in both directions.
 ### Only backends whose semantics meet the contract may enforce a document
 
 A published spend cap requires Redis or Postgres *selected as the budget
-backend*; a published concurrency ceiling requires Redis leases. The in-memory
+backend*; a published concurrency ceiling requires Redis leases. Both, always:
+`axond.policy.v1` makes `max_in_flight_per_subject` and `lease_ttl_seconds`
+required (ADR 0036), so there is no spend-only document, and a deployment
+without shared leases cannot publish policy at all. Supporting one would mean an
+optional concurrency block in the contract — a change to ADR 0036, deliberately
+not made here: a policy that silently enforces half of what it states is the
+ambiguity the typed contract exists to remove. The in-memory
 and no-op backends cannot enforce a fleet-wide statement and are refused with the
 bootstrap change named. Whether the budget store's keys carry a scope-wide cap is
 a durable layout fact: a document that turns one on or off is refused as a
@@ -163,10 +176,12 @@ planned before publication, an unsupported backend, a layout mismatch, or a
 forked epoch surfaces as one refusal naming the fix, rather than as divergent
 enforcement discovered later from usage records.
 
-**Publishing an unenforceable cap is impossible; running an ungoverned namespace
-denies.** These are two sides of failing closed, and the second is the sharper
-edge: a projected namespace whose tenant has no document is refused spend rather
-than granted an infinite budget.
+**Publishing an unenforceable cap is impossible, and publishing an ungoverned
+namespace is too.** A namespace with no document is refused spend rather than
+granted an infinite budget — and because the revision that would introduce one
+is refused first, that denial is not something an operator can publish their way
+into. The cost is a stricter ordering: a tenant-level floor has to exist before
+its namespaces are projected.
 
 **Security review outcome.** Trigger 1 fires: revocation is now enforced from
 published state, since `minimum_token_epoch` raises the token epochs the verifier
@@ -197,4 +212,14 @@ call site is added, and no credential or secret material is read.
   makes a control-plane incident a spend-enforcement incident.
 - **Letting an ungoverned namespace fall back to the bootstrap file.** Friendlier
   during a rollout, and it silently serves a deployment's own limits to a tenant
-  an operator believes is capped by the control plane.
+  an operator believes is capped by the control plane. In stateful mode the file
+  has no namespaces to fall back to in any case.
+- **Publishing the revision and letting the ungoverned namespace 503.** It keeps
+  the revision and the enforcement decision separate, and it makes an ordering
+  mistake in the control plane cost a tenant's traffic instead of costing the
+  operator one refusal they can read and fix.
+- **Making the concurrency block optional so a spend-only deployment can publish.**
+  It fits the deployment that only wants budgets, and it makes a document's
+  meaning depend on which backends the reader booted with — the ambiguity ADR
+  0036 removed. If spend-only is wanted, it is a contract change there, not a
+  runtime relaxation here.

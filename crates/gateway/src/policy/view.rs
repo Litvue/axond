@@ -55,8 +55,23 @@ pub struct ActivePolicy {
 }
 
 impl ActivePolicy {
+    /// Whether this replica has values to enforce for the namespace at all.
+    ///
+    /// The two `None`s move together — a policy is a whole document or nothing
+    /// — so one of them answers it.
+    pub(super) const fn unenforceable(&self) -> bool {
+        self.budget.is_none()
+    }
+
     /// The policy the bootstrap file states, which is the whole policy of a
     /// stateless deployment.
+    ///
+    /// Stateless only. A stateful bootstrap cannot declare a namespace at all
+    /// (`[[namespace]]` is rejected at boot, ADR 0027), so there is no such
+    /// thing as a file-governed namespace in a deployment whose caps are
+    /// published — which is what keeps a scope-wide layout (`[budget]
+    /// namespace_scope`, whose *value* the file may not state) from leaving a
+    /// namespace enforced against caps the file only half-describes.
     fn bootstrap(config: &Config) -> Self {
         Self {
             budget: Some(BudgetCaps {
@@ -115,12 +130,18 @@ pub struct PolicyView {
 impl PolicyView {
     /// Derive the view a configuration describes.
     ///
-    /// Stateless: every namespace is governed by the file. Stateful: a *projected*
-    /// namespace is governed by the document a revision published for it
+    /// Stateless: every namespace is governed by the file. Stateful: a namespace
+    /// is governed by the document a revision published for it
     /// ([`Namespace::policy`](crate::config::Namespace::policy)) and by nothing
-    /// otherwise, while a namespace the bootstrap file itself declares keeps being
-    /// governed by the file that declared it — the control plane never published a
-    /// policy for a namespace it does not know about.
+    /// otherwise — the file governs none of them, because a stateful bootstrap
+    /// cannot declare one.
+    ///
+    /// "By nothing" denies rather than admits, but a replica does not reach that
+    /// state by activating a revision:
+    /// [`plan`](super::activation::plan) refuses a candidate that would serve an
+    /// ungoverned namespace, so the denial is what a *bootstrap* view can
+    /// describe before any document exists, not something a publication
+    /// introduces.
     pub fn of(config: &Config) -> Self {
         let stateful = config.mode == Mode::Stateful;
         let bootstrap = ActivePolicy::bootstrap(config);
@@ -140,7 +161,7 @@ impl PolicyView {
                         .push(namespace.id.clone());
                     ActivePolicy::published(&policy.body, policy.generation)
                 }
-                None if stateful && namespace.project.is_some() => ActivePolicy::default(),
+                None if stateful => ActivePolicy::default(),
                 None => bootstrap,
             };
             by_namespace.insert(namespace.id.clone(), policy);
@@ -193,7 +214,19 @@ impl PolicyView {
     pub(super) fn ungoverned(&self, namespace: &str) -> bool {
         self.by_namespace
             .get(namespace)
-            .is_some_and(|policy| policy.generation.is_none())
+            .is_some_and(ActivePolicy::unenforceable)
+    }
+
+    /// The namespaces this view serves with nothing to enforce for them.
+    ///
+    /// A stateful replica denies every request to such a namespace, so a
+    /// candidate naming one is refused before it is published rather than
+    /// activated into a namespace-wide outage.
+    pub(super) fn unenforceable(&self) -> impl Iterator<Item = &str> {
+        self.by_namespace
+            .iter()
+            .filter(|(_, policy)| policy.unenforceable())
+            .map(|(namespace, _)| namespace.as_str())
     }
 
     /// The document governing `namespace`, whichever scope published it.

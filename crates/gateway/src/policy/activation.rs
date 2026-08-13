@@ -107,6 +107,17 @@ pub enum ActivationRefusal {
         scope: PolicyScope,
         namespace: String,
     },
+    /// A namespace the candidate serves that no document in it governs.
+    ///
+    /// Activating it would serve the namespace with nothing to enforce, which
+    /// denies every request to it. That is a namespace-wide outage a
+    /// publication would introduce, so the publication is what gives way.
+    #[error(
+        "namespace `{namespace}` is served by this candidate with no policy document governing \
+         it, so every request to it would be denied. Publish a tenant-level document as the \
+         floor before projecting the namespace, or remove it"
+    )]
+    Ungoverned { namespace: String },
 }
 
 impl ActivationRefusal {
@@ -117,17 +128,20 @@ impl ActivationRefusal {
             Self::Migration { .. } => "migration",
             Self::Refused { .. } => "refused",
             Self::Withdrawn { .. } => "withdrawn",
+            Self::Ungoverned { .. } => "ungoverned",
         }
     }
 
-    /// The scope whose document was refused.
+    /// The scope whose document was refused, when the refusal is about one.
+    /// [`Ungoverned`](Self::Ungoverned) is about a namespace no scope claimed.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const fn scope(&self) -> PolicyScope {
+    pub const fn scope(&self) -> Option<PolicyScope> {
         match self {
             Self::Unsupported { scope, .. }
             | Self::Migration { scope, .. }
             | Self::Refused { scope, .. }
-            | Self::Withdrawn { scope, .. } => *scope,
+            | Self::Withdrawn { scope, .. } => Some(*scope),
+            Self::Ungoverned { .. } => None,
         }
     }
 }
@@ -222,20 +236,20 @@ pub(super) fn plan(
         let Some(current) = active.published().get(scope) else {
             // Nothing was enforced for *this scope*, but its namespaces may have
             // been inheriting another one's document — a project publishing over
-            // its tenant's. Report the drain that handover really is, judged
-            // against the values that were binding. Only the drain: epochs are
-            // per-scope, so a different scope's epoch is not this one's history
-            // and cannot make the document stale, forked, or a layout change.
-            let drains = published
-                .namespaces
-                .iter()
-                .filter_map(|namespace| active.governing(namespace))
-                .map(|inherited| inherited.displaced_by(&published.body))
-                .find(|transition| transition.class() == TransitionClass::Drain);
-            match drains {
-                Some(transition) => activation
-                    .draining
-                    .push((*scope, transition.reasons().to_vec())),
+            // its tenant's. Classify that handover against the values that were
+            // actually binding, by value only: epochs are per-scope, so a
+            // different scope's epoch is not this one's history and cannot make
+            // the document stale or forked.
+            let handover = handover(
+                *scope,
+                published
+                    .namespaces
+                    .iter()
+                    .filter_map(|namespace| active.governing(namespace))
+                    .map(|inherited| inherited.displaced_by(&published.body)),
+            )?;
+            match handover {
+                Some(reasons) => activation.draining.push((*scope, reasons)),
                 None => activation.live.push(*scope),
             }
             continue;
@@ -297,9 +311,82 @@ pub(super) fn plan(
                 namespace: served.clone(),
             });
         }
-        activation.withdrawn.push(*scope);
+        // The handover the other direction, classified the same way: whatever
+        // takes this scope's namespaces over is a change to what they enforce,
+        // even though neither document moved. Reported as a drain when it
+        // tightens, so an operator watching `draining()` sees both directions.
+        let handover = handover(
+            *scope,
+            current
+                .namespaces
+                .iter()
+                .filter_map(|namespace| candidate.governing(namespace))
+                .map(|inheriting| current.body.displaced_by(inheriting)),
+        )?;
+        match handover {
+            Some(reasons) => activation.draining.push((*scope, reasons)),
+            None => activation.withdrawn.push(*scope),
+        }
+    }
+    // Last, because a namespace left ungoverned by a document being *dropped* is
+    // the withdrawal above, which names the scope that dropped it. What is left
+    // here is a namespace that arrived without one — projected before its
+    // tenant's floor was published. Activating it would serve the namespace with
+    // nothing to enforce, denying every request to it, and no later publication
+    // undoes the requests denied in between; refusing keeps the last known good
+    // policy, and the namespaces it governs, serving.
+    if let Some(namespace) = candidate.unenforceable().next() {
+        return Err(ActivationRefusal::Ungoverned {
+            namespace: namespace.to_owned(),
+        });
     }
     Ok(activation)
+}
+
+/// Fold every namespace a scope hands over — in either direction — into one
+/// outcome: refused if the document taking over lowers something this model
+/// never lowers, drained if it strands a hold, live otherwise.
+///
+/// Handovers are judged by value only ([`PolicyBody::displaced_by`]), because
+/// the two scopes have no shared epoch history — but "by value only" is not "by
+/// the loosening values only": a token floor that falls restores tokens an
+/// operator revoked whether the document lowering it is the namespace's own or
+/// the one it inherits.
+fn handover(
+    scope: PolicyScope,
+    transitions: impl Iterator<Item = PolicyTransition>,
+) -> Result<Option<Vec<TransitionReason>>, ActivationRefusal> {
+    let mut drain = None;
+    for transition in transitions {
+        match transition.class() {
+            TransitionClass::Live => {}
+            TransitionClass::Drain => drain = Some(transition.reasons().to_vec()),
+            TransitionClass::MigrationRequired => {
+                return Err(ActivationRefusal::Migration {
+                    scope,
+                    detail: format!(
+                        "{} would take the namespace over from another scope's document and \
+                         change the shape of what is stored with it. Migrate the ledgers and \
+                         restart the fleet on a bootstrap that declares the new layout first",
+                        reasons(&transition)
+                    ),
+                });
+            }
+            TransitionClass::Refused => {
+                return Err(ActivationRefusal::Refused {
+                    scope,
+                    detail: format!(
+                        "{} against the document the namespace is governed by today. Changing \
+                         which scope governs a namespace does not make a change this model \
+                         refuses performable: publish the value the current document enforces, \
+                         or higher",
+                        reasons(&transition)
+                    ),
+                });
+            }
+        }
+    }
+    Ok(drain)
 }
 
 /// Whether these backends can enforce a document for `scope` at all, and whether
@@ -324,9 +411,11 @@ fn supportable(
         return Err(ActivationRefusal::Unsupported {
             scope,
             detail: format!(
-                "a published concurrency ceiling needs leases every replica shares, and \
-                 `[rate_limit] backend = \"{}\"` has none. Select `redis` in the bootstrap file \
-                 and restart",
+                "every `axond.policy.v1` document states a concurrency ceiling \
+                 (`max_in_flight_per_subject` and `lease_ttl_seconds` are required fields, ADR \
+                 0036), so there is no spend-only policy for a deployment without shared leases \
+                 to enforce it with, and `[rate_limit] backend = \"{}\"` has none. Select \
+                 `redis` in the bootstrap file and restart",
                 support.rate_limit.as_str()
             ),
         });
@@ -482,7 +571,7 @@ mod tests {
         assert_eq!(refusal.reason(), "refused");
         assert_eq!(
             refusal.scope(),
-            scope(),
+            Some(scope()),
             "the refusal names the document it is about"
         );
         assert!(
@@ -632,16 +721,143 @@ mod tests {
         let activation = plan(&tenants, &handover(&tighter), shared())
             .expect("a project may cap itself below its tenant");
         assert_eq!(
-            activation.draining().len(),
-            1,
+            activation.draining(),
+            [
+                (project, vec![TransitionReason::BudgetLowered]),
+                (scope(), vec![TransitionReason::BudgetLowered]),
+            ],
             "cutting the cap a namespace was enforcing is a drain, whichever \
-             document states it"
+             document states it — reported for the scope taking over and the \
+             one handing it off"
         );
 
         let activation = plan(&tenants, &handover(&looser), shared())
             .expect("raising the cap binds immediately");
         assert!(activation.draining().is_empty());
         assert_eq!(activation.live(), [project]);
+    }
+
+    /// A project of a tenant that has one, for handover tests.
+    fn project() -> PolicyScope {
+        PolicyScope::Project {
+            tenant: tenant_id(1),
+            project: crate::desired_state::fixtures::project_id(1),
+        }
+    }
+
+    /// The refusal a namespace-wide outage never gets to become: a namespace is
+    /// projected before any document governs it, so every request to it would be
+    /// denied. The candidate is refused, and what was already published stays.
+    #[test]
+    fn a_candidate_serving_an_ungoverned_namespace_is_refused_before_it_is_published() {
+        let document = body(scope(), 1, 1_000);
+        let mut candidate = governed(
+            "acme/core",
+            NamespacePolicy {
+                body: document,
+                generation: generation(&document, 1),
+            },
+        );
+        candidate
+            .namespace
+            .push(crate::policy::view::tests::projected("acme/new", None));
+
+        let refusal = plan(&empty(), &PolicyView::of(&candidate), shared())
+            .expect_err("a namespace with no document would deny every request to it");
+        assert_eq!(refusal.reason(), "ungoverned");
+        assert_eq!(refusal.scope(), None, "no document, no scope to name");
+        assert!(refusal.to_string().contains("acme/new"), "{refusal}");
+
+        plan(&empty(), &view(&document, 1), shared())
+            .expect("the same candidate without the ungoverned namespace activates");
+    }
+
+    /// The floor an operator raised to revoke tokens is not lowered by changing
+    /// *which* document states it. Both directions of a handover are compared by
+    /// value, and a falling floor is refused in either.
+    #[test]
+    fn a_handover_cannot_lower_the_token_floor() {
+        let floor = |scope, epoch, token_epoch| {
+            detailed(scope, epoch, 1_000, None, 300, 8, 60, token_epoch)
+        };
+        let revoked = floor(scope(), 2, 500);
+        let tenants = view(&revoked, 1);
+        let projects = |body: &crate::desired_state::policy::PolicyBody| {
+            PolicyView::of(&governed(
+                "acme/core",
+                NamespacePolicy {
+                    body: *body,
+                    generation: generation(body, 2),
+                },
+            ))
+        };
+
+        let lower = projects(&floor(project(), 1, 100));
+        let refusal = plan(&tenants, &lower, shared())
+            .expect_err("a project cannot un-revoke its tenant's tokens by publishing over it");
+        assert_eq!(refusal.reason(), "refused");
+        assert!(
+            refusal.to_string().contains("TokenFloorLowered"),
+            "{refusal}"
+        );
+
+        let refusal = plan(&projects(&floor(project(), 1, 900)), &tenants, shared())
+            .expect_err("dropping a project document cannot lower the floor either");
+        assert_eq!(refusal.reason(), "refused");
+        assert!(
+            refusal.to_string().contains("TokenFloorLowered"),
+            "{refusal}"
+        );
+
+        plan(&tenants, &projects(&floor(project(), 1, 500)), shared())
+            .expect("a handover that keeps the floor is a handover");
+    }
+
+    /// Handing a namespace back to a tighter document strands nothing — holds
+    /// keep their generation's terms — but an operator draining before a
+    /// migration has to see it, so it is reported as the drain it is.
+    #[test]
+    fn dropping_a_project_document_for_a_tighter_tenant_one_drains() {
+        let tenants = body(scope(), 1, 1_000);
+        let mut both = governed(
+            "acme/core",
+            NamespacePolicy {
+                body: body(project(), 1, 5_000),
+                generation: generation(&body(project(), 1, 5_000), 2),
+            },
+        );
+        both.namespace.push(crate::policy::view::tests::projected(
+            "acme/edge",
+            Some(NamespacePolicy {
+                body: tenants,
+                generation: generation(&tenants, 2),
+            }),
+        ));
+        let mut handed_back = stateful_config();
+        for namespace in ["acme/core", "acme/edge"] {
+            handed_back
+                .namespace
+                .push(crate::policy::view::tests::projected(
+                    namespace,
+                    Some(NamespacePolicy {
+                        body: tenants,
+                        generation: generation(&tenants, 3),
+                    }),
+                ));
+        }
+
+        let activation = plan(
+            &PolicyView::of(&both),
+            &PolicyView::of(&handed_back),
+            shared(),
+        )
+        .expect("the namespace stays governed, by its tenant's document");
+        assert_eq!(
+            activation.draining(),
+            [(project(), vec![TransitionReason::BudgetLowered])],
+            "a tighter document taking the namespace over is a drain, not a silent withdrawal"
+        );
+        assert!(activation.withdrawn().is_empty());
     }
 
     /// A revision that moved an unrelated resource restates every document under
