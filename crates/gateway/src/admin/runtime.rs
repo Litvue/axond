@@ -141,7 +141,6 @@ impl Surface {
     /// surface's own store paces: deferring the router is what lets one boot
     /// order satisfy both, with a single connection pool behind administration,
     /// the diagnostic, and an availability read.
-    #[must_use]
     pub fn router(self, availability: Option<Arc<dyn AvailabilityReader>>) -> Router {
         let Some(api) = self.api else {
             return router::refusing_router();
