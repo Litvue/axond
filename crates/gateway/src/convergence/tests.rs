@@ -12,6 +12,7 @@
 //! Tokio's paused clock. No test here is timing-sensitive.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::compile::testing::{AliasProjection, bootstrap, env};
@@ -25,6 +26,7 @@ use crate::desired_state::{DesiredState, ExpectedRevision, RevisionId, fixtures}
 use crate::state::AppState;
 use crate::telemetry;
 use crate::usage::{UsageFanout, UsageSink};
+use async_trait::async_trait;
 
 /// One replica: a control plane, a compiler, the `ArcSwap` it publishes into,
 /// and a clock the test owns.
@@ -37,6 +39,34 @@ struct Replica {
     /// what a test reads to see which versions this process is holding, without
     /// being able to read the material itself.
     ledger: Arc<MaterialLedger>,
+}
+
+/// A real revision compiler with a test-only refusal switch. This lets the
+/// refresh test fail after the first publication, which proves the candidate
+/// path still protects the active snapshot rather than only proving boot-time
+/// refusal.
+struct ToggleCompiler {
+    delegate: RevisionCompiler<AliasProjection>,
+    refuse: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl CandidateCompiler for ToggleCompiler {
+    async fn compile(
+        &self,
+        revision: &crate::desired_state::LoadedRevision,
+        generation: u64,
+    ) -> Result<crate::state::ConfigSnapshot, CompileError> {
+        if self.refuse.load(Ordering::Acquire) {
+            return Err(CompileError::Projection {
+                revision: revision.id(),
+                source: ProjectionError::Incomplete {
+                    detail: "the test compiler refused this refresh".to_owned(),
+                },
+            });
+        }
+        self.delegate.compile(revision, generation).await
+    }
 }
 
 impl Replica {
@@ -148,14 +178,15 @@ impl Replica {
         .expect("the bootstrap config is servable");
         let clock = ManualClock::new();
         let ledger = Arc::clone(secrets.ledger());
+        let compiler = Arc::new(RevisionCompiler::with_secrets(
+            bootstrap(),
+            env(),
+            AliasProjection { provider },
+            Arc::clone(&secrets),
+        ));
         let reconciler = Arc::new(Reconciler::new(
             Arc::clone(store) as Arc<dyn ControlPlaneStore>,
-            Arc::new(RevisionCompiler::with_secrets(
-                bootstrap(),
-                env(),
-                AliasProjection { provider },
-                Arc::clone(&secrets),
-            )),
+            compiler,
             Arc::new(state.clone()),
             settings(),
             cache,
@@ -168,6 +199,49 @@ impl Replica {
             reconciler,
             ledger,
         }
+    }
+
+    /// A replica whose first compile succeeds and whose later refreshes can be
+    /// refused without replacing its already-published snapshot.
+    fn toggleable(store: &Arc<InMemoryControlPlane>) -> (Self, Arc<AtomicBool>) {
+        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+        let state = AppState::new(
+            bootstrap(),
+            &env(),
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("the bootstrap config is servable");
+        let clock = ManualClock::new();
+        let secrets = super::secrets::testing::permissive();
+        let refuse = Arc::new(AtomicBool::new(false));
+        let compiler = Arc::new(ToggleCompiler {
+            delegate: RevisionCompiler::with_secrets(
+                bootstrap(),
+                env(),
+                AliasProjection { provider: "openai" },
+                secrets.clone(),
+            ),
+            refuse: Arc::clone(&refuse),
+        });
+        let reconciler = Arc::new(Reconciler::new(
+            Arc::clone(store) as Arc<dyn ControlPlaneStore>,
+            compiler,
+            Arc::new(state.clone()),
+            settings(),
+            None,
+            Arc::new(clock.clone()),
+        ));
+        (
+            Self {
+                store: Arc::clone(store),
+                state,
+                clock,
+                reconciler,
+                ledger: Arc::clone(secrets.ledger()),
+            },
+            refuse,
+        )
     }
 
     fn report(&self) -> RevisionReport {
@@ -285,6 +359,114 @@ async fn a_converged_replica_does_not_republish_what_it_is_already_serving() {
     assert_eq!(replica.generation(), 1, "no spurious republication");
 }
 
+/// A lifecycle change in the secret store can leave the desired revision id
+/// untouched. An explicit refresh must therefore bypass only the active-id
+/// skip, then use the ordinary compile/admit/publish path.
+#[tokio::test]
+async fn a_force_refresh_recompiles_and_publishes_the_same_revision() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let replica = Replica::serving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    let outcome = replica
+        .reconciler
+        .force_refresh_once(telemetry::CONVERGENCE_NOTIFIED)
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Published { revision, generation, .. }
+                if revision == published && generation == 2
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(replica.report().active, Some(published));
+    assert_eq!(
+        replica.generation(),
+        2,
+        "the refreshed snapshot was published"
+    );
+}
+
+/// Refreshing is still candidate compilation, not an imperative replacement:
+/// a failed refresh leaves the prior same-revision snapshot serving.
+#[tokio::test]
+async fn a_failed_force_refresh_does_not_publish() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let (replica, refuse) = Replica::toggleable(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let before = replica.served_aliases();
+    refuse.store(true, Ordering::Release);
+
+    let outcome = replica
+        .reconciler
+        .force_refresh_once(telemetry::CONVERGENCE_NOTIFIED)
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Rejected { revision, reason }
+                if revision == Some(published) && reason == "projection"
+        ),
+        "{outcome:?}"
+    );
+    let report = replica.report();
+    assert_eq!(report.active, Some(published));
+    assert_eq!(report.generation, 1);
+    assert_eq!(replica.generation(), 1);
+    assert_eq!(replica.served_aliases(), before);
+}
+
+/// A refused refresh has refreshed nothing, and the revision id it would key
+/// off is unchanged, so the request outlives the attempt: the next ordinary
+/// convergence recompiles instead of skipping as already converged.
+#[tokio::test]
+async fn a_refused_force_refresh_is_retried_by_the_next_convergence() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let (replica, refuse) = Replica::toggleable(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    refuse.store(true, Ordering::Release);
+    let refused = replica
+        .reconciler
+        .force_refresh_once(telemetry::CONVERGENCE_NOTIFIED)
+        .await;
+    assert!(matches!(refused, Outcome::Rejected { .. }), "{refused:?}");
+
+    refuse.store(false, Ordering::Release);
+    let outcome = replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Published { revision, generation, .. }
+                if revision == published && generation == 2
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        replica.generation(),
+        2,
+        "the refresh eventually took effect"
+    );
+}
+
 /// A second revision converges on top of the first, and the replica ends up
 /// serving the newer alias set rather than a union of both.
 #[tokio::test]
@@ -380,6 +562,61 @@ async fn a_notification_converges_before_the_next_poll() {
         replica.report().active,
         Some(published),
         "a notification converges without the clock advancing"
+    );
+
+    let _ = stop.send(());
+    task.await.expect("the loop stops");
+}
+
+/// Force-refresh signals carry no payload and coalesce into one wake-up. The
+/// loop still takes the ordinary compile-and-publish path, even though the
+/// desired revision id has not changed.
+#[tokio::test(start_paused = true)]
+async fn force_refresh_signals_coalesce_and_refresh_the_run_loop() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let replica = Replica::serving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    let signal = Arc::new(ChangeSignal::new());
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let loop_reconciler = Arc::clone(&replica.reconciler);
+    let listener = Arc::clone(&signal);
+    let task = tokio::spawn(async move {
+        loop_reconciler
+            .run(listener, async {
+                let _ = stopped.await;
+            })
+            .await;
+    });
+
+    // No yield occurs between these calls, so the loop sees one coalesced
+    // notification carrying one refresh request.
+    signal.force_refresh();
+    signal.force_refresh();
+    for _ in 0..32 {
+        if replica.generation() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(replica.report().active, Some(published));
+    assert_eq!(
+        replica.generation(),
+        2,
+        "the run loop performed one refresh"
+    );
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        replica.generation(),
+        2,
+        "coalesced signals do not cause a second publication"
     );
 
     let _ = stop.send(());

@@ -9,10 +9,12 @@
 //! Postgres `LISTEN`/`NOTIFY` is fire-and-forget: a notification delivered while
 //! a replica is reconnecting is simply gone, and a replica that treated
 //! notifications as its trigger would sit on a stale snapshot indefinitely with
-//! nothing to report. So the poll is the *correctness* mechanism and a
-//! notification only shortens the wait ([`ChangeSignal`]). Turning notifications
-//! off costs latency, never convergence — and that is what the missed-notification
-//! test asserts.
+//! nothing to report. So the poll is the *correctness* mechanism and an ordinary
+//! notification only shortens the wait ([`ChangeSignal`]). Turning ordinary
+//! notifications off costs latency, never convergence — and that is what the
+//! missed-notification test asserts. A force-refresh notification is deliberately
+//! different: it asks the same candidate path to run even when the durable
+//! revision id is unchanged.
 //!
 //! # Why a failed candidate cannot half-apply
 //!
@@ -38,7 +40,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use super::backoff::Backoff;
 use super::compile::{CandidateCompiler, CompileError};
@@ -100,15 +102,21 @@ impl SnapshotSink for AppState {
     }
 }
 
-/// A hint that desired state changed.
+/// A hint that desired state changed, or that the active revision must be
+/// recompiled even when its durable id did not change.
 ///
 /// Optional by construction: nothing here carries the change itself, so a lost
 /// signal costs at most one poll interval. A Postgres `LISTEN` task calls
 /// [`ChangeSignal::notify`]; a deployment without notifications simply never
-/// does.
+/// does. Secret-store lifecycle changes use [`ChangeSignal::force_refresh`]:
+/// they do not create a durable desired-state revision, but they can change
+/// whether the active revision is materializable. The signal is deliberately
+/// coalescing; the next attempt reads the current revision and therefore never
+/// needs to carry a secret or a lifecycle payload through this layer.
 #[derive(Debug, Default)]
 pub struct ChangeSignal {
     notify: Notify,
+    refresh: AtomicBool,
 }
 
 impl ChangeSignal {
@@ -121,8 +129,24 @@ impl ChangeSignal {
         self.notify.notify_one();
     }
 
-    async fn notified(&self) {
+    /// Wake the reconciler and require it to recompile the current desired
+    /// revision, even if that revision is already active.
+    ///
+    /// This is the safe bridge for out-of-band lifecycle changes such as a
+    /// secret being disabled or rotated. It never publishes directly: the
+    /// ordinary compile-then-admit-then-publish path still decides whether the
+    /// refreshed candidate is usable, and a refusal leaves the last-known-good
+    /// snapshot active. A refusal also leaves the request pending, so the retry
+    /// the reconciler already schedules recompiles instead of skipping on an
+    /// unchanged revision id.
+    pub fn force_refresh(&self) {
+        self.refresh.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    async fn notified(&self) -> bool {
         self.notify.notified().await;
+        self.refresh.swap(false, Ordering::Acquire)
     }
 }
 
@@ -312,6 +336,15 @@ pub struct Reconciler {
     /// The revision the sink is serving, as this reconciler last published it.
     /// Compared against desired to decide whether to hydrate at all.
     active: Mutex<Option<RevisionId>>,
+    /// Only one attempt may derive and publish a next generation at a time.
+    /// This matters for the explicit refresh seam, whose callers may race with
+    /// one another even though the normal loop has one owner.
+    attempt_lock: AsyncMutex<()>,
+    /// A refresh that has been asked for and not yet served. It outlives a single
+    /// attempt because a refused candidate has not refreshed anything: the
+    /// desired revision id is unchanged, so without this the backoff retry would
+    /// take the already-converged skip and the request would be dropped.
+    refresh_pending: AtomicBool,
     backoff: Mutex<Backoff>,
     /// Whether the last export failed, so a recovering disk is logged once
     /// rather than every attempt.
@@ -338,6 +371,8 @@ impl Reconciler {
             cache,
             clock,
             active: Mutex::new(None),
+            attempt_lock: AsyncMutex::new(()),
+            refresh_pending: AtomicBool::new(false),
             export_failing: AtomicBool::new(false),
         }
     }
@@ -426,6 +461,29 @@ impl Reconciler {
     /// One full convergence step. Deterministic and independently callable, which
     /// is what the tests drive instead of racing the loop's timers.
     pub async fn converge_once(&self, trigger: &'static str) -> Outcome {
+        self.converge_once_with_refresh(trigger, false).await
+    }
+
+    /// Recompile and republish the current desired revision.
+    ///
+    /// A durable revision is the normal convergence key, but some runtime
+    /// inputs intentionally live outside desired state. Secret-store lifecycle
+    /// transitions are the important example: they must take effect without
+    /// inventing a no-op revision. This method uses exactly the same atomic
+    /// candidate path as ordinary convergence and is therefore safe to call
+    /// from an administrative lifecycle handler or its change listener.
+    pub async fn force_refresh_once(&self, trigger: &'static str) -> Outcome {
+        self.converge_once_with_refresh(trigger, true).await
+    }
+
+    async fn converge_once_with_refresh(
+        &self,
+        trigger: &'static str,
+        force_refresh: bool,
+    ) -> Outcome {
+        if force_refresh {
+            self.refresh_pending.store(true, Ordering::Release);
+        }
         let span = telemetry::revision_convergence_span(trigger);
         let outcome = match self.attempt().await {
             Ok(Some(revision)) => {
@@ -478,8 +536,11 @@ impl Reconciler {
                     tracing::debug!("revision convergence stopped");
                     return;
                 }
-                () = signal.notified() => {
-                    self.converge_once(telemetry::CONVERGENCE_NOTIFIED).await;
+                force_refresh = signal.notified() => {
+                    self.converge_once_with_refresh(
+                        telemetry::CONVERGENCE_NOTIFIED,
+                        force_refresh,
+                    ).await;
                 }
                 () = tokio::time::sleep(delay) => {
                     self.converge_once(telemetry::CONVERGENCE_POLLED).await;
@@ -489,7 +550,21 @@ impl Reconciler {
     }
 
     /// The attempt itself: `Ok(None)` means there was nothing to do.
+    ///
+    /// A pending refresh is consumed here, under the attempt lock, and put back
+    /// if the attempt failed, so that the retry this replica already schedules
+    /// recompiles rather than skipping on an unchanged revision id.
     async fn attempt(&self) -> Result<Option<RevisionId>, AttemptError> {
+        let _attempt = self.attempt_lock.lock().await;
+        let force_refresh = self.refresh_pending.swap(false, Ordering::AcqRel);
+        let result = self.attempt_inner(force_refresh).await;
+        if force_refresh && result.is_err() {
+            self.refresh_pending.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    async fn attempt_inner(&self, force_refresh: bool) -> Result<Option<RevisionId>, AttemptError> {
         let started = self.clock.now();
         // The cheap read first. It answers "is there anything to do?" without
         // hydrating bodies, and it is also this replica's liveness check against
@@ -497,7 +572,7 @@ impl Reconciler {
         let desired = self.store.desired_revision().await?;
         self.status.observe_desired(desired);
         let active = *self.active.lock().expect("not poisoned");
-        if desired.is_none() || desired == active {
+        if desired.is_none() || (!force_refresh && desired == active) {
             self.backoff.lock().expect("not poisoned").succeed();
             return Ok(None);
         }
