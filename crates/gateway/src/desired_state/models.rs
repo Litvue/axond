@@ -707,7 +707,7 @@ pub enum ModelError {
         reference: ResourceRef,
         field: &'static str,
     },
-    #[error("{reference} field `{field}` is not an id: {source}")]
+    #[error("{reference} field `{field}` {source}")]
     MalformedId {
         reference: ResourceRef,
         field: &'static str,

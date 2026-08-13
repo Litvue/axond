@@ -41,7 +41,12 @@ unchanged by it. This page is the evidence for them under stateful mode.
   responses, idempotent replays, refusals, state, history, audit trails, and
   convergence all describe the credential by reference. A document that pastes
   material where a `sct_…` reference belongs is refused by naming the form
-  expected, rather than by echoing what arrived.
+  expected, rather than by echoing what arrived. The refusal distinguishes a
+  value of the wrong kind from a right-prefixed identifier whose UUID is
+  malformed, so an operator can tell a mispaste from a typo, and it says so from
+  the parse failure rather than from the text: no identifier refusal anywhere —
+  request field, record field, log line, or audit trail — renders the string it
+  refused.
 
 ## How it is tested
 
