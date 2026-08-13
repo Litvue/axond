@@ -450,6 +450,25 @@ mod tests {
             blob
         );
 
+        // A catalogue snapshot specifically: a model enablement's snapshot pin
+        // resolves through this round trip, so a body that came back as anything
+        // but the same kind and digest would make an intact revision refuse to
+        // converge.
+        let snapshot = BlobRef::of(BlobKind::CatalogSnapshot, b"snapshot");
+        let columns = body_columns(&ResourceBody::Blob(snapshot)).expect("encodable");
+        let restored = body(
+            columns.form,
+            None,
+            columns.blob_kind.as_deref(),
+            columns.blob_digest.as_deref(),
+            Some(i64::try_from(snapshot.size_bytes).expect("fixture size")),
+        )
+        .expect("reads back");
+        assert_eq!(
+            restored.blob().map(|blob| (blob.kind, blob.digest)),
+            Some((BlobKind::CatalogSnapshot, snapshot.digest))
+        );
+
         // A blob body whose blob row is gone: unreadable, not a guessed size.
         assert!(matches!(
             body(

@@ -1,4 +1,4 @@
-# 38. Snapshot-pinned model enablements and ordered project aliases
+# 40. Snapshot-pinned model enablements and ordered project aliases
 
 Date: 2026-08-13
 
