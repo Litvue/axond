@@ -1,0 +1,126 @@
+# Stateful integration: the release gates and what proves them
+
+Stateful mode
+([#160](https://github.com/Litvue/axond/issues/160)) is being built as a set of
+*contract* slices — durable schemas, typed documents, protocol boundaries — each
+landing on its own. None of them makes a replica serve statefully. That last step
+is **integration**: the wiring that connects a bootstrap file to a control plane,
+a control plane to a compiled snapshot, and a snapshot to the request path, plus
+the evidence that each of #160's release gates actually holds on the assembled
+system.
+
+This page is the integration plan and its acceptance matrix. It exists so that
+"is stateful mode ready?" has a single answer with a reference behind each line,
+rather than a set of merged pull requests nobody has run together.
+
+- [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) — the two
+  operating modes and what each one owns.
+- [Control-plane revision journal](./control-plane-journal.md) — the durable
+  storage layer.
+- [Revision convergence](./revision-convergence.md) — how a published revision
+  reaches a replica.
+
+## Who owns what
+
+| Owner | Owns | Examples |
+| --- | --- | --- |
+| A contract slice | One durable schema or typed document, its validation, and its unit-level tests | tenancy/RBAC rows, `axond.policy.v1`, price books, the `/admin/v1` protocol, the SecretStore trait |
+| Integration | The seams between slices, the `serve` path, and the end-to-end evidence | constructing the control plane at boot, compiling a revision into a snapshot, publishing it atomically, readiness semantics, the smoke harness |
+
+Integration never re-implements a contract. When a gate below is blocked, it is
+blocked on a *body schema* or a *protocol* that a slice owns, and the integration
+work is the wiring that becomes possible once that lands.
+
+Integration-owned files, so that parallel slices and this work do not collide:
+
+- `crates/gateway/tests/stateful_integration.rs` — the smoke harness.
+- `crates/gateway/tests/support/stateful.rs` — its fixtures.
+- `docs/operations/stateful-integration.md` — this page.
+- The `serve`-path wiring in `crates/gateway/src/main.rs` and
+  `crates/gateway/src/state.rs`, once the gates below unblock it.
+
+## The dependency graph
+
+Waves, in landing order. Everything inside a wave is independent of everything
+else in it.
+
+```
+wave 0  (landed)   revision journal · convergence loop · LKG cache · preflight/migrate
+                   status contract · typed credentials + secret lifecycle contract
+                        │
+wave 1  (in flight) #252 tenancy/principals/RBAC/audit      #207/#247 catalogue import
+                    #253 axond.policy.v1 documents          #251 approved price books
+                    #255 model enablement + project aliases #250 derived availability
+                    #254 /admin/v1 protocol boundary        #244 empty-ledger adoption
+                    #145 SecretStore implementation         #249 usage outbox
+                        │
+wave 2  (integration) IG-01 … IG-05: boot → connect → hydrate → compile → publish → serve
+                        │
+wave 3  (integration) IG-06 … IG-10: the properties that only hold on the whole system
+                        │
+wave 4              #156 qualification evidence over the integrated system
+```
+
+A wave-1 slice that slips does not block the whole of wave 2: the gates below
+name their own dependencies, and each is wired and qualified as soon as *its*
+dependencies land.
+
+## Acceptance matrix
+
+Every gate has an identifier, the #160 release gate it discharges, the wiring
+integration owns, what it depends on, and the harness scenario that proves it.
+`Status` is either `wired` (the scenario runs and asserts the property) or
+`blocked` (the scenario asserts that the system still refuses to pretend
+otherwise, and names what it waits for).
+
+`crates/gateway/tests/stateful_integration.rs` parses this table. A gate added
+here without a scenario, or a scenario without a row, fails the suite.
+
+| Gate | #160 release gate | Integration wiring | Depends on | Evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap either reaches its control plane or fails loudly — never serves an empty snapshot | #252, #253, #255, #251, #250, #145 | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_refuses_to_serve_an_empty_snapshot` | blocked |
+| IG-02 | Postgres-first control plane | Operator preflight, forward-only migration, and the connect a replica performs before it serves | #244 | `preflight_describes_a_stateless_install`, `migrate_prepares_a_control_plane_before_replicas_start` | wired |
+| IG-03 | Control-plane loss leaves last-known-good serving | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | #252, #253, #255, #251, #250 | `hydrate_compile_publish_is_one_atomic_step` | blocked |
+| IG-04 | Provider secrets rotate without redeployment | Resolve every credential a candidate snapshot needs through the SecretStore during compilation, never on the request path | #145 | `secrets_resolve_during_compilation_only` | blocked |
+| IG-05 | Every mutation validated, revisioned, authorized, audited | The authenticated `/admin/v1` path from request to published revision, including breakglass | #254, #252, #143 | `an_admin_mutation_publishes_an_audited_revision` | blocked |
+| IG-06 | No control-plane reads on ordinary inference | Routing, catalogue, authentication, and pricing read only the published snapshot | IG-03 | `inference_touches_no_control_plane_connection` | blocked |
+| IG-07 | Control-plane loss leaves last-known-good serving | Bounded backoff, staleness reporting, and cold boot from the signed last-known-good cache | IG-03 | `control_plane_loss_keeps_the_last_known_good_snapshot_serving` | blocked |
+| IG-08 | Bounded, observable runtime | Readiness reflects convergence rather than process liveness; `/status` reports desired, loaded, active, and lag | IG-03, #238 | `readiness_and_status_report_convergence` | blocked |
+| IG-09 | Every request records the effective price version | The compiled snapshot carries the approved price-book identity into each usage record | #251, #249 | `every_usage_record_names_the_price_version` | blocked |
+| IG-10 | Tenant catalogue views isolated and explained | The tenant-facing catalogue is projected from the snapshot and explains effective availability | #250, #255, #207 | `a_tenant_catalogue_is_isolated_and_explains_itself` | blocked |
+| IG-11 | Published capacity and failure-recovery evidence | Stateful profiles in the qualification harness: convergence under load, control-plane outage, rolling upgrade | IG-01 … IG-08, #156 | `stateful_qualification_profiles_are_published` | blocked |
+
+## What "wired" requires
+
+A gate moves to `wired` in one pull request that does all four of:
+
+1. lands the seam in integration-owned files;
+2. turns its scenario in `crates/gateway/tests/stateful_integration.rs` into one
+   that asserts the property on a running process, not on a type;
+3. updates this row, including dropping the dependency that unblocked it;
+4. records the operator-visible consequence on the page that owns it
+   ([convergence](./revision-convergence.md), [the
+   journal](./control-plane-journal.md), or
+   [upgrades](./upgrades.md)).
+
+A gate is never moved to `wired` because its dependencies merged. The scenario
+runs, or the gate is blocked.
+
+## Running the harness
+
+```sh
+# The scenarios that need no datastore.
+cargo test -p axond --all-features --test stateful_integration
+
+# Including the control-plane scenarios, against a throwaway PostgreSQL.
+docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=axond-ci --name axond-cp postgres:17.6-alpine
+AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres \
+  cargo test -p axond --all-features --test stateful_integration
+```
+
+Without `AXOND_TEST_POSTGRES_DSN` the control-plane scenarios skip, the way the
+rest of the suite treats optional datastores. CI's stateful lane sets
+`AXOND_TEST_REQUIRE_SERVICES=1`, so a skipped scenario there is a failure rather
+than a quiet pass. Each run works in a schema of its own and drops it afterwards,
+so a shared database is safe and a crashed run leaks one empty schema rather than
+poisoning the next.
