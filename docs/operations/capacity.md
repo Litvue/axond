@@ -5,6 +5,10 @@ of them a change is allowed to move. The design and its boundaries are
 [ADR 0033](../adr/0033-capacity-qualification-harness.md); the bounds the
 replica sheds at are [ADR 0030](../adr/0030-request-bounds-and-load-shedding.md).
 
+What a replica costs over hours rather than minutes — leaks, descriptor balance,
+and usage-record reconciliation — is
+[endurance qualification](./endurance.md), which uses the same conventions.
+
 This page qualifies the **stateless request path only** — a Tier 0 process with
 no Redis, no Postgres, and no control plane. It is not evidence about stateful
 serving, revision convergence, or any store-backed control.
