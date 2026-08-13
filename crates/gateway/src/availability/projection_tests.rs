@@ -335,6 +335,93 @@ fn an_unnameable_enablement_is_counted_and_files_no_record() {
     assert!(!verdict.permits_attempt());
 }
 
+/// A look whose key this revision describes no record for cannot be filed, and
+/// has already left the queue. It is counted, because it cost a provider round
+/// trip and every other refusal here is reported — and it is not counted as
+/// misfiled, which names a look filed under the wrong key rather than one filed
+/// under no key at all.
+#[test]
+fn a_look_about_a_key_no_record_describes_is_counted_rather_than_dropped_silently() {
+    let deployment = Deployment::new().entitled().governed();
+    let unenabled = ScopeRef::tenant(fixtures::tenant_id(7));
+    let stray = DiscoveryObservation::new(
+        unenabled,
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(90),
+    );
+
+    let projected = project(&deployment, &catalogue(), &resolved(40), [stray]);
+
+    assert_eq!(projected.undescribed_looks(), 1);
+    assert_eq!(projected.misfiled(), 0);
+    assert!(
+        projected
+            .index()
+            .record(&AvailabilityKey::new(unenabled, target()))
+            .is_none()
+    );
+    // The keys the revision does describe are untouched by it: no evidence.
+    assert_eq!(
+        verdict(&projected, &deployment.key(), 100).reason,
+        AvailabilityReason::NoEvidence
+    );
+
+    // And a look the revision does describe is filed, not counted.
+    let described = DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(90),
+    );
+    let projected = project(&deployment, &catalogue(), &resolved(40), [described]);
+    assert_eq!(projected.undescribed_looks(), 0);
+    assert_eq!(
+        verdict(&projected, &deployment.key(), 100).state,
+        AvailabilityState::Available
+    );
+}
+
+/// Two enablements of one scope naming one target are combined at their least
+/// permissive value, so the verdict does not depend on which one the iteration
+/// reached last.
+///
+/// Reachable because desired state's uniqueness is per offering identity among
+/// the enablements that *resolve*, while a record is keyed by scope and target: a
+/// disabled enablement and the enablement replacing it are both projected, and
+/// both name one key. Asserted in both resource id orders, because order
+/// dependence is exactly the defect.
+#[test]
+fn two_enablements_naming_one_key_decide_the_same_way_in_either_order() {
+    let verdicts = [29_u64, 31].map(|seed| {
+        let deployment = Deployment::new().entitled().governed();
+        let tenant = deployment.tenant;
+        let superseded = fixtures::enablement_body(seed, ModelOwner::tenant(tenant), MODEL)
+            .transitioned(ModelLifecycle::Disabled)
+            .version(
+                Slug::parse("gpt-4o-superseded").expect("a well-formed slug"),
+                fixtures::catalog_reference(),
+            );
+        let deployment = deployment.with(superseded);
+
+        let projected = project(&deployment, &catalogue(), &resolved(40), None);
+
+        assert_eq!(projected.conflicting(), 1);
+        verdict(&projected, &deployment.key(), 100)
+    });
+
+    // Stricter than the enabled declaration alone, which is the safe direction,
+    // and the same whichever declaration came first.
+    assert_eq!(verdicts[0], verdicts[1]);
+    assert_eq!(verdicts[0].state, AvailabilityState::Denied);
+    assert_eq!(verdicts[0].reason, AvailabilityReason::NotEnabled);
+    assert_eq!(verdicts[0].decided_by, DecidedBy::Enablement);
+}
+
 /// One tenant's credential entitles nothing in another's scope, and one tenant's
 /// enablement is not filed under another's key.
 #[test]

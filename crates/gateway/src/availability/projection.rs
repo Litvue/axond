@@ -35,6 +35,11 @@
 //! that are counted ([`ProjectedAvailability::unnameable`]) rather than dropped
 //! silently, because a projection that quietly stopped describing half a
 //! catalogue would otherwise look identical to a tenant that enabled nothing.
+//! A look about a key no record exists for is counted the same way
+//! ([`ProjectedAvailability::undescribed_looks`]), and so is a key two
+//! enablements both name, whose dimensions are combined at their least permissive
+//! value rather than resolved by iteration order
+//! ([`ProjectedAvailability::conflicting`]).
 //!
 //! The same holds in the other direction, for a key an *earlier* revision
 //! described and this one does not — a rollback that dropped an enablement, a
@@ -78,6 +83,7 @@
 //!
 //! [`ModelEnablementBody::state`]: crate::desired_state::ModelEnablementBody::state
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
@@ -366,6 +372,8 @@ pub struct ProjectedAvailability {
     skewed: usize,
     superseded: usize,
     misfiled: usize,
+    undescribed_looks: usize,
+    conflicting: usize,
 }
 
 impl ProjectedAvailability {
@@ -424,6 +432,31 @@ impl ProjectedAvailability {
     pub const fn misfiled(&self) -> usize {
         self.misfiled
     }
+
+    /// Observations dropped because this revision describes no record for the
+    /// key they name — a look taken while the target was briefly un-nameable, a
+    /// catalogue snapshot no longer in hand, an enablement since removed.
+    ///
+    /// Dropped rather than kept queued, because a target that never comes back
+    /// would otherwise grow the queue without bound, and counted rather than
+    /// dropped silently, because a look cost a provider round trip.
+    pub const fn undescribed_looks(&self) -> usize {
+        self.undescribed_looks
+    }
+
+    /// Keys two enablements of this revision both resolve to, whose records were
+    /// combined at their least permissive value rather than resolved by
+    /// iteration order.
+    ///
+    /// Reachable because uniqueness in desired state is per *offering identity*
+    /// among the enablements that resolve, while a record is keyed by scope and
+    /// target: a disabled enablement and the one replacing it name one key.
+    /// Non-zero means a verdict is stricter than the most permissive enablement
+    /// an operator wrote, which is the safe direction, but it is still a
+    /// discrepancy worth reading.
+    pub const fn conflicting(&self) -> usize {
+        self.conflicting
+    }
 }
 
 /// The projection itself: a revision, a catalogue, and the material a candidate
@@ -461,9 +494,10 @@ impl<'a> AvailabilityProjection<'a> {
         let policies = PolicySet::of(state)?;
 
         let mut described = BTreeSet::new();
-        let mut declarations = Vec::new();
+        let mut declarations: BTreeMap<AvailabilityKey, AvailabilityRecord> = BTreeMap::new();
         let mut unnameable = 0;
         let mut skewed = 0;
+        let mut conflicting = 0;
 
         for enablement in models.enablements() {
             let pinned = enablement.body.offering();
@@ -488,7 +522,16 @@ impl<'a> AvailabilityProjection<'a> {
             };
             let key = AvailabilityKey::new(scope, target);
             described.insert(key.clone());
-            declarations.push((key, record));
+            match declarations.entry(key) {
+                Entry::Vacant(slot) => {
+                    slot.insert(record);
+                }
+                Entry::Occupied(mut held) => {
+                    conflicting += 1;
+                    let combined = least_permissive(held.get(), record);
+                    held.insert(combined);
+                }
+            }
         }
 
         let mut builder = AvailabilityIndexBuilder::carrying_evidence_for(previous, &described);
@@ -496,9 +539,18 @@ impl<'a> AvailabilityProjection<'a> {
             builder = builder.record(key, record);
         }
 
+        // A look whose key this revision does not describe has nowhere to be
+        // filed — the record it belongs to does not exist — and it has already
+        // been taken off the queue. Dropped rather than queued back, since a
+        // target that never returns would grow the queue without bound, but
+        // counted: it cost a provider round trip, and every other refusal in
+        // this projection is reported.
+        let mut undescribed_looks = 0;
         for observation in observations {
             if described.contains(&observation.key()) {
                 builder = builder.observe(observation);
+            } else {
+                undescribed_looks += 1;
             }
         }
 
@@ -521,6 +573,8 @@ impl<'a> AvailabilityProjection<'a> {
             skewed,
             superseded: builder.superseded(),
             misfiled: builder.misfiled(),
+            undescribed_looks,
+            conflicting,
             index: builder.build(),
         })
     }
@@ -1034,6 +1088,67 @@ const fn rank(entitlement: Entitlement) -> u8 {
         Entitlement::Unknown => 2,
         Entitlement::Revoked => 1,
         Entitlement::Missing => 0,
+    }
+}
+
+/// How much a presence answer permits, so the stricter of two declarations wins.
+const fn presence_rank(presence: CataloguePresence) -> u8 {
+    match presence {
+        CataloguePresence::Present => 2,
+        CataloguePresence::Withdrawn => 1,
+        CataloguePresence::Absent => 0,
+    }
+}
+
+/// How much a policy answer permits. An undecided policy is not a permit, and a
+/// written refusal is stricter still.
+const fn policy_rank(policy: PolicyDecision) -> u8 {
+    match policy {
+        PolicyDecision::Permitted => 2,
+        PolicyDecision::Indeterminate => 1,
+        PolicyDecision::Denied => 0,
+    }
+}
+
+/// The one record two enablements naming one key agree on: every dimension at
+/// whichever of the two permits less.
+///
+/// Desired state refuses two *resolving* enablements of one offering at one
+/// scope, but it projects the ones that do not resolve too — a disabled
+/// enablement and the one that replaced it are both read here, and both name one
+/// `(scope, target)`. Keeping whichever the iteration happened to reach last
+/// would make an operator-facing verdict depend on resource id order, so the two
+/// are combined instead: the result can be stricter than one of the enablements,
+/// never more permissive than both, and the key is counted in
+/// [`ProjectedAvailability::conflicting`].
+fn least_permissive(held: &AvailabilityRecord, other: AvailabilityRecord) -> AvailabilityRecord {
+    let (entitlement, credential) = if rank(other.entitlement) < rank(held.entitlement) {
+        (other.entitlement, other.credential.clone())
+    } else {
+        (held.entitlement, held.credential.clone())
+    };
+    AvailabilityRecord {
+        presence: if presence_rank(other.presence) < presence_rank(held.presence) {
+            other.presence
+        } else {
+            held.presence
+        },
+        enablement: if held.enablement.is_enabled() && other.enablement.is_enabled() {
+            Enablement::Enabled
+        } else {
+            Enablement::NotEnabled
+        },
+        entitlement,
+        policy: if policy_rank(other.policy) < policy_rank(held.policy) {
+            other.policy
+        } else {
+            held.policy
+        },
+        credential,
+        // Runtime health is overlaid at evaluation, and evidence is carried by
+        // the builder rather than declared: a declaration sets neither, so
+        // neither is combined here.
+        ..AvailabilityRecord::default()
     }
 }
 
