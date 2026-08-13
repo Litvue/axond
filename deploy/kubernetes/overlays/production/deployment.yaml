@@ -40,6 +40,12 @@ spec:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: DoNotSchedule
+          # Skew is counted per ReplicaSet, so a rolling update's surge Pod is
+          # not measured against the Pods it replaces. Without this, a cluster
+          # with as many nodes as replicas cannot place the surge Pod and
+          # `maxUnavailable: 0` will not free a node for it: the rollout hangs.
+          matchLabelKeys:
+            - pod-template-hash
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: axond

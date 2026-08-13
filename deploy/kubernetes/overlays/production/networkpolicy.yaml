@@ -72,11 +72,22 @@ spec:
       ports:
         - protocol: TCP
           port: 443
-    # Stateful backends and the telemetry collector. These select in-cluster
-    # workloads by label; replace a rule with an `ipBlock` for the managed
-    # service's address when the datastore is outside the cluster, and delete the
-    # rules for stores this deployment does not configure. Deleting is safe:
-    # nothing in the base overlay's stateless config dials any of them.
+    # Stateful backends and the telemetry collector. A bare `podSelector` selects
+    # Pods in *this* namespace only, so each rule as written reaches a store that
+    # runs alongside axond. Add a `namespaceSelector` beside the `podSelector` in
+    # the same peer when the store runs elsewhere in the cluster:
+    #
+    #   - to:
+    #       - namespaceSelector:
+    #           matchLabels:
+    #             kubernetes.io/metadata.name: observability
+    #         podSelector:
+    #           matchLabels:
+    #             app.kubernetes.io/name: opentelemetry-collector
+    #
+    # and replace the peer with an `ipBlock` for a managed service outside the
+    # cluster. Delete the rules for stores this deployment does not configure;
+    # deleting is safe, because nothing in the base's stateless config dials them.
     - to:
         - podSelector:
             matchLabels:

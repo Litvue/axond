@@ -291,6 +291,15 @@ def check_topology_spread(documents: list[Document]) -> list[str]:
             "overlays/production: the per-node spread constraint is best-effort; two replicas "
             "of a fleet sized to survive one disruption must not share a node"
         )
+    # A hard constraint that counts the Pods it is replacing deadlocks against
+    # `maxUnavailable: 0` on a cluster with as many nodes as replicas: the surge
+    # Pod is unschedulable and nothing may be evicted to make room for it.
+    if node is not None and "pod-template-hash" not in node.get("matchLabelKeys", []):
+        failures.append(
+            "overlays/production: the per-node spread constraint counts every axond Pod, so a "
+            "rolling update's surge Pod exceeds its own skew and never schedules; scope the skew "
+            "with matchLabelKeys: [pod-template-hash]"
+        )
     for key, constraint in by_key.items():
         selector = constraint.get("labelSelector", {}).get("matchLabels")
         if selector != SELECTOR:
@@ -693,6 +702,13 @@ def self_test() -> int:
     ]:
         constraint["whenUnsatisfiable"] = "ScheduleAnyway"
     expect_failure("per-node spread enforcement", check_topology_spread(stacked))
+
+    fleet_wide = copy.deepcopy(production)
+    for constraint in one(fleet_wide, "Deployment")["spec"]["template"]["spec"][
+        "topologySpreadConstraints"
+    ]:
+        constraint.pop("matchLabelKeys", None)
+    expect_failure("a hard spread that deadlocks its own rollout", check_topology_spread(fleet_wide))
 
     open_egress = copy.deepcopy(production)
     for policy in of_kind(open_egress, "NetworkPolicy"):

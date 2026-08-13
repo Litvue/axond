@@ -48,11 +48,16 @@ evaluation:
   rolling update's `maxUnavailable: 0` stays honest;
 - topology spread across nodes (`DoNotSchedule`) and zones (`ScheduleAnyway`),
   because a zone that cannot hold the fleet should cost you spread, not
-  scheduling;
+  scheduling, and the node constraint counts skew per ReplicaSet
+  (`matchLabelKeys: [pod-template-hash]`) so a rolling update's extra Pod still
+  schedules on a cluster with three nodes;
 - two NetworkPolicies: a default-deny for both directions, and an allow-list
   for ingress from the ingress controller, DNS, egress to public HTTPS with the
-  link-local and private ranges excluded, and commented rules for Postgres,
-  Redis, and an OpenTelemetry collector;
+  link-local and private ranges excluded, and label-selected rules for Postgres,
+  Redis, and an OpenTelemetry collector — those three select Pods in axond's own
+  namespace, so widen them with a `namespaceSelector` (or an `ipBlock` for a
+  managed service) when a store runs elsewhere, and delete the ones this
+  deployment does not configure;
 - requests raised to `500m`/`512Mi` with memory request equal to limit, so the
   Pod is Guaranteed for memory and cannot be evicted under node pressure while
   holding buffered request bodies;
@@ -61,10 +66,10 @@ evaluation:
   [Rollouts and termination](#rollouts-and-termination)).
 
 ```bash
-digest="$(ops/pin-image-digest.sh --print 0.3.21)"
+digest="$(ops/pin-image-digest.sh --print 0.3.21)" # x-release-please-version
 SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
   ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
-ops/pin-image-digest.sh 0.3.21
+ops/pin-image-digest.sh 0.3.21 # x-release-please-version
 kubectl apply -k deploy/kubernetes/overlays/production
 kubectl -n axond rollout status deployment/axond
 ```
@@ -79,8 +84,8 @@ the release you verified:
 
 ```bash
 ops/pin-image-digest.sh --check          # fails while the sentinel is unresolved
-ops/pin-image-digest.sh --print 0.3.21   # print the index digest only
-ops/pin-image-digest.sh 0.3.21           # rewrite the overlay's digest
+ops/pin-image-digest.sh --print 0.3.21 # x-release-please-version, prints the digest
+ops/pin-image-digest.sh 0.3.21 # x-release-please-version, rewrites the overlay
 ```
 
 Resolution insists on the multi-architecture index, so a digest naming one
