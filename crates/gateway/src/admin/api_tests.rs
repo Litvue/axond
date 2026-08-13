@@ -371,6 +371,85 @@ async fn republishing_a_credential_repoints_it_at_the_material_the_document_name
     );
 }
 
+/// Rotation advances the version the credential is *in*, not the one the
+/// document spells. The document names a credential, and `secret_version` is
+/// optional, so rotating from a body already past its first version must not
+/// fall back to the document's default and hand an operator an older secret
+/// under the name of a rotation.
+#[tokio::test]
+async fn rotating_a_credential_advances_the_version_currently_in_force() {
+    let deployment = Deployment::new();
+    let mut head = deployment
+        .publish(
+            "/tenants",
+            "key-1",
+            EXPECTED_REVISION_EMPTY,
+            &tenant_document(),
+        )
+        .await;
+    head = deployment
+        .publish("/providers", "key-2", &head, &provider_document())
+        .await;
+    head = deployment
+        .publish("/credentials", "key-3", &head, &credential_document())
+        .await;
+
+    let mut rotate = credential_document();
+    rotate["mutation"] = json!("update");
+    rotate["resource"]["rotate"] = json!(true);
+    for (key, expected) in [2_u64, 3, 4].into_iter().enumerate() {
+        head = deployment
+            .publish("/credentials", &format!("key-{}", key + 4), &head, &rotate)
+            .await;
+        assert_eq!(
+            credential_secret(&deployment, &head).await.version.get(),
+            expected,
+            "each rotation advances from the version in force"
+        );
+    }
+
+    // The material a rotation lands on is staged: rotation stores material, and
+    // putting it in service stays a separate decision.
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(&head).expect("a revision"))
+        .await
+        .expect("the published revision hydrates");
+    let credential = loaded
+        .state()
+        .version_of(
+            crate::desired_state::ResourceKind::ProviderCredential,
+            fixtures::resource_id(11),
+        )
+        .expect("the credential is desired");
+    let body =
+        crate::desired_state::ProviderCredentialBody::read(credential).expect("a credential body");
+    assert_eq!(
+        body.lifecycle(),
+        crate::desired_state::SecretLifecycle::Staged
+    );
+    assert_eq!(body.secret().secret, fixtures::secret_id(12));
+}
+
+/// The secret reference the credential fixture's resource holds at `head`.
+async fn credential_secret(deployment: &Deployment, head: &str) -> crate::desired_state::SecretRef {
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(head).expect("a revision"))
+        .await
+        .expect("the published revision hydrates");
+    let credential = loaded
+        .state()
+        .version_of(
+            crate::desired_state::ResourceKind::ProviderCredential,
+            fixtures::resource_id(11),
+        )
+        .expect("the credential is desired");
+    crate::desired_state::ProviderCredentialBody::read(credential)
+        .expect("a credential body")
+        .secret()
+}
+
 /// A resource other resources pin can still be advanced. Dependency edges name
 /// an exact version and one request publishes one resource, so the candidate
 /// carries the dependents forward itself rather than leaving an operator with a

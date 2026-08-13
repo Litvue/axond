@@ -272,7 +272,10 @@ impl AdminResourceRequest for ProviderRequest {
 ///
 /// The secret is named, never carried: `secret` is a reference into the secret
 /// store, and no field on this document accepts material. A rotation is
-/// `rotate: true`, which advances the referenced version and re-stages it.
+/// `rotate: true`, which advances the version *in force* — the one the
+/// credential's current body names, not the one this document spells — and
+/// re-stages it, so a document that omits `secret_version` still rotates a
+/// credential forward from wherever it is.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialRequest {
@@ -337,19 +340,35 @@ impl AdminResourceRequest for CredentialRequest {
                     Some(resource) => Some(ProviderCredentialBody::read(resource)?),
                     None => None,
                 };
-                let staged = ProviderCredentialBody::staged(
-                    credential,
-                    owner,
-                    provider,
-                    display_name.clone(),
-                    SecretRef::new(secret, version),
-                );
+                // A rotation advances the material *in force*, never the version
+                // the document happens to spell: a credential serving v5 whose
+                // document omits `secret_version` would otherwise rotate to v2 —
+                // a downgrade wearing a rotation's name — and every later
+                // rotation would land on v2 again. The document names the
+                // credential, not the version it is at.
+                let staged = |material: SecretRef| {
+                    ProviderCredentialBody::staged(
+                        credential,
+                        owner,
+                        provider,
+                        display_name.clone(),
+                        material,
+                    )
+                };
+                let authored = SecretRef::new(secret, version);
                 let body = match (previous, rotate) {
-                    (Some(previous), true) => previous.reauthored(staged).rotated(),
-                    (Some(previous), false) => previous.reauthored(staged),
+                    (Some(previous), true) => {
+                        let material = if previous.secret().is_same_secret(authored) {
+                            previous.secret()
+                        } else {
+                            authored
+                        };
+                        previous.reauthored(staged(material)).rotated()
+                    }
+                    (Some(previous), false) => previous.reauthored(staged(authored)),
                     // Nothing to rotate: the first version of a credential is the
                     // material the author named, at the version they named.
-                    (None, _) => staged,
+                    (None, _) => staged(authored),
                 };
                 let body = match lifecycle {
                     Some(lifecycle) => body.transitioned(lifecycle)?,

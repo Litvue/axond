@@ -208,6 +208,13 @@ $ axond admin resources                   # which documents `apply` accepts
 `http://127.0.0.1:8080`; `/admin/v1` is appended to it. `--operator` and
 `--reason` carry breakglass attribution on any command.
 
+`$AXOND_ADMIN_TOKEN` is a bearer credential for the whole control plane, so an
+`http://` endpoint naming anything but this host is refused before the request
+is built — a mistyped scheme would otherwise put the token on the wire in the
+clear. Loopback is exempt, because there is no wire; a deployment that
+terminates TLS in a sidecar on the same trusted path opts in explicitly with
+`--insecure-plaintext`.
+
 A mutation is a document, from a file or standard input:
 
 ```console

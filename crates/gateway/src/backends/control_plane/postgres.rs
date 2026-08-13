@@ -3413,6 +3413,97 @@ mod tests {
         );
     }
 
+    /// Deletion is the only thing that releases a name, and releasing it is not
+    /// reversible by wishing: the slug index is partial over live rows, so a
+    /// deleted tenant's slug is free for the next tenant that asks — and the
+    /// deleted tenant cannot then be reactivated under it.
+    ///
+    /// The three moves an operator actually makes, in order: delete, reuse,
+    /// attempt to restore. The last is a `NameTaken` naming the slug, which is
+    /// the runbook's answer — reactivate under another name, or delete the row
+    /// that took this one — rather than a silent rename of either tenant.
+    #[tokio::test]
+    async fn a_deleted_tenants_slug_is_reusable_and_blocks_its_own_reactivation() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let acme = Slug::parse("acme").expect("a slug");
+        let mut head = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "acme", state()))
+            .await
+            .expect("an active tenant publishes")
+            .id;
+
+        // Deleted: the row stays, because history points at it, but the name it
+        // held is released by the partial index.
+        let mut deleted = state();
+        deleted
+            .supersede(
+                tenant_body(1, "Acme")
+                    .in_lifecycle(TenantLifecycle::Deleted)
+                    .version_at(acme.clone(), ResourceVersionNumber::FIRST.next()),
+            )
+            .expect("a later version of the same tenant");
+        head = store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(head),
+                "delete",
+                deleted,
+                90,
+            ))
+            .await
+            .expect("a deletion publishes")
+            .id;
+
+        // A different tenant takes the released name. Desired state refuses two
+        // live rows sharing a slug, so the deleted one is simply no longer
+        // declared: its row is retained, and holds nothing.
+        let mut reused = DesiredState::new();
+        reused
+            .insert(tenant(21, "acme"))
+            .expect("a state declaring one tenant is valid");
+        head = store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(head),
+                "reuse",
+                reused,
+                94,
+            ))
+            .await
+            .expect("a deleted tenant's slug is free for another tenant")
+            .id;
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY slug, lifecycle")
+                .await,
+            vec!["active", "deleted"],
+            "both rows are retained; only one is live under the name"
+        );
+
+        // And restoring the first tenant under the name it released is refused by
+        // name rather than reported as an outage or applied by renaming someone.
+        let mut restored = DesiredState::new();
+        restored
+            .insert(
+                tenant_body(1, "Acme").version_at(acme, ResourceVersionNumber::FIRST.next().next()),
+            )
+            .expect("a state declaring one tenant is valid");
+        let error = store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(head),
+                "restore",
+                restored,
+                98,
+            ))
+            .await
+            .expect_err("the slug now belongs to a live tenant");
+        assert!(
+            matches!(&error, ControlPlaneError::NameTaken { name, .. } if name == "acme"),
+            "{error}"
+        );
+        assert!(!error.retryable(), "{error}");
+    }
+
     /// The half of #144 that is a database property rather than a service one: a
     /// row naming another tenant's project, or a tenant nothing declared, is
     /// unwritable even by a caller that skipped every validation above.

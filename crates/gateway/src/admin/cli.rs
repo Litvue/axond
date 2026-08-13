@@ -73,6 +73,13 @@ pub fn command() -> Command {
             "Base URL of the gateway's administrative surface (default: ${ENDPOINT_ENV}, else \
              {DEFAULT_ENDPOINT}). The administrative credential is read from ${TOKEN_ENV}."
         ));
+    let insecure = Arg::new("insecure-plaintext")
+        .long("insecure-plaintext")
+        .global(true)
+        .action(ArgAction::SetTrue)
+        .help(format!(
+            "Send ${TOKEN_ENV} over plaintext http to a remote host (refused by default)"
+        ));
     let operator = Arg::new("operator")
         .long("operator")
         .global(true)
@@ -93,6 +100,7 @@ pub fn command() -> Command {
         .about("Read and change durable desired state through /admin/v1")
         .subcommand_required(true)
         .arg(endpoint)
+        .arg(insecure)
         .arg(operator)
         .arg(reason)
         .subcommand(
@@ -221,7 +229,7 @@ pub fn run(args: &ArgMatches) -> anyhow::Result<()> {
     let env: HashMap<String, String> = std::env::vars().collect();
     let call = plan(name, sub, &env)?;
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(send(call, base(args, &env), headers(args, sub, &env)?))
+    runtime.block_on(send(call, base(args, &env)?, headers(args, sub, &env)?))
 }
 
 /// A required flag clap has already validated as present.
@@ -317,13 +325,44 @@ fn document(path: Option<&str>) -> anyhow::Result<String> {
     }
 }
 
-fn base(args: &ArgMatches, env: &HashMap<String, String>) -> String {
+/// The base URL every call is sent to, refusing the ones that would put an
+/// administrative credential on the wire in the clear.
+///
+/// `AXOND_ADMIN_TOKEN` is a bearer credential for the whole control plane: over
+/// plaintext to another host it is readable by every hop in between, and a
+/// mistyped `http://` scheme is exactly how that happens. Loopback is exempt
+/// because there is no wire — it is also the default endpoint — and
+/// `--insecure-plaintext` is the deliberate opt-in for a deployment that
+/// terminates TLS in a sidecar on the same trusted path.
+fn base(args: &ArgMatches, env: &HashMap<String, String>) -> anyhow::Result<String> {
     let endpoint = args
         .get_one::<String>("endpoint")
         .cloned()
         .or_else(|| env.get(ENDPOINT_ENV).cloned())
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
-    format!("{}{ADMIN_PREFIX}", endpoint.trim_end_matches('/'))
+    let url = reqwest::Url::parse(&endpoint)
+        .map_err(|error| anyhow::anyhow!("`{endpoint}` is not a URL: {error}"))?;
+    if url.scheme() != "https" && !args.get_flag("insecure-plaintext") && !is_loopback(&url) {
+        anyhow::bail!(
+            "refusing to send the administrative credential to `{endpoint}` in the clear: use \
+             https, or pass --insecure-plaintext if the plaintext hop is inside a trusted path"
+        );
+    }
+    Ok(format!("{}{ADMIN_PREFIX}", endpoint.trim_end_matches('/')))
+}
+
+/// Whether a URL names this host, and so never reaches a network.
+fn is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host == "localhost" {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 fn headers(
@@ -569,18 +608,60 @@ mod tests {
     fn the_endpoint_falls_back_to_the_environment_then_the_default() {
         let args = matches(&["admin", "convergence"]);
         assert_eq!(
-            base(&args, &HashMap::new()),
+            base(&args, &HashMap::new()).expect("the default endpoint is loopback"),
             format!("{DEFAULT_ENDPOINT}{ADMIN_PREFIX}")
         );
         let env = HashMap::from([(ENDPOINT_ENV.to_owned(), "https://gw.example/".to_owned())]);
         assert_eq!(
-            base(&args, &env),
+            base(&args, &env).expect("https"),
             format!("https://gw.example{ADMIN_PREFIX}")
         );
         let args = matches(&["admin", "--endpoint", "https://flag.example", "convergence"]);
         assert_eq!(
-            base(&args, &env),
+            base(&args, &env).expect("https"),
             format!("https://flag.example{ADMIN_PREFIX}")
+        );
+    }
+
+    /// The administrative credential is a bearer token for the whole control
+    /// plane, so a plaintext hop to another host is refused before the request
+    /// is built — from either source of the endpoint, and whatever the reason
+    /// for the scheme. Loopback has no hop, and the opt-in is explicit.
+    #[test]
+    fn a_plaintext_endpoint_off_this_host_is_refused_before_the_token_is_sent() {
+        let args = matches(&["admin", "--endpoint", "http://gw.example", "convergence"]);
+        let error = base(&args, &HashMap::new())
+            .expect_err("a bearer credential is not sent in the clear across a network");
+        let message = error.to_string();
+        assert!(message.contains("http://gw.example"), "{message}");
+        assert!(message.contains("https"), "{message}");
+
+        let env = HashMap::from([(ENDPOINT_ENV.to_owned(), "http://gw.example".to_owned())]);
+        base(&matches(&["admin", "convergence"]), &env)
+            .expect_err("the environment is no safer than the flag");
+
+        for loopback in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+        ] {
+            base(
+                &matches(&["admin", "--endpoint", loopback, "convergence"]),
+                &HashMap::new(),
+            )
+            .expect("a request to this host reaches no wire");
+        }
+
+        let opted_in = matches(&[
+            "admin",
+            "--endpoint",
+            "http://gw.example",
+            "--insecure-plaintext",
+            "convergence",
+        ]);
+        assert_eq!(
+            base(&opted_in, &HashMap::new()).expect("the operator said so explicitly"),
+            format!("http://gw.example{ADMIN_PREFIX}")
         );
     }
 }
