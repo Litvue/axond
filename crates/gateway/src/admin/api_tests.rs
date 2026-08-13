@@ -117,7 +117,6 @@ impl Deployment {
             store: self.store.clone(),
         }
     }
-    }
 
     async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
         let response = router(self.api.clone())

@@ -35,7 +35,6 @@ use super::reads::{
 use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest};
 use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi};
 use super::service::{AvailabilityAuthority, MutationOutcome};
-use crate::desired_state::{MutationKind, ProjectId, ResourceScope, RevisionId, Surface, TenantId};
 use crate::desired_state::{
     ModelLifecycle, MutationKind, OfferingId, ProjectId, ResourceScope, RevisionId, Surface,
     TenantId, WireFamily,
