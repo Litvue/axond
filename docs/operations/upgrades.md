@@ -111,6 +111,12 @@ and drain the outbox before rolling back to a build that predates a row version.
 
 ## Rollback
 
+For the shipped stateful Kubernetes overlay, use the
+[stateful deployment runbook](./stateful-deployment-runbook.md). It separates
+an /admin/v1 desired-state rollback (a new journal revision) from a compatible
+image rollback (a Recreate replacement), and gives the updatedReplicas and
+probe checks that apply while the fleet intentionally has no Ready Pods.
+
 Rollback is safe only when the old binary understands the current config and
 state layout.
 
