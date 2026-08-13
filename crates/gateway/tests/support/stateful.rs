@@ -214,7 +214,6 @@ impl ControlPlane {
             .is_some()
     }
 
-    /// The applied migration versions, in order.
     /// A replica of this deployment, running until the fixture is dropped.
     ///
     /// The control plane must already be migrated: a replica opens it at boot,
@@ -253,6 +252,7 @@ impl ControlPlane {
         replica
     }
 
+    /// The applied migration versions, in order.
     pub async fn applied_versions(&self) -> Vec<i32> {
         client(&self.dsn)
             .await
