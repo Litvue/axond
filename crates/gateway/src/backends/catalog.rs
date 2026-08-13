@@ -2240,7 +2240,12 @@ impl LastKnownGoodCatalog {
     /// unchanged answer ends the run and ages the active snapshot forward.
     ///
     /// `Ok(None)` is the one odd answer: a `304` before any first import
-    /// confirms content that is not held, so there is nothing to record.
+    /// confirms content nobody holds, which no conditional request asked for.
+    /// There is nothing to admit and nothing to age, but the import did not
+    /// advance the catalogue either, so it counts as an [`RefusalReason::Unknown`]
+    /// refusal rather than passing silently — otherwise an intermediary answering
+    /// `304` to every unconditional request would leave the catalogue empty with
+    /// every signal at rest.
     pub fn record_refresh<E: Refusable>(
         &mut self,
         refreshed: Result<CatalogRefresh, E>,
@@ -2249,6 +2254,7 @@ impl LastKnownGoodCatalog {
         match refreshed {
             Ok(CatalogRefresh::Unchanged { validators }) => {
                 if !self.record_unchanged(validators, checked_at) {
+                    self.record_refusal(Refusal::new(RefusalReason::Unknown));
                     return Ok(None);
                 }
                 Ok(self.active.as_ref().map(|active| Admission::Unchanged {
@@ -3439,6 +3445,30 @@ mod tests {
         let report = catalogue.report(checked_at);
         assert_eq!(report.consecutive_refusals, 0, "a 304 ends the run");
         assert_eq!(report.active_age(), Some(Duration::ZERO));
+    }
+
+    /// An unchanged answer to a request that could not have been conditional
+    /// confirms content nobody holds. Nothing becomes active, so the import has
+    /// to leave a mark rather than reading as a quiet success.
+    #[test]
+    fn an_unchanged_answer_with_nothing_held_is_counted_as_a_refusal() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert!(
+            catalogue
+                .record_refresh::<CatalogError>(
+                    Ok(CatalogRefresh::Unchanged {
+                        validators: SourceValidators::etag("\"one\""),
+                    }),
+                    checked_at,
+                )
+                .expect("nothing to admit")
+                .is_none()
+        );
+        let report = catalogue.report(checked_at);
+        assert_eq!(report.active, None, "nothing became active");
+        assert_eq!(report.consecutive_refusals, 1);
+        assert_eq!(report.last_refusal, Some(RefusalReason::Unknown));
     }
 
     #[tokio::test]
