@@ -7138,6 +7138,19 @@ max_ttl = "15m"
             })
             .collect();
 
+        // And its refusals are counted where its capacity is held, so the
+        // runbook's split of `axond_admission_rejections` distinguishes a
+        // credential flood from busy readers rather than reporting both as the
+        // answering ceiling.
+        assert_eq!(
+            state
+                .0
+                .admission
+                .admit_diagnostic_authentication(DiagnosticCredential::Minted)
+                .err(),
+            Some(crate::admission::AdmissionRejection::DiagnosticsAuthenticating)
+        );
+
         // Another token waits behind the flood rather than behind the store.
         let (status, body) = status_response(state.clone(), Some("axt1.another-one")).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

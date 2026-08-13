@@ -158,6 +158,13 @@ pub enum AdmissionRejection {
     QueueTimeout,
     #[error("concurrent diagnostic limit exceeded")]
     Diagnostics,
+    /// Refused before the credential was checked, by the ceiling on
+    /// *authenticating* diagnostics rather than on answering them. Same code as
+    /// [`Self::Diagnostics`] — a caller has no action that distinguishes them,
+    /// and the difference is not a caller's business — but its own resource, so
+    /// the operator splitting refusals sees which ceiling refused.
+    #[error("concurrent diagnostic authentication limit exceeded")]
+    DiagnosticsAuthenticating,
 }
 
 impl AdmissionRejection {
@@ -165,7 +172,7 @@ impl AdmissionRejection {
     /// assert it declares each one rather than discovering the drift in a
     /// dashboard that a new refusal silently falls outside of.
     #[cfg(test)]
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Tenant,
         Self::TenantCapacity,
         Self::Streams,
@@ -173,6 +180,7 @@ impl AdmissionRejection {
         Self::QueueFull,
         Self::QueueTimeout,
         Self::Diagnostics,
+        Self::DiagnosticsAuthenticating,
     ];
 
     /// The stable machine-readable error type a caller matches on.
@@ -184,7 +192,9 @@ impl AdmissionRejection {
             Self::Global => "gateway_overloaded",
             Self::QueueFull => "admission_queue_full",
             Self::QueueTimeout => "admission_queue_timeout",
-            Self::Diagnostics => "diagnostic_concurrency_exceeded",
+            Self::Diagnostics | Self::DiagnosticsAuthenticating => {
+                "diagnostic_concurrency_exceeded"
+            }
         }
     }
 
@@ -206,7 +216,8 @@ impl AdmissionRejection {
             | Self::Global
             | Self::QueueFull
             | Self::QueueTimeout
-            | Self::Diagnostics => Some(1),
+            | Self::Diagnostics
+            | Self::DiagnosticsAuthenticating => Some(1),
             Self::TenantCapacity => None,
         }
     }
@@ -219,6 +230,7 @@ impl AdmissionRejection {
             Self::Global => RESOURCE_REQUEST,
             Self::QueueFull | Self::QueueTimeout => RESOURCE_QUEUE,
             Self::Diagnostics => RESOURCE_DIAGNOSTIC,
+            Self::DiagnosticsAuthenticating => RESOURCE_DIAGNOSTIC_AUTH,
         }
     }
 }
@@ -383,7 +395,7 @@ impl AdmissionControl {
         };
         let permit = Arc::clone(partition)
             .try_acquire_owned()
-            .map_err(|_| reject(AdmissionRejection::Diagnostics))?;
+            .map_err(|_| reject(AdmissionRejection::DiagnosticsAuthenticating))?;
         metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC_AUTH);
         Ok(DiagnosticPermit {
             resource: RESOURCE_DIAGNOSTIC_AUTH,
