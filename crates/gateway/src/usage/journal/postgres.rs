@@ -204,22 +204,39 @@ impl PostgresJournal {
     /// The check is a read of each table this journal uses, because the failure
     /// it prevents — a deployment that boots, accepts events, and cannot append
     /// them — is worse than a refusal an operator can fix with one `psql` run.
+    ///
+    /// It names the columns rather than selecting a constant, so a table an older
+    /// copy of the DDL created — `axond_usage_outbox_consumer` without
+    /// `resolved_through`, which every claim reads — is a boot refusal rather than
+    /// a runtime error on the first claim.
     async fn check_schema(&self) -> Result<(), JournalError> {
         self.run("check schema", |client| {
             Box::pin(async move {
-                for table in [
-                    "axond_usage_outbox",
-                    "axond_usage_outbox_consumer",
-                    "axond_usage_outbox_delivery",
-                    "axond_usage_outbox_loss",
+                for (table, columns) in [
+                    (
+                        "axond_usage_outbox",
+                        "position, request_id, schema_version, namespace, subject, record, \
+                         observed_at, appended_at",
+                    ),
+                    (
+                        "axond_usage_outbox_consumer",
+                        "consumer, registered_at, resolved_through",
+                    ),
+                    (
+                        "axond_usage_outbox_delivery",
+                        "position, consumer, attempts, lease_expires_at, acknowledged_at, \
+                         quarantined_at, poison_reason",
+                    ),
+                    ("axond_usage_outbox_loss", "id, dropped"),
                 ] {
                     if let Err(error) = client
-                        .query_opt(&format!("SELECT 1 FROM {table} LIMIT 1"), &[])
+                        .query_opt(&format!("SELECT {columns} FROM {table} LIMIT 1"), &[])
                         .await
                     {
                         return Err(OpError::Journal(backend(format!(
-                            "`{table}` is not readable, so this build cannot own the usage \
-                             outbox; apply `ops/postgres/usage_outbox_v1.sql` (or set \
+                            "`{table}` is not readable with the columns this build needs, so it \
+                             cannot own the usage outbox; apply (or re-apply) \
+                             `ops/postgres/usage_outbox_v1.sql` (or set \
                              `[usage_journal] create_schema = true`): {error}"
                         ))));
                     }
@@ -249,11 +266,13 @@ impl PostgresJournal {
 /// How many events are stored: the position span, less the gaps in it that the
 /// gate knows about, or a fresh bounded count when it does not.
 ///
-/// Bounded twice over, because this runs inside the append a request is waiting
-/// on and an unbounded `count(*)` gets slower exactly as the outbox falls behind,
-/// which is when appends can least afford it. The span is two index probes on
-/// [`SPAN`]; a replica counts at most once per [`COUNT_REFRESH`] however full the
-/// outbox is; and a count stops at `max_events + 1` rows, the largest number the
+/// Bounded three ways over, because this runs inside the append a request is
+/// waiting on and an unbounded `count(*)` gets slower exactly as the outbox falls
+/// behind, which is when appends can least afford it. The span is two index probes
+/// on [`SPAN`]; a span below the limit *is* the answer, because the span can only
+/// overstate how many rows it covers, so an outbox that is not spanning its limit
+/// never counts at all; a replica counts at most once per [`COUNT_REFRESH`]
+/// otherwise; and a count stops at `max_events + 1` rows, the largest number the
 /// decision can distinguish, since anything above the limit is over it.
 async fn stored_events(
     tx: &Transaction<'_>,
@@ -261,6 +280,11 @@ async fn stored_events(
     max_events: u64,
 ) -> Result<u64, OpError> {
     let span = tx.query_one(SPAN, &[]).await?.get::<_, i64>(0).max(0) as u64;
+    if span < max_events {
+        // An upper bound that admits, so the cheapest correct answer: the rows
+        // stored cannot outnumber the positions they occupy.
+        return Ok(span);
+    }
     if let Some(estimate) = gate.estimate(span, max_events) {
         return Ok(estimate);
     }
@@ -632,9 +656,22 @@ impl UsageJournal for PostgresJournal {
         self.run("stats", move |client| {
             let name = name.clone();
             Box::pin(async move {
+                // Floored on the consumer's resolved prefix for the same reason a
+                // claim is: the backlog is what these gauges describe, and the
+                // retained acknowledged history behind the floor would otherwise
+                // make a gauge published every maintenance tick a full scan of the
+                // retention window. Quarantined events are counted from the
+                // delivery side instead, because they *are* resolved — they sit
+                // below the floor — and an operator still has to see them; its
+                // partial index holds only poison rows.
                 let row = client
                     .query_one(
-                        "WITH state AS (
+                        "WITH floor AS (
+                             SELECT COALESCE(
+                                 (SELECT resolved_through FROM axond_usage_outbox_consumer
+                                  WHERE consumer = $1), 0) AS position
+                         ),
+                         state AS (
                              SELECT e.observed_at, d.acknowledged_at, d.quarantined_at,
                                     d.lease_expires_at,
                                     (d.acknowledged_at IS NULL AND d.quarantined_at IS NULL
@@ -643,13 +680,16 @@ impl UsageJournal for PostgresJournal {
                              FROM axond_usage_outbox e
                              LEFT JOIN axond_usage_outbox_delivery d
                                  ON d.position = e.position AND d.consumer = $1
+                                AND d.position > (SELECT position FROM floor)
+                             WHERE e.position > (SELECT position FROM floor)
                          )
                          SELECT
                              count(*) FILTER (WHERE pending),
                              count(*) FILTER (WHERE acknowledged_at IS NULL
                                               AND quarantined_at IS NULL
                                               AND lease_expires_at > $2),
-                             count(*) FILTER (WHERE quarantined_at IS NOT NULL),
+                             (SELECT count(*) FROM axond_usage_outbox_delivery
+                              WHERE consumer = $1 AND quarantined_at IS NOT NULL),
                              min(observed_at) FILTER (WHERE pending),
                              (SELECT dropped FROM axond_usage_outbox_loss WHERE id)
                          FROM state",
@@ -1343,6 +1383,63 @@ mod tests {
             matches!(&error, JournalError::Backend(message) if message.contains("axond_usage_outbox")),
             "{error:?}"
         );
+    }
+
+    /// The schema an earlier copy of the shipped DDL left behind: a consumer
+    /// table without `resolved_through`, which every claim reads. `CREATE TABLE
+    /// IF NOT EXISTS` would leave it that way, so this asserts the two things
+    /// that keep it from becoming a runtime failure on the first claim — boot
+    /// refuses, and re-applying the DDL adopts the column.
+    #[tokio::test]
+    async fn a_consumer_table_from_before_the_claim_floor_is_migrated_not_served() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let schema = "axond_outbox_migration";
+        let admin = client(&dsn, None).await;
+        admin
+            .batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
+            ))
+            .await
+            .expect("a schema of its own");
+        let old = client(&dsn, Some(schema)).await;
+        old.batch_execute(SCHEMA_DDL).await.expect("the schema");
+        old.batch_execute("ALTER TABLE axond_usage_outbox_consumer DROP COLUMN resolved_through")
+            .await
+            .expect("the shape an earlier copy created");
+
+        let error = PostgresJournal::connect(
+            &dsn,
+            settings(schema, false, capacity(16, CapacityPolicy::Refuse)),
+        )
+        .await
+        .expect_err("a consumer table this build cannot claim from is a boot failure");
+        assert!(
+            matches!(&error, JournalError::Backend(message)
+                if message.contains("axond_usage_outbox_consumer")),
+            "{error:?}"
+        );
+
+        // Re-applying the shipped DDL is the whole upgrade: the column is added
+        // additively rather than skipped along with the table.
+        let journal = PostgresJournal::connect(
+            &dsn,
+            settings(schema, true, capacity(16, CapacityPolicy::Refuse)),
+        )
+        .await
+        .expect("re-applying the DDL adopts the column");
+        let billing = consumer("billing");
+        let event = event_for("GW_INBOUND_ACME_KEY");
+        assert!(journal.append(&event).await.expect("append").is_new());
+        let claimed = journal
+            .claim(
+                &billing,
+                claim_at(4, Duration::from_secs(30), SystemTime::now()),
+            )
+            .await
+            .expect("a claim reads the migrated column");
+        assert_eq!(claimed.len(), 1);
     }
 
     #[tokio::test]

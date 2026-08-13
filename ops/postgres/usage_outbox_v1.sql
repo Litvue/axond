@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS axond_usage_outbox_consumer (
     resolved_through bigint      NOT NULL DEFAULT 0
 );
 
+-- `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a
+-- deployment that applied an earlier copy of this file would keep a consumer
+-- table without `resolved_through` and fail on every claim. Stated additively so
+-- re-applying this file is a complete upgrade rather than a no-op.
+ALTER TABLE axond_usage_outbox_consumer
+    ADD COLUMN IF NOT EXISTS resolved_through bigint NOT NULL DEFAULT 0;
+
 -- Per-consumer delivery state. `lease_expires_at` is what makes recovery
 -- automatic: a worker that dies mid-delivery stops renewing, the lease expires,
 -- and the event is claimable again with the next attempt number. Acknowledgement
@@ -88,6 +95,14 @@ CREATE TABLE IF NOT EXISTS axond_usage_outbox_delivery (
 CREATE INDEX IF NOT EXISTS axond_usage_outbox_delivery_open_idx
     ON axond_usage_outbox_delivery (consumer, position)
     WHERE acknowledged_at IS NULL AND quarantined_at IS NULL;
+
+-- The poison count an operator alerts on. Quarantined events are resolved as far
+-- as delivery is concerned, so they sit behind the claim floor and cannot be
+-- counted from the backlog; this index is what keeps counting them cheap without
+-- reading the retained history.
+CREATE INDEX IF NOT EXISTS axond_usage_outbox_delivery_poison_idx
+    ON axond_usage_outbox_delivery (consumer)
+    WHERE quarantined_at IS NOT NULL;
 
 -- Events lost to `capacity_policy = "drop-oldest"`, which is the only way this
 -- outbox can lose an accepted event. Durable rather than a process counter, so

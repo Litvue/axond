@@ -240,16 +240,25 @@ impl DeliveryWorker {
                 if delivery.id.attempt < attempts {
                     continue;
                 }
-                if let Err(error) = self
+                match self
                     .journal
                     .quarantine(&delivery.id, PoisonReason::Rejected)
                     .await
                 {
-                    tracing::warn!(
+                    // Counted here rather than in the journal, because this is
+                    // the path that condemns a rejected event: the count is what
+                    // an operator alerts on, and the gauge alone only moves on
+                    // the next maintenance tick.
+                    Ok(()) => crate::telemetry::metrics::record_usage_journal_quarantined(
+                        self.journal.name(),
+                        self.settings.consumer.as_str(),
+                        PoisonReason::Rejected.as_str(),
+                    ),
+                    Err(error) => tracing::warn!(
                         delivery = %delivery.id,
                         error = %error,
                         "usage event exhausted its delivery attempts but could not be quarantined"
-                    );
+                    ),
                 }
             }
             return Ok(0);

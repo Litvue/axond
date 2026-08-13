@@ -127,6 +127,13 @@ reclamation, drop-oldest — are cached, for at most a second, and a stale one m
 a replica read the outbox as *fuller* than it is. So the limit can refuse an
 append a second early after another replica prunes; it cannot be overshot.
 
+An append pays two index probes for that span and, below the limit, nothing else:
+the span can only overstate how many rows it covers, so a span under `max_events`
+is already proof there is room. Only an outbox whose positions span its limit
+counts rows, at most once per second per replica and never past `max_events + 1`
+rows — the largest number the decision can tell apart. So the request path never
+pays for the size of the backlog, which is exactly when it could least afford to.
+
 ## What enabling it changes about your sinks
 
 In billing-grade mode the outbox *is* the buffer, and the worker writes each
@@ -175,6 +182,12 @@ floor that stepped over that earlier event would leave it durable and never
 delivered. The margin is far longer than `operation_timeout_ms` can let an append
 run, so the only thing it costs is that the floor trails the backlog by one
 maintenance tick's worth of events.
+
+The gauges published each maintenance tick are floored the same way, for the same
+reason: `depth`, `in_flight`, and the oldest pending age describe the backlog, so
+they are read from the events above the floor. The poison count cannot be — a
+quarantined event *is* resolved, so it sits below the floor — and is counted from
+its own partial index instead, which holds only quarantined delivery rows.
 
 Measured on PostgreSQL 17 with 200,000 acknowledged events inside their retention
 window, 100 awaiting delivery across 64 ordering keys, and one consumer
@@ -275,12 +288,14 @@ The outbox row carries the `schema_version` it was written at.
   exactly like the usage table ([ADR 0009](../adr/0009-durable-usage-sinks.md)).
 - **The DDL is idempotent.** Re-applying `usage_outbox_v1.sql` to a schema that
   already has it is a no-op, which is what makes the setup step safe to script.
-  One caveat for anyone who applied a pre-release copy of it: `CREATE TABLE IF
-  NOT EXISTS` will not add `axond_usage_outbox_consumer.resolved_through` to a
-  table that already exists, so add it once by hand — `ALTER TABLE
-  axond_usage_outbox_consumer ADD COLUMN IF NOT EXISTS resolved_through bigint
-  NOT NULL DEFAULT 0` — before starting the gateway. A released version is only
-  ever superseded by a new `usage_outbox_v<N>.sql`.
+  It is also *additive*: `CREATE TABLE IF NOT EXISTS` does nothing to a table
+  that already exists, so the file states
+  `axond_usage_outbox_consumer.resolved_through` as an `ALTER TABLE … ADD COLUMN
+  IF NOT EXISTS` too, and re-applying it to a schema an earlier copy created is a
+  complete upgrade rather than a no-op. If it is not applied, boot refuses: the
+  schema check reads the columns this build needs by name, so a missing one is a
+  startup failure naming the table rather than an error on the first claim. A
+  released version is only ever superseded by a new `usage_outbox_v<N>.sql`.
 - **Drain before you downgrade.** Rolling back to a build that predates a row
   version leaves those rows undeliverable — reported as
   `axond.usage.journal.undeliverable{axond.journal.reason="schema_ahead"}` rather than silently
