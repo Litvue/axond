@@ -49,8 +49,13 @@ Two properties worth knowing before you plan capacity or retention:
   published revision is what the gateway authorizes against; the transaction that
   publishes it also writes these rows so the database can enforce ownership on its
   own — a tenant-scoped row cannot name a tenant nothing declared, and a
-  principal cannot be scoped into another tenant's project. Migration 0002 also
-  adds row-level-security policies keyed on `axond.tenant_id`: a session that sets
+  principal cannot be scoped into another tenant's project. Since 0004 the two
+  journal tables are keyed to the tenant table as well, for the rows written after
+  it lands; the *Applied out of band* section below states exactly what that
+  covers, because it deliberately exempts the history that predates it.
+
+  Migration 0002 also adds row-level-security policies keyed on
+  `axond.tenant_id`: a session that sets
   it sees deployment-wide rows and that tenant's, and a session that does not set
   it — the publisher — is unrestricted. Authorization decisions stay in the
   service layer; the policies are defence in depth.
@@ -83,7 +88,7 @@ Two properties worth knowing before you plan capacity or retention:
   `pg_class.relrowsecurity` audit reports as unprotected, so the list and the
   database agree.
 
-  Two preconditions before you apply 0002 and 0003 to a deployment that is
+  Two preconditions before you apply 0002, 0003, and 0004 to a deployment that is
   already running. The policies are `FORCE`d so that they bind the table owner too — the
   single-role install is the common one, and enabling row-level security that the
   owning role bypasses would claim a wall that is not there — and `ALTER TABLE …
@@ -268,6 +273,7 @@ schema changes out of band:
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0002_tenancy_access.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0003_tenancy_constraints.sql
+psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0004_journal_ownership.sql
 axond migrate adopt  --config /etc/axond/axond.toml  # record the baseline that applied
 axond migrate status --config /etc/axond/axond.toml  # now Current
 ```
@@ -278,6 +284,50 @@ replaces the immediately-checked ones 0002 created — a deployment that applied
 forward migration rather than an edit to 0002 for the reason the *Drifted* row
 below states: the ledger compares a recorded checksum against the shipped file,
 so an applied migration is immutable. Re-applying it is a no-op.
+
+0004 keys the two journal tables to `axond_cp_tenant`, and is the one migration
+whose coverage you should know exactly, because it is deliberately partial. It
+adds its foreign keys `NOT VALID`: every journal row written from the moment it
+lands names a tenant this deployment has a row for, and rows already stored keep
+the exemption 0002 granted them. That exemption is not an oversight to be cleared
+later — a pre-tenancy revision has tenant-scoped rows and no owner rows, so
+validating them would mean inventing a tenant no revision ever declared, which is
+indistinguishable afterwards from one an operator granted. There is no
+`VALIDATE CONSTRAINT` step to run, and `pg_constraint.convalidated = false` on
+these four keys is the expected steady state rather than a pending task:
+
+```bash
+psql "$GW_CONTROL_PLANE_DSN" -c "SELECT conrelid::regclass, conname, convalidated
+  FROM pg_constraint WHERE contype = 'f' AND NOT convalidated ORDER BY conname"
+```
+
+One consequence for the mixed-version window the *Upgrade* order below describes.
+A binary older than 0004 does not record the owners history names, so if it
+publishes against a 0004 schema, a publication whose journal rows name a tenant its
+revision does not declare is refused by these keys rather than stored — and that
+binary reports the refusal as a **retryable outage**, because its journal writes
+predate the classification that knows better, so the caller retries against a state
+no retry reaches. What it looks like: repeated publication failures, with
+`ERROR: insert or update on table "axond_cp_resource_version" violates foreign key
+constraint` in the PostgreSQL log. The remedy is to roll the publisher forward
+(0004's binary records the owner instead, and classifies a violation as a refusal
+naming the constraint) or to publish a revision that declares the tenant. Only a
+publisher writes journal rows, so replicas still on the old binary are unaffected —
+which is why the upgrade order below puts the publisher first.
+
+Republishing history still works, including a rollback to a pre-tenancy revision:
+before it writes journal rows, the publishing transaction records an owner for
+every tenant the *state's resources* name and the revision does not declare, at
+`lifecycle = "deleted"` — referenced by history, declared by nothing. Resources
+only: the scope a mutation is made at and the tenant a change is attributed to
+describe a change being made now rather than history, so one naming a tenant this
+deployment has no row for is refused instead of given one. Such a row is not a
+tenant anybody granted (nothing serves it, its name is not held against a declared
+tenant, and only a revision declaring it can turn it into one), and an owner row
+that already exists is never rewritten, so a rollback demotes no live tenant.
+Ownership stops at the tenant: a journal row's *project* is still checked in the
+domain alone, because a project has no lifecycle to publish (#191) and a
+synthesized project row could not be told apart from a declared one.
 
 The `psql` path creates the ledger table without recording anything in it, so the
 journal is then reported as *Unrecorded* — a ledger that exists and records nothing

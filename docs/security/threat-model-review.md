@@ -493,7 +493,9 @@ written by `crates/gateway/src/backends/control_plane/postgres.rs`, the
 row-level-security policies and tenant-scoped constraints in
 `crates/gateway/sql/control_plane_0002_tenancy_access.sql` and the deferred rules
 and attribution filters that replace some of them in
-`crates/gateway/sql/control_plane_0003_tenancy_constraints.sql`, and the
+`crates/gateway/sql/control_plane_0003_tenancy_constraints.sql`, the journal
+ownership keys in
+`crates/gateway/sql/control_plane_0004_journal_ownership.sql`, and the
 denied-action record. A new administrative surface or action fires this trigger even when the
 handler is downstream work: the matrix is exhaustive, so a surface with no
 decided action is a hole rather than an omission.
@@ -507,7 +509,26 @@ The three risks this area exists to bound, and where each is answered:
   deployment — and a role cannot be granted at a scope it does not mean. The
   database holds the same rule independently: a projected row cannot name a
   tenant nothing declared or a project another tenant owns, so a service-layer
-  bug is a failed transaction rather than a cross-tenant write.
+  bug is a failed transaction rather than a cross-tenant write. Since 0004 that
+  covers the journal too, with its coverage stated rather than assumed: the keys
+  are `NOT VALID`, so every row written after they land names a tenant this
+  deployment has a row for and rows stored before them keep 0002's exemption,
+  because validating those means inventing an owner for a tenant no revision
+  declared. Republishing history satisfies the key instead of being refused by it —
+  the publishing transaction records an owner it names and no revision declares at
+  `lifecycle = "deleted"`, which serves nobody and is never rewritten over a live
+  tenant. Ownership stops at the tenant, the boundary row-level security is keyed
+  on; a journal row's project stays a domain check, because a project has no
+  lifecycle to publish and a synthesized project row would be indistinguishable
+  from a declared one. What the keys state is that the tenant has a *row* —
+  declared, retained, or recorded for history — which a retired tenant has satisfied
+  since 0002; "the revision that stores this row declares its tenant" stays the
+  service layer's. Two things keep a publication from widening that set to its own
+  benefit: the recording step runs after the deferred keys settle, so it cannot
+  supply the ownership its own principals need, and it covers the state's resource
+  scopes only — the mutation scope and actor attribution travelling with a
+  publication get no owner row, so a caller cannot leave one behind for an
+  identifier it merely names.
 - **Identifier enumeration.** A refusal tells the caller `forbidden` and nothing
   else. Whether a tenant exists, whether a principal resolved, and which half of
   an OIDC pair was wrong are recorded in the denial row and never returned, so a
@@ -562,6 +583,11 @@ so run it the way [CONTRIBUTING](../../CONTRIBUTING.md#development) documents:
 `publishing_a_revision_projects_the_owners_and_the_directory_it_declares`,
 `a_tenant_lifecycle_transition_is_a_row_update_and_never_a_delete`,
 `a_projected_row_cannot_name_an_absent_tenant_or_another_tenants_project`,
+`a_journal_row_cannot_name_a_tenant_this_deployment_has_no_row_for` and
+`a_revision_naming_an_undeclared_tenant_records_that_owner_as_deleted` for the
+journal keys and the exemption they keep — the first asserts that the four keys are
+present *and* unvalidated, so a later change that quietly validates them fails
+here rather than in an operator's upgrade —
 `denied_actions_are_recorded_and_read_back_per_tenant_newest_first`,
 `denials_are_recorded_once_and_read_newest_first_per_tenant` for the in-memory
 oracle's agreement with it, and
@@ -591,8 +617,10 @@ contract change and a schema change at once: the projected role vocabulary is a
 version fleet may run, per the [upgrade guide](../operations/upgrades.md) and the
 [control-plane journal](../operations/control-plane-journal.md). New tenant-scoped
 constraints on existing history are ordered work: a constraint added `NOT VALID`
-needs the backfill named before it is validated, and that belongs in a follow-up
-issue rather than in the migration that could not enforce it yet.
+either names the backfill that lets it be validated, or states — in the migration,
+the runbook, and a test — that validation is not pending and why, as 0004 does for
+the journal keys. Reporting an operator a validation step they can never complete
+is worse than stating the boundary.
 
 ## Recording the review
 
