@@ -387,9 +387,12 @@ CREATE POLICY axond_cp_principal_isolation ON axond_cp_principal
 -- itself is shared state — but when a workload made the attempt the row carries
 -- that workload's tenant and principal id, and a session pinned to one tenant
 -- reading those would learn which service accounts of every other tenant tried
--- to administer the deployment and what they tried. The read API treats
--- `denials(None, ..)` as a platform-scoped page; this is the same rule, one
--- layer down.
+-- to administer the deployment and what they tried. A tenant-scoped row attempted
+-- by another tenant's workload is filtered for the same reason: the tenant that
+-- was targeted may read that it refused something, and not the attacker's
+-- identifiers. `ControlPlaneStore::denials` applies this predicate itself, so the
+-- read API and the wall behind it state one rule rather than two; the unpinned
+-- publisher — and the platform-scoped read — still sees every actor.
 ALTER TABLE axond_cp_access_denial ENABLE ROW LEVEL SECURITY;
 ALTER TABLE axond_cp_access_denial FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS axond_cp_access_denial_isolation ON axond_cp_access_denial;

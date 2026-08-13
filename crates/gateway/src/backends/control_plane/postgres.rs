@@ -803,6 +803,16 @@ impl ControlPlaneStore for PostgresControlPlane {
                 // `IS NOT DISTINCT FROM` so `None` selects the deployment-scoped
                 // denials rather than every row: a refusal that named no tenant is
                 // a platform-scoped read, not a wildcard.
+                //
+                // Attribution is filtered as well as scope, and for a reason the
+                // targeted tenant does not get to override: the actor of a refused
+                // cross-tenant attempt is another tenant's workload, and its tenant
+                // and principal ids are that tenant's identifiers. A refusal by a
+                // human, by breakglass, or by the gateway has no actor tenant and
+                // stays readable, and the platform-scoped read — which is the
+                // unpinned session the policy leaves unrestricted — still sees
+                // every actor. The predicate is the row-level-security policy on
+                // this table, so the two layers state one rule.
                 let rows = client
                     .query(
                         "SELECT denial_id, actor_kind, actor_issuer, actor_subject, \
@@ -810,6 +820,7 @@ impl ControlPlaneStore for PostgresControlPlane {
                          scope_kind, tenant_id, project_id, reason, recorded_at \
                          FROM axond_cp_access_denial \
                          WHERE tenant_id IS NOT DISTINCT FROM $1 \
+                         AND ($1::text IS NULL OR actor_tenant_id IS NULL OR actor_tenant_id = $1) \
                          ORDER BY recorded_at DESC, denial_id DESC LIMIT $2",
                         &[&tenant, &limit],
                     )
@@ -3986,6 +3997,33 @@ mod tests {
                 .first()
                 .map(|denial| denial.actor.clone()),
             Some(workload.actor.clone())
+        );
+
+        // And a refusal *against* this tenant attempted by another tenant's
+        // workload is not part of this tenant's page: it may read that something
+        // was refused, and not the other tenant's identifiers. The platform read
+        // still sees the actor, and so does the row-level-security policy's
+        // unpinned session.
+        let mut intruder = denial(95, ResourceScope::Tenant(tenant), DenialReason::CrossTenant);
+        intruder.actor = Actor::Workload {
+            tenant: other,
+            principal: PrincipalId::new(uuid(36)),
+        };
+        store.record_denial(&intruder).await.expect("record");
+        assert!(
+            !store
+                .denials(Some(tenant), 10)
+                .await
+                .expect("read")
+                .contains(&intruder),
+            "a tenant's page named another tenant's workload"
+        );
+        assert!(
+            store
+                .column("SELECT denial_id FROM axond_cp_access_denial")
+                .await
+                .contains(&intruder.id.to_string()),
+            "the refusal is still recorded — it is the read that is scoped"
         );
     }
 

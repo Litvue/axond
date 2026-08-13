@@ -308,7 +308,18 @@ impl ControlPlaneStore for InMemoryControlPlane {
         let mut denials: Vec<AccessDenial> = storage
             .denials
             .iter()
-            .filter(|denial| denial.tenant() == tenant)
+            // Scope *and* attribution, as the durable store and its row-level
+            // security both filter: a tenant-scoped read does not hand back the
+            // tenant and principal ids of another tenant's workload, and the
+            // platform-scoped read still sees every actor.
+            .filter(|denial| {
+                denial.tenant() == tenant
+                    && (tenant.is_none()
+                        || denial
+                            .actor
+                            .tenant()
+                            .is_none_or(|actor| Some(actor) == tenant))
+            })
             .cloned()
             .collect();
         denials.sort_by(|left, right| {
@@ -326,8 +337,8 @@ impl ControlPlaneStore for InMemoryControlPlane {
 mod tests {
     use super::super::canonical::CanonicalValue;
     use super::super::fixtures::{
-        DESIRED_STATE_RESOURCES, alias, candidate, legacy_tenant, reference, revision_id, state,
-        state_with_renamed_alias, tenant_id,
+        DESIRED_STATE_RESOURCES, alias, candidate, legacy_tenant, principal_id, reference,
+        revision_id, state, state_with_renamed_alias, tenant_id,
     };
     use super::super::mutation::{Actor, ExpectedRevision};
     use super::super::resource::{ResourceBody, ResourceKind};
@@ -389,6 +400,34 @@ mod tests {
             store.denials(None, 10).await.expect("read"),
             vec![deployment],
             "no tenant means the deployment-scoped page, not every row"
+        );
+
+        // A refusal against this tenant attempted by another tenant's workload is
+        // not part of this tenant's page, as the durable store and its row-level
+        // security both have it: the targeted tenant may read that it refused
+        // something, not who by.
+        let mut intruder = denial(5, ResourceScope::Tenant(tenant), 500);
+        intruder.actor = Actor::Workload {
+            tenant: other,
+            principal: principal_id(36),
+        };
+        store.record_denial(&intruder).await.expect("record");
+        assert!(
+            !store
+                .denials(Some(tenant), 10)
+                .await
+                .expect("read")
+                .contains(&intruder),
+            "a tenant's page named another tenant's workload"
+        );
+        assert!(
+            store
+                .denials(None, 10)
+                .await
+                .expect("read")
+                .iter()
+                .all(|denial| denial.tenant().is_none()),
+            "the platform page is still the deployment-scoped one"
         );
 
         // An outage is an outage for refusals too: a denial that cannot be
