@@ -65,6 +65,11 @@
 //! rather than dropped: it is an operator-actionable mismatch between a published
 //! revision and a file, and silently serving traffic with no credential for that
 //! provider is the failure mode it would otherwise become.
+//!
+//! That refusal is scoped to credentials that would actually land in a pool,
+//! which is why the namespaces a credential serves are computed first: a
+//! withdrawn tenant's leftover key serves nothing, and letting it refuse the
+//! candidate would turn one dormant tenant into a fleet that stops converging.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -130,8 +135,15 @@ impl RevisionProjection for CredentialProjection {
 
         let mut claimed: HashSet<(String, String)> = HashSet::new();
         for credential in &owned {
+            // Namespaces first, so a credential that lands in no pool is skipped
+            // before its provider is checked: an owner whose traffic is withdrawn
+            // must not be able to refuse a revision it does not serve.
+            let serves = serving(&namespaces, credential);
+            if serves.is_empty() {
+                continue;
+            }
             let provider = provider_id(&config, &providers, credential)?;
-            for namespace in serving(&namespaces, credential) {
+            for namespace in serves {
                 claimed.insert((namespace.to_owned(), provider.clone()));
                 config
                     .credential
@@ -139,8 +151,12 @@ impl RevisionProjection for CredentialProjection {
             }
         }
         for credential in &inherited {
+            let serves = serving(&namespaces, credential);
+            if serves.is_empty() {
+                continue;
+            }
             let provider = provider_id(&config, &providers, credential)?;
-            for namespace in serving(&namespaces, credential) {
+            for namespace in serves {
                 if claimed.contains(&(namespace.to_owned(), provider.clone())) {
                     // The project brought its own key for this provider.
                     continue;
@@ -573,6 +589,38 @@ mod tests {
         state
             .insert(fixtures::tenant(TENANT, "acme"))
             .and_then(|state| state.insert(connection()))
+            .and_then(|state| {
+                state.insert(credential(
+                    CREDENTIAL,
+                    "primary",
+                    SecretOwner::tenant(tenant()),
+                    fixtures::secret_ref(CREDENTIAL),
+                    SecretLifecycle::Active,
+                ))
+            })
+            .expect("a valid revision");
+
+        assert_eq!(projected(&state), []);
+    }
+
+    /// And it is skipped *before* its provider is checked. Otherwise a withdrawn
+    /// tenant's leftover key, naming a provider this deployment does not declare,
+    /// would refuse every revision — one dormant tenant stopping the fleet from
+    /// converging on a credential that serves nothing.
+    #[test]
+    fn a_credential_serving_no_namespace_does_not_refuse_for_its_provider() {
+        let mut state = DesiredState::new();
+        let elsewhere = ProviderBody::for_tenant(
+            fixtures::provider_id(CREDENTIAL),
+            tenant(),
+            fixtures::display_name("Elsewhere"),
+            WireFamily::OpenaiChat,
+            "https://elsewhere.example/v1",
+        )
+        .version(Slug::parse("elsewhere").expect("fixture slug"));
+        state
+            .insert(fixtures::tenant(TENANT, "acme"))
+            .and_then(|state| state.insert(elsewhere))
             .and_then(|state| {
                 state.insert(credential(
                     CREDENTIAL,

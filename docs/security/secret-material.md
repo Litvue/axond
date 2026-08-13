@@ -86,11 +86,18 @@ Unwrapping is production code: the harness compiler resolves through
 `SecretMaterialization` and hands the resulting `ResolvedSecrets` to
 `ConfigSnapshot::build_with`, so retention, rotation overlap, and zeroization
 are asserted about the shipped seam and its `MaterialLedger` rather than about a
-mock. What the harness still supplies is the step that turns a resolved version
-into a credential pool entry: the projection that emits `[[credential]]` from
-typed credential bodies is not wired into `serve` yet, so these tests name the
-material with an env-var name of their own. When that projection lands, that one
-seam is what should be repointed at it.
+mock. Turning a resolved version into a credential pool entry is production code
+too: `RuntimeProjection` emits the `[[credential]]` entries a provider call
+leases from, each naming the exact version the candidate resolved, so a request
+that reaches the fake provider with the sentinel key proves the shipped path
+carried it there.
+
+Two seams the harness still supplies, neither touching material: an alias's
+targets, because projecting a catalogue is its own slice, and which namespace an
+inbound key binds to, because binding a caller to a projected namespace is
+#252's. A projected project is reached by a qualified id no `axond.toml` can
+declare, so the suite rebinds its bootstrap key to it rather than inventing an
+identity model. Stateful `serve` is still not wired for the same reason.
 
 The authenticated `/admin/v1` boundary is likewise not on this branch; the
 administrative reads that page is responsible for are asserted at the store
