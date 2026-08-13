@@ -178,7 +178,10 @@ alert at two consecutive refusals rather than one.
 The count is a property of the catalogue rather than of whatever drives it:
 `LastKnownGoodCatalog::record_refresh` takes the whole refresh outcome, so a
 fetch that never reached a parse still counts and a confirmed `304` still ends
-the run, and the scheduler slice has no separate bookkeeping to get wrong.
+the run, and the scheduler slice has no separate bookkeeping to get wrong. Every
+refusal it counts is also handed back with its reason — on the error for a failed
+refresh, and as `Refreshed::Refused` for the one refusal that produces no error —
+so the counter split by reason can never fall behind the run gauge.
 
 None of this is an availability incident. Catalogue freshness is not an
 admission, entitlement, billing, readiness, or liveness dependency: a stale

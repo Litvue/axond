@@ -727,6 +727,12 @@ pub fn record_status_refresh(component: &'static str, outcome: &'static str) {
 /// The reason and nothing else: the pointer, source URL, and error text the
 /// refusal also carries are unbounded over one upstream document, and belong to
 /// the log line the import wrote.
+///
+/// Every refusal has one to record: a failed refresh carries it on its error, and
+/// a refresh that refused without an error carries it in
+/// [`Refreshed::Refused`](crate::backends::catalog::Refreshed::Refused), so a
+/// caller counting only its error branch would let the run climb without naming a
+/// reason.
 #[allow(dead_code)]
 pub fn record_catalog_refusal(reason: crate::backends::catalog::RefusalReason) {
     let Some(instruments) = INSTRUMENTS.get() else {

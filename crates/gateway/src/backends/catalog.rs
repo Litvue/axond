@@ -2079,6 +2079,40 @@ pub enum Admission {
     Initial { content_id: CatalogContentId },
 }
 
+/// What a refresh that produced no error did to the catalogue.
+///
+/// A refresh can fail without an error to log: a source that answers "not
+/// modified" where nothing was ever imported has refused the import while
+/// reporting success. Naming that outcome, and carrying the [`Refusal`] with it,
+/// is what keeps a caller's refusal counter agreeing with the catalogue's own —
+/// recording a reason from the error branch alone would count the run without
+/// ever naming this reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refreshed {
+    /// The refresh advanced the catalogue, or confirmed what was already active.
+    Admitted(Admission),
+    /// The refresh left the catalogue where it was, for this bounded reason.
+    Refused(Refusal),
+}
+
+impl Refreshed {
+    /// The admission, when the refresh advanced or confirmed the catalogue.
+    pub const fn admission(&self) -> Option<&Admission> {
+        match self {
+            Self::Admitted(admission) => Some(admission),
+            Self::Refused(_) => None,
+        }
+    }
+
+    /// The refusal to record, when the refresh advanced nothing.
+    pub const fn refusal(&self) -> Option<&Refusal> {
+        match self {
+            Self::Admitted(_) => None,
+            Self::Refused(refusal) => Some(refusal),
+        }
+    }
+}
+
 /// The active catalogue, and the rule that a failed import cannot disturb it.
 ///
 /// Every import goes through [`LastKnownGoodCatalog::admit`] or
@@ -2247,16 +2281,19 @@ impl LastKnownGoodCatalog {
     /// of a caller's diligence: a fetch failure counts, and a confirmed
     /// unchanged answer ends the run and ages the active snapshot forward.
     ///
-    /// `Ok(None)` is the one odd answer: a `304` before any first import
-    /// confirms content nobody holds, which no conditional request asked for.
-    /// There is nothing to admit and nothing to age, but the import did not
+    /// [`Refreshed::Refused`] is the one odd answer: a `304` before any first
+    /// import confirms content nobody holds, which no conditional request asked
+    /// for. There is nothing to admit and nothing to age, but the import did not
     /// advance the catalogue either, so it counts as an
     /// [`RefusalReason::UnsolicitedUnchanged`] refusal rather than passing
     /// silently — otherwise an intermediary answering `304` to every
     /// unconditional request would leave the catalogue empty with every signal
     /// at rest. The reason is its own arm because no `CatalogError` was ever
     /// produced, so the runbook's pointer-in-the-log step has nothing to offer
-    /// and the label itself has to say why.
+    /// and the label itself has to say why. It is carried in the success value
+    /// rather than counted silently so a caller recording a reason from its error
+    /// branch alone cannot miss it: every refusal this method counts is also
+    /// handed back with a [`Refusal`] to record.
     ///
     /// An admitted snapshot is aged to `checked_at` rather than to the
     /// `fetched_at` its source stated: age means how long ago *this process*
@@ -2268,20 +2305,26 @@ impl LastKnownGoodCatalog {
         &mut self,
         refreshed: Result<CatalogRefresh, E>,
         checked_at: SystemTime,
-    ) -> Result<Option<Admission>, (E, Option<&CatalogSnapshot>)> {
+    ) -> Result<Refreshed, (E, Option<&CatalogSnapshot>)> {
         match refreshed {
             Ok(CatalogRefresh::Unchanged { validators }) => {
                 if !self.record_unchanged(validators, checked_at) {
-                    self.record_refusal(Refusal::new(RefusalReason::UnsolicitedUnchanged));
-                    return Ok(None);
+                    let refusal = Refusal::new(RefusalReason::UnsolicitedUnchanged);
+                    self.record_refusal(refusal.clone());
+                    return Ok(Refreshed::Refused(refusal));
                 }
-                Ok(self.active.as_ref().map(|active| Admission::Unchanged {
-                    content_id: active.content.content_id(),
+                Ok(Refreshed::Admitted(Admission::Unchanged {
+                    content_id: self
+                        .active
+                        .as_ref()
+                        .expect("an unchanged answer was confirmed against an active snapshot")
+                        .content
+                        .content_id(),
                 }))
             }
             Ok(CatalogRefresh::Updated(mut snapshot)) => {
                 snapshot.source.fetched_at = checked_at;
-                Ok(Some(self.admit(*snapshot)))
+                Ok(Refreshed::Admitted(self.admit(*snapshot)))
             }
             Err(error) => {
                 self.record_refusal(error.refusal());
@@ -3439,7 +3482,10 @@ mod tests {
                 imported_at,
             )
             .expect("an admitted import");
-        assert!(matches!(first, Some(Admission::Initial { .. })));
+        assert!(matches!(
+            first,
+            Refreshed::Admitted(Admission::Initial { .. })
+        ));
 
         // A fetch that never produced a document to parse still counts.
         let unreachable = CatalogError::unavailable("test", "connection refused".to_owned());
@@ -3462,7 +3508,10 @@ mod tests {
                 checked_at,
             )
             .expect("a confirmed answer");
-        assert!(matches!(confirmed, Some(Admission::Unchanged { .. })));
+        assert!(matches!(
+            confirmed,
+            Refreshed::Admitted(Admission::Unchanged { .. })
+        ));
         let report = catalogue.report(checked_at);
         assert_eq!(report.consecutive_refusals, 0, "a 304 ends the run");
         assert_eq!(report.active_age(), Some(Duration::ZERO));
@@ -3475,16 +3524,19 @@ mod tests {
     fn an_unchanged_answer_with_nothing_held_is_counted_as_a_refusal() {
         let mut catalogue = LastKnownGoodCatalog::new();
         let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        assert!(
-            catalogue
-                .record_refresh::<CatalogError>(
-                    Ok(CatalogRefresh::Unchanged {
-                        validators: SourceValidators::etag("\"one\""),
-                    }),
-                    checked_at,
-                )
-                .expect("nothing to admit")
-                .is_none()
+        let refreshed = catalogue
+            .record_refresh::<CatalogError>(
+                Ok(CatalogRefresh::Unchanged {
+                    validators: SourceValidators::etag("\"one\""),
+                }),
+                checked_at,
+            )
+            .expect("an answer, not an error");
+        assert_eq!(refreshed.admission(), None, "nothing was admitted");
+        assert_eq!(
+            refreshed.refusal().map(Refusal::reason),
+            Some(RefusalReason::UnsolicitedUnchanged),
+            "and the caller is handed the reason to record, not just a count"
         );
         let report = catalogue.report(checked_at);
         assert_eq!(report.active, None, "nothing became active");
