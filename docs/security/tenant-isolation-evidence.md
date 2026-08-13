@@ -56,7 +56,7 @@ runtime. Each names the change that unblocks it.
 | --- | --- | --- |
 | A principal of one tenant is refused a project, credential, or alias of another at the service layer | [#144] — durable principals, roles, and `Directory::authorize` | There is no principal in the runtime today: an inbound caller is a gateway key bound to a namespace in the config, so there is nothing to authorize *as*, and no denial to record |
 | A cross-tenant read is refused by the database itself, not only by the query that asked | [#144] — row-level security keyed on `axond.tenant_id` | The shipped control-plane schema has ownership constraints and the hydration join, but no RLS policy, so "the DB refuses it" cannot be asserted without asserting the absence of a policy that is not there |
-| No cross-tenant visibility through the admin surface | [#200] — the authenticated `/admin/v1` protocol and service boundary | The routes do not exist; the runtime serves the inference surface only |
+| No cross-tenant visibility through the admin surface | [#143] — the `/admin/v1` resource handlers | [#200]'s protocol and service boundary has landed, but it is contract-only: the route table is empty and `serve` mounts nothing, so the runtime still answers on the inference surface alone and there is no administrative read to scope |
 | Tenancy isolation holds over *durable* projects and credentials rather than configured namespaces | The convergence slice that wires desired state into `serve` | `desired_state` and `convergence` are contract-only: no revision is loaded on the request path, so the runtime's namespaces are the ones its config declares. The projection that makes a project a tenant-qualified namespace is tested where it lives (`convergence::tenancy`), and the runtime suite above exercises the same *shape* of namespace id, which is what keeps the two from drifting before they are joined |
 
 When each lands, the corresponding row moves into the table above with the test
@@ -65,6 +65,7 @@ that proves it. The suite is structured for that: the harness in
 describes the deployment rather than any one case, so a new assertion is a test
 against the tenants already booted.
 
+[#143]: https://github.com/Litvue/axond/issues/143
 [#144]: https://github.com/Litvue/axond/issues/144
 [#200]: https://github.com/Litvue/axond/issues/200
 [#225]: https://github.com/Litvue/axond/issues/225
