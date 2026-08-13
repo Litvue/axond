@@ -43,8 +43,12 @@ echo "check-cosign-format: cosign ${installed} matches the release pin"
 
 work="$(mktemp -d)"
 registry=""
+# The trap runs under `set -e`, so a failing removal must not take the rest of
+# the cleanup — or the script's exit status — with it.
 cleanup() {
-  [[ -n "$registry" ]] && docker rm --force "$registry" >/dev/null 2>&1
+  if [[ -n "$registry" ]]; then
+    docker rm --force "$registry" >/dev/null 2>&1 || true
+  fi
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -101,10 +105,14 @@ digest_of() {
     tr -d '\r' | awk '/^[Dd]ocker-[Cc]ontent-[Dd]igest:/ {print $2}'
 }
 
-docker buildx build --provenance=false --sbom=false --platform linux/amd64 \
-  --tag "${image}:arch" --push "$work" >/dev/null
-arch_digest="$(digest_of arch)"
+for platform in amd64 arm64; do
+  docker buildx build --provenance=false --sbom=false "--platform=linux/${platform}" \
+    --tag "${image}:${platform}" --push "$work" >/dev/null
+done
+arch_digest="$(digest_of amd64)"
+other_digest="$(digest_of arm64)"
 test -n "$arch_digest"
+test -n "$other_digest"
 cosign sign --yes --key "$key" --tlog-upload=false "${image}@${arch_digest}"
 assert_signature_tag cosign-format-canary "$arch_digest" "architecture image"
 cosign verify --key "$pub" --insecure-ignore-tlog=true \
@@ -114,9 +122,18 @@ cosign verify --key "$pub" --insecure-ignore-tlog=true \
 # descriptor: a format change could reach one lane and not the other. The index
 # is assembled the way ops/publish-image-index.sh assembles it.
 docker buildx imagetools create --tag "${image}:index" \
-  "${image}@${arch_digest}" >/dev/null
+  "${image}@${arch_digest}" "${image}@${other_digest}" >/dev/null
 index_digest="$(digest_of index)"
 test -n "$index_digest"
+# Two children so the result is an index rather than a passed-through manifest:
+# with one source, buildx may return the source descriptor itself, and the
+# assertion below would then re-check the architecture image's signature and
+# report the index as covered without ever signing one.
+if [[ "$index_digest" == "$arch_digest" || "$index_digest" == "$other_digest" ]]; then
+  echo "check-cosign-format: imagetools returned a child manifest (${index_digest})" \
+    "instead of an index, so the index half of this check would prove nothing" >&2
+  exit 1
+fi
 cosign sign --yes --key "$key" --tlog-upload=false "${image}@${index_digest}"
 assert_signature_tag cosign-format-canary "$index_digest" "multi-arch index"
 cosign verify --key "$pub" --insecure-ignore-tlog=true \

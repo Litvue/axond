@@ -135,17 +135,28 @@ def check_cosign_verify(text: str, relative: str) -> list[str]:
 
     Keyless verification without both certificate flags accepts any Fulcio
     certificate, so it proves only that *someone* signed the artifact. `--key`
-    is the other way to say the same thing — the signature must verify against
-    one named public key — and the certificate flags do not apply to it.
+    can say the same thing — the signature must verify against one named public
+    key — but only when the file knows which key that is, so the exemption is
+    limited to a file that mints the pair it then verifies against. A `--key`
+    pointing at anything supplied from outside names no signer, and the release
+    path must keep restricting the identity and its issuer instead.
     """
     failures: list[str] = []
     lines = text.splitlines()
+    self_minted = "cosign generate-key-pair" in text
     for index, line in enumerate(lines):
         # A shell comment discussing the command is prose, not an invocation.
         if "cosign verify" not in line or line.lstrip().startswith("#"):
             continue
         block = command_block(lines, index)
         if re.search(r"--key[= ]", block):
+            if self_minted:
+                continue
+            failures.append(
+                f"{relative}:{index + 1}: `cosign verify --key` names a signer only "
+                "where the key is generated in this file; otherwise pass "
+                "--certificate-identity-regexp and --certificate-oidc-issuer"
+            )
             continue
         if "--certificate-identity-regexp" not in block or "--certificate-oidc-issuer" not in block:
             failures.append(
@@ -297,11 +308,19 @@ def self_test() -> list[str]:
             "one reviewed pin per action",
         ),
         (
-            "cosign verify bound to a named public key instead",
+            "cosign verify bound to a public key the lane minted itself",
             SELF_TEST_PERMISSIONS
             + "jobs:\n  a:\n    steps:\n"
+            "      - run: cosign generate-key-pair --output-key-prefix k\n"
             "      - run: cosign verify --key k.pub ghcr.io/o/r@sha256:x\n",
             "",
+        ),
+        (
+            "cosign verify against a key that comes from somewhere else",
+            SELF_TEST_PERMISSIONS
+            + "jobs:\n  a:\n    steps:\n"
+            '      - run: cosign verify --key "$SOME_KEY" ghcr.io/o/r@sha256:x\n',
+            "names a signer only where the key is generated in this file",
         ),
         (
             "cosign verify without an identity restriction",
@@ -358,6 +377,7 @@ def self_test() -> list[str]:
         # neighbouring one must not lend that restriction to a keyless verify:
         # both invocations are read as the separate commands they are.
         script.write_text(
+            'cosign generate-key-pair --output-key-prefix "$WORK/k"\n'
             'cosign verify --key "$PUB" "$IMAGE" >/dev/null\n'
             'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
             encoding="utf-8",
@@ -365,6 +385,7 @@ def self_test() -> list[str]:
         if check(root):
             problems.append(f"self-test: key-based verifies were rejected: {check(root)}")
         script.write_text(
+            'cosign generate-key-pair --output-key-prefix "$WORK/k"\n'
             'cosign verify "$IMAGE" >/dev/null\n'
             'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
             encoding="utf-8",
