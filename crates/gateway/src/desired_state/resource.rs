@@ -78,18 +78,26 @@ impl ResourceKind {
 
     /// Whether a kind may live at a scope.
     ///
-    /// Three rules, and they are the reason scope is on the envelope rather than
+    /// Four rules, and they are the reason scope is on the envelope rather than
     /// inside a body:
     ///
     /// - a tenant and the model catalogue are deployment-wide: the tenant *is*
     ///   the boundary, and catalogue metadata is upstream fact, not tenant state;
     /// - a project belongs to exactly one tenant;
+    /// - an identity may live at *any* scope, because a platform administrator is
+    ///   an identity that belongs to no tenant: its grants are over the
+    ///   deployment, so scoping it into one tenant would either be a lie or make
+    ///   the platform role unrepresentable. The narrower scopes are the ordinary
+    ///   case — a tenant's administrator, a project's workload — and
+    ///   [`Directory`](super::access::Directory) holds each role to the scopes it
+    ///   may be granted at;
     /// - everything else is tenant- or project-scoped, never deployment-wide, so
     ///   no ordinary resource can be authored outside a tenant by accident.
     pub const fn permits(self, scope: &ResourceScope) -> bool {
         match self {
             Self::Tenant | Self::CatalogModel => matches!(scope, ResourceScope::Deployment),
             Self::Project => matches!(scope, ResourceScope::Tenant(_)),
+            Self::Identity => true,
             _ => matches!(
                 scope,
                 ResourceScope::Tenant(_) | ResourceScope::Project { .. }
@@ -128,6 +136,38 @@ impl ResourceScope {
         match self {
             Self::Deployment => None,
             Self::Tenant(tenant) | Self::Project { tenant, .. } => Some(*tenant),
+        }
+    }
+
+    /// Whether this scope encloses `inner`: a grant held here reaches there.
+    ///
+    /// Containment runs one way only. Deployment encloses every scope, a tenant
+    /// encloses itself and its own projects, and a project encloses nothing but
+    /// itself — a grant on one project is not a grant on its tenant, or the
+    /// narrowest grant would be the widest one.
+    pub fn contains(&self, inner: &Self) -> bool {
+        match (self, inner) {
+            (Self::Deployment, _) => true,
+            (Self::Tenant(outer), Self::Tenant(tenant) | Self::Project { tenant, .. }) => {
+                outer == tenant
+            }
+            (Self::Tenant(_) | Self::Project { .. }, Self::Deployment) => false,
+            (Self::Project { .. }, Self::Tenant(_)) => false,
+            (Self::Project { .. }, Self::Project { .. }) => self == inner,
+        }
+    }
+}
+
+/// Renders a scope the way a refusal has to name it: ids only, narrowest last.
+///
+/// Ids rather than slugs, because a slug is renameable and a message an operator
+/// reads has to point at the row they can look up.
+impl std::fmt::Display for ResourceScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deployment => f.write_str("deployment scope"),
+            Self::Tenant(tenant) => write!(f, "{tenant}"),
+            Self::Project { tenant, project } => write!(f, "{tenant}/{project}"),
         }
     }
 }
@@ -476,11 +516,28 @@ mod tests {
         assert!(ResourceKind::CatalogModel.permits(&ResourceScope::Deployment));
         assert!(ResourceKind::Project.permits(&ResourceScope::Tenant(tenant)));
         assert!(!ResourceKind::Project.permits(&project));
+        // An identity is the one kind that lives at every scope: a platform
+        // administrator belongs to no tenant, and a project's workload belongs to
+        // one project. Which *roles* each may hold is the directory's rule, not
+        // the envelope's.
+        for scope in [
+            ResourceScope::Deployment,
+            ResourceScope::Tenant(tenant),
+            project.clone(),
+        ] {
+            assert!(
+                ResourceKind::Identity.permits(&scope),
+                "identity at {scope}"
+            );
+        }
 
         for kind in ResourceKind::ALL {
             if matches!(
                 kind,
-                ResourceKind::Tenant | ResourceKind::Project | ResourceKind::CatalogModel
+                ResourceKind::Tenant
+                    | ResourceKind::Project
+                    | ResourceKind::CatalogModel
+                    | ResourceKind::Identity
             ) {
                 continue;
             }

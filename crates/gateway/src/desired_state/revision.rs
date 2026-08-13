@@ -25,12 +25,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
+use super::access::Directory;
 use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, SerializerVersion};
 use super::credentials::{CredentialError, Credentials};
-use super::ids::{AuditEventId, MutationId, RevisionId, Slug};
+use super::ids::{AuditEventId, MutationId, ResourceId, RevisionId, Slug};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::policy::{PolicyError, PolicySet};
-use super::resource::{BlobRef, ResourceRef, ResourceScope, ResourceVersion};
+use super::resource::{BlobRef, ResourceKind, ResourceRef, ResourceScope, ResourceVersion};
 use super::tenancy::{Tenancy, TenancyError};
 
 /// Why a desired state is not a valid revision.
@@ -49,6 +50,11 @@ pub enum ValidationError {
     MultipleVersions {
         first: ResourceRef,
         second: ResourceRef,
+    },
+    #[error("{proposed} does not advance on {previous}")]
+    VersionNotAdvanced {
+        previous: ResourceRef,
+        proposed: ResourceRef,
     },
     #[error("`{slug}` names both {first} and {second} in the same scope")]
     DuplicateSlug {
@@ -246,12 +252,19 @@ impl DesiredState {
             return Err(ValidationError::UnreferencedBlob { digest: *digest });
         }
 
-        // Last, because it is the only step that reads a *body*: everything above
-        // holds for every resource kind, including the ones whose schemas later
-        // slices own. Tenancy is the one schema the domain knows (#191), and it is
-        // what makes ownership — a project's tenant, and the tenant of anything
+        // Last, because these are the only steps that read a *body*: everything
+        // above holds for every resource kind, including the ones whose schemas
+        // later slices own. Tenancy is the schema the domain knows (#191), and it
+        // is what makes ownership — a project's tenant, and the tenant of anything
         // scoped to one — a domain invariant rather than a projection's problem.
-        Tenancy::of(self)?;
+        let tenancy = Tenancy::of(self)?;
+        // Then the directory, against that tenancy (#144): a grant over a tenant
+        // this revision does not declare, or over another tenant's project, is
+        // refused here rather than at the moment someone uses it. Identity bodies
+        // are strictly read because no release has ever published one — there is
+        // no untyped identity row in any deployment for this to become
+        // retroactively strict about.
+        Directory::of(self, &tenancy)?;
 
         // Then the bodies that hang off tenancy. Credentials are read after it
         // because their ownership is stated in the same terms — a tenant, and
@@ -266,6 +279,45 @@ impl DesiredState {
         PolicySet::of(self)?;
 
         Ok(())
+    }
+
+    /// Replace a resource with a later version of itself.
+    ///
+    /// The shape every administrative change has: desired state is complete, so
+    /// renaming a project or disabling a tenant means republishing everything with
+    /// one resource advanced. Refuses a version that does not advance, because a
+    /// revision that reuses a version number would make "which body is version 3?"
+    /// depend on which revision you loaded.
+    ///
+    /// Inserts when the resource is absent, so a caller building the next revision
+    /// out of the current one does not have to branch on whether it is a create.
+    pub fn supersede(&mut self, resource: ResourceVersion) -> Result<&mut Self, ValidationError> {
+        let previous = self
+            .resources
+            .keys()
+            .find(|reference| {
+                reference.kind == resource.reference.kind && reference.id == resource.reference.id
+            })
+            .copied();
+        if let Some(previous) = previous {
+            if previous.version >= resource.reference.version {
+                return Err(ValidationError::VersionNotAdvanced {
+                    previous,
+                    proposed: resource.reference,
+                });
+            }
+            self.resources.remove(&previous);
+        }
+        self.insert(resource)
+    }
+
+    /// The version of a resource this state holds, by identity rather than by
+    /// reference: a caller advancing a resource knows *which* resource, not which
+    /// version number it is currently at.
+    pub fn version_of(&self, kind: ResourceKind, id: ResourceId) -> Option<&ResourceVersion> {
+        self.resources
+            .values()
+            .find(|resource| resource.reference.kind == kind && resource.reference.id == id)
     }
 
     /// The checksum of this state's canonical bytes: the revision's identity as

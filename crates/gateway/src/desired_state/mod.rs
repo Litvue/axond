@@ -17,7 +17,8 @@
 //! | [`resource`] | what a resource is: a generic envelope, versioned references, content-addressed blobs |
 //! | [`mutation`] | who changed it, under what expectation, and what the audit trail records |
 //! | [`revision`] | the complete state, the candidate that proposes it, the manifest that records it, and the integrity checks that let a replica trust it |
-//! | [`tenancy`] | the first two body schemas: what a tenant and a tenant-owned project are, and who owns what |
+//! | [`tenancy`] | the first two body schemas: what a tenant and a tenant-owned project are, who owns what, and where a tenant is in its life |
+//! | [`access`] | who may change it: the identity directory, the roles, and the authorization decision a mutation has to carry |
 //! | [`policy`] | the complete policy document of a tenant or a project, its generation, and how a change to it may be activated |
 //!
 //! # Three properties everything else rests on
@@ -44,16 +45,24 @@
 //!
 //! It is not wired into the request path. The runtime remains stateless: nothing
 //! here is constructed by `serve`, and no snapshot is compiled from a revision
-//! yet. It is also not a complete body model: [`tenancy`] and [`policy`] are the
-//! only schemas the domain reads, and identity, provider, catalogue, and pricing
-//! bodies remain owned by their own slices. A policy document is a contract
-//! rather than an activation: nothing enforces one, and [`PolicyTransition`]
-//! states what enforcing a change *would* require of a fleet.
+//! yet. It is also not a complete body model: [`tenancy`], [`access`], and
+//! [`policy`] are the only schemas the domain reads, and provider, catalogue, and
+//! pricing bodies remain owned by their own slices — [`access::Surface`] names
+//! those surfaces so they can be authorized against, which is not the same as
+//! authoring them. A policy document is a contract rather than an activation:
+//! nothing enforces one, and [`PolicyTransition`] states what enforcing a change
+//! *would* require of a fleet.
+//!
+//! Nor is [`access`] request-path authorization. An inference request is
+//! authorized against the snapshot it captured when it started
+//! ([`crate::principals`]); a [`access::Role`] is about administering the control
+//! plane, and no directory is consulted while a request is in flight.
 //!
 //! The types are the contract that #165, #166, and #142 build against, and the
 //! test-only `oracle` module is the executable statement of how a
 //! `ControlPlaneStore` must behave when they do.
 
+pub mod access;
 pub mod canonical;
 pub mod credentials;
 pub mod ids;
@@ -75,6 +84,12 @@ pub(crate) mod oracle;
 // a re-export nothing in the tree happens to name yet is still part of the
 // contract #165, #166, and #142 build against.
 #[allow(unused_imports)]
+pub use access::{
+    AccessDenial, AccessRequest, Action, Authorization, Basis, Caller, Credential, Denial,
+    DenialReason, Directory, IDENTITY_SCHEMA, IdentityBody, IdentityError, IdentityKind, KeyError,
+    Principal, Role, Surface, WorkloadKey,
+};
+#[allow(unused_imports)]
 pub use canonical::{
     Canonical, CanonicalError, CanonicalValue, Checksum, InvalidChecksum, SerializerVersion,
 };
@@ -85,8 +100,8 @@ pub use credentials::{
 };
 #[allow(unused_imports)]
 pub use ids::{
-    AuditEventId, InvalidId, InvalidSlug, InvalidUuid7, MutationId, ProjectId, ResourceId,
-    RevisionId, SecretId, Slug, TenantId, Uuid7, Uuid7Generator,
+    AuditEventId, InvalidId, InvalidSlug, InvalidUuid7, MutationId, PrincipalId, ProjectId,
+    ResourceId, RevisionId, SecretId, Slug, TenantId, Uuid7, Uuid7Generator,
 };
 #[allow(unused_imports)]
 pub use mutation::{
@@ -118,5 +133,6 @@ pub use secrets::{
 #[allow(unused_imports)]
 pub use tenancy::{
     DisplayName, InvalidDisplayName, PROJECT_SCHEMA, Project, ProjectBody, QualifiedProject,
-    TENANT_SCHEMA, Tenancy, TenancyError, Tenant, TenantBody,
+    TENANT_LIFECYCLE_SCHEMA, TENANT_SCHEMA, Tenancy, TenancyError, Tenant, TenantBody,
+    TenantLifecycle,
 };
