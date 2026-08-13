@@ -287,22 +287,23 @@ sustained, or the same spread over `axond_revision_converged`. Both are
 per-replica gauges with no labels of their own, so the fleet view is the spread
 across the series your scrape distinguishes by `instance`.
 
-That distinction has to come from your pipeline, because axond's OTLP resource
-carries only `service.name`. A per-replica collector — a sidecar, or a DaemonSet
-scraped per pod — gives each replica its own series and the spread works. A
-*single shared* collector receiving OTLP from every replica collapses them into
-one series, and then every spread in this section is permanently zero and
-`AxondFleetRevisionSplit` can never fire. Either run the collector per replica,
-or add a replica-identifying resource attribute in the pipeline and turn
-`resource_to_telemetry_conversion` on so it reaches the series.
+That distinction has to come from your pipeline. Set a unique
+`AXOND_INSTANCE_ID` on each replica and use the shipped collector configuration:
+it converts Axond's `service.instance.id` OTLP resource attribute into the
+`service_instance_id` Prometheus label. A per-replica collector — a sidecar, or a
+DaemonSet scraped per pod — also works and can use its normal `instance` label.
+A *single shared* collector receiving OTLP from every replica without either
+identity path collapses them into one series, and then every spread in this
+section is permanently zero and `AxondFleetRevisionSplit` can never fire.
+Neither identity path contains tenant, model, caller, or credential data.
 
 **Alert.** `AxondFleetRevisionSplit`.
 
 **First response.** A brief split is convergence working: replicas converge
 independently and there is no fleet-wide barrier. A persistent split is one
-replica stuck — take that replica's identity from the series labels your scrape
-adds (`instance`, `pod`), read its `GET /admin/v1/status` revision summary (once
-convergence is wired — it is `null` until then), and
+replica stuck — take its `service_instance_id` (or the per-replica scrape
+`instance`/`pod`) from the series, read its `GET /admin/v1/status` revision
+summary (once convergence is wired — it is `null` until then), and
 treat it as the previous failure mode. A replica whose generation lags after a
 file reload rather than a revision has a different file or environment than its
 siblings; restarting *that* replica is safe and usually the fix.

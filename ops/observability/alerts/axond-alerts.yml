@@ -112,13 +112,13 @@ groups:
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-control-plane-is-unreachable"
 
       - alert: AxondRevisionLagAboveTarget
-        expr: "max(axond_revision_lag) > 600000"
+        expr: "max by (service_instance_id) (axond_revision_lag) > 600000"
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "A replica has been behind the desired revision for over 10 minutes"
-          description: "Lag measures how long desired has differed from active. Seconds are convergence working; ten minutes is an incident. Read the rejection reason for the stage that refused."
+          summary: "Replica {{ $labels.service_instance_id }} has been behind the desired revision for over 10 minutes"
+          description: "Lag measures how long desired has differed from active. Seconds are convergence working; ten minutes is an incident. Read the affected replica's rejection reason for the stage that refused."
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-replica-will-not-converge"
 
       - alert: AxondRevisionRejectionsSustained

@@ -162,6 +162,11 @@ fn canonical_label(spec: &MetricSpec, prometheus_key: &str) -> Option<&'static s
         .iter()
         .find(|label| label.key.replace('.', "_") == prometheus_key)
         .map(|label| label.key)
+        .or_else(|| {
+            catalog::resource_label("service.instance.id")
+                .filter(|label| label.key.replace('.', "_") == prometheus_key)
+                .map(|label| label.key)
+        })
 }
 
 /// One metric selector found in an expression: the family, and the label
@@ -523,7 +528,8 @@ pub fn validate_expression(asset: &str, expr: &str) -> Vec<AssetError> {
                 });
                 continue;
             };
-            if let Some(literal) = &matcher.literal
+            if catalog::resource_label(canonical).is_none()
+                && let Some(literal) = &matcher.literal
                 && let Err(error) = catalog::validate_label_value(spec.name, canonical, literal)
             {
                 failures.push(AssetError::Catalog {
@@ -806,6 +812,7 @@ fn validate_drill_down(asset: &str, variable: &str, definition: &str) -> Vec<Ass
     };
     let class = spec
         .label(canonical)
+        .or_else(|| catalog::resource_label(canonical))
         .map(|label| label.class)
         .unwrap_or(LabelClass::Closed);
     if class != LabelClass::Configured {

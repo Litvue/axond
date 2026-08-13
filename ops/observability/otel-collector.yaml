@@ -4,17 +4,20 @@
 # here rather than by the gateway. `add_metric_suffixes: false` is what makes the
 # translation exactly "dots become underscores": no `_total` on counters and no
 # unit suffix, which is the spelling the shipped assets use. Flip it and the
-# assets match nothing.
+# assets match nothing. Resource conversion preserves the optional
+# `service.instance.id` as `service_instance_id`, which lets fleet panels and
+# alerts name the lagging replica.
 #
 # This pipeline is written for a collector *per replica* — a sidecar, or a
 # DaemonSet whose exporter is scraped per pod — because that is what gives each
-# replica its own series. axond's resource carries only `service.name`, so a
-# single shared collector receiving OTLP from the whole fleet collapses every
-# replica into one series, and the fleet-spread rules
+# replica its own series. Set `AXOND_INSTANCE_ID` uniquely on each replica; a
+# single shared collector receiving OTLP from the whole fleet otherwise collapses
+# every replica into one series, and the fleet-spread rules
 # (`AxondFleetRevisionSplit`, `AxondRevisionConvergenceSplit`, and the
 # convergence panels) then read zero for ever. If you must centralise, add a
 # replica-identifying resource attribute upstream and set
-# `resource_to_telemetry_conversion: enabled: true` so it reaches the series.
+# `resource_to_telemetry_conversion: enabled: true` below so it reaches the
+# series.
 #
 # Everything else below is a minimum, not a recommendation: add your own
 # processors, authentication, and exporters as your environment requires.
@@ -33,7 +36,7 @@ exporters:
     endpoint: 0.0.0.0:9464
     add_metric_suffixes: false
     resource_to_telemetry_conversion:
-      enabled: false
+      enabled: true
     # The default, stated because a rule depends on it:
     # AxondStatusRefresherStalled detects a stalled refresher as the absence of
     # axond_status_refreshes over ten minutes, and this is how long a series
