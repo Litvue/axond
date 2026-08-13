@@ -35,22 +35,71 @@ def markdown_files() -> list[Path]:
     )
 
 
+def display(path: Path) -> str:
+    """A path as the repository names it, or as given when it is outside the tree."""
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def heading_slugs(text: str) -> set[str]:
+    """Every fragment a Markdown page offers, as GitHub derives them.
+
+    GitHub lowercases a heading, drops everything that is not a word character,
+    a hyphen, or a space, and joins on hyphens; inline markup is rendered away
+    first, so `` ### `Cargo.toml` drift `` is reachable as `#cargotoml-drift`.
+    Explicit `<a id>`/`<a name>` targets count too, and a `#` inside a fenced
+    block is code rather than a heading.
+    """
+    slugs = {anchor for anchor in re.findall(r'<a\s+(?:id|name)="([^"]+)"', text)}
+    fenced = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        heading = re.match(r"#{1,6}\s+(.*?)\s*$", line)
+        if heading is None:
+            continue
+        title = re.sub(r"`([^`]*)`", r"\1", heading.group(1))
+        title = re.sub(r"!?\[([^]]*)\]\([^)]*\)", r"\1", title)
+        title = re.sub(r"[*_]", "", title)
+        slugs.add(re.sub(r"[^\w\- ]", "", title.lower()).strip().replace(" ", "-"))
+    return slugs
+
+
 def check_relative_links(files: list[Path]) -> list[str]:
     failures: list[str] = []
     link_pattern = re.compile(r"!?(?:\[[^]]*\])\(([^)]+)\)")
+    # A page is slugged once however many links point into it.
+    slugs: dict[Path, set[str]] = {}
     for source in files:
         text = source.read_text(encoding="utf-8")
         for raw_target in link_pattern.findall(text):
             target = raw_target.strip().strip("<>")
-            if not target or target.startswith(("#", "http://", "https://", "mailto:")):
+            if not target or target.startswith(("http://", "https://", "mailto:")):
                 continue
             path_text = unquote(target.split("#", 1)[0].split("?", 1)[0])
-            if not path_text:
-                continue
-            resolved = (source.parent / path_text).resolve()
+            fragment = unquote(target.partition("#")[2])
+            resolved = (source.parent / path_text).resolve() if path_text else source
             if not resolved.exists():
                 failures.append(
-                    f"{source.relative_to(ROOT)}: missing relative link target {target!r}"
+                    f"{display(source)}: missing relative link target {target!r}"
+                )
+                continue
+            # A fragment is checked for Markdown only: a line anchor into source
+            # is not a heading, and a renamed heading is the silent break here —
+            # the link keeps resolving to the page and lands at its top.
+            if not fragment or resolved.suffix != ".md":
+                continue
+            if resolved not in slugs:
+                slugs[resolved] = heading_slugs(resolved.read_text(encoding="utf-8"))
+            if fragment not in slugs[resolved]:
+                failures.append(
+                    f"{display(source)}: link {target!r} names no heading in "
+                    f"{display(resolved)}"
                 )
     return failures
 
@@ -368,6 +417,41 @@ def self_test() -> int:
         empty_record = check_adr_numbering(records)
         assert len(empty_record) == 1, empty_record
         assert "does not start with" in empty_record[0], empty_record
+
+    # Fragments: the slug rules a cross-link relies on, and the rename it breaks.
+    page = (
+        "# Releasing\n\n"
+        "## Version classification\n\n"
+        "### `Cargo.toml` drift, **checked**\n\n"
+        '<a id="legacy-anchor"></a>\n\n'
+        "```text\n# Not a heading\n```\n"
+    )
+    assert heading_slugs(page) == {
+        "releasing",
+        "version-classification",
+        "cargotoml-drift-checked",
+        "legacy-anchor",
+    }, heading_slugs(page)
+    assert "not-a-heading" not in heading_slugs(page)
+    with tempfile.TemporaryDirectory() as raw:
+        pages = Path(raw)
+        (pages / "runbook.md").write_text(page, encoding="utf-8")
+        source = pages / "guide.md"
+        source.write_text(
+            "[classification](./runbook.md#version-classification)\n"
+            "[self](#top)\n\n# Top\n",
+            encoding="utf-8",
+        )
+        assert check_relative_links([source]) == []
+        # The rename this gate exists for: the page still resolves, the heading
+        # does not, and the reader lands at the top of it with no error anywhere.
+        (pages / "runbook.md").write_text(
+            page.replace("## Version classification", "## How a version is classified"),
+            encoding="utf-8",
+        )
+        renamed = check_relative_links([source])
+        assert len(renamed) == 1, renamed
+        assert "names no heading in" in renamed[0], renamed
 
     print("check-docs: release-path gate self-test passed")
     return 0
