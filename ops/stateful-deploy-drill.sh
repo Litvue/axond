@@ -180,10 +180,13 @@ kube apply -f "${workdir}/rendered.yaml" >/dev/null
 step "One Job migrates the schema, and a rerun is a no-op"
 kube -n axond wait --for=condition=complete job/axond-migrate --timeout=180s >/dev/null ||
   fail "the axond-migrate Job did not complete: $(kube -n axond logs job/axond-migrate 2>&1 | tail -n 5)"
-migration_log="$(kube -n axond logs job/axond-migrate)"
+# Every attempt's Pod survives its Job (`restartPolicy: Never`, `backoffLimit: 6`),
+# and `logs job/...` prints whichever one it picks first, so a migration that
+# needed a retry would be judged by the attempt that failed. Aggregate them.
+migration_log="$(kube -n axond logs -l job-name=axond-migrate --tail=-1)"
 grep -q "applied .* migration" <<<"$migration_log" ||
   fail "the migration Job completed without applying anything: ${migration_log}"
-ok "$(head -n 1 <<<"$migration_log")"
+ok "$(grep -m 1 "applied .* migration" <<<"$migration_log")"
 
 # Forward-only and idempotent is the property that makes it safe in front of an
 # upgrade, so it is asserted rather than assumed: the same Job spec, run again,
@@ -192,10 +195,12 @@ kube -n axond delete job axond-migrate --wait=true >/dev/null
 kube apply -f "${workdir}/rendered.yaml" >/dev/null
 kube -n axond wait --for=condition=complete job/axond-migrate --timeout=180s >/dev/null ||
   fail "the rerun of the migration Job did not complete"
-rerun_log="$(kube -n axond logs job/axond-migrate)"
+rerun_log="$(kube -n axond logs -l job-name=axond-migrate --tail=-1)"
 grep -q "is current" <<<"$rerun_log" ||
   fail "a rerun against a migrated database was not a no-op: ${rerun_log}"
-ok "rerun: $(head -n 1 <<<"$rerun_log")"
+! grep -q "applied .* migration" <<<"$rerun_log" ||
+  fail "the rerun migrated a second time: ${rerun_log}"
+ok "rerun: $(grep -m 1 "is current" <<<"$rerun_log")"
 
 step "Replicas boot, serve /admin/v1, and stay unready"
 kube -n axond wait --for=jsonpath='{.status.phase}'=Running pod \
