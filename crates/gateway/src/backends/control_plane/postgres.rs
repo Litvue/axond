@@ -28,7 +28,7 @@
 //!   opaque secret *reference*; plaintext lives in the secret store, and no value
 //!   from a body is ever logged.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -44,6 +44,8 @@ use super::hydration::{self, HydrationLimits};
 use super::rows;
 use super::schema::{self, Baseline, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
 use super::{ControlPlaneError, ControlPlaneStore, StatusProbeAdmission};
+#[cfg(test)]
+use crate::availability::EvidenceClear;
 use crate::availability::store::{
     self as availability_store, EvidenceWrite, ObservationSlot, ObservationStore, StoredObservation,
 };
@@ -1116,26 +1118,37 @@ impl ObservationStore for PostgresControlPlane {
                     .transaction()
                     .await
                     .map_err(|error| unavailable("begin an observation write", &error))?;
-                // Every key the write names is replaced wholesale, cleared keys
-                // included. An upsert alone would leave behind a retained look a
-                // later definitive conclusion discredited, and the next restart
-                // would believe it; a key whose looks were all discredited emits
-                // no row, so it is only reachable through the cleared half.
-                let mut replaced: BTreeSet<AvailabilityKey> = BTreeSet::new();
-                for key in rows.iter().map(|row| &row.key).chain(cleared.iter()) {
-                    if !replaced.insert(key.clone()) {
-                        continue;
-                    }
+                // A replica may be behind another replica. Replace only evidence
+                // no newer than this write, so a stale projection cannot erase a
+                // look the other replica learned later. The cutoff is per key:
+                // rows are a whole-record replacement, while an explicit clear
+                // carries the newest observation it owns. `ON CONFLICT DO NOTHING`
+                // preserves a row that won the race with a still-stale writer.
+                let mut replaced: BTreeMap<AvailabilityKey, SystemTime> = BTreeMap::new();
+                for row in &rows {
+                    replaced
+                        .entry(row.key.clone())
+                        .and_modify(|before| *before = (*before).max(row.observation.observed_at))
+                        .or_insert(row.observation.observed_at);
+                }
+                for clear in &cleared {
+                    replaced
+                        .entry(clear.key.clone())
+                        .and_modify(|before| *before = (*before).max(clear.before))
+                        .or_insert(clear.before);
+                }
+                for (key, before) in replaced {
                     transaction
                         .execute(
                             "DELETE FROM axond_cp_availability_observation \
                              WHERE tenant_id = $1 AND project_id IS NOT DISTINCT FROM $2 \
-                             AND provider = $3 AND model = $4",
+                             AND provider = $3 AND model = $4 AND observed_at <= $5",
                             &[
                                 &key.scope.tenant.to_string(),
                                 &key.scope.project.map(|project| project.to_string()),
                                 &key.target.provider.as_str(),
                                 &key.target.model.as_str(),
+                                &before,
                             ],
                         )
                         .await
@@ -1152,7 +1165,8 @@ impl ObservationStore for PostgresControlPlane {
                             "INSERT INTO axond_cp_availability_observation \
                              (tenant_id, project_id, provider, model, slot, result, \
                              completeness, source, observed_at, expires_at, definitive_at) \
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                             ON CONFLICT DO NOTHING",
                             &[
                                 &row.key.scope.tenant.to_string(),
                                 &row.key.scope.project.map(|project| project.to_string()),
@@ -6011,7 +6025,9 @@ mod tests {
             .expect("evidence is written");
 
         store
-            .save(&EvidenceWrite::default().clearing([key.clone()]))
+            .save(
+                &EvidenceWrite::default().clearing([EvidenceClear::new(key.clone(), instant(100))]),
+            )
             .await
             .expect("the key is cleared");
 
@@ -6035,7 +6051,7 @@ mod tests {
                 .build(),
         );
         assert!(write.rows().is_empty());
-        assert_eq!(write.cleared(), &[key]);
+        assert_eq!(write.cleared(), &[EvidenceClear::new(key, instant(100))]);
     }
 
     /// A replica that has only projected an empty record does not own that
@@ -6081,6 +6097,65 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, key);
         assert_eq!(rows[0].observation.result, DiscoveryResult::Present);
+    }
+
+    /// A replica can also be behind while still holding a look. Its whole-key
+    /// replacement must not displace a newer look that another replica has
+    /// already durably written, and its stale clear must not remove it either.
+    #[tokio::test]
+    async fn a_stale_replica_write_does_not_replace_newer_evidence() {
+        let Some((store, dsn, schema)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(ExpectedRevision::Empty, "state", state()))
+            .await
+            .expect("a tenant exists to own evidence");
+
+        let scope = ScopeRef::tenant(tenant_id(1));
+        let key = AvailabilityKey::new(scope, observation_target());
+        let replica_b = second_store(&dsn, &schema).await;
+        let newer = look(
+            scope,
+            DiscoveryResult::Present,
+            DiscoveryCompleteness::Complete,
+            instant(200),
+        );
+        store
+            .save(&EvidenceWrite::of_rows(vec![StoredObservation {
+                key: key.clone(),
+                slot: ObservationSlot::Current,
+                observation: newer.clone(),
+                definitive_at: Some(instant(200)),
+            }]))
+            .await
+            .expect("replica A writes the newer look");
+
+        let stale = look(
+            scope,
+            DiscoveryResult::Absent,
+            DiscoveryCompleteness::Complete,
+            instant(100),
+        );
+        replica_b
+            .save(&EvidenceWrite::of_rows(vec![StoredObservation {
+                key: key.clone(),
+                slot: ObservationSlot::Current,
+                observation: stale,
+                definitive_at: Some(instant(100)),
+            }]))
+            .await
+            .expect("replica B writes its stale view");
+        replica_b
+            .save(
+                &EvidenceWrite::default().clearing([EvidenceClear::new(key.clone(), instant(100))]),
+            )
+            .await
+            .expect("replica B clears only evidence it knows about");
+
+        let rows = store.load(Some(scope)).await.expect("read evidence");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].observation.is_same_look(&newer));
     }
 
     /// A stale discovery writer naming a tenant the journal no longer owns is a

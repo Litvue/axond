@@ -454,28 +454,17 @@ pub struct AvailabilityIndexBuilder {
 impl AvailabilityIndexBuilder {
     /// Start from the records of an existing index.
     ///
-    /// How a refresh keeps last-known-good evidence across an index replacement:
-    /// the previous index is immutable, so a refresh reads it into a builder and
-    /// publishes a new one rather than editing what readers hold.
+    /// This is used while restoring stored evidence before a revision is known.
+    /// Once a revision is available, callers must use
+    /// [`carrying_evidence_for`](Self::carrying_evidence_for) so the desired key
+    /// set is explicit and keys a revision stopped describing cannot survive by
+    /// accident.
     pub fn from_index(index: &AvailabilityIndex) -> Self {
         Self {
             records: index.records.clone(),
             superseded: 0,
             misfiled: 0,
         }
-    }
-
-    /// Start from an existing index's *evidence*, holding no dimension it
-    /// derived.
-    ///
-    /// What a re-derivation needs: discovery evidence is learned and must
-    /// survive, while every dimension is a fact of a revision and must be stated
-    /// again by the revision in hand. A key the new revision no longer describes
-    /// therefore keeps its looks and its watermark under fail-closed dimensions
-    /// rather than its former permit, and a key that held no evidence at all
-    /// simply ceases to exist.
-    pub fn carrying_evidence(index: &AvailabilityIndex) -> Self {
-        Self::carrying_evidence_where(index, |_, record| record.holds_evidence())
     }
 
     /// Start from an existing index's evidence, keeping only the keys the

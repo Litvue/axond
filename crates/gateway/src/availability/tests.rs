@@ -1906,7 +1906,7 @@ fn a_key_whose_looks_were_discredited_is_written_as_cleared() {
     assert!(write.rows().is_empty(), "both looks were discredited");
     assert_eq!(
         write.cleared(),
-        [key(scope, "gpt-4o")],
+        [EvidenceClear::new(key(scope, "gpt-4o"), at(500))],
         "so the stored looks must go with them"
     );
 }

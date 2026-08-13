@@ -81,6 +81,24 @@ pub struct StoredObservation {
     pub definitive_at: Option<SystemTime>,
 }
 
+/// A conditional deletion of one scope/target's stored evidence.
+///
+/// `before` is the newest observation this writer is allowed to remove. A
+/// replica can be behind another replica, so a delete must not be an
+/// unconditional statement about the key: newer evidence belongs to whoever
+/// observed it and must survive this write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceClear {
+    pub key: AvailabilityKey,
+    pub before: SystemTime,
+}
+
+impl EvidenceClear {
+    pub const fn new(key: AvailabilityKey, before: SystemTime) -> Self {
+        Self { key, before }
+    }
+}
+
 impl StoredObservation {
     /// The rows that describe an index's evidence, in key order.
     ///
@@ -108,8 +126,8 @@ impl StoredObservation {
     }
 }
 
-/// One single-writer replacement of a replica's evidence: the looks it owns,
-/// and explicit keys whose old evidence it owns and is clearing.
+/// One replica's replacement of the evidence it owns: the looks it has, and
+/// explicit keys whose old evidence it is clearing.
 ///
 /// Both halves, because a row set alone cannot say that a key *stopped* having
 /// evidence. A record whose looks were all discredited emits no row, and a write
@@ -125,7 +143,7 @@ impl StoredObservation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvidenceWrite {
     rows: Vec<StoredObservation>,
-    cleared: Vec<AvailabilityKey>,
+    cleared: Vec<EvidenceClear>,
 }
 
 impl EvidenceWrite {
@@ -141,7 +159,9 @@ impl EvidenceWrite {
                         && record.discovery.is_none()
                         && record.last_known_good.is_none()
                 })
-                .map(|(key, _)| key.clone())
+                .map(|(key, record)| {
+                    EvidenceClear::new(key.clone(), record.definitive_at.expect("filtered"))
+                })
                 .collect(),
         }
     }
@@ -155,12 +175,22 @@ impl EvidenceWrite {
         }
     }
 
-    /// Also clear these keys, whatever the store holds for them.
+    /// Also conditionally clear these keys.
+    ///
+    /// The clear carries the newest observation it is entitled to remove. A
+    /// later look written by another replica is left intact.
     #[must_use]
-    pub fn clearing(mut self, keys: impl IntoIterator<Item = AvailabilityKey>) -> Self {
+    pub fn clearing(mut self, keys: impl IntoIterator<Item = EvidenceClear>) -> Self {
         self.cleared.extend(keys);
-        self.cleared.sort();
-        self.cleared.dedup();
+        self.cleared.sort_by(|left, right| left.key.cmp(&right.key));
+        self.cleared.dedup_by(|left, right| {
+            if left.key == right.key {
+                left.before = left.before.max(right.before);
+                true
+            } else {
+                false
+            }
+        });
         self
     }
 
@@ -169,7 +199,7 @@ impl EvidenceWrite {
     }
 
     /// The keys whose stored evidence must not survive this write.
-    pub fn cleared(&self) -> &[AvailabilityKey] {
+    pub fn cleared(&self) -> &[EvidenceClear] {
         &self.cleared
     }
 
@@ -200,8 +230,8 @@ pub trait ObservationStore: Send + Sync {
         scope: Option<ScopeRef>,
     ) -> Result<Vec<StoredObservation>, ControlPlaneError>;
 
-    /// Replace the stored evidence for every key the write names — the keys its
-    /// rows mention, and the keys it clears.
+    /// Conditionally replace the stored evidence for every key the write names
+    /// — the keys its rows mention, and the keys it clears.
     ///
     /// Per key rather than per row, so a record whose retained look was
     /// discredited stops having one: an upsert alone would leave the discredited
@@ -209,6 +239,8 @@ pub trait ObservationStore: Send + Sync {
     /// discredited emits no row at all, which is why the write carries
     /// [`EvidenceWrite::cleared`] beside them — otherwise the one case where
     /// stored evidence must disappear is the one case a row set cannot express.
+    /// The store only replaces rows at or before the write's observation
+    /// watermark, so a stale replica cannot erase a newer replica's knowledge.
     ///
     /// Atomic across both halves: a write that deleted the cleared keys and then
     /// failed to insert the rows would leave a replica remembering less than it

@@ -101,7 +101,7 @@ use super::dimensions::{
 use super::discovery::DiscoveryObservation;
 use super::index::{AvailabilityIndex, AvailabilityIndexBuilder, AvailabilityRecord};
 use super::refs::{AvailabilityKey, CredentialRef, ScopeRef, TargetRef};
-use super::store::{self, EvidenceWrite, StoredObservation};
+use super::store::{self, EvidenceClear, EvidenceWrite, StoredObservation};
 use super::verdict::Availability;
 
 /// Why a revision could not be projected into availability at all.
@@ -621,7 +621,7 @@ pub struct AvailabilityEvidence {
     /// Keys detached by projection and awaiting the writer that owns their old
     /// evidence. An empty record never enters this set, which is what keeps a
     /// replica that has not looked from deleting another replica's rows.
-    orphaned: Mutex<BTreeSet<AvailabilityKey>>,
+    orphaned: Mutex<BTreeMap<AvailabilityKey, SystemTime>>,
     /// What the last derivation was told, so a later look can be folded in
     /// without waiting for a revision that may never come.
     ///
@@ -662,9 +662,22 @@ pub struct AvailabilityEvidence {
 struct Superseded {
     derivation: u64,
     index: Arc<AvailabilityIndex>,
-    orphaned: BTreeSet<AvailabilityKey>,
+    orphaned: BTreeMap<AvailabilityKey, SystemTime>,
     derived_from: Option<(Arc<DesiredState>, CredentialReadiness)>,
     looks: Vec<DiscoveryObservation>,
+}
+
+/// The newest evidence a replica has for a key. Conditional orphan cleanup may
+/// remove rows up to this instant, but never a look another replica recorded
+/// afterwards.
+fn latest_evidence_at(record: &AvailabilityRecord) -> Option<SystemTime> {
+    record
+        .discovery
+        .iter()
+        .chain(record.last_known_good.iter())
+        .map(|observation| observation.observed_at)
+        .chain(record.definitive_at)
+        .max()
 }
 
 impl AvailabilityEvidence {
@@ -674,7 +687,7 @@ impl AvailabilityEvidence {
             catalogue: Mutex::new(Arc::new(catalogue)),
             index: Mutex::new(Arc::new(AvailabilityIndex::empty())),
             pending: Mutex::new(Vec::new()),
-            orphaned: Mutex::new(BTreeSet::new()),
+            orphaned: Mutex::new(BTreeMap::new()),
             derived_from: Mutex::new(None),
             deriving: Mutex::new(()),
             replaced: Mutex::new(None),
@@ -735,7 +748,7 @@ impl AvailabilityEvidence {
         let orphaned = self
             .lock(&self.orphaned)
             .iter()
-            .cloned()
+            .map(|(key, before)| EvidenceClear::new(key.clone(), *before))
             .collect::<Vec<_>>();
         EvidenceWrite::of_index(&self.index()).clearing(orphaned)
     }
@@ -780,8 +793,13 @@ impl AvailabilityEvidence {
         let orphaned = projected
             .orphaned()
             .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
+            .filter_map(|key| {
+                previous
+                    .record(key)
+                    .and_then(latest_evidence_at)
+                    .map(|before| (key.clone(), before))
+            })
+            .collect::<BTreeMap<_, _>>();
         *self.lock(&self.replaced) = Some(Superseded {
             derivation,
             index: previous,

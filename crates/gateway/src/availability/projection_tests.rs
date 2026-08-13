@@ -603,7 +603,47 @@ fn removed_targets_have_a_bounded_orphan_evidence_lifecycle() {
         2,
         "the reintroduced target owns its current and fallback slots"
     );
-    assert_eq!(write.cleared(), &[deployment.key()]);
+    assert_eq!(
+        write.cleared(),
+        &[EvidenceClear::new(deployment.key(), at(100))]
+    );
+}
+
+/// A revision that stops describing a key also drops a retained definitive
+/// watermark. Keeping that bare conclusion would make the in-memory index and
+/// its durable clear set grow forever as enablements churn.
+#[test]
+fn a_removed_key_drops_its_definitive_watermark_from_the_live_index() {
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+    evidence.observe(DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Absent,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(100),
+    ));
+    evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("the target projects");
+    assert_eq!(
+        evidence
+            .index()
+            .record(&deployment.key())
+            .and_then(|record| record.definitive_at),
+        Some(at(100))
+    );
+
+    let removed = evidence
+        .derive(&DesiredState::new(), &resolved(40))
+        .expect("removing the target projects");
+    assert!(removed.index().record(&deployment.key()).is_none());
+    assert_eq!(removed.orphaned(), &[deployment.key()]);
+    assert!(
+        evidence.persistable().rows().is_empty(),
+        "the detached watermark is cleanup metadata, not live evidence"
+    );
 }
 
 /// A key nobody ever learned anything about leaves nothing behind: only evidence
