@@ -289,6 +289,13 @@ pub struct Occupancy {
 #[derive(Debug, Clone, Serialize)]
 pub struct Segment {
     pub index: usize,
+    /// Whether load was still being offered for the whole segment. The last
+    /// segment of a run is not: it spans the settle wait, the upstream cleanup
+    /// wait, and the quiesce, and is an idle reading of a process that has
+    /// stopped serving. It is recorded, because what the process gives back
+    /// when it goes idle is worth reading, and it is kept out of the trend and
+    /// the segment count, because it is not a sample of the run's steady state.
+    pub under_load: bool,
     pub started_ms: u128,
     pub elapsed_ms: u128,
     pub offered: u64,

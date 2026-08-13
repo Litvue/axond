@@ -249,6 +249,8 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
     tokio::time::sleep(QUIESCE).await;
     let finished = sampler.finish();
     aggregate.absorb(&finished.pending);
+    // Recorded, but not as a segment of the run: nothing was offered during it.
+    aggregate.under_load = false;
     aggregate.close_segment(started.elapsed());
 
     let result = assemble(
@@ -578,6 +580,10 @@ struct Aggregate {
     by_credential_source: BTreeMap<String, u64>,
     /// Open segment, reset at each boundary.
     open: OpenSegment,
+    /// Whether the workers are still offering. Cleared once they have stopped,
+    /// so the segment that spans the settle and quiesce waits is marked as the
+    /// idle reading it is.
+    under_load: bool,
     /// Sample extremes over the whole run, kept as the segments are closed.
     rss_peak: u64,
     fds_peak: u64,
@@ -634,6 +640,7 @@ impl Aggregate {
             by_namespace: BTreeMap::new(),
             by_credential_source: BTreeMap::new(),
             open: OpenSegment::default(),
+            under_load: true,
             rss_peak: 0,
             fds_peak: 0,
             sockets_peak: 0,
@@ -807,6 +814,7 @@ impl Aggregate {
         let cpu = cpu_delta(&open.samples);
         self.segments.push(Segment {
             index: self.segments.len(),
+            under_load: self.under_load,
             started_ms: open.started_ms,
             elapsed_ms: elapsed,
             offered: open.offered,
@@ -1028,7 +1036,12 @@ fn resources(
 /// Fit the per-segment medians. A slope needs both enough segments and enough
 /// wall clock to be a slope rather than a rounding error of the first minute,
 /// so `fitted` records whether the drift gates may be believed.
-fn trend(segments: &[Segment], scale: &Scale) -> Trend {
+fn trend(all: &[Segment], scale: &Scale) -> Trend {
+    // Only the segments that had load offered through them: the last one is
+    // the settle and quiesce wait, and an idle reading at the end would pull
+    // the fitted slope down by exactly as much as the process gave back.
+    let segments: Vec<Segment> = all.iter().filter(|s| s.under_load).cloned().collect();
+    let segments = segments.as_slice();
     let hours = |segment: &Segment| {
         (segment.started_ms as f64 + segment.elapsed_ms as f64 / 2.0) / 3_600_000.0
     };
@@ -1117,7 +1130,7 @@ fn verdicts(result: &EnduranceResult) -> Vec<Verdict> {
         ),
         Verdict::at_least(
             "min_segments",
-            result.segments.len() as f64,
+            result.trend.segments as f64,
             thresholds.min_segments as f64,
         ),
         // Every axis the plan mixes over has to have been offered. A run that

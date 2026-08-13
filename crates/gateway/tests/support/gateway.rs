@@ -83,17 +83,20 @@ static CONFIGS: AtomicU64 = AtomicU64::new(0);
 /// How many ephemeral ports a boot may lose before the suite gives up.
 const BOOT_ATTEMPTS: u32 = 4;
 
-/// How many diagnostic lines a boot's captured output keeps. Failure output
-/// wants the recent past, and a run long enough to overflow this is a soak
-/// whose evidence is its artifact rather than its scrollback — retaining every
-/// line of a twelve-hour run would make the harness the leak it is looking for.
-const DIAGNOSTIC_LINES: usize = 4096;
+/// How many output lines a boot keeps. Failure output wants the recent past,
+/// and a run long enough to overflow this is a soak whose evidence is its
+/// artifact rather than its scrollback — retaining every line of a twelve-hour
+/// run would make the harness the leak it is looking for.
+const RETAINED_LINES: usize = 4096;
 
 /// What the process has said, kept so a failing test can print it and a
 /// harness can read what each request was charged.
 #[derive(Default)]
 struct Output {
-    /// Non-usage output, bounded to the most recent [`DIAGNOSTIC_LINES`].
+    /// Everything the process wrote, usage records included, bounded to the
+    /// most recent [`RETAINED_LINES`]. Records stay here as well as in
+    /// [`Self::usage`] because assertions about what the process must *not*
+    /// print — a prompt, a credential — read the raw text.
     lines: VecDeque<String>,
     /// How many lines were dropped to stay inside that bound, so truncated
     /// output says so rather than reading as everything the process wrote.
@@ -106,16 +109,16 @@ struct Output {
 
 impl Output {
     fn ingest(&mut self, line: String) {
-        match serde_json::from_str::<Value>(&line) {
-            Ok(value) if value.get("schema_version").is_some() => self.usage.push(value),
-            _ => {
-                if self.lines.len() == DIAGNOSTIC_LINES {
-                    self.lines.pop_front();
-                    self.dropped += 1;
-                }
-                self.lines.push_back(line);
-            }
+        if let Ok(value) = serde_json::from_str::<Value>(&line)
+            && value.get("schema_version").is_some()
+        {
+            self.usage.push(value);
         }
+        if self.lines.len() == RETAINED_LINES {
+            self.lines.pop_front();
+            self.dropped += 1;
+        }
+        self.lines.push_back(line);
     }
 
     fn rendered(&self) -> String {
@@ -304,8 +307,8 @@ impl Axond {
         format!("{}{path}", self.base_url)
     }
 
-    /// What the process has written to stdout/stderr, for failure output: its
-    /// most recent lines, minus the usage records, which are [`Self::usage_records`].
+    /// What the process has written to stdout/stderr, for failure output and
+    /// for assertions over the raw text: its most recent lines.
     pub fn output(&self) -> String {
         self.output.lock().expect("output lock").rendered()
     }
