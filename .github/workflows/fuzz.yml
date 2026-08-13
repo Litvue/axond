@@ -24,6 +24,9 @@ on:
           - config_toml
           - token_verify
           - credentials_query
+          - sse_decode
+          - provider_stream
+          - provider_error
 
 permissions:
   contents: read
@@ -52,8 +55,12 @@ jobs:
         run: |
           set -euo pipefail
           case "${REQUESTED}" in
-            all) targets='["config_toml", "token_verify", "credentials_query"]' ;;
-            config_toml | token_verify | credentials_query) targets="[\"${REQUESTED}\"]" ;;
+            all)
+              targets='["config_toml", "token_verify", "credentials_query", "sse_decode", "provider_stream", "provider_error"]'
+              ;;
+            config_toml | token_verify | credentials_query | sse_decode | provider_stream | provider_error)
+              targets="[\"${REQUESTED}\"]"
+              ;;
             *) echo "unknown fuzz target ${REQUESTED}" >&2; exit 1 ;;
           esac
           echo "targets=${targets}" >> "${GITHUB_OUTPUT}"

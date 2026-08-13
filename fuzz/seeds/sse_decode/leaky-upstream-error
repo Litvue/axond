@@ -1,0 +1,3 @@
+event: error
+data: {"type":"error","error":{"type":"api_error","message":"upstream https://fuzz-upstream.provider.invalid/v1/messages?key=live refused token axond-fuzz-gateway-credential-not-a-secret"}}
+

@@ -14,6 +14,9 @@ pub enum StreamParseError {
 
 pub struct SseDecoder {
     buffer: String,
+    /// How much of `buffer` is already known to hold no event delimiter, so a
+    /// partial event is never rescanned once per chunk that extends it.
+    scanned: usize,
     max_buffer_bytes: usize,
 }
 
@@ -27,6 +30,7 @@ impl SseDecoder {
     pub fn new(max_buffer_bytes: usize) -> Self {
         Self {
             buffer: String::new(),
+            scanned: 0,
             max_buffer_bytes,
         }
     }
@@ -37,19 +41,44 @@ impl SseDecoder {
             return Err(StreamParseError::BufferLimit(self.max_buffer_bytes));
         }
         let mut events = Vec::new();
-        while let Some(end) = event_end(&self.buffer) {
-            let block = self.buffer[..end].replace('\r', "");
+        // Scanning and draining per event would reread and reshuffle the whole
+        // buffer once per event, which is quadratic in what an upstream sends:
+        // a chunk of nothing but delimiters costs the gateway far more than it
+        // costs the provider. A cursor plus a single drain keeps it linear.
+        let mut search = self.scanned;
+        let mut consumed = 0;
+        while let Some(offset) = event_end(&self.buffer[search..]) {
+            let end = search + offset;
+            let block = self.buffer[consumed..end].replace('\r', "");
             let delimiter_len = if self.buffer[end..].starts_with("\r\n\r\n") {
                 4
             } else {
                 2
             };
-            self.buffer.drain(..end + delimiter_len);
+            consumed = end + delimiter_len;
+            search = consumed;
             if let Some(event) = parse_event(&block) {
                 events.push(event);
             }
         }
+        self.buffer.drain(..consumed);
+        // A delimiter can straddle the next chunk, so the tail stays unscanned.
+        let mut scanned = self.buffer.len().saturating_sub(DELIMITER_OVERLAP);
+        while scanned > 0 && !self.buffer.is_char_boundary(scanned) {
+            scanned -= 1;
+        }
+        self.scanned = scanned;
         Ok(events)
+    }
+
+    /// What the decoder is still holding between events, for the out-of-tree
+    /// fuzz project to assert the buffer stays bounded and never retains a
+    /// complete event. Compiled only under `--cfg fuzzing`, which nothing but
+    /// [`fuzz/`](https://github.com/Litvue/axond/tree/main/fuzz) sets, so this
+    /// widens no published API.
+    #[cfg(fuzzing)]
+    pub fn fuzz_buffered(&self) -> &str {
+        &self.buffer
     }
 
     pub fn finish(self) -> Result<(), StreamParseError> {
@@ -61,13 +90,25 @@ impl SseDecoder {
     }
 }
 
+/// The longest prefix of an event delimiter that can end a chunk: `\r\n\r`.
+const DELIMITER_OVERLAP: usize = 3;
+
+/// Where the first event delimiter starts, whichever of the two it is.
+///
+/// One left-to-right pass rather than a search for each delimiter: searching
+/// separately costs a scan of the whole buffer for the delimiter that is not
+/// there, on every event, which a stream of LF-delimited events pays in full.
 fn event_end(buffer: &str) -> Option<usize> {
-    match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+    let bytes = buffer.as_bytes();
+    for index in 0..bytes.len().saturating_sub(1) {
+        if bytes[index] == b'\n' && bytes[index + 1] == b'\n' {
+            return Some(index);
+        }
+        if bytes[index] == b'\r' && bytes[index..].starts_with(b"\r\n\r\n") {
+            return Some(index);
+        }
     }
+    None
 }
 
 fn parse_event(block: &str) -> Option<SseEvent> {
@@ -106,5 +147,79 @@ mod tests {
         assert_eq!(events[0].event.as_deref(), Some("delta"));
         assert_eq!(events[0].data, "{\"a\":1}\ntail");
         decoder.finish().unwrap();
+    }
+
+    /// What the `sse_decode` fuzz target asserts over arbitrary bodies, pinned
+    /// here for the cases the corpus is built from: where a chunk boundary
+    /// falls cannot change what a stream decodes to.
+    #[test]
+    fn every_chunk_boundary_decodes_a_body_identically() {
+        for body in [
+            "data: one\n\ndata: two\n\n",
+            "event: delta\r\ndata: {\"a\":1}\r\n\r\n: keep-alive\r\n\r\ndata: [DONE]\r\n\r\n",
+            "data: first\ndata: second\n\ndata: tail",
+            ": comment only\n\n\n\ndata: \n\n",
+        ] {
+            let mut whole = SseDecoder::default();
+            let expected = whole.push(body).unwrap();
+            for cut in 1..body.len() {
+                if !body.is_char_boundary(cut) {
+                    continue;
+                }
+                let mut split = SseDecoder::default();
+                let mut events = split.push(&body[..cut]).unwrap();
+                events.extend(split.push(&body[cut..]).unwrap());
+                assert_eq!(events, expected, "{body:?} split at {cut}");
+            }
+        }
+    }
+
+    /// A stream that ends mid-event is a controlled error, not a panic and not
+    /// a silently accepted truncation.
+    #[test]
+    fn a_truncated_final_event_is_refused_by_finish() {
+        let mut decoder = SseDecoder::default();
+        assert!(decoder.push("data: complete\n\ndata: trunc").unwrap().len() == 1);
+        assert_eq!(decoder.finish(), Err(StreamParseError::Incomplete));
+    }
+
+    /// The scan cursor must not skip a delimiter that arrives one byte at a
+    /// time, which is the boundary case it exists to avoid rescanning.
+    #[test]
+    fn a_delimiter_split_byte_by_byte_still_terminates_an_event() {
+        let body = "event: delta\r\ndata: one\r\n\r\ndata: two\n\n";
+        let mut decoder = SseDecoder::default();
+        let mut events = Vec::new();
+        for byte in 0..body.len() {
+            events.extend(decoder.push(&body[byte..=byte]).unwrap());
+        }
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event.as_deref(), Some("delta"));
+        assert_eq!(events[0].data, "one");
+        assert_eq!(events[1].data, "two");
+        decoder.finish().unwrap();
+    }
+
+    /// A stream of nothing but delimiters is the cheapest thing an upstream can
+    /// send and used to be the most expensive thing to parse: scanning and
+    /// draining per event made the cost quadratic in the chunk.
+    #[test]
+    fn a_chunk_of_many_tiny_events_is_parsed_in_one_pass() {
+        let events = 200_000;
+        let mut decoder = SseDecoder::new(8 * 1024 * 1024);
+        let decoded = decoder.push(&"data: x\n\n".repeat(events)).unwrap();
+        assert_eq!(decoded.len(), events);
+        decoder.finish().unwrap();
+    }
+
+    /// The buffer limit is the bound on what an upstream can make the gateway
+    /// hold for a stream that never terminates an event.
+    #[test]
+    fn an_unterminated_event_trips_the_buffer_limit() {
+        let mut decoder = SseDecoder::new(64);
+        assert_eq!(
+            decoder.push(&"data: ".repeat(64)),
+            Err(StreamParseError::BufferLimit(64))
+        );
     }
 }

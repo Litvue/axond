@@ -251,7 +251,7 @@ impl AnthropicStreamDecoder {
 impl ProviderStreamDecoder for AnthropicStreamDecoder {
     fn decode(&mut self, event: SseEvent) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
         let data: Value = serde_json::from_str(&event.data)
-            .map_err(|error| ProviderError::InvalidStream(error.to_string()))?;
+            .map_err(|error| ProviderError::invalid_stream(error.to_string()))?;
         let kind = event
             .event
             .as_deref()
@@ -355,7 +355,7 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                     }
                     Some("input_json_delta") => {
                         let Some(tool_index) = self.tool_blocks.get(&index).copied() else {
-                            return Err(ProviderError::InvalidStream(format!(
+                            return Err(ProviderError::invalid_stream(format!(
                                 "input_json_delta for unknown content block {index}"
                             )));
                         };
@@ -411,9 +411,9 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                     .unwrap_or("Anthropic stream error")
                     .to_owned();
                 if crate::is_rate_limit_payload(&data) {
-                    Err(ProviderError::RateLimitedStream(message))
+                    Err(ProviderError::rate_limited_stream(message))
                 } else {
-                    Err(ProviderError::InvalidStream(message))
+                    Err(ProviderError::invalid_stream(message))
                 }
             }
             _ => Ok(Vec::new()),
@@ -462,13 +462,13 @@ impl NativeMessagesDecoder {
 impl ProviderStreamDecoder for NativeMessagesDecoder {
     fn decode(&mut self, event: SseEvent) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
         let data: Value = serde_json::from_str(&event.data)
-            .map_err(|error| ProviderError::InvalidStream(error.to_string()))?;
+            .map_err(|error| ProviderError::invalid_stream(error.to_string()))?;
         let kind = event
             .event
             .clone()
             .or_else(|| data.get("type").and_then(Value::as_str).map(str::to_owned));
         if is_rate_limit_payload(&data) {
-            return Err(ProviderError::RateLimitedStream(
+            return Err(ProviderError::rate_limited_stream(
                 data.pointer("/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("Anthropic stream rate limited")
@@ -484,7 +484,7 @@ impl ProviderStreamDecoder for NativeMessagesDecoder {
                 merge_anthropic_usage(&mut self.usage, data.get("usage").unwrap_or(&Value::Null))
             }
             Some("error") => {
-                return Err(ProviderError::InvalidStream(
+                return Err(ProviderError::invalid_stream(
                     data.pointer("/error/message")
                         .and_then(Value::as_str)
                         .unwrap_or("Anthropic stream error")

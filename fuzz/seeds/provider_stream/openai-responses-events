@@ -1,0 +1,6 @@
+data: {"type":"response.output_text.delta","delta":"hi"}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}
+
+data: [DONE]
+

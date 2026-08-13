@@ -182,6 +182,9 @@ fuzz-all seconds="60":
     just fuzz config_toml {{seconds}}
     just fuzz token_verify {{seconds}}
     just fuzz credentials_query {{seconds}}
+    just fuzz sse_decode {{seconds}}
+    just fuzz provider_stream {{seconds}}
+    just fuzz provider_error {{seconds}}
 
 # The heavy SSE soak: hundreds of concurrent streams with cancels and drops.
 # The short subset runs in `just test`; this is the long one.

@@ -138,14 +138,14 @@ impl ProviderStreamDecoder for OpenAiStreamDecoder {
             return Ok(vec![ProviderStreamEvent::Done(self.usage)]);
         }
         let data: Value = serde_json::from_str(&event.data)
-            .map_err(|error| ProviderError::InvalidStream(error.to_string()))?;
+            .map_err(|error| ProviderError::invalid_stream(error.to_string()))?;
         if crate::is_rate_limit_payload(&data) {
             let message = data
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or("OpenAI stream rate limited")
                 .to_owned();
-            return Err(ProviderError::RateLimitedStream(message));
+            return Err(ProviderError::rate_limited_stream(message));
         }
         let usage = match self.surface {
             Surface::ChatCompletions => data.get("usage"),
