@@ -11,7 +11,7 @@ to roll back, and what to check before publishing.
 Policy activation rides the [revision convergence](./revision-convergence.md)
 loop, so everything that page says about polling, mixed fleets, and outages
 applies here unchanged. The design is
-[ADR 0046](../adr/0046-runtime-policy-activation.md).
+[ADR 0047](../adr/0047-runtime-policy-activation.md).
 
 > Stateless deployments are unaffected in every respect. With no control plane
 > there are no revisions and no documents: `axond.toml` is the policy, forever.

@@ -1,7 +1,7 @@
 //! Throttling for the "no document governs this namespace" report.
 //!
 //! A namespace no published document governs is denied on every request that
-//! touches it (`docs/adr/0046-runtime-policy-activation.md`), and a denial an
+//! touches it (`docs/adr/0047-runtime-policy-activation.md`), and a denial an
 //! operator cannot see is a denial they cannot fix — but the condition is a
 //! property of the *view*, not of the request, so logging it per request scales
 //! the log volume with traffic and buries the line that explains it. Every
