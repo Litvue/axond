@@ -1,20 +1,33 @@
 # Fuzzing Axond
 
-Axond parses two kinds of untrusted input: what an operator's configuration file
-says, and what a caller puts in a request. This project fuzzes both, on the
-parsers the process actually runs.
+Axond parses three kinds of untrusted input: what an operator's configuration
+file says, what a caller puts in a request, and what a provider sends back. This
+project fuzzes all three, on the parsers the process actually runs.
 
 | Target | What it drives | Why |
 | --- | --- | --- |
 | `config_toml` | `Config::from_toml_str` and the whole validation graph | Boot and every `SIGHUP` reload re-parse a file the gateway does not control |
 | `token_verify` | `axt1.` JWS decoding, key selection, signature, and every claim check | A minted token is the one credential an attacker can shape freely |
 | `credentials_query` | `GET /v1/credentials/status?namespaces=…` parsing | Hand-rolled percent-decoding, so malformed escapes, duplicate keys, empty values, and oversized inputs all land here |
+| `sse_decode` | `SseDecoder` on arbitrary bodies split at arbitrary chunk boundaries | A stream arrives in whatever pieces the network produced, and an event, a delimiter, or a character can straddle two of them |
+| `provider_stream` | The OpenAI, Foundry, and Anthropic stream decoders — translated and native | They interpret provider JSON mid-relay, where a panic loses a live response |
+| `provider_error` | `ProviderError::from_upstream`, `::transport`, and the classification behind them | An upstream failure body decides whether the gateway retries, fails over, or opens a circuit |
 
-The properties each target asserts live in [`src/lib.rs`](./src/lib.rs): a
-parser returns rather than panicking, a refusal is a typed value the gateway
-could answer with, and what it accepts stays inside the bounds the request path
-relies on — including that a signature from one namespace's signer never
-verifies into another.
+The properties each target asserts live in [`src/lib.rs`](./src/lib.rs) and
+[`src/wire.rs`](./src/wire.rs): a parser returns rather than panicking, a
+refusal is a typed value the gateway could answer with, and what it accepts
+stays inside the bounds the request path relies on — including that a signature
+from one namespace's signer never verifies into another.
+
+The wire targets add what a relay depends on: the decoder never holds more than
+its limit and never retains a complete event, decoding never expands its input,
+a chunk boundary cannot change what a body decodes to, a stream that ends
+mid-event is refused by `finish`, every provider diagnostic is truncated to
+`MAX_DIAGNOSTIC_BYTES`, and classification stays deterministic and internally
+consistent. Disclosure is asserted with canaries: the harness holds a gateway
+credential and an upstream URL that it passes to nothing, so either appearing in
+a rendered error is a finding. Catalogue parsing is deliberately absent — it is
+issue #222's target.
 
 Runs are hermetic. The seam the targets call
 ([`crates/gateway/src/fuzz_seam.rs`](../crates/gateway/src/fuzz_seam.rs)) builds
@@ -24,7 +37,8 @@ material, so nothing here opens a socket, reads a file, or holds a real secret.
 ## Layout
 
 - `fuzz_targets/` — the `cargo fuzz` entry points, one per target.
-- `src/lib.rs` — the target bodies and their assertions, shared with the smoke.
+- `src/lib.rs` — the config and credential target bodies, shared with the smoke.
+- `src/wire.rs` — the SSE, provider-stream, and provider-error target bodies.
 - `src/bin/smoke.rs` — the bounded, deterministic seed replay CI requires.
 - `seeds/<target>/` — the committed corpus. `corpus/` and `artifacts/` are
   generated and ignored.
@@ -51,7 +65,10 @@ the lockfile audit behind it.
 just fuzz-smoke
 ```
 
-Proves signature verification is live, then replays every seed plus fixed
+Proves signature verification is live and that pinned valid SSE fixtures still
+decode to the events they must under every boundary they can be split on — both
+are there because the other assertions are relative, and a parser that returned
+nothing at all would satisfy them. Then it replays every seed plus fixed
 derivations — truncations, single-byte flips, one oversized repetition — and a set
 of tokens minted at replay time. It fails on a panic, on an input slower than its
 budget, or on an allocation past a hard cap enforced by the binary's own global

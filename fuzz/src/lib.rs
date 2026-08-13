@@ -23,8 +23,16 @@
 //! seam in `axond` is built from a config compiled into the binary with
 //! synthetic key material, so a fuzz run is hermetic and holds no real secret.
 
+mod wire;
+
 use arbitrary::Arbitrary;
 use axond_fuzz_seam::{Rejection, VerifiedToken};
+
+pub use wire::{
+    GATEWAY_CREDENTIAL_CANARY, PROVIDER_URL_CANARY, ProviderStreamInput, SseInput, StreamShape,
+    UpstreamFailure, assert_disclosure_check_survives_escaping, assert_valid_fixtures_are_stable,
+    provider_error, provider_stream, sse_decode, sse_decode_at_limit, sse_events,
+};
 
 /// A refusal must carry an operator-facing reason. An empty one would reach a
 /// log or a response body as a blank message.

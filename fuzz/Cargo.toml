@@ -35,6 +35,10 @@ arbitrary = { version = "1.4.2", features = ["derive"] }
 # The seam this links against only exists under `--cfg fuzzing`, which
 # `.cargo/config.toml` sets for this workspace and `cargo fuzz` sets on its own.
 axond = { path = "../crates/gateway" }
+# The wire decoders are an ordinary library, so they are linked directly rather
+# than through the binary's seam. The `--cfg fuzzing` this workspace sets still
+# reaches them, which is what exposes `SseDecoder::fuzz_buffered`.
+gateway-core = { path = "../crates/gateway-core" }
 libfuzzer-sys = { version = "0.4.10", optional = true }
 
 # The deterministic seed-replay smoke: bounded, stable-only, and the lane CI
@@ -65,6 +69,30 @@ bench = false
 [[bin]]
 name = "credentials_query"
 path = "fuzz_targets/credentials_query.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sse_decode"
+path = "fuzz_targets/sse_decode.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provider_stream"
+path = "fuzz_targets/provider_stream.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provider_error"
+path = "fuzz_targets/provider_error.rs"
 required-features = ["libfuzzer"]
 test = false
 doc = false

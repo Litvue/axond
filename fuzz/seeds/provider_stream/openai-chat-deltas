@@ -1,0 +1,6 @@
+data: {"id":"c1","choices":[{"delta":{"content":"hi"}}]}
+
+data: {"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}
+
+data: [DONE]
+

@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+/// The longest upstream diagnostic a [`ProviderError`] carries, before the
+/// truncation marker.
+///
+/// An upstream failure body is attacker-influenced and arrives over the
+/// network, so the diagnostic built from it is bounded *here* rather than only
+/// at the edge that read it: a provider error is logged, counted, and rendered
+/// into a response, and every one of those is a place an unbounded body would
+/// end up. The transport already truncates what it reads (`max_error_bytes`,
+/// 64 KiB), which makes this the second bound rather than the only one — and
+/// the one that holds for any caller, including a future non-HTTP one.
+pub const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+
+/// Appended to a diagnostic that hit [`MAX_DIAGNOSTIC_BYTES`], so a reader can
+/// tell a truncated message from a short one.
+pub const DIAGNOSTIC_TRUNCATION_MARKER: &str = "… [truncated]";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DependencyFailure {
     pub provider: String,
@@ -43,7 +59,7 @@ impl ProviderError {
 
     pub fn from_upstream(provider: impl Into<String>, status: u16, body: &str) -> Self {
         let provider = provider.into();
-        let message = extract_message(body);
+        let message = bounded(extract_message(body));
         if is_context_length_error(body) || is_context_length_error(&message) {
             return Self::ContextWindowExceeded(message);
         }
@@ -61,11 +77,24 @@ impl ProviderError {
         }
     }
 
+    /// A malformed provider stream, with its diagnostic bounded: the message
+    /// comes from the provider's own payload, so it is untrusted input the same
+    /// way a failure body is.
+    pub fn invalid_stream(message: impl Into<String>) -> Self {
+        Self::InvalidStream(bounded(message.into()))
+    }
+
+    /// A rate-limited provider stream, with its diagnostic bounded for the same
+    /// reason as [`Self::invalid_stream`].
+    pub fn rate_limited_stream(message: impl Into<String>) -> Self {
+        Self::RateLimitedStream(bounded(message.into()))
+    }
+
     pub fn transport(provider: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Dependency(vec![DependencyFailure {
             provider: provider.into(),
             status: None,
-            message: message.into(),
+            message: bounded(message.into()),
         }])
     }
 
@@ -101,6 +130,23 @@ impl ProviderError {
             _ => false,
         }
     }
+}
+
+/// Cut a diagnostic down to [`MAX_DIAGNOSTIC_BYTES`] on a character boundary.
+///
+/// The cut is by bytes rather than characters because what is being bounded is
+/// the memory and the log line, not the glyph count.
+fn bounded(mut message: String) -> String {
+    if message.len() <= MAX_DIAGNOSTIC_BYTES {
+        return message;
+    }
+    let mut cut = MAX_DIAGNOSTIC_BYTES;
+    while !message.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    message.truncate(cut);
+    message.push_str(DIAGNOSTIC_TRUNCATION_MARKER);
+    message
 }
 
 fn extract_message(body: &str) -> String {
@@ -212,6 +258,93 @@ mod tests {
         assert!(matches!(error, ProviderError::ModelUnavailable(_)));
         assert!(error.is_retryable());
         assert!(!error.affects_provider_health());
+    }
+
+    /// A provider that answers a failure with megabytes of HTML must not put
+    /// megabytes into a log line, a metric label, or a response body.
+    #[test]
+    fn upstream_diagnostics_are_bounded_however_large_the_body_is() {
+        let body = "x".repeat(4 * MAX_DIAGNOSTIC_BYTES);
+        for (status, message) in [
+            (
+                400,
+                diagnostic(&ProviderError::from_upstream("p", 400, &body)),
+            ),
+            (
+                404,
+                diagnostic(&ProviderError::from_upstream("p", 404, &body)),
+            ),
+            (
+                503,
+                diagnostic(&ProviderError::from_upstream("p", 503, &body)),
+            ),
+        ] {
+            assert!(
+                message.len() <= MAX_DIAGNOSTIC_BYTES + DIAGNOSTIC_TRUNCATION_MARKER.len(),
+                "status {status} carried a {}-byte diagnostic",
+                message.len()
+            );
+            assert!(
+                message.ends_with(DIAGNOSTIC_TRUNCATION_MARKER),
+                "status {status}"
+            );
+        }
+        // The JSON path is bounded too: the message a provider nests is as
+        // attacker-influenced as the body around it.
+        let nested = format!(r#"{{"error":{{"message":"{}"}}}}"#, "y".repeat(64 * 1024));
+        let error = ProviderError::from_upstream("p", 500, &nested);
+        assert!(
+            diagnostic(&error).len() <= MAX_DIAGNOSTIC_BYTES + DIAGNOSTIC_TRUNCATION_MARKER.len()
+        );
+        // So is a transport diagnostic, which is built from an error string
+        // rather than a body but reaches the same places.
+        let transport = ProviderError::transport("p", "z".repeat(1024 * 1024));
+        assert!(
+            diagnostic(&transport).len()
+                <= MAX_DIAGNOSTIC_BYTES + DIAGNOSTIC_TRUNCATION_MARKER.len()
+        );
+    }
+
+    /// Truncation cuts bytes, so it has to land on a character boundary: a
+    /// multi-byte character straddling the bound would panic the truncation.
+    #[test]
+    fn truncation_never_splits_a_character() {
+        // Three bytes each, so the 4096-byte bound falls mid-character.
+        let body = "€".repeat(MAX_DIAGNOSTIC_BYTES);
+        let message = diagnostic(&ProviderError::from_upstream("p", 500, &body));
+        assert!(message.len() <= MAX_DIAGNOSTIC_BYTES + DIAGNOSTIC_TRUNCATION_MARKER.len());
+        assert!(
+            message
+                .trim_end_matches(DIAGNOSTIC_TRUNCATION_MARKER)
+                .chars()
+                .all(|character| character == '€')
+        );
+    }
+
+    /// A body short enough to keep is kept whole: bounding must not silently
+    /// mangle the diagnostics operators actually read.
+    #[test]
+    fn short_diagnostics_are_untouched() {
+        let error = ProviderError::from_upstream("p", 500, "upstream unavailable");
+        assert_eq!(diagnostic(&error), "upstream unavailable");
+    }
+
+    fn diagnostic(error: &ProviderError) -> String {
+        match error {
+            ProviderError::InvalidRequest(message)
+            | ProviderError::ContextWindowExceeded(message)
+            | ProviderError::Unsupported(message)
+            | ProviderError::InvalidStream(message)
+            | ProviderError::RateLimitedStream(message) => message.clone(),
+            ProviderError::ModelUnavailable(failures) | ProviderError::Dependency(failures) => {
+                failures
+                    .iter()
+                    .map(|failure| failure.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            ProviderError::AllCircuitsOpen(providers) => providers.join("\n"),
+        }
     }
 
     #[test]

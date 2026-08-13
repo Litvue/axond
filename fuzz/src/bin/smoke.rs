@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arbitrary::{Arbitrary, Unstructured};
-use axond_fuzz::TokenInput;
+use axond_fuzz::{ProviderStreamInput, SseInput, StreamShape, TokenInput};
 
 /// Live heap the whole replay may hold at once. The parsers under test are
 /// bounded by their input, which is why this is generous in absolute terms and
@@ -125,7 +125,117 @@ const TARGETS: &[Target] = &[
         run: replay_token_verify,
         minimum_classes: 6,
     },
+    Target {
+        name: "sse_decode",
+        run: replay_sse_decode,
+        minimum_classes: 7,
+    },
+    Target {
+        name: "provider_stream",
+        run: replay_provider_stream,
+        minimum_classes: 7,
+    },
+    Target {
+        name: "provider_error",
+        run: replay_provider_error,
+        minimum_classes: 5,
+    },
 ];
+
+/// Chunk boundaries the SSE seeds are replayed on. Coprime with nothing in
+/// particular — the point is that they land inside `data:` prefixes, inside
+/// `\r\n\r\n` delimiters, and inside multi-byte characters.
+const SMOKE_CUTS: &[u16] = &[1, 3, 6, 7, 11, 13, 17, 23, 29, 31];
+
+/// A buffer limit the seeds can reach, so the refusal path is replayed rather
+/// than merely defined.
+const SMOKE_BUFFER_LIMIT: u16 = 48;
+
+/// The statuses every provider-error seed body is classified under, chosen to
+/// reach each arm of `from_upstream`: a client refusal, a missing model, a rate
+/// limit, and two server-side failures.
+const SMOKE_STATUSES: &[u16] = &[400, 404, 413, 429, 500, 503];
+
+/// SSE seeds are readable wire captures, so a seed file is replayed twice: the
+/// way libFuzzer replays it, decoded through `Arbitrary`, and as the body it
+/// literally is — split on fixed boundaries, once under a limit it cannot trip
+/// and once under one it can.
+fn replay_sse_decode(data: &[u8]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    if let Ok(input) = SseInput::arbitrary_take_rest(Unstructured::new(data)) {
+        classes.extend(axond_fuzz::sse_decode(&input));
+    }
+    let Ok(body) = str::from_utf8(data) else {
+        classes.push("not_utf8");
+        return classes;
+    };
+    // A limit the body cannot trip, then one it always can. The first is sized
+    // from the body rather than pinned to `u16::MAX`, because the oversized
+    // derivation is `OVERSIZED_BYTES` — one byte past what a `u16` can express,
+    // which would make this pass a second refusal rather than a clean decode.
+    for max_buffer_bytes in [body.len().max(1), usize::from(SMOKE_BUFFER_LIMIT)] {
+        classes.extend(axond_fuzz::sse_decode_at_limit(
+            body,
+            SMOKE_CUTS,
+            max_buffer_bytes,
+        ));
+    }
+    classes
+}
+
+/// Provider-stream seeds are wire captures too, so each is decoded into SSE
+/// events first and then fed to every decoder shape. A capture of one provider
+/// reaching another provider's decoder is the interesting case: it is what a
+/// misconfigured or swapped upstream produces.
+fn replay_provider_stream(data: &[u8]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    if let Ok(input) = ProviderStreamInput::arbitrary_take_rest(Unstructured::new(data)) {
+        classes.extend(axond_fuzz::provider_stream(&input));
+    }
+    let Ok(body) = str::from_utf8(data) else {
+        classes.push("not_utf8");
+        return classes;
+    };
+    let events = axond_fuzz::sse_events(body);
+    let borrowed: Vec<(Option<&str>, &str)> = events
+        .iter()
+        .map(|(name, data)| (name.as_deref(), data.as_str()))
+        .collect();
+    for shape in [
+        StreamShape::OpenAiChat,
+        StreamShape::OpenAiResponses,
+        StreamShape::FoundryChat,
+        StreamShape::AnthropicTranslated,
+        StreamShape::AnthropicNative,
+    ] {
+        classes.extend(axond_fuzz::provider_stream(&ProviderStreamInput {
+            shape,
+            events: borrowed.clone(),
+        }));
+    }
+    classes
+}
+
+/// Provider-error seeds are upstream failure bodies, replayed under every
+/// status in [`SMOKE_STATUSES`] so one body exercises every classification arm.
+fn replay_provider_error(data: &[u8]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    if let Ok(input) = axond_fuzz::UpstreamFailure::arbitrary_take_rest(Unstructured::new(data)) {
+        classes.extend(axond_fuzz::provider_error(&input));
+    }
+    let Ok(body) = str::from_utf8(data) else {
+        classes.push("not_utf8");
+        return classes;
+    };
+    for status in SMOKE_STATUSES {
+        classes.extend(axond_fuzz::provider_error(&axond_fuzz::UpstreamFailure {
+            provider: "smoke-provider",
+            status: *status,
+            body,
+        }));
+    }
+    classes
+}
 
 fn replay_config_toml(data: &[u8]) -> Vec<&'static str> {
     vec![axond_fuzz::config_toml(data)]
@@ -497,6 +607,16 @@ fn main() {
     // vacuous.
     axond_fuzz::assert_signature_verification_is_real();
     println!("token_verify: signature verification is live (minted accepted, tampered refused)");
+    // Likewise for the stream targets: their properties are relative, so a
+    // decoder that returned nothing would satisfy them. The pinned fixtures are
+    // what proves a valid stream still decodes to the events it must, under
+    // every boundary it can be split on.
+    axond_fuzz::assert_valid_fixtures_are_stable();
+    println!("sse_decode: valid fixtures decode identically under every chunk boundary");
+    // And the leakage oracle itself: a canary spelled with JSON escapes is the
+    // input carrying it, not a decoder disclosing it.
+    axond_fuzz::assert_disclosure_check_survives_escaping();
+    println!("provider_error: an escaped canary is read as the input that carried it");
     let mut inputs = 0_usize;
     for target in TARGETS {
         let mut target_inputs = 0_usize;

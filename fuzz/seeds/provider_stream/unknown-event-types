@@ -1,0 +1,12 @@
+event: ping
+data: {"type":"ping"}
+
+event: not_a_type
+data: {"type":"not_a_type","payload":[1,2,3]}
+
+data: null
+
+data: []
+
+data: 12345
+
