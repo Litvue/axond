@@ -238,6 +238,8 @@ migration text the build embeds must be the file it applies.
 
 PostgreSQL 14 or newer. CI exercises 17. Boot reads `server_version_num` and
 refuses an older server rather than failing later on a statement it cannot run.
+The supported range, and what a major upgrade of the backend requires, are in
+[Supported versions](../deployment/stateful-backends.md#supported-versions).
 
 ## TLS and connectivity
 
@@ -356,6 +358,11 @@ fleet should be serving. Nothing here is safe to prune selectively: mutations an
 audit events are referenced by revisions, and resource versions are referenced by
 every manifest that pins them. Expired idempotency rows are the only
 self-pruning data, and they are pruned on the write path that depends on them.
+
+The objectives that back that up (RPO, RTO), the archiving and dump mechanisms, a
+point-in-time recovery procedure, and the drill that proves both restores work
+are in
+[Backup, restore, and point-in-time recovery](./backup-and-recovery.md).
 
 ## Useful queries
 

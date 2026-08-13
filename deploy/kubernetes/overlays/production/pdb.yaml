@@ -1,0 +1,11 @@
+# Two replicas keep serving through a voluntary disruption — a node drain, an
+# upgrade of the cluster, a descheduler — rather than one. With `replicas: 3`
+# that admits exactly one disruption at a time, which is what the rolling update
+# (`maxUnavailable: 0`, `maxSurge: 1`) already does on its own.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: axond
+  namespace: axond
+spec:
+  minAvailable: 2

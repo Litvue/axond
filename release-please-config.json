@@ -46,6 +46,10 @@
         {
           "type": "generic",
           "path": "deploy/kubernetes/base/deployment.yaml"
+        },
+        {
+          "type": "generic",
+          "path": "docs/deployment/kubernetes.md"
         }
       ]
     }

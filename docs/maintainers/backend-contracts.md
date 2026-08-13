@@ -194,7 +194,7 @@ label `secret`) and the previously published snapshot keeps serving.
 
 `CatalogSource::refresh` may store new or changed model metadata without human
 action. It never enables a model for a tenant, never changes which alias targets
-exist, and never activates a price — `CatalogPrice` is the rate the upstream
+exist, and never activates a price — `ObservedPrice` is the rate the upstream
 *publishes*, and turning it into a billed price is an explicit administrative
 mutation. `CatalogRefresh::Unchanged` is a first-class answer so "the upstream
 has nothing new" cannot be confused with "the upstream now lists no models",

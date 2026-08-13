@@ -63,6 +63,9 @@ and operate it.
   decision tree.
 - [Upgrades and rollback](./operations/upgrades.md) — compatibility policy,
   migration ordering, mixed-version rules, and rollback limits.
+- [Backup, restore, and PITR](./operations/backup-and-recovery.md) — what is
+  durable, the recovery objectives, the archiving and dump mechanisms, and the
+  drill that proves a restore lands where it was aimed.
 - [Capacity qualification](./operations/capacity.md) — per-replica envelopes,
   candidate SLOs, the committed load profiles, and what a capacity run gates on.
 - [Recovery qualification](./operations/recovery-qualification.md) — the
