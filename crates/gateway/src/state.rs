@@ -586,14 +586,15 @@ impl ConfigSnapshot {
     /// nothing relevant changed — and either way the choice is visible at the call
     /// site.
     ///
-    /// The file reloader ([`crate::reload`]) makes the second choice, narrowed:
-    /// it carries the outgoing looks under
-    /// [`AvailabilityIndex::carrying_evidence_only`] and lets the next
-    /// compilation restate every dimension. A reload can change the providers and
-    /// credentials a verdict was derived against, so keeping the verdicts would
-    /// let an edit keep serving a permit the new file never granted; dropping the
-    /// index whole would make a `SIGHUP` the one way this replica forgets a look
-    /// it took.
+    /// The file reloader ([`crate::reload`]) makes the second choice, and can:
+    /// nothing availability is derived from is in the file. The four durable
+    /// dimensions come from the revision's enablements, connections, credentials,
+    /// and policy documents, the evidence from discovery, and health is overlaid
+    /// at read time from the serving snapshot's own circuits — so a reload can
+    /// neither invalidate a verdict nor restate one. Dropping or blanking the
+    /// index would make a `SIGHUP` the way an operator loses the answer to which
+    /// models a tenant can reach, and keep it lost: convergence compiles only
+    /// when desired state changes, which a file edit is not.
     #[must_use]
     pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
         self.availability = Some(availability);

@@ -977,3 +977,61 @@ fn a_look_taken_between_revisions_reaches_a_served_index() {
         "and the replica holds it, so the next snapshot carries it"
     );
 }
+
+/// Two derivations at once must not lose a look between them: the queue is
+/// emptied by the first and the index written by the second, so an unserialised
+/// pair could publish a view derived from evidence the other had consumed.
+#[test]
+fn a_concurrent_derivation_does_not_swallow_a_look() {
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+    let readiness = resolved(40);
+    evidence
+        .derive(&deployment.state, &readiness)
+        .expect("the revision projects");
+
+    const LOOKS: u64 = 64;
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            for look in 0..LOOKS {
+                evidence.observe(DiscoveryObservation::new(
+                    deployment.scope(),
+                    target(),
+                    DiscoveryResult::Present,
+                    DiscoveryCompleteness::Complete,
+                    DiscoverySource::ProviderListing,
+                    at(200 + look),
+                ));
+                evidence
+                    .reproject()
+                    .expect("a revision has been derived")
+                    .expect("the same revision projects again");
+            }
+        });
+        threads.spawn(|| {
+            for _ in 0..LOOKS {
+                evidence
+                    .derive(&deployment.state, &readiness)
+                    .expect("the revision projects");
+            }
+        });
+    });
+
+    evidence
+        .reproject()
+        .expect("a revision has been derived")
+        .expect("the same revision projects again");
+    let held = evidence.index();
+    let record = held
+        .record(&deployment.key())
+        .expect("the target is described");
+    let discovery = record
+        .discovery
+        .as_ref()
+        .expect("every look is accounted for");
+    assert_eq!(
+        discovery.observed_at,
+        at(200 + LOOKS - 1),
+        "the newest look reached the index rather than being derived over"
+    );
+}

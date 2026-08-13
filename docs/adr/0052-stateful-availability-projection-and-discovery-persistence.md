@@ -115,12 +115,14 @@ A re-projection folds the queue into the revision already derived — no desired
 state is re-read and nothing is re-validated — and answers nothing at all before
 the first derivation, because dimensions no revision stated are not dimensions.
 
-**A reload keeps the looks and restates the verdicts.** A config file can change
-the providers and credentials a verdict stood on, so carrying the verdicts across
-a `SIGHUP` would let an edit keep serving a permit the new file never granted;
-dropping the index whole would make a reload the one way a replica forgets what
-it saw. The reloader carries the evidence under fail-closed dimensions and lets
-the next compilation restate them.
+**A reload carries the whole view.** Nothing availability is derived from is in
+the config file: the four durable dimensions come from the revision, the evidence
+from discovery, and health is overlaid at read time from the serving snapshot's
+own circuits. A `SIGHUP` can therefore neither invalidate a verdict nor restate
+one, and because convergence compiles only when desired state changes, dropping
+or blanking the index would make a reload the way an operator loses the answer to
+which models a tenant can reach — and keeps it lost, until some unrelated
+publication happens to arrive.
 
 **An administrative read reports the phase the next request would find.** The
 breaker stores the phase the last request left behind, so a target whose cooldown
@@ -172,9 +174,13 @@ Postgres, or `SecretStore` read on an inference request.
 - **Let a read move a breaker past its elapsed cooldown.** It would make the
   administrative surface a participant in request-path state, and an operator's
   refresh would spend the probe a real request should have taken.
-- **Carry the derived dimensions across a config reload.** The cheapest way for a
-  removed credential to keep serving a target: the file that removed it is exactly
-  the file the verdicts were not derived against.
+- **Blank the dimensions across a config reload.** Fail-closed looks prudent and
+  is not: no dimension is derived from the file, so the reload would be refusing
+  an answer it has no reason to doubt, indefinitely, during the incident that
+  prompted the reload.
+- **Derive without serialising.** A derivation empties the queue before it writes
+  the index, so two at once — a publication and a discovery re-projection — would
+  drop looks a replica already paid a provider round trip for.
 
 ## Not decided here
 

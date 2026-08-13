@@ -598,6 +598,19 @@ pub struct AvailabilityEvidence {
     /// discovery loop with no way to re-derive would hold evidence no reader can
     /// see. Cloned off the request path, once per revision.
     derived_from: Mutex<Option<(Arc<DesiredState>, CredentialReadiness)>>,
+    /// Held for the whole of a derivation, so that one is atomic with respect to
+    /// any other.
+    ///
+    /// The queue and the index are separate values under separate locks, and a
+    /// derivation reads the index, empties the queue, projects, and writes the
+    /// index back. Two of them at once — compilation publishing a revision while
+    /// the discovery loop re-projects a round of looks — could otherwise
+    /// interleave so that the second wrote an index derived from a `previous`
+    /// taken before the first, silently losing looks the first had already taken
+    /// off the queue: evidence a replica paid a provider round trip for, gone
+    /// from both the queue and every index. Nothing on the request path takes
+    /// this.
+    deriving: Mutex<()>,
 }
 
 impl AvailabilityEvidence {
@@ -608,6 +621,7 @@ impl AvailabilityEvidence {
             index: Mutex::new(Arc::new(AvailabilityIndex::empty())),
             pending: Mutex::new(Vec::new()),
             derived_from: Mutex::new(None),
+            deriving: Mutex::new(()),
         }
     }
 
@@ -642,6 +656,7 @@ impl AvailabilityEvidence {
     /// older than a conclusion the index has already reached is discredited, and
     /// a row naming another scope is refused rather than filed.
     pub fn restore(&self, rows: impl IntoIterator<Item = StoredObservation>) -> usize {
+        let _deriving = self.lock(&self.deriving);
         let mut held = self.lock(&self.index);
         let mut builder = AvailabilityIndexBuilder::from_index(&held);
         for (key, record) in store::restored_records(rows) {
@@ -664,11 +679,17 @@ impl AvailabilityEvidence {
     }
 
     /// Project `state` over the evidence held, publish the result, and return it.
+    ///
+    /// Serialised against every other derivation: the read of the index, the
+    /// draining of the queue, and the write back are one step, so a concurrent
+    /// caller cannot publish an index derived from evidence this one has already
+    /// consumed.
     pub fn derive(
         &self,
         state: &DesiredState,
         readiness: &CredentialReadiness,
     ) -> Result<ProjectedAvailability, AvailabilityProjectionError> {
+        let _deriving = self.lock(&self.deriving);
         let catalogue = Arc::clone(&self.lock(&self.catalogue));
         let previous = self.index();
         let pending: Vec<DiscoveryObservation> = self.lock(&self.pending).drain(..).collect();

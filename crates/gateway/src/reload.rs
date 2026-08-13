@@ -168,21 +168,20 @@ impl Reloader {
                     None => candidate,
                     Some(pricing) => candidate.with_pricing(pricing.clone()),
                 };
-                // Discovery evidence is carried the same way and for the same
-                // reason, minus the dimensions: a look this replica took is not
-                // in the file either, and dropping it on `SIGHUP` would make a
-                // reload the one way last-known-good state disappears without a
-                // revision saying so. What is *not* carried is what the outgoing
-                // revision said about entitlement, enablement, policy, and the
-                // catalogue — the file can change the providers and credentials
-                // those verdicts were derived against, so they come back as the
-                // fail-closed defaults and the next compilation restates them.
-                // A reload therefore costs freshness and never invents access.
+                // The derived availability view is carried the same way and for
+                // the same reason. Nothing it rests on is in the file: its four
+                // durable dimensions come from the revision's enablements,
+                // connections, credentials, and policy documents, its evidence
+                // from discovery, and its health is overlaid at read time from
+                // the serving snapshot's own circuits. A reload can therefore
+                // neither invalidate a verdict nor restate one — and because
+                // convergence only compiles when desired state changes, dropping
+                // or blanking the view would make a `SIGHUP` the way an operator
+                // loses the answer to "which models can this tenant reach",
+                // indefinitely, during the incident that prompted the reload.
                 let candidate = match current.availability_handle() {
                     None => candidate,
-                    Some(availability) => {
-                        candidate.with_availability(Arc::new(availability.carrying_evidence_only()))
-                    }
+                    Some(availability) => candidate.with_availability(availability),
                 };
                 let summary = ReloadSummary::between(&self.boot, &current, &candidate);
                 let generation = candidate.generation;
@@ -1746,12 +1745,12 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         );
     }
 
-    /// A look this replica took is not in the file either. A reload keeps the
-    /// evidence and drops the verdicts derived with it: the file can change the
-    /// providers and credentials those verdicts stood on, so the dimensions come
-    /// back fail-closed and the next projection restates them.
+    /// Availability is derived from the revision and from discovery, neither of
+    /// which is in the file, and convergence only compiles when desired state
+    /// changes. A `SIGHUP` must therefore not be the way an operator stops being
+    /// able to see which models a tenant can reach.
     #[tokio::test]
-    async fn a_reload_keeps_the_looks_and_restates_the_verdicts() {
+    async fn a_reload_does_not_blind_an_availability_read() {
         use crate::availability::{
             AvailabilityIndex, AvailabilityKey, AvailabilityRecord, AvailabilityState,
             CataloguePresence, DiscoveryCompleteness, DiscoveryObservation, DiscoveryResult,
@@ -1819,14 +1818,15 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         );
         assert_eq!(
             record.presence,
-            CataloguePresence::Absent,
-            "and not how it keeps a permit the new file never granted"
+            CataloguePresence::Present,
+            "nor how it forgets what the revision it is serving stated"
         );
         assert_eq!(
             carried
                 .evaluate(&key, SystemTime::UNIX_EPOCH + Duration::from_secs(110))
                 .state,
-            AvailabilityState::Unavailable
+            AvailabilityState::Available,
+            "the target the outgoing snapshot served is still served"
         );
     }
 
