@@ -48,9 +48,9 @@ mod desired_state;
 mod error;
 mod key_material;
 mod mint;
-// Operator commands: `axond check preflight`, `axond migrate status`, and
-// `axond migrate apply`. Nothing here is on the request path or reachable from
-// `serve`.
+// Operator commands: `axond check preflight`, `axond migrate status`,
+// `axond migrate apply`, and `axond migrate adopt`. Nothing here is on the
+// request path or reachable from `serve`.
 mod ops;
 mod principals;
 // The recovery qualification driver (#219). Tests only: it holds a replica's
@@ -113,6 +113,7 @@ fn main() -> anyhow::Result<()> {
         Some(("migrate", args)) => match args.subcommand() {
             Some(("status", args)) => migrate_control_plane(args, Migration::Status),
             Some(("apply", args)) => migrate_control_plane(args, Migration::Apply),
+            Some(("adopt", args)) => migrate_control_plane(args, Migration::Adopt),
             _ => unreachable!("clap validates subcommands"),
         },
         None => serve(),
@@ -202,6 +203,15 @@ fn cli() -> Command {
                         .about(
                             "Apply pending control-plane migrations, forward only. Idempotent and \
                              safe to run before replicas start.",
+                        )
+                        .arg(config_arg()),
+                )
+                .subcommand(
+                    Command::new("adopt")
+                        .about(
+                            "Record the baseline an out-of-band `psql` apply left unrecorded, for \
+                             the migrations whose tables this database actually holds. Executes no \
+                             migration SQL; refuses anything but an empty ledger.",
                         )
                         .arg(config_arg()),
                 ),
@@ -377,21 +387,24 @@ fn preflight(args: &clap::ArgMatches) -> anyhow::Result<()> {
     )
 }
 
-/// Which half of `axond migrate` is running. The read and the write are one
-/// function because they share every step except the last one — and separate
-/// subcommands because only one of them changes a database.
+/// Which part of `axond migrate` is running. They are one function because they
+/// share every step except the last one — and separate subcommands because two of
+/// them change a database and one cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Migration {
     Status,
     Apply,
+    Adopt,
 }
 
-/// `axond migrate status --config PATH` and `axond migrate apply --config PATH`.
+/// `axond migrate status`, `axond migrate apply`, and `axond migrate adopt`,
+/// each `--config PATH`.
 ///
 /// `status` is read-only and exits non-zero while a migration is outstanding, so
-/// a rollout can gate on it. `apply` is the only command here that writes, is
-/// forward-only, and is idempotent: running it twice reports a current schema
-/// rather than migrating twice.
+/// a rollout can gate on it. `apply` is forward-only and idempotent: running it
+/// twice reports a current schema rather than migrating twice. `adopt` records the
+/// baseline of a database whose DDL was applied out of band, on the evidence of
+/// the objects it holds, and executes no migration file at all.
 fn migrate_control_plane(args: &clap::ArgMatches, which: Migration) -> anyhow::Result<()> {
     let path = config_path(args);
     let config = ops::load(&path).map_err(ops_failure)?;
@@ -400,13 +413,24 @@ fn migrate_control_plane(args: &clap::ArgMatches, which: Migration) -> anyhow::R
     let report = match which {
         Migration::Status => runtime.block_on(ops::migrate::status(&config, &env)),
         Migration::Apply => runtime.block_on(ops::migrate::apply(&config, &env)),
+        Migration::Adopt => runtime.block_on(ops::migrate::adopt(&config, &env)),
     }
     .map_err(ops_failure)?;
     println!("{report}");
+    migration_exit(which, &report)
+}
+
+/// What a migration command's exit code says, separated from performing it so it
+/// can be checked directly for every state.
+///
+/// A rollout gate reads the code and not the report, so "succeeded" has to mean
+/// "and there is nothing left to do": `status` and `adopt` both exit non-zero on a
+/// schema that still needs migrating. Adoption is the less obvious of the two —
+/// recording a baseline below the required version *is* a success, and it is also
+/// a database no replica may serve until `apply` runs.
+fn migration_exit(which: Migration, report: &ops::migrate::Report) -> anyhow::Result<()> {
     match which {
-        // A pending schema is the answer `status` was asked for, and it is also a
-        // "not ready": a replica must not be started against it.
-        Migration::Status if !report.is_settled() => {
+        Migration::Status | Migration::Adopt if !report.is_settled() => {
             anyhow::bail!("the control-plane schema is not ready to serve")
         }
         _ if !report.is_ok() => anyhow::bail!("the control-plane schema was refused"),
@@ -675,6 +699,58 @@ mod tests {
                 "`{}` must require an action",
                 argv.join(" ")
             );
+        }
+    }
+
+    /// The exit code every migration command hands a rollout gate.
+    ///
+    /// `adopt` is the one worth pinning: recording a baseline succeeds, and a
+    /// baseline below the required version still leaves `apply` to run, so a zero
+    /// there would let replicas start against a schema that is not ready. The same
+    /// holds for an `adopt` that found a ledger already recording a *behind*
+    /// history, which reports pending migrations rather than an adoption.
+    #[test]
+    fn only_a_settled_schema_lets_status_or_adopt_exit_zero() {
+        use ops::migrate::{Report, State};
+
+        let control_plane = |state: State| Report::ControlPlane {
+            dsn_env: "GW_CONTROL_PLANE_DSN".to_owned(),
+            state,
+        };
+        let pending = vec![(2, "control_plane_0002_example")];
+        let adopted = vec![(1, "control_plane_0001_initial")];
+
+        for state in [
+            State::Adopted {
+                adopted: adopted.clone(),
+                pending: pending.clone(),
+            },
+            State::Pending {
+                pending: pending.clone(),
+            },
+        ] {
+            let report = control_plane(state);
+            assert!(report.is_ok(), "{report}");
+            for which in [Migration::Status, Migration::Adopt] {
+                assert!(
+                    migration_exit(which, &report).is_err(),
+                    "{which:?} must not exit zero while a migration is outstanding: {report}"
+                );
+            }
+        }
+
+        // A whole baseline, and a refusal: settled succeeds for both commands, and
+        // a refused schema fails for all three whatever `is_settled` says.
+        let whole = control_plane(State::Adopted {
+            adopted,
+            pending: Vec::new(),
+        });
+        let refused = control_plane(State::Refused {
+            reason: "the ledger records nothing".to_owned(),
+        });
+        for which in [Migration::Status, Migration::Apply, Migration::Adopt] {
+            assert!(migration_exit(which, &whole).is_ok(), "{whole}");
+            assert!(migration_exit(which, &refused).is_err(), "{refused}");
         }
     }
 

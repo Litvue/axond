@@ -148,8 +148,13 @@ contains and move it forward.
 ```bash
 axond migrate status --config /etc/axond/axond.toml   # read-only
 axond migrate apply  --config /etc/axond/axond.toml   # forward-only, idempotent
+axond migrate adopt  --config /etc/axond/axond.toml   # only after applying its DDL by hand
 axond check preflight --config /etc/axond/axond.toml  # read-only boot rehearsal
 ```
+
+Applying the journal's DDL with `psql` anyway leaves the ledger empty, which is a
+refusal rather than a fresh database: `axond migrate adopt` records the baseline
+the objects present account for, and refuses if they do not account for one.
 
 The stores on this page have no ledger, so nothing above orchestrates them;
 `axond check preflight` still checks that their `dsn_env` references resolve,

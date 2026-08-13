@@ -1,12 +1,16 @@
-//! `axond migrate status` and `axond migrate apply`: the control-plane journal's
-//! schema, reported and moved forward.
+//! `axond migrate status`, `axond migrate apply`, and `axond migrate adopt`: the
+//! control-plane journal's schema, reported and moved forward.
 //!
 //! One database, one ledger, one direction. The journal records every migration
 //! it has applied — version, shipped file name, and a checksum of that file's
 //! text — so "what does this database contain?" is answered from the database
 //! rather than guessed from the binary's version. [`status`] reads that ledger
-//! without writing to it; [`apply`] is the only thing here that writes, and what
-//! it writes is the versions above the recorded prefix and nothing else.
+//! without writing to it; [`apply`] writes the versions above the recorded prefix
+//! and nothing else; [`adopt`] writes ledger rows for DDL an operator applied out
+//! of band, and only for the versions whose objects the database actually holds.
+//! No command here executes a migration file twice, and none of them repairs a
+//! history: adoption is how an *unrecorded* history becomes a recorded one, which
+//! is a different question from a recorded history that disagrees with this build.
 //!
 //! Forward-only is not a convention here, it is the absence of a downgrade path:
 //! there is no `revert`, applied files are immutable, and a database whose ledger
@@ -21,6 +25,7 @@ use std::fmt;
 use super::{
     OpsError, control_plane, control_plane_dsn_env, control_plane_error, open_control_plane,
 };
+use crate::backends::control_plane::postgres::Adoption;
 use crate::backends::control_plane::schema::{self, SchemaStatus};
 use crate::config::Config;
 
@@ -36,6 +41,14 @@ pub enum State {
     /// to do reports [`State::Current`], so re-running it is visibly a no-op
     /// rather than an indistinguishable success.
     Applied { applied: Vec<(i32, &'static str)> },
+    /// `adopt` recorded these versions as already applied, on the evidence of
+    /// the tables they declare, and `pending` is what an `apply` must still add.
+    /// Never empty for the same reason [`State::Applied`] is not: an `adopt`
+    /// that recorded nothing reports the state it found instead.
+    Adopted {
+        adopted: Vec<(i32, &'static str)>,
+        pending: Vec<(i32, &'static str)>,
+    },
     /// This build must not write to this database, and why.
     Refused { reason: String },
 }
@@ -64,7 +77,13 @@ impl State {
     /// Whether an operator still has an `apply` to run. `status` exits non-zero
     /// on a pending schema so a deployment gate can be `axond migrate status`.
     pub fn is_settled(&self) -> bool {
-        !matches!(self, Self::Pending { .. } | Self::Refused { .. })
+        match self {
+            Self::Pending { .. } | Self::Refused { .. } => false,
+            // An adoption that left versions above the baseline is a schema no
+            // replica may serve yet: the operator's next command is an `apply`.
+            Self::Adopted { pending, .. } => pending.is_empty(),
+            Self::Current { .. } | Self::Applied { .. } => true,
+        }
     }
 }
 
@@ -139,6 +158,23 @@ impl fmt::Display for Report {
                     list(applied)
                 )
             }
+            State::Adopted { adopted, pending } => {
+                write!(
+                    f,
+                    "adopted {} migration(s) as already applied: {}",
+                    adopted.len(),
+                    list(adopted)
+                )?;
+                if pending.is_empty() {
+                    return write!(f, "; the schema is now current");
+                }
+                write!(
+                    f,
+                    "; {} migration(s) still pending: {} (run `axond migrate apply`)",
+                    pending.len(),
+                    list(pending)
+                )
+            }
             State::Refused { reason } => write!(f, "refused: {reason}"),
         }
     }
@@ -201,6 +237,39 @@ pub async fn apply(config: &Config, env: &HashMap<String, String>) -> Result<Rep
     Ok(Report::ControlPlane { dsn_env, state })
 }
 
+/// Record the baseline a hand-applied schema left unrecorded.
+///
+/// The operator-explicit half of the empty-ledger contract: applying the shipped
+/// DDL with `psql` creates the ledger without recording anything in it, and the
+/// ledger is the only record of what ran, so this build will neither serve that
+/// database nor migrate it from zero. `adopt` is how an operator says "this DDL
+/// was applied" — and it is checked rather than believed. The baseline recorded is
+/// the longest prefix of shipped migrations whose statements are *all* confirmed
+/// — tables and indexes present, idempotent seed rows written; a prefix that is
+/// empty, interrupted, or not a prefix is refused with
+/// [`OpsError::Refused`] and writes nothing.
+///
+/// It executes no migration SQL, so it can never double-apply a file. It is
+/// idempotent: run against a ledger that already records a history, it writes
+/// nothing and reports what is there.
+pub async fn adopt(config: &Config, env: &HashMap<String, String>) -> Result<Report, OpsError> {
+    let Some(control_plane) = control_plane(config) else {
+        return Ok(Report::NoControlPlane);
+    };
+    let dsn_env = control_plane_dsn_env(control_plane);
+    let store = open_control_plane(control_plane, env).await?;
+    let state = match store.adopt_ledger().await.map_err(control_plane_error)? {
+        Adoption::Recorded { versions, status } => State::Adopted {
+            adopted: named(&versions),
+            pending: named(&schema::pending(&status)),
+        },
+        // Nothing was written, so the report is the state that made writing
+        // unnecessary: current, or behind with an `apply` outstanding.
+        Adoption::AlreadyRecorded { status } => State::from_status(&status),
+    };
+    Ok(Report::ControlPlane { dsn_env, state })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +291,7 @@ mod tests {
         for report in [
             status(&config, &env).await.expect("status"),
             apply(&config, &env).await.expect("apply"),
+            adopt(&config, &env).await.expect("adopt"),
         ] {
             assert_eq!(report, Report::NoControlPlane);
             assert!(report.is_ok() && report.is_settled(), "{report}");
@@ -433,6 +503,36 @@ mod tests {
         dsn: String,
     }
 
+    /// Cluster-wide state a test made, undone however the test ends.
+    ///
+    /// A role and a schema outlive the test that created them, and a failing
+    /// assertion panics past any cleanup written at the end of the body, so
+    /// repeated failures accumulate roles holding grants on dropped schemas.
+    /// Dropping runs the undo statement on a thread of its own: this runs inside
+    /// a Tokio worker, which cannot block on a runtime, and there is no async
+    /// `Drop` to hand the work to instead.
+    struct Cleanup {
+        dsn: String,
+        sql: String,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let (dsn, sql) = (self.dsn.clone(), self.sql.clone());
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime to clean up on")
+                    .block_on(async move {
+                        let _ = client(&dsn).await.batch_execute(&sql).await;
+                    });
+            })
+            .join()
+            .expect("clean up what the test created");
+        }
+    }
+
     impl Fixture {
         /// A connection of the test's own, so what the commands did is observed
         /// from outside them.
@@ -471,6 +571,42 @@ mod tests {
                 .iter()
                 .map(|row| (row.get(0), row.get(1), row.get(2)))
                 .collect()
+        }
+
+        /// The database an operator gets from `psql -f`: every object the shipped
+        /// migration declares, including the ledger table, and no ledger row.
+        async fn hand_applied(&self) {
+            self.hand_applied_through(schema::MIGRATIONS.len()).await;
+        }
+
+        /// The same, stopped after `versions` files: the database of an operator
+        /// who hand-applied what shipped at the time and never ran the rest.
+        async fn hand_applied_through(&self, versions: usize) {
+            let client = self.observe().await;
+            for migration in schema::MIGRATIONS.iter().take(versions) {
+                client
+                    .batch_execute(migration.sql)
+                    .await
+                    .expect("apply the shipped DDL the way an operator would");
+            }
+            assert!(
+                self.ledger().await.is_empty(),
+                "applying the shipped DDL by hand must not record anything: that is the whole \
+                 problem adoption exists for"
+            );
+        }
+
+        async fn relation_exists(&self, relation: &str) -> bool {
+            self.observe()
+                .await
+                .query_one(
+                    "SELECT to_regclass($1)::text",
+                    &[&format!("{}.{relation}", self.schema)],
+                )
+                .await
+                .expect("probe a relation")
+                .get::<_, Option<String>>(0)
+                .is_some()
         }
     }
 
@@ -635,8 +771,10 @@ mod tests {
             panic!("an empty ledger is not something to migrate from zero: {reported}");
         };
         assert!(
-            reason.contains("records no migrations") && reason.contains("INSERT INTO"),
-            "the refusal names the baseline to state: {reason}"
+            reason.contains("records no migrations")
+                && reason.contains("axond migrate adopt")
+                && reason.contains("drop the empty"),
+            "the refusal names both ways out of an empty ledger: {reason}"
         );
 
         let error = apply(&fixture.config, &fixture.env)
@@ -666,8 +804,41 @@ mod tests {
             "a refused apply executed the shipped migration SQL anyway"
         );
 
-        // The baseline, stated: the same database is then current, and still
-        // untouched by an apply.
+        // Adoption is refused here too, and for the opposite reason `apply` is:
+        // there is no applied schema to adopt. A ledger nobody applied DDL beside
+        // is a database whose objects say "nothing ran", so recording a baseline
+        // would be recording a fiction that every later decision then trusts.
+        let error = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect_err("there is no baseline to adopt when no object is present");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "an operator decision, not an outage: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("drop the empty")
+                && error.to_string().contains("axond migrate apply"),
+            "the refusal names the way forward for an unapplied database: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("schema `{}`", fixture.schema)),
+            "and names where it looked, because the ledger can answer from one schema on a \
+             search path while the objects are sought in another: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must not record a baseline"
+        );
+        assert!(
+            !fixture.relation_exists("axond_cp_blob").await,
+            "adoption must never execute migration SQL"
+        );
+
+        // The baseline, stated by hand: still supported, and still classified the
+        // same way, so `adopt` is a convenience over the manual `INSERT` rather
+        // than a replacement for a contract it changed.
         let client = fixture.observe().await;
         for migration in schema::MIGRATIONS.iter() {
             client
@@ -692,6 +863,280 @@ mod tests {
                 version: schema::required_version()
             }),
             "{adopted}"
+        );
+    }
+
+    /// A `psql -f` that stopped one statement short of the end.
+    ///
+    /// The shipped file ends by seeding the singleton head row, and `psql` without
+    /// a wrapping transaction can abort before it: every table present, no head
+    /// row. Adoption records what it confirmed, and a seed row is part of what a
+    /// migration did, so this is the partly-applied refusal rather than a baseline
+    /// — otherwise the ledger would call v1 applied and the next `apply` would
+    /// never write the anchor publication needs.
+    #[tokio::test]
+    async fn a_hand_applied_schema_missing_its_seed_row_is_refused_rather_than_adopted() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+        fixture
+            .observe()
+            .await
+            .batch_execute("DELETE FROM axond_cp_head")
+            .await
+            .expect("undo the seed the shipped file ends with");
+
+        let error = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect_err("a migration that did not finish is not a baseline");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "an operator decision, not an outage: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("only partly applied")
+                && error
+                    .to_string()
+                    .contains("`axond_cp_head` has no seeded row"),
+            "the refusal names the repair, and the table is present so it must not claim \
+             otherwise: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must not record a baseline"
+        );
+    }
+
+    /// A role that may read the ledger but not the objects the out-of-band apply
+    /// created is an operator's to fix, not an outage to retry.
+    ///
+    /// Adoption's premise is DDL applied by somebody else, plausibly as another
+    /// role, so `42501` while reading the evidence is a realistic failure rather
+    /// than a theoretical one. Reported as retryable it would have a rollout gate
+    /// loop forever on a grant nobody is going to make from a retry.
+    ///
+    /// The seed probe is the privileged read: `pg_class` is world-readable, so the
+    /// relation probes answer for any role. That is not a gap in the check — a
+    /// table's existence is what they ask about, and existence does not depend on
+    /// who is asking — but it does mean this test rides on the shipped history
+    /// having a seed row, which
+    /// `a_migrations_declared_tables_are_read_out_of_the_shipped_ddl` pins.
+    #[tokio::test]
+    async fn a_role_that_cannot_read_the_evidence_refuses_rather_than_advising_a_retry() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+
+        // A login role with the ledger and the schema, and no read on the rest.
+        let role = format!("{}_probe", fixture.schema);
+        let client = client(&fixture.dsn).await;
+        if client
+            .batch_execute(&format!(
+                "CREATE ROLE {role} LOGIN PASSWORD 'adopt-probe';
+                 GRANT USAGE ON SCHEMA {} TO {role};
+                 GRANT SELECT, INSERT ON {}.axond_cp_schema_migration TO {role}",
+                fixture.schema, fixture.schema
+            ))
+            .await
+            .is_err()
+        {
+            // Not a superuser: this database cannot host the case.
+            return;
+        }
+        // A role is cluster-wide, unlike the schema this fixture owns, so it goes
+        // however this test ends — including through a failing assertion.
+        let _role_cleanup = Cleanup {
+            dsn: fixture.dsn.clone(),
+            sql: format!(
+                "REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM {role};
+                 REVOKE ALL ON SCHEMA {} FROM {role};
+                 DROP ROLE {role}",
+                fixture.schema, fixture.schema
+            ),
+        };
+        // The premise, asserted rather than assumed: this role cannot read the
+        // adopted tables at all. A relation probe still answers for it, because it
+        // asks `pg_class` — which no grant governs — whether the object exists.
+        for table in ["axond_cp_blob", "axond_cp_head"] {
+            let granted: bool = client
+                .query_one(
+                    "SELECT has_table_privilege($1, $2, 'SELECT')",
+                    &[&role, &format!("{}.{table}", fixture.schema)],
+                )
+                .await
+                .expect("ask what the role may read")
+                .get(0);
+            assert!(!granted, "{table} must not be readable by {role}");
+        }
+        let Some((scheme, rest)) = fixture.dsn.split_once("://") else {
+            panic!("a DSN with a scheme");
+        };
+        let host = rest.split_once('@').map_or(rest, |(_, host)| host);
+        let env = HashMap::from([(
+            "GW_CONTROL_PLANE_DSN".to_owned(),
+            format!("{scheme}://{role}:adopt-probe@{host}"),
+        )]);
+
+        let error = adopt(&fixture.config, &env)
+            .await
+            .expect_err("evidence that cannot be read is not evidence");
+        assert!(
+            matches!(error, OpsError::Refused { .. }),
+            "the server rejected the read, which is a grant to make: {error:?}"
+        );
+        assert!(
+            !error.is_retryable(),
+            "a rollout gate must stop rather than loop: {error}"
+        );
+        assert!(
+            error.to_string().contains("42501") && error.to_string().contains("no retry clears it"),
+            "the refusal names the SQLSTATE and says a retry will not help: {error}"
+        );
+        assert!(
+            error.to_string().contains("axond_cp_head"),
+            "the seed probe runs only once its table is confirmed, so naming it is also the proof \
+             that the relation probes answered for a role with no read on those tables: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must not record a baseline"
+        );
+
+        // The same role able to read everything and to write nothing: the refusal
+        // is the ledger write's, and it says so rather than reporting a migration
+        // this command never runs.
+        client
+            .batch_execute(&format!(
+                "GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {role};
+                 REVOKE INSERT ON {}.axond_cp_schema_migration FROM {role}",
+                fixture.schema, fixture.schema
+            ))
+            .await
+            .expect("let the role read the evidence but not record it");
+        let error = adopt(&fixture.config, &env)
+            .await
+            .expect_err("a baseline that cannot be written is not recorded");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "a rejected write is a grant to make, not an outage: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("recording the adopted baseline"),
+            "adoption runs no migration, so the refusal must not name one: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must not record a baseline"
+        );
+
+        // The same role with the ledger read taken away too, so this coverage does
+        // not depend on the shipped history ending in a seed row: whatever adoption
+        // is refused a read of, it refuses rather than advising a retry.
+        client
+            .batch_execute(&format!(
+                "REVOKE SELECT ON {}.axond_cp_schema_migration FROM {role}",
+                fixture.schema
+            ))
+            .await
+            .expect("take the ledger read away as well");
+        let error = adopt(&fixture.config, &env)
+            .await
+            .expect_err("a ledger that cannot be read is not an empty ledger");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "a rejected read is an operator decision at every step of adoption: {error:?}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must not record a baseline"
+        );
+    }
+
+    /// Another install's journal on the same search path is not evidence about
+    /// *this* schema.
+    ///
+    /// With `[control_plane] schema` unset the DSN's own `search_path` applies, and
+    /// it may well end in `public`. A relation probe that resolved down that path
+    /// would read the neighbour's tables as proof that this schema's DDL was
+    /// applied and record a baseline for objects it cannot even see — the one way
+    /// adoption could write a ledger row for a migration that never ran here. So
+    /// the probe is qualified to `current_schema()`, the schema an `apply` would
+    /// have created these tables in.
+    #[tokio::test]
+    async fn objects_in_another_schema_on_the_path_are_not_evidence_of_an_applied_baseline() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        // The neighbour: a complete, hand-applied journal, ledger row and all.
+        let neighbour = format!("{}_neighbour", fixture.schema);
+        let client = client(&fixture.dsn).await;
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {neighbour}; SET search_path TO {neighbour}"
+            ))
+            .await
+            .expect("create the neighbouring schema");
+        let _neighbour_cleanup = Cleanup {
+            dsn: fixture.dsn.clone(),
+            sql: format!("DROP SCHEMA {neighbour} CASCADE"),
+        };
+        for migration in schema::MIGRATIONS.iter() {
+            client
+                .batch_execute(migration.sql)
+                .await
+                .expect("apply the shipped DDL into the neighbour");
+        }
+
+        // This schema: the empty ledger and nothing else, on a search path that
+        // reaches the neighbour's tables.
+        fixture
+            .observe()
+            .await
+            .batch_execute(
+                "CREATE TABLE axond_cp_schema_migration (
+                     version     integer     PRIMARY KEY,
+                     name        text        NOT NULL,
+                     checksum    text        NOT NULL,
+                     applied_at  timestamptz NOT NULL DEFAULT now()
+                 )",
+            )
+            .await
+            .expect("create an empty ledger");
+        let config = Config::from_toml_str(
+            "mode = \"stateful\"\n\
+             [control_plane]\n\
+             dsn_env = \"GW_CONTROL_PLANE_DSN\"\n\
+             [secret_store]\n\
+             kek_env = \"GW_KEK\"\n\
+             [[admin_breakglass]]\n\
+             env = \"GW_BREAKGLASS\"\n",
+        )
+        .expect("valid stateful config without a schema of its own");
+        let separator = if fixture.dsn.contains('?') { '&' } else { '?' };
+        let env = HashMap::from([(
+            "GW_CONTROL_PLANE_DSN".to_owned(),
+            format!(
+                "{}{separator}options=-c%20search_path%3D{},{neighbour}",
+                fixture.dsn, fixture.schema
+            ),
+        )]);
+
+        let error = adopt(&config, &env)
+            .await
+            .expect_err("a neighbour's tables are not this schema's baseline");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "an operator decision, not an outage: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("drop the empty"),
+            "the refusal is the one for a database where nothing was applied: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a baseline was recorded for objects that live in another schema"
         );
     }
 
@@ -1002,6 +1447,7 @@ mod tests {
         for error in [
             status(&config, &env).await.expect_err("nothing answers"),
             apply(&config, &env).await.expect_err("nothing answers"),
+            adopt(&config, &env).await.expect_err("nothing answers"),
         ] {
             assert!(error.is_retryable(), "{error}");
             let rendered = error.to_string();
@@ -1024,5 +1470,516 @@ mod tests {
             "{rendered}"
         );
         assert!(report.is_ok() && report.is_settled(), "{rendered}");
+    }
+
+    #[test]
+    fn an_adopted_report_names_the_baseline_and_what_is_still_pending() {
+        let whole = Report::ControlPlane {
+            dsn_env: "GW_CONTROL_PLANE_DSN".to_owned(),
+            state: State::Adopted {
+                adopted: named(&[1]),
+                pending: Vec::new(),
+            },
+        };
+        let rendered = whole.to_string();
+        assert!(
+            rendered.contains("adopted 1 migration(s) as already applied")
+                && rendered.contains("v1 control_plane_0001_initial")
+                && rendered.contains("now current"),
+            "{rendered}"
+        );
+        assert!(whole.is_ok() && whole.is_settled(), "{rendered}");
+
+        // A baseline below the required version is a success that is not a
+        // finished deployment: the exit code has to keep a rollout gate honest.
+        let partial = Report::ControlPlane {
+            dsn_env: "GW_CONTROL_PLANE_DSN".to_owned(),
+            state: State::Adopted {
+                adopted: named(&[1]),
+                pending: named(&[1]),
+            },
+        };
+        assert!(partial.is_ok() && !partial.is_settled(), "{partial}");
+        assert!(
+            partial.to_string().contains("axond migrate apply"),
+            "{partial}"
+        );
+    }
+
+    /// The database the documented manual path leaves — every shipped file run
+    /// with `psql -f`, tenancy included: every object present, the ledger present,
+    /// and nothing recorded in it. What `adopt` is for — and the recording is on
+    /// the evidence of the objects, so afterwards the database is byte-for-byte
+    /// the ledger an `apply` would have written, which is what makes every later
+    /// classification the same for both paths.
+    #[tokio::test]
+    async fn a_hand_applied_schema_is_adopted_as_the_baseline_its_objects_prove() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+
+        let refused = status(&fixture.config, &fixture.env)
+            .await
+            .expect("an unrecorded schema has a status");
+        assert!(
+            matches!(refused.state(), Some(State::Refused { .. })),
+            "an unrecorded schema is refused until it is adopted: {refused}"
+        );
+
+        let report = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect("the objects the shipped DDL declares are all present");
+        assert_eq!(
+            report.state(),
+            Some(&State::Adopted {
+                adopted: named(
+                    &schema::MIGRATIONS
+                        .iter()
+                        .map(|migration| migration.version)
+                        .collect::<Vec<_>>()
+                ),
+                pending: Vec::new(),
+            }),
+            "{report}"
+        );
+        assert_eq!(
+            fixture.ledger().await,
+            schema::MIGRATIONS
+                .iter()
+                .map(|migration| (
+                    migration.version,
+                    migration.name.to_owned(),
+                    migration.checksum().to_string()
+                ))
+                .collect::<Vec<_>>(),
+            "an adopted baseline is the ledger an apply would have written"
+        );
+
+        let settled = status(&fixture.config, &fixture.env)
+            .await
+            .expect("an adopted schema has a status");
+        assert_eq!(
+            settled.state(),
+            Some(&State::Current {
+                version: schema::required_version()
+            }),
+            "{settled}"
+        );
+
+        // The point of the whole exercise: the shipped SQL is never executed over
+        // objects that are already there. A table dropped after adoption stays
+        // dropped, because an apply against a current schema applies nothing.
+        fixture
+            .observe()
+            .await
+            .batch_execute("DROP TABLE axond_cp_idempotency CASCADE")
+            .await
+            .expect("drop a table the migration creates");
+        let applied = apply(&fixture.config, &fixture.env)
+            .await
+            .expect("an adopted schema is current, so an apply is a no-op");
+        assert_eq!(
+            applied.state(),
+            Some(&State::Current {
+                version: schema::required_version()
+            }),
+            "{applied}"
+        );
+        assert!(
+            !fixture.relation_exists("axond_cp_idempotency").await,
+            "applying after an adoption replayed the shipped migration SQL"
+        );
+    }
+
+    /// The other empty ledger an operator can be holding: v1 applied by hand
+    /// before v2 shipped, and v2 never run. The baseline is v1, v2 stays pending,
+    /// and `apply` is what runs it — which is the whole point of adopting a prefix
+    /// rather than the history, and of the exit code being non-zero until it is
+    /// done.
+    ///
+    /// Worth a database rather than a unit test because v2 rewrites two of v1's
+    /// own constraints under their original names: they are present here without
+    /// v2 having run, and reading them as evidence would refuse every deployment
+    /// in this state as half-way through v2.
+    #[tokio::test]
+    async fn a_schema_hand_applied_only_as_far_as_v1_adopts_v1_and_leaves_v2_pending() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied_through(1).await;
+        assert!(
+            !fixture.relation_exists("axond_cp_tenant").await,
+            "v2's objects must not be there: this is the pre-tenancy manual state"
+        );
+
+        // Everything above v1, read out of the shipped history rather than listed:
+        // this state is "the ledger names the prefix the objects account for and
+        // `apply` runs the rest", however long the rest has become.
+        let rest: Vec<i32> = schema::MIGRATIONS
+            .iter()
+            .map(|migration| migration.version)
+            .filter(|version| *version > 1)
+            .collect();
+
+        let report = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect("v1's objects are all present, so v1 is adoptable");
+        assert_eq!(
+            report.state(),
+            Some(&State::Adopted {
+                adopted: named(&[1]),
+                pending: named(&rest),
+            }),
+            "{report}"
+        );
+        assert!(
+            report.is_ok() && !report.is_settled(),
+            "a baseline with a migration still pending is not a schema to serve: {report}"
+        );
+        assert_eq!(
+            fixture.ledger().await,
+            vec![(
+                1,
+                schema::MIGRATIONS[0].name.to_owned(),
+                schema::MIGRATIONS[0].checksum().to_string()
+            )],
+            "only the version the objects account for may be recorded"
+        );
+
+        // And the recorded prefix is one `apply` extends, which is what makes the
+        // adoption of a prefix safe: v2 runs once, from the ledger, rather than
+        // being replayed over a schema that already had it.
+        let applied = apply(&fixture.config, &fixture.env)
+            .await
+            .expect("an adopted prefix is behind, so an apply runs the rest");
+        assert_eq!(
+            applied.state(),
+            Some(&State::Applied {
+                applied: named(&rest)
+            }),
+            "{applied}"
+        );
+        assert!(
+            fixture.relation_exists("axond_cp_tenant").await,
+            "the apply that followed the adoption has to have run v2"
+        );
+    }
+
+    /// Adoption is idempotent, and it is idempotent the way `apply` is: the second
+    /// run reports the state it found rather than recording a second baseline.
+    #[tokio::test]
+    async fn a_second_adopt_reports_the_recorded_history_rather_than_writing_again() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+        adopt(&fixture.config, &fixture.env)
+            .await
+            .expect("the first adoption records the baseline");
+        let first = fixture.ledger().await;
+
+        let second = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect("a recorded history is not a refusal");
+        assert_eq!(
+            second.state(),
+            Some(&State::Current {
+                version: schema::required_version()
+            }),
+            "a second adoption reports the history it found: {second}"
+        );
+        assert_eq!(
+            fixture.ledger().await,
+            first,
+            "a second adoption rewrote the ledger it should have left alone"
+        );
+    }
+
+    /// An ordinary migrated database, for the same reason a twice-adopted one is a
+    /// no-op: `adopt` answers "what is this *unrecorded* schema?", so a database
+    /// that already has a history is reported rather than written to. That is what
+    /// keeps a mistaken `adopt` in a rollout from being a ledger edit.
+    #[tokio::test]
+    async fn adopting_a_migrated_database_reports_it_and_records_nothing() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        apply(&fixture.config, &fixture.env)
+            .await
+            .expect("migrate normally");
+        let recorded = fixture.ledger().await;
+
+        let report = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect("a migrated database is current, not adoptable");
+        assert_eq!(
+            report.state(),
+            Some(&State::Current {
+                version: schema::required_version()
+            }),
+            "{report}"
+        );
+        assert_eq!(fixture.ledger().await, recorded, "{report}");
+    }
+
+    /// A half-applied migration is the case adoption must not paper over: one of
+    /// the tables the file declares is missing, so neither "it was applied" nor
+    /// "it was not" is true. Recording it would promise a schema the database does
+    /// not have, and the failure has to leave the ledger exactly as empty as it
+    /// found it — a partial baseline would be worse than none.
+    #[tokio::test]
+    async fn a_partly_applied_schema_is_refused_without_recording_anything() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+        fixture
+            .observe()
+            .await
+            .batch_execute("DROP TABLE axond_cp_head CASCADE")
+            .await
+            .expect("leave the hand-applied schema incomplete");
+
+        let error = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect_err("an incomplete schema has no baseline");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "an operator decision, not an outage: {error:?}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("only partly applied") && rendered.contains("axond_cp_head"),
+            "the refusal names the object that is missing: {rendered}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must record no version at all, not the ones it got through"
+        );
+        assert!(
+            !fixture.relation_exists("axond_cp_head").await,
+            "adoption executed DDL to repair what it should have refused"
+        );
+
+        // Still refused by the read-only command and by `apply`, unchanged: the
+        // schema is unrecorded, and a failed adoption did not make it anything else.
+        let report = status(&fixture.config, &fixture.env)
+            .await
+            .expect("status still reads");
+        assert!(
+            matches!(report.state(), Some(State::Refused { .. })),
+            "{report}"
+        );
+        assert!(
+            apply(&fixture.config, &fixture.env)
+                .await
+                .expect_err("apply still refuses an unrecorded schema")
+                .to_string()
+                .contains("records no migrations")
+        );
+    }
+
+    /// A database with no ledger at all is `apply`'s job, not adoption's, and a
+    /// ledger this build cannot account for is nobody's: adoption is one narrow
+    /// operation on one status, so every other status it is pointed at is a typed
+    /// refusal that writes nothing.
+    #[tokio::test]
+    async fn adoption_refuses_every_schema_that_is_not_an_empty_ledger() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        // Absent: no ledger to reconcile, and `apply` is the command for it.
+        let error = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect_err("an absent schema is not adoptable");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("existing but empty"),
+            "the refusal says what adoption is for: {error}"
+        );
+        assert!(
+            !fixture.ledger_exists().await,
+            "a refused adoption created the ledger it refused to reconcile"
+        );
+
+        // Drifted: a recorded history whose text is not this build's. Adoption
+        // must not "fix" it by recording the checksum this build ships.
+        apply(&fixture.config, &fixture.env)
+            .await
+            .expect("migrate to current first");
+        fixture
+            .observe()
+            .await
+            .execute(
+                "UPDATE axond_cp_schema_migration SET checksum = $1 WHERE version = $2",
+                &[&Checksum::of(b"an edited migration").to_string(), &1_i32],
+            )
+            .await
+            .expect("drift the recorded checksum");
+        let error = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect_err("a drifted history is not adoptable");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "{error:?}"
+        );
+        assert_eq!(
+            fixture.ledger().await.first().map(|row| row.2.clone()),
+            Some(Checksum::of(b"an edited migration").to_string()),
+            "a refused adoption rewrote a recorded checksum"
+        );
+    }
+
+    /// A v2 database with one of the tenancy migration's effects put back the way
+    /// v1 left it. Each case is a schema no version describes, and each has to be
+    /// refused by name: the effects `adopt` confirms are columns, named
+    /// constraints, both row-security flags and policies, so a deployment missing
+    /// any one of them is half-way through v2 rather than at v1 or v2.
+    ///
+    /// The `ADD CONSTRAINT` case is the one that needs a database to demonstrate:
+    /// v2 drops a v1 constraint, so a schema that still has it has not had v2
+    /// applied, however complete the rest of it looks.
+    #[tokio::test]
+    async fn a_tenancy_effect_undone_by_hand_is_refused_and_named() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+
+        for (undo, named, redo) in [
+            (
+                "ALTER TABLE axond_cp_head NO FORCE ROW LEVEL SECURITY",
+                "forced row level security on `axond_cp_head` is not enabled",
+                "ALTER TABLE axond_cp_head FORCE ROW LEVEL SECURITY",
+            ),
+            (
+                "ALTER TABLE axond_cp_tenant DISABLE ROW LEVEL SECURITY",
+                "row level security on `axond_cp_tenant` is not enabled",
+                "ALTER TABLE axond_cp_tenant ENABLE ROW LEVEL SECURITY",
+            ),
+            // A policy the `DO` block creates dynamically, which adoption knows to
+            // look for because it reads the block's own list of tables.
+            (
+                "DROP POLICY axond_cp_blob_isolation ON axond_cp_blob",
+                "`axond_cp_blob`'s `axond_cp_blob_isolation` policy is not present",
+                "CREATE POLICY axond_cp_blob_isolation ON axond_cp_blob USING (true)",
+            ),
+            (
+                "ALTER TABLE axond_cp_mutation DROP CONSTRAINT \
+                 axond_cp_mutation_actor_attribution",
+                "`axond_cp_mutation`'s `axond_cp_mutation_actor_attribution` constraint is not \
+                 present",
+                "ALTER TABLE axond_cp_mutation ADD CONSTRAINT \
+                 axond_cp_mutation_actor_attribution CHECK (true)",
+            ),
+            // The reverse direction: something v2 takes away, still there.
+            (
+                "ALTER TABLE axond_cp_audit_event ADD CONSTRAINT \
+                 axond_cp_audit_event_actor_kind_check CHECK (true)",
+                "`axond_cp_audit_event`'s `axond_cp_audit_event_actor_kind_check` constraint is \
+                 still present",
+                "ALTER TABLE axond_cp_audit_event DROP CONSTRAINT \
+                 axond_cp_audit_event_actor_kind_check",
+            ),
+            (
+                "ALTER TABLE axond_cp_audit_event DROP COLUMN actor_principal_id",
+                "`axond_cp_audit_event`'s `actor_principal_id` column is not present",
+                // Dropping the column takes the constraint over it along with it,
+                // so putting the schema back means putting both back.
+                "ALTER TABLE axond_cp_audit_event \
+                 ADD COLUMN actor_principal_id text NULL, \
+                 ADD CONSTRAINT axond_cp_audit_event_actor_attribution CHECK (true)",
+            ),
+        ] {
+            fixture
+                .observe()
+                .await
+                .batch_execute(undo)
+                .await
+                .unwrap_or_else(|error| panic!("undo one tenancy effect ({undo}): {error}"));
+            let error = adopt(&fixture.config, &fixture.env)
+                .await
+                .expect_err("a schema missing one of v2's effects has no baseline");
+            assert!(
+                matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+                "an operator decision, not an outage: {error:?}"
+            );
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("only partly applied") && rendered.contains(named),
+                "the refusal has to name what is wrong ({named}): {rendered}"
+            );
+            assert!(
+                fixture.ledger().await.is_empty(),
+                "a refused adoption recorded a version anyway: {undo}"
+            );
+            fixture
+                .observe()
+                .await
+                .batch_execute(redo)
+                .await
+                .unwrap_or_else(|error| panic!("put the tenancy effect back ({redo}): {error}"));
+        }
+
+        // Every effect back where the shipped files leave it, so the refusals above
+        // are each one missing effect's doing rather than v2 being unadoptable.
+        let report = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect("a fully hand-applied v1+v2 schema is adoptable");
+        assert_eq!(
+            report.state(),
+            Some(&State::Adopted {
+                adopted: named(
+                    &schema::MIGRATIONS
+                        .iter()
+                        .map(|migration| migration.version)
+                        .collect::<Vec<_>>()
+                ),
+                pending: Vec::new(),
+            }),
+            "{report}"
+        );
+    }
+
+    /// Two operators, one database: adoption takes the journal's advisory lock and
+    /// re-reads the ledger under it, so a race records one baseline and the loser
+    /// reports the history the winner wrote.
+    #[tokio::test]
+    async fn concurrent_adoptions_record_the_baseline_once() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+        let (left, right) = tokio::join!(
+            adopt(&fixture.config, &fixture.env),
+            adopt(&fixture.config, &fixture.env)
+        );
+        let states = [
+            left.expect("the first adoption").state().cloned(),
+            right.expect("the second adoption").state().cloned(),
+        ];
+        assert_eq!(
+            states
+                .iter()
+                .filter(|state| matches!(state, Some(State::Adopted { .. })))
+                .count(),
+            1,
+            "exactly one of two concurrent adoptions records a baseline: {states:?}"
+        );
+        assert!(
+            states
+                .iter()
+                .any(|state| matches!(state, Some(State::Current { .. }))),
+            "the adoption that lost the race finds a recorded history: {states:?}"
+        );
+        assert_eq!(
+            fixture.ledger().await.len(),
+            schema::MIGRATIONS.len(),
+            "each migration is recorded once however many adoptions ran"
+        );
     }
 }
