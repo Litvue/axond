@@ -381,7 +381,7 @@ whose tenant isolation is not actually in place.
 
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),
-[ADR 0040](../adr/0041-billing-grade-usage-outbox.md),
+[ADR 0041](../adr/0041-billing-grade-usage-outbox.md),
 [ADR 0017](../adr/0017-state-tiers-and-optional-backends.md), and
 [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) hold the
 telemetry, durability, and tier positions; section 3 of the security review is
@@ -393,7 +393,7 @@ cardinality *and* a disclosure decision.
 
 A change to the *delivery guarantee* is part of this trigger too, not just a
 change to the row. The billing-grade usage outbox
-([ADR 0040](../adr/0041-billing-grade-usage-outbox.md)) puts a durable write on
+([ADR 0041](../adr/0041-billing-grade-usage-outbox.md)) puts a durable write on
 the request path for deployments that opt in, so the review question is
 availability as much as disclosure: with the defaults, an outbox that is full or
 unreachable refuses requests, and the escapes from that (`capacity_policy =

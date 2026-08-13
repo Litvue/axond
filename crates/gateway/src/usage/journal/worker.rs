@@ -40,6 +40,15 @@ use tokio::task::JoinHandle;
 use super::{Claim, ConsumerId, Delivery, JournalError, JournalStats, PoisonReason, UsageJournal};
 use crate::usage::{ObservedRecord, UsageSink};
 
+/// How long past its budget a worker is waited for, to cover the batch it is
+/// already writing.
+const DRAIN_MARGIN: Duration = Duration::from_secs(1);
+
+/// The bound on a backlog read taken after the delivery budget is spent. Kept
+/// below [`DRAIN_MARGIN`] so a closing read can neither make a worker that
+/// stopped correctly look abandoned nor push shutdown past the flush timeout.
+const CLOSING_READ: Duration = Duration::from_millis(500);
+
 /// How the worker claims and how often.
 #[derive(Debug, Clone)]
 pub struct WorkerSettings {
@@ -210,7 +219,14 @@ impl DeliveryWorker {
                 Ok(_) => {}
             }
         }
-        if let Ok(stats) = self.journal.stats(&self.settings.consumer).await {
+        // Bounded separately from the delivery budget, and by less than the
+        // margin `WorkerHandle::drain` waits: a journal operation carries its
+        // own timeout, which can be many times that margin, and a worker
+        // abandoned for a slow closing read would be reported as never having
+        // stopped when it had.
+        if let Ok(Ok(stats)) =
+            tokio::time::timeout(CLOSING_READ, self.journal.stats(&self.settings.consumer)).await
+        {
             report.observe(stats);
         }
         report
@@ -575,7 +591,7 @@ impl WorkerHandle {
         // The bound the worker was given plus a margin for the batch it is
         // already writing; a task that overran it is abandoned rather than
         // allowed to hold the process open.
-        match tokio::time::timeout(budget + Duration::from_secs(1), task).await {
+        match tokio::time::timeout(budget + DRAIN_MARGIN, task).await {
             Ok(Ok(report)) => report,
             Ok(Err(error)) => {
                 tracing::error!(error = %error, "usage journal worker panicked");
@@ -597,9 +613,17 @@ impl WorkerHandle {
     /// are marked unknown.
     async fn unreported(journal: &Arc<dyn UsageJournal>, consumer: &ConsumerId) -> DrainReport {
         let mut report = DrainReport::default();
-        match journal.stats(consumer).await {
-            Ok(stats) => report.observe(stats),
-            Err(error) => tracing::error!(
+        // Bounded too: this runs after the shutdown budget is already spent, so
+        // an unreachable journal must not add its operation timeout to a
+        // shutdown an orchestrator sized its grace period against.
+        match tokio::time::timeout(CLOSING_READ, journal.stats(consumer)).await {
+            Ok(Ok(stats)) => report.observe(stats),
+            Err(_) => tracing::error!(
+                journal = journal.name(),
+                "usage journal backlog could not be read inside its bound after the drain was \
+                 abandoned"
+            ),
+            Ok(Err(error)) => tracing::error!(
                 journal = journal.name(),
                 error = %error,
                 "usage journal backlog could not be read after the drain was abandoned"
@@ -724,6 +748,94 @@ mod tests {
         async fn stats(&self, consumer: &ConsumerId) -> Result<JournalStats, JournalError> {
             self.0.stats(consumer).await
         }
+    }
+
+    /// A journal whose backlog read takes as long as a journal operation
+    /// timeout allows: what a large outbox on a busy database does to the read
+    /// the worker takes on its way out.
+    struct SlowStats(InMemoryUsageJournal, Duration);
+
+    #[async_trait]
+    impl UsageJournal for SlowStats {
+        fn name(&self) -> &'static str {
+            "slow-stats"
+        }
+
+        fn capacity(&self) -> Capacity {
+            self.0.capacity()
+        }
+
+        fn mode(&self) -> super::super::DeliveryMode {
+            self.0.mode()
+        }
+
+        async fn append(&self, event: &UsageEvent) -> Result<Appended, JournalError> {
+            self.0.append(event).await
+        }
+
+        async fn claim(
+            &self,
+            consumer: &ConsumerId,
+            claim: Claim,
+        ) -> Result<Vec<Delivery>, JournalError> {
+            self.0.claim(consumer, claim).await
+        }
+
+        async fn ack(&self, delivery: &DeliveryId) -> Result<(), JournalError> {
+            self.0.ack(delivery).await
+        }
+
+        async fn quarantine(
+            &self,
+            delivery: &DeliveryId,
+            reason: PoisonReason,
+        ) -> Result<(), JournalError> {
+            self.0.quarantine(delivery, reason).await
+        }
+
+        async fn relinquish(&self, delivery: &DeliveryId) -> Result<(), JournalError> {
+            self.0.relinquish(delivery).await
+        }
+
+        async fn stats(&self, consumer: &ConsumerId) -> Result<JournalStats, JournalError> {
+            tokio::time::sleep(self.1).await;
+            self.0.stats(consumer).await
+        }
+    }
+
+    /// The closing backlog read is bounded on its own, so a journal operation
+    /// that outlasts the drain margin cannot turn a worker that stopped
+    /// correctly into an abandoned one — nor hold shutdown open for the whole
+    /// operation timeout twice over.
+    #[tokio::test]
+    async fn a_slow_closing_backlog_read_does_not_make_a_stopped_worker_look_abandoned() {
+        let journal = Arc::new(SlowStats(
+            InMemoryUsageJournal::new(),
+            Duration::from_secs(5),
+        ));
+        let sinks: Vec<Box<dyn UsageSink>> = vec![];
+        let handle = DeliveryWorker::new(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::new(sinks),
+            settings(Duration::from_secs(30)),
+        )
+        .spawn();
+
+        let started = Instant::now();
+        let report = handle.drain(Duration::from_millis(50)).await;
+        assert!(
+            report.reported,
+            "a worker abandoned for its closing read: {report:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited on the journal's own timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !report.counted,
+            "the backlog read did not finish, so it is unknown rather than zero: {report:?}"
+        );
     }
 
     /// Fast enough that a test does not wait on a poll, long enough that the
