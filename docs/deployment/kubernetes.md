@@ -70,6 +70,21 @@ evaluation:
   `secret.yaml`), because its values are published in this repository — see
   [The Secret the overlay does not ship](#the-secret-the-overlay-does-not-ship).
 
+The overlay requires **Kubernetes 1.32 or newer**, because two of its fields have
+version floors and an older API server drops them rather than rejecting the
+manifest:
+
+- the `sleep` `preStop` lifecycle action, on by default from 1.30 and GA in 1.32;
+  the distroless image has no shell, so an `exec` hook is not a fallback, and a
+  dropped hook means Pods stop receiving traffic only after `SIGTERM`;
+- `matchLabelKeys` on a topology spread constraint, on by default from 1.27; a
+  dropped key turns the hard per-node spread into the fleet-wide form that
+  deadlocks a rolling update on a cluster with as many nodes as replicas, which
+  surfaces as a hung upgrade rather than as a rejected manifest.
+
+On an older cluster, confirm both survive a round trip through
+`kubectl -n axond get deployment axond -o yaml` before trusting a rollout.
+
 ```bash
 kubectl create namespace axond
 kubectl -n axond create secret generic axond-secrets \

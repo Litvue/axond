@@ -257,7 +257,16 @@ def check_resources(documents: list[Document], label: str) -> list[str]:
                             f"{section}.{resource}"
                         )
             limit = resources.get("limits", {}).get("memory")
-            if limit is None or not admission:
+            if limit is None:
+                continue
+            if not all(key in admission for key in ("max_in_flight", "max_request_bytes")):
+                failures.append(
+                    f"{label}: the mounted axond.toml declares no [admission] "
+                    "max_in_flight/max_request_bytes, so the gateway runs on its compiled-in "
+                    "ceilings and nothing pairs them with "
+                    f"container {container['name']!r}'s {limit} memory limit; keep the ceilings "
+                    "in the ConfigMap"
+                )
                 continue
             limit_bytes = parse_quantity(limit)
             worst_case = admission["max_in_flight"] * admission["max_request_bytes"]
@@ -781,6 +790,21 @@ def self_test() -> int:
         "max_in_flight = 32", "max_in_flight = 512"
     )
     expect_failure("admission against the memory limit", check_resources(greedy, "overlays/production"))
+
+    # Deleting the section is the same regression as raising it: the gateway then
+    # runs on compiled-in ceilings no manifest bounds.
+    unbounded_admission = copy.deepcopy(production)
+    config = one(unbounded_admission, "ConfigMap")
+    config["data"]["axond.toml"] = re.sub(
+        r"^max_(in_flight|request_bytes) = .*$",
+        "",
+        config["data"]["axond.toml"],
+        flags=re.MULTILINE,
+    )
+    expect_failure(
+        "a deleted [admission] ceiling",
+        check_resources(unbounded_admission, "overlays/production"),
+    )
 
     moved = copy.deepcopy(production)
     one(moved, "Service")["spec"]["ports"][0]["port"] = 9090
