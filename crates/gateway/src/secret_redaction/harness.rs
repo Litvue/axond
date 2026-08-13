@@ -4,33 +4,32 @@
 //! that resolves desired-state credentials through a `SecretStore`, and a fake
 //! provider that records what it was authenticated with.
 //!
-//! The compiler needs a word of explanation. Production convergence takes its
-//! projection as a seam ([`crate::convergence::compile`]), and the projection
-//! that reads credential bodies and resolves their references through a store is
-//! part of the runtime slice tracked by #145; it is not on `main`. Rather than
-//! assert nothing until it is, [`SecretResolvingCompiler`] wires the two landed
-//! halves together exactly as that slice will have to: read the revision's
-//! credentials with [`Credentials::of`], resolve each body's [`SecretRef`]
-//! through the [`SecretStore`], hand the material to
-//! [`ConfigSnapshot::build`] as the resolved environment, and publish the whole
-//! snapshot atomically or none of it.
+//! The compiler needs a word of explanation. Unwrapping material is production
+//! code — [`SecretMaterialization`] resolves a candidate's exact versions during
+//! compilation and hands the snapshot a [`ResolvedSecrets`] that keeps them
+//! alive — and [`SecretResolvingCompiler`] uses it rather than reimplementing
+//! it, so every retention, rotation, and zeroization property asserted here is
+//! asserted about the shipped seam.
 //!
-//! That makes the lifecycle assertions in this module family real — they run
-//! against the actual `Reconciler`, the actual `ArcSwap`, the actual request
-//! path — while keeping the harness honest about what it is: when the
-//! production projection lands, these tests should be repointed at it, and any
-//! behaviour they assert that it does not have is a bug in it, not here.
+//! What the harness still supplies is the *pool wiring*: turning a resolved
+//! version into the credential a provider call is authenticated with still runs
+//! through [`ConfigSnapshot::build_with`]'s environment, because the projection
+//! that emits `[[credential]]` entries from typed credential bodies is not on
+//! `main` yet. So this compiler names each resolved version with an env-var name
+//! and hands the material over under it, then gives the same [`ResolvedSecrets`]
+//! to the snapshot. When that projection lands, this seam is the only thing that
+//! should have to change.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::post;
-use futures::FutureExt as _;
 use serde_json::json;
 use tokio::sync::{Semaphore, mpsc};
 
@@ -41,6 +40,7 @@ use crate::backends::secrets::{SecretMaterial, SecretResolver as _};
 use crate::budget::NoBudget;
 use crate::config::{Config, Model, Target};
 use crate::convergence::compile::{CandidateCompiler, CompileError, ProjectionError};
+use crate::convergence::secrets::{MaterialLedger, SecretMaterialization};
 use crate::convergence::status::testing::ManualClock;
 use crate::convergence::{BackoffPolicy, ConvergenceSettings, Outcome, Reconciler};
 use crate::desired_state::credentials::{Credentials, ProviderCredentialBody};
@@ -132,7 +132,7 @@ fn env_name(id: ResourceId) -> String {
 pub(crate) struct SecretResolvingCompiler {
     bootstrap: Config,
     env: HashMap<String, String>,
-    secrets: Arc<InMemorySecrets>,
+    materialization: Arc<SecretMaterialization>,
     /// The bootstrap provider aliases are pointed at.
     provider: &'static str,
     resolutions: AtomicUsize,
@@ -143,10 +143,17 @@ impl SecretResolvingCompiler {
         Self {
             bootstrap,
             env: bootstrap_env(),
-            secrets,
+            materialization: Arc::new(SecretMaterialization::new(secrets, MaterialLedger::new())),
             provider: "openai",
             resolutions: AtomicUsize::new(0),
         }
+    }
+
+    /// The ledger the production materialization registers unwrapped versions
+    /// in: references only, which is how a test observes retention and
+    /// destruction without observing material.
+    pub(crate) fn ledger(&self) -> &Arc<MaterialLedger> {
+        self.materialization.ledger()
     }
 
     /// How many times material has been taken out of the store.
@@ -158,8 +165,9 @@ impl SecretResolvingCompiler {
     }
 }
 
+#[async_trait]
 impl CandidateCompiler for SecretResolvingCompiler {
-    fn compile(
+    async fn compile(
         &self,
         revision: &LoadedRevision,
         generation: u64,
@@ -177,25 +185,22 @@ impl CandidateCompiler for SecretResolvingCompiler {
                 detail: error.to_string(),
             })
         })?;
+        // All of the candidate's material or none of it, resolved by the shipped
+        // materialization: a version it cannot unwrap is a refusal here, before
+        // anything is published.
+        let resolved = self
+            .materialization
+            .resolve(revision.state())
+            .await
+            .map_err(projection)?;
         for credential in credentials.all() {
             if !credential.body.permits_resolution() {
                 continue;
             }
             let reference = credential.body.secret();
-            let material = self
-                .secrets
-                .resolve(credential.body.owner(), &reference)
-                .now_or_never()
-                .expect("the in-memory store resolves without yielding")
-                .map_err(|error| {
-                    // The reference is named; the material is what could not be
-                    // obtained, so there is nothing of it to name.
-                    projection(ProjectionError::Secret {
-                        holder: credential.reference,
-                        reference: reference.to_string(),
-                        detail: error.to_string(),
-                    })
-                })?;
+            let material = resolved
+                .get(reference)
+                .expect("a resolvable credential's version is in the resolved set");
             self.resolutions.fetch_add(1, Ordering::Relaxed);
             let name = env_name(credential.reference.id);
             config.credential.push(crate::config::Credential {
@@ -232,9 +237,14 @@ impl CandidateCompiler for SecretResolvingCompiler {
                 revision: id,
                 source,
             })?;
-        ConfigSnapshot::build(config, &env, generation).map_err(|source| CompileError::Snapshot {
-            revision: id,
-            source,
+        // The snapshot takes the resolved set, so the material stays alive for
+        // exactly as long as this snapshot can be serving a request and is
+        // zeroized when the last holder drops it.
+        ConfigSnapshot::build_with(config, &env, generation, resolved).map_err(|source| {
+            CompileError::Snapshot {
+                revision: id,
+                source,
+            }
         })
     }
 }
@@ -537,12 +547,7 @@ pub(crate) async fn live_material(pairs: &[(SecretRef, &'static str)]) -> Vec<St
     let secrets = InMemorySecrets::new();
     let mut resolved = Vec::with_capacity(pairs.len());
     for (reference, plaintext) in pairs {
-        secrets.seed(
-            owner(),
-            *reference,
-            SecretLifecycle::Active,
-            material(plaintext),
-        );
+        secrets.seed(owner(), *reference, plaintext, SecretLifecycle::Active);
         resolved.push(
             secrets
                 .resolve(owner(), reference)

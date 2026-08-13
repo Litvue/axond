@@ -95,12 +95,9 @@ async fn material_is_disclosed_to_the_runtime_and_never_read_back_by_an_administ
 async fn a_rotation_publishes_new_material_without_cutting_an_in_flight_request() {
     let provider = FakeProvider::gated().await;
     let replica = Replica::new(&provider);
-    replica.secrets.seed(
-        owner(),
-        first(),
-        SecretLifecycle::Active,
-        material(PROVIDER_MATERIAL),
-    );
+    replica
+        .secrets
+        .seed(owner(), first(), PROVIDER_MATERIAL, SecretLifecycle::Active);
     replica
         .publish(
             "first",
@@ -121,12 +118,9 @@ async fn a_rotation_publishes_new_material_without_cutting_an_in_flight_request(
     // The administrator rotates: new material, new secret version, a republished
     // credential body pinning it.
     let rotated = first().rotated();
-    replica.secrets.seed(
-        owner(),
-        rotated,
-        SecretLifecycle::Active,
-        material(ROTATED_MATERIAL),
-    );
+    replica
+        .secrets
+        .seed(owner(), rotated, ROTATED_MATERIAL, SecretLifecycle::Active);
     let desired = replica
         .publish(
             "rotation",
@@ -175,12 +169,9 @@ async fn a_rotation_publishes_new_material_without_cutting_an_in_flight_request(
 async fn a_failed_resolution_keeps_the_last_known_good_snapshot_serving() {
     let provider = FakeProvider::serving().await;
     let replica = Replica::new(&provider);
-    replica.secrets.seed(
-        owner(),
-        first(),
-        SecretLifecycle::Active,
-        material(PROVIDER_MATERIAL),
-    );
+    replica
+        .secrets
+        .seed(owner(), first(), PROVIDER_MATERIAL, SecretLifecycle::Active);
     replica
         .publish(
             "first",
@@ -233,12 +224,9 @@ async fn a_failed_resolution_keeps_the_last_known_good_snapshot_serving() {
 
     // And the store outage recovers into a publication rather than needing a
     // restart: the same candidate compiles once the material is there.
-    replica.secrets.seed(
-        owner(),
-        rotated,
-        SecretLifecycle::Active,
-        material(ROTATED_MATERIAL),
-    );
+    replica
+        .secrets
+        .seed(owner(), rotated, ROTATED_MATERIAL, SecretLifecycle::Active);
     let outcome = replica.converge().await;
     assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
     assert_eq!(replica.generation(), 2);
@@ -258,12 +246,9 @@ async fn retired_material_is_destroyed_once_no_snapshot_references_it() {
     let replica = Replica::new(&provider);
     let rotated = first().rotated();
     for (reference, plaintext) in [(first(), PROVIDER_MATERIAL), (rotated, ROTATED_MATERIAL)] {
-        replica.secrets.seed(
-            owner(),
-            reference,
-            SecretLifecycle::Active,
-            material(plaintext),
-        );
+        replica
+            .secrets
+            .seed(owner(), reference, plaintext, SecretLifecycle::Active);
     }
     replica
         .publish(
@@ -285,14 +270,27 @@ async fn retired_material_is_destroyed_once_no_snapshot_references_it() {
     assert_eq!(replica.generation(), 2);
 
     // While a reference survives, the old material is still resolvable: retiring
-    // it here is what would cut the request holding it.
+    // it here is what would cut the request holding it. Both versions' unwrapped
+    // material is live at once, which is what a rotation *is* from the ledger's
+    // side.
     assert!(replica.secrets.holds_material(&first()));
+    let ledger = replica.compiler.ledger();
+    assert!(ledger.holds(first()), "{:?}", ledger.retained());
+    assert!(ledger.holds(rotated), "{:?}", ledger.retained());
     let weak = Arc::downgrade(&superseded);
     drop(superseded);
     assert!(
         weak.upgrade().is_none(),
         "the superseded snapshot is still referenced, so retirement would be premature"
     );
+    // Dropping the last snapshot holding the superseded version zeroizes its
+    // material without anybody scheduling the release.
+    assert!(
+        !ledger.holds(first()),
+        "unwrapped material outlived the last snapshot referencing it: {:?}",
+        ledger.retained()
+    );
+    assert_eq!(ledger.retained(), vec![rotated]);
 
     // Nothing references it: the operator retires the version.
     replica
@@ -420,12 +418,9 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
 async fn material_crosses_the_store_boundary_once_per_compilation() {
     let provider = FakeProvider::serving().await;
     let replica = Replica::new(&provider);
-    replica.secrets.seed(
-        owner(),
-        first(),
-        SecretLifecycle::Active,
-        material(PROVIDER_MATERIAL),
-    );
+    replica
+        .secrets
+        .seed(owner(), first(), PROVIDER_MATERIAL, SecretLifecycle::Active);
     replica
         .publish(
             "first",

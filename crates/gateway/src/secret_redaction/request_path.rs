@@ -21,7 +21,7 @@ use tower::util::ServiceExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::harness::{
-    FakeProvider, PROVIDER_MATERIAL, Replica, chat_request, first, live_material, material, owner,
+    FakeProvider, PROVIDER_MATERIAL, Replica, chat_request, first, live_material, owner,
     state_pinning, sweep,
 };
 use crate::desired_state::{ResourceVersionNumber, SecretLifecycle};
@@ -85,12 +85,9 @@ async fn a_served_request_leaks_its_credentials_into_nothing_it_emits() {
     let provider = FakeProvider::serving().await;
     let usage = CapturingSink::default();
     let replica = Replica::with_sinks(&provider, vec![Box::new(usage.clone())]);
-    replica.secrets.seed(
-        owner(),
-        first(),
-        SecretLifecycle::Active,
-        material(PROVIDER_MATERIAL),
-    );
+    replica
+        .secrets
+        .seed(owner(), first(), PROVIDER_MATERIAL, SecretLifecycle::Active);
     replica
         .publish(
             "first",
@@ -173,12 +170,9 @@ async fn a_failed_request_leaks_its_credentials_into_no_error_surface() {
     let provider = FakeProvider::unreachable();
     let usage = CapturingSink::default();
     let replica = Replica::with_sinks(&provider, vec![Box::new(usage.clone())]);
-    replica.secrets.seed(
-        owner(),
-        first(),
-        SecretLifecycle::Active,
-        material(PROVIDER_MATERIAL),
-    );
+    replica
+        .secrets
+        .seed(owner(), first(), PROVIDER_MATERIAL, SecretLifecycle::Active);
     replica
         .publish(
             "first",

@@ -80,13 +80,15 @@ than being skipped.
 
 ## What is not covered yet
 
-The compiler that joins desired-state credentials to the secret store lives in
-the test harness, because the production projection that does so is part of the
-zero-redeploy runtime slice and is not yet wired into `serve`. The lifecycle
-assertions run against the real reconciler and the real request path, so they
-are statements about behaviour rather than about a mock — but when that
-projection lands, these tests should be repointed at it, and any behaviour here
-that it does not have is a bug in it.
+Unwrapping is production code: the harness compiler resolves through
+`SecretMaterialization` and hands the resulting `ResolvedSecrets` to
+`ConfigSnapshot::build_with`, so retention, rotation overlap, and zeroization
+are asserted about the shipped seam and its `MaterialLedger` rather than about a
+mock. What the harness still supplies is the step that turns a resolved version
+into a credential pool entry: the projection that emits `[[credential]]` from
+typed credential bodies is not wired into `serve` yet, so these tests name the
+material with an env-var name of their own. When that projection lands, that one
+seam is what should be repointed at it.
 
 The authenticated `/admin/v1` boundary is likewise not on this branch; the
 administrative reads that page is responsible for are asserted at the store
