@@ -63,6 +63,10 @@ pub struct Slice {
     pub manifest: Option<String>,
     #[serde(default)]
     pub driver: Option<String>,
+    /// The test that keeps a committed contract honest while its driver does
+    /// not exist. It measures nothing, which is why it is not a driver.
+    #[serde(default)]
+    pub contract_test: Option<String>,
     #[serde(default)]
     pub contract: Option<String>,
     #[serde(default)]
@@ -90,6 +94,7 @@ impl Slice {
         self.manifest
             .iter()
             .chain(&self.driver)
+            .chain(&self.contract_test)
             .chain(&self.contract)
             .chain(&self.adr)
             .chain(&self.heavy_lane)
@@ -106,7 +111,7 @@ impl Slice {
 pub enum Status {
     /// No manifest and no driver: the question is written down and nothing runs.
     Unbuilt,
-    /// A committed manifest and a contract test that keeps it honest, but no
+    /// A committed manifest and a `contract_test` that keeps it honest, but no
     /// driver — the scenarios are declared, never measured.
     Declared,
     /// A driver that runs, with no retained run of its heavy tier behind it.
@@ -274,7 +279,6 @@ pub struct RecordBinary {
 pub struct RecordInputs {
     pub manifest: String,
     pub manifest_sha256: String,
-    pub config_sha256: String,
     pub fixtures: u32,
 }
 
@@ -295,7 +299,11 @@ pub struct RecordHardware {
 pub struct RecordProfile {
     pub id: String,
     pub concurrency: u32,
+    /// The config the process booted for this profile, which is per profile
+    /// rather than per run: `mixed` boots a second credential per provider.
+    pub config_sha256: String,
     pub requests: u64,
+    pub elapsed_ms: u64,
     pub offered: u64,
     pub accepted: u64,
     pub rejected: u64,

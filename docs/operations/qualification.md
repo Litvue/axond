@@ -42,7 +42,7 @@ than from what it says:
 | Status | Reached when |
 | --- | --- |
 | `unbuilt` | The question is written down. Nothing runs. |
-| `declared` | A committed manifest and contract page, checked by a test, with no driver behind them. |
+| `declared` | A committed manifest and contract page, kept honest by a `contract_test`, with no driver behind them. A contract test measures nothing, which is why it is not one. |
 | `harnessed` | A driver a lane runs, with no retained run of its heavy tier. |
 | `evidenced` | A driver, and at least one retained run in the repository — including a heavy-tier one, because a reduced run is a correctness check, not a capacity measurement. |
 
@@ -51,8 +51,11 @@ than from what it says:
 A run's full artifacts (`target/capacity/**/*.json`) are complete and
 disposable. What the repository keeps is a *record*: the numbers, plus the
 provenance that decides what may legitimately be compared with what — commit,
-binary digest and cargo profile, manifest and config digests, fixture count, and
-the machine.
+binary digest and cargo profile, manifest digest, fixture count, the machine,
+and, per profile, the config the process actually booted. The manifest digest is
+asserted against the committed manifest, so editing a profile's scale or
+thresholds invalidates every record taken before the edit rather than leaving it
+quietly describing a workload that no longer exists.
 
 | Record | Tier | Runner | Commit |
 | --- | --- | --- | --- |

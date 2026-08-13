@@ -132,6 +132,14 @@ fn a_slice_cannot_claim_a_rung_it_has_not_reached() {
                     "{id}: a declared slice commits a manifest and a contract page"
                 );
                 assert!(
+                    slice.contract_test.is_some(),
+                    "{id}: a declared contract nothing checks is a wish list"
+                );
+                assert!(
+                    slice.driver.is_none(),
+                    "{id}: it has a driver, so its scenarios are run rather than declared"
+                );
+                assert!(
                     slice.retained.is_empty(),
                     "{id}: a declared slice has no driver, so it has measured nothing"
                 );
@@ -178,8 +186,9 @@ fn a_slice_cannot_claim_a_rung_it_has_not_reached() {
 fn retained_evidence_is_reproducible_from_the_committed_inputs() {
     let packet = packet::load();
     let capacity = packet.slice(SliceId::Capacity);
-    let profiles: BTreeSet<String> = support::capacity::manifest::load()
-        .0
+    let (manifest, manifest_text) = support::capacity::manifest::load();
+    let manifest_sha256 = support::capacity::manifest::sha256_hex(manifest_text.as_bytes());
+    let profiles: BTreeSet<String> = manifest
         .profiles
         .iter()
         .map(|profile| profile.id.clone())
@@ -196,6 +205,12 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
             Some(record.inputs.manifest.as_str()),
             capacity.manifest.as_deref(),
             "{relative}: the run read a manifest the slice does not commit"
+        );
+        assert_eq!(
+            record.inputs.manifest_sha256, manifest_sha256,
+            "{relative}: the manifest has changed since the run, so the record \
+             describes a workload the repository no longer defines \u{2014} re-run the \
+             tier and rewrite it"
         );
         assert!(
             !record.source.git_dirty,
@@ -225,6 +240,10 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
             assert!(
                 profile.passed,
                 "{relative}: {id} is retained as evidence of a run that failed its gates"
+            );
+            assert!(
+                profile.elapsed_ms > 0 && !profile.config_sha256.is_empty(),
+                "{relative}: {id} records neither how long it ran nor what it booted"
             );
             assert_eq!(
                 profile.offered, profile.requests,
