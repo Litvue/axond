@@ -495,9 +495,8 @@ impl Relay {
                                             return;
                                         }
                                         Err(open_err) => {
-                                            self.phase = Phase::Failed(transport_caller_message(
-                                                &open_err,
-                                            ));
+                                            self.phase =
+                                                Phase::Failed(transport_caller_message(&open_err));
                                             return;
                                         }
                                     }
