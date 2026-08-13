@@ -49,7 +49,7 @@ unnoticed one.
 | `routes.rs` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
 | Namespace resolution, `credentials.rs` pool lookup, `allow_platform_fallback`, budget/rate-limit keys, operator views | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
 | `backends/secrets.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
-| `backends/catalog.rs`, `aliases.rs`, `availability/`, `desired_state/models.rs`, `/v1/models`, alias scope, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
+| `backends/catalog.rs`, `aliases.rs`, `availability/`, `desired_state/models.rs`, `desired_state/pricing.rs`, `/v1/models`, alias scope, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `usage/`, `telemetry/`, control-plane journal | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
 | `desired_state/access.rs`, `desired_state/tenancy.rs`, control-plane tenancy/principal projection, `/admin/v1` authorization, denial records | [Control-plane tenancy, principals, and administrative authorization](#7-control-plane-tenancy-principals-and-administrative-authorization) |
@@ -227,8 +227,9 @@ families, the `/v1/models` projection, catalogue ingestion in
 `crates/gateway/src/backends/catalog.rs`, derived availability and discovery
 evaluation in `crates/gateway/src/availability/`, the durable enablement and
 alias bodies and their publication rules in
-`crates/gateway/src/desired_state/models.rs`, pricing metadata, and any new route
-that exposes model or provider metadata.
+`crates/gateway/src/desired_state/models.rs`, pricing metadata, approved pricing
+in `crates/gateway/src/desired_state/pricing.rs`, and any new route that exposes
+model or provider metadata.
 
 **Regression tests.** Pattern semantics are the entitlement boundary:
 `patterns_match_case_sensitively_and_union`, `prefix_does_not_subsume_other_globs`,
@@ -246,7 +247,23 @@ durable side of the same rule: `an_observed_catalogue_rate_is_not_an_approved_pr
 `an_alias_is_a_project_scoped_name_unique_within_its_project`, and
 `an_untyped_enablement_is_refused_rather_than_skipped` — a published entitlement
 names one catalogue, reaches only its own owner, and is never inferred from an
-unreadable row. A new route is also covered mechanically: `ops/check-docs.py` fails a registered
+unreadable row. Activation must stay an operator decision, and a price the
+runtime cannot bill must not become a cheap one:
+`a_revision_without_a_price_book_carries_no_approved_pricing`,
+`approving_an_observed_rate_preserves_it_exactly`,
+`a_draft_book_activates_no_prices`,
+`a_rate_finer_than_a_micro_dollar_is_refused_rather_than_rounded`,
+`a_negative_rate_is_refused`,
+`a_rate_beyond_the_units_range_is_refused_as_an_overflow`,
+`a_context_tiered_schedule_is_refused_naming_the_threshold`,
+`an_audio_rate_is_refused_because_no_usage_field_would_bill_it`, and
+`an_approved_book_with_no_readable_approver_is_refused`. An unpriced target must
+stay *unpriced* rather than free — `a_target_the_book_does_not_price_has_no_price`
+— and a refused book must not disarm the prices already in force:
+`a_price_book_this_build_cannot_bill_leaves_the_previous_pricing_active`. What a
+request was billed against stays attributable through
+`a_snapshot_records_the_book_and_catalogue_it_priced_from`. A
+new route is also covered mechanically: `ops/check-docs.py` fails a registered
 route that the [compatibility contract](../compatibility.md) does not document.
 
 Derived availability is evidence, never entitlement, and its tests hold that
@@ -273,7 +290,12 @@ identities, observed versus approved pricing, tenant defaults against project
 overrides, and ordered single-wire-family alias targets — is
 [ADR 0042](../adr/0042-model-enablement-and-alias-contracts.md), and a change to
 what an enablement pins or to which targets an alias may name amends it; `CatalogSource`'s background-only placement is in
-[backend contracts](../maintainers/backend-contracts.md). Item 2 of the security
+[backend contracts](../maintainers/backend-contracts.md).
+[ADR 0043](../adr/0043-catalogue-source-imports.md) holds observed rates as
+metadata and [ADR 0046](../adr/0046-approved-price-books.md) makes approval the
+only activation, with exact conversion and no request-path pricing lookup — a
+change that prices from mutable or unapproved data supersedes 0044 rather than
+relaxing it. Item 2 of the security
 review's accepted-risk section is why `/v1/models` is authenticated and scoped —
 re-read it before changing that projection. The availability stance is a decision
 of its own and is written down as
@@ -302,7 +324,9 @@ to its state vocabulary, or to what it pins is a *compatibility* change: say whi
 stored revisions the new build stops reading, and record it in the
 [journal runbook](../operations/control-plane-journal.md) and
 [revision convergence](../operations/revision-convergence.md#resource-body-schemas)
-rather than only in the changelog.
+rather than only in the changelog. A price-book schema change is the same kind of
+entry, because a replica that cannot read a book keeps serving the prices it
+already converged onto.
 
 ## 5. Persistence, migrations, telemetry, and usage
 
@@ -327,7 +351,14 @@ Redis-backed tests (`a_batch_lands_in_postgres` and the shared-store tests) skip
 without services, so run them the way
 [CONTRIBUTING](../../CONTRIBUTING.md#development) documents — CI's stateful lane
 does. A new emitted field needs a test that it carries a non-secret identifier:
-usage rows carry `credential_id` and `credential_source`, never material.
+usage rows carry `credential_id` and `credential_source`, never material; the
+pricing publication line emits a resource reference, a content checksum, and a
+catalogue content id — digests and names, not bodies — and what it attributes is
+held by `a_snapshot_records_the_book_and_catalogue_it_priced_from`. A reason code
+or metric label is a closed vocabulary, and adding a value to one is gated
+mechanically by `every_revision_rejection_reason_is_catalogued`,
+`every_reason_code_is_bounded_and_distinct`, and
+`operator_only_reasons_coarsen_and_tenant_safe_ones_do_not`.
 
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),

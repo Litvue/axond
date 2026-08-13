@@ -154,6 +154,18 @@ impl Reloader {
 
         match self.candidate(env, &current, current.generation + 1) {
             Ok(candidate) => {
+                // A file reload replaces what the file describes and nothing
+                // else. Approved pricing is not in the file — it came from a
+                // desired revision this replica converged on — so it is carried
+                // onto the candidate rather than dropped: publishing a snapshot
+                // without it would unprice a converged deployment on the next
+                // `SIGHUP`, which is the one way pricing could disappear without
+                // a revision saying so. Which pricing convergence *replaces* is
+                // its own business (#142); this only refuses to lose it.
+                let candidate = match current.pricing() {
+                    None => candidate,
+                    Some(pricing) => candidate.with_pricing(pricing.clone()),
+                };
                 let summary = ReloadSummary::between(&self.boot, &current, &candidate);
                 let generation = candidate.generation;
                 self.state.publish(candidate);
@@ -1554,6 +1566,45 @@ env = "GW_ADMIN_BREAKGLASS"
             .reload_with_env(TRIGGER_SIGNAL, &tenant_env())
             .expect("resolves once the key is exported");
         assert_eq!(state.config().generation, 1);
+    }
+
+    /// The config file says nothing about prices, so a reload has nothing to say
+    /// about them either. Convergence publishes approved pricing onto the
+    /// snapshot it compiles; a `SIGHUP` afterwards must not be the way a
+    /// deployment silently stops being priced.
+    #[tokio::test]
+    async fn a_reload_does_not_unprice_a_converged_snapshot() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let pricing = crate::desired_state::fixtures::approved_pricing_snapshot();
+        let converged = ConfigSnapshot::build(
+            Config::load(file.path()).expect("valid boot config"),
+            &inbound_env(),
+            7,
+        )
+        .expect("the boot config compiles")
+        .with_pricing(pricing.clone());
+        state.publish(converged);
+
+        // A real edit, so the candidate is published rather than skipped.
+        file.rewrite(&format!(
+            r#"{PLATFORM_ONLY}
+[[model]]
+name = "gpt-4o-mini"
+targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 }} }}]
+"#
+        ));
+        Reloader::new(file.path(), state.clone())
+            .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .expect("the candidate is valid");
+
+        let after = state.config();
+        assert_eq!(after.generation, 8);
+        assert_eq!(after.pricing(), Some(&pricing));
+        assert_eq!(
+            listed_aliases(&state).await,
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
     }
 
     #[tokio::test]

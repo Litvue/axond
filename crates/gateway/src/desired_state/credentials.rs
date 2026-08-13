@@ -65,8 +65,8 @@ use std::collections::BTreeMap;
 use super::canonical::{Canonical, CanonicalValue};
 use super::ids::{InvalidId, ProjectId, ResourceId, SecretId, Slug, TenantId};
 use super::record::{
-    BodyError, DISPLAY_NAME_FIELD, DisplayNameError, PROJECT_ID_FIELD, Record, SCHEMA_FIELD,
-    TENANT_ID_FIELD,
+    BodyError, DISPLAY_NAME_FIELD, DisplayNameError, IdentifiedBody, PROJECT_ID_FIELD, Record,
+    SCHEMA_FIELD, TENANT_ID_FIELD,
 };
 use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
@@ -317,7 +317,23 @@ impl BodyError for CredentialError {
     fn field_type(reference: ResourceRef, field: &'static str) -> Self {
         Self::FieldType { reference, field }
     }
+}
 
+impl DisplayNameError for CredentialError {
+    fn malformed_display_name(
+        reference: ResourceRef,
+        field: &'static str,
+        source: InvalidDisplayName,
+    ) -> Self {
+        Self::MalformedDisplayName {
+            reference,
+            field,
+            source,
+        }
+    }
+}
+
+impl IdentifiedBody for CredentialError {
     fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self {
         Self::MalformedId {
             reference,
@@ -331,20 +347,6 @@ impl BodyError for CredentialError {
             reference,
             declared,
             identity,
-        }
-    }
-}
-
-impl DisplayNameError for CredentialError {
-    fn malformed_display_name(
-        reference: ResourceRef,
-        field: &'static str,
-        source: InvalidDisplayName,
-    ) -> Self {
-        Self::MalformedDisplayName {
-            reference,
-            field,
-            source,
         }
     }
 }

@@ -22,7 +22,7 @@
 use std::time::SystemTime;
 
 use super::canonical::{Canonical, CanonicalValue};
-use super::ids::{AuditEventId, MutationId, PrincipalId, RevisionId, TenantId};
+use super::ids::{AuditEventId, InvalidId, MutationId, PrincipalId, RevisionId, TenantId};
 use super::resource::{ResourceRef, ResourceScope};
 
 /// Who performed a mutation.
@@ -72,6 +72,122 @@ impl Canonical for Actor {
                 ("kind", CanonicalValue::string("system")),
                 ("component", CanonicalValue::string(component.clone())),
             ]),
+        }
+    }
+}
+
+/// Why a canonical record does not describe an actor.
+///
+/// Reading is the inverse of [`Canonical`] and lives next to it, because a body
+/// that records an actor — a price-book approval, for instance — must reach the
+/// same conclusion the writer did rather than reinterpreting the record its own
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidActor {
+    #[error("an actor is recorded as a record with a `kind`")]
+    NotARecord,
+    #[error("actor kind `{kind}` is not one this build knows")]
+    UnknownKind { kind: String },
+    #[error("an actor of kind `{kind}` is missing the `{field}` field, or it is not a string")]
+    Field {
+        kind: &'static str,
+        field: &'static str,
+    },
+    #[error("an actor of kind `{kind}` does not have a `{field}` field in this build")]
+    UnknownField { kind: &'static str, field: String },
+    #[error("an actor of kind `{kind}` records a `{field}` that is not an id: {source}")]
+    Id {
+        kind: &'static str,
+        field: &'static str,
+        source: InvalidId,
+    },
+}
+
+impl Actor {
+    /// Read an actor back out of its canonical form.
+    ///
+    /// Strict for the same reason every body reader is: an actor this build cannot
+    /// read is a refusal, never an anonymous fallback, because "who approved this"
+    /// is the question the type exists to keep answerable.
+    pub fn read(value: &CanonicalValue) -> Result<Self, InvalidActor> {
+        let CanonicalValue::Map(fields) = value else {
+            return Err(InvalidActor::NotARecord);
+        };
+        let string = |field: &'static str| match fields
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, value)| value)
+        {
+            Some(CanonicalValue::String(text)) => Some(text.clone()),
+            _ => None,
+        };
+        // A field this build does not know is refused rather than dropped: an
+        // approval read back in a reduced form would name a different approver
+        // than the one who signed it, and re-canonicalizing it would publish a
+        // checksum the stored bytes do not have.
+        let only = |kind: &'static str, known: &[&str]| match fields
+            .iter()
+            .map(|(name, _)| name)
+            .find(|name| !known.contains(&name.as_str()))
+        {
+            None => Ok(()),
+            Some(field) => Err(InvalidActor::UnknownField {
+                kind,
+                field: field.clone(),
+            }),
+        };
+        let kind = string("kind").ok_or(InvalidActor::NotARecord)?;
+        match kind.as_str() {
+            "human" => {
+                only("human", &["kind", "issuer", "subject"])?;
+                Ok(Self::Human {
+                    issuer: string("issuer").ok_or(InvalidActor::Field {
+                        kind: "human",
+                        field: "issuer",
+                    })?,
+                    subject: string("subject").ok_or(InvalidActor::Field {
+                        kind: "human",
+                        field: "subject",
+                    })?,
+                })
+            }
+            "breakglass" => {
+                only("breakglass", &["kind"])?;
+                Ok(Self::Breakglass)
+            }
+            "workload" => {
+                only("workload", &["kind", "tenant", "principal"])?;
+                let id = |field: &'static str| {
+                    string(field).ok_or(InvalidActor::Field {
+                        kind: "workload",
+                        field,
+                    })
+                };
+                Ok(Self::Workload {
+                    tenant: TenantId::parse(&id("tenant")?).map_err(|source| InvalidActor::Id {
+                        kind: "workload",
+                        field: "tenant",
+                        source,
+                    })?,
+                    principal: PrincipalId::parse(&id("principal")?).map_err(|source| {
+                        InvalidActor::Id {
+                            kind: "workload",
+                            field: "principal",
+                            source,
+                        }
+                    })?,
+                })
+            }
+            "system" => {
+                only("system", &["kind", "component"])?;
+                Ok(Self::System {
+                    component: string("component").ok_or(InvalidActor::Field {
+                        kind: "system",
+                        field: "component",
+                    })?,
+                })
+            }
+            _ => Err(InvalidActor::UnknownKind { kind }),
         }
     }
 }

@@ -32,6 +32,7 @@ use super::ids::{AuditEventId, MutationId, ResourceId, RevisionId, Slug};
 use super::models::{ModelEnablementBody, ModelError, Models};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::policy::{PolicyError, PolicySet};
+use super::pricing::{PriceBooks, PricingError};
 use super::providers::{ProviderError, Providers};
 use super::resource::{BlobRef, ResourceKind, ResourceRef, ResourceScope, ResourceVersion};
 use super::secrets::ForbiddenTransition;
@@ -120,6 +121,10 @@ pub enum ValidationError {
     /// size it was before model bodies were typed.
     #[error("this revision's model contracts are not valid: {0}")]
     Model(Box<ModelError>),
+    /// Boxed because a pricing refusal names a target, an interval, and a rate,
+    /// and every `Result` in convergence would otherwise carry that width.
+    #[error("this revision's pricing is not valid: {0}")]
+    Pricing(Box<PricingError>),
     #[error("audit event {audit} records mutation {recorded}, not this candidate's {mutation}")]
     AuditMutationMismatch {
         audit: AuditEventId,
@@ -334,6 +339,11 @@ impl DesiredState {
         // no untyped identity row in any deployment for this to become
         // retroactively strict about.
         Directory::of(self, &tenancy)?;
+        // Pricing last (#201). It is validated here rather than only in the
+        // projection for the same reason: a price book whose rates cannot be
+        // billed, or whose rules contradict each other, must never be published,
+        // and hydration must reach the same conclusion about a retained one.
+        PriceBooks::of(self).map_err(|error| ValidationError::Pricing(Box::new(error)))?;
 
         // Then the bodies that hang off tenancy. Credentials are read after it
         // because their ownership is stated in the same terms — a tenant, and
@@ -558,6 +568,9 @@ pub enum BodySkew {
     /// Boxed for the same reason [`ValidationError::Model`] is.
     #[error(transparent)]
     Model(Box<ModelError>),
+    /// Boxed for the same reason [`ValidationError::Pricing`] is.
+    #[error(transparent)]
+    Pricing(Box<PricingError>),
 }
 
 impl From<ModelError> for ValidationError {
@@ -590,6 +603,12 @@ impl From<ModelError> for BodySkew {
     }
 }
 
+impl From<Box<PricingError>> for BodySkew {
+    fn from(error: Box<PricingError>) -> Self {
+        Self::Pricing(error)
+    }
+}
+
 impl BodySkew {
     /// The resource the refusal is about, whichever schema refused it.
     pub const fn reference(&self) -> ResourceRef {
@@ -598,6 +617,7 @@ impl BodySkew {
             Self::Credential(error) => error.reference(),
             Self::Policy(error) => error.reference(),
             Self::Model(error) => error.reference(),
+            Self::Pricing(error) => error.reference(),
         }
     }
 }
@@ -694,6 +714,9 @@ impl IntegrityError {
             }
             ValidationError::Model(model) if model.is_incompatible() => {
                 Self::Incompatible(BodySkew::Model(model))
+            }
+            ValidationError::Pricing(pricing) if pricing.is_incompatible() => {
+                Self::Incompatible(BodySkew::Pricing(pricing))
             }
             other => Self::Invalid(other),
         }
