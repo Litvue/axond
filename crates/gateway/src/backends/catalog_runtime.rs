@@ -13,9 +13,9 @@
 //! architecture: [`RuntimeSource`] and [`RuntimeStore`] are closed enumerations of
 //! what `[catalog]` may select, so a deployment cannot be handed a source or a
 //! store this build did not ship, and a stateful deployment cannot be handed the
-//! in-memory one at all ([`Config::validate`] refuses it — a catalogue that
-//! disappears on restart is not a catalogue an operator can approve prices
-//! against).
+//! in-memory one at all ([`crate::config::Config`] validation refuses it — a
+//! catalogue that disappears on restart is not a catalogue an operator can
+//! approve prices against).
 //!
 //! What the loop does *not* do is as deliberate as what it does. An import is an
 //! observation: it never enables a model, never moves a price, and never changes
