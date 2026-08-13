@@ -81,25 +81,35 @@ or policy; it will fail at the same PR-creation boundary.
 
 ## After the first multi-architecture release
 
-The quickstart still forces `linux/amd64` so that ARM hosts can run the last
-amd64-only image at all. The first release that publishes a `linux/amd64` +
-`linux/arm64` index makes that fallback obsolete, and
-`ops/check-release-config.py` says so on every subsequent run:
+0.3.18 was that release, and this cleanup has landed: the quickstart no longer
+defaults `platform:` at all, and the operator-facing pages no longer date the
+index to a future release. It is recorded here because the same steps apply if
+the quickstart pin is ever moved back onto an amd64-only release.
+
+While the pinned tag is amd64-only, the quickstart must force `linux/amd64` so
+ARM hosts can pull it at all, and `ops/check-release-config.py` *fails* without
+it. The first release publishing a `linux/amd64` + `linux/arm64` index makes the
+fallback obsolete, and the check then says so on every subsequent run:
 
 ```
-release configuration note: docker-compose.yml: the pinned tag 0.3.17 publishes a
+release configuration note: docker-compose.yml: the pinned tag 0.3.18 publishes a
 multi-architecture image, so the amd64 fallback now only forces emulation on ARM
-hosts; switch to `platform: ${AXOND_PLATFORM-}` and bump
-LAST_AMD64_ONLY_VERSION to 0.3.17
+hosts; switch to `platform: ${AXOND_PLATFORM-}`
 ```
 
 It is a note, not a failure, because release-please bumps the pinned tag inside
 its own generated release PR and never rewrites the `platform:` line — failing
-there would block the release. Land the two-line follow-up once that release is
-published: set `platform: ${AXOND_PLATFORM-}` in `docker-compose.yml` and bump
-`LAST_AMD64_ONLY_VERSION` in `ops/check-release-config.py` to the released
-version. `ops/check-compose-platform.sh` then proves native resolution, and the
-note disappears.
+there would block the release. So the follow-up lands once that release is
+published: set `platform: ${AXOND_PLATFORM-}` in `docker-compose.yml` and drop
+the `from the next release onward` caveat from the pages that promise the index.
+`ops/check-compose-platform.sh` then proves native resolution, and the notes
+disappear.
+
+`LAST_AMD64_ONLY_VERSION` is *not* part of that follow-up. It names the last
+release published as a single `linux/amd64` image — 0.3.17 — so it moves only
+when the pin is rebased onto a newer amd64-only release. Bumping it to the
+multi-architecture release instead re-asserts that the pinned tag is amd64-only
+and fails the check that the follow-up just satisfied.
 
 ## Repair an existing tag
 

@@ -119,10 +119,9 @@ The public image is distroless, runs as non-root, contains no shell or package
 manager, and is published as a multi-architecture index covering `linux/amd64`
 and `linux/arm64`. There is no `latest` tag.
 
-The index is published from the next release onward. Releases up to and including
-the pinned version below publish a single `linux/amd64` image, so on those tags
-the platform listing has one entry and there is no `-arm64` reference to pull;
-ARM hosts run them under emulation ([architecture
+Both platform children are addressable directly as `:<version>-amd64` and
+`:<version>-arm64`; an ARM host pulling the index resolves its native child
+without emulation ([architecture
 selection](./deployment/docker-compose.md#architecture-selection)).
 
 ```bash
@@ -181,12 +180,13 @@ architecture.
 
 ### Older releases
 
-Linux ARM64 archives and the multi-architecture image exist from the first
-release that published them; earlier releases carry the x86-64 Linux, macOS, and
-Windows artifacts only. Asking an older release for an ARM64 archive fails with
-an explicit message naming the release and target rather than a transfer error,
-and the Compose quickstart keeps an `AXOND_PLATFORM` default that runs the
-last amd64-only image on ARM hosts under emulation — see [architecture
+Linux ARM64 archives and the multi-architecture image start with 0.3.18;
+releases up to and including 0.3.17 carry the x86-64 Linux, macOS, and Windows
+artifacts and a single `linux/amd64` image only. Asking one of those releases for
+an ARM64 archive fails with an explicit message naming the release and target
+rather than a transfer error, and pinning one in the Compose quickstart needs an
+explicit `AXOND_PLATFORM=linux/amd64` for an ARM host to run it under emulation
+rather than fail to pull — see [architecture
 selection](./deployment/docker-compose.md#architecture-selection).
 
 ## Build from source

@@ -251,6 +251,7 @@ jobs:
           # ever passes on the committed tree proves nothing.
           python3 ops/check-docs.py --self-test
           python3 ops/check-docs.py
+          python3 ops/check-release-config.py --self-test
           python3 ops/check-release-config.py
           shellcheck install.sh ops/publish-image-index.sh \
             ops/verify-image-evidence.sh ops/check-compose-platform.sh \

@@ -4,10 +4,9 @@
 published as a multi-architecture index for `linux/amd64` and `linux/arm64`. It
 runs as non-root and contains no shell or package manager.
 
-The index is published from the next release onward; releases up to and including
-the currently pinned quickstart tag publish a single `linux/amd64` image, which
-ARM hosts run under emulation ([architecture
-selection](./docker-compose.md#architecture-selection)).
+An ARM host resolves the index's native child rather than emulating amd64
+([architecture selection](./docker-compose.md#architecture-selection)); releases
+up to and including 0.3.17 published a single `linux/amd64` image.
 
 ## Runtime contract
 
