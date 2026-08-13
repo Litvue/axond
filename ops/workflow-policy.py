@@ -39,6 +39,13 @@ VERSION_COMMENT = re.compile(r"^(?:v\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?|stable|mast
 # the signer identity has to stay anchored at both ends, or a modified copy of
 # the release workflow running from another ref would satisfy it.
 ANCHORED_IDENTITY = re.compile(r"^\s*SIGNER_IDENTITY:\s*\^.+\$\s*$")
+# The one file allowed to verify against a key instead of a certificate
+# identity. It signs a throwaway image in a local registry to prove the pinned
+# cosign still writes the documented signature format; nothing it verifies is a
+# release artifact. Naming the file keeps the exemption from being something any
+# future script can grant itself by minting a key pair — widening it is a review
+# of this list, which is the point.
+KEY_VERIFY_FILES = frozenset({"ops/check-cosign-format.sh"})
 
 
 def workflows(root: Path) -> list[Path]:
@@ -142,16 +149,19 @@ def minted_public_keys(text: str) -> set[str]:
     outside is not, so the two are told apart by what the `--key` word is rather
     than by whether the file mints a pair somewhere. Both the generated path and
     any variable holding it count, because the script that mints a pair reads it
-    back through a variable.
+    back through a variable. Commented-out lines mint nothing.
     """
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
     keys = {
         f"{unquote(match.group(1))}.pub"
         for match in re.finditer(
-            r"cosign generate-key-pair[^\n]*--output-key-prefix[= ]+(\S+)", text
+            r"cosign generate-key-pair[^\n]*--output-key-prefix[= ]+(\S+)", code
         )
     }
     # `pub="$work/canary.pub"` refers to the same file as the prefix does.
-    for match in re.finditer(r"^\s*(\w+)=(\S+)\s*$", text, re.MULTILINE):
+    for match in re.finditer(r"^\s*(\w+)=(\S+)\s*$", code, re.MULTILINE):
         if unquote(match.group(2)) in keys:
             keys |= {f"${match.group(1)}", f"${{{match.group(1)}}}"}
     return keys
@@ -163,14 +173,15 @@ def check_cosign_verify(text: str, relative: str) -> list[str]:
     Keyless verification without both certificate flags accepts any Fulcio
     certificate, so it proves only that *someone* signed the artifact. `--key`
     can say the same thing — the signature must verify against one named public
-    key — but only when this file is what named it: the exemption covers the
-    public half of a pair minted here, and nothing else. A key arriving from the
-    environment names no signer, so it stays subject to the identity flags even
-    in a file that mints a throwaway pair elsewhere in it.
+    key — but only in `KEY_VERIFY_FILES`, and only for the public half of a pair
+    that file mints itself. Anywhere else, and for any key arriving from the
+    environment, the certificate flags are the only accepted restriction: a
+    script must not be able to opt out of the release contract by generating a
+    key pair next to the verify it wants excused.
     """
     failures: list[str] = []
     lines = text.splitlines()
-    minted = minted_public_keys(text)
+    minted = minted_public_keys(text) if relative in KEY_VERIFY_FILES else set()
     for index, line in enumerate(lines):
         # A shell comment discussing the command is prose, not an invocation.
         if "cosign verify" not in line or line.lstrip().startswith("#"):
@@ -182,9 +193,9 @@ def check_cosign_verify(text: str, relative: str) -> list[str]:
                 continue
             failures.append(
                 f"{relative}:{index + 1}: `cosign verify --key {key.group(1)}` names a "
-                "signer only where that key is the public half of a pair generated in "
-                "this file; otherwise pass --certificate-identity-regexp and "
-                "--certificate-oidc-issuer"
+                "signer only in " + ", ".join(sorted(KEY_VERIFY_FILES)) + ", and only "
+                "for a key generated in that file; otherwise pass "
+                "--certificate-identity-regexp and --certificate-oidc-issuer"
             )
             continue
         if "--certificate-identity-regexp" not in block or "--certificate-oidc-issuer" not in block:
@@ -337,20 +348,12 @@ def self_test() -> list[str]:
             "one reviewed pin per action",
         ),
         (
-            "cosign verify bound to a public key the lane minted itself",
+            "a workflow minting its own key to skip the identity restriction",
             SELF_TEST_PERMISSIONS
             + "jobs:\n  a:\n    steps:\n"
             "      - run: cosign generate-key-pair --output-key-prefix k\n"
             "      - run: cosign verify --key k.pub ghcr.io/o/r@sha256:x\n",
-            "",
-        ),
-        (
-            "cosign verify against a key that comes from somewhere else",
-            SELF_TEST_PERMISSIONS
-            + "jobs:\n  a:\n    steps:\n"
-            "      - run: cosign generate-key-pair --output-key-prefix k\n"
-            '      - run: cosign verify --key "$SOME_KEY" ghcr.io/o/r@sha256:x\n',
-            "the public half of a pair generated in this file",
+            "names a signer only in",
         ),
         (
             "cosign verify without an identity restriction",
@@ -403,41 +406,67 @@ def self_test() -> list[str]:
             problems.append(
                 "self-test: an unrestricted `cosign verify` in ops/ was not rejected"
             )
-        # A key-based verify restricts the signer by naming the key, and a
-        # neighbouring one must not lend that restriction to a keyless verify:
-        # both invocations are read as the separate commands they are.
+        script.unlink()
+        # The format canary verifies against a pair it mints itself, which names
+        # a signer; the same command anywhere else, or against a key from the
+        # environment, does not.
         minted = (
             'cosign generate-key-pair --output-key-prefix "$WORK/k"\n'
             'PUB="$WORK/k.pub"\n'
         )
-        script.write_text(
-            minted + 'cosign verify --key "$PUB" "$IMAGE" >/dev/null\n'
-            'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
-            encoding="utf-8",
-        )
-        if check(root):
-            problems.append(f"self-test: key-based verifies were rejected: {check(root)}")
-        # Minting a throwaway pair does not vouch for a key handed in from
-        # elsewhere, even in the same file.
-        script.write_text(
-            minted + 'cosign verify --key "$RELEASE_KEY" "$IMAGE" >/dev/null\n',
-            encoding="utf-8",
-        )
-        if not any("generated in this file" in failure for failure in check(root)):
-            problems.append(
-                "self-test: a foreign key was excused by an unrelated generated pair"
+        for name in sorted(KEY_VERIFY_FILES):
+            canary = root / name
+            canary.write_text(
+                minted + 'cosign verify --key "$PUB" "$IMAGE" >/dev/null\n'
+                'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
+                encoding="utf-8",
             )
+            if check(root):
+                problems.append(
+                    f"self-test: {name}'s self-minted verifies were rejected: {check(root)}"
+                )
+            # Minting a throwaway pair does not vouch for a key handed in from
+            # elsewhere, even in the file allowed to use one.
+            canary.write_text(
+                minted + 'cosign verify --key "$RELEASE_KEY" "$IMAGE" >/dev/null\n',
+                encoding="utf-8",
+            )
+            if not any("names a signer only in" in failure for failure in check(root)):
+                problems.append(
+                    "self-test: a foreign key was excused by an unrelated generated pair"
+                )
+            # A commented-out generator mints nothing.
+            canary.write_text(
+                '# cosign generate-key-pair --output-key-prefix "$WORK/k"\n'
+                'cosign verify --key "$WORK/k.pub" "$IMAGE" >/dev/null\n',
+                encoding="utf-8",
+            )
+            if not any("names a signer only in" in failure for failure in check(root)):
+                problems.append(
+                    "self-test: a commented-out generator was read as minting a key"
+                )
+            canary.write_text(
+                minted + 'cosign verify "$IMAGE" >/dev/null\n'
+                'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
+                encoding="utf-8",
+            )
+            if not any(
+                "--certificate-identity-regexp" in failure for failure in check(root)
+            ):
+                problems.append(
+                    "self-test: an unrestricted `cosign verify` was excused by a "
+                    "key-based one on the next line"
+                )
+            canary.unlink()
+        # Another script cannot grant itself the exemption by minting a pair.
         script.write_text(
-            minted + 'cosign verify "$IMAGE" >/dev/null\n'
-            'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
+            minted + 'cosign verify --key "$PUB" "$IMAGE" >/dev/null\n',
             encoding="utf-8",
         )
-        if not any(
-            "--certificate-identity-regexp" in failure for failure in check(root)
-        ):
+        if not any("names a signer only in" in failure for failure in check(root)):
             problems.append(
-                "self-test: an unrestricted `cosign verify` was excused by a "
-                "key-based one on the next line"
+                "self-test: a script outside KEY_VERIFY_FILES exempted itself by "
+                "generating a key pair"
             )
     return problems
 

@@ -310,7 +310,10 @@ no `permissions:` block, `permissions: write-all`, an unanchored
 `SIGNER_IDENTITY`, and a `cosign verify` that does not restrict the certificate
 identity and issuer — in the workflows and in the shell under `ops/`, which is
 where [`ops/verify-image-evidence.sh`](../../ops/verify-image-evidence.sh)
-actually verifies the release images. It also requires one reviewed pin per
+actually verifies the release images. The single exception is named in the
+checker: [`ops/check-cosign-format.sh`](../../ops/check-cosign-format.sh) may
+verify with `--key`, and only against a key pair it mints itself, because a pull
+request has no OIDC identity to verify against. It also requires one reviewed pin per
 action across all workflows, so two lanes cannot silently run different builds of
 the same Action.
 The lane proves it still rejects those with `ops/workflow-policy.py --self-test`
