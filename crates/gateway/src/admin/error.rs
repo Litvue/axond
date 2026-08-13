@@ -125,6 +125,16 @@ pub enum AdminError {
     /// caller cannot influence.
     #[error("the control plane refused the operation")]
     ControlPlaneDenied { detail: String },
+    /// Two resources claim one name. The caller's fix is to rename, or to delete
+    /// whatever still holds the name — so the name is in the response, and the
+    /// status is a conflict rather than the `500` an opaque backend refusal
+    /// would have produced.
+    #[error("the {noun} name `{name}` is already taken")]
+    NameTaken {
+        noun: &'static str,
+        name: String,
+        detail: String,
+    },
     #[error("the audit summary is empty, too long, or not printable")]
     AuditSummaryInvalid,
     #[error("the `X-Axond-Dry-Run` header must be `true` or `false`")]
@@ -172,6 +182,7 @@ impl AdminError {
         "revision_too_large",
         "control_plane_unavailable",
         "control_plane_denied",
+        "name_taken",
         "audit_summary_invalid",
         "dry_run_invalid",
         "history_limit_invalid",
@@ -200,6 +211,7 @@ impl AdminError {
             Self::RevisionTooLarge { .. } => "revision_too_large",
             Self::ControlPlaneUnavailable { .. } => "control_plane_unavailable",
             Self::ControlPlaneDenied { .. } => "control_plane_denied",
+            Self::NameTaken { .. } => "name_taken",
             Self::AuditSummaryInvalid => "audit_summary_invalid",
             Self::DryRunInvalid => "dry_run_invalid",
             Self::HistoryLimitInvalid { .. } => "history_limit_invalid",
@@ -227,6 +239,7 @@ impl AdminError {
             | Self::RequestInvalid { .. } => StatusCode::BAD_REQUEST,
             Self::RevisionConflict { .. }
             | Self::IdempotencyKeyReused { .. }
+            | Self::NameTaken { .. }
             | Self::ImmutableResourceVersion { .. } => StatusCode::CONFLICT,
             Self::RevisionNotFound(_) | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
@@ -271,6 +284,7 @@ impl AdminError {
             | Self::RevisionTooLarge { detail, .. }
             | Self::ControlPlaneUnavailable { detail }
             | Self::ControlPlaneDenied { detail }
+            | Self::NameTaken { detail, .. }
             | Self::RequestInvalid { detail, .. } => Some(detail),
             _ => None,
         }
@@ -348,6 +362,16 @@ impl AdminError {
             ControlPlaneError::Denied { backend, message } => Self::ControlPlaneDenied {
                 detail: format!("{backend}: {message}"),
             },
+            ControlPlaneError::NameTaken { noun, name, holder } => Self::NameTaken {
+                noun,
+                detail: holder.map_or_else(
+                    || format!("the {noun} name `{name}` is already projected"),
+                    |constraint| {
+                        format!("the {noun} name `{name}` violates the unique index {constraint}")
+                    },
+                ),
+                name,
+            },
             ControlPlaneError::Corrupt { revision, source } => Self::RevisionUnreadable {
                 revision: Some(revision),
                 detail: source.to_string(),
@@ -392,6 +416,9 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
             ("dangling_blob_reference", Some(*from))
         }
         ValidationError::UnreferencedBlob { .. } => ("unreferenced_blob", None),
+        ValidationError::PinnedSnapshotWithdrawn { enablement, .. } => {
+            ("pinned_snapshot_withdrawn", Some(*enablement))
+        }
         ValidationError::CrossTenantReference { from, .. } => {
             ("cross_tenant_reference", Some(*from))
         }

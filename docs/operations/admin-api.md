@@ -28,9 +28,10 @@ gates on it. **Serve inference from `mode = "stateless"` until convergence
 ships**; use stateful mode to build and review desired state.
 
 A stateless deployment answers every `/admin/v1` path with
-`409 stateful_mode_required`, before authentication and without opening any
+`501 stateful_mode_required`, before authentication and without opening any
 backend: the mode is the answer to the question that was asked, where a `404`
-would be indistinguishable from an older build.
+would be indistinguishable from an older build and a `401` would invite a caller
+to find a credential that cannot exist.
 
 ## Authentication
 
@@ -137,6 +138,55 @@ code rather than on prose:
 and the rest of the vocabulary are listed in `AdminError::CODES`, which a test
 holds in step with the enum. Operator detail — a backend's message, a store's
 DSN — is logged, never serialized.
+
+`name_taken` is the one refusal an operator most often meets by accident: a
+`409` saying that the slug a tenant or project asked for is already projected to
+another row. It is caller-fixable, and the two runbooks below are how.
+
+## Runbooks
+
+### Reclaiming a tenant or project name
+
+Slugs are unique among *live* rows only. A tenant whose lifecycle is `deleted`
+releases its slug — the projection's unique index is partial — so:
+
+- **the name is free** when the row that holds it is `deleted`, and a deleted
+  tenant may be reactivated under its old slug for as long as nothing else has
+  claimed it in the meantime;
+- **the name is held** by any tenant that is not `deleted`, including one no
+  longer named by the current revision: desired state supersedes rows, it does
+  not forget them, so a name is released by a lifecycle move and never by
+  omission. Publish the holder as `deleted`, then publish the new row.
+- **restoring a deleted tenant whose slug was taken** is refused with
+  `name_taken`, naming the slug. Reactivate it under a different slug, or delete
+  the tenant that took the name first; the gateway will not silently rename
+  either row.
+
+The same holds for projects, whose slugs are unique within their tenant.
+
+### Refreshing a model catalogue
+
+A catalogue resource *is* its snapshot: an enablement records the digest it read
+an offering from, and that pin is immutable, because re-pointing it is how a
+published alias's meaning would change underneath its callers. Re-importing
+different content under a catalogue an enablement reads from is therefore
+refused with `validation_failed` and the rule `pinned_snapshot_withdrawn`,
+naming the enablement that holds the pin.
+
+The refresh is published alongside the old snapshot instead:
+
+```console
+$ axond admin apply --resource catalogs --file catalogue-2026-08.json ...   # a new catalogue id
+$ axond admin apply --resource models   --file retire-gpt-4o.json ...       # "state": "disabled"
+$ axond admin apply --resource models   --file enable-gpt-4o-2026-08.json ...
+$ axond admin apply --resource aliases  --file retarget-default.json ...
+```
+
+Disabling the old enablement is what frees the offering for its replacement: a
+disabled enablement resolves to nothing, so it holds no offering, while every
+revision that served it stays readable and auditable. Aliases keep pointing at
+the enablement they name until they are retargeted, so the switchover is one
+alias publication and its rollback is another.
 
 ## `axond admin`
 

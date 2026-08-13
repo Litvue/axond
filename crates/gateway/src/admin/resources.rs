@@ -42,7 +42,7 @@ use crate::desired_state::{
     ObservedPrice, OfferingId, PolicyBody, PolicyEpoch, PolicyScope, ProjectBody, ProjectId,
     ProviderBody, ProviderCredentialBody, ResourceBody, ResourceId, ResourceKind, ResourceRef,
     ResourceScope, ResourceVersion, ResourceVersionNumber, RevocationPolicy, SecretId,
-    SecretLifecycle, SecretOwner, SecretRef, SecretVersion, Slug, TenantBody, TenantId,
+    SecretLifecycle, SecretOwner, SecretRef, SecretVersion, Slug, Surface, TenantBody, TenantId,
     TenantLifecycle, ValidationError, WireFamily,
 };
 
@@ -71,6 +71,11 @@ pub trait AdminResourceRequest: DeserializeOwned + Send + Sync + 'static {
     /// The schema name a refusal names, so a client learns which document it got
     /// wrong rather than only that it got one wrong.
     const SCHEMA: &'static str;
+
+    /// The surface a refusal of this document is recorded against in the denial
+    /// trail, so an investigator filters denials by what was reached for rather
+    /// than by which URL was typed.
+    const SURFACE: Surface;
 
     /// Resolve the document into the scope it changes and the edit it performs.
     ///
@@ -153,6 +158,8 @@ pub struct TenantRequest {
 impl AdminResourceRequest for TenantRequest {
     const SCHEMA: &'static str = "tenant";
 
+    const SURFACE: Surface = Surface::Tenant;
+
     fn plan(self) -> Result<ResourcePlan, AdminError> {
         let tenant = tenant_id::<Self>(&self.tenant)?;
         let slug = slug::<Self>(&self.slug)?;
@@ -190,6 +197,8 @@ pub struct ProjectRequest {
 impl AdminResourceRequest for ProjectRequest {
     const SCHEMA: &'static str = "project";
 
+    const SURFACE: Surface = Surface::Project;
+
     fn plan(self) -> Result<ResourcePlan, AdminError> {
         let project = project_id::<Self>(&self.project)?;
         let tenant = tenant_id::<Self>(&self.tenant)?;
@@ -223,6 +232,8 @@ pub struct ProviderRequest {
 
 impl AdminResourceRequest for ProviderRequest {
     const SCHEMA: &'static str = "provider";
+
+    const SURFACE: Surface = Surface::Provider;
 
     fn plan(self) -> Result<ResourcePlan, AdminError> {
         let provider = resource_id::<Self>("provider", &self.provider)?;
@@ -283,6 +294,8 @@ pub struct CredentialRequest {
 
 impl AdminResourceRequest for CredentialRequest {
     const SCHEMA: &'static str = "provider-credential";
+
+    const SURFACE: Surface = Surface::Credential;
 
     fn plan(self) -> Result<ResourcePlan, AdminError> {
         let credential = resource_id::<Self>("credential", &self.credential)?;
@@ -368,6 +381,8 @@ pub struct CatalogRequest {
 impl AdminResourceRequest for CatalogRequest {
     const SCHEMA: &'static str = "catalog-snapshot";
 
+    const SURFACE: Surface = Surface::Model;
+
     fn plan(self) -> Result<ResourcePlan, AdminError> {
         let catalog = resource_id::<Self>("catalog", &self.catalog)?;
         let slug = slug::<Self>(&self.slug)?;
@@ -380,6 +395,7 @@ impl AdminResourceRequest for CatalogRequest {
         Ok(ResourcePlan::new(
             ResourceScope::Deployment,
             move |state: &mut DesiredState| {
+                refuse_withdrawing_a_pinned_snapshot(state, catalog, digest)?;
                 let version = next_version(state, ResourceKind::CatalogModel, catalog);
                 state.declare_blob(blob);
                 publish(
@@ -425,6 +441,8 @@ pub struct ModelRequest {
 
 impl AdminResourceRequest for ModelRequest {
     const SCHEMA: &'static str = "model-enablement";
+
+    const SURFACE: Surface = Surface::Model;
 
     fn plan(self) -> Result<ResourcePlan, AdminError> {
         let enablement = resource_id::<Self>("enablement", &self.enablement)?;
@@ -527,6 +545,8 @@ pub struct AliasRequest {
 impl AdminResourceRequest for AliasRequest {
     const SCHEMA: &'static str = "model-alias";
 
+    const SURFACE: Surface = Surface::Alias;
+
     fn plan(self) -> Result<ResourcePlan, AdminError> {
         let alias = resource_id::<Self>("alias", &self.alias)?;
         let tenant = tenant_id::<Self>(&self.tenant)?;
@@ -609,6 +629,8 @@ pub struct PolicyRequest {
 impl AdminResourceRequest for PolicyRequest {
     const SCHEMA: &'static str = "policy";
 
+    const SURFACE: Surface = Surface::Policy;
+
     fn plan(self) -> Result<ResourcePlan, AdminError> {
         let tenant = tenant_id::<Self>(&self.tenant)?;
         let project = self
@@ -645,6 +667,50 @@ impl AdminResourceRequest for PolicyRequest {
             },
         ))
     }
+}
+
+/// Refuse a catalogue refresh that would take away content an enablement reads
+/// its offering from.
+///
+/// The dependent carry-forward below re-points edges, and an enablement's
+/// snapshot is not an edge: it is part of what the enablement *is*, and
+/// [`ModelEnablementBody::transition_from`] refuses a version that changes it.
+/// Carrying the edge forward while the digest changed would therefore publish an
+/// enablement whose pin resolves to nothing, reported as an unpinned snapshot
+/// from three resources away. Named here, the refusal says which enablement and
+/// which digest, and the documented flow — a new catalogue resource, new
+/// enablements against it, the old ones retired — is reachable.
+///
+/// [`ModelEnablementBody::transition_from`]: crate::desired_state::ModelEnablementBody::transition_from
+fn refuse_withdrawing_a_pinned_snapshot(
+    state: &DesiredState,
+    catalog: ResourceId,
+    digest: Checksum,
+) -> Result<(), ValidationError> {
+    let Some(held) = state.version_of(ResourceKind::CatalogModel, catalog) else {
+        return Ok(());
+    };
+    let withdrawn = match held.body.blob() {
+        Some(blob) if blob.digest != digest => blob.digest,
+        _ => return Ok(()),
+    };
+    let catalog = held.reference;
+    for resource in state.resources() {
+        if resource.reference.kind != ResourceKind::ModelEnablement {
+            continue;
+        }
+        let pinned = ModelEnablementBody::read(resource)
+            .map(|body| body.offering().is_pinned_to(withdrawn))
+            .unwrap_or(false);
+        if pinned {
+            return Err(ValidationError::PinnedSnapshotWithdrawn {
+                catalog,
+                enablement: resource.reference,
+                digest: withdrawn,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Publish a resource version into the candidate, advancing everything pinned to

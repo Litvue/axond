@@ -56,7 +56,7 @@ use std::time::SystemTime;
 use serde::Serialize;
 use tracing::{debug, warn};
 
-use super::auth::{AdminAction, AdminAuthError, AdminGrant};
+use super::auth::{AdminAction, AdminAuthError, AdminGrant, AdminIdentity};
 use super::diff::SemanticDiff;
 use super::error::AdminError;
 use super::protocol::{MutationRequest, WriteMode};
@@ -67,8 +67,9 @@ use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::config::Mode;
 use crate::convergence::RevisionReport;
 use crate::desired_state::{
-    AuditEvent, AuditEventId, DesiredState, ExpectedRevision, LoadedRevision, Mutation, MutationId,
-    ResourceScope, RevisionCandidate, RevisionId, Uuid7Generator, ValidationError,
+    AccessDenial, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
+    LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
+    Uuid7Generator, ValidationError,
 };
 
 /// Whether a grant at `granted` may change a resource scoped to `resource`.
@@ -229,6 +230,67 @@ impl AdminService {
             }
         }
         Ok(())
+    }
+
+    /// Record an authenticated caller's refusal in the durable denial trail.
+    ///
+    /// Only refusals of *authority* are recorded, and only in stateful mode:
+    /// there is nothing to write to otherwise, and a refusal that never reached
+    /// an identity — a missing credential, a stateless deployment — attributes to
+    /// nobody, so a row for it would be a log line pretending to be an audit
+    /// record. What is recorded is the pair an investigator asks about: which
+    /// identity reached for which scope, and which rule turned it away.
+    ///
+    /// A store failure here does not change the answer the caller gets. The
+    /// refusal already happened; failing the request because the *record* of it
+    /// could not be written would turn an authorization failure into an
+    /// availability failure, and would let a caller who can stall the control
+    /// plane change a `403` into a `503`. It is logged at `warn`, where the
+    /// deployment's own alerting sees it.
+    pub(super) async fn record_denial(
+        &self,
+        identity: &AdminIdentity,
+        action: AdminAction,
+        surface: Surface,
+        scope: &ResourceScope,
+        error: &AdminError,
+    ) {
+        let (Some(store), AdminError::Forbidden(refusal)) = (self.store.as_ref(), error) else {
+            return;
+        };
+        let denial = AccessDenial {
+            id: AuditEventId::new(self.ids.next()),
+            actor: identity.actor(),
+            surface,
+            action: action.recorded_action(),
+            scope: scope.clone(),
+            reason: match refusal {
+                AdminAuthError::ActionNotPermitted { .. } => DenialReason::RoleLacksAction,
+                _ => DenialReason::OutOfScope,
+            },
+            recorded_at: SystemTime::now(),
+        };
+        if let Err(error) = store.record_denial(&denial).await {
+            warn!(
+                target: "axond.admin",
+                error = %error,
+                action = action.as_str(),
+                "an administrative denial could not be recorded",
+            );
+        }
+    }
+
+    /// Record a mutation's own refusal, from the grant and the request that
+    /// carry everything the trail needs.
+    async fn denied(&self, grant: &AdminGrant, request: &MutationRequest, error: &AdminError) {
+        self.record_denial(
+            grant.identity(),
+            grant.action(),
+            request.surface,
+            &request.scope,
+            error,
+        )
+        .await;
     }
 
     /// Check a grant covers the action about to be performed.
@@ -395,10 +457,19 @@ impl AdminService {
         // The verb the request performs, not merely some mutating verb: a
         // rollback grant is not a publication grant, and the service is the place
         // that cannot be bypassed by a handler asking its authorizer for the
-        // wrong one.
-        Self::permits(grant, AdminAction::for_mutation(request.kind))?;
+        // wrong one. Every refusal below is an authenticated caller reaching past
+        // its authority, so each one is written to the denial trail before it is
+        // returned — including the ones an authorizer already had a chance to
+        // make, because these checks exist precisely for the case where it did
+        // not.
+        if let Err(error) = Self::permits(grant, AdminAction::for_mutation(request.kind)) {
+            self.denied(grant, request, &error).await;
+            return Err(error);
+        }
         if grant.scope() != &request.scope {
-            return Err(AdminError::Forbidden(AdminAuthError::ScopeNotPermitted));
+            let error = AdminError::Forbidden(AdminAuthError::ScopeNotPermitted);
+            self.denied(grant, request, &error).await;
+            return Err(error);
         }
 
         // 3. The complete desired state the caller built its change on, read once.
@@ -452,7 +523,10 @@ impl AdminService {
         // changed rather than only what it said it would.
         let mut candidate_state = current_state.clone();
         edit.edit(&mut candidate_state)?;
-        Self::within_scope(grant.scope(), current_state, &candidate_state)?;
+        if let Err(error) = Self::within_scope(grant.scope(), current_state, &candidate_state) {
+            self.denied(grant, request, &error).await;
+            return Err(error);
+        }
 
         // 5 and 6. Validate the whole candidate, then diff two complete states.
         let mutation = MutationId::new(self.ids.next());

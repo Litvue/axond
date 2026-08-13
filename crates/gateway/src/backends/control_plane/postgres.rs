@@ -1411,28 +1411,29 @@ async fn insert_audit_event(
 /// not reported as weather.
 ///
 /// A retained row is why this matters. The projection keeps tenants and projects
-/// a later revision stopped declaring, because history references them, and
-/// their slugs stay reserved with them — so a revision that re-uses the name of
-/// a dropped tenant or project violates a unique index. As an outage that is a
-/// caller retrying forever against a state no retry reaches; as a refusal it is
-/// an operator reading which name is taken. Which of the two conditions is a
-/// *product* mistake — that a name is reserved by a row nothing serves — is a
-/// separate question from how the failure is reported, and only the reporting is
-/// decided here.
+/// a later revision stopped declaring, because history references them, and an
+/// undeleted one keeps its name with it — so a candidate that re-uses a name a
+/// live row holds violates a unique index. As an outage that is a caller
+/// retrying forever against a state no retry reaches; as
+/// [`ControlPlaneError::NameTaken`] it is a `409` naming the name to change,
+/// which is the only thing the caller can act on. A deleted tenant releases its
+/// slug — the partial index says so — so this is never how a deletion is
+/// undone; restoring one is republishing that tenant as `active`, and it fails
+/// here only when some *other* live tenant took the name meanwhile.
 fn projection_failure(
     operation: &str,
-    noun: &str,
+    noun: &'static str,
     slug: &str,
     error: &tokio_postgres::Error,
 ) -> ControlPlaneError {
     if is_unique_violation(error) {
-        return denied(format!(
-            "the {noun} name `{slug}` is already held by a projected row: {}; a {noun} that an \
-             earlier revision declared keeps its name until it is deleted, so no retry clears this",
-            error
+        return ControlPlaneError::NameTaken {
+            noun,
+            name: slug.to_owned(),
+            holder: error
                 .as_db_error()
-                .map_or_else(|| error.to_string(), |db| db.message().to_owned())
-        ));
+                .and_then(|db| db.constraint().map(ToOwned::to_owned)),
+        };
     }
     unavailable(operation, error)
 }
@@ -3733,6 +3734,39 @@ mod tests {
             .expect("read")
             .get(0);
         assert!(deployment > 0, "shared state is not hidden from a tenant");
+
+        // The publication chain is platform state: one revision is every
+        // tenant's desired state at one instant, so a pinned session reading it
+        // would learn that other tenants exist and how often they publish.
+        for table in [
+            "axond_cp_head",
+            "axond_cp_revision",
+            "axond_cp_revision_entry",
+            "axond_cp_revision_blob",
+            "axond_cp_blob",
+            "axond_cp_resource_dependency",
+        ] {
+            let visible: i64 = client
+                .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+                .await
+                .expect("read as the pinned session")
+                .get(0);
+            assert_eq!(visible, 0, "{table} leaked the publication chain");
+        }
+
+        // An idempotency record names no tenant, so it is walled through the
+        // mutation it deduplicates: this session sees the key of its own retry
+        // and not the other tenant's, which is the publication cadence the
+        // journal policy already hides.
+        let keys: i64 = client
+            .query_one("SELECT count(*) FROM axond_cp_idempotency", &[])
+            .await
+            .expect("read as the pinned session")
+            .get(0);
+        assert_eq!(
+            keys, 1,
+            "an idempotency key is visible exactly when the mutation it records is"
+        );
 
         // The unpinned publisher still sees both tenants, or the migration would
         // have hidden rows from the writer.

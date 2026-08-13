@@ -29,7 +29,9 @@ use super::reads::{
 use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest};
 use super::router::AdminApi;
 use super::service::MutationOutcome;
-use crate::desired_state::{MutationKind, ProjectId, ResourceScope, RevisionId, TenantId};
+use crate::desired_state::{
+    MutationKind, ProjectId, ResourceScope, RevisionId, Surface, TenantId,
+};
 
 /// The route table's mutating rows, as method routers.
 pub(super) fn publish_route<R: AdminResourceRequest>() -> MethodRouter<Arc<AdminApi>> {
@@ -76,10 +78,13 @@ async fn publish<R: AdminResourceRequest>(
     let summary = AuditSummary::parse(&envelope.summary)?;
     let kind = envelope.mutation.kind();
     let plan = envelope.resource.plan()?;
-    let grant = api.authorize(&identity, AdminAction::Publish, &plan.scope)?;
+    let grant = api
+        .authorize(&identity, AdminAction::Publish, R::SURFACE, &plan.scope)
+        .await?;
     let request = MutationRequest {
         preconditions,
         kind,
+        surface: R::SURFACE,
         scope: plan.scope.clone(),
         summary,
     };
@@ -113,10 +118,18 @@ async fn rollback(
         request.tenant.as_deref(),
         request.project.as_deref(),
     )?;
-    let grant = api.authorize(&identity, AdminAction::Rollback, &scope)?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::Rollback,
+            Surface::AuditTrail,
+            &scope,
+        )
+        .await?;
     let mutation = MutationRequest {
         preconditions,
         kind: MutationKind::Rollback,
+        surface: Surface::AuditTrail,
         scope,
         summary,
     };
@@ -130,11 +143,14 @@ async fn state(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
 ) -> Result<Json<StateView>, AdminError> {
-    let grant = api.authorize(
-        &identity,
-        AdminAction::ReadState,
-        &ResourceScope::Deployment,
-    )?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::ReadState,
+            Surface::AuditTrail,
+            &ResourceScope::Deployment,
+        )
+        .await?;
     Ok(Json(api.service.desired_state(&grant).await?))
 }
 
@@ -161,11 +177,14 @@ async fn history(
         schema: "history",
         detail: rejection.body_text(),
     })?;
-    let grant = api.authorize(
-        &identity,
-        AdminAction::ReadHistory,
-        &ResourceScope::Deployment,
-    )?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::ReadHistory,
+            Surface::AuditTrail,
+            &ResourceScope::Deployment,
+        )
+        .await?;
     let limit = match query.limit {
         None => HistoryLimit::default(),
         Some(limit) => HistoryLimit::parse(limit)?,
@@ -193,11 +212,14 @@ async fn audit(
     identity: AdminIdentity,
     Path(revision): Path<String>,
 ) -> Result<Json<AuditPage>, AdminError> {
-    let grant = api.authorize(
-        &identity,
-        AdminAction::ReadAudit,
-        &ResourceScope::Deployment,
-    )?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::ReadAudit,
+            Surface::AuditTrail,
+            &ResourceScope::Deployment,
+        )
+        .await?;
     let revision = RevisionId::parse(&revision).map_err(|error| AdminError::RequestInvalid {
         schema: "audit",
         detail: format!("`revision`: {error}"),
@@ -211,11 +233,14 @@ async fn convergence(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
 ) -> Result<Json<ConvergenceResult>, AdminError> {
-    let grant = api.authorize(
-        &identity,
-        AdminAction::ReadConvergence,
-        &ResourceScope::Deployment,
-    )?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::ReadConvergence,
+            Surface::AuditTrail,
+            &ResourceScope::Deployment,
+        )
+        .await?;
     let report = api.convergence_report();
     Ok(Json(api.service.convergence(&grant, report.as_ref())?))
 }

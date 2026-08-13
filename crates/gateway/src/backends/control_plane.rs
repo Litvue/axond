@@ -162,6 +162,23 @@ pub enum ControlPlaneError {
         backend: &'static str,
         message: String,
     },
+    /// Two resources claim one name. The projection enforces uniqueness on the
+    /// names an operator types — a tenant slug, a project slug within its tenant
+    /// — and a candidate that re-uses one already held by a row this deployment
+    /// retains cannot be published.
+    ///
+    /// Separate from [`ControlPlaneError::Denied`] because the two need opposite
+    /// answers: a denial is the deployment's own problem, where this is the
+    /// caller's, fixed by picking another name or by deleting the resource that
+    /// holds this one. It is reported with the name, so the fix does not require
+    /// reading a driver message.
+    #[error("the {noun} name `{name}` is already held by another {noun}")]
+    NameTaken {
+        noun: &'static str,
+        name: String,
+        /// The resource that holds the name, when the projection can name it.
+        holder: Option<String>,
+    },
     /// A retained revision could not be interpreted. Never masked as
     /// "unavailable": an operator has to know that stored state is unreadable.
     ///
@@ -245,7 +262,7 @@ impl BackendFailure for ControlPlaneError {
     fn category(&self) -> FailureCategory {
         match self {
             Self::Unavailable { .. } => FailureCategory::Unavailable,
-            Self::Conflict { .. } => FailureCategory::Conflict,
+            Self::Conflict { .. } | Self::NameTaken { .. } => FailureCategory::Conflict,
             Self::RevisionNotFound(_) => FailureCategory::NotFound,
             Self::Invalid(_)
             | Self::ImmutableResourceVersion { .. }

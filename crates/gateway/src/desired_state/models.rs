@@ -59,9 +59,11 @@
 //! tenant-scoped enablement applies to every project of that tenant, and a
 //! project-scoped one for the same offering replaces it for that project.
 //! [`Models::effective_for`] states the resolution once, so no consumer invents a
-//! second precedence rule, and two enablements at the *same* scope for one
-//! offering are refused ([`ModelError::DuplicateOffering`]) rather than resolved
-//! by iteration order.
+//! second precedence rule, and two *enabled* enablements at the same scope for
+//! one offering are refused ([`ModelError::DuplicateOffering`]) rather than
+//! resolved by iteration order. A disabled one resolves to nothing and so holds
+//! no offering — which is what makes replacing an enablement reachable, since a
+//! new snapshot is a new enablement and desired state never forgets the old.
 //!
 //! # What is checked, and where
 //!
@@ -1695,6 +1697,14 @@ impl Models {
                     enablement.body.owner(),
                 )?;
             }
+            // Only what resolves can be ambiguous. A disabled enablement is
+            // never returned to anyone, so holding an offering it no longer
+            // serves would make a refreshed snapshot unreachable: a new snapshot
+            // is a new enablement, and the enablement it replaces can only be
+            // disabled — this state has no way to forget a resource.
+            if !enablement.body.is_enabled() {
+                continue;
+            }
             let owner = enablement.body.owner();
             let offering = enablement.body.offering().offering;
             if let Some(conflicting) = offerings.insert((owner, offering), enablement.reference) {
@@ -2189,6 +2199,69 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    /// The replacement path: an offering a disabled enablement used to serve is
+    /// free for the enablement that replaces it. Without this a refreshed
+    /// snapshot could never be enabled, since a new snapshot is a new enablement
+    /// and desired state has no way to drop the old one.
+    #[test]
+    fn a_disabled_enablement_does_not_hold_the_offering_that_replaces_it() {
+        let replacement = enablement_body(33, owner_tenant(), "gpt-4o")
+            .version(Slug::parse("gpt-4o-refreshed").unwrap(), catalog_reference());
+        let mut state = state_with_models();
+        let retired = state
+            .resources()
+            .find(|resource| {
+                ModelEnablementBody::read(resource)
+                    .is_ok_and(|body| body.offering().offering == offering_id("gpt-4o"))
+            })
+            .cloned()
+            .expect("the state enables gpt-4o");
+        let body = ModelEnablementBody::read(&retired)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled);
+        let disabled = body.version_at(
+            retired.slug.clone(),
+            retired.reference.version.next(),
+            catalog_reference(),
+        );
+        let disabled_reference = disabled.reference;
+        state
+            .supersede(disabled)
+            .expect("disabling advances the enablement");
+        // Every alias that named the enablement follows it to the version that
+        // disabled it, exactly as an administrative edit carries dependents.
+        let dependents: Vec<ResourceVersion> = state
+            .resources()
+            .filter(|resource| resource.depends_on.contains(&retired.reference))
+            .cloned()
+            .collect();
+        for dependent in dependents {
+            let alias = ModelAliasBody::read(&dependent).expect("an alias body");
+            let targets: Vec<AliasTarget> = alias
+                .targets()
+                .iter()
+                .map(|target| {
+                    if target.enablement == disabled_reference.id {
+                        AliasTarget::new(target.enablement, disabled_reference.version)
+                    } else {
+                        *target
+                    }
+                })
+                .collect();
+            state
+                .supersede(
+                    alias
+                        .retargeted(targets)
+                        .version_at(dependent.slug.clone(), dependent.reference.version.next()),
+                )
+                .expect("the alias follows its target");
+        }
+        state.insert(replacement).expect("a distinct reference");
+        state
+            .validate()
+            .expect("only what resolves can be ambiguous");
     }
 
     #[test]

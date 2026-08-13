@@ -78,7 +78,7 @@ use super::resources::{
 };
 use super::service::AdminService;
 use crate::convergence::{RevisionReport, RevisionStatus};
-use crate::desired_state::ResourceScope;
+use crate::desired_state::{ResourceScope, Surface};
 
 /// Everything an administrative handler needs: the service, and the two
 /// authorities that decide who may call it.
@@ -135,13 +135,29 @@ impl AdminApi {
     /// The scope comes from the request, so authorization happens in the handler
     /// rather than in the layer: the layer knows the route's action but cannot
     /// know which tenant a body names.
-    pub fn authorize(
+    ///
+    /// A refusal is written to the denial trail before it is returned, which is
+    /// why this is the only way a handler reaches the authorizer: an
+    /// authenticated caller reaching for authority it does not hold is exactly
+    /// the event an investigator asks the control plane about, and a code path
+    /// that could refuse without recording would be the one that hides it.
+    pub async fn authorize(
         &self,
         identity: &AdminIdentity,
         action: AdminAction,
+        surface: Surface,
         scope: &ResourceScope,
     ) -> Result<AdminGrant, AdminError> {
-        Ok(self.authorizer.authorize(identity, action, scope)?)
+        match self.authorizer.authorize(identity, action, scope) {
+            Ok(grant) => Ok(grant),
+            Err(refusal) => {
+                let error = AdminError::from(refusal);
+                self.service
+                    .record_denial(identity, action, surface, scope, &error)
+                    .await;
+                Err(error)
+            }
+        }
     }
 }
 

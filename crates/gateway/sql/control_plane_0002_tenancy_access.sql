@@ -375,3 +375,63 @@ CREATE POLICY axond_cp_audit_event_isolation ON axond_cp_audit_event
             WHERE carried.mutation_id = axond_cp_audit_event.mutation_id
         )
     );
+
+-- Idempotency records name no tenant, but each one points at the mutation it
+-- deduplicates, and that mutation is a tenant's change. Filtered through it, a
+-- pinned session sees the keys of its own retries and learns nothing about how
+-- often another tenant publishes — the cadence signal the opaque `forbidden`
+-- refusal exists to suppress would otherwise be readable straight off this
+-- table.
+ALTER TABLE axond_cp_idempotency ENABLE ROW LEVEL SECURITY;
+ALTER TABLE axond_cp_idempotency FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS axond_cp_idempotency_isolation ON axond_cp_idempotency;
+CREATE POLICY axond_cp_idempotency_isolation ON axond_cp_idempotency
+    USING (
+        coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR EXISTS (
+            SELECT 1 FROM axond_cp_mutation AS recorded
+            WHERE recorded.mutation_id = axond_cp_idempotency.mutation_id
+        )
+    )
+    WITH CHECK (
+        coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR EXISTS (
+            SELECT 1 FROM axond_cp_mutation AS recorded
+            WHERE recorded.mutation_id = axond_cp_idempotency.mutation_id
+        )
+    );
+
+-- The publication chain itself — the head, the revisions, what each revision
+-- carried, and the content it carried it as — is deployment-wide by
+-- construction: one revision is *every* tenant's desired state at one instant,
+-- so there is no tenant column to key a policy on and no per-tenant subset of a
+-- revision to expose. A tenant's view of published state is its resource
+-- versions, which are already walled; the chain that published them is platform
+-- state, and a session pinned to a tenant reads none of it. An unpinned session
+-- — the service, a migration, an operator's `psql` — is unaffected, which is the
+-- same shape every policy above has.
+DO $$
+DECLARE
+    chained text;
+BEGIN
+    FOREACH chained IN ARRAY ARRAY[
+        'axond_cp_head',
+        'axond_cp_revision',
+        'axond_cp_revision_entry',
+        'axond_cp_revision_blob',
+        'axond_cp_blob',
+        'axond_cp_resource_dependency'
+    ] LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', chained);
+        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', chained);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I', chained || '_isolation', chained);
+        EXECUTE format(
+            'CREATE POLICY %I ON %I USING (%s) WITH CHECK (%s)',
+            chained || '_isolation',
+            chained,
+            'coalesce(current_setting(''axond.tenant_id'', true), '''') = ''''',
+            'coalesce(current_setting(''axond.tenant_id'', true), '''') = '''''
+        );
+    END LOOP;
+END
+$$;

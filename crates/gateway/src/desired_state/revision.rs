@@ -76,6 +76,27 @@ pub enum ValidationError {
     DanglingBlobReference { from: ResourceRef, digest: Checksum },
     #[error("blob {digest} is declared but referenced by no resource")]
     UnreferencedBlob { digest: Checksum },
+    /// A catalogue row was asked to carry different content while an enablement
+    /// still reads its offering from the content it carries now.
+    ///
+    /// An enablement's snapshot is immutable — [`ModelEnablementBody`] refuses a
+    /// version that re-pins one, because that is how a published alias's meaning
+    /// changes underneath it — so a refresh cannot be applied to the enablements
+    /// that pinned the old contents. The refusal names them, and the way through
+    /// is the one ADR 0040 describes: publish the refreshed snapshot, enable the
+    /// offerings against it, and retire the enablements that read the old one.
+    ///
+    /// [`ModelEnablementBody`]: super::models::ModelEnablementBody
+    #[error(
+        "{catalog} still supplies the snapshot {digest} that {enablement} is pinned to; \
+         an enablement's snapshot is immutable, so publish the refreshed catalogue as its own \
+         resource and enable offerings against it"
+    )]
+    PinnedSnapshotWithdrawn {
+        catalog: ResourceRef,
+        enablement: ResourceRef,
+        digest: Checksum,
+    },
     #[error("{from} depends on {to}, which belongs to another tenant")]
     CrossTenantReference { from: ResourceRef, to: ResourceRef },
     #[error("deployment-scoped {from} depends on tenant-scoped {to}")]

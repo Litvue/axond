@@ -425,6 +425,117 @@ async fn advancing_a_resource_other_resources_pin_carries_those_resources_forwar
         .await;
 }
 
+/// A refreshed catalogue is a new snapshot, and an enablement's snapshot is part
+/// of what it is: re-importing different content under a row an enablement reads
+/// from is refused by name, rather than published into a state whose pins no
+/// longer resolve.
+#[tokio::test]
+async fn refreshing_a_catalogue_an_enablement_reads_from_is_refused_by_name() {
+    let deployment = Deployment::new();
+    let head = build(&deployment).await;
+
+    let refreshed = *fixtures::second_blob_backed_catalog(23)
+        .body
+        .blob()
+        .expect("a blob body");
+    let mut reimported = catalog_document();
+    reimported["mutation"] = json!("update");
+    reimported["resource"]["digest"] = refreshed.digest.to_string().into();
+    reimported["resource"]["size_bytes"] = json!(refreshed.size_bytes);
+
+    let (status, error) = deployment
+        .post("/catalogs", "key-catalog-refresh", &head, &reimported)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"]["type"], "validation_failed", "{error}");
+    assert_eq!(
+        error["error"]["rule"], "pinned_snapshot_withdrawn",
+        "the refusal names why, not just that: {error}"
+    );
+    assert_eq!(
+        deployment.store.published_revisions(),
+        8,
+        "a refused candidate publishes nothing"
+    );
+}
+
+/// The way through the refusal above: the refreshed snapshot arrives as its own
+/// catalogue resource, and offerings are enabled against it, leaving the
+/// enablements that read the old snapshot to be retired on their own schedule.
+#[tokio::test]
+async fn a_refreshed_catalogue_is_imported_as_its_own_resource_and_enabled_against() {
+    let deployment = Deployment::new();
+    let mut head = build(&deployment).await;
+
+    let refreshed = *fixtures::second_blob_backed_catalog(23)
+        .body
+        .blob()
+        .expect("a blob body");
+    let mut imported = catalog_document();
+    imported["resource"]["catalog"] = fixtures::resource_id(23).to_string().into();
+    imported["resource"]["slug"] = json!("openai-models-2026-08");
+    imported["resource"]["digest"] = refreshed.digest.to_string().into();
+    imported["resource"]["size_bytes"] = json!(refreshed.size_bytes);
+    head = deployment
+        .publish("/catalogs", "key-catalog-refresh", &head, &imported)
+        .await;
+
+    let mut disabled = model_document();
+    disabled["mutation"] = json!("update");
+    disabled["resource"]["state"] = json!("disabled");
+    head = deployment
+        .publish("/models", "key-model-retire", &head, &disabled)
+        .await;
+
+    let mut enabled = model_document();
+    enabled["resource"]["enablement"] = fixtures::resource_id(24).to_string().into();
+    enabled["resource"]["slug"] = json!("gpt-4o-2026-08");
+    enabled["resource"]["catalog"] = fixtures::resource_id(23).to_string().into();
+    enabled["resource"]["snapshot"] = refreshed.digest.to_string().into();
+    head = deployment
+        .publish("/models", "key-model-refresh", &head, &enabled)
+        .await;
+
+    let mut retargeted = alias_document();
+    retargeted["mutation"] = json!("update");
+    retargeted["resource"]["targets"] =
+        json!([{ "enablement": fixtures::resource_id(24).to_string() }]);
+    let head = deployment
+        .publish("/aliases", "key-alias-refresh", &head, &retargeted)
+        .await;
+
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(&head).expect("a revision"))
+        .await
+        .expect("the published revision hydrates");
+    let state = loaded.state();
+    let enablement = state
+        .version_of(
+            crate::desired_state::ResourceKind::ModelEnablement,
+            fixtures::resource_id(24),
+        )
+        .expect("the refreshed enablement is desired");
+    let body =
+        crate::desired_state::ModelEnablementBody::read(enablement).expect("an enablement body");
+    assert!(
+        body.offering().is_pinned_to(refreshed.digest),
+        "the new enablement reads the refreshed snapshot"
+    );
+    let alias = state
+        .version_of(
+            crate::desired_state::ResourceKind::Alias,
+            fixtures::resource_id(15),
+        )
+        .expect("the alias is desired");
+    let alias_body = crate::desired_state::ModelAliasBody::read(alias).expect("an alias body");
+    assert_eq!(
+        alias_body.primary().expect("a target").enablement,
+        fixtures::resource_id(24),
+        "the alias serves the refreshed enablement"
+    );
+}
+
 #[tokio::test]
 async fn a_second_publication_of_a_resource_supersedes_it_rather_than_duplicating_it() {
     let deployment = Deployment::new();
