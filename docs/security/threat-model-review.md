@@ -292,7 +292,7 @@ overrides, and ordered single-wire-family alias targets — is
 what an enablement pins or to which targets an alias may name amends it; `CatalogSource`'s background-only placement is in
 [backend contracts](../maintainers/backend-contracts.md).
 [ADR 0043](../adr/0043-catalogue-source-imports.md) holds observed rates as
-metadata and [ADR 0044](../adr/0044-approved-price-books.md) makes approval the
+metadata and [ADR 0045](../adr/0045-approved-price-books.md) makes approval the
 only activation, with exact conversion and no request-path pricing lookup — a
 change that prices from mutable or unapproved data supersedes 0044 rather than
 relaxing it. Item 2 of the security

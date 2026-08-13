@@ -1,4 +1,4 @@
-# 44. Approved price books: what activates a rate, and what a snapshot must remember
+# 45. Approved price books: what activates a rate, and what a snapshot must remember
 
 Date: 2026-08-12
 

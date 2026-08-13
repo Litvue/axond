@@ -127,7 +127,7 @@ Two units for money now exist, and they cannot be mixed accidentally:
 micro-dollars, with no conversion between them in this slice. That is the point
 — an observation must not silently become a charge — but it does mean price
 activation has to state its rounding explicitly, in public, when it arrives.
-[ADR 0044](./0044-approved-price-books.md) is that statement: an approval
+[ADR 0045](./0045-approved-price-books.md) is that statement: an approval
 activates a rate, and a rate that is not a whole number of micro-dollars is
 refused rather than rounded in either direction.
 
