@@ -61,11 +61,14 @@ use super::diff::SemanticDiff;
 use super::error::AdminError;
 use super::protocol::{MutationRequest, WriteMode};
 use super::reads::{
-    AuditPage, ConvergenceResult, HistoryRequest, RevisionPage, RevisionRecord, StateView,
+    AuditPage, AvailabilityResult, ConvergenceResult, HistoryRequest, RevisionPage, RevisionRecord,
+    StateView,
 };
+use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::config::Mode;
 use crate::convergence::RevisionReport;
+use crate::status::StatusScope;
 use crate::desired_state::{
     AccessDenial, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
     LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
@@ -402,6 +405,57 @@ impl AdminService {
         Self::permits_deployment_read(grant, AdminAction::ReadConvergence)?;
         self.store()?;
         Ok(report.map_or_else(ConvergenceResult::unreconciled, ConvergenceResult::of))
+    }
+
+    /// What this replica derives about one scope's models (#148).
+    ///
+    /// Takes the reader rather than holding one, for the same reason
+    /// [`AdminService::convergence`] takes a report: the answer is replica-local
+    /// and already in memory, so it reaches no store and survives the outage that
+    /// prompted the question. `None` is a replica that derives no view, and says
+    /// so rather than answering with an empty catalogue.
+    ///
+    /// Scoped rather than deployment-wide, and narrowed twice. The grant must
+    /// enclose the scope asked about, so a tenant administrator cannot read
+    /// another tenant's — or a sibling project's — derived entitlements. And a
+    /// grant narrower than the deployment sees the namespace projection of each
+    /// verdict, which keeps the deployment's discovery machinery out of a tenant's
+    /// answer.
+    pub fn availability(
+        &self,
+        grant: &AdminGrant,
+        scope: &ResourceScope,
+        reader: Option<&dyn AvailabilityReader>,
+        now: SystemTime,
+    ) -> Result<AvailabilityResult, AdminError> {
+        Self::permits(grant, AdminAction::ReadAvailability)?;
+        if !grant.scope().contains(scope) {
+            return Err(AdminError::Forbidden(AdminAuthError::ScopeNotPermitted));
+        }
+        self.store()?;
+        let Some(reference) = ScopeRef::of(scope) else {
+            // Availability is a question about a tenant's models: a
+            // deployment-wide answer would be every tenant's entitlements in one
+            // document, which is the cross-tenant disclosure the keying exists to
+            // prevent.
+            return Err(AdminError::RequestInvalid {
+                schema: "availability",
+                detail: "`tenant`: an availability read must name the tenant it asks about"
+                    .to_owned(),
+            });
+        };
+        let Some(reader) = reader else {
+            return Ok(AvailabilityResult::underived(scope));
+        };
+        let index = reader.index();
+        let runtime = reader.runtime();
+        let targets = AvailabilityView::new(&index, &runtime).evaluate_scope(reference, now);
+        let status = if grant.scope() == &ResourceScope::Deployment {
+            StatusScope::Deployment
+        } else {
+            StatusScope::Namespace
+        };
+        Ok(AvailabilityResult::of(scope, status, targets))
     }
 
     /// Republish a retained revision's complete desired state as a new revision.

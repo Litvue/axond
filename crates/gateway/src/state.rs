@@ -24,7 +24,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::admission::{AdmissionControl, DiagnosticCredential};
 use crate::aliases::AliasScope;
-use crate::availability::AvailabilityIndex;
+use crate::availability::{AvailabilityIndex, AvailabilityReader, RuntimeObservations};
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
@@ -190,9 +190,10 @@ pub struct ConfigSnapshot {
     /// one-way — a projection cannot add a model, a namespace, or a credential, so
     /// no amount of discovery evidence can enlarge what is served.
     ///
-    /// [`ConfigSnapshot::build`] always produces the empty index: this slice is
-    /// contract only, nothing polls a provider, and no request consults a verdict.
-    #[allow(dead_code)]
+    /// [`ConfigSnapshot::build`] always produces the empty index. A compiler
+    /// holding availability evidence attaches a derived one during compilation
+    /// (#148), off the request path and before publication; no request consults a
+    /// verdict, and nothing polls a provider to produce it.
     availability: Arc<AvailabilityIndex>,
     /// The approved pricing this snapshot serves under, when it was compiled from
     /// a revision that published a price book (#201).
@@ -545,7 +546,6 @@ impl ConfigSnapshot {
 
     /// The index as a handle, for carrying the evidence an outgoing snapshot holds
     /// onto its replacement without cloning the records.
-    #[allow(dead_code)]
     pub fn availability_handle(&self) -> Arc<AvailabilityIndex> {
         Arc::clone(&self.availability)
     }
@@ -802,6 +802,23 @@ impl AppState {
     /// The stateful policy this replica enforces.
     pub fn policy(&self) -> &Arc<PolicyRuntime> {
         &self.0.policy
+    }
+}
+
+/// A replica answers availability questions from what it is already serving.
+///
+/// Both halves come from the loaded snapshot, and neither reaches a store: the
+/// index is the projection compilation attached to it, and the health is the
+/// circuits that snapshot's own requests have been tripping. Read together from
+/// one `Arc`, so an answer cannot describe one revision's targets with another
+/// revision's circuits.
+impl AvailabilityReader for AppState {
+    fn index(&self) -> Arc<AvailabilityIndex> {
+        self.config().availability_handle()
+    }
+
+    fn runtime(&self) -> RuntimeObservations {
+        RuntimeObservations::of_circuits(self.config().target_circuits.snapshot())
     }
 }
 

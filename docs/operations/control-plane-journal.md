@@ -274,6 +274,7 @@ psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0002_tenancy_access.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0003_tenancy_constraints.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0004_journal_ownership.sql
+psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0005_availability_observations.sql
 axond migrate adopt  --config /etc/axond/axond.toml  # record the baseline that applied
 axond migrate status --config /etc/axond/axond.toml  # now Current
 ```

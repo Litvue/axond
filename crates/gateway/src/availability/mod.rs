@@ -80,9 +80,13 @@
 pub mod dimensions;
 pub mod discovery;
 pub mod index;
+pub mod projection;
 pub mod refs;
+pub mod store;
 pub mod verdict;
 
+#[cfg(test)]
+mod projection_tests;
 #[cfg(test)]
 mod tests;
 
@@ -98,6 +102,13 @@ pub use discovery::{
 };
 #[allow(unused_imports)]
 pub use index::{AvailabilityIndex, AvailabilityIndexBuilder, AvailabilityRecord};
+#[allow(unused_imports)]
+pub use projection::{
+    AvailabilityEvidence, AvailabilityProjection, AvailabilityProjectionError, AvailabilityReader,
+    AvailabilityView, Catalogue, CatalogueListing, CredentialReadiness, ProjectedAvailability, RuntimeObservations,
+};
+#[allow(unused_imports)]
+pub use store::{ObservationSlot, ObservationStore, StoredObservation};
 #[allow(unused_imports)]
 pub use refs::{
     AvailabilityKey, CredentialRef, InvalidToken, ModelRef, ProviderRef, ScopeRef, TargetRef, Token,

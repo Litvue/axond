@@ -259,6 +259,8 @@ pub enum AdminAction {
     ReadAudit,
     /// Read what this replica has converged onto.
     ReadConvergence,
+    /// Read the availability this replica derives for a scope.
+    ReadAvailability,
     /// Publish a new revision.
     Publish,
     /// Republish an earlier revision's desired state.
@@ -271,6 +273,7 @@ impl AdminAction {
         Self::ReadHistory,
         Self::ReadAudit,
         Self::ReadConvergence,
+        Self::ReadAvailability,
         Self::Publish,
         Self::Rollback,
     ];
@@ -281,6 +284,7 @@ impl AdminAction {
             Self::ReadHistory => "read_history",
             Self::ReadAudit => "read_audit",
             Self::ReadConvergence => "read_convergence",
+            Self::ReadAvailability => "read_availability",
             Self::Publish => "publish",
             Self::Rollback => "rollback",
         }
@@ -316,9 +320,11 @@ impl AdminAction {
     /// rather than which field of a document it would have changed.
     pub const fn recorded_action(self) -> Action {
         match self {
-            Self::ReadState | Self::ReadHistory | Self::ReadAudit | Self::ReadConvergence => {
-                Action::Read
-            }
+            Self::ReadState
+            | Self::ReadHistory
+            | Self::ReadAudit
+            | Self::ReadConvergence
+            | Self::ReadAvailability => Action::Read,
             Self::Publish | Self::Rollback => Action::Update,
         }
     }

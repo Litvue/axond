@@ -1026,6 +1026,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "control_plane_0004_journal_ownership",
         sql: include_str!("../../../sql/control_plane_0004_journal_ownership.sql"),
     },
+    Migration {
+        version: 5,
+        name: "control_plane_0005_availability_observations",
+        sql: include_str!("../../../sql/control_plane_0005_availability_observations.sql"),
+    },
 ];
 
 /// The schema version this build requires.

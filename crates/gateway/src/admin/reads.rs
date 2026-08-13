@@ -33,10 +33,12 @@ use serde::Serialize;
 
 use super::diff::ScopeView;
 use super::error::AdminError;
+use crate::availability::{Availability, TargetRef};
 use crate::convergence::RevisionReport;
 use crate::desired_state::{
-    Actor, AuditEvent, DesiredState, LoadedRevision, RevisionId, RevisionManifest,
+    Actor, AuditEvent, DesiredState, LoadedRevision, ResourceScope, RevisionId, RevisionManifest,
 };
+use crate::status::StatusScope;
 
 /// How many revisions one history page may contain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +421,94 @@ impl ConvergenceResult {
             last_convergence_ms: self.last_convergence_ms,
             consecutive_failures: self.consecutive_failures,
             last_rejection: self.last_rejection,
+        }
+    }
+}
+
+/// What this replica derives about one scope's models (#148).
+///
+/// Replica-local, like [`ConvergenceResult`]: it reads the index the snapshot
+/// being served carries and this replica's own circuits, so it answers during
+/// the control-plane or provider outage that prompted the question. Two replicas
+/// may legitimately answer differently, which is why the answer names the
+/// generation it was read from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AvailabilityResult {
+    /// The scope asked about, narrowest last.
+    pub scope: String,
+    /// Whether this replica derives availability at all. `false` is not "nothing
+    /// is available": the replica projects no view, so an operator must not read
+    /// the empty list as a deployment with no models.
+    pub deriving: bool,
+    pub targets: Vec<AvailabilityTarget>,
+}
+
+/// One target's derived availability.
+///
+/// Carries the verdict and its evidence, never the evidence's operator detail: a
+/// discovery observation's `detail` can hold a provider's error text, and this is
+/// a response. What the caller sees is additionally narrowed by the scope of the
+/// grant that asked — a tenant-scoped administrator gets
+/// [`Availability::for_scope`] at namespace scope, which drops the discovery
+/// source and any reason that describes the deployment's own machinery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AvailabilityTarget {
+    pub provider: String,
+    pub model: String,
+    pub state: &'static str,
+    pub reason: &'static str,
+    pub decided_by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
+    /// Whether the verdict rests on retained evidence rather than a current
+    /// observation — the difference between "discovery says so" and "discovery
+    /// said so, and has not been able to speak since".
+    pub last_known_good: bool,
+}
+
+impl AvailabilityResult {
+    /// A replica that derives no availability view.
+    pub fn underived(scope: &ResourceScope) -> Self {
+        Self {
+            scope: scope.to_string(),
+            deriving: false,
+            targets: Vec::new(),
+        }
+    }
+
+    pub fn of(
+        scope: &ResourceScope,
+        status: StatusScope,
+        targets: Vec<(TargetRef, Availability)>,
+    ) -> Self {
+        Self {
+            scope: scope.to_string(),
+            deriving: true,
+            targets: targets
+                .into_iter()
+                .map(|(target, verdict)| AvailabilityTarget::of(&target, verdict, status))
+                .collect(),
+        }
+    }
+}
+
+impl AvailabilityTarget {
+    fn of(target: &TargetRef, verdict: Availability, scope: StatusScope) -> Self {
+        let verdict = verdict.for_scope(scope);
+        Self {
+            provider: target.provider.as_str().to_owned(),
+            model: target.model.as_str().to_owned(),
+            state: verdict.state.as_str(),
+            reason: verdict.reason.code(),
+            decided_by: verdict.decided_by.as_str(),
+            observed_at_ms: verdict.observed_at.map(millis),
+            expires_at_ms: verdict.expires_at.map(millis),
+            source: verdict.source.map(|source| source.as_str()),
+            last_known_good: verdict.last_known_good,
         }
     }
 }

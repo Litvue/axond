@@ -13,6 +13,7 @@
 //! see which tenant a document is about without parsing it.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::Json;
 use axum::body::Bytes;
@@ -27,7 +28,8 @@ use super::conditional::Conditional;
 use super::error::AdminError;
 use super::protocol::{AuditSummary, MutationPreconditions, MutationRequest};
 use super::reads::{
-    AuditPage, ConvergenceResult, HistoryLimit, HistoryRequest, RevisionPage, StateView,
+    AuditPage, AvailabilityResult, ConvergenceResult, HistoryLimit, HistoryRequest, RevisionPage,
+    StateView,
 };
 use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest};
 use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi};
@@ -57,6 +59,10 @@ pub(super) fn audit_route() -> MethodRouter<Arc<AdminApi>> {
 
 pub(super) fn convergence_route() -> MethodRouter<Arc<AdminApi>> {
     get(convergence)
+}
+
+pub(super) fn availability_route() -> MethodRouter<Arc<AdminApi>> {
+    get(availability)
 }
 
 /// The buffered request body, or the administrative refusal for one that never
@@ -302,6 +308,44 @@ async fn convergence(
     // exists for.
     let identity = result.identity();
     Ok(Conditional::identified_by(&headers, result, &identity))
+}
+
+/// What an availability read asks about.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AvailabilityQuery {
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// What this replica derives about one scope's models — answered from the
+/// snapshot it is serving and its own circuits, so it survives the control-plane
+/// or provider outage that prompted the question.
+async fn availability(
+    State(api): State<Arc<AdminApi>>,
+    identity: AdminIdentity,
+    query: Result<Query<AvailabilityQuery>, QueryRejection>,
+) -> Result<Json<AvailabilityResult>, AdminError> {
+    let Query(query) = query.map_err(|rejection| AdminError::RequestInvalid {
+        schema: "availability",
+        detail: rejection.body_text(),
+    })?;
+    let scope = scope_of(
+        "availability",
+        query.tenant.as_deref(),
+        query.project.as_deref(),
+    )?;
+    let grant = api
+        .authorize(&identity, AdminAction::ReadAvailability, Surface::Model, &scope)
+        .await?;
+    Ok(Json(api.service.availability(
+        &grant,
+        &scope,
+        api.availability.as_deref(),
+        SystemTime::now(),
+    )?))
 }
 
 /// The scope a request names, from an optional tenant and project.

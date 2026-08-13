@@ -28,6 +28,7 @@
 //!   opaque secret *reference*; plaintext lives in the secret store, and no value
 //!   from a body is ever logged.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -43,12 +44,16 @@ use super::hydration::{self, HydrationLimits};
 use super::rows;
 use super::schema::{self, Baseline, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
 use super::{ControlPlaneError, ControlPlaneStore, StatusProbeAdmission};
+use crate::availability::store::{
+    self as availability_store, ObservationSlot, ObservationStore, StoredObservation,
+};
+use crate::availability::{AvailabilityKey, DiscoveryObservation, ScopeRef, TargetRef};
 use crate::backends::{Capabilities, Capability};
 use crate::desired_state::{
     AccessDenial, Action, AuditEvent, Credential, DenialPage, DenialReason, Directory,
-    IntegrityError, LoadedRevision, Mutation, ResourceRef, ResourceVersion, ResourceVersionNumber,
-    RevisionCandidate, RevisionId, RevisionManifest, SerializerVersion, Surface, Tenancy,
-    Uuid7Generator,
+    IntegrityError, LoadedRevision, Mutation, ProjectId, ResourceRef, ResourceVersion,
+    ResourceVersionNumber, RevisionCandidate, RevisionId, RevisionManifest, SerializerVersion,
+    Surface, Tenancy, TenantId, Uuid7Generator,
 };
 
 const BACKEND: &str = "postgres";
@@ -1032,6 +1037,177 @@ impl ControlPlaneStore for PostgresControlPlane {
         })
         .await
     }
+}
+
+/// Discovery evidence, kept between restarts.
+///
+/// The same database as the journal and deliberately not the same kind of state:
+/// a revision is desired state and is published, while an observation is
+/// something a replica learned and is merely remembered. Nothing here is read on
+/// the request path, nothing here is read while compiling a snapshot's routing
+/// tables, and a total loss of these rows costs a deployment its freshness and
+/// nothing else — every target falls back to `unknown`, which is what a replica
+/// that has not looked honestly knows.
+#[async_trait]
+impl ObservationStore for PostgresControlPlane {
+    async fn load(
+        &self,
+        scope: Option<ScopeRef>,
+    ) -> Result<Vec<StoredObservation>, ControlPlaneError> {
+        let tenant = scope.map(|scope| scope.tenant.to_string());
+        let project = scope.and_then(|scope| scope.project.map(|project| project.to_string()));
+        // A scope is matched exactly, project included: a tenant-wide read and a
+        // project's read are different questions, and answering the narrower one
+        // with the tenant's rows would report a project as knowing things it does
+        // not.
+        self.run(None, move |client| {
+            Box::pin(async move {
+                let rows = client
+                    .query(
+                        "SELECT tenant_id, project_id, provider, model, slot, result, \
+                         completeness, source, observed_at, expires_at, definitive_at \
+                         FROM axond_cp_availability_observation \
+                         WHERE ($1::text IS NULL OR tenant_id = $1) \
+                         AND ($1::text IS NULL OR project_id IS NOT DISTINCT FROM $2) \
+                         ORDER BY tenant_id, project_id, provider, model, slot",
+                        &[&tenant, &project],
+                    )
+                    .await
+                    .map_err(|error| unavailable("read discovery observations", &error))?;
+                rows.iter().map(observation_row).collect()
+            })
+        })
+        .await
+    }
+
+    async fn save(&self, rows: &[StoredObservation]) -> Result<(), ControlPlaneError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let rows = rows.to_vec();
+        self.run(None, move |client| {
+            Box::pin(async move {
+                let transaction = client
+                    .transaction()
+                    .await
+                    .map_err(|error| unavailable("begin an observation write", &error))?;
+                // Every key the caller mentions is replaced wholesale. An upsert
+                // alone would leave behind a retained look a later definitive
+                // conclusion discredited, and the next restart would believe it.
+                let mut replaced: BTreeSet<AvailabilityKey> = BTreeSet::new();
+                for row in &rows {
+                    if !replaced.insert(row.key.clone()) {
+                        continue;
+                    }
+                    transaction
+                        .execute(
+                            "DELETE FROM axond_cp_availability_observation \
+                             WHERE tenant_id = $1 AND project_id IS NOT DISTINCT FROM $2 \
+                             AND provider = $3 AND model = $4",
+                            &[
+                                &row.key.scope.tenant.to_string(),
+                                &row.key.scope.project.map(|project| project.to_string()),
+                                &row.key.target.provider.as_str(),
+                                &row.key.target.model.as_str(),
+                            ],
+                        )
+                        .await
+                        .map_err(|error| unavailable("replace discovery evidence", &error))?;
+                }
+                for row in &rows {
+                    // `detail` is dropped at the boundary rather than filtered on
+                    // read: a probe's error body is not evidence, and a column
+                    // holding it would be readable from every backup.
+                    transaction
+                        .execute(
+                            "INSERT INTO axond_cp_availability_observation \
+                             (tenant_id, project_id, provider, model, slot, result, \
+                             completeness, source, observed_at, expires_at, definitive_at) \
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                            &[
+                                &row.key.scope.tenant.to_string(),
+                                &row.key.scope.project.map(|project| project.to_string()),
+                                &row.key.target.provider.as_str(),
+                                &row.key.target.model.as_str(),
+                                &row.slot.as_str(),
+                                &row.observation.result.as_str(),
+                                &row.observation.completeness.as_str(),
+                                &row.observation.source.as_str(),
+                                &row.observation.observed_at,
+                                &row.observation.expires_at,
+                                &row.definitive_at,
+                            ],
+                        )
+                        .await
+                        .map_err(|error| unavailable("record discovery evidence", &error))?;
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| unavailable("commit discovery evidence", &error))?;
+                Ok(())
+            })
+        })
+        .await
+    }
+}
+
+/// One stored look, or a refusal to interpret it.
+///
+/// Vocabulary a release never wrote is corrupt storage rather than a dropped
+/// row: a newer replica's evidence read by an older build is intact state this
+/// build cannot read, and silently reporting the target as unlooked-at would
+/// hide a version skew behind an honest-looking `unknown`.
+fn observation_row(row: &Row) -> Result<StoredObservation, ControlPlaneError> {
+    let tenant: String = row.get(0);
+    let project: Option<String> = row.get(1);
+    let provider: String = row.get(2);
+    let model: String = row.get(3);
+    let slot: String = row.get(4);
+    let result: String = row.get(5);
+    let completeness: String = row.get(6);
+    let source: String = row.get(7);
+
+    let tenant = TenantId::parse(&tenant)
+        .map_err(|error| corrupt_storage(format!("an observation names no tenant: {error}")))?;
+    let project = project
+        .map(|project| ProjectId::parse(&project))
+        .transpose()
+        .map_err(|error| corrupt_storage(format!("an observation names no project: {error}")))?;
+    let target = TargetRef::parse(&provider, &model).map_err(|error| {
+        corrupt_storage(format!("an observation names no target: {error}"))
+    })?;
+    let scope = match project {
+        None => ScopeRef::tenant(tenant),
+        Some(project) => ScopeRef::project(tenant, project),
+    };
+    let key = AvailabilityKey::new(scope, target.clone());
+    let slot = ObservationSlot::parse(&slot)
+        .ok_or_else(|| corrupt_storage(format!("`{slot}` is not an observation slot")))?;
+    let result = availability_store::parse_result(&result)
+        .ok_or_else(|| corrupt_storage(format!("`{result}` is not a discovery result")))?;
+    let completeness = availability_store::parse_completeness(&completeness).ok_or_else(|| {
+        corrupt_storage(format!("`{completeness}` is not a discovery completeness"))
+    })?;
+    let source = availability_store::parse_source(&source)
+        .ok_or_else(|| corrupt_storage(format!("`{source}` is not a discovery source")))?;
+
+    let observation = DiscoveryObservation {
+        scope,
+        target,
+        result,
+        completeness,
+        source,
+        observed_at: row.get(8),
+        expires_at: row.get(9),
+        detail: None,
+    };
+    Ok(StoredObservation {
+        key,
+        slot,
+        observation,
+        definitive_at: row.get(10),
+    })
 }
 
 /// Whether a publication wrote a revision or replayed one.
@@ -2028,6 +2204,7 @@ mod tests {
 
     use super::super::hydration::HydrationLimit;
     use super::*;
+    use crate::availability::discovery::{DiscoveryCompleteness, DiscoveryResult, DiscoverySource};
     use crate::backends::{BackendFailure, FailureCategory};
     use crate::desired_state::fixtures::{
         DESIRED_STATE_RESOURCES, candidate, human, principal_id, project, project_alias,
@@ -5537,6 +5714,255 @@ mod tests {
                 .await
                 .len(),
             2
+        );
+    }
+
+    /// A look, as discovery would file it.
+    fn look(
+        scope: ScopeRef,
+        result: DiscoveryResult,
+        completeness: DiscoveryCompleteness,
+        observed_at: SystemTime,
+    ) -> DiscoveryObservation {
+        DiscoveryObservation::new(
+            scope,
+            observation_target(),
+            result,
+            completeness,
+            DiscoverySource::ProviderListing,
+            observed_at,
+        )
+    }
+
+    fn observation_target() -> TargetRef {
+        TargetRef::parse("openai", "gpt-4o-mini").expect("a well-formed target")
+    }
+
+    fn instant(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    /// Evidence outlives the process that took it, and the probe's own words do
+    /// not: a restart may know that a listing found the model, and must not carry
+    /// the error body a failed one collected.
+    #[tokio::test]
+    async fn discovery_evidence_survives_a_restart_without_the_probes_own_words() {
+        let Some((store, dsn, schema)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(ExpectedRevision::Empty, "state", state()))
+            .await
+            .expect("a tenant and a project exist to own evidence");
+
+        let scope = ScopeRef::project(tenant_id(1), project_id(2));
+        let key = AvailabilityKey::new(scope, observation_target());
+        let current = look(
+            scope,
+            DiscoveryResult::Indeterminate,
+            DiscoveryCompleteness::Partial,
+            instant(200),
+        )
+        .detailed("HTTP 500 from https://api.example.test/v1/models?key=sk-live-secret");
+        let retained = look(
+            scope,
+            DiscoveryResult::Present,
+            DiscoveryCompleteness::Complete,
+            instant(100),
+        )
+        .expiring_at(instant(900));
+        store
+            .save(&[
+                StoredObservation {
+                    key: key.clone(),
+                    slot: ObservationSlot::Current,
+                    observation: current.clone(),
+                    definitive_at: Some(instant(100)),
+                },
+                StoredObservation {
+                    key: key.clone(),
+                    slot: ObservationSlot::LastKnownGood,
+                    observation: retained.clone(),
+                    definitive_at: Some(instant(100)),
+                },
+            ])
+            .await
+            .expect("evidence is written");
+
+        // A second replica, as a restart is.
+        let restarted = second_store(&dsn, &schema).await;
+        let read = restarted.load(None).await.expect("evidence is read back");
+        assert_eq!(read.len(), 2, "both slots survive");
+        assert_eq!(read[0].slot, ObservationSlot::Current);
+        assert_eq!(read[1].slot, ObservationSlot::LastKnownGood);
+        assert_eq!(read[0].definitive_at, Some(instant(100)));
+        assert!(
+            read.iter().all(|row| row.observation.detail.is_none()),
+            "a probe's detail must not be durable"
+        );
+        assert!(
+            read[0].observation.is_same_look(&current),
+            "the current look is the same evidence it was written as"
+        );
+        assert!(read[1].observation.is_same_look(&retained));
+        assert_eq!(read[1].observation.expires_at, Some(instant(900)));
+        assert_eq!(
+            store
+                .load(Some(ScopeRef::tenant(tenant_id(1))))
+                .await
+                .expect("read")
+                .len(),
+            0,
+            "a project's evidence is not the tenant's"
+        );
+    }
+
+    /// A record is replaced whole, so a retained look a later conclusion
+    /// discredited does not sit in storage waiting for the next restart.
+    #[tokio::test]
+    async fn saving_a_record_replaces_the_evidence_it_held() {
+        let Some((store, _dsn, _schema)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(ExpectedRevision::Empty, "state", state()))
+            .await
+            .expect("a tenant exists to own evidence");
+
+        let scope = ScopeRef::tenant(tenant_id(1));
+        let key = AvailabilityKey::new(scope, observation_target());
+        let positive = look(
+            scope,
+            DiscoveryResult::Present,
+            DiscoveryCompleteness::Complete,
+            instant(100),
+        );
+        store
+            .save(&[
+                StoredObservation {
+                    key: key.clone(),
+                    slot: ObservationSlot::Current,
+                    observation: positive.clone(),
+                    definitive_at: Some(instant(100)),
+                },
+                StoredObservation {
+                    key: key.clone(),
+                    slot: ObservationSlot::LastKnownGood,
+                    observation: positive,
+                    definitive_at: Some(instant(100)),
+                },
+            ])
+            .await
+            .expect("write");
+
+        let dropped = look(
+            scope,
+            DiscoveryResult::Absent,
+            DiscoveryCompleteness::Complete,
+            instant(300),
+        );
+        store
+            .save(&[StoredObservation {
+                key: key.clone(),
+                slot: ObservationSlot::Current,
+                observation: dropped.clone(),
+                definitive_at: Some(instant(300)),
+            }])
+            .await
+            .expect("write the conclusion");
+
+        let read = store.load(Some(scope)).await.expect("read");
+        assert_eq!(read.len(), 1, "the discredited fallback is gone");
+        assert_eq!(read[0].slot, ObservationSlot::Current);
+        assert!(read[0].observation.is_same_look(&dropped));
+        assert_eq!(read[0].definitive_at, Some(instant(300)));
+    }
+
+    /// Availability is entitlement, and entitlement is a tenant's: which models
+    /// another tenant's credentials can reach is exactly the enumeration the
+    /// row-level policies exist to prevent.
+    #[tokio::test]
+    async fn one_tenants_discovery_evidence_is_not_another_tenants() {
+        let Some((store, dsn, schema)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "two tenants",
+                two_tenant_directory_state(),
+            ))
+            .await
+            .expect("two tenants publish");
+
+        for tenant in [tenant_id(1), tenant_id(11)] {
+            let scope = ScopeRef::tenant(tenant);
+            store
+                .save(&[StoredObservation {
+                    key: AvailabilityKey::new(scope, observation_target()),
+                    slot: ObservationSlot::Current,
+                    observation: look(
+                        scope,
+                        DiscoveryResult::Present,
+                        DiscoveryCompleteness::Complete,
+                        instant(100),
+                    ),
+                    definitive_at: Some(instant(100)),
+                }])
+                .await
+                .expect("write");
+        }
+
+        let mine = store
+            .load(Some(ScopeRef::tenant(tenant_id(1))))
+            .await
+            .expect("read");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].key.scope.tenant, tenant_id(1));
+        assert_eq!(store.load(None).await.expect("read").len(), 2);
+
+        // And behind the service layer, the same wall the rest of the tenant-owned
+        // tables are behind: a session pinned to one tenant, asking for everything.
+        let role = format!("{schema}_availability_reader");
+        store
+            .attempt(&format!(
+                "CREATE ROLE {role} LOGIN PASSWORD 'reader'; \
+                 GRANT USAGE ON SCHEMA {schema} TO {role}; \
+                 GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}"
+            ))
+            .await
+            .expect("create the reading role");
+        let mut config: Config = dsn.parse().expect("test dsn");
+        config.user(&role).password("reader");
+        config.connect_timeout(Duration::from_secs(5));
+        let (client, connection) = config
+            .connect(crate::usage::tls_connector())
+            .await
+            .expect("connect as the reading role");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "SET search_path TO {schema}; SET axond.tenant_id = '{}'",
+                tenant_id(11)
+            ))
+            .await
+            .expect("pin the session to one tenant");
+        let rows: Vec<String> = client
+            .query(
+                "SELECT tenant_id FROM axond_cp_availability_observation",
+                &[],
+            )
+            .await
+            .expect("read as the pinned session")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![tenant_id(11).to_string()],
+            "the observation table leaked another tenant's evidence"
         );
     }
 

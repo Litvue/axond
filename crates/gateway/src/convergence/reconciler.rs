@@ -219,6 +219,7 @@ pub const REVISION_REASONS: &[&str] = &[
     "withdrawn",
     "ungoverned",
     "invalid_policy",
+    "availability",
 ];
 
 /// The reason label for a store failure. Exhaustive, so a new

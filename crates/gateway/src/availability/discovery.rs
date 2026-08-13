@@ -249,6 +249,19 @@ impl DiscoveryObservation {
         self
     }
 
+    /// The same look with its operator-facing detail dropped.
+    ///
+    /// What crosses a storage or process boundary: `detail` is whatever a probe
+    /// collected, so it lives for the lifetime of the process that observed it
+    /// and is not written anywhere a backup or a support session can read it.
+    /// The look is unchanged as *evidence* — [`is_same_look`](Self::is_same_look)
+    /// still matches the original.
+    #[must_use]
+    pub fn without_detail(mut self) -> Self {
+        self.detail = None;
+        self
+    }
+
     /// The key this observation is filed under.
     pub fn key(&self) -> AvailabilityKey {
         AvailabilityKey::new(self.scope, self.target.clone())

@@ -622,6 +622,7 @@ async fn serve() -> anyhow::Result<()> {
         observability,
     )
     .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
+
     tracing::info!(
         gateway_keys = state.config().inbound_key_count(),
         gateway_verifiers = state.config().token_verifier_count(),
@@ -638,6 +639,11 @@ async fn serve() -> anyhow::Result<()> {
     // Kept past the router so the sinks can be flushed after the last request:
     // shutdown is the one point where durability outranks the request path.
     let resources = state.clone();
+    // Routed after the inference state exists, because an availability read is
+    // answered from the snapshot this replica is serving (#148), while the store
+    // behind administration was opened before it so the diagnostic paces against
+    // the connection administrative requests take.
+    let administration = admin.router(Some(Arc::new(state.clone())));
     // A replica that cannot compile a revision into a snapshot still administers
     // one: the administrative surface is mounted either way, and only inference
     // is replaced by its refusal. The replica diagnostic is mounted either way
@@ -650,7 +656,7 @@ async fn serve() -> anyhow::Result<()> {
         }
     };
     let app = inference
-        .merge(admin.router)
+        .merge(administration)
         .layer(telemetry::TelemetryLayer);
 
     tracing::info!(

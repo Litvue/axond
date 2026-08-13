@@ -25,7 +25,14 @@
 //!    version the revision's typed credentials pin, through the deployment's
 //!    `SecretStore`. This is the only step that awaits, and the only place
 //!    durable material enters the process.
-//! 5. **Snapshot build.** [`ConfigSnapshot::build_with`] resolves credentials,
+//! 5. **Availability.** When the process holds [`AvailabilityEvidence`], the
+//!    revision's catalogue pins, enablements, credentials, and policy are
+//!    projected into an availability view over the discovery evidence the replica
+//!    has already accumulated (#148), and the result rides on the snapshot.
+//!    Derived, never desired state: it cannot add a model, a namespace, or a
+//!    credential to what the revision declares, and a deployment that derives
+//!    none publishes snapshots exactly as before.
+//! 6. **Snapshot build.** [`ConfigSnapshot::build_with`] resolves credentials,
 //!    gateway keys, verifiers, and minting material, and takes ownership of the
 //!    material step 4 unwrapped — so every secret a candidate needs is resolved
 //!    *here*, off the request path, before anything is published, and is held for
@@ -42,6 +49,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 
+use crate::availability::{AvailabilityEvidence, AvailabilityProjectionError, CredentialReadiness};
 use crate::config::{Config, ConfigError};
 use crate::desired_state::pricing::{
     EffectiveInstant, InvalidInstant, PriceBooks, PricingError, PricingSnapshot,
@@ -166,6 +174,20 @@ pub enum CompileError {
         #[source]
         source: ActivationRefusal,
     },
+    /// The revision's own bodies could not be read into an availability view.
+    ///
+    /// A refusal rather than a snapshot carrying an empty view: these are bodies
+    /// the projection already read, so a disagreement between the two stages means
+    /// this build understands the revision less well than it just claimed to, and
+    /// publishing would answer "which models may this tenant call" from a view
+    /// nobody derived. Not the arm a discovery outage takes — no provider is
+    /// reached here, and absent evidence is a verdict rather than an error.
+    #[error("revision {revision} could not be projected into an availability view: {source}")]
+    Availability {
+        revision: RevisionId,
+        #[source]
+        source: AvailabilityProjectionError,
+    },
 }
 
 impl CompileError {
@@ -190,6 +212,7 @@ impl CompileError {
         "withdrawn",
         "ungoverned",
         "invalid_policy",
+        "availability",
     ];
 
     /// The revision that was refused.
@@ -200,7 +223,8 @@ impl CompileError {
             | Self::Pricing { revision, .. }
             | Self::Clock { revision, .. }
             | Self::Snapshot { revision, .. }
-            | Self::Activation { revision, .. } => *revision,
+            | Self::Activation { revision, .. }
+            | Self::Availability { revision, .. } => *revision,
         }
     }
 
@@ -221,6 +245,7 @@ impl CompileError {
             Self::Clock { .. } => "clock",
             Self::Snapshot { .. } => "snapshot",
             Self::Activation { source, .. } => source.reason(),
+            Self::Availability { .. } => "availability",
         }
     }
 }
@@ -262,6 +287,13 @@ pub struct RevisionCompiler<P> {
     /// thing that holds plaintext is not the thing that can change what a
     /// credential points at.
     secrets: Arc<SecretMaterialization>,
+    /// This replica's availability state, or `None` when the process derives
+    /// none.
+    ///
+    /// Held by the compiler rather than by a snapshot because it outlives
+    /// snapshots: the discovery evidence accumulated under one revision is
+    /// exactly what the next revision must not cost.
+    availability: Option<Arc<AvailabilityEvidence>>,
     /// The clock effective-dated pricing is resolved against.
     ///
     /// Injected as a function rather than read inline so a test can compile the
@@ -294,8 +326,17 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
             env,
             projection,
             secrets,
+            availability: None,
             clock: SystemTime::now,
         }
+    }
+
+    /// The same compiler, deriving an availability view onto every snapshot it
+    /// publishes.
+    #[must_use]
+    pub fn with_availability(mut self, availability: Arc<AvailabilityEvidence>) -> Self {
+        self.availability = Some(availability);
+        self
     }
 
     /// The same compiler, resolving pricing against a fixed clock.
@@ -375,16 +416,30 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
                 revision: id,
                 source,
             })?;
+        // Read before the set is handed to the snapshot: "this credential's exact
+        // version is in hand" is what separates a credential a tenant holds from
+        // one it can use, and it is a set of references, never material.
+        let readiness = CredentialReadiness::of(&secrets);
         let snapshot = ConfigSnapshot::build_with(config, &self.env, generation, secrets).map_err(
             |source| CompileError::Snapshot {
                 revision: id,
                 source,
             },
         )?;
-        Ok(match pricing {
+        let snapshot = match pricing {
             None => snapshot,
             Some(pricing) => snapshot.with_pricing(pricing),
-        })
+        };
+        let Some(evidence) = self.availability.as_ref() else {
+            return Ok(snapshot);
+        };
+        let projected = evidence
+            .derive(revision.state(), &readiness)
+            .map_err(|source| CompileError::Availability {
+                revision: id,
+                source,
+            })?;
+        Ok(snapshot.with_availability(Arc::new(projected.into_index())))
     }
 }
 

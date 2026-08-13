@@ -244,6 +244,15 @@ impl AvailabilityIndex {
         self.records.get(key)
     }
 
+    /// Every record, in key order, as filed.
+    ///
+    /// The dimensions rather than verdicts, for the two callers that need the
+    /// facts themselves: an operator-facing dump, and the writer that persists
+    /// discovery evidence between restarts.
+    pub fn records(&self) -> impl Iterator<Item = (&AvailabilityKey, &AvailabilityRecord)> {
+        self.records.iter()
+    }
+
     /// The availability of one target in one scope at `now`.
     ///
     /// Walks the precedence ladder in the module docs. A key the index does not
@@ -254,6 +263,35 @@ impl AvailabilityIndex {
             return Availability::no_record();
         };
         Self::evaluate_record(record, now)
+    }
+
+    /// The availability of one target at `now`, with this replica's own health
+    /// for it overlaid.
+    ///
+    /// Runtime health is the one dimension a *derived* index cannot carry
+    /// honestly: circuits belong to the replica and to the snapshot it is
+    /// serving, so a record built when a revision compiled would report the
+    /// health of a breaker that had not yet attempted anything. The overlay is
+    /// applied here instead, at the instant of the question, and it can only
+    /// lower a verdict — the ladder's runtime rungs sit below every authority, so
+    /// a replica's own trouble never reports a target as *more* available than
+    /// the deployment's facts make it.
+    pub fn evaluate_with(
+        &self,
+        key: &AvailabilityKey,
+        now: SystemTime,
+        health: RuntimeHealth,
+    ) -> Availability {
+        let Some(record) = self.records.get(key) else {
+            return Availability::no_record();
+        };
+        Self::evaluate_record(
+            &AvailabilityRecord {
+                runtime: health,
+                ..record.clone()
+            },
+            now,
+        )
     }
 
     fn evaluate_record(record: &AvailabilityRecord, now: SystemTime) -> Availability {
