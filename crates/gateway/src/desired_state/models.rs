@@ -98,7 +98,9 @@
 //! An *alias* row whose body declares no `schema` at all is a row written before
 //! these bodies were typed. It is skipped rather than refused, because hydration
 //! runs these rules and refusing such a row would stop an existing revision from
-//! loading on upgrade.
+//! loading on upgrade. The accommodation is that one shape only: a row that
+//! carries the key is read strictly, so a `schema` that is not text is a refusal
+//! rather than a row that skips the alias rules unreported.
 //!
 //! An *enablement* has no such history — no release ever wrote one — so an
 //! untyped enablement body is refused rather than skipped. Skipping it would be
@@ -1665,9 +1667,11 @@ impl Models {
     /// once per scope, and that every alias resolves — in order, within its own
     /// reach, and in one wire family.
     ///
-    /// An *alias* row whose body declares no `schema` is skipped rather than
-    /// refused, because such rows predate this slice; an untyped *enablement* is
-    /// refused, because none was ever published. See the module documentation.
+    /// An *alias* row whose body carries no `schema` key at all is skipped rather
+    /// than refused, because such rows predate this slice; a row that carries the
+    /// key is read strictly however its value is spelled, and an untyped
+    /// *enablement* is refused, because none was ever published. See the module
+    /// documentation.
     pub fn of(state: &DesiredState) -> Result<Self, ModelError> {
         let mut models = Self::default();
         for resource in state.resources() {
@@ -1683,7 +1687,7 @@ impl Models {
                         },
                     );
                 }
-                ResourceKind::Alias if is_typed(resource) => {
+                ResourceKind::Alias if !predates_this_slice(resource) => {
                     let body = ModelAliasBody::read(resource)?;
                     models.aliases.insert(
                         body.alias(),
@@ -1836,15 +1840,22 @@ impl Models {
     }
 }
 
-/// Whether an alias body declares a schema at all, and is therefore a body this
-/// slice reads strictly rather than a row written before it.
-fn is_typed(resource: &ResourceVersion) -> bool {
+/// Whether an alias row is one a build predating this slice wrote, and is
+/// therefore skipped rather than read: a body carrying no `schema` key, of any
+/// shape a build before these bodies were typed could have written.
+///
+/// A body that carries a `schema` key at all is this slice's to read, whatever
+/// that value turns out to be: an integer or a list there is damage, and the
+/// shared reader refuses it by naming the field, which is the refusal an operator
+/// needs. Treating an unreadable marker as a row from before this slice would let
+/// a damaged alias skip the scope, target, reach, and wire-family rules with
+/// nothing reported, which for an entitlement body is worse than refusing the
+/// revision.
+fn predates_this_slice(resource: &ResourceVersion) -> bool {
     let ResourceBody::Inline(CanonicalValue::Map(fields)) = &resource.body else {
-        return false;
+        return true;
     };
-    fields
-        .iter()
-        .any(|(field, value)| field == SCHEMA_FIELD && matches!(value, CanonicalValue::String(_)))
+    !fields.iter().any(|(field, _)| field == SCHEMA_FIELD)
 }
 
 /// The snapshot an enablement pins must be a snapshot this revision carries, as a
@@ -2784,6 +2795,57 @@ mod tests {
         let models = Models::of(&state).unwrap();
         assert_eq!(models.aliases().len(), 0);
         assert_eq!(models.enablements().len(), 0);
+    }
+
+    #[test]
+    fn an_alias_whose_schema_marker_is_damaged_is_refused_rather_than_skipped() {
+        // The upgrade accommodation is a body with no `schema` key at all. A key
+        // that is present but is not text is damage, so reading it as a row
+        // predating this slice would let it skip the scope, target, reach, and
+        // wire-family rules with nothing reported.
+        let alias = typed_alias(
+            &tenant_id(1),
+            &project_id(2),
+            32,
+            "fast",
+            &[reference_of(30)],
+        );
+        for marker in [
+            CanonicalValue::integer(1),
+            CanonicalValue::List(vec![CanonicalValue::string(MODEL_ALIAS_SCHEMA)]),
+            CanonicalValue::map([(SCHEMA_FIELD, CanonicalValue::string(MODEL_ALIAS_SCHEMA))]),
+        ] {
+            let damaged = with_fields(&alias, |fields| {
+                set(fields, SCHEMA_FIELD, marker.clone());
+            });
+            let state = state_replacing(damaged.clone());
+
+            let error = Models::of(&state).expect_err("a damaged schema marker is refused");
+            assert_eq!(
+                error,
+                ModelError::FieldType {
+                    reference: damaged.reference,
+                    field: SCHEMA_FIELD
+                }
+            );
+            assert!(
+                error.is_incompatible(),
+                "a marker this build cannot read is skew, not corruption"
+            );
+            let error = state
+                .validate()
+                .expect_err("a revision carrying a damaged alias is not valid");
+            assert!(
+                matches!(
+                    model_error(&error),
+                    Some(ModelError::FieldType {
+                        field: SCHEMA_FIELD,
+                        ..
+                    })
+                ),
+                "{error}"
+            );
+        }
     }
 
     #[test]

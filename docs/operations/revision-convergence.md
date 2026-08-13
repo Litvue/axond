@@ -154,7 +154,10 @@ Five rules hold for every body schema, present and future:
   `schema` field is *skipped* by the model rules instead of refused, because
   untyped alias rows exist in revisions already stored and refusing one would
   stop an existing revision from hydrating on upgrade. Such a row is neither
-  validated nor refused — republish it from this build to have it checked. A
+  validated nor refused — republish it from this build to have it checked. The
+  exception is exactly that shape: an alias whose `schema` field is *present* is
+  read strictly, so a marker that is not text is `incompatible` rather than a row
+  that quietly skips the alias rules. A
   model *enablement* has no such history, so an untyped enablement is
   `incompatible` like every other untyped body
   ([ADR 0037](../adr/0037-model-enablement-and-alias-contracts.md)).
