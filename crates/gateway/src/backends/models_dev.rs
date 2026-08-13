@@ -35,7 +35,7 @@
 //!
 //! The decisions this module rests on — the observed-rate unit, the three
 //! identities, and the compiled-in seed — are recorded in
-//! [ADR 0042](https://github.com/Litvue/axond/blob/main/docs/adr/0042-catalogue-source-imports.md).
+//! [ADR 0043](https://github.com/Litvue/axond/blob/main/docs/adr/0043-catalogue-source-imports.md).
 //!
 //! # Strict where a mistake would be silent
 //!
