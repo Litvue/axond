@@ -21,10 +21,15 @@ deployment unit. Read the release's `CHANGELOG.md` entry before every rollout.
 4. Apply additive Postgres usage migrations before deploying writers, including
    `ops/postgres/usage_outbox_v1.sql` before any replica that enables
    `[usage_journal] backend = "postgres"`.
-5. Complete any stop-the-fleet Redis/Postgres budget migration before starting
+5. Apply `ops/postgres/catalog_v1.sql` before any replica that retains imported
+   catalogues. No release configures a catalogue store yet, so this is inert
+   until the slice that wires one exists; the DDL is additive and idempotent,
+   and applying it early costs two empty tables
+   ([ADR 0050](../adr/0050-durable-catalogue-snapshots-and-refresh-orchestration.md)).
+6. Complete any stop-the-fleet Redis/Postgres budget migration before starting
    namespace-cap-aware replicas.
-6. Verify ingress streaming behavior and client retries.
-7. Retain the old artifact and old configuration for rollback where compatible.
+7. Verify ingress streaming behavior and client retries.
+8. Retain the old artifact and old configuration for rollback where compatible.
 
 In stateful mode the new binary owns the control-plane half of that list. Run
 these from the new artifact, with the fleet still on the old one:

@@ -348,10 +348,13 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
     /// reading as healthy on content nobody can reproduce is the failure this
     /// check exists for.
     pub async fn restore(&mut self, now: SystemTime) -> Result<Restored, RefreshError> {
-        let stored = self.store.load().await.map_err(|error| {
-            self.catalogue.record_refusal(error.refusal());
-            RefreshError::Store(error)
-        })?;
+        let stored = match self.store.load().await {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.count_refusal(error.refusal(), now).await;
+                return Err(RefreshError::Store(error));
+            }
+        };
         if let Some(active) = stored.active {
             let confirmed_at = active.source.fetched_at;
             let snapshot = match hydrate(&active) {
@@ -367,10 +370,7 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
                         stored.consecutive_refusals,
                         stored.last_refusal.map(Refusal::new),
                     );
-                    let refusal = error.refusal();
-                    self.catalogue.record_refusal(refusal.clone());
-                    self.record_refusal_durably(refusal.reason(), now).await;
-                    self.report_state(now);
+                    self.count_refusal(error.refusal(), now).await;
                     return Err(RefreshError::Stored(error));
                 }
             };
@@ -400,10 +400,10 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
             source: snapshot.source.clone(),
             payload: RawPayload::new(SEED_PAYLOAD.as_bytes()),
         };
-        self.store.activate(&import, now).await.map_err(|error| {
-            self.catalogue.record_refusal(error.refusal());
-            RefreshError::Store(error)
-        })?;
+        if let Err(error) = self.store.activate(&import, now).await {
+            self.count_refusal(error.refusal(), now).await;
+            return Err(RefreshError::Store(error));
+        }
         // Aged to now, not to the day the excerpt was cut: age is how long ago
         // this process confirmed the content, and a seed imported this minute is
         // a minute old however old its fixture says it is.
@@ -422,11 +422,7 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
             };
         }
         let asked_with = self.catalogue.validators().cloned();
-        let answer = self.ask(asked_with.as_ref()).await;
-        let answer = match answer {
-            Ok(refresh) => self.retain(refresh, asked_with.as_ref(), now).await,
-            Err(error) => Err(error),
-        };
+        let answer = self.attempt(asked_with.as_ref(), now).await;
         let (answer, retention) = match answer {
             Ok((refresh, retention)) => (Ok(refresh), retention),
             Err(error) => (Err(error), None),
@@ -462,17 +458,33 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
         }
     }
 
-    /// Ask the source, under the schedule's ceiling.
-    async fn ask(
-        &self,
+    /// Ask the source and retain what it answered, under the schedule's
+    /// ceiling.
+    ///
+    /// One ceiling over both halves, because either can hang and the failure is
+    /// the same one: a background task that never produces an outcome stops
+    /// counting refusals and stops reporting staleness, which is worse than the
+    /// refused refresh a bounded attempt costs. A store is free to impose its
+    /// own ceiling — [`PostgresCatalogStore`] does — but the refresher does not
+    /// depend on every implementation having remembered to.
+    ///
+    /// [`PostgresCatalogStore`]: super::catalog_store::postgres::PostgresCatalogStore
+    async fn attempt(
+        &mut self,
         asked_with: Option<&SourceValidators>,
-    ) -> Result<CatalogRefresh, RefreshError> {
-        tokio::time::timeout(self.schedule.timeout, self.source.refresh(asked_with))
-            .await
-            .map_err(|_| RefreshError::TimedOut {
-                timeout: self.schedule.timeout,
-            })?
-            .map_err(RefreshError::Source)
+        now: SystemTime,
+    ) -> Result<(CatalogRefresh, Option<Retention>), RefreshError> {
+        let timeout = self.schedule.timeout;
+        tokio::time::timeout(timeout, async {
+            let refresh = self
+                .source
+                .refresh(asked_with)
+                .await
+                .map_err(RefreshError::Source)?;
+            self.retain(refresh, asked_with, now).await
+        })
+        .await
+        .map_err(|_| RefreshError::TimedOut { timeout })?
     }
 
     /// Write what the source answered, before any of it becomes active.
@@ -525,11 +537,9 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
         refusal: Refusal,
         now: SystemTime,
     ) -> RefreshOutcome {
-        crate::telemetry::metrics::record_catalog_refusal(refusal.reason());
-        self.record_refusal_durably(refusal.reason(), now).await;
+        self.publish_refusal(refusal.reason(), now).await;
         let retry_in = self.backoff.fail();
         self.next_due = now + retry_in;
-        self.report_state(now);
         RefreshOutcome::Refused {
             trigger,
             refusal,
@@ -538,15 +548,51 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
         }
     }
 
-    /// Count a refusal in the store, best effort.
+    /// Count a refusal everywhere it is counted: in the holder, in the metric
+    /// an alert reads, in the store, and in the state gauges.
+    ///
+    /// Boot refusals go through this too. A deployment whose store is
+    /// unreachable, or whose stored catalogue no longer rehydrates, is refusing
+    /// exactly as a deployment whose upstream is down is refusing; a refusal
+    /// that moved the counter without moving the metric would be invisible to
+    /// an alert keyed on the metric, and precisely at boot, where the previous
+    /// process's gauges are the ones still published.
+    async fn count_refusal(&mut self, refusal: Refusal, now: SystemTime) {
+        self.catalogue.record_refusal(refusal.clone());
+        self.publish_refusal(refusal.reason(), now).await;
+    }
+
+    /// Everything a counted refusal owes the outside: the metric, the store,
+    /// and the state gauges. Separate from the holder's count because a
+    /// refreshed refusal is already counted by
+    /// [`LastKnownGoodCatalog::record_refresh`], and counting it twice would
+    /// make one outage read as two.
+    async fn publish_refusal(&self, reason: RefusalReason, now: SystemTime) {
+        crate::telemetry::metrics::record_catalog_refusal(reason);
+        self.record_refusal_durably(reason, now).await;
+        self.report_state(now);
+    }
+
+    /// Count a refusal in the store, best effort and bounded.
     ///
     /// A store that cannot record the refusal has already cost this refresh —
     /// the in-process count moved, and the report an operator reads is
     /// projected from it — so failing the refresh a second time over the
     /// bookkeeping would only replace one refusal with a less informative one.
+    /// The same reasoning bounds it: bookkeeping that hangs must not be what
+    /// stops a refresher from ever producing an outcome.
     async fn record_refusal_durably(&self, reason: RefusalReason, now: SystemTime) {
-        if let Err(error) = self.store.refuse(reason, now).await {
-            tracing::warn!(%error, "a refused catalogue refresh could not be counted durably");
+        match tokio::time::timeout(self.schedule.timeout, self.store.refuse(reason, now)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "a refused catalogue refresh could not be counted durably");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?self.schedule.timeout,
+                    "a refused catalogue refresh could not be counted durably in time",
+                );
+            }
         }
     }
 
@@ -736,6 +782,58 @@ mod tests {
         ) -> Result<(), CatalogStoreError> {
             self.refusals.lock().expect("lock").push(reason);
             Ok(())
+        }
+    }
+
+    /// A store whose writes never return, to prove the ceiling covers the half
+    /// of an attempt the upstream is not responsible for.
+    #[derive(Debug, Default)]
+    struct HangingStore;
+
+    #[async_trait]
+    impl CatalogStore for HangingStore {
+        fn name(&self) -> &'static str {
+            "hanging"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::NONE
+        }
+
+        async fn load(&self) -> Result<StoredCatalogState, CatalogStoreError> {
+            Ok(StoredCatalogState::default())
+        }
+
+        async fn retained(
+            &self,
+            _content_id: CatalogContentId,
+        ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
+            Ok(None)
+        }
+
+        async fn activate(
+            &self,
+            _import: &RetainedCatalog,
+            _activated_at: SystemTime,
+        ) -> Result<Retention, CatalogStoreError> {
+            std::future::pending().await
+        }
+
+        async fn confirm(
+            &self,
+            _content_id: CatalogContentId,
+            _validators: &SourceValidators,
+            _confirmed_at: SystemTime,
+        ) -> Result<bool, CatalogStoreError> {
+            std::future::pending().await
+        }
+
+        async fn refuse(
+            &self,
+            _reason: RefusalReason,
+            _refused_at: SystemTime,
+        ) -> Result<(), CatalogStoreError> {
+            std::future::pending().await
         }
     }
 
@@ -1010,6 +1108,25 @@ mod tests {
             RefusalReason::Unreachable,
             "an upstream that did not answer in time is an upstream that did not answer"
         );
+    }
+
+    /// The ceiling is documented as covering fetch and retention together, and
+    /// a store that hangs is the more dangerous half: the refresher would stop
+    /// producing outcomes altogether, so nothing would count a refusal or
+    /// report the staleness that followed.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_does_not_answer_costs_one_refused_refresh_too() {
+        let source = ScriptedSource::new([Ok(updated(CATALOGUE, "\"one\""))]);
+        let mut refresher = refresher(source, HangingStore);
+        refresher.restore(at(10)).await.expect("restore");
+
+        let outcome = refresher.refresh(RefreshTrigger::Scheduled, at(20)).await;
+        let RefreshOutcome::Refused { refusal, .. } = outcome else {
+            panic!("a hanging store is refused rather than waited on: {outcome:?}");
+        };
+        assert_eq!(refusal.reason(), RefusalReason::Unreachable);
+        assert!(refresher.active().is_none());
+        assert_eq!(refresher.report(at(20)).consecutive_refusals, 1);
     }
 
     /// The retry sequence is a pure function of the failure count, so it is

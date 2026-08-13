@@ -218,7 +218,7 @@ impl PostgresCatalogStore {
             *guard = Some(
                 self.connect_client()
                     .await
-                    .map_err(|error| unavailable("reconnect", &error))?,
+                    .map_err(|error| outage("reconnect", &error))?,
             );
         }
         let result = tokio::time::timeout(
@@ -266,7 +266,7 @@ impl CatalogStore for PostgresCatalogStore {
                         &[],
                     )
                     .await
-                    .map_err(|error| unavailable("read the active catalogue", &error))?
+                    .map_err(|error| statement_failure("read the active catalogue", &error))?
                 else {
                     return Ok(StoredCatalogState::default());
                 };
@@ -295,7 +295,7 @@ impl CatalogStore for PostgresCatalogStore {
                         &[&content_id.checksum().to_string()],
                     )
                     .await
-                    .map_err(|error| unavailable("read the active snapshot", &error))?
+                    .map_err(|error| statement_failure("read the active snapshot", &error))?
                     .ok_or_else(|| {
                         CatalogStoreError::corrupt(
                             BACKEND,
@@ -340,7 +340,7 @@ impl CatalogStore for PostgresCatalogStore {
                         &[&content_id.checksum().to_string()],
                     )
                     .await
-                    .map_err(|error| unavailable("read a retained catalogue", &error))?;
+                    .map_err(|error| statement_failure("read a retained catalogue", &error))?;
                 row.as_ref().map(decode_snapshot).transpose()
             })
         })
@@ -388,7 +388,7 @@ impl CatalogStore for PostgresCatalogStore {
                 let transaction = client
                     .transaction()
                     .await
-                    .map_err(|error| unavailable("begin an activation", &error))?;
+                    .map_err(|error| statement_failure("begin an activation", &error))?;
                 // `DO NOTHING` is the idempotence: the same catalogue imported
                 // twice is one row, and the second import is told so.
                 let inserted = transaction
@@ -411,7 +411,7 @@ impl CatalogStore for PostgresCatalogStore {
                         ],
                     )
                     .await
-                    .map_err(|error| unavailable("retain a catalogue snapshot", &error))?;
+                    .map_err(|error| statement_failure("retain a catalogue snapshot", &error))?;
                 // Re-activating the content already active carries the stated
                 // validators over the held ones, exactly as `confirm` does: a
                 // full answer whose bytes are the active content is the `304`
@@ -436,11 +436,11 @@ impl CatalogStore for PostgresCatalogStore {
                         &[&content_id, &etag, &last_modified, &activated_at],
                     )
                     .await
-                    .map_err(|error| unavailable("activate a catalogue snapshot", &error))?;
+                    .map_err(|error| statement_failure("activate a catalogue snapshot", &error))?;
                 transaction
                     .commit()
                     .await
-                    .map_err(|error| unavailable("commit an activation", &error))?;
+                    .map_err(|error| statement_failure("commit an activation", &error))?;
                 Ok(if inserted == 1 {
                     Retention::Retained
                 } else {
@@ -480,7 +480,7 @@ impl CatalogStore for PostgresCatalogStore {
                         ],
                     )
                     .await
-                    .map_err(|error| unavailable("confirm the active catalogue", &error))?;
+                    .map_err(|error| statement_failure("confirm the active catalogue", &error))?;
                 Ok(updated == 1)
             })
         })
@@ -508,7 +508,7 @@ impl CatalogStore for PostgresCatalogStore {
                         &[&reason.as_str(), &refused_at],
                     )
                     .await
-                    .map_err(|error| unavailable("record a refused refresh", &error))?;
+                    .map_err(|error| statement_failure("record a refused refresh", &error))?;
                 Ok(())
             })
         })
@@ -621,11 +621,34 @@ fn boot_failure(
                 remedy()
             ),
         ),
-        None => unavailable(operation, error),
+        None => outage(operation, error),
     }
 }
 
-fn unavailable(operation: &str, error: &tokio_postgres::Error) -> CatalogStoreError {
+/// A statement failure while doing `operation`, split by who has to act.
+///
+/// Boot proves only that the two tables can be read, so a role granted
+/// `SELECT` but not `INSERT`, or a table dropped after boot, first shows up
+/// here. Reported as an outage it would be retried until someone read the log:
+/// a privilege is not restored by waiting, and the connection would be
+/// discarded and reopened on every attempt. The same `SQLSTATE`s that name an
+/// operator at boot name one at runtime.
+fn statement_failure(operation: &str, error: &tokio_postgres::Error) -> CatalogStoreError {
+    match error.code().filter(|code| operator_must_act(code)) {
+        Some(code) => CatalogStoreError::denied(
+            BACKEND,
+            format!(
+                "could not {operation} ({}: {error}). Apply ops/postgres/catalog_v1.sql and grant \
+                 the gateway role SELECT, INSERT and UPDATE on axond_catalog_snapshot and \
+                 axond_catalog_active",
+                code.code(),
+            ),
+        ),
+        None => outage(operation, error),
+    }
+}
+
+fn outage(operation: &str, error: &tokio_postgres::Error) -> CatalogStoreError {
     CatalogStoreError::unavailable(BACKEND, format!("{operation} failed: {error}"))
 }
 
@@ -716,6 +739,41 @@ mod tests {
             .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
             .await
             .expect("drop the test schema");
+    }
+
+    /// Boot proves only that the tables can be read, so a table dropped — or a
+    /// privilege revoked — after boot first shows up on a write. Reported as an
+    /// outage it would be retried until a human read the log; waiting does not
+    /// restore a table.
+    #[tokio::test]
+    async fn a_table_that_disappeared_after_boot_names_the_operator_rather_than_an_outage() {
+        let Some((store, schema)) = store().await else {
+            return;
+        };
+        let dsn = postgres_dsn().expect("a store implies a dsn");
+        let (client, connection) = tokio_postgres::connect(&dsn, crate::usage::tls_connector())
+            .await
+            .expect("connect to the test database");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "DROP TABLE {schema}.axond_catalog_snapshot, {schema}.axond_catalog_active"
+            ))
+            .await
+            .expect("drop the tables out from under the store");
+
+        let error = store
+            .activate(&seed_import(), at(100))
+            .await
+            .expect_err("the table is gone");
+        assert!(
+            matches!(error, CatalogStoreError::Denied { .. }),
+            "a missing table is an operator's to answer: {error}"
+        );
+        assert!(!crate::backends::BackendFailure::retryable(&error));
+        drop_schema(&schema).await;
     }
 
     #[tokio::test]
@@ -972,7 +1030,7 @@ mod tests {
                         .query_one("SELECT count(*) FROM axond_catalog_active", &[])
                         .await
                         .map(|row| row.get(0))
-                        .map_err(|error| unavailable("count active rows", &error))
+                        .map_err(|error| statement_failure("count active rows", &error))
                 })
             })
             .await
