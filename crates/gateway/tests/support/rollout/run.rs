@@ -914,7 +914,7 @@ fn axond(args: &[&str], env: &[(&str, &str)]) -> CommandRecord {
 /// treated as a credential and replaced by the name it came from, and any
 /// database URL is dropped whole — a failure path that echoes its environment
 /// must not turn the artifact into a secret.
-fn redacted(text: &str, secrets: &[(&str, &str)]) -> String {
+pub fn redacted(text: &str, secrets: &[(&str, &str)]) -> String {
     let mut out = text.to_owned();
     for (name, value) in secrets {
         // Short values would match unrelated text; nothing this harness passes
@@ -1079,7 +1079,7 @@ fn ledger(harness: &Harness, expected: u64, records: &[Value]) -> LossLedger {
 /// count lets a duplicate one replica wrote stand in for the record another
 /// replica lost, and then a loss of one and a duplicate of one reads as a clean
 /// run.
-fn reconcile(
+pub fn reconcile(
     callers: &[CallerRequest],
     pinned: &BTreeMap<String, u64>,
     records: &BTreeMap<String, u64>,
@@ -1118,211 +1118,6 @@ fn reconcile(
             }
         })
         .collect()
-}
-
-/// What may reach an uploaded artifact, decided by test rather than by trusting
-/// every future failure path of every operator command not to echo its
-/// environment.
-///
-/// Plain `#[test]`s: this is an integration test crate, where `cfg(test)` is
-/// never set and a `cfg(test)` module would be compiled out.
-mod artifact_redaction {
-    use super::*;
-
-    #[test]
-    fn command_output_carries_no_credential_it_was_given() {
-        let dsn = "postgres://postgres:hunter2@127.0.0.1:55432/postgres";
-        let kek = "0".repeat(64);
-        let secrets = [
-            ("GW_CONTROL_PLANE_DSN", dsn),
-            ("GW_KEK", kek.as_str()),
-            ("GW_BREAKGLASS", "fence-breakglass"),
-        ];
-        let output = redacted(
-            &format!("error: connecting to {dsn} failed\nkek={kek}\nbreakglass=fence-breakglass\n"),
-            &secrets,
-        );
-
-        for secret in [dsn, kek.as_str(), "fence-breakglass", "hunter2"] {
-            assert!(
-                !output.contains(secret),
-                "the artifact still carries `{secret}`:\n{output}"
-            );
-        }
-        assert!(
-            output.contains("${GW_KEK}") && output.contains("${GW_BREAKGLASS}"),
-            "the evidence still names what was redacted:\n{output}"
-        );
-        assert!(output.contains("connecting to"), "the message survives");
-    }
-
-    /// A URL the harness never handed over — one the binary composed itself, or
-    /// one a library logged — is still a credential, so the scrub is by shape
-    /// rather than only by known value.
-    #[test]
-    fn an_unknown_database_url_is_scrubbed_by_shape() {
-        let output = redacted(
-            "checking postgresql://admin:s3cret@db.internal:5432/axond, then done",
-            &[],
-        );
-
-        assert_eq!(
-            output, "checking ${redacted-url}, then done",
-            "the URL is gone whether or not the harness knew it"
-        );
-    }
-}
-
-/// The usage reconciliation, exercised on hand-built ledgers: these are the
-/// cases that decide whether a lost record can hide behind a retry, and they are
-/// too rare in a live run to be left to one.
-///
-/// Plain `#[test]`s: this is an integration test crate, where `cfg(test)` is
-/// never set and a `cfg(test)` module would be compiled out.
-mod usage_accounting {
-    use super::super::ingress::Attempt;
-    use super::*;
-
-    fn caller(id: u64, attempts: Vec<Attempt>) -> CallerRequest {
-        CallerRequest { id, attempts }
-    }
-
-    fn refused(replica: &str) -> Attempt {
-        Attempt {
-            replica: replica.to_owned(),
-            status: Some(503),
-            refused_while_draining: true,
-        }
-    }
-
-    fn answered(replica: &str) -> Attempt {
-        Attempt {
-            replica: replica.to_owned(),
-            status: Some(200),
-            refused_while_draining: false,
-        }
-    }
-
-    fn dropped(replica: &str) -> Attempt {
-        Attempt {
-            replica: replica.to_owned(),
-            status: None,
-            refused_while_draining: false,
-        }
-    }
-
-    fn records(rows: [(&str, u64); 2]) -> BTreeMap<String, u64> {
-        rows.into_iter()
-            .map(|(id, count)| (id.to_owned(), count))
-            .collect()
-    }
-
-    fn row<'a>(ledger: &'a [ReplicaUsage], replica: &str) -> &'a ReplicaUsage {
-        ledger
-            .iter()
-            .find(|row| row.replica == replica)
-            .expect("the replica is in the ledger")
-    }
-
-    /// One caller request, two replicas: the draining one refused it and the
-    /// other answered. Only the answering replica owes a record, and the record
-    /// the refusing one kept for the work it had begun is a duplicate of that
-    /// caller request rather than a second answered caller.
-    #[test]
-    fn a_refusal_retried_elsewhere_is_one_caller_request_not_two() {
-        let ledger = reconcile(
-            &[caller(0, vec![refused("previous-0"), answered("next-0")])],
-            &BTreeMap::new(),
-            &records([("previous-0", 1), ("next-0", 1)]),
-        );
-
-        assert_eq!(row(&ledger, "next-0").caller_requests_answered, 1);
-        assert_eq!(row(&ledger, "previous-0").caller_requests_answered, 0);
-        assert_eq!(row(&ledger, "previous-0").retry_duplicates, 1);
-        assert!(ledger.iter().all(|row| row.missing == 0));
-        assert!(ledger.iter().all(|row| row.unexplained_surplus == 0));
-    }
-
-    /// Two records for one caller request on the replica that answered it, with
-    /// no refusal to explain either: double accounting, and the surplus says so.
-    #[test]
-    fn a_duplicate_record_for_one_caller_request_is_surplus() {
-        let ledger = reconcile(
-            &[caller(0, vec![answered("next-0")])],
-            &BTreeMap::new(),
-            &records([("next-0", 2), ("previous-0", 0)]),
-        );
-
-        assert_eq!(row(&ledger, "next-0").unexplained_surplus, 1);
-        assert_eq!(row(&ledger, "next-0").retry_duplicates, 0);
-    }
-
-    /// The case a fleet-wide count gets wrong. One caller request was refused
-    /// and retried, so a duplicate exists and is explained; a second caller
-    /// request was answered by a different replica that lost its record. The
-    /// totals match — two callers, two records — and the loss is still reported,
-    /// because the comparison is made replica by replica.
-    #[test]
-    fn a_duplicate_on_one_replica_cannot_mask_a_loss_on_another() {
-        let ledger = reconcile(
-            &[
-                caller(0, vec![refused("previous-0"), answered("next-0")]),
-                caller(1, vec![answered("previous-1")]),
-            ],
-            &BTreeMap::new(),
-            &[("previous-0", 1), ("next-0", 1), ("previous-1", 0)]
-                .into_iter()
-                .map(|(id, count)| (id.to_owned(), count))
-                .collect(),
-        );
-
-        let owed: u64 = ledger.iter().map(|row| row.caller_requests_answered).sum();
-        let wrote: u64 = ledger.iter().map(|row| row.usage_records).sum();
-        assert_eq!(
-            owed, wrote,
-            "the fleet-wide totals agree, which is the trap"
-        );
-        assert_eq!(row(&ledger, "previous-1").missing, 1);
-        assert_eq!(row(&ledger, "previous-0").retry_duplicates, 1);
-    }
-
-    /// A replica that dropped the connection never reached its request path, so
-    /// it is owed nothing and entitled to nothing: a transport failure is not a
-    /// draining refusal, and cannot be spent explaining a record.
-    #[test]
-    fn a_transport_failure_is_not_a_draining_refusal() {
-        let ledger = reconcile(
-            &[caller(0, vec![dropped("previous-0"), answered("next-0")])],
-            &BTreeMap::new(),
-            &records([("previous-0", 1), ("next-0", 1)]),
-        );
-
-        assert_eq!(
-            row(&ledger, "previous-0").caller_requests_refused_while_draining,
-            0
-        );
-        assert_eq!(row(&ledger, "previous-0").retry_duplicates, 0);
-        assert_eq!(
-            row(&ledger, "previous-0").unexplained_surplus,
-            1,
-            "a record from a replica that never answered is unexplained"
-        );
-    }
-
-    /// Requests the harness pinned to a replica bypass the balancer, so they
-    /// have no caller identity of their own and are owed against that replica
-    /// directly.
-    #[test]
-    fn pinned_requests_are_owed_by_the_replica_they_were_sent_to() {
-        let ledger = reconcile(
-            &[],
-            &[("previous-0".to_owned(), 2)].into_iter().collect(),
-            &records([("previous-0", 1), ("next-0", 0)]),
-        );
-
-        assert_eq!(row(&ledger, "previous-0").caller_requests_answered, 2);
-        assert_eq!(row(&ledger, "previous-0").missing, 1);
-    }
 }
 
 /// What the rollout cost in throughput while the fleet was short a replica.
