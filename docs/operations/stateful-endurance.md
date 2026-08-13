@@ -43,17 +43,24 @@ the same order:
 
 | At | Event | What the run then looks for |
 | --- | --- | --- |
-| 10% | Catalogue revision — a new alias is published and every replica reloaded | the `chat-catalogue-v2` alias begins serving |
-| 20% | Credential revision — the pool is rotated | a usage record attributed to `fake-openai-rotated` |
-| 30% | Policy revision — the probe tenant loses `allow_platform_fallback` | the probe tenant stops being served |
-| 40% | The provider is slowed by 250 ms at the gate | latency moves; nothing fails |
-| 52% | The provider is taken away — connections refused and cut | refusals typed as circuit-open, and recovery afterwards |
-| 66% | The usage database is taken away | dropped sink batches, reported by the process and reconciled |
-| 80% | Rolling restart — each replica is drained and replaced one at a time | no request refused for want of a ready replica, and the flushed rows arrive |
+| 8% | Catalogue revision — a new alias is published and every replica reloaded | the `chat-catalogue-v2` alias begins serving |
+| 16% | Credential revision — the pool is rotated | a usage record attributed to `fake-openai-rotated` |
+| 24% | Policy revision — the probe tenant loses `allow_platform_fallback` | the probe tenant stops being served |
+| 30% | The provider is slowed by 250 ms at the gate | latency moves; nothing fails |
+| 42% | The provider is taken away — connections refused and cut | refusals typed as circuit-open, and recovery afterwards |
+| 63% | The usage database is taken away | dropped sink batches, reported by the process and reconciled |
+| 84% | Rolling restart — each replica is drained and replaced one at a time | no request refused for want of a ready replica, and the flushed rows arrive |
+
+The gaps between them are sized for the *shorter* tier. Attribution runs past
+the end of a fault by `recovery_allowance_ms`, which is an absolute duration
+while every offset is a fraction, so a gap comfortable over twelve hours can be
+nothing at ninety seconds — and a smoke tier that restarted the fleet inside the
+database outage's attribution window would be excusing errors the soak tier
+counts. A test asserts the separation at both durations.
 
 | Tier | Duration | Concurrency | Sample interval | Segment |
 | --- | --- | --- | --- | --- |
-| `smoke` | 60 s | 8 | 200 ms | 10 s |
+| `smoke` | 90 s | 8 | 200 ms | 10 s |
 | `soak` | 12 h | 24 | 1 s | 15 min |
 
 The smoke tier is the same code, manifest, script, and gates as the soak; only
@@ -77,7 +84,7 @@ just stateful-endurance
 
 # A shorter dispatched run — forty minutes here. The override applies to the
 # soak tier alone, so the smoke tier in the same binary keeps its committed
-# minute. Segments shrink to match.
+# ninety seconds. Segments shrink to match.
 just stateful-endurance 2400000
 ```
 
@@ -101,9 +108,11 @@ name; the toolchain, git commit and dirty flag; and the host's CPU, kernel, core
 count and memory. **Numbers from artifacts whose provenance differs are not
 comparable.**
 
-It carries no credential. The normalised config replaces the ephemeral ports and
-the per-run key directory, tenant keys are delivered as files under the run
-directory and named rather than quoted, and the usage DSN travels as the *name*
+It carries no credential. The normalised config replaces the ephemeral ports,
+the per-run key directory, and the run's own usage schema — all three change
+every run, and a fingerprint that changed with them would make every artifact
+incomparable. Tenant keys are delivered as files under the run directory and
+named rather than quoted, and the usage DSN travels as the *name*
 of the environment variable the replicas read it from. Credential evidence is
 label attribution — `fake-openai-rotated` — not material.
 
@@ -181,6 +190,9 @@ Fields worth knowing:
 - `restart.flushed_on_exit` counts the usage rows a retiring replica emitted
   while draining; they are reconciled with the rest, so a restart cannot hide a
   row by taking the process that owed it away.
+- `revisions[].converged_ms` is `null` for a revision that was published and
+  never observed, so an artifact fails on its own terms rather than by omitting
+  the revision that did not land.
 - `tenancy.probe_served_before_policy` and `probe_refused_after_policy` are the
   same probe on either side of the policy revision. Both must be non-zero, or
   the isolation gate passed without ever being tested.

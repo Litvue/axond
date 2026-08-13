@@ -33,7 +33,7 @@ the manifest it names is a test failure.
   so it cannot be set by hand.
 - **Not evidence about stateful serving.** Every retained record is Tier 0: one
   process, no Redis, no Postgres, no control plane. The stateful endurance
-  harness does drive a fleet with a durable usage sink, but only its one-minute
+  harness does drive a fleet with a durable usage sink, but only its ninety-second
   smoke tier has run, and a correctness run is not a measurement. See
   [recovery qualification](./recovery-qualification.md) for what stateful
   recovery will have to show.

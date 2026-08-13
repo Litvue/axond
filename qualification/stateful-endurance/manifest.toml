@@ -7,7 +7,7 @@
 # the binary's (ADR 0033).
 #
 # The schedule is written as fractions of the run rather than as offsets, so the
-# one-minute smoke and the twelve-hour soak exercise the same events in the
+# ninety-second smoke and the twelve-hour soak exercise the same events in the
 # same order. Only the time between them differs.
 
 schema_version = 1
@@ -35,7 +35,10 @@ faulted = 1
 # The tier ordinary CI runs. Long enough to hold every scheduled event with
 # room between them, short enough to belong in a pull request.
 [profile.smoke]
-duration_ms = 60000
+# Ninety seconds rather than sixty: the recovery allowance below is an absolute
+# duration while every offset is a fraction, so the shortest tier is what decides
+# whether the attribution windows stay clear of each other and of the restart.
+duration_ms = 90000
 concurrency = 8
 think_time_ms = 10
 sample_interval_ms = 200
@@ -52,18 +55,23 @@ segment_ms = 900000
 # When each event happens, as a fraction of the offered duration, and how long
 # the windowed ones last. Ordered and non-overlapping: an artifact has to be
 # able to attribute an error to one declared window rather than to two.
+#
+# The gaps are sized for the smoke tier: an event separated from the previous
+# window by less than the recovery allowance would be inside that window's
+# attribution span at ninety seconds and outside it at twelve hours, which is
+# two different qualifications rather than one at two scales.
 [profile.schedule]
-catalogue_revision_at = 0.10
-credential_revision_at = 0.20
-policy_revision_at = 0.30
-upstream_latency_at = 0.40
+catalogue_revision_at = 0.08
+credential_revision_at = 0.16
+policy_revision_at = 0.24
+upstream_latency_at = 0.30
 upstream_latency_for = 0.06
 # What the fault gate in front of the provider adds to every connection while
 # the latency window is open.
 upstream_latency_ms = 250
-upstream_outage_at = 0.52
+upstream_outage_at = 0.42
 upstream_outage_for = 0.06
-usage_backend_outage_at = 0.66
+usage_backend_outage_at = 0.63
 usage_backend_outage_for = 0.06
 # A record settled a couple of seconds either side of the outage is the
 # outage's. The driver's clock and the gateway's `recorded_at` are set moments
@@ -79,7 +87,7 @@ usage_outage_attribution_slack_ms = 3000
 # artifact records how long each window actually took to recover and the SLO
 # bounds it.
 recovery_allowance_ms = 10000
-rolling_restart_at = 0.80
+rolling_restart_at = 0.84
 
 # What a passing run means. Every threshold is a property of the gateway rather
 # than of the machine it ran on: how fast the runner is moves throughput, not

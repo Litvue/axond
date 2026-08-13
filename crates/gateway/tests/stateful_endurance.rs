@@ -125,6 +125,15 @@ fn assert_qualifies(result: &StatefulEnduranceResult) {
         "more rows are missing than the processes reported dropping: {:#?}",
         result.usage
     );
+    // Both sides of the policy revision, or the gate passed without ever being
+    // tested: a probe tenant refused from the start would satisfy the second
+    // assertion while proving nothing about the revision.
+    assert!(
+        result.tenancy.probe_served_before_policy > 0,
+        "the probe tenant was never served before its policy revision, so its later refusal is \
+         not evidence of the revision: {:#?}",
+        result.tenancy
+    );
     assert!(
         result.tenancy.probe_refused_after_policy > 0,
         "the probe tenant was never refused after its policy revision, so isolation was not \
@@ -254,34 +263,72 @@ fn the_script_is_the_same_at_both_tiers() {
                 begins.as_str()
             );
         }
-        // Two backends must not be out at once: a run in which the provider and
-        // the database fail together cannot attribute what it loses to either.
-        let duration = Duration::from_millis(profile.soak.duration_ms);
-        let windows = profile.schedule.fault_windows(duration);
-        for pair in windows.windows(2) {
-            assert!(
-                pair[0].1 <= pair[1].0,
-                "{}: the declared fault windows overlap",
-                profile.id
-            );
-        }
-        // Attribution runs past the end of each fault by the recovery
-        // allowance, because a breaker tripped by a declared outage is still
-        // open for its cooldown afterwards. The extended windows must not
-        // overlap either, or a refusal could be charged to two outages.
-        let attributed = profile.schedule.attribution_windows(duration);
+        // The separations are checked at *both* durations. The allowance below
+        // is an absolute duration while every offset is a fraction, so a gap
+        // that is comfortable over twelve hours can be nothing at ninety
+        // seconds — and a tier where the restart happens inside the database
+        // outage's attribution window is running a different qualification.
         let allowance = Duration::from_millis(profile.schedule.recovery_allowance_ms);
         assert!(allowance > Duration::ZERO, "{}: no allowance", profile.id);
-        for (declared, attributed) in windows.iter().zip(&attributed) {
-            assert_eq!(declared.0, attributed.0);
-            assert_eq!(declared.1 + allowance, attributed.1);
-        }
-        for pair in attributed.windows(2) {
-            assert!(
-                pair[0].1 <= pair[1].0,
-                "{}: the attribution windows overlap",
-                profile.id
-            );
+        for tier in [Tier::Smoke, Tier::Soak] {
+            let duration = Duration::from_millis(profile.scale(tier).duration_ms);
+            let label = tier.as_str();
+            // Two backends must not be out at once: a run in which the provider
+            // and the database fail together cannot attribute what it loses to
+            // either.
+            let windows = profile.schedule.fault_windows(duration);
+            for pair in windows.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0,
+                    "{} [{label}]: the declared fault windows overlap",
+                    profile.id
+                );
+            }
+            // Attribution runs past the end of each fault by the recovery
+            // allowance, because a breaker tripped by a declared outage is
+            // still open for its cooldown afterwards. The extended windows must
+            // not overlap either, or a refusal could be charged to two outages.
+            let attributed = profile.schedule.attribution_windows(duration);
+            for (declared, attributed) in windows.iter().zip(&attributed) {
+                assert_eq!(declared.0, attributed.0);
+                assert_eq!(declared.1 + allowance, attributed.1);
+            }
+            for pair in attributed.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0,
+                    "{} [{label}]: the attribution windows overlap",
+                    profile.id
+                );
+            }
+            // Nor may a moment the driver *acts* fall inside one: a revision
+            // published or a fleet restarted while a fault is still being
+            // attributed has its own errors excused by that fault.
+            let (usage_from, usage_to) = profile.schedule.usage_outage_window(duration);
+            for scheduled in profile.schedule.resolve(duration) {
+                if matches!(
+                    scheduled.event,
+                    Event::UpstreamOutageBegins
+                        | Event::UpstreamOutageEnds
+                        | Event::UsageBackendOutageBegins
+                        | Event::UsageBackendOutageEnds
+                ) {
+                    continue;
+                }
+                for (from, to) in &attributed {
+                    assert!(
+                        scheduled.at < *from || scheduled.at >= *to,
+                        "{} [{label}]: `{}` happens inside a fault's attribution window",
+                        profile.id,
+                        scheduled.event.as_str()
+                    );
+                }
+                assert!(
+                    scheduled.at < usage_from || scheduled.at >= usage_to,
+                    "{} [{label}]: `{}` happens inside the usage-outage attribution window",
+                    profile.id,
+                    scheduled.event.as_str()
+                );
+            }
         }
     }
 }

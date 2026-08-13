@@ -65,6 +65,11 @@ pub const USAGE_DSN_ENV: &str = "GW_USAGE_DSN";
 /// every run would make every artifact incomparable.
 pub const KEY_DIR_PLACEHOLDER: &str = "/TENANT_KEY_DIR";
 
+/// The placeholder the run's own usage table is replaced by, for the same
+/// reason: the schema is named after the moment the run started, and it is in
+/// the config text the artifact hashes.
+pub const USAGE_TABLE_PLACEHOLDER: &str = "QUALIFICATION_SCHEMA.axond_usage";
+
 /// Distinguishes the replicas one run boots, live and retired alike.
 static REPLICAS: AtomicU64 = AtomicU64::new(0);
 
@@ -349,12 +354,15 @@ flush_timeout_ms = 5000
         )
     }
 
-    /// The config with this process' temporary directory taken out of it. The
-    /// ports are normalised by the shared provenance collector; the key
-    /// directory is this harness' own, and an input hash that changed every run
-    /// would make every artifact incomparable.
+    /// The config with this run's own names taken out of it: the temporary key
+    /// directory and the ephemeral usage schema. The ports are normalised by
+    /// the shared provenance collector. Both of these change every run, and an
+    /// input hash that changed every run would make every artifact
+    /// incomparable.
     pub fn portable(&self, config: &str) -> String {
-        config.replace(&self.key_dir.display().to_string(), KEY_DIR_PLACEHOLDER)
+        config
+            .replace(&self.key_dir.display().to_string(), KEY_DIR_PLACEHOLDER)
+            .replace(&self.usage_table, USAGE_TABLE_PLACEHOLDER)
     }
 }
 

@@ -54,7 +54,7 @@ what it sees.
 `qualification/stateful-endurance/manifest.toml` places every event — three
 revisions, an upstream latency window, an upstream outage, a usage-backend
 outage, and a rolling restart — as a fraction of the offered duration, so the
-one-minute smoke tier and the twelve-hour soak execute the same script in the
+ninety-second smoke tier and the twelve-hour soak execute the same script in the
 same order. A tier that ran a different script would not be a shorter run of the
 same qualification, and a test asserts the two orders are equal.
 

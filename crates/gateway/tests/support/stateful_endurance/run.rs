@@ -234,6 +234,7 @@ pub async fn run_with(
 
     let settle = Duration::from_millis(profile.termination.settle_ms);
     state.settle(&mut fleet, settle, started).await;
+    state.abandon_pending_revisions();
     let settled = durable.await_settled(settle, DURABLE_QUIET).await;
 
     let (usage_from, usage_to) = profile.schedule.usage_outage_window(duration);
@@ -1005,6 +1006,10 @@ struct State {
     fault_windows: Vec<(Duration, Duration)>,
     last_record_at: Duration,
     samplers: Vec<(String, Sampler)>,
+    /// Where each replica's series was written, keyed by replica and relative
+    /// to the workspace: a reader following the artifact has to land on the
+    /// file the verdicts were fitted through.
+    sample_paths: BTreeMap<String, String>,
     live: BTreeMap<String, LiveResources>,
     resources: Vec<ReplicaResources>,
     revisions: Vec<RevisionObservation>,
@@ -1170,6 +1175,7 @@ impl State {
             fault_windows: schedule.attribution_windows(duration),
             last_record_at: Duration::ZERO,
             samplers: Vec::new(),
+            sample_paths: BTreeMap::new(),
             live: BTreeMap::new(),
             resources: Vec::new(),
             revisions: Vec::new(),
@@ -1216,6 +1222,8 @@ impl State {
 
     fn start_sampler(&mut self, id: &str, pid: u32, interval: Duration, dir: &Path, stem: &str) {
         let path = dir.join(format!("{stem}.{id}.samples.jsonl"));
+        self.sample_paths
+            .insert(id.to_owned(), fleet::relative(&path));
         self.samplers
             .push((id.to_owned(), Sampler::start(pid, interval, &path)));
         self.live.insert(id.to_owned(), LiveResources::default());
@@ -1492,6 +1500,22 @@ impl State {
         self.pending_credential = Some((revision, now, Instant::now()));
     }
 
+    /// Write down a revision that was published and never observed. Left
+    /// pending it would simply be absent from the artifact, and an artifact
+    /// that omits the revision that failed reads exactly like one where every
+    /// revision converged.
+    fn abandon_pending_revisions(&mut self) {
+        if let Some((revision, published_at, _)) = self.pending_credential.take() {
+            self.revisions.push(RevisionObservation {
+                event: Event::CredentialRevision.as_str().to_owned(),
+                revision: revision.label(),
+                published_at_ms: published_at.as_millis() as u64,
+                converged_ms: None,
+                observed: "no usage record was ever attributed to the rotated pool".to_owned(),
+            });
+        }
+    }
+
     fn open_fault(&mut self, event: Event, now: Duration, counts: GateCounts) {
         self.open_faults
             .insert(event.as_str(), (now, counts, self.errors_in_fault_windows));
@@ -1660,6 +1684,7 @@ fn assemble(
         unexpected_statuses,
         by_status,
         sink_drops,
+        sample_paths,
         resources,
         revisions,
         faults,
@@ -1829,7 +1854,7 @@ fn assemble(
             drain_interval_ms: DRAIN_EVERY.as_millis() as u64,
             samples_paths: resources
                 .iter()
-                .map(|replica| format!("{}.samples.jsonl", replica.replica))
+                .filter_map(|replica| sample_paths.get(&replica.replica).cloned())
                 .collect(),
         },
         environment,
