@@ -1499,8 +1499,12 @@ pub enum FetchError {
 /// conditional `GET` — and reporting that as an outage would have a scheduler
 /// retry it forever while the operator reads "upstream is down" about a URL only
 /// they can fix.
+///
+/// A `3xx` counts the same way, because [`HttpCatalogFetch`] does not follow
+/// redirects: the answer says the catalogue lives somewhere other than the URL
+/// the snapshots name, which is a change only an operator may make.
 const fn misconfigured(status: u16) -> bool {
-    matches!(status, 400..=499) && !matches!(status, 408 | 429)
+    matches!(status, 300..=499) && !matches!(status, 408 | 429)
 }
 
 impl Refusable for FetchError {
@@ -1649,9 +1653,18 @@ impl HttpCatalogFetch {
     /// The timeout is the client's own rather than only the refresher's, so a
     /// connection that stalls mid-body is abandoned by the layer holding the
     /// socket instead of being left for a cancelled task to drop.
+    ///
+    /// Redirects are *not* followed. The configured URL is the source of record
+    /// stamped onto every snapshot's provenance, and a followed redirect would
+    /// let the answer decide which document — and which transport — the import
+    /// actually read, while the retained URL still named the one an operator
+    /// approved. A moved upstream is a bounded refusal that names its status, so
+    /// the deployment keeps its last known good catalogue until the URL is
+    /// changed on purpose.
     pub fn new(timeout: Duration) -> Result<Self, FetchError> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| FetchError::Transport {
                 message: error.to_string(),
@@ -2851,6 +2864,53 @@ mod tests {
         );
     }
 
+    /// The configured URL is what every snapshot's provenance names, so the
+    /// answer may not redirect the import somewhere else — least of all onto
+    /// plaintext. A moved upstream is a bounded refusal an operator acts on.
+    #[tokio::test]
+    async fn a_redirected_source_is_refused_rather_than_followed() {
+        let transfers = Arc::new(AtomicUsize::new(0));
+        let router = axum::Router::new()
+            .route(
+                "/moved/catalog.json",
+                get(|| async {
+                    (StatusCode::FOUND, [(header::LOCATION, "/catalog.json")], "").into_response()
+                }),
+            )
+            .route("/catalog.json", get(serve))
+            .with_state(Upstream {
+                etag: "\"identity-1\"".to_owned(),
+                payload: IDENTITY,
+                transfers: Arc::clone(&transfers),
+            });
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("a free port");
+        let address = listener.local_addr().expect("a bound address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let adapter = ModelsDevAdapter::new(format!("http://{address}/moved/catalog.json"))
+            .expect("a catalog.json URL");
+        let source = ModelsDevSource::new(adapter, fetch());
+
+        let error = source.refresh(None).await.expect_err("a redirect");
+        assert_eq!(
+            transfers.load(Ordering::Relaxed),
+            0,
+            "the redirect target was never read"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("302"),
+            "the refusal names the status it got, said: {message}"
+        );
+        assert!(
+            !error.retryable(),
+            "asking the same URL again is answered the same way"
+        );
+    }
+
     #[tokio::test]
     async fn an_upstream_outage_is_retryable_and_leaves_the_catalogue_alone() {
         struct Offline;
@@ -2891,7 +2951,7 @@ mod tests {
     /// an operator the upstream is down.
     #[test]
     fn a_url_that_cannot_serve_a_catalogue_is_not_reported_as_an_outage() {
-        for status in [400, 404, 405, 410, 414, 451] {
+        for status in [301, 302, 307, 308, 400, 404, 405, 410, 414, 451] {
             let error = CatalogError::from(FetchError::Status { status });
             assert_eq!(
                 error,

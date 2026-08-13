@@ -414,6 +414,11 @@ async fn run(
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) {
     let mut shutdown = std::pin::pin!(shutdown);
+    // Whether anything can still ask for an import. Once every handle is gone the
+    // arm is disabled rather than re-armed: a closed receiver is *ready*
+    // forever, and a ready arm ahead of the sleep under `biased` would be a spin
+    // rather than the schedule this keeps serving.
+    let mut askable = true;
     loop {
         let now = SystemTime::now();
         let delay = refresher
@@ -426,12 +431,12 @@ async fn run(
                 tracing::debug!("catalogue refresh stopped");
                 return;
             }
-            asked = manual.recv() => {
+            asked = manual.recv(), if askable => {
                 let Some(ManualRefresh { answer }) = asked else {
                     // Every handle is gone, so nothing can ask again. The
                     // schedule is still worth keeping: the deployment is serving.
                     tracing::debug!("no catalogue handle remains; refreshing on schedule only");
-                    manual = mpsc::channel(1).1;
+                    askable = false;
                     continue;
                 };
                 let outcome = refresh(&mut refresher, &status, RefreshTrigger::Manual).await;
@@ -591,6 +596,52 @@ mod tests {
                 .is_some_and(|report| report.active.is_some()),
             "the refresh published what it left active"
         );
+    }
+
+    /// Dropping every handle leaves the schedule running, and *asleep*.
+    ///
+    /// A closed receiver is ready forever, so the arm reading it has to stop
+    /// being selected rather than be re-armed: an arm ahead of the sleep under
+    /// `biased` that is permanently ready would spin a core and starve the
+    /// schedule it was meant to preserve. The observable version of that is
+    /// this: with no handle left, the next interval still imports, which is only
+    /// reachable through the sleep arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_catalogue_nothing_holds_a_handle_to_keeps_refreshing_on_schedule() {
+        let config = CatalogConfig {
+            refresh_interval_seconds: 1,
+            refresh_timeout_seconds: 1,
+            retry_initial_seconds: 1,
+            retry_max_seconds: 1,
+            ..offline()
+        };
+        let handle = start(&config, None, &no_env(), std::future::pending())
+            .await
+            .expect("an offline catalogue starts")
+            .expect("an enabled catalogue yields a handle");
+        let status = Arc::clone(handle.status());
+        drop(handle);
+
+        // What the boot import left active. Every later import re-stamps it with
+        // when this process last confirmed the content, so the timestamp moving
+        // is the schedule having run after the last handle went away.
+        let confirmed = |report: Option<CatalogReport>| {
+            report
+                .and_then(|report| report.active)
+                .map(|active| active.fetched_at)
+        };
+        let before = confirmed(status.report());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if confirmed(status.report()) > before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the schedule stopped importing once the last handle dropped"
+            );
+        }
     }
 
     /// Shutdown outranks catalogue work: a terminating process must not start an

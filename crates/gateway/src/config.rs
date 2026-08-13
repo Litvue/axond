@@ -3368,6 +3368,19 @@ impl Config {
         if catalog.source == CatalogSourceBackend::ModelsDev {
             crate::backends::models_dev::ModelsDevAdapter::new(catalog.url())
                 .map_err(|error| ConfigError::Invalid(format!("catalog.source_url: {error}")))?;
+            // Transport is part of the source's identity, not a deployment
+            // detail: catalogue metadata is what an operator later reads to
+            // approve a price, and a plaintext mirror lets whoever holds the
+            // path between them substitute it. A mirror is fine; a
+            // downgradeable one is not.
+            if !catalog.url().starts_with("https://") {
+                return Err(ConfigError::Invalid(format!(
+                    "catalog.source_url `{}` must be `https://`: imported metadata is read for \
+                     pricing and enablement decisions, so a source that can be substituted in \
+                     transit is refused rather than trusted",
+                    catalog.url()
+                )));
+            }
         } else if catalog.source_url.is_some() {
             return Err(ConfigError::Invalid(format!(
                 "catalog `{}`: `source_url` applies only to `models-dev`",
@@ -5820,6 +5833,42 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
         assert!(
             refusal.contains("source_url"),
             "`source_url` applies only to the models.dev source, said: {refusal}"
+        );
+    }
+
+    /// A mirror is allowed; a downgradeable one is not. Imported metadata is
+    /// what an operator reads to approve a price or enable a model later, so a
+    /// plaintext source — whose document anyone on the path may substitute — is
+    /// refused where it is written rather than trusted at every refresh.
+    #[test]
+    fn a_catalogue_source_url_must_be_https() {
+        for rejected in [
+            "http://models.dev/catalog.json",
+            "http://internal.mirror.example/catalog.json",
+            "http://127.0.0.1:8080/catalog.json",
+        ] {
+            let refusal = catalogue_refusal(&format!(
+                "{VALID}\n[catalog]\nsource = \"models-dev\"\nsource_url = \"{rejected}\"\n"
+            ));
+            assert!(
+                refusal.contains("https://"),
+                "the refusal must say which transport is required, said: {refusal}"
+            );
+            assert!(
+                !refusal.contains("must be at least"),
+                "`{rejected}` must be refused for its transport, said: {refusal}"
+            );
+        }
+
+        // An HTTPS mirror is a legitimate deployment choice: the rule is the
+        // transport, not the host.
+        let config = catalogue_config(&format!(
+            "{VALID}\n[catalog]\nsource = \"models-dev\"\nsource_url = \
+             \"https://mirror.internal.example/models.dev/catalog.json\"\n"
+        ));
+        assert_eq!(
+            config.catalog.url(),
+            "https://mirror.internal.example/models.dev/catalog.json"
         );
     }
 
