@@ -220,7 +220,7 @@ interface — read it at your own risk.
 
 Stateful mode's desired state is versioned by schema identifier per body, not by
 one revision format. A price book declares `axond.price-book.v1`
-([ADR 0045](./adr/0045-approved-price-books.md)), and a replica reads only the
+([ADR 0046](./adr/0046-approved-price-books.md)), and a replica reads only the
 schemas its build knows:
 
 - Adding an optional field to a body **is** a schema bump. Bodies are read

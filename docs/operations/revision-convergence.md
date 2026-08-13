@@ -517,7 +517,7 @@ The refusal reason is the triage key.
   and not as a pricing-specific reason. **Every** replica of this build refuses
   the revision, and the fleet keeps serving the previously published pricing
   along with its routing; approve a corrected book. See
-  [ADR 0045](../adr/0045-approved-price-books.md) for why none of these are
+  [ADR 0046](../adr/0046-approved-price-books.md) for why none of these are
   rounded or partially applied.
 - **`pricing`** (reported as `pricing_rejected` on `/status`) — the same refusal
   reached one stage later, when the book is resolved into billable rates. Reading
