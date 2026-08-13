@@ -103,7 +103,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
 
@@ -146,13 +146,15 @@ jobs:
             -print_final_stats=1
 
       # Both uploads run on failure too: the corpus is what reproduces a finding,
-      # and the artifact is the finding itself.
+      # and the artifact is the finding itself. The attempt number is part of the
+      # key because the backend refuses to overwrite one that already exists and
+      # only warns, which would drop everything a re-run explored.
       - name: Retain the corpus
         if: always()
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Retain the corpus as a downloadable artifact
         if: always()
