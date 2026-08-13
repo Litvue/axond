@@ -7371,16 +7371,14 @@ max_ttl = "15m"
         }
     }
 
-    /// What a released binary answers today. `main.rs` builds its state through
-    /// `new_with_rate_limiter`, which injects
-    /// [`ReplicaObservability::stateless`], so no component is observed and no
-    /// revision is tracked: every component is `disabled` with reason
-    /// `not_configured`. This is the boundary the shipped dependency panels and
-    /// their three alerts wait on, and it is documented as such in the
-    /// observability runbook — a slice that injects a refresher should turn this
-    /// test into its own opposite.
+    /// What a released binary answers in the *stateless* posture, which is the
+    /// default one: no store is opened, so nothing is observed and no revision
+    /// is tracked, and every component is `disabled` with reason
+    /// `not_configured`. `disabled` rather than `unavailable` is the whole
+    /// point — a deployment without a control plane is not a deployment with a
+    /// broken one, and the shipped alerts are written not to page for it.
     #[tokio::test]
-    async fn the_production_constructor_observes_nothing_yet() {
+    async fn a_stateless_replica_observes_nothing_and_says_so() {
         let config = Config::from_toml_str(STATUS_CONFIG).expect("status config");
         let env = HashMap::from([
             ("AXOND_OPERATOR_KEY".to_owned(), OPERATOR_KEY.to_owned()),
@@ -7409,6 +7407,59 @@ max_ttl = "15m"
             assert_eq!(entry["state"], "disabled", "{entry}");
             assert_eq!(entry["reason"], "not_configured", "{entry}");
         }
+    }
+
+    /// The stateful posture, through the wiring a released binary uses:
+    /// [`ReplicaObservability::observing`] over the store administration was
+    /// built on. One refresh round is enough — the read is a cache read, so what
+    /// the route reports is exactly what the last round published.
+    ///
+    /// The two halves that matter are both here: the control plane is observed
+    /// *live*, and every component this deployment does not have is still
+    /// `disabled` rather than being reported as broken because nobody probed it.
+    #[tokio::test]
+    async fn a_stateful_replica_observes_the_control_plane_it_administers() {
+        let oracle = Arc::new(crate::desired_state::oracle::InMemoryControlPlane::new());
+        let (observability, refresher) = ReplicaObservability::observing(
+            Arc::clone(&oracle) as Arc<dyn crate::backends::control_plane::ControlPlaneStore>,
+            crate::status::probes::ControlPlaneProbe::pacing(
+                &crate::backends::control_plane::postgres::ControlPlaneSettings::default(),
+            ),
+        );
+        let state = status_state(observability);
+
+        refresher.refresh_once().await;
+        let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        let component = |body: &serde_json::Value, name: &str| {
+            body["components"]
+                .as_array()
+                .expect("components")
+                .iter()
+                .find(|entry| entry["component"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} is reported"))
+        };
+        assert_eq!(component(&body, "control_plane")["state"], "ok", "{body}");
+        assert_eq!(component(&body, "secret_store")["state"], "disabled");
+        assert_eq!(component(&body, "budget_store")["state"], "disabled");
+
+        // An outage moves the observation, and nothing else: the replica keeps
+        // answering, and the reason is the bounded code rather than the store's
+        // own message.
+        oracle.set_unavailable(true);
+        refresher.refresh_once().await;
+        let (status, body) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        let control_plane = component(&body, "control_plane");
+        assert_eq!(control_plane["state"], "unavailable", "{body}");
+        assert_eq!(control_plane["reason"], "unreachable", "{body}");
+        assert!(
+            !body
+                .to_string()
+                .contains("fake control plane is unavailable"),
+            "the backend's own message reached the response: {body}"
+        );
     }
 
     /// Status is a diagnostic, not work. Once admission closes, a served route

@@ -41,6 +41,10 @@ pub mod postgres;
 mod rows;
 pub mod schema;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
 use hydration::HydrationLimit;
 
 use async_trait::async_trait;
@@ -292,6 +296,40 @@ impl BackendFailure for ControlPlaneError {
 /// [`Capability::OptimisticConcurrency`]: super::Capability::OptimisticConcurrency
 /// [`Capability::IdempotentWrites`]: super::Capability::IdempotentWrites
 /// [`Capability::TransactionalAudit`]: super::Capability::TransactionalAudit
+/// A reserved place in the serialized control-plane queue for one status probe.
+///
+/// The reservation is acquired before the probe derives its timeout, and is
+/// carried into the backend operation so the operation is not counted twice.
+pub struct StatusProbeAdmission {
+    timeout: Duration,
+    pending: Arc<AtomicUsize>,
+}
+
+impl StatusProbeAdmission {
+    pub(crate) fn new(timeout: Duration, pending: Arc<AtomicUsize>) -> Self {
+        Self { timeout, pending }
+    }
+
+    pub(crate) fn standalone(timeout: Duration) -> Self {
+        Self::new(timeout, Arc::new(AtomicUsize::new(1)))
+    }
+
+    pub(crate) fn pending(pending: Arc<AtomicUsize>) -> Self {
+        pending.fetch_add(1, Ordering::AcqRel);
+        Self::new(Duration::ZERO, pending)
+    }
+
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+impl Drop for StatusProbeAdmission {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
     fn name(&self) -> &'static str;
@@ -303,6 +341,26 @@ pub trait ControlPlaneStore: Send + Sync {
     /// Never consulted by `/readyz`: readiness reflects whether the replica
     /// holds an active snapshot, not whether the control plane is reachable.
     async fn health(&self) -> Result<(), ControlPlaneError>;
+
+    /// Reserve a place in the serialized queue for a status health call.
+    ///
+    /// Postgres implements this from the same operation counter its
+    /// administrative methods use. The reservation is kept until the health
+    /// operation finishes, so a probe cannot sample a queue depth and then join
+    /// the queue without accounting for itself.
+    fn status_probe_admission(&self) -> Option<StatusProbeAdmission> {
+        None
+    }
+
+    /// Run the health call with its queue reservation, when the backend provides
+    /// one. Backends without serialized admission can use the normal health path.
+    async fn health_with_status_probe(
+        &self,
+        admission: Option<StatusProbeAdmission>,
+    ) -> Result<(), ControlPlaneError> {
+        drop(admission);
+        self.health().await
+    }
 
     /// The newest published revision, or `None` before the first publication.
     async fn desired_revision(&self) -> Result<Option<RevisionId>, ControlPlaneError>;

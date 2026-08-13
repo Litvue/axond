@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::*;
 
@@ -123,6 +124,83 @@ fn the_shipped_pipeline_lets_the_stall_rule_see_a_gap() {
         minutes(expiration, COLLECTOR) < minutes(lookback, RULES),
         "the exporter holds a series for {expiration} while the stall rule looks back {lookback}, \
          so the series never lapses and the rule can never fire"
+    );
+}
+
+/// The other end of the same coupling: a refresher paced slower than the
+/// exporter holds a series for leaves the same hole in `axond_status_refreshes`
+/// that a refresher which *stopped* leaves, so the cap the live pacing is
+/// derived under has to stay below both windows. The cadence comes from operator
+/// configuration ([`crate::status::probes::ControlPlaneProbe::pacing`]), so
+/// without this the two assets and the code that feeds them drift apart
+/// silently — and silence is what the rule reads.
+#[test]
+fn the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it() {
+    fn minutes(duration: &str, source: &str) -> u64 {
+        duration
+            .strip_suffix('m')
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("{source} states a duration in whole minutes: `{duration}`"))
+    }
+
+    let collector = read(COLLECTOR);
+    let expiration = collector
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("metric_expiration:"))
+        .map(str::trim)
+        .expect("the shipped pipeline states the expiration the rule depends on");
+    let rules = read(RULES);
+    let lookback = rules
+        .split_once("absent_over_time(axond_status_refreshes[")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(window, _)| window)
+        .expect("AxondStatusRefresherStalled watches for the absence of the refresh counter");
+
+    let cap = crate::status::probes::MAX_REFRESH_INTERVAL;
+    for (window, source) in [(expiration, COLLECTOR), (lookback, RULES)] {
+        assert!(
+            cap < Duration::from_secs(minutes(window, source) * 60),
+            "a refresher may be paced every {cap:?} while {source} works in {window} windows, so a \
+             healthy replica's series lapses and the stall rule pages"
+        );
+    }
+    assert!(
+        crate::status::probes::MAX_PROBE_TIMEOUT
+            < Duration::from_secs(minutes(expiration, COLLECTOR) * 60),
+        "a queue-aware probe may wait {:?} while the exporter retains samples for {expiration}, \
+         so a deep queue would make a live refresher look stalled",
+        crate::status::probes::MAX_PROBE_TIMEOUT
+    );
+
+    // The same cap against the other status rule: a round is allowed to take up
+    // to the cap, and the age gauge carries what the round took, so a threshold
+    // at or below it calls a slow-but-configured deployment stale.
+    let stale_expression = rules
+        .lines()
+        .find(|line| {
+            line.contains(
+                "axond_status_observation_age{axond_status_component=\\\"control_plane\\\"} > ",
+            )
+        })
+        .expect("AxondStatusObservationsStale is scoped to the control plane");
+    let stale_threshold: u64 = stale_expression
+        .split_once("} > ")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .and_then(|(threshold, _)| threshold.trim().parse().ok())
+        .expect("AxondStatusObservationsStale compares the control-plane age against a millisecond threshold");
+    assert!(
+        cap < Duration::from_millis(stale_threshold),
+        "a control-plane round may take {cap:?} while AxondStatusObservationsStale calls {stale_threshold}ms \
+         stale, so a deployment paced at the cap pages while observing normally"
+    );
+    // And the replica agrees with the rule about the word: an operator paged for
+    // a stale observation reads `stale` on the status page rather than an `ok`
+    // the registry still believes in.
+    assert!(
+        crate::status::probes::MAX_STALENESS_BUDGET <= Duration::from_millis(stale_threshold),
+        "the control-plane registry keeps an observation usable for \
+         {:?} while the rule pages at {stale_threshold}ms",
+        crate::status::probes::MAX_STALENESS_BUDGET
     );
 }
 

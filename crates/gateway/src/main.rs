@@ -575,17 +575,39 @@ async fn serve() -> anyhow::Result<()> {
     // the listener exists: a stateful replica whose administrative surface cannot
     // come up must fail at boot rather than serve a deployment nobody can
     // administer. In stateless mode this opens nothing at all.
-    let (admin_surface, admin_mode) =
-        admin::runtime::surface(&config, &env).await.map_err(|e| {
-            anyhow::anyhow!(
-                "a stateful deployment could not bring up its administrative surface: {e}"
-            )
-        })?;
+    let admin = admin::runtime::surface(&config, &env).await.map_err(|e| {
+        anyhow::anyhow!("a stateful deployment could not bring up its administrative surface: {e}")
+    })?;
     tracing::info!(
-        mode = admin_mode,
+        mode = admin.mode,
         prefix = admin::ADMIN_PREFIX,
         "administrative surface"
     );
+
+    // What this replica can say about itself. A stateful replica observes the
+    // control plane it administers against — on administration's own store, so
+    // the diagnostic and the administrative path fail together rather than
+    // disagreeing — and a stateless one has nothing durable to observe, so it
+    // reports every component `disabled` without opening a socket. Neither
+    // posture touches `/readyz`: readiness is "do I hold a snapshot", and a
+    // probe that consulted a dependency would multiply one outage by the fleet
+    // size (ADR 0031).
+    let (observability, status_refresher) = match admin.control_plane.as_ref() {
+        Some(observed) => {
+            let (observability, refresher) = ReplicaObservability::observing(
+                Arc::clone(&observed.store),
+                observed.pacing.clone(),
+            );
+            tracing::info!(
+                component = "control_plane",
+                refresh_interval_ms = observed.pacing.refresh_interval.as_millis() as u64,
+                probe_timeout_ms = observed.pacing.probe_timeout.as_millis() as u64,
+                "dependency status observed"
+            );
+            (observability, Some(refresher))
+        }
+        None => (ReplicaObservability::stateless(), None),
+    };
 
     let bind = config.server.bind;
     let watching = config.reload.watch;
@@ -597,7 +619,7 @@ async fn serve() -> anyhow::Result<()> {
         rate_limiter,
         revocation,
         policy,
-        ReplicaObservability::stateless(),
+        observability,
     )
     .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
     tracing::info!(
@@ -628,7 +650,7 @@ async fn serve() -> anyhow::Result<()> {
         }
     };
     let app = inference
-        .merge(admin_surface)
+        .merge(admin.router)
         .layer(telemetry::TelemetryLayer);
 
     tracing::info!(
@@ -652,11 +674,35 @@ async fn serve() -> anyhow::Result<()> {
         },
         resolved.clone(),
     );
+    // The refresher lives exactly as long as this process serves: it is started
+    // after the listener exists, so a boot that fails never probed anything, and
+    // stopped by dropping the sender below, so a drain does not leave a task
+    // polling a control plane nobody is reading about. Its first round runs
+    // immediately, which is why a status read moments after boot reports an
+    // observation rather than an empty registry.
+    let (stop_refreshing, stopped) = tokio::sync::oneshot::channel::<()>();
+    let refreshing = status_refresher.map(|refresher| {
+        tokio::spawn(async move {
+            refresher
+                .run(async {
+                    let _ = stopped.await;
+                })
+                .await;
+        })
+    });
     let served = axum::serve(listener, app).with_graceful_shutdown(drain);
     // Only used if the server ends without ever being signalled.
     let boot = shutdown::Plan::from(&resources.config().config.shutdown);
     let outcome = shutdown::serve_bounded(served, &lifecycle, &resolved, boot).await;
     let plan = resolved.or(boot);
+
+    // Before the settle and flush budgets, because those are for spend already
+    // incurred and a probe round is neither: the last thing the diagnostic can
+    // usefully say has already been said by the time the listener is closed.
+    drop(stop_refreshing);
+    if let Some(refreshing) = refreshing {
+        let _ = refreshing.await;
+    }
 
     // One budget for the whole post-serving sequence, not one per step: what an
     // orchestrator's termination grace period has to cover is the total, and the

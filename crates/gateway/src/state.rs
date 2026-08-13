@@ -25,8 +25,10 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::admission::{AdmissionControl, DiagnosticCredential};
 use crate::aliases::AliasScope;
 use crate::availability::AvailabilityIndex;
+use crate::backends::control_plane::ControlPlaneStore;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
+use crate::convergence::SystemClock;
 use crate::convergence::secrets::ResolvedSecrets;
 use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
@@ -43,7 +45,8 @@ use crate::rate_limit::NoLimit;
 use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
 use crate::shutdown::Lifecycle;
-use crate::status::registry::CachedStatusRegistry;
+use crate::status::probes::ControlPlaneProbe;
+use crate::status::registry::{CachedStatusRegistry, StatusRefresher, StatusSettings};
 use crate::usage::UsageDelivery;
 #[cfg(test)]
 use crate::usage::UsageFanout;
@@ -108,6 +111,42 @@ impl ReplicaObservability {
             status: Arc::new(CachedStatusRegistry::stateless()),
             revision: None,
         }
+    }
+
+    /// The stateful posture: the control plane this replica administers against
+    /// is observed on the same store administration uses, and every component
+    /// this deployment does not have stays `disabled`.
+    ///
+    /// The refresher is returned rather than spawned so the caller owns its
+    /// lifetime: it has to stop with the process, and a task spawned out of a
+    /// constructor would outlive the drain that is supposed to end it.
+    ///
+    /// `pacing` comes from the store's own timeouts
+    /// ([`ControlPlaneProbe::pacing`]) rather than from a default: it decides
+    /// which components are enabled — and so which are probed at all, since an
+    /// enabled component nobody probes ages into `unavailable` instead of
+    /// reporting `disabled` — and how long a round may take before the refresher
+    /// calls it a timeout.
+    pub fn observing(
+        control_plane: Arc<dyn ControlPlaneStore>,
+        pacing: StatusSettings,
+    ) -> (Self, StatusRefresher) {
+        debug_assert!(pacing.validate().is_ok(), "the derived pacing is valid");
+        let status = Arc::new(CachedStatusRegistry::new(pacing, Arc::new(SystemClock)));
+        let refresher = StatusRefresher::new(
+            Arc::clone(&status),
+            vec![Arc::new(ControlPlaneProbe::new(control_plane))],
+        );
+        (
+            Self {
+                status,
+                // Still `None`: no release constructs a reconciler, so there is
+                // no convergence state to report and an empty report would be a
+                // false all-clear (#142).
+                revision: None,
+            },
+            refresher,
+        )
     }
 }
 
@@ -618,7 +657,8 @@ impl AppState {
     }
 
     /// Test-only: production builds go through [`AppState::new_with_policy`],
-    /// which threads the one [`PolicyRuntime`] the backends read.
+    /// which threads the one [`PolicyRuntime`] the backends read and the
+    /// observability the mode it booted in decides.
     #[cfg(test)]
     pub fn new_with_rate_limiter(
         config: Config,

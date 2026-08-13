@@ -51,7 +51,11 @@ carries the field and
 no data until that slice hands the status page the same handle the
 administrative surface reads. Which
 components are enabled is a deployment property, so a stateless replica answers
-`200` with every component `disabled` rather than `404`. The route is bounded by
+`200` with every component `disabled` rather than `404`. A stateful replica
+observes one component today, the control plane, on the connection its
+administrative surface holds; the rest stay `disabled` until the slice owning
+each backend injects a probe, and a component moving from `disabled` to a real
+state is additive rather than a contract change. The route is bounded by
 its own fixed eight-deep diagnostic ceiling on answering — `503
 diagnostic_concurrency_exceeded` beyond it — rather than by
 `admission.max_in_flight`, so it stays answerable on a saturated or draining

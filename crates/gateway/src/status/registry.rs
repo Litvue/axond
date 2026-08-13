@@ -20,6 +20,8 @@
 //!   this map, which the request path never reads.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -57,6 +59,12 @@ pub struct StatusSettings {
 
 /// The floor on [`StatusSettings::refresh_interval`].
 pub const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often the view is exported as metrics, when a round is not exporting it
+/// anyway. Fast enough that an age crossing a rule's threshold is seen well
+/// within the rule's hold window, and it is a fixed-size export: one gauge per
+/// component, never per request.
+pub const EXPORT_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InvalidStatusSettings {
@@ -238,17 +246,24 @@ impl CachedStatusRegistry {
         StatusView { components }
     }
 
-    /// Export the current view as metrics. Called from the refresher, after a
-    /// round of observations, so ageing shows up in the gauge even for a
-    /// component nothing observed this round.
-    fn export(&self) {
-        for observed in self.view().components {
+    /// Export the current view as metrics, and return what was exported.
+    ///
+    /// Called on its own cadence rather than only after a round: a round
+    /// republishes every observation, so an export tied to one always reports an
+    /// age of about zero and `axond_status_observation_age` could never climb —
+    /// the gauge would describe the publishing loop instead of the observations.
+    /// Exporting between rounds is what makes a probe that is taking too long, or
+    /// a round that never came, visible as ageing.
+    pub(super) fn export(&self) -> StatusView {
+        let view = self.view();
+        for observed in &view.components {
             metrics::record_status_component(
                 observed.component.as_str(),
                 observed.state,
                 observed.age,
             );
         }
+        view
     }
 }
 
@@ -261,8 +276,20 @@ impl CachedStatusRegistry {
 pub trait ComponentProbe: Send + Sync {
     fn component(&self) -> Component;
 
+    /// Start one observation and return its timeout together with the future
+    /// that owns any admission lease acquired for that observation.
+    fn begin<'a>(
+        &'a self,
+        fallback: Duration,
+    ) -> (
+        Duration,
+        Pin<Box<dyn Future<Output = ComponentObservation> + Send + 'a>>,
+    ) {
+        (fallback, Box::pin(self.observe()))
+    }
+
     /// Observe the backend. Called from the background refresher only, and
-    /// bounded by [`StatusSettings::probe_timeout`]; an implementation reports
+    /// bounded by the duration returned from [`Self::begin`]; an implementation reports
     /// failure as a bounded [`StatusReason`] plus an operator-facing detail
     /// rather than propagating the backend's error type.
     async fn observe(&self) -> ComponentObservation;
@@ -292,9 +319,10 @@ impl StatusRefresher {
 
     /// Observe every probe once, concurrently, each under the probe timeout.
     pub async fn refresh_once(&self) {
-        let timeout = self.registry.settings().probe_timeout;
+        let fallback = self.registry.settings().probe_timeout;
         let observations = futures::future::join_all(self.probes.iter().map(|probe| async move {
-            match tokio::time::timeout(timeout, probe.observe()).await {
+            let (timeout, observation) = probe.begin(fallback);
+            match tokio::time::timeout(timeout, observation).await {
                 Ok(observation) => observation,
                 // An abandoned probe is an observation like any other, so a
                 // hung backend ages into `unavailable` rather than leaving the
@@ -313,9 +341,11 @@ impl StatusRefresher {
         self.registry.export();
     }
 
-    /// Refresh on the configured interval until `shutdown` resolves.
+    /// Refresh on the configured interval until `shutdown` resolves, exporting
+    /// on [`EXPORT_INTERVAL`] independently so ageing is visible between rounds.
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()> + Send) {
-        let mut ticker = tokio::time::interval(self.registry.settings().refresh_interval);
+        let refresh_interval = self.registry.settings().refresh_interval;
+        let mut ticker = tokio::time::interval(refresh_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let refreshing = async {
             loop {
@@ -323,9 +353,21 @@ impl StatusRefresher {
                 self.refresh_once().await;
             }
         };
+
+        let registry = Arc::clone(&self.registry);
+        let ageing = async move {
+            let mut ticker = tokio::time::interval(EXPORT_INTERVAL.min(refresh_interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                registry.export();
+            }
+        };
+
         tokio::select! {
             () = shutdown => {}
             () = refreshing => {}
+            () = ageing => {}
         }
     }
 }
