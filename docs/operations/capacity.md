@@ -11,7 +11,9 @@ and usage-record reconciliation — is
 
 This page qualifies the **stateless request path only** — a Tier 0 process with
 no Redis, no Postgres, and no control plane. It is not evidence about stateful
-serving, revision convergence, or any store-backed control.
+serving, revision convergence, or any store-backed control. Where that leaves
+production qualification as a whole, and which runs are retained as evidence, is
+the [qualification packet](./qualification.md).
 
 ## What the harness runs
 

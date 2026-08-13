@@ -1,0 +1,147 @@
+# A retained capacity run: what one replica did, and on what.
+#
+# Written by ops/qualification-evidence.py from the artifacts of a single
+# run; see docs/operations/qualification.md for how a record is read and
+# docs/operations/capacity.md for what the numbers mean. Two records may
+# only be compared when their provenance matches — the digests and the
+# hardware below are what makes that checkable rather than assumed.
+
+schema_version = 1
+slice = "capacity"
+tier = "heavy"
+runner = "local"
+runner_note = "8 vCPU Intel Xeon Platinum 8559C cloud VM, debug build (cargo test), unshared"
+
+[source]
+git_commit = "e62c8dede29cc7e95da1194d51ee98bc1dc179f5"
+git_dirty = false
+crate_version = "0.3.21"
+
+[binary]
+sha256 = "4f64fd0b66a78451c8e1fa2134ff46317bf6e87fe9b1dea2994111a624e0792d"
+version = "0.3.21"
+cargo_profile = "debug"
+rustc = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+
+[inputs]
+manifest = "qualification/capacity/manifest.toml"
+manifest_sha256 = "9f6e690cb8323bb51c28db5ca7f63113f29cdb9b828bbd20f3d7dd9a24a6515f"
+config_sha256 = "59d5fcee0fc90aeff0c39109970f302f9bb5b89417d057ccba8825c121429a12"
+fixtures = 8
+
+[hardware]
+os = "linux"
+arch = "x86_64"
+kernel = "5.15.200"
+cpu_model = "INTEL(R) XEON(R) PLATINUM 8559C"
+cpus = 8
+total_memory_kib = 32881112
+containerized = false
+
+[[profile]]
+id = "buffered"
+concurrency = 128
+requests = 40000
+offered = 40000
+accepted = 40000
+rejected = 0
+errors = 0
+accepted_rps = 7046.8
+latency_p50_ms = 17.38
+latency_p95_ms = 27.26
+latency_p99_ms = 33.49
+peak_rss_kib = 45184
+rss_growth_kib = 23380
+peak_sockets = 319
+cpu_seconds = 26.87
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "cancellation"
+concurrency = 300
+requests = 8000
+offered = 8000
+accepted = 8000
+rejected = 0
+errors = 0
+accepted_rps = 1597.5
+latency_p50_ms = 281.51
+latency_p95_ms = 323.12
+latency_p99_ms = 486.65
+ttft_p95_ms = 69.01
+peak_rss_kib = 56432
+rss_growth_kib = 34720
+peak_sockets = 717
+cpu_seconds = 19.61
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "mixed"
+concurrency = 128
+requests = 12000
+offered = 12000
+accepted = 12000
+rejected = 0
+errors = 0
+accepted_rps = 1363.7
+latency_p50_ms = 2.87
+latency_p95_ms = 278.50
+latency_p99_ms = 284.18
+ttft_p95_ms = 50.62
+peak_rss_kib = 40020
+rss_growth_kib = 18412
+peak_sockets = 291
+cpu_seconds = 21.82
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "response-size"
+concurrency = 64
+requests = 6000
+offered = 6000
+accepted = 6000
+rejected = 0
+errors = 0
+accepted_rps = 1112.2
+latency_p50_ms = 53.92
+latency_p95_ms = 93.98
+latency_p99_ms = 113.46
+peak_rss_kib = 67008
+rss_growth_kib = 45388
+peak_sockets = 153
+cpu_seconds = 21.97
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "streaming"
+concurrency = 300
+requests = 8000
+offered = 8000
+accepted = 8000
+rejected = 0
+errors = 0
+accepted_rps = 1022.5
+latency_p50_ms = 277.53
+latency_p95_ms = 307.99
+latency_p99_ms = 660.56
+ttft_p95_ms = 69.67
+peak_rss_kib = 50652
+rss_growth_kib = 28952
+peak_sockets = 770
+cpu_seconds = 27.67
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
