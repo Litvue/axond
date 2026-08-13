@@ -110,9 +110,14 @@ const TARGETS: &[Target] = &[
         minimum_classes: 4,
     },
     Target {
+        // Below what the corpus reaches today (8), because part of that count
+        // comes from arbitrary `Minted` decodings whose lifetime claims are
+        // compared against the wall clock: pinning the floor at the observed
+        // value would let the clock, not a regression, fail a required lane.
+        // The named scenarios below assert the time-sensitive classes exactly.
         name: "token_verify",
         run: replay_token_verify,
-        minimum_classes: 8,
+        minimum_classes: 6,
     },
 ];
 

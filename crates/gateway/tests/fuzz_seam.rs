@@ -17,11 +17,15 @@ fn module_names(relative: &str) -> Vec<String> {
     let source = fs::read_to_string(&path).expect("target root is readable");
     let mut names: Vec<String> = source
         .lines()
-        .filter_map(|line| {
+        .zip(std::iter::once("").chain(source.lines()))
+        .filter_map(|(line, previous)| {
             // Only top-level declarations of a *file* module: a nested `mod` is
             // indented, an inline `mod tests {` carries its own body rather than
             // a source file, and a `#[cfg(test)]` one belongs to whichever
-            // target runs the tests.
+            // target runs the tests rather than to the seam.
+            if previous.trim_start().starts_with("#[cfg(test)]") {
+                return None;
+            }
             let rest = line.strip_prefix("mod ")?;
             Some(rest.strip_suffix(';')?.to_owned())
         })
