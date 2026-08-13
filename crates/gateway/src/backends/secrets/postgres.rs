@@ -951,6 +951,44 @@ mod tests {
         );
     }
 
+    /// The same endpoint as `dsn`, reached as another role. The test DSN is
+    /// whatever the environment supplies, so the credentials are replaced rather
+    /// than assumed; `None` for a key/value DSN this cannot rewrite.
+    fn with_role(dsn: &str, role: &str, password: &str) -> Option<String> {
+        let (scheme, rest) = dsn.split_once("://")?;
+        if !matches!(scheme, "postgres" | "postgresql") {
+            return None;
+        }
+        let endpoint = match rest.split_once('/') {
+            // Only an `@` in the authority is credentials; one in the path or
+            // the query is not.
+            Some((authority, _)) => authority
+                .rsplit_once('@')
+                .map_or(rest, |(_, host)| &rest[authority.len() - host.len()..]),
+            None => rest.rsplit_once('@').map_or(rest, |(_, host)| host),
+        };
+        Some(format!("{scheme}://{role}:{password}@{endpoint}"))
+    }
+
+    #[test]
+    fn a_test_dsn_is_rewritten_onto_another_role_whatever_credentials_it_carried() {
+        for dsn in [
+            "postgres://postgres:secret@127.0.0.1:5432/axond",
+            "postgres://127.0.0.1:5432/axond",
+            "postgresql://someone@127.0.0.1:5432/axond?sslmode=disable",
+        ] {
+            let rewritten = with_role(dsn, "reader", "pw").expect("a URL-shaped DSN");
+            assert!(
+                rewritten.contains("://reader:pw@127.0.0.1:5432/axond"),
+                "{rewritten}"
+            );
+        }
+        assert_eq!(
+            with_role("host=127.0.0.1 user=postgres", "reader", "pw"),
+            None
+        );
+    }
+
     /// A live endpoint that refuses writes: the boot is retryable, and the error
     /// says which of the two read-only worlds it is in.
     #[tokio::test]
@@ -968,20 +1006,40 @@ mod tests {
             "axond_ro_{}",
             Uuid7Generator::new().next().to_string().replace('-', "")
         );
+        // The grant matters: without `CREATE` the role would fail the DDL on
+        // privilege too, and the test would only be passing because the server
+        // happens to check read-only-ness first.
         client
             .batch_execute(&format!(
                 "CREATE ROLE {role} LOGIN PASSWORD 'axond'; ALTER ROLE {role} SET \
-                 default_transaction_read_only = on"
+                 default_transaction_read_only = on; GRANT CREATE, USAGE ON SCHEMA public TO \
+                 {role}"
             ))
             .await
-            .expect("a role that cannot write");
+            .expect("a role that may create but cannot write");
 
-        let read_only_dsn = dsn.replace("postgres://postgres:", &format!("postgres://{role}:"));
-        let error =
-            PostgresSecrets::connect(&read_only_dsn, SecretStoreSettings::default(), kek(29))
-                .await
-                .expect_err("a read-only endpoint cannot be prepared");
+        // Everything after the role exists runs through `outcome`, so the shared
+        // test database does not keep the login role when an assertion fails.
+        let outcome = match with_role(&dsn, &role, "axond") {
+            Some(read_only_dsn) => Some(
+                PostgresSecrets::connect(&read_only_dsn, SecretStoreSettings::default(), kek(29))
+                    .await
+                    .err(),
+            ),
+            None => None,
+        };
+        client
+            .batch_execute(&format!(
+                "REVOKE ALL ON SCHEMA public FROM {role}; DROP ROLE IF EXISTS {role}"
+            ))
+            .await
+            .expect("drop the test role");
 
+        let Some(outcome) = outcome else {
+            // A key/value DSN this cannot rewrite: nothing was exercised.
+            return;
+        };
+        let error = outcome.expect("a read-only endpoint cannot be prepared");
         assert_eq!(
             error.category(),
             FailureCategory::Unavailable,
@@ -990,13 +1048,9 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("default_transaction_read_only"),
-            "the diagnosis names the setting to look at: {message}"
+            "only a `25006` carries the read-only diagnosis, so this also pins that the DDL \
+             failed on read-only-ness rather than on privilege: {message}"
         );
-
-        client
-            .batch_execute(&format!("DROP ROLE IF EXISTS {role}"))
-            .await
-            .expect("drop the test role");
     }
 
     fn kek(seed: u8) -> DeploymentKek {
