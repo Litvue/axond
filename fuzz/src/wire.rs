@@ -590,10 +590,116 @@ fn assert_no_disclosure(rendered: &str, sources: &[&str]) {
     for canary in [GATEWAY_CREDENTIAL_CANARY, PROVIDER_URL_CANARY] {
         if rendered.contains(canary) {
             assert!(
-                sources.iter().any(|source| source.contains(canary)),
+                sources.iter().any(|source| carries(source, canary)),
                 "a diagnostic disclosed {canary:?}, which no input carried"
             );
         }
+    }
+}
+
+/// Whether `source` carries `canary`, as the diagnostic built from it sees it.
+///
+/// A diagnostic is extracted with `serde_json`, which resolves string escapes,
+/// so a body spelling the canary as `\u0061xond-…` produces one that contains it
+/// while the raw source does not. Matching the raw bytes alone would call that a
+/// disclosure, which it is not: the input carried the value.
+fn carries(source: &str, canary: &str) -> bool {
+    source.contains(canary) || json_unescaped(source).contains(canary)
+}
+
+/// `source` with JSON string escapes resolved, everywhere they appear.
+///
+/// Not a JSON parse: the escapes are resolved wherever they sit, because a
+/// diagnostic may be extracted from any string in any shape of body. An escape
+/// that is not one JSON defines is left as it was written, which is the
+/// conservative direction — it can only fail to explain an occurrence, never
+/// invent one.
+fn json_unescaped(source: &str) -> String {
+    let mut unescaped = String::with_capacity(source.len());
+    let mut characters = source.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            unescaped.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('"') => unescaped.push('"'),
+            Some('\\') => unescaped.push('\\'),
+            Some('/') => unescaped.push('/'),
+            Some('b') => unescaped.push('\u{8}'),
+            Some('f') => unescaped.push('\u{c}'),
+            Some('n') => unescaped.push('\n'),
+            Some('r') => unescaped.push('\r'),
+            Some('t') => unescaped.push('\t'),
+            Some('u') => {
+                let digits: String = characters.by_ref().take(4).collect();
+                match u32::from_str_radix(&digits, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                {
+                    Some(decoded) => unescaped.push(decoded),
+                    // A lone surrogate or a truncated escape: keep it verbatim.
+                    None => {
+                        unescaped.push_str("\\u");
+                        unescaped.push_str(&digits);
+                    }
+                }
+            }
+            Some(other) => {
+                unescaped.push('\\');
+                unescaped.push(other);
+            }
+            None => unescaped.push('\\'),
+        }
+    }
+    unescaped
+}
+
+/// Prove the disclosure check reads an escaped canary as the input carrying it,
+/// rather than as a decoder having invented it.
+///
+/// The canaries sit verbatim in the seeds, so libFuzzer holds them as mutation
+/// tokens and an escaped spelling is reachable. Without this, the first one
+/// found would be reported as a leak the gateway never had.
+///
+/// # Panics
+///
+/// If an escaped canary stops being recognised as its own explanation.
+pub fn assert_disclosure_check_survives_escaping() {
+    for canary in [GATEWAY_CREDENTIAL_CANARY, PROVIDER_URL_CANARY] {
+        let mut escaped = String::from("{\"error\":{\"message\":\"");
+        for (index, character) in canary.chars().enumerate() {
+            // Escape every other character, so both the escaped and the literal
+            // spellings are exercised in one string.
+            if index % 2 == 0 && character.is_ascii() {
+                escaped.push_str(&format!("\\u{:04x}", character as u32));
+            } else if character == '"' || character == '\\' {
+                escaped.push('\\');
+                escaped.push(character);
+            } else {
+                escaped.push(character);
+            }
+        }
+        escaped.push_str("\"}}");
+        assert!(
+            !escaped.contains(canary),
+            "the escaped spelling was not escaped at all"
+        );
+        assert!(
+            carries(&escaped, canary),
+            "an escaped canary stopped explaining the diagnostic built from it"
+        );
+        // The property the check exists for: a value no input carried is still
+        // a disclosure, however it is spelled.
+        assert!(
+            !carries("{\"error\":{\"message\":\"nothing to see\"}}", canary),
+            "an unrelated body was read as carrying a canary"
+        );
+        // End to end, through the constructor a diagnostic is actually built by.
+        assert_typed_provider_error(
+            &ProviderError::from_upstream("fuzz-provider", 400, &escaped),
+            &[&escaped],
+        );
     }
 }
 

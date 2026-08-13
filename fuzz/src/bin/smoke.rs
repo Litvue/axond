@@ -613,6 +613,10 @@ fn main() {
     // every boundary it can be split on.
     axond_fuzz::assert_valid_fixtures_are_stable();
     println!("sse_decode: valid fixtures decode identically under every chunk boundary");
+    // And the leakage oracle itself: a canary spelled with JSON escapes is the
+    // input carrying it, not a decoder disclosing it.
+    axond_fuzz::assert_disclosure_check_survives_escaping();
+    println!("provider_error: an escaped canary is read as the input that carried it");
     let mut inputs = 0_usize;
     for target in TARGETS {
         let mut target_inputs = 0_usize;
