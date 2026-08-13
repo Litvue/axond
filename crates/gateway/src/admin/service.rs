@@ -371,7 +371,20 @@ impl AdminService {
             ExpectedRevision::Exactly(id) => Some(id),
         };
         let current = match base {
-            Some(id) => Some(store.load_revision(id).await.map_err(log_store)?),
+            Some(id) => match store.load_revision(id).await {
+                Ok(revision) => Some(revision),
+                // A base that is both stale and no longer retained is a lost race,
+                // not a bogus request: the caller needs the head to re-read from,
+                // which a non-retryable 404 would not give it. A missing base that
+                // *is* the head is an integrity problem, and stays one.
+                Err(ControlPlaneError::RevisionNotFound(_)) if !expected.matches(head) => {
+                    return Err(AdminError::RevisionConflict {
+                        expected,
+                        actual: head,
+                    });
+                }
+                Err(error) => return Err(log_store(error)),
+            },
             None => None,
         };
         let empty = DesiredState::new();

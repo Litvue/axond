@@ -547,6 +547,32 @@ async fn a_stale_expected_revision_conflicts_without_publishing() {
     );
 }
 
+#[tokio::test]
+async fn an_expected_revision_the_store_no_longer_has_conflicts_rather_than_404s() {
+    let store = Arc::new(InMemoryControlPlane::new());
+    let service = service(&store);
+    let head = publish_fixture(&service, "key-1").await;
+
+    // A base that is not the head and is not retained: the caller lost a race
+    // against a publication old enough to have been pruned, and needs the head.
+    let error = service
+        .apply(
+            &grant(AdminAction::Publish),
+            &request(
+                "key-2",
+                ExpectedRevision::Exactly(fixtures::revision_id(99)),
+                WriteMode::Apply,
+            ),
+            &replace_with(fixtures::state_with_renamed_alias()),
+        )
+        .await
+        .expect_err("a base that is gone is not a base");
+    assert_eq!(error.code(), "revision_conflict");
+    let envelope = serde_json::to_value(error.envelope()).expect("a serializable envelope");
+    assert_eq!(envelope["error"]["revision"], head);
+    assert_eq!(store.published_revisions(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Dry run
 // ---------------------------------------------------------------------------
