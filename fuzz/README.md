@@ -72,8 +72,8 @@ as an empty library, and this workspace's clippy skips `axond` as a path
 dependency, so nothing else here has it under `-D warnings`. And it checks the
 lockfile first and says so, rather than leaving a bare `--locked`
 error to interpret. Releases are handled for you: `release-please.yml` syncs both
-lockfiles when the workspace version changes, for whichever of the gateway crates
-this lockfile actually records.
+lockfiles when the workspace version changes, using this same command for this
+one.
 
 ## Coverage-guided runs (nightly toolchain)
 
