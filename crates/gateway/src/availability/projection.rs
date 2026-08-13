@@ -683,16 +683,19 @@ impl AvailabilityEvidence {
 /// reaches no store, so the question is answerable during exactly the outages
 /// that prompt it.
 pub trait AvailabilityReader: Send + Sync {
-    /// The index the snapshot this replica is serving carries, or `None` when it
-    /// derives no view at all.
+    /// The index the snapshot this replica is serving carries and that same
+    /// snapshot's circuits, or `None` when this replica derives no view at all.
     ///
-    /// The distinction is the point: a replica that has derived nothing must not
-    /// answer with an empty catalogue, which an operator reads as a tenant that
-    /// has lost every entitlement.
-    fn index(&self) -> Option<Arc<AvailabilityIndex>>;
-
-    /// This replica's own per-target health, as of now.
-    fn runtime(&self) -> RuntimeObservations;
+    /// One call rather than two, because the two halves must describe the same
+    /// instant: a publication landing between separate reads would pair one
+    /// revision's targets with the next revision's breaker, which has attempted
+    /// nothing and so reports every target [`RuntimeHealth::Unobserved`] — the
+    /// overlay would silently vanish mid-incident.
+    ///
+    /// `None` rather than an empty index, and the distinction is the point: a
+    /// replica that has derived nothing must not answer with an empty catalogue,
+    /// which an operator reads as a tenant that has lost every entitlement.
+    fn read(&self) -> Option<(Arc<AvailabilityIndex>, RuntimeObservations)>;
 }
 
 /// One replica's reading of a derived index: the index, and this replica's own

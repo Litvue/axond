@@ -1534,12 +1534,8 @@ struct StaticAvailability {
 }
 
 impl AvailabilityReader for StaticAvailability {
-    fn index(&self) -> Option<Arc<AvailabilityIndex>> {
-        self.index.clone()
-    }
-
-    fn runtime(&self) -> RuntimeObservations {
-        self.runtime.clone()
+    fn read(&self) -> Option<(Arc<AvailabilityIndex>, RuntimeObservations)> {
+        Some((self.index.clone()?, self.runtime.clone()))
     }
 }
 

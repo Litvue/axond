@@ -813,16 +813,15 @@ impl AppState {
 ///
 /// Both halves come from the loaded snapshot, and neither reaches a store: the
 /// index is the projection compilation attached to it, and the health is the
-/// circuits that snapshot's own requests have been tripping. Read together from
-/// one `Arc`, so an answer cannot describe one revision's targets with another
-/// revision's circuits.
+/// circuits that snapshot's own requests have been tripping. Loaded once, so an
+/// answer cannot describe one revision's targets with another revision's
+/// circuits.
 impl AvailabilityReader for AppState {
-    fn index(&self) -> Option<Arc<AvailabilityIndex>> {
-        self.config().availability_handle()
-    }
-
-    fn runtime(&self) -> RuntimeObservations {
-        RuntimeObservations::of_circuits(self.config().target_circuits.snapshot())
+    fn read(&self) -> Option<(Arc<AvailabilityIndex>, RuntimeObservations)> {
+        let snapshot = self.config();
+        let index = snapshot.availability_handle()?;
+        let runtime = RuntimeObservations::of_circuits(snapshot.target_circuits.snapshot());
+        Some((index, runtime))
     }
 }
 

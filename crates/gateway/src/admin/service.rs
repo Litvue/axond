@@ -452,11 +452,9 @@ impl AdminService {
         // Attached but deriving nothing is still deriving nothing: a replica whose
         // snapshot carries no projection says so, rather than answering with an
         // empty list of targets an operator would read as a lost entitlement.
-        let Some((reader, index)) = reader.and_then(|reader| Some((reader, reader.index()?)))
-        else {
+        let Some((index, runtime)) = reader.and_then(AvailabilityReader::read) else {
             return Ok(AvailabilityResult::underived(scope));
         };
-        let runtime = reader.runtime();
         let targets =
             AvailabilityView::new(&index, &runtime).evaluate_inherited_scope(reference, now);
         let status = if grant.scope() == &ResourceScope::Deployment {
