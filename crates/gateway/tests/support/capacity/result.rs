@@ -521,6 +521,10 @@ pub struct Tenancy {
 pub struct TenantCounts {
     pub offered: u64,
     pub accepted: u64,
+    /// Everything the replica took on rather than shed, whatever became of it:
+    /// the denominator the isolation counts are measured against, because a
+    /// request that failed after dispatch still spent its owner's credential.
+    pub dispatched: u64,
     pub rejected: u64,
     pub usage_records: u64,
     /// Requests the upstream saw bearing this namespace's own credential. The

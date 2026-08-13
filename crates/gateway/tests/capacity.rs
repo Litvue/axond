@@ -591,6 +591,18 @@ fn assert_expected_outcomes(profile: &capacity::Profile, result: &CapacityResult
                     profile.id,
                     tenant.namespace
                 );
+                // The isolation counts are measured against what the replica
+                // dispatched rather than what it served, so that an upstream
+                // failure reads as a failure rather than as a crossed
+                // credential. This profile has no faults in it, so the two are
+                // the same number — and the equality is what keeps the
+                // one-directional counts as strict here as an exact match.
+                assert_eq!(
+                    counts.dispatched, counts.accepted,
+                    "{}: {} lost a dispatched request, so its isolation counts \
+                     are measured against a load it did not carry",
+                    profile.id, tenant.namespace
+                );
             }
             assert!(
                 result.ttft_ms.is_some(),

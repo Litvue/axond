@@ -708,10 +708,14 @@ async fn recovery_probe(client: &reqwest::Client, base_url: &str, gauges: &Gauge
 
 /// Who was served, who was charged, and whose credential paid for it.
 ///
-/// Every count here is per namespace and exact over the whole run. A tenant
-/// served with another tenant's key would show as a credential used more often
-/// than its owner was served; a row filed against the wrong tenant would show
-/// as a namespace charged for requests it did not send.
+/// Every count here is per namespace and exact over the whole run, and the two
+/// isolation counts are deliberately one-directional: what they measure is a
+/// tenant's credential used *more* often than that tenant dispatched, and a
+/// namespace charged for *more* requests than it sent. Fewer of either is a
+/// request that failed before it got that far — already a threshold breach of
+/// its own, and not a crossing. Inferring a crossing from any inequality would
+/// report an ordinary upstream failure as a leak between customers, which is
+/// the one finding an operator must be able to trust.
 fn tenancy(
     attempts: &[Attempt],
     records: &[Value],
@@ -728,19 +732,25 @@ fn tenancy(
                     && matches!(a.outcome, Outcome::Accepted | Outcome::Cancelled)
             })
             .count() as u64;
+        // Everything the replica took on: a shed request never reaches an
+        // upstream or accounting, and everything else may.
+        let dispatched = attempts
+            .iter()
+            .filter(|a| a.namespace == tenant.namespace && a.outcome != Outcome::Rejected)
+            .count() as u64;
         let usage_records = records
             .iter()
             .filter(|record| record["namespace"].as_str() == Some(tenant.namespace))
             .count() as u64;
         // The fake sees the raw secret; the record keeps the namespace it
         // belongs to and the count, never the value.
-        let upstream_calls = presented_credentials
+        let upstream_calls: u64 = presented_credentials
             .iter()
             .filter(|(presented, _)| presented.contains(tenant.upstream_key))
             .map(|(_, calls)| *calls)
             .sum();
-        foreign_credential_uses += accepted.abs_diff(upstream_calls);
-        misattributed_usage_records += accepted.abs_diff(usage_records);
+        foreign_credential_uses += upstream_calls.saturating_sub(dispatched);
+        misattributed_usage_records += usage_records.saturating_sub(dispatched);
         by_namespace.insert(
             tenant.namespace.to_owned(),
             TenantCounts {
@@ -749,6 +759,7 @@ fn tenancy(
                     .filter(|a| a.namespace == tenant.namespace)
                     .count() as u64,
                 accepted,
+                dispatched,
                 rejected: attempts
                     .iter()
                     .filter(|a| a.namespace == tenant.namespace && a.outcome == Outcome::Rejected)
