@@ -11,7 +11,7 @@ decomposes into five slices. They landed, and will land, at different depths:
 | --- | --- | --- | --- |
 | `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `evidenced` | Driver, eight committed profiles — including multi-tenant isolation, admission shedding, and a bounded stalling backend — reduced tier on every change, heavy tier on demand, and two retained runs. |
 | `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Driver and committed mix; the smoke tier runs in CI. The 12–24 hour tier has never been dispatched. |
-| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `declared` | A committed scenario contract and a test that keeps it honest. No driver: stateful serving is not assembled yet. |
+| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver, committed scenarios, and nine stages running against a real Postgres in two lanes — the outage, the cold boots, convergence, a logical restore, and a point-in-time recovery. Every scenario still has a blocked stage: stateful serving is not assembled yet. |
 | `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `unbuilt` | Nothing. The fake upstream already injects the provider faults a matrix would drive. |
 | `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver, committed scenarios, and a reduced tier in CI. The heavy tier has never been dispatched, and mixed-version serving waits on a stateful replica. |
 
@@ -102,8 +102,11 @@ number is a regression rather than a different machine.
   hours can exercise (`max_rss_drift_kib_per_hour` and its neighbours) have no
   run behind them, so the soak tier is a declared bound rather than a measured
   one.
-- **`recovery`** — a driver, which waits on the resource slices that give a
-  stateful replica something to serve. The packet mirrors the manifest's own
+- **`recovery`** — every stage that needs a served request: serving through the
+  outage, from a restored cache, and across a recovery, plus the rotation whose
+  evidence is a request authenticated with rotated material. They wait on the
+  resource slices that give a stateful replica something to serve. The durable
+  half runs today in both lanes. The packet mirrors the manifest's own
   dependency map and is tested against it, so landing a slice moves both.
 - **`fault`** — a manifest and a driver. The provider rows are unblocked today;
   the backend rows need a stateful replica to fail.
@@ -127,8 +130,9 @@ and why no capacity profile claims it.
   SLOs, and what a capacity run gates on.
 - [Endurance qualification](./endurance.md) — the mixed-workload soak and the
   leak and accounting properties it gates on.
-- [Recovery qualification](./recovery-qualification.md) — the declared stateful
-  outage, cold-boot, convergence, rotation, and restore scenarios.
+- [Recovery qualification](./recovery-qualification.md) — the stateful outage,
+  cold-boot, convergence, rotation, and restore scenarios, the two lanes that
+  run them, and what each retains.
 - [Upgrades and rollback](./upgrades.md) — the compatibility and rollback rules
   the rollout slice will qualify.
 - [ADR 0033](../adr/0033-capacity-qualification-harness.md) — why a run is

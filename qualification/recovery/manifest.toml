@@ -27,6 +27,20 @@
 # still declares the evidence it will retain, so landing the dependency is a
 # matter of writing the driver rather than of deciding what the stage means.
 #
+# `runner` names the lane that executes a stage, and only an executable stage
+# has one. Two drivers, because the two halves need different machinery:
+#
+#   * `stateful-tests` — the in-process driver in `qualification::recovery`,
+#     which cuts the TCP path to a real journal. It can sever a link; it cannot
+#     take a base backup or promote a recovered cluster.
+#   * `restore-drill` — `ops/restore-drill.sh`, which runs a real PostgreSQL with
+#     WAL archiving under Docker, publishes through `axond admin` against a
+#     running replica, and recovers it two ways.
+#
+# Both lanes write the same artifact schema to `target/recovery/`, and
+# `ops/check-recovery-evidence.py --runner <lane>` fails a lane whose executable
+# stages left no artifact, so "the stage ran" is checked rather than assumed.
+#
 # `gate` fields are the hard failures, and they are deliberately restricted to
 # properties that do not move with the machine: whether requests were still
 # answered, whether the replica converged inside its declared bound, how much
@@ -48,7 +62,7 @@
 # ceiling is evaluated against requests that were actually offered rather than
 # passing by default.
 
-schema_version = 2
+schema_version = 3
 
 # ── Serving through the outage ───────────────────────────────────────────────
 
@@ -72,6 +86,7 @@ max_unauthenticated_admin_successes = 0
 [[scenario.stage]]
 id = "journal-outage"
 status = "executable"
+runner = "stateful-tests"
 covers = """
 The link to a real Postgres journal is severed under a converged replica: the \
 active revision is retained, an administrative publish fails retryably without \
@@ -127,6 +142,7 @@ max_unauthenticated_admin_successes = 0
 [[scenario.stage]]
 id = "cold-boot"
 status = "executable"
+runner = "stateful-tests"
 covers = """
 A replica with a cache exported from a real revision boots with the journal \
 unreachable: bootstrap succeeds from the signed cache, the restored revision is \
@@ -164,6 +180,7 @@ max_unauthenticated_admin_successes = 0
 [[scenario.stage]]
 id = "cold-boot"
 status = "executable"
+runner = "stateful-tests"
 covers = """
 The same boot with no cache file at all: bootstrap refuses with the unreachable \
 control plane as its reason, and nothing is published — no empty configuration \
@@ -201,6 +218,7 @@ max_unauthenticated_admin_successes = 0
 [[scenario.stage]]
 id = "cold-boot"
 status = "executable"
+runner = "stateful-tests"
 covers = """
 Every way a cache can fail its authentication — an edited record, a foreign \
 signing key, a truncated file — refuses the boot and names the cache, and none \
@@ -241,6 +259,7 @@ max_unauthenticated_admin_successes = 0
 [[scenario.stage]]
 id = "journal-recovery"
 status = "executable"
+runner = "stateful-tests"
 covers = """
 The link is restored under the replica that survived the outage and the one that \
 booted from cache: administrative writes are accepted again, both converge to \
@@ -338,44 +357,61 @@ max_unauthenticated_admin_successes = 0
 
 [[scenario.stage]]
 id = "restore"
+status = "executable"
+runner = "restore-drill"
+covers = """
+A deployment is built through `axond admin` against a running replica, backed \
+up while that replica administers it, and restored into a database it never \
+wrote: the revision chain, its checksums, the tenancy and access projections, \
+the credential references, and the audit rows all come back, a replica booted \
+on the restored journal reads the same head, and a publication against that \
+head is accepted."""
+evidence = ["outage_timeline", "revisions", "restore_duration"]
+
+[[scenario.stage]]
+id = "administration"
+status = "executable"
+runner = "restore-drill"
+covers = """
+The audit trail across the backup and the restore, read back through the \
+authenticated administrative surface of a replica booted on the restored \
+database — and refused, on the same surface, without a credential."""
+evidence = ["audit_auth"]
+
+[[scenario.stage]]
+id = "durable-inventory"
 status = "blocked"
 covers = """
-Taking a backup while the fleet serves, losing the database, restoring it, and \
-naming what came back: revisions, tenancy, secret metadata, pricing, and audit \
-rows, with the head revision hydrating from the restored journal."""
-evidence = ["outage_timeline", "revisions", "restore_duration", "data_loss_boundary"]
-
-[[scenario.stage.blocked_on]]
-issue = 144
-needs = "durable tenants, projects, principals, RBAC, and audit boundaries, so a restore has tenancy and audit state to compare rather than only a revision chain"
+The durable state a restore has to bring back beyond the journal and its \
+tenancy: wrapped secret material and its lifecycle, imported catalogue \
+snapshots, and effective-dated price books. Named per class rather than \
+counted, because a restore that brought back the revisions and lost the \
+material they reference is a restore that reads as complete."""
+evidence = ["data_loss_boundary"]
 
 [[scenario.stage.blocked_on]]
 issue = 145
-needs = "stored secret metadata, so the restore is checked to bring wrapped material and its lifecycle back with the revisions that reference it"
+needs = "the staging and rotation path for wrapped material, so a restore can be checked to bring secret metadata and its lifecycle back with the credentials that reference it"
 
 [[scenario.stage.blocked_on]]
 issue = 146
-needs = "imported catalogue snapshots, so a restored revision's blob references point at content that has to survive with it"
+needs = "an operator path that imports a catalogue snapshot, so a restored revision's blob references point at content that has to survive with it"
 
 [[scenario.stage.blocked_on]]
 issue = 147
-needs = "effective-dated price books, so the restore covers pricing state and not only routing state"
-
-[[scenario.stage.blocked_on]]
-issue = 158
-needs = "the operator restore procedure this scenario rehearses"
+needs = "effective-dated price books, so the restore covers pricing state and not only routing and tenancy state"
 
 [[scenario.stage]]
 id = "reconvergence"
 status = "blocked"
 covers = """
 The replicas that kept serving converging onto the restored journal, and the \
-traffic and audit trail that says they did so without fighting it."""
-evidence = ["serving_behavior", "convergence_lag", "audit_auth"]
+traffic that says they did so without fighting it."""
+evidence = ["serving_behavior", "convergence_lag"]
 
 [[scenario.stage.blocked_on]]
 issue = 148
-needs = "a projection, so a replica converging onto a restored journal is observable in what it serves"
+needs = "a projection and the reconciler that publishes it in `serve`, so a replica converging onto a restored journal is observable in what it serves rather than only in what it reads"
 
 [[scenario]]
 id = "point-in-time-recovery"
@@ -400,33 +436,47 @@ max_unauthenticated_admin_successes = 0
 
 [[scenario.stage]]
 id = "recovery"
+status = "executable"
+runner = "restore-drill"
+covers = """
+A base backup and archived WAL recovered to a target taken between two \
+publications, and the boundary measured in both directions: every revision \
+committed before the target is present in the promoted cluster, the revision \
+published after it is absent, the head is the pre-target revision, and a \
+replica booted on the recovered database reads that head and accepts a \
+publication against it."""
+evidence = ["outage_timeline", "revisions", "restore_duration"]
+
+[[scenario.stage]]
+id = "administration"
+status = "executable"
+runner = "restore-drill"
+covers = """
+The audit trail that survived the recovery target, read back through the \
+authenticated administrative surface of a replica booted on the promoted \
+cluster — and refused there without a credential."""
+evidence = ["audit_auth"]
+
+[[scenario.stage]]
+id = "usage-boundary"
 status = "blocked"
 covers = """
-Recovering a database with archiving enabled to a chosen target, and measuring \
-the boundary: what was published before the target survived, and what was \
-published after it did not."""
-evidence = ["outage_timeline", "revisions", "restore_duration", "data_loss_boundary"]
+The same boundary measured over usage: which usage records survived the \
+recovery target, and under which identity a replayed request is the same \
+request."""
+evidence = ["data_loss_boundary"]
 
 [[scenario.stage.blocked_on]]
 issue = 155
 needs = "the explicit decision on the durable usage outbox and globally unique request ids: whether a recovery boundary is measured over usage records at all, and against which identity"
 
-[[scenario.stage.blocked_on]]
-issue = 158
-needs = "the operator recovery procedure, including which PITR target an operator is told to choose"
-
-[[scenario.stage.blocked_on]]
-issue = 159
-needs = "the hardened workflow this scenario's lane runs in, since a recovery lane runs a database with archiving enabled and publishes its evidence as an artifact"
-
 [[scenario.stage]]
 id = "reconvergence"
 status = "blocked"
 covers = """
-Serving across the recovery and converging onto the recovered head, with the \
-audit trail that survived the target."""
-evidence = ["serving_behavior", "convergence_lag", "audit_auth"]
+Serving across the recovery and converging onto the recovered head."""
+evidence = ["serving_behavior", "convergence_lag"]
 
 [[scenario.stage.blocked_on]]
 issue = 148
-needs = "a projection, so serving across a point-in-time recovery is measured rather than assumed"
+needs = "a projection and the reconciler that publishes it in `serve`, so serving across a point-in-time recovery is measured rather than assumed"

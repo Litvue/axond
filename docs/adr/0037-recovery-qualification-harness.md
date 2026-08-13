@@ -161,3 +161,48 @@ Consequences of the amendment:
 - Landing #148 and #149 unblocks the serving stages of scenarios whose
   control-plane stages already pass, so those scenarios flip to executable
   without their outage behaviour being re-litigated.
+
+## Amendment: two lanes, and evidence that survives its own failure
+
+Date: 2026-08-13
+
+Two things the first amendment left implicit turned out to matter once the
+restore half became executable.
+
+**A stage names the lane that runs it.** The durable half of `backup-restore`
+and `point-in-time-recovery` cannot run inside the in-process driver: it needs a
+database that is dumped, dropped, restored, and recovered to a target, and a
+*second* replica booted on the result to read it. That is a shell drill around
+Docker, not a `cargo test`. So the manifest gained a `runner` field —
+`stateful-tests` or `restore-drill` — and `ops/restore-drill.sh` became the
+second lane rather than a drill standing beside the harness. It publishes the
+state a recovery has to bring back through `axond admin apply` against a running
+replica, so what is restored is a deployment a replica produced rather than rows
+this script invented, and it writes the same artifact schema through
+`ops/recovery-evidence.py`. A stage that names no lane, and a lane that owns no
+stage, both fail the contract test.
+
+**A stage that fails must still leave its evidence.** The first driver asserted
+its conditions, so a genuine regression unwound the stage before its artifact
+was written — a missing file, which is the one failure mode a retained evidence
+directory cannot describe, and which CI's `if-no-files-found: warn` then reads
+as nothing to upload. Conditions are now *recorded* as checks and judged at the
+end of the stage: a failing stage writes an artifact naming the check, its
+bound, and what was observed, and fails afterwards. `ops/check-recovery-evidence.py`
+closes the other end by reading the manifest as the list of artifacts each lane
+owes, refusing a missing file, a foreign schema, a wrong lane, a failed verdict,
+an empty timeline, or an artifact carrying a forbidden string. It is run in both
+lanes in CI, and its own `--self-test` keeps it from degenerating into a checker
+that accepts everything.
+
+Consequences of the amendment:
+
+- Nine stages produce evidence: five in-process, four in the restore lane.
+- The drill's credential and cache-signing key are generated per run and never
+  printed, and the checker is given both, so an artifact that leaked one fails
+  the lane instead of being uploaded.
+- The restore lane qualifies the revision journal, its checksums, the tenancy
+  and access projections, the credential references, and the audit rows. Wrapped
+  secret material, catalogue snapshots, price books, and usage records are named
+  as the blocked `durable-inventory` and `usage-boundary` stages rather than
+  implied by a restore that "came back".

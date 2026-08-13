@@ -72,11 +72,15 @@ use crate::desired_state::{
 use crate::state::AppState;
 use crate::usage::{UsageFanout, UsageSink};
 
+/// The lane this driver is, as the manifest spells it.
+pub(crate) const RUNNER: &str = "stateful-tests";
+
 /// The stages this driver runs, as `scenario/stage`.
 ///
 /// The honesty gate for the whole harness: a manifest stage marked `executable`
-/// that is not in this list, or a stage in this list the manifest still calls
-/// blocked, fails [`the_driver_runs_exactly_the_stages_the_manifest_calls_executable`].
+/// under this driver's [`RUNNER`] that is not in this list, or a stage in this
+/// list the manifest still calls blocked, fails
+/// [`the_driver_runs_exactly_the_stages_the_manifest_calls_executable`].
 /// A recovery claim is only as good as the code behind it, and this is the one
 /// place the two are compared.
 pub(crate) const DRIVEN_STAGES: [&str; 5] = [
@@ -112,6 +116,11 @@ struct Scenario {
 struct Stage {
     id: String,
     status: String,
+    /// The lane that runs the stage. This driver is one of two, so it claims
+    /// only the stages that name it — the restore and PITR stages belong to
+    /// `ops/restore-drill.sh`, which needs a cluster it can promote.
+    #[serde(default)]
+    runner: Option<String>,
     evidence: Vec<String>,
 }
 
@@ -233,6 +242,7 @@ impl StageSpec {
         let mut recorder = Recorder::new(
             &self.scenario,
             &self.stage,
+            RUNNER,
             &self.capability,
             &classes,
             &deployment.schema,
@@ -596,6 +606,47 @@ fn cache(name: &str) -> LastKnownGood {
     LastKnownGood::new(cache_path(name), KEY).expect("a long enough signing key")
 }
 
+// ── Failing through the artifact ─────────────────────────────────────────────
+
+/// The step this stage cannot continue past, as a recorded check rather than an
+/// unwind: on the failing side the check is written, the artifact is finished,
+/// and the stage returns.
+///
+/// An `expect` here would panic mid-stage and take the evidence with it, which
+/// is the failure mode a retained evidence directory cannot describe — the
+/// regression arrives as a missing file rather than as an artifact saying which
+/// step failed and what came before it.
+macro_rules! demand_ok {
+    ($recorder:expr, $check:expr, $result:expr, $detail:expr) => {
+        match $result {
+            Ok(value) => {
+                $recorder.require_that($check, true, $detail);
+                value
+            }
+            Err(error) => {
+                $recorder.require_that($check, false, format!("{}: refused with {error}", $detail));
+                return finish($recorder);
+            }
+        }
+    };
+}
+
+/// The same, for a step whose whole point is that it is refused.
+macro_rules! demand_err {
+    ($recorder:expr, $check:expr, $result:expr, $detail:expr) => {
+        match $result {
+            Err(error) => {
+                $recorder.require_that($check, true, $detail);
+                error
+            }
+            Ok(_) => {
+                $recorder.require_that($check, false, format!("{}: it succeeded", $detail));
+                return finish($recorder);
+            }
+        }
+    };
+}
+
 // ── The stages ───────────────────────────────────────────────────────────────
 
 /// `control-plane-outage/journal-outage`: a converged replica loses the journal.
@@ -614,23 +665,33 @@ async fn control_plane_outage_journal_outage() {
     let mut recorder = spec.recorder(&deployment);
 
     let administrator = deployment.administrator().await;
-    let baseline = publish(
-        &administrator,
-        ExpectedRevision::Empty,
-        "recovery-baseline",
-        deployment.materialized(fixtures::state()).await,
-    )
-    .await
-    .expect("the journal accepts the baseline revision");
+    let baseline = demand_ok!(
+        recorder,
+        "the_journal_accepts_the_baseline",
+        publish(
+            &administrator,
+            ExpectedRevision::Empty,
+            "recovery-baseline",
+            deployment.materialized(fixtures::state()).await,
+        )
+        .await,
+        "a baseline revision is published before the cut"
+    );
     recorder.mark("published", format!("baseline revision {}", baseline.id));
 
     let replica = Replica::build(&deployment, None).await;
-    let active = replica
-        .reconciler
-        .bootstrap()
-        .await
-        .expect("the replica converges before the outage");
-    assert_eq!(active, baseline.id);
+    let active = demand_ok!(
+        recorder,
+        "the_replica_converges_before_the_outage",
+        replica.reconciler.bootstrap().await,
+        "the replica reaches the baseline while the journal is reachable"
+    );
+    recorder.require(
+        "the_replica_converged_on_the_baseline",
+        baseline.id,
+        active,
+        "the snapshot the outage must not cost is the baseline",
+    );
     let generation_before = replica.generation();
     let aliases_before = replica.served_aliases();
     recorder.mark("converged", format!("active revision {active}"));
@@ -643,16 +704,20 @@ async fn control_plane_outage_journal_outage() {
         "the loopback path to the journal was dropped mid-flight; reconnection is refused",
     );
 
-    let refusal = publish(
-        &administrator,
-        ExpectedRevision::Exactly(baseline.id),
-        "recovery-during-outage",
-        deployment
-            .materialized(fixtures::state_with_renamed_alias())
-            .await,
-    )
-    .await
-    .expect_err("an administrative write cannot succeed without the journal");
+    let refusal = demand_err!(
+        recorder,
+        "the_publish_is_refused_during_the_outage",
+        publish(
+            &administrator,
+            ExpectedRevision::Exactly(baseline.id),
+            "recovery-during-outage",
+            deployment
+                .materialized(fixtures::state_with_renamed_alias())
+                .await,
+        )
+        .await,
+        "an administrative write cannot succeed without the journal"
+    );
     let category = category_reason(refusal.category());
     recorder.mark("publish-refused", format!("{category}: {refusal}"));
     recorder.observe("admin_write_outcome", category);
@@ -664,10 +729,12 @@ async fn control_plane_outage_journal_outage() {
     let outcome = replica.reconciler.converge_once("qualification").await;
     recorder.mark("convergence-failed", format!("{outcome:?}"));
     let report = replica.reconciler.report();
-    let rejection = report
-        .last_rejection
-        .as_ref()
-        .expect("a failed attempt is reported");
+    let rejection = demand_ok!(
+        recorder,
+        "the_failed_attempt_is_reported",
+        report.last_rejection.as_ref().ok_or("nothing was reported"),
+        "a replica that cannot read the journal says so rather than going quiet"
+    );
     recorder.observe("convergence_rejection_reason", rejection.reason);
     // Zero, and the artifact says so rather than omitting the class the manifest
     // promises: a replica that cannot read desired state cannot know it is
@@ -688,11 +755,37 @@ async fn control_plane_outage_journal_outage() {
 
     // What the outage must not have cost: the compiled snapshot the replica was
     // already serving.
-    assert_eq!(report.active, Some(baseline.id));
-    assert_eq!(replica.generation(), generation_before);
-    assert_eq!(replica.served_aliases(), aliases_before);
-    assert_eq!(rejection.reason, "unavailable");
-    assert!(BackendFailure::retryable(&refusal));
+    recorder.require(
+        "the_active_revision_survives_the_cut",
+        baseline.id,
+        report
+            .active
+            .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+        "the outage degrades change, not what is already serving",
+    );
+    recorder.require(
+        "the_snapshot_generation_does_not_move",
+        generation_before,
+        replica.generation(),
+        "no snapshot was swapped in during the outage",
+    );
+    recorder.require(
+        "the_served_aliases_do_not_change",
+        aliases_before.join(","),
+        replica.served_aliases().join(","),
+        "the routing the replica answers with is the one it converged on",
+    );
+    recorder.require(
+        "the_rejection_names_the_unavailable_journal",
+        "unavailable",
+        rejection.reason,
+        "an unreachable journal is a retryable condition, not an invalid revision",
+    );
+    recorder.require_that(
+        "the_refused_publish_is_retryable",
+        BackendFailure::retryable(&refusal),
+        "a caller is told to retry rather than to change the request",
+    );
 
     recorder.gate(
         "admin_writes",
@@ -749,23 +842,29 @@ async fn cold_boot_valid_cache_cold_boot() {
     let mut recorder = spec.recorder(&deployment);
 
     let administrator = deployment.administrator().await;
-    let baseline = publish(
-        &administrator,
-        ExpectedRevision::Empty,
-        "cold-boot-cache",
-        deployment.materialized(fixtures::state()).await,
-    )
-    .await
-    .expect("the journal accepts the baseline revision");
+    let baseline = demand_ok!(
+        recorder,
+        "the_journal_accepts_the_baseline",
+        publish(
+            &administrator,
+            ExpectedRevision::Empty,
+            "cold-boot-cache",
+            deployment.materialized(fixtures::state()).await,
+        )
+        .await,
+        "a baseline revision is published before the cache is exported"
+    );
 
     // A converged replica exports its cache; the booting replica reads that file.
     let seeded = cache("valid");
     let path = seeded.path().to_path_buf();
     let warm = Replica::build(&deployment, Some(seeded)).await;
-    warm.reconciler
-        .bootstrap()
-        .await
-        .expect("the seeding replica converges");
+    demand_ok!(
+        recorder,
+        "the_seeding_replica_converges",
+        warm.reconciler.bootstrap().await,
+        "the cache under test is one a converged replica exported"
+    );
     recorder.mark(
         "cache-exported",
         format!("revision {} written to the signed cache", baseline.id),
@@ -786,11 +885,12 @@ async fn cold_boot_valid_cache_cold_boot() {
     );
 
     let started = Instant::now();
-    let restored = booting
-        .reconciler
-        .bootstrap()
-        .await
-        .expect("a signed cache is a servable snapshot when the journal is unreachable");
+    let restored = demand_ok!(
+        recorder,
+        "the_cold_boot_restores_from_the_cache",
+        booting.reconciler.bootstrap().await,
+        "a signed cache is a servable snapshot when the journal is unreachable"
+    );
     let took = started.elapsed();
     let report = booting.reconciler.report();
     recorder.mark(
@@ -813,10 +913,33 @@ async fn cold_boot_valid_cache_cold_boot() {
     );
     recorder.observe("snapshot_generation_after_cold_boot", booting.generation());
 
-    assert_eq!(restored, baseline.id);
-    assert_eq!(report.source, Some(SnapshotSource::LastKnownGood));
-    assert_eq!(report.active, Some(baseline.id));
-    assert!(!booting.served_aliases().is_empty());
+    recorder.require(
+        "the_restored_revision_is_the_cached_one",
+        baseline.id,
+        restored,
+        "the boot restored the revision the previous replica exported",
+    );
+    recorder.require(
+        "the_snapshot_came_from_the_cache",
+        SnapshotSource::LastKnownGood.as_str(),
+        report
+            .source
+            .map_or("none", crate::convergence::SnapshotSource::as_str),
+        "the journal was unreachable, so the only lawful source is the signed cache",
+    );
+    recorder.require(
+        "the_active_revision_is_the_cached_one",
+        baseline.id,
+        report
+            .active
+            .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+        "the replica reports what it restored",
+    );
+    recorder.require_that(
+        "the_restored_snapshot_routes_somewhere",
+        !booting.served_aliases().is_empty(),
+        "a snapshot with no aliases is an empty configuration wearing a revision id",
+    );
 
     recorder.gate(
         "readiness",
@@ -874,14 +997,19 @@ async fn cold_boot_no_cache_cold_boot() {
     let mut recorder = spec.recorder(&deployment);
 
     let administrator = deployment.administrator().await;
-    publish(
-        &administrator,
-        ExpectedRevision::Empty,
-        "cold-boot-no-cache",
-        deployment.materialized(fixtures::state()).await,
-    )
-    .await
-    .expect("the journal accepts the baseline revision");
+    demand_ok!(
+        recorder,
+        "the_journal_accepts_the_baseline",
+        publish(
+            &administrator,
+            ExpectedRevision::Empty,
+            "cold-boot-no-cache",
+            deployment.materialized(fixtures::state()).await,
+        )
+        .await,
+        "there is desired state to serve, so the refusal is about the cut and not about an empty \
+         journal"
+    );
 
     let booting = Replica::build(&deployment, None).await;
     let generation_before = booting.generation();
@@ -894,11 +1022,12 @@ async fn cold_boot_no_cache_cold_boot() {
     );
 
     let started = Instant::now();
-    let error = booting
-        .reconciler
-        .bootstrap()
-        .await
-        .expect_err("a replica with no cache and no journal has nothing to serve");
+    let error = demand_err!(
+        recorder,
+        "the_cold_boot_is_refused",
+        booting.reconciler.bootstrap().await,
+        "a replica with no cache and no journal has nothing to serve"
+    );
     let took = started.elapsed();
     recorder.mark("cold-boot-refused", error.to_string());
     recorder.observe("cold_start_outcome", "refused");
@@ -907,14 +1036,24 @@ async fn cold_boot_no_cache_cold_boot() {
     recorder.observe("snapshot_generation_after_cold_boot", booting.generation());
 
     let refused_for_the_journal = matches!(error, BootstrapError::Unavailable { .. });
-    assert!(
+    recorder.require_that(
+        "the_refusal_names_the_unreachable_journal",
         refused_for_the_journal,
-        "the refusal must name the unreachable control plane: {error}"
+        format!("an operator is told which dependency is missing: {error}"),
     );
     // Nothing was published: the replica is refusing, not serving an empty
     // configuration behind a failing probe.
-    assert_eq!(booting.generation(), generation_before);
-    assert!(booting.reconciler.report().active.is_none());
+    recorder.require(
+        "the_snapshot_generation_does_not_move",
+        generation_before,
+        booting.generation(),
+        "a refusing replica publishes nothing, not even an empty configuration",
+    );
+    recorder.require_that(
+        "no_revision_is_reported_active",
+        booting.reconciler.report().active.is_none(),
+        "a replica that never converged claims no active revision",
+    );
 
     recorder.gate(
         "readiness",
@@ -971,26 +1110,37 @@ async fn cold_boot_invalid_cache_cold_boot() {
     let mut recorder = spec.recorder(&deployment);
 
     let administrator = deployment.administrator().await;
-    publish(
-        &administrator,
-        ExpectedRevision::Empty,
-        "cold-boot-invalid",
-        deployment.materialized(fixtures::state()).await,
-    )
-    .await
-    .expect("the journal accepts the baseline revision");
+    demand_ok!(
+        recorder,
+        "the_journal_accepts_the_baseline",
+        publish(
+            &administrator,
+            ExpectedRevision::Empty,
+            "cold-boot-invalid",
+            deployment.materialized(fixtures::state()).await,
+        )
+        .await,
+        "the cache under test is damaged from an authentic one, not invented"
+    );
 
     // One authentic cache, exported by a converged replica, then damaged three
     // ways.
     let seeded = cache("invalid");
     let authentic = seeded.path().to_path_buf();
     let warm = Replica::build(&deployment, Some(seeded)).await;
-    warm.reconciler
-        .bootstrap()
-        .await
-        .expect("the seeding replica converges");
+    demand_ok!(
+        recorder,
+        "the_seeding_replica_converges",
+        warm.reconciler.bootstrap().await,
+        "an authentic cache is exported before it is damaged"
+    );
     drop(warm);
-    let bytes = std::fs::read(&authentic).expect("the exported cache is readable");
+    let bytes = demand_ok!(
+        recorder,
+        "the_exported_cache_is_readable",
+        std::fs::read(&authentic),
+        "the damaged variants are made from the file the replica wrote"
+    );
     recorder.mark("cache-exported", format!("{} bytes", bytes.len()));
 
     let mut edited = bytes.clone();
@@ -1035,19 +1185,34 @@ async fn cold_boot_invalid_cache_cold_boot() {
     for (variant, path, booting) in booting {
         let generation_before = booting.generation();
 
-        let error = booting
-            .reconciler
-            .bootstrap()
-            .await
-            .expect_err("a cache that fails its authentication is not a snapshot");
-        let cache_refused = matches!(error, BootstrapError::Cache { .. });
-        assert!(
-            cache_refused,
-            "{variant}: the refusal must name the cache rather than the journal: {error}"
+        let error = demand_err!(
+            recorder,
+            "the_unauthentic_cache_is_refused",
+            booting.reconciler.bootstrap().await,
+            format!("{variant}: a cache that fails its authentication is not a snapshot")
         );
-        assert_eq!(booting.generation(), generation_before);
-        assert!(booting.reconciler.report().active.is_none());
-        refusals += 1;
+        let cache_refused = matches!(error, BootstrapError::Cache { .. });
+        recorder.require_that(
+            "the_refusal_names_the_cache",
+            cache_refused,
+            format!(
+                "{variant}: an operator is told the cache is the problem, not the journal: {error}"
+            ),
+        );
+        recorder.require(
+            "the_snapshot_generation_does_not_move",
+            generation_before,
+            booting.generation(),
+            format!("{variant}: nothing unauthentic reached the served snapshot"),
+        );
+        recorder.require_that(
+            "no_revision_is_reported_active",
+            booting.reconciler.report().active.is_none(),
+            format!("{variant}: the replica claims no active revision after refusing"),
+        );
+        if cache_refused {
+            refusals += 1;
+        }
 
         recorder.mark(
             &format!("cold-boot-refused-{variant}"),
@@ -1118,29 +1283,35 @@ async fn recovery_convergence_journal_recovery() {
     let mut recorder = spec.recorder(&deployment);
 
     let administrator = deployment.administrator().await;
-    let baseline = publish(
-        &administrator,
-        ExpectedRevision::Empty,
-        "recovery-head-baseline",
-        deployment.materialized(fixtures::state()).await,
-    )
-    .await
-    .expect("the journal accepts the baseline revision");
+    let baseline = demand_ok!(
+        recorder,
+        "the_journal_accepts_the_baseline",
+        publish(
+            &administrator,
+            ExpectedRevision::Empty,
+            "recovery-head-baseline",
+            deployment.materialized(fixtures::state()).await,
+        )
+        .await,
+        "the fleet has a revision to converge on before the cut"
+    );
 
     let survivor = Replica::build(&deployment, Some(cache("survivor"))).await;
-    survivor
-        .reconciler
-        .bootstrap()
-        .await
-        .expect("the surviving replica converges before the outage");
+    demand_ok!(
+        recorder,
+        "the_surviving_replica_converges_before_the_outage",
+        survivor.reconciler.bootstrap().await,
+        "one replica enters the outage already serving the baseline"
+    );
     let cold_cache = cache("cold-booter");
     let cold_path = cold_cache.path().to_path_buf();
     let seeding = Replica::build(&deployment, Some(cold_cache)).await;
-    seeding
-        .reconciler
-        .bootstrap()
-        .await
-        .expect("the second replica exports a cache");
+    demand_ok!(
+        recorder,
+        "the_second_replica_exports_a_cache",
+        seeding.reconciler.bootstrap().await,
+        "the other replica enters the outage with a cache to boot from"
+    );
     drop(seeding);
     recorder.mark("converged", format!("fleet at revision {}", baseline.id));
 
@@ -1154,18 +1325,25 @@ async fn recovery_convergence_journal_recovery() {
     .await;
     deployment.link.sever();
     recorder.mark("severed", "the fleet loses the journal");
-    let restored_from_cache = cold_booter
-        .reconciler
-        .bootstrap()
-        .await
-        .expect("the cold-booting replica restores its cache");
-    assert_eq!(restored_from_cache, baseline.id);
-    assert!(
+    let restored_from_cache = demand_ok!(
+        recorder,
+        "the_cold_booting_replica_restores_its_cache",
+        cold_booter.reconciler.bootstrap().await,
+        "the fleet that has to converge is one survivor and one cold boot"
+    );
+    recorder.require(
+        "the_cold_boot_restores_the_baseline",
+        baseline.id,
+        restored_from_cache,
+        "both replicas enter the recovery from the same revision",
+    );
+    recorder.require_that(
+        "convergence_fails_while_the_journal_is_gone",
         matches!(
             survivor.reconciler.converge_once("qualification").await,
             crate::convergence::Outcome::Rejected { .. }
         ),
-        "convergence cannot succeed while the journal is unreachable"
+        "the step that succeeds after the recovery is the step that failed during the outage",
     );
 
     // The journal is untouched by the cut, so an administrator connected to it
@@ -1181,14 +1359,18 @@ async fn recovery_convergence_journal_recovery() {
     .into_iter()
     .enumerate()
     {
-        head = publish(
-            &direct_administrator(&deployment).await,
-            ExpectedRevision::Exactly(head),
-            &format!("recovery-during-outage-{index}"),
-            state,
+        head = demand_ok!(
+            recorder,
+            "the_journal_keeps_accepting_writes_from_elsewhere",
+            publish(
+                &direct_administrator(&deployment).await,
+                ExpectedRevision::Exactly(head),
+                &format!("recovery-during-outage-{index}"),
+                state,
+            )
+            .await,
+            "the fleet returns to a journal that moved on without it"
         )
-        .await
-        .expect("the journal itself keeps accepting writes")
         .id;
     }
     recorder.mark(
@@ -1197,23 +1379,28 @@ async fn recovery_convergence_journal_recovery() {
     );
     recorder.observe("revisions_published_during_outage", 2u64);
 
-    deployment
-        .link
-        .restore()
-        .await
-        .expect("the link comes back on the same port");
+    demand_ok!(
+        recorder,
+        "the_link_comes_back_on_the_same_dsn",
+        deployment.link.restore().await,
+        "the recovery is the dependency returning, not the replicas being reconfigured"
+    );
     recorder.mark("restored", "the journal is reachable again on the same DSN");
 
-    let accepted = publish_until_accepted(
-        &administrator,
-        ExpectedRevision::Exactly(head),
-        "recovery-after-restore",
-        deployment
-            .materialized(fixtures::state_with_second_tenant())
-            .await,
-    )
-    .await
-    .expect("administrative writes are accepted once the journal returns");
+    let accepted = demand_ok!(
+        recorder,
+        "the_publish_is_accepted_after_the_recovery",
+        publish_until_accepted(
+            &administrator,
+            ExpectedRevision::Exactly(head),
+            "recovery-after-restore",
+            deployment
+                .materialized(fixtures::state_with_second_tenant())
+                .await,
+        )
+        .await,
+        "administrative writes are accepted once the journal returns"
+    );
     head = accepted.id;
     recorder.mark("publish-accepted", format!("head revision {head}"));
     recorder.observe("admin_write_outcome", "accepted");
@@ -1223,19 +1410,34 @@ async fn recovery_convergence_journal_recovery() {
     for (name, replica) in [("survivor", &survivor), ("cold-booter", &cold_booter)] {
         let outcome = converge_until_head(replica, head).await;
         let report = replica.reconciler.report();
-        assert_eq!(report.active, Some(head), "{name} did not reach the head");
-        assert!(report.converged(), "{name} reports itself as lagging");
+        recorder.require(
+            "the_replica_reaches_the_head",
+            head,
+            report
+                .active
+                .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            format!("{name} converged onto the revisions published while it was disconnected"),
+        );
+        recorder.require_that(
+            "the_replica_reports_itself_converged",
+            report.converged(),
+            format!("{name} says it is at desired state rather than only being at it"),
+        );
         recorder.mark(
             &format!("converged-{name}"),
             format!("{outcome:?} after the journal returned"),
         );
         recorder.observe(
             &format!("{name}_active_revision"),
-            report.active.expect("active").to_string(),
+            report
+                .active
+                .map_or_else(|| "none".to_owned(), |id| id.to_string()),
         );
         recorder.observe(
             &format!("{name}_desired_revision"),
-            report.desired.expect("desired").to_string(),
+            report
+                .desired
+                .map_or_else(|| "none".to_owned(), |id| id.to_string()),
         );
         recorder.observe(&format!("{name}_convergence_lag_seconds"), report.lag);
         recorder.observe(
@@ -1253,25 +1455,31 @@ async fn recovery_convergence_journal_recovery() {
 
     // Nothing the journal accepted — before, during, or after the outage — was
     // lost, and the chain the fleet converged onto is the one it holds.
-    let trail = administrator
-        .audit_trail(head)
-        .await
-        .expect("the audit trail survives the outage");
+    let trail = demand_ok!(
+        recorder,
+        "the_audit_trail_survives_the_outage",
+        administrator.audit_trail(head).await,
+        "the head published after the recovery carries its audit"
+    );
     recorder.observe("audit_events_for_head", trail.len() as u64);
     let mut surviving = 0u64;
     let mut walked = Some(head);
     while let Some(id) = walked {
-        let manifest = administrator
-            .load_manifest(id)
-            .await
-            .expect("every published revision is still readable");
+        let manifest = demand_ok!(
+            recorder,
+            "every_published_revision_is_still_readable",
+            administrator.load_manifest(id).await,
+            "the chain the fleet converged onto is walked to its root"
+        );
         surviving += 1;
         walked = manifest.parent;
     }
     recorder.observe("revisions_readable_after_recovery", surviving);
-    assert_eq!(
-        surviving, 4,
-        "the baseline, two outage-window revisions, and the post-recovery head must all survive"
+    recorder.require(
+        "no_revision_is_lost_across_the_outage",
+        4u64,
+        surviving,
+        "the baseline, two outage-window revisions, and the post-recovery head all survive",
     );
 
     // The bound is how long a replica may still be behind desired state after
@@ -1420,7 +1628,7 @@ fn the_driver_runs_exactly_the_stages_the_manifest_calls_executable() {
     let mut executable: Vec<String> = Vec::new();
     for scenario in &manifest.scenarios {
         for stage in &scenario.stages {
-            if stage.status == "executable" {
+            if stage.status == "executable" && stage.runner.as_deref() == Some(RUNNER) {
                 executable.push(format!("{}/{}", scenario.id, stage.id));
             }
         }
@@ -1430,7 +1638,7 @@ fn the_driver_runs_exactly_the_stages_the_manifest_calls_executable() {
     driven.sort();
     assert_eq!(
         executable, driven,
-        "the manifest and the driver disagree about which stages run"
+        "the manifest and the driver disagree about which `{RUNNER}` stages run"
     );
 }
 

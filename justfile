@@ -53,6 +53,7 @@ docs-check:
     bash -n ops/verify-image-evidence.sh
     bash -n ops/pin-image-digest.sh
     bash -n ops/restore-drill.sh
+    python3 ops/check-recovery-evidence.py --self-test
     bash -n ops/rollout-drill.sh
     bash ops/check-compose-platform.sh
     bash ops/check-installer-download.sh

@@ -8,9 +8,11 @@ behaviour being qualified is
 [revision convergence](./revision-convergence.md#during-a-control-plane-outage)
 and the [control-plane journal](./control-plane-journal.md#during-a-postgres-outage).
 
-This page is a **contract, and a partial report.** Five stages run today against
-a real PostgreSQL journal and write evidence to `target/recovery/`; the rest are
-declared and blocked — see [the stages](#the-stages-and-what-runs-today) and
+This page is a **contract, and a partial report.** Nine stages run today against
+a real PostgreSQL — five in-process against a severable journal, four against a
+backed-up and point-in-time-recovered database driven through `axond admin` —
+and each writes evidence to `target/recovery/`; the rest are declared and
+blocked — see [the stages](#the-stages-and-what-runs-today) and
 [what is blocked, and on what](#what-is-blocked-and-on-what). No scenario is
 qualified end to end, because none of them can serve a request yet.
 
@@ -30,6 +32,17 @@ A scenario is split into **stages** — the control-plane half and the serving
 half became executable at different times — and each stage carries its own
 status, evidence, and blockers. A scenario is executable exactly when all of its
 stages are, which is why every scenario below is still incomplete.
+
+An executable stage also names the **lane** that runs it, because the two halves
+of the harness need different machinery:
+
+| Lane | What it is | What it runs |
+| --- | --- | --- |
+| `stateful-tests` | The in-process driver in `crates/gateway/src/qualification/recovery.rs`, run by `cargo test -p axond --bin axond qualification::recovery`. | An outage produced by cutting a loopback link to a real journal, and the cold boots and convergence around it. |
+| `restore-drill` | `ops/restore-drill.sh`, run by `just restore-drill`. | A real PostgreSQL with WAL archiving in Docker, a deployment published through `axond admin` against a running replica, a logical restore, and a point-in-time recovery — each read and extended by a replica booted on the recovered database. |
+
+A stage that claims neither lane, and a lane with no stages, both fail the
+contract test: a lane nothing runs is how a harness quietly stops running.
 
 `crates/gateway/tests/recovery_contract.rs` keeps the file honest: it fails when
 a scenario loses its gate, when the evidence classes below stop being covered,
@@ -71,12 +84,18 @@ never be upgraded by editing the manifest alone.
 | `recovery-convergence/administration` | blocked | The audit trail read through an authenticated surface. |
 | `secret-rotation/rotation` | blocked | Rotating material behind a credential reference without a redeployment. |
 | `secret-rotation/serving` | blocked | Requests authenticated with the rotated material. |
-| `backup-restore/restore` | blocked | Backup, loss, restore, and what came back with it. |
+| `backup-restore/restore` | runs | A deployment published through `axond admin` is dumped, restored into a database no replica ever wrote, and read back by a replica booted on it: same head, same checksum, whole revision chain, whole resource set, and a publication against the restored head accepted. |
+| `backup-restore/administration` | runs | The audit trail read back through the authenticated surface of that replica, refused there without a credential, and checked to name a credential's reference rather than any material. |
+| `backup-restore/durable-inventory` | blocked | The wrapped secret material, catalogue snapshots, and price books a restore must bring back beyond the journal and its tenancy. |
 | `backup-restore/reconvergence` | blocked | Replicas converging onto the restored journal. |
-| `point-in-time-recovery/recovery` | blocked | Recovery to a chosen target, with the data-loss boundary measured. |
+| `point-in-time-recovery/recovery` | runs | A base backup plus archived WAL recovered to a target taken between two publications: everything before the target is present, the revision after it is absent, and a replica booted on the promoted cluster reads the pre-target head and accepts a publication against it. |
+| `point-in-time-recovery/administration` | runs | The audit trail on the safe side of the target read back through the authenticated surface; the trail of the revision after it is gone with the revision. |
+| `point-in-time-recovery/usage-boundary` | blocked | The same boundary measured over usage records. |
 | `point-in-time-recovery/reconvergence` | blocked | Serving across the recovery and converging onto the recovered head. |
 
 ## Running the stages that run
+
+### The `stateful-tests` lane
 
 The driver lives in the crate rather than in `tests/`, because a recovery stage
 has to hold a replica's reconciler, its signed cache, and a real
@@ -102,8 +121,51 @@ the stage is not in a position to measure is recorded as `not_evaluated` with
 the reason, never omitted — an artifact that listed only the gates it met would
 read as a qualified scenario.
 
-CI runs the same stages in the stateful lane, which has a real Postgres service,
-and keeps the artifacts under `recovery-evidence` on the run.
+Under `AXOND_TEST_REQUIRE_SERVICES=1` a DSN the harness cannot cut — a
+multi-host failover string, a Unix socket, an unresolvable host — fails the run
+instead of skipping it, so a lane that quietly measured nothing cannot report
+green.
+
+### The `restore-drill` lane
+
+```sh
+just restore-drill              # or: bash ops/restore-drill.sh
+```
+
+It needs Docker, `psql`, `pg_dump`, `pg_restore`, `pg_basebackup`, `jq`, and
+`curl`; it starts `postgres:17.6-alpine` with WAL archiving, migrates it with
+`axond migrate apply`, and then does everything else the way an operator would:
+a live replica is started on the live database, a five-resource deployment is
+published through `axond admin apply --resource …`, and each recovered database
+is handed to a replica of its own on its own port. The ports
+(`AXOND_DRILL_LIVE_HTTP`, `AXOND_DRILL_LOGICAL_HTTP`,
+`AXOND_DRILL_RECOVERED_HTTP`) and the container name are overridable for a
+machine that is already using them.
+
+The drill's replicas authenticate with a breakglass credential taken from the
+environment — the drill generates a throwaway one, and neither it nor the cache
+signing key is ever printed or written to an artifact. The checker enforces
+that: it refuses any artifact containing either value.
+
+Both lanes record their conditions and judge them at the end of a stage rather
+than aborting on the first one that fails, so a stage that fails still leaves an
+artifact saying what it observed. A failure is deterministic: the stage names
+the check, its bound, and what it saw, and the run exits non-zero after the
+evidence is on disk.
+
+### Checking that the evidence is actually there
+
+```sh
+ops/check-recovery-evidence.py --runner stateful-tests
+ops/check-recovery-evidence.py --runner restore-drill
+```
+
+Each lane owes an artifact for every stage the manifest gives it. The checker
+reads the manifest, then refuses a missing artifact, a wrong schema version, a
+wrong scenario, stage, lane, capability or evidence set, a failed gate or check,
+an empty timeline, and any artifact carrying a forbidden string. CI runs it in
+both lanes before uploading `target/recovery/`, so a lane that produced no
+evidence fails the build instead of uploading nothing.
 
 ## What a run retains
 
@@ -156,12 +218,23 @@ flaking, and a flaky recovery gate is one that gets switched off.
 
 Every scenario is still `blocked`, because every scenario has at least one
 blocked stage. The reason is upstream of the harness: a replica cannot yet serve
-a projected revision, because the resource bodies a revision is made of —
-tenancy, providers, catalogue, pricing, policy — are owned by slices that have
-not landed. So the serving, restore, and rotation halves are specified and
-waiting, while the control-plane halves run against
-[the journal](./control-plane-journal.md) and its forward-only migrations, the
-convergence reconciler, and the signed last-known-good cache.
+a projected revision — in `stateful` mode it administers `/admin/v1` and refuses
+inference, and `/readyz` reports it unconverged — because the projection a
+revision compiles into is owned by a slice that has not landed. So every stage
+that needs a served request is specified and waiting: serving through the
+outage, serving from a restored cache, serving across a recovery, and the
+rotation whose evidence is a request authenticated with rotated material. The
+durable half runs: the journal and its forward-only migrations, the convergence
+reconciler, the signed last-known-good cache, and — in the restore lane — the
+backup, the point-in-time recovery, and the administrative surface of a replica
+booted on the result.
+
+The restore lane's own boundary is worth stating plainly, because a restore that
+brings back revisions reads as complete: it qualifies the revision journal, its
+checksums, the tenancy and access projections, the credential *references*, and
+the audit rows. Wrapped secret material and its lifecycle, catalogue snapshots,
+and effective-dated price books are the blocked `durable-inventory` stage, and
+usage records are the blocked `usage-boundary` stage.
 
 | Slice | What the harness needs from it |
 | --- | --- |
@@ -174,7 +247,6 @@ convergence reconciler, and the signed last-known-good cache.
 | #150 | Dynamically configurable budgets, rate limits, and revocation, so a converged revision changes policy a request can be observed under. |
 | #155 | The explicit decision on the durable usage outbox and globally unique request ids: whether a recovery boundary is measured over usage records at all, and against which identity. |
 | #158 | The operator restore and recovery procedures this harness rehearses, and the deployment overlay that provisions the cache signing key. |
-| #159 | The hardened workflow the recovery lane runs in — it runs a database with archiving enabled and publishes its evidence as an artifact. |
 
 The manifest carries the same map per scenario, so landing a slice tells you
 which scenarios it unblocks.
