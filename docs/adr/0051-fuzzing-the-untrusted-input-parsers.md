@@ -1,4 +1,4 @@
-# 50. Fuzzing the untrusted-input parsers
+# 51. Fuzzing the untrusted-input parsers
 
 Date: 2026-08-12
 
