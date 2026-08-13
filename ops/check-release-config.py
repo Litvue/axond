@@ -411,6 +411,42 @@ def check_release_success(text: str) -> list[str]:
     return failures
 
 
+def cosign_installer_steps(text: str) -> list[str]:
+    """Every step that installs cosign, however the step happens to be written.
+
+    A step's `uses:` is not necessarily its first line — `- name:` above it is
+    just as valid — so the installer is found by its `uses:` line and the whole
+    enclosing list item is returned. Keying on `- uses:` instead would read a
+    named step as no step at all and pass a lane that pins nothing.
+    """
+    lines = text.splitlines()
+    marks = [
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"\s*(- )?uses: sigstore/cosign-installer@", line)
+    ]
+    steps: list[str] = []
+    for mark in marks:
+        start = mark
+        while start >= 0 and not lines[start].lstrip().startswith("- "):
+            start -= 1
+        if start < 0:
+            continue
+        indent = len(lines[start]) - len(lines[start].lstrip())
+        end = start + 1
+        while end < len(lines):
+            line = lines[end]
+            if not line.strip():
+                end += 1
+                continue
+            depth = len(line) - len(line.lstrip())
+            if depth < indent or (depth == indent and line.lstrip().startswith("- ")):
+                break
+            end += 1
+        steps.append("\n".join(lines[start:end]))
+    return steps
+
+
 def check_cosign_pin(text: str) -> list[str]:
     """Signing must name the cosign binary, and stay on the format consumers verify.
 
@@ -426,14 +462,10 @@ def check_cosign_pin(text: str) -> list[str]:
     rather than a dependency bump.
     """
     failures: list[str] = []
-    steps = re.findall(
-        r"^( *)- uses: sigstore/cosign-installer@[^\n]*\n((?:\1  [^\n]*\n|\n)*)",
-        text,
-        re.MULTILINE,
-    )
+    steps = cosign_installer_steps(text)
     if not steps:
         return ["release-please.yml: no cosign-installer step found; the release must sign"]
-    for _, body in steps:
+    for body in steps:
         pin = re.search(r"cosign-release:\s*(\S+)", body)
         if pin is None:
             failures.append(
@@ -687,6 +719,21 @@ def self_test() -> int:
     assert check_cosign_pin(signed.replace("          cosign-release: v2.5.2\n", "")) != []
     assert check_cosign_pin(signed.replace("v2.5.2", "v3.0.6")) != []
     assert check_cosign_pin("jobs:\n  release-image:\n    steps: []\n") != []
+    # A named step is the same step: reading it as no step at all would let an
+    # unpinned lane pass, which is the regression this gate exists to catch.
+    named = signed.replace(
+        "      - uses: sigstore/cosign-installer@abc # v4.1.2\n",
+        "      - name: Install cosign\n        uses: sigstore/cosign-installer@abc # v4.1.2\n",
+    )
+    assert len(cosign_installer_steps(named)) == 1
+    assert check_cosign_pin(named) == []
+    assert check_cosign_pin(named.replace("          cosign-release: v2.5.2\n", "")) != []
+    # Two lanes, one of them unpinned: the pinned one must not hide the other.
+    both = signed + signed.replace(
+        "        with:\n          cosign-release: v2.5.2\n", ""
+    ).replace("release-image", "release-image-index-promote")
+    assert len(cosign_installer_steps(both)) == 2
+    assert len(check_cosign_pin(both)) == 1
 
     # The committed constant is deliberately not asserted here: it legitimately
     # moves if the quickstart is ever pinned back onto a newer amd64-only release,
