@@ -1479,6 +1479,33 @@ env = "GW_ADMIN_BREAKGLASS"
         );
     }
 
+    /// A projected credential that rotates to another version of its secret has
+    /// the same pool key, so only the reference it pins tells a reload that every
+    /// call in that pool now authenticates with different material.
+    #[test]
+    fn a_projected_credentials_version_rotation_is_a_change() {
+        let projected = |secret: crate::desired_state::SecretRef| {
+            let mut config = Config::from_toml_str(PLATFORM_ONLY).expect("a valid config");
+            config.credential = vec![crate::config::Credential {
+                namespace: "platform".to_owned(),
+                provider: "openai".to_owned(),
+                env: None,
+                secret: Some(secret),
+                id: Some("platform-openai".to_owned()),
+                weight: 1,
+            }];
+            config
+        };
+        let before = projected(crate::desired_state::fixtures::secret_ref_at(1, 1));
+        let rotated = projected(crate::desired_state::fixtures::secret_ref_at(1, 2));
+
+        assert_eq!(
+            credential_version_changes(&before, &rotated),
+            vec!["platform/openai/platform-openai".to_owned()]
+        );
+        assert!(credential_version_changes(&before, &before).is_empty());
+    }
+
     #[derive(Serialize)]
     struct ReloadTokenClaims {
         exp: u64,
