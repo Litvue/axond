@@ -315,6 +315,7 @@ impl StatusProbeAdmission {
     }
 
     pub(crate) fn pending(pending: Arc<AtomicUsize>) -> Self {
+        pending.fetch_add(1, Ordering::AcqRel);
         Self::new(Duration::ZERO, pending)
     }
 

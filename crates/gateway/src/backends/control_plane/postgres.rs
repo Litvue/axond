@@ -2108,7 +2108,6 @@ mod tests {
         let worker_observed = Arc::clone(&observed);
         let worker = std::thread::spawn(move || {
             worker_start.wait();
-            worker_count.fetch_add(1, Ordering::AcqRel);
             let _admin = StatusProbeAdmission::pending(worker_count.clone());
             worker_observed.store(worker_count.load(Ordering::Acquire), Ordering::Release);
         });
