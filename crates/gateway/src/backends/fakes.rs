@@ -413,10 +413,10 @@ impl CatalogSource for InMemoryCatalog {
         since: Option<&SourceValidators>,
     ) -> Result<CatalogRefresh, CatalogError> {
         if self.unavailable.load(Ordering::Relaxed) {
-            return Err(CatalogError::Unavailable {
-                backend: "in-memory",
-                message: "fake catalogue source is unavailable".to_owned(),
-            });
+            return Err(CatalogError::unavailable(
+                "in-memory",
+                "fake catalogue source is unavailable".to_owned(),
+            ));
         }
         if since == Some(&self.validators) {
             return Ok(CatalogRefresh::Unchanged {

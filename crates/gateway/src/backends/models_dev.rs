@@ -86,7 +86,7 @@ use super::catalog::{
     CatalogRefresh, CatalogSnapshot, CatalogSource, ETag, InvalidCatalogId, JsonPointer, Modality,
     ModelCapability, ModelFacts, ModelField, ModelId, ModelLifecycle, ModelLimits, ObservedPrice,
     ObservedRate, PriceRates, PriceTier, PriceTierThreshold, ProviderEndpoint, ProviderOffering,
-    SchemaVersion, SourceValidators, source_snapshot,
+    Refusable, Refusal, RefusalReason, SchemaVersion, SourceValidators, source_snapshot,
 };
 use super::{Capabilities, Capability};
 use crate::desired_state::canonical::{CanonicalError, CanonicalValue};
@@ -114,8 +114,16 @@ pub enum ModelsDevError {
     UnsupportedEndpoint { url: String },
     #[error("the payload is not JSON: {message}")]
     NotJson { message: String },
-    #[error("the payload is not a models.dev catalogue document: {message}")]
-    Schema { message: String },
+    #[error(
+        "the payload is not a models.dev catalogue document{}: {message}",
+        pointer.as_ref().map_or_else(String::new, |pointer| format!(" at `{pointer}`"))
+    )]
+    Schema {
+        /// Where the deserializer was when it refused, when it was anywhere: a
+        /// document that is not an object at all is refused before any field.
+        pointer: Option<JsonPointer>,
+        message: String,
+    },
     #[error("`{pointer}` is keyed `{key}` but its `id` is `{id}`")]
     IdMismatch {
         pointer: JsonPointer,
@@ -173,6 +181,14 @@ pub enum ModelsDevError {
 }
 
 impl ModelsDevError {
+    /// A schema refusal decided at a known location in the payload.
+    fn schema_at(pointer: JsonPointer, message: impl Into<String>) -> Self {
+        Self::Schema {
+            pointer: Some(pointer),
+            message: message.into(),
+        }
+    }
+
     fn identifier(pointer: &JsonPointer, source: InvalidCatalogId) -> Self {
         Self::Identifier {
             pointer: pointer.clone(),
@@ -181,10 +197,59 @@ impl ModelsDevError {
     }
 }
 
+/// Each parse failure's bounded reason, and the location it was decided at.
+///
+/// One arm per variant rather than a catch-all: a new variant is a compile
+/// error here, which is the point — a refusal mode nobody classified would
+/// otherwise be counted as [`RefusalReason::Unknown`] and be invisible on the
+/// dashboard that matters.
+impl Refusable for ModelsDevError {
+    fn refusal(&self) -> Refusal {
+        match self {
+            Self::UnsupportedEndpoint { .. } => Refusal::new(RefusalReason::UnsupportedEndpoint),
+            Self::NotJson { .. } => Refusal::new(RefusalReason::NotJson),
+            Self::Schema { pointer, .. } => pointer.clone().map_or_else(
+                || Refusal::new(RefusalReason::Schema),
+                |pointer| Refusal::at(RefusalReason::Schema, pointer),
+            ),
+            Self::IdMismatch { pointer, .. } => {
+                Refusal::at(RefusalReason::IdMismatch, pointer.clone())
+            }
+            Self::Identifier { pointer, .. } => {
+                Refusal::at(RefusalReason::Identifier, pointer.clone())
+            }
+            Self::UnknownStatus { pointer, .. } => {
+                Refusal::at(RefusalReason::UnknownStatus, pointer.clone())
+            }
+            Self::UnknownModality { pointer, .. } => {
+                Refusal::at(RefusalReason::UnknownModality, pointer.clone())
+            }
+            Self::Price { pointer, .. } => Refusal::at(RefusalReason::Price, pointer.clone()),
+            Self::UnknownTierType { pointer, .. } => {
+                Refusal::at(RefusalReason::UnknownTierType, pointer.clone())
+            }
+            Self::DuplicateTier { pointer } => {
+                Refusal::at(RefusalReason::DuplicateTier, pointer.clone())
+            }
+            Self::NeutralPrice { pointer } => {
+                Refusal::at(RefusalReason::NeutralPrice, pointer.clone())
+            }
+            Self::UncanonicalizableText { pointer, .. } => {
+                Refusal::at(RefusalReason::UncanonicalizableText, pointer.clone())
+            }
+            Self::AmbiguousModelKey { pointer, .. } => {
+                Refusal::at(RefusalReason::AmbiguousModelKey, pointer.clone())
+            }
+            Self::Content { .. } => Refusal::new(RefusalReason::Content),
+        }
+    }
+}
+
 impl From<ModelsDevError> for CatalogError {
     fn from(error: ModelsDevError) -> Self {
         Self::Invalid {
             backend: BACKEND,
+            refusal: error.refusal(),
             message: error.to_string(),
         }
     }
@@ -257,17 +322,33 @@ impl ModelsDevAdapter {
         let text = std::str::from_utf8(payload).map_err(|error| ModelsDevError::NotJson {
             message: error.to_string(),
         })?;
-        let document: WireCatalog = serde_json::from_str(text).map_err(|error| {
-            if error.is_syntax() || error.is_eof() {
-                ModelsDevError::NotJson {
-                    message: error.to_string(),
+        // Deserialized through a path-tracking wrapper so that a missing field
+        // or a changed type is refused *at a pointer*, like every other refusal:
+        // serde's own line and column describe the bytes, and an operator
+        // diagnosing drift needs the field.
+        let mut deserializer = serde_json::Deserializer::from_str(text);
+        let document: WireCatalog =
+            serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+                let pointer = json_pointer(error.path());
+                let inner = error.into_inner();
+                if inner.is_syntax() || inner.is_eof() {
+                    ModelsDevError::NotJson {
+                        message: inner.to_string(),
+                    }
+                } else {
+                    ModelsDevError::Schema {
+                        pointer,
+                        message: inner.to_string(),
+                    }
                 }
-            } else {
-                ModelsDevError::Schema {
-                    message: error.to_string(),
-                }
-            }
-        })?;
+            })?;
+        // `serde_json::from_str` ends by refusing bytes after the top-level
+        // value; a hand-built deserializer has to be told to.
+        deserializer
+            .end()
+            .map_err(|error| ModelsDevError::NotJson {
+                message: error.to_string(),
+            })?;
         let content = normalize(&document)?;
         let source = source_snapshot(
             self.source_url.clone(),
@@ -759,6 +840,35 @@ fn normalize(document: &WireCatalog) -> Result<CatalogContent, ModelsDevError> {
     CatalogContent::new(providers, models).map_err(|source| ModelsDevError::Content { source })
 }
 
+/// The deserializer's position, as a JSON Pointer into the payload.
+///
+/// `None` where the path names nothing — a payload that is not an object is
+/// refused before any field, and there is no location to hand an operator.
+/// `Segment::Unknown` is dropped rather than rendered: a segment the tracker
+/// could not name cannot be pointed at.
+fn json_pointer(path: &serde_path_to_error::Path) -> Option<JsonPointer> {
+    let mut pointer = JsonPointer::new("");
+    let mut named = false;
+    for segment in path.iter() {
+        match segment {
+            serde_path_to_error::Segment::Seq { index } => {
+                pointer = pointer.child(&index.to_string());
+                named = true;
+            }
+            serde_path_to_error::Segment::Map { key } => {
+                pointer = pointer.child(key);
+                named = true;
+            }
+            serde_path_to_error::Segment::Enum { variant } => {
+                pointer = pointer.child(variant);
+                named = true;
+            }
+            serde_path_to_error::Segment::Unknown => {}
+        }
+    }
+    named.then_some(pointer)
+}
+
 /// The payload location a field was read from, so an override points at the
 /// provider's own value rather than at the offering as a whole.
 fn field_pointer(offering: &JsonPointer, field: ModelField) -> JsonPointer {
@@ -946,8 +1056,11 @@ fn price(
         let tier_pointer = pointer.child("tiers").child(&index.to_string());
         let threshold = match tier.tier.kind.as_str() {
             "context" => PriceTierThreshold::ContextOver {
-                tokens: tier.tier.size.ok_or_else(|| ModelsDevError::Schema {
-                    message: format!("`{tier_pointer}/tier` states no `size`"),
+                tokens: tier.tier.size.ok_or_else(|| {
+                    ModelsDevError::schema_at(
+                        tier_pointer.child("tier"),
+                        "a `context` tier states no `size`",
+                    )
                 })?,
             },
             kind => {
@@ -1371,15 +1484,33 @@ const fn misconfigured(status: u16) -> bool {
     matches!(status, 400..=499) && !matches!(status, 408 | 429)
 }
 
+impl Refusable for FetchError {
+    fn refusal(&self) -> Refusal {
+        Refusal::new(match self {
+            Self::Transport { .. } => RefusalReason::Unreachable,
+            Self::Status { status } if *status == 401 || *status == 403 => RefusalReason::Denied,
+            // A status only the operator's URL can fix is counted apart from an
+            // upstream that is merely down, so a run of refusals reads as the
+            // misconfiguration it is rather than as an outage.
+            Self::Status { status } if misconfigured(*status) => RefusalReason::UnsupportedEndpoint,
+            Self::Status { .. } => RefusalReason::Unreachable,
+            Self::TooLarge { .. } => RefusalReason::Oversized,
+        })
+    }
+}
+
 impl From<FetchError> for CatalogError {
     fn from(error: FetchError) -> Self {
+        let refusal = error.refusal();
         match error {
             FetchError::Status { status } if status == 401 || status == 403 => Self::Denied {
                 backend: BACKEND,
+                refusal,
                 message: error.to_string(),
             },
             FetchError::Status { status } if misconfigured(status) => Self::Misconfigured {
                 backend: BACKEND,
+                refusal,
                 message: error.to_string(),
             },
             // The document itself is unusable, so the next identical request
@@ -1387,10 +1518,12 @@ impl From<FetchError> for CatalogError {
             // Someone has to raise the ceiling or point the source elsewhere.
             FetchError::TooLarge { .. } => Self::Invalid {
                 backend: BACKEND,
+                refusal,
                 message: error.to_string(),
             },
             error => Self::Unavailable {
                 backend: BACKEND,
+                refusal,
                 message: error.to_string(),
             },
         }
@@ -1569,6 +1702,9 @@ mod tests {
             "price-type" => include_str!("fixtures/models_dev/drift.price-type.json"),
             "price-partial" => include_str!("fixtures/models_dev/drift.price-partial.json"),
             "tier-type" => include_str!("fixtures/models_dev/drift.tier-type.json"),
+            "tier-without-size" => {
+                include_str!("fixtures/models_dev/drift.tier-without-size.json")
+            }
             "tier-duplicate" => include_str!("fixtures/models_dev/drift.tier-duplicate.json"),
             "model-id-mismatch" => include_str!("fixtures/models_dev/drift.model-id-mismatch.json"),
             "model-id-case" => include_str!("fixtures/models_dev/drift.model-id-case.json"),
@@ -1936,14 +2072,41 @@ mod tests {
             ("top-level-array", |error| {
                 matches!(error, ModelsDevError::Schema { .. })
             }),
+            // A required field missing from the document root is refused before
+            // the deserializer is anywhere, so there is no location to name and
+            // the message is the whole diagnosis.
             ("missing-providers", |error| {
-                matches!(error, ModelsDevError::Schema { .. })
+                matches!(error, ModelsDevError::Schema { pointer: None, .. })
             }),
+            // A field missing from a record is refused *at that record*: which
+            // of six thousand offerings dropped `name` is the diagnosis, and the
+            // deserializer's line and column is not it.
             ("missing-model-name", |error| {
-                matches!(error, ModelsDevError::Schema { .. })
+                matches!(
+                    error,
+                    ModelsDevError::Schema { pointer: Some(pointer), .. }
+                        if pointer.as_str() == "/providers/hpc-ai/models/openai~1gpt-5.5"
+                )
             }),
+            // A type change is refused at the field that changed type.
             ("limit-type", |error| {
-                matches!(error, ModelsDevError::Schema { .. })
+                matches!(
+                    error,
+                    ModelsDevError::Schema { pointer: Some(pointer), .. }
+                        if pointer.as_str()
+                            == "/providers/hpc-ai/models/openai~1gpt-5.5/limit/context"
+                )
+            }),
+            // The tier's own pointer, not the offering's: the code that refuses
+            // it already knows which tier, and "a tier states no size" without
+            // saying which is not a diagnosis.
+            ("tier-without-size", |error| {
+                matches!(
+                    error,
+                    ModelsDevError::Schema { pointer: Some(pointer), .. }
+                        if pointer.as_str()
+                            == "/providers/hpc-ai/models/openai~1gpt-5.5/cost/tiers/0/tier"
+                )
             }),
             (
                 "unknown-status",
@@ -2078,7 +2241,55 @@ mod tests {
                 expected(&error),
                 "`{name}` produced the wrong error: {error}"
             );
+            // The refusal an operator sees carries the same location the error
+            // decided at: a pointer the classifier drops on the way out is a
+            // pointer nobody can act on.
+            if let ModelsDevError::Schema {
+                pointer: Some(pointer),
+                ..
+            } = &error
+            {
+                assert_eq!(
+                    error.refusal().pointer(),
+                    Some(pointer),
+                    "`{name}`'s refusal must name where it was decided"
+                );
+                // And so does the text, which is all a log line built from
+                // `Display` — or a `CatalogError` flattened from this one —
+                // has to go on.
+                let message = error.to_string();
+                assert!(
+                    message.contains(pointer.as_str()),
+                    "`{name}`'s message must read where it was decided: {message}"
+                );
+                assert!(
+                    CatalogError::from(error.clone())
+                        .to_string()
+                        .contains(pointer.as_str()),
+                    "`{name}` must keep that location on the way out of the module"
+                );
+            }
         }
+    }
+
+    /// A payload that parses and then keeps going is two documents spliced
+    /// together, and the raw digest covers both while the content would come
+    /// from the first alone. Refused, so provenance and content cannot disagree
+    /// about what was read.
+    #[test]
+    fn a_payload_that_does_not_end_where_its_document_does_is_refused() {
+        let spliced = format!("{IDENTITY}{IDENTITY}");
+        assert!(
+            matches!(
+                parse(&spliced).expect_err("two documents are not one document"),
+                ModelsDevError::NotJson { .. }
+            ),
+            "trailing content is malformed JSON, not a schema change"
+        );
+        assert!(
+            parse(&format!("{IDENTITY}  \n")).is_ok(),
+            "trailing whitespace is not content"
+        );
     }
 
     #[test]
@@ -2529,8 +2740,14 @@ mod tests {
             CatalogError::from(FetchError::Status { status: 403 }),
             CatalogError::Denied {
                 backend: BACKEND,
+                refusal: Refusal::new(RefusalReason::Denied),
                 message: "upstream answered HTTP 403".to_owned(),
             }
+        );
+        assert_eq!(
+            error.refused_by().reason(),
+            RefusalReason::Unreachable,
+            "an outage is a transport refusal, not a denial"
         );
     }
 
@@ -2545,12 +2762,18 @@ mod tests {
                 error,
                 CatalogError::Misconfigured {
                     backend: BACKEND,
+                    refusal: Refusal::new(RefusalReason::UnsupportedEndpoint),
                     message: format!("upstream answered HTTP {status}"),
                 },
                 "HTTP {status} says the configured URL is wrong"
             );
             assert!(!error.retryable(), "HTTP {status} cannot be retried away");
             assert_eq!(error.category(), FailureCategory::NotFound);
+            assert_eq!(
+                error.refused_by().reason(),
+                RefusalReason::UnsupportedEndpoint,
+                "HTTP {status} is counted apart from an upstream that is down"
+            );
         }
 
         for status in [408, 429, 500, 502, 503, 504] {
@@ -2575,6 +2798,11 @@ mod tests {
         });
         assert!(matches!(oversized, CatalogError::Invalid { .. }));
         assert!(!oversized.retryable());
+        assert_eq!(
+            oversized.refused_by().reason(),
+            RefusalReason::Oversized,
+            "a ceiling breach is counted apart from a malformed document"
+        );
     }
 
     /// A declared length is the sender's claim about a body nobody has read yet,
@@ -2612,6 +2840,7 @@ mod tests {
             error,
             CatalogError::Invalid {
                 backend: BACKEND,
+                refusal: Refusal::new(RefusalReason::Oversized),
                 message: format!("payload exceeds the {ceiling}-byte ceiling"),
             }
         );
@@ -2645,6 +2874,7 @@ mod tests {
             source.refresh(None).await.expect_err("too large to parse"),
             CatalogError::Invalid {
                 backend: BACKEND,
+                refusal: Refusal::new(RefusalReason::Oversized),
                 message: format!("payload exceeds the {ceiling}-byte ceiling"),
             }
         );

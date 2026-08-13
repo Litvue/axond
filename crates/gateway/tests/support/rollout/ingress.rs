@@ -499,7 +499,6 @@ async fn probe_loop(state: Arc<IngressState>, poll: Duration) {
                 .is_ok_and(|response| response.status().is_success());
             member.observe(ready, state.elapsed());
         }
-        tokio::time::sleep(poll).await;
     }
 }
 
