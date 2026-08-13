@@ -786,10 +786,10 @@ pub(super) fn log_secret(error: crate::backends::secrets::SecretError) -> AdminE
     // backend detail is caller-adjacent input and must never become a log field.
     // Secret lifecycle logs below carry only references and ownership metadata;
     // audit attribution remains a separate durable control-plane concern.
-    if !matches!(error, AdminError::SecretMaterialRefused { .. }) {
-        if let Some(detail) = error.operator_detail() {
-            warn!(code = error.code(), detail, "secret-store operation failed");
-        }
+    if !matches!(error, AdminError::SecretMaterialRefused { .. })
+        && let Some(detail) = error.operator_detail()
+    {
+        warn!(code = error.code(), detail, "secret-store operation failed");
     }
     error
 }
