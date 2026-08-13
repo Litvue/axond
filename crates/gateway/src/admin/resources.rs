@@ -38,12 +38,13 @@ use super::error::AdminError;
 use super::service::DesiredStateEdit;
 use crate::desired_state::{
     AliasTarget, BlobKind, BlobRef, BudgetBound, BudgetPolicy, CatalogOffering, Checksum,
-    ConcurrencyPolicy, DesiredState, DisplayName, ModelAliasBody, ModelEnablementBody,
-    ModelLifecycle, ModelOwner, ObservedPrice, OfferingId, PolicyBody, PolicyEpoch, PolicyScope,
-    ProjectBody, ProjectId, ProviderBody, ProviderCredentialBody, ResourceBody, ResourceId,
-    ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
-    RevocationPolicy, SecretId, SecretLifecycle, SecretOwner, SecretRef, SecretVersion, Slug,
-    Surface, TenantBody, TenantId, TenantLifecycle, ValidationError, WireFamily,
+    ConcurrencyPolicy, DesiredState, DisplayName, InvalidDisplayName, InvalidId, InvalidSlug,
+    ModelAliasBody, ModelEnablementBody, ModelLifecycle, ModelOwner, ObservedPrice, OfferingId,
+    PolicyBody, PolicyEpoch, PolicyScope, ProjectBody, ProjectId, ProviderBody,
+    ProviderCredentialBody, ResourceBody, ResourceId, ResourceKind, ResourceRef, ResourceScope,
+    ResourceVersion, ResourceVersionNumber, RevocationPolicy, SecretId, SecretLifecycle,
+    SecretOwner, SecretRef, SecretVersion, Slug, Surface, TenantBody, TenantId, TenantLifecycle,
+    ValidationError, WireFamily,
 };
 
 /// What a handler contributes to a mutation: where it applies, and what it does.
@@ -332,11 +333,15 @@ impl AdminResourceRequest for CredentialRequest {
         // mistake, so its refusal names the form expected rather than echoing
         // what arrived: an error is rendered into a response, a log line and an
         // audit trail, and a mispasted key must not reach any of them.
-        let secret = SecretId::parse(&self.secret).map_err(|_| {
-            malformed::<Self>(
+        let secret = SecretId::parse(&self.secret).map_err(|error| match error {
+            InvalidId::Prefix { .. } => malformed::<Self>(
                 "secret",
                 &format!("is not a `{}`-prefixed secret id", SecretId::PREFIX),
-            )
+            ),
+            InvalidId::Uuid(_) => malformed::<Self>(
+                "secret",
+                "names a secret id whose uuid is not a hyphenated version 7 uuid",
+            ),
         })?;
         // An omitted version is *unstated*, not "the first": for a credential
         // that already exists it means the version in force, resolved against
@@ -868,23 +873,59 @@ fn resource_id<R: AdminResourceRequest>(
     field: &'static str,
     text: &str,
 ) -> Result<ResourceId, AdminError> {
-    ResourceId::parse(text).map_err(|error| malformed::<R>(field, &error.to_string()))
+    ResourceId::parse(text).map_err(|error| malformed_id::<R>(field, ResourceId::PREFIX, error))
 }
 
 fn tenant_id<R: AdminResourceRequest>(text: &str) -> Result<TenantId, AdminError> {
-    TenantId::parse(text).map_err(|error| malformed::<R>("tenant", &error.to_string()))
+    TenantId::parse(text).map_err(|error| malformed_id::<R>("tenant", TenantId::PREFIX, error))
 }
 
 fn project_id<R: AdminResourceRequest>(text: &str) -> Result<ProjectId, AdminError> {
-    ProjectId::parse(text).map_err(|error| malformed::<R>("project", &error.to_string()))
+    ProjectId::parse(text).map_err(|error| malformed_id::<R>("project", ProjectId::PREFIX, error))
 }
 
 fn slug<R: AdminResourceRequest>(text: &str) -> Result<Slug, AdminError> {
-    Slug::parse(text).map_err(|error| malformed::<R>("slug", &error.to_string()))
+    Slug::parse(text).map_err(|error| {
+        let detail = match error {
+            InvalidSlug::Empty => "must not be empty".to_owned(),
+            InvalidSlug::TooLong { max, .. } => format!("is over the {max}-character limit"),
+            InvalidSlug::Character { .. } => {
+                "contains a character outside ASCII letters, digits, `-`, and `_`".to_owned()
+            }
+            InvalidSlug::Boundary { .. } => "must start and end with a letter or digit".to_owned(),
+            InvalidSlug::IdLike { .. } => "looks like an id; ids are not names".to_owned(),
+        };
+        malformed::<R>("slug", &detail)
+    })
 }
 
 fn display_name<R: AdminResourceRequest>(text: &str) -> Result<DisplayName, AdminError> {
-    DisplayName::parse(text).map_err(|error| malformed::<R>("display_name", &error.to_string()))
+    DisplayName::parse(text).map_err(|error| {
+        let detail = match error {
+            InvalidDisplayName::Empty => "must not be empty".to_owned(),
+            InvalidDisplayName::TooLong { max, .. } => {
+                format!("is over the {max}-character limit")
+            }
+            InvalidDisplayName::ControlCharacter { .. } => {
+                "contains a control character".to_owned()
+            }
+            InvalidDisplayName::ByteOrderMark => "contains a byte-order mark".to_owned(),
+            InvalidDisplayName::Untrimmed => "may not begin or end with whitespace".to_owned(),
+        };
+        malformed::<R>("display_name", &detail)
+    })
+}
+
+fn malformed_id<R: AdminResourceRequest>(
+    field: &'static str,
+    prefix: &'static str,
+    error: InvalidId,
+) -> AdminError {
+    let detail = match error {
+        InvalidId::Prefix { .. } => format!("is not a `{prefix}`-prefixed id"),
+        InvalidId::Uuid(_) => "has a malformed hyphenated version 7 uuid".to_owned(),
+    };
+    malformed::<R>(field, &detail)
 }
 
 fn checksum<R: AdminResourceRequest>(
@@ -907,9 +948,96 @@ fn malformed<R: AdminResourceRequest>(field: &'static str, detail: &str) -> Admi
     }
 }
 
-fn unknown<R: AdminResourceRequest>(field: &'static str, value: &str) -> AdminError {
+fn unknown<R: AdminResourceRequest>(field: &'static str, _value: &str) -> AdminError {
     AdminError::RequestInvalid {
         schema: R::SCHEMA,
-        detail: format!("`{field}`: `{value}` is not a value this build knows"),
+        detail: format!("`{field}`: is not a value this build knows"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::desired_state::fixtures;
+
+    const PASTED_MATERIAL: &str = "sk-axond-admin-sentinel-51H9xNEVERLOGME";
+
+    fn credential() -> CredentialRequest {
+        CredentialRequest {
+            credential: fixtures::resource_id(11).to_string(),
+            tenant: fixtures::tenant_id(1).to_string(),
+            project: None,
+            provider: fixtures::resource_id(10).to_string(),
+            slug: "openai-primary".to_owned(),
+            display_name: "OpenAI primary".to_owned(),
+            secret: fixtures::secret_ref(3).secret.to_string(),
+            secret_version: Some(1),
+            lifecycle: Some("active".to_owned()),
+            rotate: false,
+        }
+    }
+
+    fn refusal(request: CredentialRequest) -> String {
+        match request.plan() {
+            Ok(_) => panic!("the malformed credential document was accepted"),
+            Err(error) => error
+                .operator_detail()
+                .expect("a request refusal has operator detail")
+                .to_owned(),
+        }
+    }
+
+    #[test]
+    fn secret_reference_errors_distinguish_prefix_from_malformed_uuid_without_echoing() {
+        let mut wrong_prefix = credential();
+        wrong_prefix.secret = PASTED_MATERIAL.to_owned();
+        let prefix_detail = refusal(wrong_prefix);
+        assert_eq!(
+            prefix_detail,
+            "`secret`: is not a `sct_`-prefixed secret id"
+        );
+        assert!(!prefix_detail.contains(PASTED_MATERIAL));
+
+        const MALFORMED_REFERENCE: &str = "sct_not-a-hyphenated-uuid";
+        let mut malformed_uuid = credential();
+        malformed_uuid.secret = MALFORMED_REFERENCE.to_owned();
+        let uuid_detail = refusal(malformed_uuid);
+        assert_eq!(
+            uuid_detail,
+            "`secret`: names a secret id whose uuid is not a hyphenated version 7 uuid"
+        );
+        assert!(!uuid_detail.contains(MALFORMED_REFERENCE));
+    }
+
+    #[test]
+    fn malformed_document_fields_do_not_echo_pasted_material() {
+        let cases = [
+            ("credential", format!("{PASTED_MATERIAL}!")),
+            ("tenant", format!("{PASTED_MATERIAL}!")),
+            ("project", format!("{PASTED_MATERIAL}!")),
+            ("provider", format!("{PASTED_MATERIAL}!")),
+            ("slug", format!("{PASTED_MATERIAL}!")),
+            ("display_name", format!("{PASTED_MATERIAL}\n")),
+            ("lifecycle", PASTED_MATERIAL.to_owned()),
+        ];
+
+        for (field, value) in cases {
+            let mut request = credential();
+            match field {
+                "credential" => request.credential = value.clone(),
+                "tenant" => request.tenant = value.clone(),
+                "project" => request.project = Some(value.clone()),
+                "provider" => request.provider = value.clone(),
+                "slug" => request.slug = value.clone(),
+                "display_name" => request.display_name = value.clone(),
+                "lifecycle" => request.lifecycle = Some(value.clone()),
+                _ => unreachable!("the test case names its field"),
+            }
+            let detail = refusal(request);
+            assert!(
+                !detail.contains(&value),
+                "{field} validation echoed pasted material: {detail}"
+            );
+        }
     }
 }

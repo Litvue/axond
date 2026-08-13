@@ -259,7 +259,57 @@ async fn no_administrative_response_discloses_the_material_a_credential_names() 
         .post("/credentials", "mispasted", &revision, &mispasted, false)
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert!(
+        refusal.contains("not a `sct_`-prefixed secret id"),
+        "a wrong-prefix refusal should identify the expected form: {refusal}"
+    );
     sweep.assert_absent("a mispasted-material refusal", &refusal);
+
+    // A reference with the right prefix but a malformed UUID needs a different
+    // explanation, and still must not repeat the pasted identifier.
+    const MALFORMED_SECRET_REFERENCE: &str = "sct_not-a-hyphenated-uuid";
+    let mut malformed_reference = credential.clone();
+    malformed_reference["resource"]["secret"] = json!(MALFORMED_SECRET_REFERENCE);
+    let (status, refusal) = console
+        .post(
+            "/credentials",
+            "malformed-reference",
+            &revision,
+            &malformed_reference,
+            false,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert!(
+        refusal.contains("hyphenated version 7 uuid"),
+        "a right-prefix refusal should identify the malformed identifier: {refusal}"
+    );
+    assert!(
+        !refusal.contains(MALFORMED_SECRET_REFERENCE),
+        "a malformed secret reference must not be echoed: {refusal}"
+    );
+
+    // The same disclosure boundary applies when material is pasted into a
+    // different document field. Each value is deliberately invalid for its
+    // field so the response exercises validation rather than publishing a
+    // caller-chosen name that merely happens to resemble a key.
+    for (field, value) in [
+        ("credential", json!(format!("{PROVIDER_MATERIAL}!"))),
+        ("tenant", json!(format!("{PROVIDER_MATERIAL}!"))),
+        ("project", json!(format!("{PROVIDER_MATERIAL}!"))),
+        ("provider", json!(format!("{PROVIDER_MATERIAL}!"))),
+        ("slug", json!(format!("{PROVIDER_MATERIAL}!"))),
+        ("display_name", json!(format!("{PROVIDER_MATERIAL}\n"))),
+    ] {
+        let mut invalid = credential.clone();
+        invalid["resource"][field] = value;
+        let key = format!("mispasted-{field}");
+        let (status, refusal) = console
+            .post("/credentials", &key, &revision, &invalid, false)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {refusal}");
+        sweep.assert_absent(&format!("a mispasted {field} refusal"), &refusal);
+    }
 
     for path in [
         "/state".to_owned(),
