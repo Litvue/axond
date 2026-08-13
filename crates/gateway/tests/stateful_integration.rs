@@ -19,6 +19,12 @@
 //! the scenario fails here and has to be rewritten into the real assertion
 //! instead of quietly passing.
 //!
+//! **A gate is `Partial` when a running process proves the path that exists and
+//! a named slice still owns the rest.** IG-05 is the current one: a mutation is
+//! validated, revisioned, and audited against a real control plane through the
+//! breakglass credential, while authorizing an OIDC principal against a scoped
+//! grant waits on a replica that authenticates one.
+//!
 //! The gate table below and the matrix in
 //! `docs/operations/stateful-integration.md` are checked against each other, so
 //! neither can drift: an integration pull request that unblocks a gate has to
@@ -41,6 +47,7 @@ use support::{GATEWAY_KEY, boot, client};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Wired,
+    Partial,
     Blocked,
 }
 
@@ -48,6 +55,7 @@ impl Status {
     fn parse(text: &str) -> Self {
         match text {
             "wired" => Self::Wired,
+            "partial" => Self::Partial,
             "blocked" => Self::Blocked,
             other => panic!("unknown status {other:?} in the acceptance matrix"),
         }
@@ -91,7 +99,7 @@ const GATES: &[Gate] = &[
     },
     Gate {
         id: "IG-05",
-        status: Status::Blocked,
+        status: Status::Partial,
         scenarios: &["an_admin_mutation_publishes_an_audited_revision"],
     },
     Gate {
@@ -660,11 +668,196 @@ fn secrets_resolve_during_compilation_only() {
     stateful_serving_is_still_refused("IG-04");
 }
 
-/// Becomes: an authenticated `/admin/v1` mutation is validated, revisioned,
-/// authorized, and audited in the transaction that publishes it.
-#[test]
-fn an_admin_mutation_publishes_an_audited_revision() {
-    stateful_serving_is_still_refused("IG-05");
+// ── IG-05: validated, revisioned, authorized, audited mutations ──────────────
+
+/// One authenticated mutation, followed from the request to the revision it
+/// published and the audit event that attributes it.
+///
+/// `partial` in the matrix, and precisely: everything here happens through the
+/// breakglass credential, which is the only administrative principal a
+/// deployment has before it has been administered into existence. Authorizing an
+/// OIDC principal against a scoped grant waits on a replica that authenticates
+/// one, and gets a scenario of its own rather than an assumption here.
+#[tokio::test]
+async fn an_admin_mutation_publishes_an_audited_revision() {
+    let Some(control_plane) = ControlPlane::create().await else {
+        eprintln!(
+            "SKIPPED without AXOND_TEST_POSTGRES_DSN: IG-05's `partial` row is NOT proven by this \
+             run. It is proven by CI's required `Stateful tests` lane, which sets \
+             AXOND_TEST_REQUIRE_SERVICES=1 so this skip is a failure there."
+        );
+        return;
+    };
+    let migrated = control_plane.run(&["migrate", "apply"]);
+    assert!(
+        migrated.succeeded(),
+        "a mutation is published against a migrated control plane:\n{}",
+        migrated.context()
+    );
+    let replica = control_plane.serve().await;
+    let client = client();
+
+    // A tenant: the one resource a freshly migrated deployment can hold, since
+    // everything else is scoped to one.
+    let tenant = "ten_019ff9e0-0000-7000-8000-000000000001";
+    let document = serde_json::json!({
+        "summary": "create the integration tenant",
+        "mutation": "create",
+        "resource": {
+            "tenant": tenant,
+            "slug": "integration",
+            "display_name": "Integration",
+        },
+    });
+    let publish = |key: &'static str, expected: &'static str| {
+        stateful::breakglass(
+            client.post(replica.admin_url("/tenants")),
+            "IG-05: publish an audited revision",
+        )
+        .header("idempotency-key", key)
+        .header("x-axond-expected-revision", expected)
+        .json(&document)
+        .send()
+    };
+
+    // 1. Authenticated: an anonymous mutation is refused before it is validated,
+    //    so an unauthenticated caller cannot learn what the deployment contains
+    //    by watching which bodies are rejected.
+    let anonymous = client
+        .post(replica.admin_url("/tenants"))
+        .json(&document)
+        .send()
+        .await
+        .expect("an unauthenticated response");
+    assert_eq!(
+        anonymous.status(),
+        401,
+        "an unauthenticated mutation must be refused:\n{}",
+        replica.output()
+    );
+
+    // 2. Precondition-carrying: a mutation with no idempotency key is refused
+    //    rather than published once and unrepeatably.
+    let unconditional = stateful::breakglass(
+        client.post(replica.admin_url("/tenants")),
+        "IG-05: a mutation with no preconditions",
+    )
+    .json(&document)
+    .send()
+    .await
+    .expect("a response");
+    assert_eq!(
+        unconditional.status(),
+        400,
+        "a mutation without an idempotency key must be refused:\n{}",
+        replica.output()
+    );
+
+    // 3. Published: one revision, checksummed, with the resource in its diff.
+    let published = publish("ig-05-tenant", "empty")
+        .await
+        .expect("a publish response");
+    assert_eq!(
+        published.status(),
+        200,
+        "an authenticated mutation with satisfied preconditions publishes:\n{}",
+        replica.output()
+    );
+    let published: serde_json::Value = published.json().await.expect("a publish result");
+    let revision = published["revision"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a publish result names its revision: {published}"))
+        .to_owned();
+    assert_eq!(
+        published["diff"]["summary"]["added"], 1,
+        "the published revision adds exactly the resource the caller described: {published}"
+    );
+
+    // 4. Durable and readable: the revision is the deployment's desired state and
+    //    its history, read back from the control plane through the surface.
+    let state: serde_json::Value = stateful::breakglass(
+        client.get(replica.admin_url("/state")),
+        "IG-05: read the published state",
+    )
+    .send()
+    .await
+    .expect("a state response")
+    .json()
+    .await
+    .expect("a state document");
+    assert_eq!(
+        state["revision"], revision,
+        "the published revision is the current desired state: {state}"
+    );
+    assert_eq!(
+        state["resources"][0]["kind"], "tenant",
+        "the desired state holds the resource that was published: {state}"
+    );
+
+    // 5. Audited, and attributed to the credential that was actually used:
+    //    breakglass is recorded as breakglass rather than disguised as a person.
+    let audit: serde_json::Value = stateful::breakglass(
+        client.get(replica.admin_url(&format!("/audit/{revision}"))),
+        "IG-05: read the audit trail",
+    )
+    .send()
+    .await
+    .expect("an audit response")
+    .json()
+    .await
+    .expect("an audit document");
+    let event = &audit["events"][0];
+    assert_eq!(
+        event["actor"]["kind"], "breakglass",
+        "the audit event names the credential population that published: {audit}"
+    );
+    assert_eq!(
+        event["kind"], "create",
+        "the audit event records the kind of change that was declared: {audit}"
+    );
+    assert!(
+        event["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("create the integration tenant")),
+        "the audit event carries the author's own summary: {audit}"
+    );
+
+    // 6. Concurrency-safe: the same body under the same idempotency key is the
+    //    same mutation, and a stale expected revision is a conflict rather than a
+    //    silent overwrite.
+    let replayed = publish("ig-05-tenant", "empty")
+        .await
+        .expect("a replay response");
+    assert_eq!(
+        replayed.status(),
+        200,
+        "replaying a mutation under its idempotency key is not a second mutation:\n{}",
+        replica.output()
+    );
+    let stale = publish("ig-05-tenant-again", "empty")
+        .await
+        .expect("a conflict response");
+    assert_eq!(
+        stale.status(),
+        409,
+        "a mutation that expects a superseded revision must conflict:\n{}",
+        replica.output()
+    );
+    let history: serde_json::Value = stateful::breakglass(
+        client.get(replica.admin_url("/history")),
+        "IG-05: count the revisions",
+    )
+    .send()
+    .await
+    .expect("a history response")
+    .json()
+    .await
+    .expect("a history document");
+    assert_eq!(
+        history["revisions"].as_array().map(Vec::len),
+        Some(1),
+        "three requests describing one change leave one revision behind: {history}"
+    );
 }
 
 /// Becomes: a served inference request opens no control-plane connection and

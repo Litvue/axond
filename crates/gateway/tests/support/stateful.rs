@@ -147,6 +147,10 @@ pub const DSN_ENV: &str = "GW_INTEGRATION_CONTROL_PLANE_DSN";
 pub const KEK_ENV: &str = "GW_INTEGRATION_KEK";
 pub const BREAKGLASS_ENV: &str = "GW_INTEGRATION_BREAKGLASS";
 
+/// The value behind [`BREAKGLASS_ENV`]. A scenario that presents the credential
+/// needs its value, not only the name of the reference that carries it.
+pub const BREAKGLASS: &str = "integration-test-breakglass";
+
 impl ControlPlane {
     /// `None` when no test database is configured.
     pub async fn create() -> Option<Self> {
@@ -184,7 +188,7 @@ impl ControlPlane {
             (DSN_ENV, dsn.clone()),
             // Fixture values for references the commands only have to resolve.
             (KEK_ENV, "integration-test-kek-0123456789abcdef".to_owned()),
-            (BREAKGLASS_ENV, "integration-test-breakglass".to_owned()),
+            (BREAKGLASS_ENV, BREAKGLASS.to_owned()),
         ]);
         Some(Self {
             dsn,
@@ -283,6 +287,11 @@ impl Replica {
         format!("http://{}{path}", self.bind)
     }
 
+    /// An `/admin/v1` URL, spelt through the prefix the binary serves.
+    pub fn admin_url(&self, path: &str) -> String {
+        self.url(&format!("/admin/v1{path}"))
+    }
+
     /// Everything the replica has reported so far, for a failure message.
     pub fn output(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
@@ -311,6 +320,18 @@ impl Replica {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+}
+
+/// Present the breakglass credential, attributed.
+///
+/// Attribution is required rather than convenient: the surface refuses an
+/// unattributed breakglass request, and the audit row records who and why — so a
+/// helper that omitted it would be a helper for a `401`.
+pub fn breakglass(request: reqwest::RequestBuilder, reason: &str) -> reqwest::RequestBuilder {
+    request
+        .bearer_auth(BREAKGLASS)
+        .header("x-axond-breakglass-operator", "integration-harness")
+        .header("x-axond-breakglass-reason", reason)
 }
 
 /// A replica left running would hold its schema open against the `DROP` the
