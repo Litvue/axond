@@ -306,6 +306,7 @@ impl UsageJournal for PostgresJournal {
                     };
                 }
 
+                let mut dropped = 0;
                 let mut stored = stored_events(&tx, &gate, capacity.max_events).await?;
                 if stored >= capacity.max_events {
                     // Space that is only owed to a courtesy window goes first:
@@ -317,7 +318,8 @@ impl UsageJournal for PostgresJournal {
                     if stored >= capacity.max_events
                         && capacity.policy == CapacityPolicy::DropOldest
                     {
-                        stored -= drop_oldest(&tx, stored - capacity.max_events + 1).await?;
+                        dropped = drop_oldest(&tx, stored - capacity.max_events + 1).await?;
+                        stored -= dropped;
                     }
                     if reclaimed > 0 {
                         gate.invalidate();
@@ -350,6 +352,16 @@ impl UsageJournal for PostgresJournal {
                     )
                     .await?;
                 tx.commit().await?;
+                // Counted after the commit, because a drop this transaction
+                // rolled back lost nothing, and the loss counter is the one an
+                // operator is paged on.
+                if dropped > 0 {
+                    crate::telemetry::metrics::record_usage_journal_lost(
+                        BACKEND,
+                        "capacity_drop",
+                        dropped,
+                    );
+                }
                 gate.appended();
                 Ok(Appended::Accepted {
                     position: row.get::<_, i64>(0).max(0) as u64,
@@ -388,6 +400,12 @@ impl UsageJournal for PostgresJournal {
                 .await?;
 
                 let mut claimed: Vec<Delivery> = Vec::with_capacity(claim.max_events);
+                // What this claim would report, held until the commit that makes
+                // it true: the pool re-runs this closure once after a database
+                // error, and a retried pass must not count its first pass's
+                // quarantines twice.
+                let mut condemnations: Vec<PoisonReason> = Vec::new();
+                let mut undeliverable: Vec<&'static str> = Vec::new();
                 // A pass that only condemned rows advanced the head of those
                 // ordering keys without filling the batch, so the selection runs
                 // again: the caller's next event is deliverable now, and a claim
@@ -441,10 +459,7 @@ impl UsageJournal for PostgresJournal {
                         // attempt, no verdict, no lease. Its own version's replica
                         // will deliver it.
                         if stored_version > readable {
-                            crate::telemetry::metrics::record_usage_journal_undeliverable(
-                                BACKEND,
-                                "schema_ahead",
-                            );
+                            undeliverable.push("schema_ahead");
                             continue;
                         }
                         if attempt > max_attempts {
@@ -456,6 +471,7 @@ impl UsageJournal for PostgresJournal {
                                 attempt,
                             )
                             .await?;
+                            condemnations.push(PoisonReason::AttemptsExhausted);
                             condemned += 1;
                             continue;
                         }
@@ -471,11 +487,10 @@ impl UsageJournal for PostgresJournal {
                                     reason = %reason,
                                     "usage outbox row could not be decoded; quarantining it"
                                 );
-                                crate::telemetry::metrics::record_usage_journal_undeliverable(
-                                    BACKEND, "corrupt",
-                                );
+                                undeliverable.push("corrupt");
                                 condemn(&tx, position, &name, PoisonReason::Malformed, attempt)
                                     .await?;
+                                condemnations.push(PoisonReason::Malformed);
                                 condemned += 1;
                                 continue;
                             }
@@ -507,6 +522,16 @@ impl UsageJournal for PostgresJournal {
                     }
                 }
                 tx.commit().await?;
+                for reason in condemnations {
+                    crate::telemetry::metrics::record_usage_journal_quarantined(
+                        BACKEND,
+                        &name,
+                        reason.as_str(),
+                    );
+                }
+                for reason in undeliverable {
+                    crate::telemetry::metrics::record_usage_journal_undeliverable(BACKEND, reason);
+                }
                 Ok(claimed)
             })
         })
@@ -711,7 +736,9 @@ async fn reclaim_delivered(tx: &Transaction<'_>, wanted: u64) -> Result<u64, OpE
         .await?)
 }
 
-/// Delete up to `wanted` oldest droppable events and count them as lost.
+/// Delete up to `wanted` oldest droppable events, raising the durable loss
+/// total. The caller counts the loss in telemetry after the commit, so a
+/// rolled-back drop is not reported as lost billing data.
 ///
 /// A quarantined event is never a candidate: it is evidence an operator was
 /// asked to look at, so a journal whose whole backlog is poison refuses instead.
@@ -735,13 +762,13 @@ async fn drop_oldest(tx: &Transaction<'_>, wanted: u64) -> Result<u64, OpError> 
             &[&lost],
         )
         .await?;
-        crate::telemetry::metrics::record_usage_journal_lost(BACKEND, "capacity_drop", dropped);
     }
     Ok(dropped)
 }
 
 /// Take an event out of one consumer's delivery path, registering the attempt it
-/// died on so the poison count and the attempt history agree.
+/// died on so the poison count and the attempt history agree. Telemetry is the
+/// caller's, once the transaction that condemned the row has committed.
 async fn condemn(
     tx: &Transaction<'_>,
     position: i64,
@@ -759,7 +786,6 @@ async fn condemn(
         &[&position, &consumer, &attempt, &reason.as_str()],
     )
     .await?;
-    crate::telemetry::metrics::record_usage_journal_quarantined(BACKEND, consumer, reason.as_str());
     Ok(())
 }
 

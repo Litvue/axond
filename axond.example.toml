@@ -403,9 +403,10 @@ targets = [
 # Replacing material under the same verifier `kid` is reported as changed with
 # a short fingerprint; a new `kid` remains available for overlap rotation.
 #
-# `[server] bind`, `[[usage_sink]]`, and `[budget]` changes are reported with a
-# warning and otherwise ignored — the socket is already bound, sinks own live
-# connections, and the budget store owns its reservations, so all need a
+# `[server] bind`, `[[usage_sink]]`, `[usage_journal]`, and `[budget]` changes
+# are reported with a warning and otherwise ignored — the socket is already
+# bound, sinks own live connections, the usage outbox owns its connection and
+# delivery worker, and the budget store owns its reservations, so all need a
 # restart. This includes changes to the budget's `limit_microdollars`. See
 # docs/adr/0011-config-hot-reload.md.
 
