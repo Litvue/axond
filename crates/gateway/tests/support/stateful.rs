@@ -41,6 +41,13 @@ pub fn private_config(name: &str, contents: &str) -> PathBuf {
     path
 }
 
+/// A loopback address nothing is listening on, so a scenario never depends on
+/// one fixed port being free on the machine running it.
+pub fn free_addr() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    listener.local_addr().expect("a bound address")
+}
+
 /// One operator command, run against `config` with exactly `env` in scope.
 ///
 /// The environment is replaced rather than extended: a control-plane DSN

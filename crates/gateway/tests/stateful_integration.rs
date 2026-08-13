@@ -26,7 +26,10 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use support::stateful::{self, ControlPlane};
 use support::{GATEWAY_KEY, boot, client};
@@ -213,13 +216,14 @@ fn every_gate_has_a_scenario_that_exists() {
 
 /// A complete stateful bootstrap whose references are satisfied — the config
 /// closest to a production one that can exist before the control plane is wired.
-fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>) {
+fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>, SocketAddr) {
+    let bind = stateful::free_addr();
     let config = stateful::private_config(
         "axond.toml",
         &format!(
             "mode = \"stateful\"\n\
              [server]\n\
-             bind = \"127.0.0.1:18099\"\n\
+             bind = \"{bind}\"\n\
              [control_plane]\n\
              dsn_env = \"{dsn}\"\n\
              [secret_store]\n\
@@ -250,7 +254,7 @@ fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>) {
             "integration-test-breakglass".to_owned(),
         ),
     ]);
-    (config, env)
+    (config, env, bind)
 }
 
 /// `serve` still declines a stateful config, so a gate that depends on stateful
@@ -260,7 +264,7 @@ fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>) {
 /// — which is the point: each gate is then rewritten into the property it was
 /// always meant to prove, and its matrix row moves with it.
 fn stateful_serving_is_still_refused(gate: &str) {
-    let (config, env) = stateful_bootstrap();
+    let (config, env, _bind) = stateful_bootstrap();
     let run = stateful::run(&config, &["check", "preflight"], &env);
     assert!(
         !run.succeeded(),
@@ -304,21 +308,52 @@ async fn stateless_boot_serves_with_no_control_plane() {
 
 #[test]
 fn stateful_boot_refuses_to_serve_an_empty_snapshot() {
-    let (config, env) = stateful_bootstrap();
+    let (config, env, bind) = stateful_bootstrap();
     let mut command = std::process::Command::new(stateful::axond());
-    command.env("AXOND_CONFIG", &config);
+    command
+        .env_clear()
+        .env("AXOND_CONFIG", &config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
     for (key, value) in &env {
         command.env(key, value);
     }
-    let output = command.output().expect("the axond binary runs");
+    let mut child = command.spawn().expect("the axond binary runs");
+
+    // A refusal exits immediately. Waiting without a deadline would instead hang
+    // the suite for as long as CI allows on the day `serve` learns to boot
+    // statefully — the very change this scenario exists to catch.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait().expect("the child's status is readable") {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let output = child.wait_with_output().expect("the child's output");
     let reported = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "IG-01: a stateful boot kept running instead of refusing, so this gate's real scenario \
+             is now possible and required. Rewrite it and move its row in \
+             docs/operations/stateful-integration.md.\n{reported}"
+        )
+    });
 
     assert!(
-        !output.status.success(),
+        !status.success(),
         "a stateful replica must refuse to start rather than serve an empty snapshot:\n{reported}"
     );
     assert!(
@@ -326,8 +361,8 @@ fn stateful_boot_refuses_to_serve_an_empty_snapshot() {
         "the refusal must name the mode it refuses, so an operator can act on it:\n{reported}"
     );
     assert!(
-        std::net::TcpStream::connect("127.0.0.1:18099").is_err(),
-        "a refused boot must not have bound a listener"
+        TcpStream::connect(bind).is_err(),
+        "a refused boot must not have bound a listener on {bind}"
     );
 }
 
@@ -439,7 +474,7 @@ async fn migrate_prepares_a_control_plane_before_replicas_start() {
     let preflight = control_plane.run(&["check", "preflight"]);
     let reported = preflight.reported();
     assert!(
-        reported.contains("control plane") && !reported.contains(&control_plane.dsn),
+        reported.contains("control-plane database") && !reported.contains(&control_plane.dsn),
         "preflight names the control plane by reference, never by DSN:\n{}",
         preflight.context()
     );
