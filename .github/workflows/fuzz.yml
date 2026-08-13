@@ -27,6 +27,7 @@ on:
           - sse_decode
           - provider_stream
           - provider_error
+          - catalog_import
 
 permissions:
   contents: read
@@ -56,9 +57,9 @@ jobs:
           set -euo pipefail
           case "${REQUESTED}" in
             all)
-              targets='["config_toml", "token_verify", "credentials_query", "sse_decode", "provider_stream", "provider_error"]'
+              targets='["config_toml", "token_verify", "credentials_query", "sse_decode", "provider_stream", "provider_error", "catalog_import"]'
               ;;
-            config_toml | token_verify | credentials_query | sse_decode | provider_stream | provider_error)
+            config_toml | token_verify | credentials_query | sse_decode | provider_stream | provider_error | catalog_import)
               targets="[\"${REQUESTED}\"]"
               ;;
             *) echo "unknown fuzz target ${REQUESTED}" >&2; exit 1 ;;

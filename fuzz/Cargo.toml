@@ -40,6 +40,10 @@ axond = { path = "../crates/gateway" }
 # reaches them, which is what exposes `SseDecoder::fuzz_buffered`.
 gateway-core = { path = "../crates/gateway-core" }
 libfuzzer-sys = { version = "0.4.10", optional = true }
+# The catalogue target edits a JSON document structurally before handing it to
+# the parser, so a semantic mutation is a semantic mutation rather than a byte
+# flip that happens to still parse.
+serde_json = "1.0.145"
 
 # The deterministic seed-replay smoke: bounded, stable-only, and the lane CI
 # requires on every pull request.
@@ -93,6 +97,10 @@ bench = false
 [[bin]]
 name = "provider_error"
 path = "fuzz_targets/provider_error.rs"
+
+[[bin]]
+name = "catalog_import"
+path = "fuzz_targets/catalog_import.rs"
 required-features = ["libfuzzer"]
 test = false
 doc = false

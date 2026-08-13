@@ -24,6 +24,7 @@
 //! synthetic key material, so a fuzz run is hermetic and holds no real secret.
 
 mod wire;
+use std::sync::OnceLock;
 
 use arbitrary::Arbitrary;
 use axond_fuzz_seam::{Rejection, VerifiedToken};
@@ -33,6 +34,12 @@ pub use wire::{
     UpstreamFailure, assert_disclosure_check_survives_escaping, assert_valid_fixtures_are_stable,
     provider_error, provider_stream, sse_decode, sse_decode_at_limit, sse_events,
 };
+/// The ceiling a catalogue refusal's operator-facing text stays under.
+///
+/// Generous next to the excerpts the parser emits and tiny next to the 64 MiB a
+/// payload may be: the property is that refusal size does not scale with the
+/// payload, not that any particular wording fits.
+const CATALOG_REFUSAL_BYTES: usize = 4096;
 
 /// A refusal must carry an operator-facing reason. An empty one would reach a
 /// log or a response body as a blank message.
@@ -57,6 +64,34 @@ fn assert_typed(rejection: &Rejection) -> &'static str {
                 code.starts_with("token_"),
                 "unexpected authentication code {code:?}"
             );
+            code
+        }
+        Rejection::Catalog {
+            code,
+            message,
+            pointer,
+        } => {
+            assert!(!message.is_empty(), "typed rejection carries no message");
+            // A refusal is logged on every scheduled retry, so an upstream that
+            // chooses its own text must not get to choose how much of this
+            // gateway's log it occupies.
+            assert!(
+                message.len() <= CATALOG_REFUSAL_BYTES,
+                "a catalogue refusal quoted {} bytes of the payload back: {message:.256?}",
+                message.len()
+            );
+            if let Some(pointer) = pointer {
+                // A location an operator can act on: RFC 6901, so rooted.
+                assert!(
+                    pointer.starts_with('/'),
+                    "catalogue refusal names a pointer that is not one: {pointer:?}"
+                );
+                assert!(
+                    pointer.len() <= CATALOG_REFUSAL_BYTES,
+                    "a catalogue refusal named a {}-byte pointer",
+                    pointer.len()
+                );
+            }
             code
         }
         // The seam resolves no store, so this is unreachable by construction.
@@ -163,6 +198,682 @@ pub fn credentials_query(data: &[u8]) -> &'static str {
     );
     class
 }
+
+/// What the catalogue target does with the bytes it is given.
+///
+/// Raw payloads find the decoding, schema, and normalization paths; edits of the
+/// bundled models.dev seed find the *semantic* ones — an import that still
+/// parses but says something different, which is the case a byte flip almost
+/// never reaches and the case an operator actually gets.
+#[derive(Debug, Arbitrary)]
+pub enum CatalogInput<'a> {
+    /// An arbitrary payload, as a mirror could answer with.
+    Payload {
+        bytes: &'a [u8],
+        etag: Option<&'a str>,
+    },
+    /// The bundled seed, re-rendered with its object keys rotated by `rotate`
+    /// and its whitespace chosen by `pretty`, then edited.
+    ///
+    /// The rendering is part of every case on purpose: normalization has to be
+    /// blind to key order and whitespace, so every semantic assertion below is
+    /// also a reordering assertion.
+    Edited {
+        edit: CatalogEdit<'a>,
+        rotate: u8,
+        pretty: bool,
+    },
+}
+
+/// One edit to the seed. Exactly one, so the class of change it should produce
+/// is unambiguous: a target that applied two could not tell a price-only import
+/// from a metadata-only one.
+#[derive(Debug, Arbitrary)]
+pub enum CatalogEdit<'a> {
+    /// Nothing but the re-rendering: the identity check on its own.
+    None,
+    /// A field the schema does not define, on one offering. Unknown fields add
+    /// information the gateway does not model; they must not change what it
+    /// stored.
+    Unknown {
+        provider: u16,
+        model: u16,
+        key: &'a str,
+        value: &'a str,
+    },
+    /// One published rate of one offering.
+    Cost {
+        provider: u16,
+        model: u16,
+        field: CostField,
+        value: f32,
+    },
+    /// One descriptive field of one offering.
+    Metadata {
+        provider: u16,
+        model: u16,
+        field: MetaField,
+        value: &'a str,
+    },
+    /// One capability flag of one offering.
+    Capability {
+        provider: u16,
+        model: u16,
+        field: CapabilityField,
+        value: bool,
+    },
+    /// The lifecycle status of one offering.
+    Lifecycle {
+        provider: u16,
+        model: u16,
+        status: LifecycleValue,
+    },
+    /// One descriptive field of a provider-neutral record, which is what an
+    /// offering's overrides are measured against.
+    Neutral {
+        model: u16,
+        field: MetaField,
+        value: &'a str,
+    },
+    /// Arbitrary bytes spliced into the rendered document: schema drift, with a
+    /// valid catalogue around it.
+    Splice { at: u16, bytes: &'a [u8] },
+}
+
+#[derive(Debug, Arbitrary, Clone, Copy)]
+pub enum CostField {
+    Input,
+    Output,
+    CacheRead,
+}
+
+#[derive(Debug, Arbitrary, Clone, Copy)]
+pub enum MetaField {
+    Name,
+    Family,
+    Knowledge,
+    ReleaseDate,
+    LastUpdated,
+}
+
+#[derive(Debug, Arbitrary, Clone, Copy)]
+pub enum CapabilityField {
+    Attachment,
+    Reasoning,
+    ToolCall,
+    StructuredOutput,
+    Temperature,
+}
+
+#[derive(Debug, Arbitrary, Clone, Copy)]
+pub enum LifecycleValue {
+    Available,
+    Alpha,
+    Beta,
+    Deprecated,
+    /// Whatever the fuzzer wants, including a status the vocabulary does not
+    /// define — which must be refused rather than folded onto a default.
+    Unknown(u8),
+}
+
+impl CostField {
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+            Self::CacheRead => "cache_read",
+        }
+    }
+}
+
+impl MetaField {
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Family => "family",
+            Self::Knowledge => "knowledge",
+            Self::ReleaseDate => "release_date",
+            Self::LastUpdated => "last_updated",
+        }
+    }
+}
+
+impl CapabilityField {
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Attachment => "attachment",
+            Self::Reasoning => "reasoning",
+            Self::ToolCall => "tool_call",
+            Self::StructuredOutput => "structured_output",
+            Self::Temperature => "temperature",
+        }
+    }
+}
+
+impl LifecycleValue {
+    fn value(self) -> String {
+        match self {
+            Self::Available => "available".to_owned(),
+            Self::Alpha => "alpha".to_owned(),
+            Self::Beta => "beta".to_owned(),
+            Self::Deprecated => "deprecated".to_owned(),
+            Self::Unknown(byte) => format!("status-{byte}"),
+        }
+    }
+}
+
+/// A models.dev catalogue import: decoding, schema validation, normalization,
+/// content identity, semantic classification, and admission over a
+/// last-known-good catalogue.
+pub fn catalog_import(input: &CatalogInput<'_>) -> &'static str {
+    match input {
+        CatalogInput::Payload { bytes, etag } => import(bytes, *etag).0,
+        CatalogInput::Edited {
+            edit,
+            rotate,
+            pretty,
+        } => {
+            let Some(seed) = seed_document() else {
+                return "unrenderable";
+            };
+            let render = |value: &serde_json::Value| render_json(value, *rotate, *pretty);
+            match edit {
+                CatalogEdit::None => {
+                    // Same catalogue, different spelling: the identity must not
+                    // notice, so the import is a no-op rather than an update.
+                    let (class, import) = import(render(&seed).as_bytes(), None);
+                    let import = import.unwrap_or_else(|| {
+                        panic!("re-rendering the seed made it unimportable: {class}")
+                    });
+                    assert_eq!(
+                        import.content_id,
+                        axond_fuzz_seam::catalog_seed_content_id(),
+                        "reordering keys or whitespace changed the content identity"
+                    );
+                    assert_eq!(class, "unchanged");
+                    "rendered"
+                }
+                CatalogEdit::Unknown {
+                    provider,
+                    model,
+                    key,
+                    value,
+                } => {
+                    let mut document = seed.clone();
+                    // Namespaced, so it is unknown whatever the fuzzer chose: a
+                    // key that collided with a schema field would be testing
+                    // the schema, not the tolerance of unknown fields.
+                    let key = format!("x-fuzz-{key}");
+                    if !edit_offering(&mut document, *provider, *model, |offering| {
+                        offering
+                            .insert(key.clone(), serde_json::Value::String((*value).to_owned()));
+                    }) {
+                        return "unaddressable";
+                    }
+                    let (class, import) = import(render(&document).as_bytes(), None);
+                    if let Some(import) = import {
+                        assert_eq!(
+                            import.content_id,
+                            axond_fuzz_seam::catalog_seed_content_id(),
+                            "an unknown field changed what was stored"
+                        );
+                        assert_eq!(class, "unchanged");
+                        "unknown_field_ignored"
+                    } else {
+                        class
+                    }
+                }
+                CatalogEdit::Cost {
+                    provider,
+                    model,
+                    field,
+                    value,
+                } => {
+                    let Some(number) = serde_json::Number::from_f64(f64::from(*value)) else {
+                        return "unrepresentable";
+                    };
+                    let mut document = seed.clone();
+                    let key = field.key();
+                    if !edit_offering(&mut document, *provider, *model, |offering| {
+                        let cost = offering
+                            .entry("cost")
+                            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                        if let Some(cost) = cost.as_object_mut() {
+                            cost.insert(key.to_owned(), serde_json::Value::Number(number.clone()));
+                        }
+                    }) {
+                        return "unaddressable";
+                    }
+                    let (class, _) = import(render(&document).as_bytes(), None);
+                    if let Some(diff) = last_diff(&document, *rotate, *pretty) {
+                        assert!(
+                            diff.is_price_only(),
+                            "changing a published rate was classified as more than a price change: {diff:?}"
+                        );
+                        return "price_changed";
+                    }
+                    class
+                }
+                CatalogEdit::Metadata {
+                    provider,
+                    model,
+                    field,
+                    value,
+                } => {
+                    let mut document = seed.clone();
+                    let key = field.key();
+                    if !edit_offering(&mut document, *provider, *model, |offering| {
+                        offering.insert(
+                            key.to_owned(),
+                            serde_json::Value::String((*value).to_owned()),
+                        );
+                    }) {
+                        return "unaddressable";
+                    }
+                    let (class, _) = import(render(&document).as_bytes(), None);
+                    assert_metadata_only(&document, *rotate, *pretty, class, "metadata_changed")
+                }
+                CatalogEdit::Capability {
+                    provider,
+                    model,
+                    field,
+                    value,
+                } => {
+                    let mut document = seed.clone();
+                    let key = field.key();
+                    if !edit_offering(&mut document, *provider, *model, |offering| {
+                        offering.insert(key.to_owned(), serde_json::Value::Bool(*value));
+                    }) {
+                        return "unaddressable";
+                    }
+                    let (class, _) = import(render(&document).as_bytes(), None);
+                    assert_metadata_only(&document, *rotate, *pretty, class, "capability_changed")
+                }
+                CatalogEdit::Lifecycle {
+                    provider,
+                    model,
+                    status,
+                } => {
+                    let mut document = seed.clone();
+                    let status = status.value();
+                    if !edit_offering(&mut document, *provider, *model, |offering| {
+                        offering.insert(
+                            "status".to_owned(),
+                            serde_json::Value::String(status.clone()),
+                        );
+                    }) {
+                        return "unaddressable";
+                    }
+                    let (class, _) = import(render(&document).as_bytes(), None);
+                    assert_metadata_only(&document, *rotate, *pretty, class, "lifecycle_changed")
+                }
+                CatalogEdit::Neutral {
+                    model,
+                    field,
+                    value,
+                } => {
+                    let mut document = seed.clone();
+                    let key = field.key();
+                    if !edit_neutral(&mut document, *model, |neutral| {
+                        neutral.insert(
+                            key.to_owned(),
+                            serde_json::Value::String((*value).to_owned()),
+                        );
+                    }) {
+                        return "unaddressable";
+                    }
+                    let (class, _) = import(render(&document).as_bytes(), None);
+                    assert_metadata_only(&document, *rotate, *pretty, class, "neutral_changed")
+                }
+                CatalogEdit::Splice { at, bytes } => {
+                    let mut rendered = render(&seed).into_bytes();
+                    let at = (*at as usize) % (rendered.len() + 1);
+                    rendered.splice(at..at, bytes.iter().copied());
+                    import(&rendered, None).0
+                }
+            }
+        }
+    }
+}
+
+/// Drive one payload through the whole import path and assert what must hold
+/// however it was produced.
+///
+/// Returns the outcome class and, when the payload was accepted, what it
+/// normalized to.
+fn import(
+    payload: &[u8],
+    etag: Option<&str>,
+) -> (&'static str, Option<axond_fuzz_seam::CatalogImport>) {
+    // The routing table a request would be served from, read before and after:
+    // a catalogue import records metadata and must never publish runtime state.
+    // Read live off the state's snapshot pointer, so publication is what the
+    // comparison watches — calibrated once per process against a separate state
+    // that is deliberately published into, since a comparison that cannot move
+    // proves nothing about the path that must not move it.
+    static PUBLICATION_IS_OBSERVABLE: OnceLock<bool> = OnceLock::new();
+    assert!(
+        *PUBLICATION_IS_OBSERVABLE.get_or_init(axond_fuzz_seam::publication_moves_runtime_routes),
+        "publishing a snapshot did not move the observed routing table: the \
+         no-publication check is blind"
+    );
+    let routes = axond_fuzz_seam::runtime_routes();
+
+    let parsed = axond_fuzz_seam::catalog_parse(payload, FETCHED_AT, etag);
+    let admission = axond_fuzz_seam::catalog_import_over_seed(payload, etag);
+
+    // Offline by construction: the only thing the import path reached for is the
+    // configured URL, served from a buffer already in hand. A second request, or
+    // a request for anything else, would mean the path grew a transfer.
+    assert_eq!(
+        admission.fetched,
+        vec![axond_fuzz_seam::catalog_source_url()],
+        "the import path made an unexpected fetch"
+    );
+
+    let class = match &parsed {
+        Err(rejection) => {
+            let class = assert_typed(rejection);
+            // The whole point of the last-known-good rule: a payload that was
+            // refused cannot have disturbed what is being served.
+            assert_eq!(admission.outcome, "refused");
+            assert!(
+                admission.active_is_seed,
+                "a refused payload replaced the active catalogue"
+            );
+            assert_eq!(
+                admission.active_content_id,
+                axond_fuzz_seam::catalog_seed_content_id(),
+                "a refused payload changed the active content identity"
+            );
+            class
+        }
+        Ok(import) => {
+            assert_accepted_catalog(import);
+            // Provenance is not identity: the same bytes retrieved at another
+            // time, with other validators, are the same catalogue.
+            let again =
+                axond_fuzz_seam::catalog_parse(payload, FETCHED_AT + 86_400, Some("W/\"other\""))
+                    .expect("a payload that parsed once parses again");
+            assert_eq!(
+                import.content_id, again.content_id,
+                "the fetch time or the validators reached the content identity"
+            );
+            assert_eq!(
+                import.model_ids, again.model_ids,
+                "normalization is not deterministic"
+            );
+            assert_eq!(
+                admission.active_content_id, import.content_id,
+                "the admitted content is not what was imported"
+            );
+            if import.content_id == axond_fuzz_seam::catalog_seed_content_id() {
+                assert_eq!(admission.outcome, "unchanged");
+                assert!(admission.diff.is_none(), "unchanged content carried a diff");
+                "unchanged"
+            } else {
+                assert_eq!(admission.outcome, "updated");
+                let diff = admission.diff.expect("an update carries a diff");
+                assert!(diff.changes > 0, "an update carried an empty diff");
+                "updated"
+            }
+        }
+    };
+    assert_eq!(
+        routes,
+        axond_fuzz_seam::runtime_routes(),
+        "a catalogue import changed the routing table a request is served from"
+    );
+    (class, parsed.ok())
+}
+
+/// What an accepted catalogue must be, whatever the payload said.
+fn assert_accepted_catalog(import: &axond_fuzz_seam::CatalogImport) {
+    // A catalogue nothing offers is refused, not admitted: a document that kept
+    // its model records and lost its providers section would otherwise take the
+    // place of one that can still be routed and priced from.
+    assert!(
+        import.models > 0 && import.providers > 0 && import.offerings > 0,
+        "an empty catalogue was accepted: {import:?}"
+    );
+    assert_eq!(
+        import.offering_keys.len(),
+        import.offerings,
+        "the stored offerings and their keys disagree"
+    );
+    assert_eq!(
+        import.model_ids.len(),
+        import.models,
+        "the stored models and their ids disagree"
+    );
+    // Normalization sorts and de-duplicates, which is what makes the content
+    // identity a function of the catalogue rather than of the document.
+    let mut sorted = import.model_ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted, import.model_ids, "stored models are not sorted");
+    let mut offerings = import.offering_keys.clone();
+    offerings.sort();
+    offerings.dedup();
+    assert_eq!(
+        offerings.len(),
+        import.offering_keys.len(),
+        "the same offering was stored twice"
+    );
+    // Calibrated the same way the no-publication check is: an oracle that can
+    // only catch an invented override, and not a dropped one, would pass every
+    // run while the guarantee the docs state went missing.
+    static OMISSIONS_ARE_VISIBLE: OnceLock<bool> = OnceLock::new();
+    assert!(
+        *OMISSIONS_ARE_VISIBLE
+            .get_or_init(axond_fuzz_seam::override_oracle_notices_a_missing_override),
+        "removing a recorded override went unnoticed: the override check is blind"
+    );
+    assert!(
+        import.overrides_are_contradictions,
+        "an override was recorded where the provider agrees with the neutral \
+         record, or a difference it states was not recorded"
+    );
+    assert!(
+        import.overrides_point_into_offerings,
+        "an override points outside the offering that states it"
+    );
+    assert_eq!(
+        import.override_pointers.len(),
+        import.overrides,
+        "an override was recorded without a pointer"
+    );
+    assert!(
+        import.priced_offerings <= import.offerings,
+        "more prices than offerings"
+    );
+    assert_eq!(
+        import.source_url,
+        axond_fuzz_seam::catalog_source_url(),
+        "an import was attributed to another source"
+    );
+    assert!(
+        !import.content_id.is_empty() && !import.raw_digest.is_empty(),
+        "an accepted import has no identity"
+    );
+}
+
+/// The diff between the seed and an edited document, when the edit changed the
+/// catalogue at all.
+fn last_diff(
+    document: &serde_json::Value,
+    rotate: u8,
+    pretty: bool,
+) -> Option<axond_fuzz_seam::CatalogDiffShape> {
+    axond_fuzz_seam::catalog_diff(
+        axond_fuzz_seam::CATALOG_SEED_PAYLOAD.as_bytes(),
+        render_json(document, rotate, pretty).as_bytes(),
+    )
+    .ok()
+    .flatten()
+}
+
+/// An edit to something the catalogue calls metadata must be classified as
+/// metadata — never as a price change, which is what a spend decision reads.
+fn assert_metadata_only(
+    document: &serde_json::Value,
+    rotate: u8,
+    pretty: bool,
+    class: &'static str,
+    changed: &'static str,
+) -> &'static str {
+    match last_diff(document, rotate, pretty) {
+        Some(diff) => {
+            assert!(
+                diff.is_metadata_only(),
+                "a metadata edit was classified as more than metadata: {diff:?}"
+            );
+            changed
+        }
+        None => class,
+    }
+}
+
+/// The bundled seed as a JSON document, ready to edit.
+fn seed_document() -> Option<serde_json::Value> {
+    serde_json::from_str(axond_fuzz_seam::CATALOG_SEED_PAYLOAD).ok()
+}
+
+/// Apply an edit to the `providers[…].models[…]` object the indices select.
+///
+/// `false` when the document has no such offering, which is not a finding: the
+/// fuzzer chose an index the seed does not have.
+fn edit_offering(
+    document: &mut serde_json::Value,
+    provider: u16,
+    model: u16,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> bool {
+    let providers = document
+        .get_mut("providers")
+        .and_then(|providers| providers.as_object_mut());
+    let Some(providers) = providers else {
+        return false;
+    };
+    if providers.is_empty() {
+        return false;
+    }
+    let index = (provider as usize) % providers.len();
+    let Some(provider) = providers.values_mut().nth(index) else {
+        return false;
+    };
+    let models = provider
+        .get_mut("models")
+        .and_then(|models| models.as_object_mut());
+    let Some(models) = models else {
+        return false;
+    };
+    if models.is_empty() {
+        return false;
+    }
+    let index = (model as usize) % models.len();
+    let Some(offering) = models
+        .values_mut()
+        .nth(index)
+        .and_then(|offering| offering.as_object_mut())
+    else {
+        return false;
+    };
+    edit(offering);
+    true
+}
+
+/// Apply an edit to the `models[…]` provider-neutral record the index selects.
+fn edit_neutral(
+    document: &mut serde_json::Value,
+    model: u16,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> bool {
+    let models = document
+        .get_mut("models")
+        .and_then(|models| models.as_object_mut());
+    let Some(models) = models else {
+        return false;
+    };
+    if models.is_empty() {
+        return false;
+    }
+    let index = (model as usize) % models.len();
+    let Some(neutral) = models
+        .values_mut()
+        .nth(index)
+        .and_then(|model| model.as_object_mut())
+    else {
+        return false;
+    };
+    edit(neutral);
+    true
+}
+
+/// Serialize a document with every object's keys rotated by `rotate` and its
+/// whitespace chosen by `pretty`.
+///
+/// `serde_json` stores objects in a sorted map, so re-serializing one is already
+/// a reordering of the committed seed; rotating on top of that reaches the
+/// orders a mirror, a proxy, or a regenerated upstream document would produce.
+/// Key order and whitespace are exactly what a content identity must be blind
+/// to, so every edited case is rendered this way.
+fn render_json(value: &serde_json::Value, rotate: u8, pretty: bool) -> String {
+    let mut out = String::new();
+    write_json(&mut out, value, rotate, pretty, 0);
+    out
+}
+
+fn write_json(out: &mut String, value: &serde_json::Value, rotate: u8, pretty: bool, depth: usize) {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            let keys: Vec<&String> = map.keys().collect();
+            let start = (rotate as usize) % keys.len();
+            out.push('{');
+            for (position, offset) in (0..keys.len()).enumerate() {
+                let key = keys[(start + offset) % keys.len()];
+                if position > 0 {
+                    out.push(',');
+                }
+                newline(out, pretty, depth + 1);
+                out.push_str(&serde_json::Value::String((*key).clone()).to_string());
+                out.push(':');
+                if pretty {
+                    out.push(' ');
+                }
+                write_json(out, &map[key], rotate, pretty, depth + 1);
+            }
+            newline(out, pretty, depth);
+            out.push('}');
+        }
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            out.push('[');
+            for (position, item) in items.iter().enumerate() {
+                if position > 0 {
+                    out.push(',');
+                }
+                newline(out, pretty, depth + 1);
+                write_json(out, item, rotate, pretty, depth + 1);
+            }
+            newline(out, pretty, depth);
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+fn newline(out: &mut String, pretty: bool, depth: usize) {
+    if pretty {
+        out.push('\n');
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
+    }
+}
+
+/// The fetch time an import is stamped with in this target. Fixed, because it is
+/// provenance: an identity that moved with it would be the finding.
+const FETCHED_AT: u64 = axond_fuzz_seam::CATALOG_FETCHED_AT_SECS;
 
 /// What the token target does with the bytes it is given.
 ///

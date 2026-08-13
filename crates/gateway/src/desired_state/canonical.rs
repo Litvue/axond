@@ -321,6 +321,13 @@ impl CanonicalValue {
     }
 
     /// A set-like collection built from members in any order.
+    ///
+    /// Sorted here for the same reason [`CanonicalValue::map`] is, and into the
+    /// same order the encoder uses: a set built from a `BTreeSet` iterates in
+    /// its element order, which is not the encoded-byte order a decoder returns,
+    /// so without this a two-member set would compare unequal to its own round
+    /// trip. A member with no canonical form has no encoding to sort by and
+    /// lands wherever; encoding the set is what refuses it.
     pub fn set(members: impl IntoIterator<Item = CanonicalValue>) -> Self {
         let mut members: Vec<Self> = members.into_iter().collect();
         // The encoder's order — the members' own encodings, sorted — so this is
@@ -781,6 +788,27 @@ mod tests {
             ])
             .to_canonical_bytes()
             .is_ok()
+        );
+    }
+
+    /// A set is built in the order it encodes in, like a map's fields: a set
+    /// whose members arrive in element order — every `BTreeSet` — would
+    /// otherwise compare unequal to the set storage returns, and every consumer
+    /// would have to compare checksums instead of values.
+    #[test]
+    fn a_set_equals_its_own_round_trip() {
+        // Element order for these is neither their length order nor their byte
+        // order, which is what the encoder sorts by.
+        let value = CanonicalValue::set([
+            CanonicalValue::string("text"),
+            CanonicalValue::string("image"),
+            CanonicalValue::string("pdf"),
+        ]);
+        let bytes = value.to_canonical_bytes().expect("canonical bytes");
+        assert_eq!(
+            SerializerVersion::default().decode(&bytes).expect("decode"),
+            value,
+            "a set built here must be the set storage returns"
         );
     }
 

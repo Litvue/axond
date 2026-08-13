@@ -203,6 +203,7 @@ fuzz-all seconds="60":
     just fuzz sse_decode {{seconds}}
     just fuzz provider_stream {{seconds}}
     just fuzz provider_error {{seconds}}
+    just fuzz catalog_import {{seconds}}
 
 # The heavy SSE soak: hundreds of concurrent streams with cancels and drops.
 # The short subset runs in `just test`; this is the long one.

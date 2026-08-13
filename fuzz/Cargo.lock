@@ -131,6 +131,7 @@ dependencies = [
  "axond",
  "gateway-core",
  "libfuzzer-sys",
+ "serde_json",
 ]
 
 [[package]]

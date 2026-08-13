@@ -86,8 +86,8 @@ use super::catalog::{
     CatalogRefresh, CatalogSnapshot, CatalogSource, ETag, InvalidCatalogId, JsonPointer, Modality,
     ModelCapability, ModelFacts, ModelField, ModelId, ModelLifecycle, ModelLimits, ObservedPrice,
     ObservedRate, PriceRates, PriceTier, PriceTierThreshold, ProviderEndpoint, ProviderOffering,
-    RawPayload, Refusable, Refusal, RefusalReason, SchemaVersion, SourceValidators,
-    source_snapshot,
+    RawPayload, Refusable, Refusal, RefusalReason, SchemaVersion, SourceValidators, excerpt,
+    excerpt_list, excerpt_located, source_snapshot,
 };
 use super::{Capabilities, Capability};
 use crate::desired_state::canonical::{CanonicalError, CanonicalValue};
@@ -109,15 +109,20 @@ const BACKEND: &str = "models.dev";
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModelsDevError {
     #[error(
-        "`{url}` is not a supported models.dev document; only `{SUPPORTED_PATH}` is \
-         (`api.json` and `models.json` have different shapes)"
+        "`{}` is not a supported models.dev document; only `{SUPPORTED_PATH}` is \
+         (`api.json` and `models.json` have different shapes)",
+        excerpt(url)
     )]
     UnsupportedEndpoint { url: String },
-    #[error("the payload is not JSON: {message}")]
+    /// Bounded at both ends: these two are the only refusals that may carry no
+    /// [`JsonPointer`], so the deserializer's trailing `at line L column C` can
+    /// be the whole of their provenance.
+    #[error("the payload is not JSON: {}", excerpt_located(message))]
     NotJson { message: String },
     #[error(
-        "the payload is not a models.dev catalogue document{}: {message}",
-        pointer.as_ref().map_or_else(String::new, |pointer| format!(" at `{pointer}`"))
+        "the payload is not a models.dev catalogue document{}: {}",
+        pointer.as_ref().map_or_else(String::new, |pointer| format!(" at `{pointer}`")),
+        excerpt_located(message)
     )]
     Schema {
         /// Where the deserializer was when it refused, when it was anywhere: a
@@ -125,7 +130,11 @@ pub enum ModelsDevError {
         pointer: Option<JsonPointer>,
         message: String,
     },
-    #[error("`{pointer}` is keyed `{key}` but its `id` is `{id}`")]
+    #[error(
+        "`{pointer}` is keyed `{}` but its `id` is `{}`",
+        excerpt(key),
+        excerpt(id)
+    )]
     IdMismatch {
         pointer: JsonPointer,
         key: String,
@@ -137,12 +146,12 @@ pub enum ModelsDevError {
         #[source]
         source: InvalidCatalogId,
     },
-    #[error("`{pointer}` has an unrecognized status `{status}`")]
+    #[error("`{pointer}` has an unrecognized status `{}`", excerpt(status))]
     UnknownStatus {
         pointer: JsonPointer,
         status: String,
     },
-    #[error("`{pointer}` has an unrecognized modality `{modality}`")]
+    #[error("`{pointer}` has an unrecognized modality `{}`", excerpt(modality))]
     UnknownModality {
         pointer: JsonPointer,
         modality: String,
@@ -152,7 +161,7 @@ pub enum ModelsDevError {
         pointer: JsonPointer,
         reason: PriceRejection,
     },
-    #[error("`{pointer}` has an unrecognized price tier type `{kind}`")]
+    #[error("`{pointer}` has an unrecognized price tier type `{}`", excerpt(kind))]
     UnknownTierType { pointer: JsonPointer, kind: String },
     #[error("`{pointer}` states two prices for the same tier threshold")]
     DuplicateTier { pointer: JsonPointer },
@@ -166,8 +175,10 @@ pub enum ModelsDevError {
         source: CanonicalError,
     },
     #[error(
-        "`{pointer}` offers `{key}`, which could be any of `{}`",
-        candidates.join("`, `")
+        "`{}` offers `{}`, which could be any of {}",
+        pointer,
+        excerpt(key),
+        excerpt_list(candidates)
     )]
     AmbiguousModelKey {
         pointer: JsonPointer,
@@ -259,13 +270,16 @@ impl From<ModelsDevError> for CatalogError {
 /// Why a published decimal is not a usable [`ObservedRate`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PriceRejection {
-    #[error("`{value}` is not a JSON number")]
+    #[error("`{}` is not a JSON number", excerpt(value))]
     NotANumber { value: String },
-    #[error("`{value}` is negative")]
+    #[error("`{}` is negative", excerpt(value))]
     Negative { value: String },
-    #[error("`{value}` is finer than one nano-dollar per million tokens")]
+    #[error(
+        "`{}` is finer than one nano-dollar per million tokens",
+        excerpt(value)
+    )]
     ExcessPrecision { value: String },
-    #[error("`{value}` is larger than an observed rate can hold")]
+    #[error("`{}` is larger than an observed rate can hold", excerpt(value))]
     Overflow { value: String },
     #[error("a price states `{stated}` without `{missing}`")]
     Partial {
@@ -1717,6 +1731,7 @@ mod tests {
             }
             "neutral-price" => include_str!("fixtures/models_dev/drift.neutral-price.json"),
             "missing-providers" => include_str!("fixtures/models_dev/drift.missing-providers.json"),
+            "providers-empty" => include_str!("fixtures/models_dev/drift.providers-empty.json"),
             "missing-model-name" => {
                 include_str!("fixtures/models_dev/drift.missing-model-name.json")
             }
@@ -1769,6 +1784,37 @@ mod tests {
                 "`{rejected}` is a different document shape"
             );
         }
+    }
+
+    /// A schema refusal names no pointer, so its position is all it has.
+    ///
+    /// The bound on quoted upstream text exists because a type error repeats the
+    /// value it rejected, and that value is the payload's to size. Cutting the
+    /// tail with it would leave an operator a truncated complaint about a
+    /// document with tens of thousands of lines and nowhere to look.
+    #[test]
+    fn a_schema_refusal_stays_bounded_and_still_says_where() {
+        let hostile = format!(
+            r#"{{"models":{{"gpt-5.5":{{"id":"gpt-5.5","name":"gpt-5.5","limit":{{"context":"{}"}}}}}}}}"#,
+            "n".repeat(4 * 1024 * 1024)
+        );
+        let refusal = parse(&hostile)
+            .expect_err("a context limit that is a string is schema drift")
+            .to_string();
+
+        assert!(
+            refusal.len() < 512,
+            "a refusal an upstream can size is a log amplifier: {} bytes",
+            refusal.len()
+        );
+        assert!(
+            refusal.contains("invalid type: string")
+                && refusal.contains("… (")
+                && refusal.contains("bytes) …")
+                && refusal.contains("at line ")
+                && refusal.contains(" column "),
+            "the bounded head and tail preserve both the rejected value and its locator: {refusal}"
+        );
     }
 
     #[test]
@@ -2222,6 +2268,17 @@ mod tests {
                     error,
                     ModelsDevError::Content {
                         source: CatalogContentError::Empty
+                    }
+                )
+            }),
+            // Model records with an empty providers section: a document that
+            // parses, says something, and offers nothing. Refused, so it cannot
+            // take the place of a catalogue that can still be routed from.
+            ("providers-empty", |error| {
+                matches!(
+                    error,
+                    ModelsDevError::Content {
+                        source: CatalogContentError::Unoffered { .. }
                     }
                 )
             }),
@@ -2854,7 +2911,8 @@ mod tests {
                 backend: BACKEND,
                 refusal: Refusal::new(RefusalReason::Oversized),
                 message: format!("payload exceeds the {ceiling}-byte ceiling"),
-            }
+            },
+            "a document that never fits is the configured source's shape, not an outage"
         );
         assert_eq!(
             transfers.load(Ordering::Relaxed),
