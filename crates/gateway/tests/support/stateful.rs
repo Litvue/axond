@@ -15,6 +15,11 @@ use std::time::{Duration, Instant};
 /// Distinguishes the fixtures of tests running in the same process.
 static FIXTURES: AtomicU64 = AtomicU64::new(0);
 
+/// How many ports a replica may lose to a sibling before its boot is the
+/// scenario's failure. Eight, because a collision is rare and independent: a run
+/// that lost this many is reporting something other than bad luck.
+const BOOT_ATTEMPTS: usize = 8;
+
 /// The shipped binary, which is what these scenarios qualify.
 pub fn axond() -> &'static str {
     env!("CARGO_BIN_EXE_axond")
@@ -222,13 +227,37 @@ impl ControlPlane {
     ///
     /// The control plane must already be migrated: a replica opens it at boot,
     /// so an unprepared schema is a boot failure rather than a scenario.
+    ///
+    /// Retried rather than attempted once, because an ephemeral port is free the
+    /// moment [`free_addr`] hands it over: a sibling scenario booting its own
+    /// replica can take it before this child binds it, and that child then exits
+    /// on the bind. A retry gives up the lost port and asks for another one, so a
+    /// collision costs an attempt instead of failing a scenario for a reason it
+    /// does not state.
     pub async fn serve(&self) -> Replica {
+        let mut reported = String::new();
+        for attempt in 0..BOOT_ATTEMPTS {
+            match self.spawn(attempt).await {
+                Ok(replica) => return replica,
+                Err(output) => reported = output,
+            }
+        }
+        panic!(
+            "a stateful replica did not serve in {BOOT_ATTEMPTS} attempts; the last one \
+             reported:\n{reported}"
+        );
+    }
+
+    /// One boot attempt on a port of its own: the running replica, or what the
+    /// child said instead of serving.
+    async fn spawn(&self, attempt: usize) -> Result<Replica, String> {
         let bind = free_addr();
         let log = self
             .config
             .parent()
             .expect("the fixture config has a directory")
-            .join("replica.log");
+            // Per attempt, so a retry's diagnostics are its own.
+            .join(format!("replica-{attempt}.log"));
         // A file rather than a pipe: a replica outlives the assertions made
         // against it, and a full pipe nobody is draining would block its next
         // log line and hang the scenario on an unrelated write.
@@ -251,9 +280,12 @@ impl ControlPlane {
             command.env(key, value);
         }
         let child = command.spawn().expect("the axond binary runs");
-        let replica = Replica { child, bind, log };
-        replica.await_liveness().await;
-        replica
+        let mut replica = Replica { child, bind, log };
+        if replica.serving().await {
+            Ok(replica)
+        } else {
+            Err(replica.output())
+        }
     }
 
     /// The applied migration versions, in order.
@@ -297,28 +329,36 @@ impl Replica {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// Wait until the process answers its liveness probe.
+    /// Whether *this* child is serving, rather than whether something answers on
+    /// its port.
     ///
     /// `/healthz`, not `/readyz`: a stateful replica serves administration while
     /// reporting itself unready for inference, so readiness is the very thing a
     /// scenario here asserts rather than a precondition it waits on.
-    async fn await_liveness(&self) {
+    ///
+    /// A liveness answer alone would not identify the answerer, so the child's own
+    /// state is what settles it: a replica that lost its port exits on the failed
+    /// bind, and this returns `false` for a retry on a fresh one rather than
+    /// letting a scenario assert against a sibling.
+    async fn serving(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(30);
         let client = reqwest::Client::new();
-        loop {
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return false;
+            }
             if let Ok(response) = client.get(self.url("/healthz")).send().await
                 && response.status().is_success()
             {
-                return;
+                // Answered — but a child that lost the port is answered *for*,
+                // and reports the bind failure a moment later. Re-read its state
+                // once the exit would have happened before believing the answer.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                return matches!(self.child.try_wait(), Ok(None));
             }
-            assert!(
-                Instant::now() < deadline,
-                "the replica never answered /healthz on {}:\n{}",
-                self.bind,
-                self.output()
-            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        false
     }
 }
 
