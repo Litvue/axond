@@ -78,29 +78,25 @@ pub fn router(state: AppState) -> Router {
         .into_iter()
         .fold(Router::new(), |router, spec| {
             let route = (spec.router)().layer(DefaultBodyLimit::max(max_request_bytes));
-            let route = match spec.auth {
-                AuthPosture::LivenessProbe => route,
-                // Admission is the outermost layer, so a request arriving after
-                // the drain window is refused before it touches authentication,
-                // budgets, or an upstream. The probes deliberately stay outside
-                // it: a draining replica is still alive, and killing it early
-                // would cut the very requests the drain exists to finish.
-                AuthPosture::Authenticated => route
-                    .layer(from_fn_with_state(
-                        (state.clone(), spec.capability),
-                        authenticate_middleware,
-                    ))
-                    .layer(from_fn_with_state(state.clone(), admission_middleware)),
-                // Authenticated, but outside admission for the same reason the
-                // probes are: it reports the shutdown rather than taking part in
-                // it. A diagnostic that closes with admission would answer
-                // `draining` for the phase an operator most needs described, and
-                // an operator polling it would count against the in-flight tally
-                // the shutdown deadline measures.
-                AuthPosture::Diagnostic => route.layer(from_fn_with_state(
+            let route = if spec.auth.requires_a_credential() {
+                route.layer(from_fn_with_state(
                     (state.clone(), spec.capability),
                     authenticate_middleware,
-                )),
+                ))
+            } else {
+                route
+            };
+            // Admission is the outermost layer, so a request arriving after the
+            // drain window is refused before it touches authentication, budgets,
+            // or an upstream. The probes and the status diagnostic deliberately
+            // stay outside it: a draining replica is still alive, killing its
+            // probes early would cut the very requests the drain exists to
+            // finish, and a diagnostic refused by admission could neither be read
+            // during the shutdown nor report that it is happening.
+            let route = if spec.auth.takes_an_admission_slot() {
+                route.layer(from_fn_with_state(state.clone(), admission_middleware))
+            } else {
+                route
             };
             router.route(spec.path, route)
         })
@@ -149,6 +145,12 @@ impl AuthPosture {
     /// do, which is what keeps the sweep test's floor closed over all of them.
     fn requires_a_credential(self) -> bool {
         !matches!(self, Self::LivenessProbe)
+    }
+
+    /// Whether a request to the route is work the replica is being asked to do,
+    /// rather than a question about the replica doing it.
+    fn takes_an_admission_slot(self) -> bool {
+        matches!(self, Self::Authenticated)
     }
 }
 
