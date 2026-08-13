@@ -74,6 +74,9 @@ and operate it.
   retained evidence behind each.
 - [Capacity qualification](./operations/capacity.md) — per-replica envelopes,
   candidate SLOs, the committed load profiles, and what a capacity run gates on.
+- [Fault qualification](./operations/fault-qualification.md) — the committed
+  provider, transport, and state-tier fault matrix, and the evidence each row
+  retains.
 - [Recovery qualification](./operations/recovery-qualification.md) — the
   committed outage, cold-boot, convergence, rotation, and restore scenarios, the
   evidence each retains, and the slices the harness still waits on.

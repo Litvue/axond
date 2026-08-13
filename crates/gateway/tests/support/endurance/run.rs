@@ -234,8 +234,13 @@ pub async fn run_with(
     let config = gateway
         .config
         .replace(&key_dir.display().to_string(), KEY_DIR_PLACEHOLDER);
-    let mut environment = Environment::collect(&config, &bind, &upstream.base_url, manifest_text);
-    environment.manifest.path = super::manifest::MANIFEST_RELATIVE.to_owned();
+    let environment = Environment::collect(
+        &config,
+        &bind,
+        &upstream.base_url,
+        super::manifest::MANIFEST_RELATIVE,
+        manifest_text,
+    );
 
     let samples_path =
         EnduranceResult::directory(tier).join(format!("{}.samples.jsonl", dispatch.stem));

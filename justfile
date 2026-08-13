@@ -164,6 +164,17 @@ endurance duration_ms="":
 rollout:
     AXOND_ROLLOUT=1 cargo test --locked --all-features --test rollout -- --nocapture --test-threads=1
 
+# One row at a time, in a lane of its own: each boots its own replica, and a
+# matrix that qualifies timing beside the rest of the suite would be measuring
+# the machine. AXOND_FAULT_MATRIX is what admits the rows, so `just test` runs
+# this binary's assertions without them. The provider and
+# transport rows need nothing; the state-tier rows take the same
+# AXOND_TEST_REDIS_URL / AXOND_TEST_POSTGRES_DSN the stateful suites do
+# (CONTRIBUTING.md has the container recipe), and skip when they are unset.
+# The committed fault matrix, publishing its evidence to target/faults/.
+faults:
+    AXOND_FAULT_MATRIX=1 cargo test --locked --all-features --test faults -- --nocapture --test-threads=1
+
 # Run the gateway against ./axond.toml (copy axond.example.toml first).
 run:
     cargo run -p axond

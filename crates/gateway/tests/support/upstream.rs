@@ -40,6 +40,9 @@ pub mod target {
     pub const DROP_STREAM: &str = "drop-stream";
     /// An upstream that answers `500` before any byte is relayed.
     pub const FAIL: &str = "fail-500";
+    /// An upstream that answers `429` before any byte is relayed: the provider
+    /// verdict that is attributable to the credential rather than to the target.
+    pub const RATE_LIMITED: &str = "rate-limited-429";
     /// Accepts the request and never sends response headers.
     pub const NO_HEADERS: &str = "no-headers";
     /// Thinks for a while and *then* answers, like a non-streamed completion:
@@ -207,8 +210,9 @@ impl UpstreamState {
             .expect("the gateway made an upstream request")
     }
 
-    /// Streamed response bodies currently open. Balanced opens and closes are
-    /// the leak assertion: a cancelled client must take its upstream with it.
+    /// Upstream responses currently open: streamed bodies, and the buffered
+    /// attempts that are still stalling. Balanced opens and closes are the leak
+    /// assertion: a cancelled client must take its upstream with it.
     pub fn open_streams(&self) -> i64 {
         self.counters.open.load(Ordering::SeqCst)
     }
@@ -218,8 +222,8 @@ impl UpstreamState {
     }
 }
 
-/// Decrements the open-stream count whenever a response body is dropped —
-/// completed, cancelled, or aborted alike.
+/// Decrements the open-response count whenever a response body — or a handler
+/// still deciding on one — is dropped: completed, cancelled, or aborted alike.
 struct ConnGuard(Arc<UpstreamState>);
 
 impl Drop for ConnGuard {
@@ -322,6 +326,13 @@ async fn handle(
                 .to_string(),
         )
             .into_response(),
+        target::RATE_LIMITED => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("content-type", "application/json"), ("retry-after", "1")],
+            json!({ "error": { "type": "rate_limit_error", "message": "fixture rate limit" } })
+                .to_string(),
+        )
+            .into_response(),
         target::SLOW_STREAM => sse(state.clone(), slow_events(anthropic, 40), Pace::Fast),
         target::DROP_STREAM => sse(state.clone(), truncated_events(anthropic), Pace::None),
         target::LONG_STREAM => sse(state.clone(), slow_events(anthropic, 20), Pace::Slow),
@@ -332,7 +343,11 @@ async fn handle(
             stalling_sse(state.clone(), events)
         }
         // Accepts the request and never answers: only a header bound ends this.
+        // The guard is held across the wait, so an abandoned buffered attempt is
+        // as observable as an abandoned stream: it is released when the gateway
+        // drops the connection and this handler is cancelled with it.
         target::NO_HEADERS => {
+            let _guard = open_guard(state.clone());
             tokio::time::sleep(FOREVER).await;
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -347,11 +362,16 @@ async fn handle(
             )
                 .into_response()
         }
-        // Headers land at once, so only a body bound ends this.
+        // Headers land at once, so only a body bound ends this. The unfinished
+        // body holds the guard, so abandoning it is observable.
         target::SLOW_BODY => {
-            let stream = futures::stream::unfold((), |()| async {
+            let guard = open_guard(state.clone());
+            let stream = futures::stream::unfold(guard, |guard| async {
                 tokio::time::sleep(FOREVER).await;
-                Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{}")), ()))
+                Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{}")),
+                    guard,
+                ))
             });
             let mut response = Response::new(Body::from_stream(stream));
             response
