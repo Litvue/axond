@@ -41,14 +41,21 @@ pub fn private_config(name: &str, contents: &str) -> PathBuf {
     path
 }
 
-/// One operator command, run against `config` with exactly `env` added.
+/// One operator command, run against `config` with exactly `env` in scope.
 ///
-/// The environment is explicit rather than inherited-plus-overrides: a
-/// control-plane DSN leaking in from the runner would make a scenario pass for a
-/// reason it did not state.
+/// The environment is replaced rather than extended: a control-plane DSN
+/// leaking in from the runner would make a scenario pass for a reason it did
+/// not state. The binary is invoked by absolute path, so nothing inherited is
+/// needed to start it; `PATH` is restored because a command may shell out, and
+/// `TMPDIR` because fixtures live under it.
 pub fn run(config: &Path, args: &[&str], env: &BTreeMap<&str, String>) -> Run {
     let mut command = Command::new(axond());
-    command.args(args).arg("--config").arg(config);
+    command.args(args).arg("--config").arg(config).env_clear();
+    for key in ["PATH", "TMPDIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     for (key, value) in env {
         command.env(key, value);
     }
