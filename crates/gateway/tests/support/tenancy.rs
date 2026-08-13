@@ -169,27 +169,48 @@ pub async fn boot(durability: Durability) -> Option<Deployment> {
     })
 }
 
-impl Deployment {
-    /// Drop everything this boot created. Called by the stateful cases so a
-    /// long-lived CI database does not accumulate a run's worth of objects per
-    /// run — including the namespace fence function, which the budget DDL also
-    /// names after the table and which dropping the table leaves behind.
-    pub async fn drop_tables(&self) {
-        let Some(dsn) = &self.dsn else {
+/// Drop everything this boot created, so a long-lived CI database does not
+/// accumulate a boot's worth of objects per run — the usage table, the three
+/// budget relations, and the namespace fence function, which the budget DDL
+/// also names after the table and which dropping the table leaves behind.
+///
+/// On [`Drop`] rather than at the end of each test, because the runs that most
+/// need cleaning up are the ones that panicked, and those never reach a
+/// trailing statement. It is a blocking cleanup on a thread of its own: the
+/// tests run on a current-thread runtime, which cannot be re-entered from a
+/// destructor.
+impl Drop for Deployment {
+    fn drop(&mut self) {
+        let Some(dsn) = self.dsn.clone() else {
             return;
         };
-        let client = connect(dsn).await;
-        for object in [
+        let objects = vec![
             format!("TABLE IF EXISTS {}_reservation", self.budget_table),
             format!("TABLE IF EXISTS {}_namespace", self.budget_table),
             format!("TABLE IF EXISTS {}", self.budget_table),
             format!("TABLE IF EXISTS {}", self.usage_table),
             format!("FUNCTION IF EXISTS {}_namespace_fence()", self.budget_table),
-        ] {
-            client
-                .batch_execute(&format!("DROP {object}"))
-                .await
-                .expect("an object this boot created can be dropped");
+        ];
+        let cleanup = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a cleanup runtime")
+                .block_on(async move {
+                    let client = connect(&dsn).await;
+                    for object in objects {
+                        if let Err(error) = client.batch_execute(&format!("DROP {object}")).await {
+                            eprintln!("isolation cleanup could not drop {object}: {error}");
+                        }
+                    }
+                });
+        });
+        // Joined, so the objects are gone before the test process is; and
+        // reported rather than panicked on, because a destructor that fails
+        // during an unwind aborts the process and buries the assertion that
+        // failed — which is the run whose cleanup matters most.
+        if cleanup.join().is_err() {
+            eprintln!("isolation cleanup thread panicked");
         }
     }
 }

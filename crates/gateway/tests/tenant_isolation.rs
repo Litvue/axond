@@ -328,8 +328,6 @@ async fn usage_rows_never_cross_a_namespace() {
             "attributed to the tenant's own credential"
         );
     }
-
-    deployment.drop_tables().await;
 }
 
 /// One tenant exhausting its namespace budget does not deny another.
@@ -406,8 +404,6 @@ async fn one_tenants_exhausted_budget_does_not_deny_another() {
         globex_spend > 0 && globex_spend < i64::try_from(cap).expect("a small cap"),
         "globex's ledger holds only its own single request: {spend:?}"
     );
-
-    deployment.drop_tables().await;
 }
 
 /// `(namespace, model, credential_id)` per settled row, once `count` have

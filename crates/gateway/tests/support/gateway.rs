@@ -155,14 +155,14 @@ impl Axond {
         // sibling test process can take the port in between. That race is the
         // ephemeral-port allocator's, not the gateway's, so a lost boot is
         // retried on a fresh port rather than failing the suite.
-        for _ in 1..BOOT_ATTEMPTS {
-            if let Some(gateway) = Self::try_start(upstream_base_url, tuning).await {
-                return gateway;
+        let mut last = String::new();
+        for _ in 0..BOOT_ATTEMPTS {
+            match Self::try_start(upstream_base_url, tuning).await {
+                Ok(gateway) => return gateway,
+                Err(output) => last = output,
             }
         }
-        Self::try_start(upstream_base_url, tuning)
-            .await
-            .expect("axond becomes healthy on a free port")
+        panic!("{}", never_served(&last));
     }
 
     /// Boot from a config the caller renders, plus extra environment.
@@ -180,26 +180,27 @@ impl Axond {
         render: &dyn Fn(SocketAddr) -> String,
         env: &[(String, String)],
     ) -> Self {
-        for _ in 1..BOOT_ATTEMPTS {
-            if let Some(gateway) = Self::try_start_custom(render, env).await {
-                return gateway;
+        let mut last = String::new();
+        for _ in 0..BOOT_ATTEMPTS {
+            match Self::try_start_custom(render, env).await {
+                Ok(gateway) => return gateway,
+                Err(output) => last = output,
             }
         }
-        Self::try_start_custom(render, env)
-            .await
-            .expect("axond becomes healthy on a free port")
+        panic!("{}", never_served(&last));
     }
 
-    /// One boot attempt: `None` when the process never became healthy, which on
-    /// a loopback port means someone else won the bind.
-    async fn try_start(upstream_base_url: &str, tuning: &str) -> Option<Self> {
+    /// One boot attempt. The error is everything that attempt's child wrote,
+    /// which on a loopback port usually means someone else won the bind — and
+    /// when it means something else, it is the only account of what.
+    async fn try_start(upstream_base_url: &str, tuning: &str) -> Result<Self, String> {
         Self::try_start_custom(&|addr| config_toml(addr, upstream_base_url, tuning), &[]).await
     }
 
     async fn try_start_custom(
         render: &dyn Fn(SocketAddr) -> String,
         extra_env: &[(String, String)],
-    ) -> Option<Self> {
+    ) -> Result<Self, String> {
         // One reservation, used for both the config directory and the boot key:
         // re-reading the counter could hand two concurrent boots the same value,
         // and the key has to be unique by construction, not by timing.
@@ -262,7 +263,11 @@ impl Axond {
             child,
             output,
         };
-        gateway.await_ready().await.then_some(gateway)
+        if gateway.await_ready().await {
+            Ok(gateway)
+        } else {
+            Err(gateway.output())
+        }
     }
 
     /// Whether the process is serving. A boot that loses its port is reported
@@ -292,26 +297,14 @@ impl Axond {
                 return self.answers_for_this_boot(&client, &base_url).await;
             }
             if let Ok(Some(_)) = self.child.try_wait() {
-                // The process is gone. Exactly one reason for that is the
-                // caller's to retry — a sibling took the port — and it says so
-                // on stderr. Every other exit is a test bug (a refused config, a
-                // datastore the boot could not reach), and reporting it here
-                // with the child's own output is the difference between naming
-                // the cause and exhausting the retries on "never became
-                // healthy".
-                //
-                // The verdict waits for the readers, though: the child's output
-                // is drained by detached threads, so a bind failure observed
-                // through `try_wait` may not have reached `lines` yet, and
-                // deciding immediately would turn the retriable case into a
-                // panic.
-                if self
-                    .lost_the_port_before(Instant::now() + Duration::from_secs(1))
-                    .await
-                {
-                    return false;
-                }
-                panic!("axond exited without serving:\n{}", self.output());
+                // The process is gone. Every exit is retriable here, because the
+                // one that is genuinely a race — a sibling took the port — is
+                // not reliably distinguishable from the ones that are not: the
+                // bind failure is a substring of output drained by detached
+                // threads, so it may not have arrived yet. The attempt's output
+                // travels with the failure instead, and the caller names the
+                // cause if every attempt fails.
+                return false;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -348,19 +341,6 @@ impl Axond {
     /// race, and a lost boot is retried on a fresh port.
     fn lost_the_port(&self) -> bool {
         self.output().contains("Address already in use")
-    }
-
-    /// [`Self::lost_the_port`], allowed until `deadline` to become true. For the
-    /// one caller that needs the negative answer to be final — an exited child
-    /// whose output may still be in flight — rather than merely current.
-    async fn lost_the_port_before(&self, deadline: Instant) -> bool {
-        while Instant::now() < deadline {
-            if self.lost_the_port() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        self.lost_the_port()
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -481,6 +461,17 @@ impl Drop for Axond {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// What to say when every attempt failed. The last child's own output is the
+/// message: a lost port race says `Address already in use` and is the boring
+/// answer, while a refused config or an unreachable datastore says what it was,
+/// and either beats reporting only that nothing became healthy.
+fn never_served(last_output: &str) -> String {
+    format!(
+        "axond never served on a free port in {BOOT_ATTEMPTS} attempts; \
+         the last one said:\n{last_output}"
+    )
 }
 
 /// A loopback address nothing is listening on. The listener is closed before
