@@ -312,8 +312,21 @@ WHERE d.quarantined_at IS NOT NULL;
 
 Quarantine is terminal for that consumer: the gateway will not deliver it again,
 and retention will not prune it while a consumer still has it quarantined. Decide
-what the event is worth, reconcile it by hand, and delete the delivery row (or
-the event) when you are done. `poison_reason = "malformed"` means the stored JSON
+what the event is worth, reconcile it by hand, and delete the **event** row when
+you are done — the delivery row cascades with it:
+
+```sql
+DELETE FROM axond_usage_outbox WHERE request_id = 'req_…';
+```
+
+Do not delete the delivery row on its own. Quarantining has already raised that
+consumer's claim floor past the event, so nothing will hand it out again, and
+without a delivery row nothing will prune it either: retention wants an
+acknowledgement from every registered consumer, and an absent row is not one. The
+event would then hold part of `max_events` forever while sitting below the floor
+the gauges are read from, so no metric would say why the outbox is filling up.
+
+`poison_reason = "malformed"` means the stored JSON
 is not a record this build can read — the row is your evidence of corruption, and
 the record's own `request_id` ties it to the request it came from.
 
