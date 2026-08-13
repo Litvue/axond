@@ -151,6 +151,8 @@ pub const CONVERGENCE_POLLED: &str = "polled";
 pub const CONVERGENCE_NOTIFIED: &str = "notified";
 /// The first convergence attempt of a stateful process.
 pub const CONVERGENCE_BOOT: &str = "boot";
+/// Convergence triggered by an effective-dated pricing boundary.
+pub const CONVERGENCE_PRICING_BOUNDARY: &str = "pricing-boundary";
 
 /// A span covering one convergence attempt: reading desired state and, when it
 /// differs, hydrating, compiling, and publishing it.

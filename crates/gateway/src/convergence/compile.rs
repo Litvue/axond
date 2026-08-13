@@ -317,7 +317,7 @@ pub struct RevisionCompiler<P> {
     /// Injected as a function rather than read inline so a test can compile the
     /// *same* revision at two instants and assert which rules were in force,
     /// which is the only way boundary behaviour is checkable at all.
-    clock: fn() -> SystemTime,
+    clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
 impl<P: RevisionProjection> RevisionCompiler<P> {
@@ -333,7 +333,7 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
         )
     }
 
-    pub const fn with_secrets(
+    pub fn with_secrets(
         bootstrap: Config,
         env: HashMap<String, String>,
         projection: P,
@@ -346,7 +346,7 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
             secrets,
             availability: None,
             derived: Mutex::new(None),
-            clock: SystemTime::now,
+            clock: Arc::new(SystemTime::now),
         }
     }
 
@@ -360,7 +360,16 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
 
     /// The same compiler, resolving pricing against a fixed clock.
     #[must_use]
-    pub const fn with_clock(mut self, clock: fn() -> SystemTime) -> Self {
+    pub fn with_clock(mut self, clock: fn() -> SystemTime) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// Resolve pricing against an injected wall clock. The source is shared
+    /// with the reconciler's boundary scheduler so a test or deployment clock
+    /// cannot make those two decisions disagree.
+    #[must_use]
+    pub fn with_clock_source(mut self, clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Self {
         self.clock = clock;
         self
     }

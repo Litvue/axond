@@ -12,8 +12,8 @@
 //! Tokio's paused clock. No test here is timing-sensitive.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::compile::testing::{AliasProjection, bootstrap, env};
 use super::lkg::testing::{KEY, cache_path};
@@ -24,6 +24,7 @@ use crate::availability::{
     DiscoveryCompleteness, DiscoveryObservation, DiscoveryResult, DiscoverySource, ScopeRef,
     TargetRef,
 };
+use crate::backends::catalog::ProviderId;
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::budget::NoBudget;
 use crate::desired_state::credentials::ProviderCredentialBody;
@@ -244,6 +245,101 @@ impl Replica {
         }
     }
 
+    /// A replica whose compiler and boundary scheduler share an injected wall
+    /// clock. The shared source is important: resolving a book and scheduling
+    /// its next boundary must never disagree about the current instant.
+    fn priced(
+        store: &Arc<InMemoryControlPlane>,
+        wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    ) -> Self {
+        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+        let state = AppState::new(
+            bootstrap(),
+            &env(),
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("the bootstrap config is servable");
+        let clock = ManualClock::new();
+        let secrets = super::secrets::testing::permissive();
+        let ledger = Arc::clone(secrets.ledger());
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap(),
+            env(),
+            AliasProjection { provider: "openai" },
+            secrets,
+        )
+        .with_clock_source(Arc::clone(&wall_clock));
+        let reconciler = Arc::new(
+            Reconciler::new(
+                Arc::clone(store) as Arc<dyn ControlPlaneStore>,
+                Arc::new(compiler),
+                Arc::new(state.clone()),
+                settings(),
+                None,
+                Arc::new(clock.clone()),
+            )
+            .with_pricing_clock(wall_clock),
+        );
+        Self {
+            store: Arc::clone(store),
+            state,
+            clock,
+            reconciler,
+            ledger,
+        }
+    }
+
+    /// The same clocked setup, with a compiler that can refuse a boundary
+    /// refresh after the first snapshot is already serving.
+    fn priced_toggleable(
+        store: &Arc<InMemoryControlPlane>,
+        wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    ) -> (Self, Arc<AtomicBool>) {
+        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+        let state = AppState::new(
+            bootstrap(),
+            &env(),
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("the bootstrap config is servable");
+        let clock = ManualClock::new();
+        let secrets = super::secrets::testing::permissive();
+        let refuse = Arc::new(AtomicBool::new(false));
+        let compiler = Arc::new(ToggleCompiler {
+            delegate: RevisionCompiler::with_secrets(
+                bootstrap(),
+                env(),
+                AliasProjection { provider: "openai" },
+                secrets.clone(),
+            )
+            .with_clock_source(Arc::clone(&wall_clock)),
+            refuse: Arc::clone(&refuse),
+        });
+        let reconciler = Arc::new(
+            Reconciler::new(
+                Arc::clone(store) as Arc<dyn ControlPlaneStore>,
+                compiler,
+                Arc::new(state.clone()),
+                settings(),
+                None,
+                Arc::new(clock.clone()),
+            )
+            .with_pricing_clock(wall_clock),
+        );
+        (
+            Self {
+                store: Arc::clone(store),
+                state,
+                clock,
+                reconciler,
+                ledger: Arc::clone(secrets.ledger()),
+            },
+            refuse,
+        )
+    }
+
     /// A replica whose first compile succeeds and whose later refreshes can be
     /// refused without replacing its already-published snapshot.
     fn toggleable(store: &Arc<InMemoryControlPlane>) -> (Self, Arc<AtomicBool>) {
@@ -305,6 +401,19 @@ impl Replica {
     fn generation(&self) -> u64 {
         self.state.config().generation
     }
+
+    fn input_price(&self) -> Option<u64> {
+        self.state
+            .config()
+            .pricing()
+            .and_then(|pricing| {
+                pricing.price(
+                    &ProviderId::parse("openai").expect("fixture provider"),
+                    "gpt-4o",
+                )
+            })
+            .map(|price| price.input_microdollars_per_million)
+    }
 }
 
 /// Tight but valid pacing, so a paused-clock test advances milliseconds rather
@@ -323,6 +432,48 @@ fn settings() -> ConvergenceSettings {
 
 fn control_plane() -> Arc<InMemoryControlPlane> {
     Arc::new(InMemoryControlPlane::new())
+}
+
+fn pricing_wall_clock(millis: Arc<AtomicU64>) -> Arc<dyn Fn() -> SystemTime + Send + Sync> {
+    Arc::new(move || UNIX_EPOCH + Duration::from_millis(millis.load(Ordering::Acquire)))
+}
+
+fn boundary_price_book() -> crate::desired_state::pricing::PriceBookBody {
+    use crate::desired_state::pricing::{EffectiveInstant, EffectiveInterval, PriceOrigin};
+
+    let target = fixtures::priced_target("openai", "gpt-4o");
+    crate::desired_state::pricing::PriceBookBody::new(
+        fixtures::catalog_content_id(),
+        crate::desired_state::pricing::Approval::Approved {
+            by: fixtures::actor(),
+            at: EffectiveInstant::EPOCH,
+            citation: None,
+        },
+    )
+    .with_rule(fixtures::price_rule(
+        target.clone(),
+        crate::desired_state::pricing::RulePrecedence::Baseline,
+        EffectiveInterval::from(EffectiveInstant::EPOCH),
+        1_000,
+        1_000,
+    ))
+    .with_rule(
+        crate::desired_state::pricing::PriceRule::new(
+            target,
+            crate::desired_state::pricing::RulePrecedence::Override,
+            EffectiveInterval::bounded(
+                EffectiveInstant::from_millis(1_000),
+                EffectiveInstant::from_millis(2_000),
+            )
+            .expect("override interval is non-empty"),
+            crate::desired_state::pricing::ApprovedRates::new(
+                crate::desired_state::pricing::ApprovedRate::from_nanos(2_000),
+                crate::desired_state::pricing::ApprovedRate::from_nanos(2_000),
+            ),
+            crate::desired_state::pricing::PriceProvenance::stated(PriceOrigin::Operator),
+        )
+        .expect("override rates convert exactly"),
+    )
 }
 
 /// Publish `state` as the newest revision, the way an administrator would.
@@ -400,6 +551,171 @@ async fn a_converged_replica_does_not_republish_what_it_is_already_serving() {
         );
     }
     assert_eq!(replica.generation(), 1, "no spurious republication");
+}
+
+/// An idle control plane advances a future-dated book at the exact half-open
+/// boundaries. No request, config edit, or durable revision change is needed:
+/// the reconciler's pricing timer wakes the ordinary atomic refresh path.
+#[tokio::test(start_paused = true)]
+async fn an_idle_control_plane_activates_and_expires_pricing_at_exact_boundaries() {
+    let store = control_plane();
+    let millis = Arc::new(AtomicU64::new(0));
+    let wall_clock = pricing_wall_clock(Arc::clone(&millis));
+    let published = publish(
+        &store,
+        "priced",
+        ExpectedRevision::Empty,
+        fixtures::state_with_price_book(&boundary_price_book()),
+    )
+    .await;
+    let replica = Replica::priced(&store, Arc::clone(&wall_clock));
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert_eq!(replica.report().active, Some(published));
+    assert_eq!(replica.input_price(), Some(1));
+    assert_eq!(
+        replica.reconciler.pricing_boundary(),
+        Some(crate::desired_state::pricing::EffectiveInstant::from_millis(1_000))
+    );
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let loop_reconciler = Arc::clone(&replica.reconciler);
+    let task = tokio::spawn(async move {
+        loop_reconciler
+            .run(Arc::new(ChangeSignal::new()), async {
+                let _ = stopped.await;
+            })
+            .await;
+    });
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert_eq!(replica.generation(), 1, "the future rule is not early");
+    millis.store(1_000, Ordering::Release);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..32 {
+        if replica.generation() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(replica.generation(), 2, "the boundary refresh published");
+    assert_eq!(replica.input_price(), Some(2));
+    assert_eq!(
+        replica.reconciler.pricing_boundary(),
+        Some(crate::desired_state::pricing::EffectiveInstant::from_millis(2_000))
+    );
+
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert_eq!(replica.input_price(), Some(2), "the override is half-open");
+    millis.store(2_000, Ordering::Release);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..32 {
+        if replica.generation() == 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        replica.generation(),
+        3,
+        "the ending boundary refresh published"
+    );
+    assert_eq!(replica.input_price(), Some(1), "the baseline is restored");
+
+    let _ = stop.send(());
+    task.await.expect("the scheduler stops");
+}
+
+/// A boundary refresh uses the same compile/admit/publish refusal semantics as
+/// every other refresh: the previous pricing remains active, and the pending
+/// refresh is retried after the transient failure clears.
+#[tokio::test(start_paused = true)]
+async fn a_failed_boundary_publication_keeps_the_previous_pricing_active() {
+    let store = control_plane();
+    let millis = Arc::new(AtomicU64::new(0));
+    let wall_clock = pricing_wall_clock(Arc::clone(&millis));
+    publish(
+        &store,
+        "priced-failure",
+        ExpectedRevision::Empty,
+        fixtures::state_with_price_book(&boundary_price_book()),
+    )
+    .await;
+    let (replica, refuse) = Replica::priced_toggleable(&store, Arc::clone(&wall_clock));
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    refuse.store(true, Ordering::Release);
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let loop_reconciler = Arc::clone(&replica.reconciler);
+    let task = tokio::spawn(async move {
+        loop_reconciler
+            .run(Arc::new(ChangeSignal::new()), async {
+                let _ = stopped.await;
+            })
+            .await;
+    });
+    tokio::task::yield_now().await;
+    millis.store(1_000, Ordering::Release);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(replica.generation(), 1);
+    assert_eq!(replica.input_price(), Some(1));
+    assert_eq!(
+        replica.report().last_rejection.as_ref().map(|r| r.reason),
+        Some("projection")
+    );
+
+    refuse.store(false, Ordering::Release);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    for _ in 0..64 {
+        if replica.generation() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        replica.generation(),
+        2,
+        "the pending boundary refresh retries"
+    );
+    assert_eq!(replica.input_price(), Some(2));
+
+    let _ = stop.send(());
+    task.await.expect("the scheduler stops");
+}
+
+/// Restarting from the same durable revision reconstructs the boundary from the
+/// book rather than inheriting an in-memory timer or requiring a config edit.
+#[tokio::test]
+async fn a_restart_reconstructs_the_same_next_pricing_boundary() {
+    let store = control_plane();
+    let millis = Arc::new(AtomicU64::new(1_000));
+    let wall_clock = pricing_wall_clock(Arc::clone(&millis));
+    publish(
+        &store,
+        "priced-restart",
+        ExpectedRevision::Empty,
+        fixtures::state_with_price_book(&boundary_price_book()),
+    )
+    .await;
+    let restarted = Replica::priced(&store, wall_clock);
+    restarted
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_BOOT)
+        .await;
+    assert_eq!(restarted.input_price(), Some(2));
+    assert_eq!(
+        restarted.reconciler.pricing_boundary(),
+        Some(crate::desired_state::pricing::EffectiveInstant::from_millis(2_000))
+    );
 }
 
 /// A lifecycle change in the secret store can leave the desired revision id

@@ -38,13 +38,14 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use super::backoff::Backoff;
 use super::compile::{CandidateCompiler, CompileError};
 use super::lkg::{LastKnownGood, LastKnownGoodError};
+use super::pricing::PricingSchedule;
 use super::settings::ConvergenceSettings;
 use super::status::{Clock, Rejection, RevisionReport, RevisionStatus, SnapshotSource};
 use crate::backends::BackendFailure;
@@ -334,6 +335,11 @@ pub struct Reconciler {
     settings: ConvergenceSettings,
     cache: Option<LastKnownGood>,
     clock: Arc<dyn Clock>,
+    /// The wall clock effective-dated pricing is resolved against. It is kept
+    /// separate from [`Clock`], whose monotonic instant measures convergence
+    /// latency and lag. Injecting this source lets tests exercise exact
+    /// boundaries and makes the scheduling policy explicit.
+    pricing_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     /// The revision the sink is serving, as this reconciler last published it.
     /// Compared against desired to decide whether to hydrate at all.
     active: Mutex<Option<RevisionId>>,
@@ -346,6 +352,13 @@ pub struct Reconciler {
     /// desired revision id is unchanged, so without this the backoff retry would
     /// take the already-converged skip and the request would be dropped.
     refresh_pending: AtomicBool,
+    /// The next boundary from the snapshot currently being served. It is
+    /// replaced only after a candidate publishes successfully, so a refused
+    /// boundary refresh cannot change either the rates or the schedule that led
+    /// to it. A fired boundary is cleared before the refresh attempt; the
+    /// existing refresh-pending/backoff path then retries a failed publication
+    /// without a zero-delay timer loop.
+    pricing_schedule: Mutex<PricingSchedule>,
     backoff: Mutex<Backoff>,
     /// Whether the last export failed, so a recovering disk is logged once
     /// rather than every attempt.
@@ -371,11 +384,33 @@ impl Reconciler {
             settings,
             cache,
             clock,
+            pricing_clock: Arc::new(SystemTime::now),
             active: Mutex::new(None),
             attempt_lock: AsyncMutex::new(()),
             refresh_pending: AtomicBool::new(false),
+            pricing_schedule: Mutex::new(PricingSchedule::empty()),
             export_failing: AtomicBool::new(false),
         }
+    }
+
+    /// Use the same wall-clock source as the compiler in deterministic tests or
+    /// a deployment that supplies a clock abstraction. Production defaults to
+    /// [`SystemTime::now`].
+    #[must_use]
+    pub fn with_pricing_clock(mut self, clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Self {
+        self.pricing_clock = clock;
+        self
+    }
+
+    /// The boundary the currently published snapshot is waiting for.
+    #[cfg(test)]
+    pub(crate) fn pricing_boundary(
+        &self,
+    ) -> Option<crate::desired_state::pricing::EffectiveInstant> {
+        self.pricing_schedule
+            .lock()
+            .expect("not poisoned")
+            .boundary()
     }
 
     /// What this replica reports about itself: desired, loaded, active, lag, and
@@ -531,6 +566,7 @@ impl Reconciler {
                     backoff.delay()
                 }
             };
+            let pricing_boundary = self.wait_for_pricing_boundary();
             tokio::select! {
                 biased;
                 () = &mut shutdown => {
@@ -543,11 +579,62 @@ impl Reconciler {
                         force_refresh,
                     ).await;
                 }
+                () = pricing_boundary => {
+                    if self.pricing_boundary_is_due() {
+                        self.pricing_schedule
+                            .lock()
+                            .expect("not poisoned")
+                            .set(None);
+                        self.force_refresh_once(telemetry::CONVERGENCE_PRICING_BOUNDARY)
+                            .await;
+                    }
+                }
                 () = tokio::time::sleep(delay) => {
-                    self.converge_once(telemetry::CONVERGENCE_POLLED).await;
+                    if self.pricing_boundary_is_due() {
+                        self.pricing_schedule
+                            .lock()
+                            .expect("not poisoned")
+                            .set(None);
+                        self.force_refresh_once(telemetry::CONVERGENCE_PRICING_BOUNDARY)
+                            .await;
+                    } else {
+                        self.converge_once(telemetry::CONVERGENCE_POLLED).await;
+                    }
                 }
             }
         }
+    }
+
+    /// Sleep until the currently published pricing snapshot's next effective
+    /// boundary. This is a control-plane timer: the request path never calls it
+    /// and never reads the price book or the wall clock.
+    async fn wait_for_pricing_boundary(&self) {
+        let delay = self
+            .pricing_schedule
+            .lock()
+            .expect("not poisoned")
+            .delay_at((self.pricing_clock)());
+        match delay {
+            Ok(Some(delay)) => tokio::time::sleep(delay).await,
+            Ok(None) => std::future::pending::<()>().await,
+            Err(error) => {
+                // Normal polling remains the recovery path for a clock that is
+                // before the effective-dating epoch or otherwise unrepresentable.
+                // Do not clamp the instant and do not spin a zero-delay timer.
+                tracing::warn!(error = %error, "effective-dated pricing boundary cannot be scheduled; relying on convergence polling");
+                tokio::time::sleep(self.settings.poll_interval).await;
+            }
+        }
+    }
+
+    /// Re-check the wall clock after the monotonic timer wakes. This second
+    /// check is what makes a backwards wall-clock adjustment safe.
+    fn pricing_boundary_is_due(&self) -> bool {
+        self.pricing_schedule
+            .lock()
+            .expect("not poisoned")
+            .due_at((self.pricing_clock)())
+            .unwrap_or(false)
     }
 
     /// The attempt itself: `Ok(None)` means there was nothing to do.
@@ -638,8 +725,15 @@ impl Reconciler {
                 pricing.effective().ends(),
             )
         });
+        let pricing_boundary = snapshot
+            .pricing()
+            .and_then(|pricing| pricing.effective().ends());
 
         self.sink.publish(snapshot);
+        self.pricing_schedule
+            .lock()
+            .expect("not poisoned")
+            .set(pricing_boundary);
         *self.active.lock().expect("not poisoned") = Some(id);
         self.backoff.lock().expect("not poisoned").succeed();
         let took = self.clock.now().saturating_duration_since(started);
