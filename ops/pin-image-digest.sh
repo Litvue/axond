@@ -50,8 +50,13 @@ case "${1:-}" in
     shift
     ;;
   -h | --help) usage ;;
+  # A mistyped flag must not become the version to resolve: `--chek` would
+  # otherwise look up an image tagged with the typo and read as a registry
+  # failure rather than as the check never having run.
+  --*) usage ;;
 esac
 [[ $# -le 1 ]] || usage
+[[ "$mode" != check || $# -eq 0 ]] || usage
 
 if [[ "$mode" == check ]]; then
   digest="$(current_digest)"
