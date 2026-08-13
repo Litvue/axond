@@ -1,0 +1,46 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: axond
+  namespace: axond
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: axond
+  # `minReplicas` stays at or above the PodDisruptionBudget's `minAvailable + 1`,
+  # so a scaled-in fleet still admits one voluntary disruption instead of
+  # deadlocking a node drain against its own budget.
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    # CPU is a proxy, and a weak one for a gateway that spends most of a request
+    # waiting on an upstream: a replica saturated by in-flight streams can sit at
+    # low CPU. It is here because it needs no metrics adapter. Prefer a custom or
+    # external metric on `axond.admission.in_flight` or the rate of
+    # `axond.admission.rejections` once one is available — those measure the
+    # ceiling that actually sheds traffic.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      # A model response can hold a connection for minutes, so scale up early and
+      # in steps that matter, and let a burst be answered rather than averaged.
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      # Scaling in is a drain per removed replica, bounded by the shutdown budget
+      # in `[shutdown]`. A long window keeps a diurnal dip from cutting capacity
+      # that a spike immediately needs back.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

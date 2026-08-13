@@ -1,0 +1,113 @@
+# Default deny, then name what a gateway actually needs. Two objects rather than
+# one: the deny has no rules to accidentally widen, and every allowance is in a
+# single reviewable place.
+#
+# NetworkPolicy is enforced by the CNI. On a cluster whose CNI does not implement
+# it, these objects are accepted by the API server and do nothing — verify with a
+# denied-egress probe rather than assuming.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: axond-default-deny
+  namespace: axond
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: axond
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: axond-allow
+  namespace: axond
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: axond
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Axond does not terminate TLS, so its only caller is the ingress that does.
+    # Replace this namespace name with the one your ingress controller runs in;
+    # a selector that matches nothing leaves the deny in place, which is the safe
+    # direction to be wrong in.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Liveness and readiness probes come from the kubelet on the node, not from a
+    # Pod. Most CNIs exempt that node-local traffic; a CNI that does not needs the
+    # node CIDR added here, or every Pod fails its probes.
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Provider APIs are public HTTPS endpoints, so egress is open to the public
+    # internet on 443 and closed to everything private: the link-local metadata
+    # service and the RFC 1918 ranges are excepted, which keeps a compromised
+    # gateway from reaching cloud instance credentials or neighbouring services
+    # while still letting it reach OpenAI or Anthropic. Narrow this to the
+    # provider egress addresses of your NAT or proxy when you have them.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+    # Stateful backends and the telemetry collector. A bare `podSelector` selects
+    # Pods in *this* namespace only, so each rule as written reaches a store that
+    # runs alongside axond. Add a `namespaceSelector` beside the `podSelector` in
+    # the same peer when the store runs elsewhere in the cluster:
+    #
+    #   - to:
+    #       - namespaceSelector:
+    #           matchLabels:
+    #             kubernetes.io/metadata.name: observability
+    #         podSelector:
+    #           matchLabels:
+    #             app.kubernetes.io/name: opentelemetry-collector
+    #
+    # and replace the peer with an `ipBlock` for a managed service outside the
+    # cluster. Delete the rules for stores this deployment does not configure;
+    # deleting is safe, because nothing in the base's stateless config dials them.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+      ports:
+        # Axond exports OTLP/HTTP only — a `grpc` protocol is a boot error — so
+        # the collector's HTTP receiver on 4318 is the only port it ever dials.
+        - protocol: TCP
+          port: 4318

@@ -34,6 +34,145 @@ curl --fail \
   http://127.0.0.1:8080/v1/models
 ```
 
+## Production overlay
+
+`deploy/kubernetes/base` is deliberately minimal: it is what you apply to
+evaluate axond in a cluster. `deploy/kubernetes/overlays/production` is the base
+plus the posture a production fleet needs, and nothing that is only useful for
+evaluation:
+
+- the image pinned by digest instead of by tag, and by an unresolvable sentinel
+  digest until you resolve it (below);
+- three replicas with `minAvailable: 2`, so exactly one voluntary disruption —
+  a node drain, a cluster upgrade, a descheduler — proceeds at a time and the
+  rolling update's `maxUnavailable: 0` stays honest;
+- topology spread across nodes (`DoNotSchedule`) and zones (`ScheduleAnyway`),
+  because a zone that cannot hold the fleet should cost you spread, not
+  scheduling, and the node constraint counts skew per ReplicaSet
+  (`matchLabelKeys: [pod-template-hash]`) so a rolling update's extra Pod still
+  schedules on a cluster with three nodes;
+- two NetworkPolicies: a default-deny for both directions, and an allow-list
+  for ingress from the ingress controller, DNS, egress to public HTTPS with the
+  link-local and private ranges excluded, and label-selected rules for Postgres,
+  Redis, and an OpenTelemetry collector — those three select Pods in axond's own
+  namespace, so widen them with a `namespaceSelector` (or an `ipBlock` for a
+  managed service) when a store runs elsewhere, and delete the ones this
+  deployment does not configure;
+- requests raised to `500m`/`512Mi` with memory request equal to limit, so the
+  Pod's memory usage can never exceed its request and it is the last candidate
+  kubelet evicts under memory pressure while holding buffered request bodies
+  (the CPU limit exceeds its request, so the QoS class is Burstable, not
+  Guaranteed);
+- a five-second `preStop` sleep, with `terminationGracePeriodSeconds: 45`
+  covering it plus the process's own 25-second shutdown budget (see
+  [Rollouts and termination](#rollouts-and-termination));
+- the base's `secret.example.yaml` deleted (`$patch: delete` in
+  `secret.yaml`), because its values are published in this repository — see
+  [The Secret the overlay does not ship](#the-secret-the-overlay-does-not-ship).
+
+The overlay requires **Kubernetes 1.32 or newer**, because two of its fields have
+version floors and an older API server drops them rather than rejecting the
+manifest:
+
+- the `sleep` `preStop` lifecycle action, on by default from 1.30 and GA in 1.32;
+  the distroless image has no shell, so an `exec` hook is not a fallback, and a
+  dropped hook means Pods stop receiving traffic only after `SIGTERM`;
+- `matchLabelKeys` on a topology spread constraint, on by default from 1.27; a
+  dropped key turns the hard per-node spread into the fleet-wide form that
+  deadlocks a rolling update on a cluster with as many nodes as replicas, which
+  surfaces as a hung upgrade rather than as a rejected manifest.
+
+On an older cluster, confirm both survive a round trip through
+`kubectl -n axond get deployment axond -o yaml` before trusting a rollout.
+
+```bash
+kubectl create namespace axond
+kubectl -n axond create secret generic axond-secrets \
+  --from-literal=GW_INBOUND_PLATFORM_KEY=... \
+  --from-literal=GW_PLATFORM_OPENAI_API_KEY=...
+digest="$(ops/pin-image-digest.sh --print 0.3.27)" # x-release-please-version
+SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
+  ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
+ops/pin-image-digest.sh 0.3.27 # x-release-please-version
+kubectl apply -k deploy/kubernetes/overlays/production
+kubectl -n axond rollout status deployment/axond
+```
+
+### The Secret the overlay does not ship
+
+The base ships `secret.example.yaml` so an evaluation renders something bootable.
+Its two values are readable by anyone with this repository, so the production
+overlay deletes the resource rather than inheriting it. The container still takes
+its credentials from `envFrom: secretRef: axond-secrets`, so applying the overlay
+without supplying that Secret leaves the Pods in `CreateContainerConfigError` —
+the intended failure, because a gateway that never starts is safer than one
+serving with an inbound key published on GitHub.
+
+Supply it however your platform supplies secrets: the `kubectl create secret`
+above for a first rollout, or an External Secrets/sealed-Secret resource named
+`axond-secrets` in the `axond` namespace. `ops/check-deploy-manifests.py` renders
+the overlay and fails if any of the base's published placeholder values reappear
+in it.
+
+### Resolving the image digest
+
+The committed overlay pins an all-zero digest, which no registry can serve. That
+is the intended state of the file in the repository: a tag can be repointed at
+different bytes after the review that approved it, and a real digest committed
+here is stale by the next release. So the digest is resolved at deploy time from
+the release you verified:
+
+```bash
+ops/pin-image-digest.sh --check          # fails while the sentinel is unresolved
+ops/pin-image-digest.sh --print 0.3.27 # x-release-please-version, prints the digest
+ops/pin-image-digest.sh 0.3.27 # x-release-please-version, rewrites the overlay
+```
+
+Resolution insists on the multi-architecture index, so a digest naming one
+architecture's child image — schedulable onto that architecture alone — is
+refused rather than pinned. The script resolves a reference and makes no claim
+about its evidence; run `ops/verify-image-evidence.sh` on the digest for the
+signature, SBOM, and provenance chain (see
+[releasing](../maintainers/releasing.md)).
+
+Run `ops/pin-image-digest.sh --check` in the job that applies the overlay. It is
+the check that separates "digest not yet resolved" from a rollout that pulls a
+placeholder.
+
+### Optional autoscaling
+
+`deploy/kubernetes/components/autoscaling` is a Kustomize component, not part of
+the overlay, because an HPA is a claim that request load and CPU move together
+for your traffic — measure that before adopting it. Take it from an overlay *of*
+the production overlay:
+
+```yaml
+# my-cluster/kustomization.yaml
+resources:
+  - ../deploy/kubernetes/overlays/production
+components:
+  - ../deploy/kubernetes/components/autoscaling
+```
+
+Adding the component to `overlays/production/kustomization.yaml` instead does not
+work, and fails quietly: Kustomize accumulates a Kustomization's components
+before applying that same Kustomization's patches, so the component removes
+`spec.replicas` and the overlay's own `deployment.yaml` patch then puts it back.
+The rendered Deployment keeps `replicas: 3`, and every apply fights the HPA for
+the field — which is the failure the component exists to avoid. Layering it above
+the overlay, as here and as the manifest gate renders it, runs the removal last.
+
+It adds an HPA at 60% CPU utilization between 3 and 12 replicas, and removes
+`spec.replicas` from the Deployment so an apply does not fight the autoscaler for
+the field. `minReplicas` stays at the disruption budget's floor plus one. Scale-up
+doubles per minute; scale-down gives up one Pod every two minutes after ten
+minutes of stability, because a scale-down is a drain and each one spends the
+termination budget above.
+
+Autoscaling on CPU does not make `[admission]` ceilings fleet-wide — read
+[Scaling](#scaling) before enabling it, and treat
+`axond.admission.rejections` as the saturation signal that CPU may not show.
+
 ## Configuration and secrets
 
 The stable `axond-config` ConfigMap name and `[reload] watch = true` allow a
@@ -158,3 +297,22 @@ the flush short.
 Keep `maxUnavailable: 0`, a PodDisruptionBudget, and enough replicas: they are
 what keeps capacity up during the drain. Clients should still retry requests
 that end before response commitment.
+
+`maxUnavailable: 0` and a hard per-node spread interact: on a cluster with as
+many schedulable nodes as replicas, a surge Pod counted against the Pods it
+replaces cannot be placed, and nothing is allowed to terminate to make room —
+the rollout hangs with a `Pending` Pod and `didn't match pod topology spread
+constraints`. The overlay avoids it with `matchLabelKeys: [pod-template-hash]`,
+which is a scheduling outcome no rendered manifest can verify, so it is proven
+on a real cluster:
+
+```bash
+just rollout-drill                # ops/rollout-drill.sh on a three-worker kind
+                                  # cluster, ~3 minutes
+```
+
+The drill rolls the overlay out, then removes `matchLabelKeys` and requires the
+same rollout to deadlock — the assertion that keeps the first result meaningful.
+It renders the overlay with a runnable image instead of the digest sentinel and
+never writes to `deploy/`. Run it when you change the spread constraints, the
+rollout strategy, or the replica count.

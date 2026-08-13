@@ -1,0 +1,73 @@
+# Production posture for the base Deployment. Only the fields that differ are
+# here; probes, security context, config mount, and rollout strategy stay as the
+# base defines them.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: axond
+  namespace: axond
+spec:
+  # Three replicas is the smallest fleet that keeps two serving through one
+  # voluntary disruption (`pdb.yaml`) while a third is being replaced.
+  replicas: 3
+  template:
+    spec:
+      # `preStop` widens the endpoint-removal window *in front of* the process
+      # drain: the sleep is what a load balancer that polls its own target health
+      # gets to notice `/readyz` failing, and it runs before `SIGTERM` reaches
+      # the process, so it adds to the shutdown budget rather than overlapping
+      # it. The image is distroless with no shell, so this is the built-in
+      # `sleep` lifecycle action (Kubernetes 1.32+) and not an `exec` hook.
+      #
+      # terminationGracePeriodSeconds must exceed
+      #   preStop.sleep + drain_grace_ms + deadline_ms + flush_timeout_ms
+      # which is 5 + 5 + 15 + 5 = 30s with the shipped `[shutdown]` defaults.
+      # `ops/check-deploy-manifests.py` asserts that against axond's own
+      # defaults, so lowering one without the other fails CI instead of losing
+      # buffered usage records to a `SIGKILL` in production.
+      terminationGracePeriodSeconds: 45
+      # Spread across zones first, then across nodes. A zone is best-effort
+      # because a single-zone cluster must still schedule; two replicas on one
+      # node is a real single point of failure for a fleet sized to survive one
+      # disruption, so the node constraint is enforced.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: axond
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          # Skew is counted per ReplicaSet, so a rolling update's surge Pod is
+          # not measured against the Pods it replaces. Without this, a cluster
+          # with as many nodes as replicas cannot place the surge Pod and
+          # `maxUnavailable: 0` will not free a node for it: the rollout hangs.
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: axond
+      containers:
+        - name: axond
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          # The memory request equals the limit: a gateway holding buffered
+          # request bodies then cannot use more memory than it requested, which
+          # makes it the last thing kubelet evicts under memory pressure. The
+          # QoS class is still Burstable, because the CPU limit is above its
+          # request on purpose — bursting through a spike is worth more here
+          # than the exemption Guaranteed would buy. The limit stays at the
+          # base's 512Mi because the ConfigMap's `[admission]` ceilings are
+          # sized against it — raise `max_request_bytes`/`max_in_flight` and
+          # this limit together.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi

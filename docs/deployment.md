@@ -189,4 +189,5 @@ implemented, and it changes nothing about the deployments above.
 - [Production checklist](./deployment/production-checklist.md)
 - [Troubleshooting](./operations/troubleshooting.md)
 - [Upgrades and rollback](./operations/upgrades.md)
+- [Backup, restore, and PITR](./operations/backup-and-recovery.md)
 - [Deployment security model](./security/deployment-model.md)

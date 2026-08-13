@@ -5,7 +5,7 @@ default:
 
 # Format, lint (warnings = errors), test, docs, supply-chain, and release
 # packaging — the CI gates.
-check: fmt-check clippy test docs deny publish-dry-run msrv api-compat workflow-policy
+check: fmt-check clippy test docs deny publish-dry-run msrv api-compat workflow-policy deploy-check
 
 fmt:
     cargo fmt --all
@@ -32,6 +32,9 @@ docs-check:
     sh -n install.sh
     bash -n ops/publish-image-index.sh
     bash -n ops/verify-image-evidence.sh
+    bash -n ops/pin-image-digest.sh
+    bash -n ops/restore-drill.sh
+    bash -n ops/rollout-drill.sh
     bash ops/check-compose-platform.sh
     bash ops/check-installer-download.sh
     bash ops/check-index-promotion.sh
@@ -40,6 +43,34 @@ docs-check:
     docker compose --env-file ops/compose/env.example config --quiet
     docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.build.yml config --quiet
     AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.stateful.yml --profile stateful config --quiet
+
+# The shipped Kubernetes manifests against the properties they promise, rendered
+# through Kustomize (or kubectl's copy of it). Needs PyYAML, installed into a
+# venv from the hash-pinned lockfile so the gate does not depend on what the
+# system python happens to carry.
+deploy-check:
+    python3 -m venv target/deploy-venv
+    target/deploy-venv/bin/pip install --quiet --require-virtualenv --require-hashes -r ops/deploy-requirements.txt
+    target/deploy-venv/bin/python ops/check-deploy-manifests.py --self-test
+    target/deploy-venv/bin/python ops/check-deploy-manifests.py
+
+# Restore a logical dump and recover to a chosen point in time against the
+# supported Postgres, with `axond migrate status` as the acceptance test. Needs
+# Docker. About a minute; documented in
+# docs/operations/backup-and-recovery.md.
+restore-drill:
+    bash ops/restore-drill.sh
+
+# Roll the production overlay out on a real three-worker kind cluster, then prove
+# the same rollout deadlocks once the per-node skew stops being counted per
+# ReplicaSet. Needs Docker, kind, kubectl, and kustomize. About three minutes;
+# documented in docs/deployment/kubernetes.md.
+rollout-drill:
+    bash ops/rollout-drill.sh
+
+# Refresh the manifest gate's lockfile, excluding releases newer than a week.
+deploy-lock:
+    uv pip compile --generate-hashes --universal --python-version 3.10 --exclude-newer "$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"))')" -o ops/deploy-requirements.txt ops/deploy-requirements.in
 
 # The declared MSRV floor: policy consistency, then a build on that toolchain.
 # Installs the floor toolchain through rustup; the pinned newer toolchain in

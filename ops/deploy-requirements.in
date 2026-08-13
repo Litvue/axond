@@ -1,0 +1,10 @@
+# The one dependency of `ops/check-deploy-manifests.py`: it reads what Kustomize
+# renders, and a hand-rolled parser of a subset of YAML would make the gate's
+# claims depend on how much of the language it happened to implement.
+# Regenerate with `just deploy-lock`.
+pyyaml
+
+# The gate reads the ConfigMap's axond.toml. `tomllib` is only in the standard
+# library from 3.11, and the repository's Python floor is 3.10, so the backport
+# fills the gap on 3.10 rather than the floor being raised for one import.
+tomli ; python_version < "3.11"
