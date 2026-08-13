@@ -1046,7 +1046,10 @@ impl Directory {
     /// 2. **Whether the request's tenant can be administered.** A deleted tenant
     ///    is a tombstone: reading its audit trail is a database operation, not an
     ///    API call. A disabled tenant is administrable, because settling a bill
-    ///    and re-enabling are the reasons to disable rather than delete.
+    ///    and re-enabling are the reasons to disable rather than delete. A
+    ///    project-scoped request also has to name a project that tenant owns:
+    ///    pairing one's own tenant with a foreign project id is a scope the grant
+    ///    test cannot see through.
     /// 3. **Whether the caller's own tenant is administrable**, which is not the
     ///    same question: a principal of a disabled tenant may not act *anywhere*,
     ///    or disabling a tenant would leave its administrators able to keep
@@ -1094,6 +1097,19 @@ impl Directory {
                 }
                 Some(_) => {}
             }
+        }
+
+        // A project scope has to name a project *of* that tenant, checked here
+        // rather than left to the grant test below: `ResourceScope::contains`
+        // compares tenants when the grant is tenant-scoped, so a caller pairing
+        // its own tenant with another tenant's project id — or with one no revision
+        // declares — is inside its grant by that measure. A write would still be
+        // refused by the composite foreign key; a read authorized on a
+        // contradictory scope has nothing behind it at all.
+        if let ResourceScope::Project { tenant, project } = request.scope
+            && tenancy.project(project).map(|owned| owned.body.tenant()) != Some(tenant)
+        {
+            return deny(DenialReason::UnknownProject);
         }
 
         let principal = match caller {
@@ -1353,6 +1369,11 @@ pub enum DenialReason {
     UnknownPrincipal,
     /// The request names a tenant this revision does not declare.
     UnknownTenant,
+    /// The request names a project this revision does not declare, or one that
+    /// belongs to a tenant other than the one the request paired it with. One
+    /// reason for both, because telling a caller which of the two it hit is a
+    /// project-existence oracle for every other tenant.
+    UnknownProject,
     /// The tenant — the request's, or the caller's own — is deleted.
     TenantNotAdministrable,
     /// The caller holds grants in a different tenant.
@@ -1370,6 +1391,7 @@ impl DenialReason {
     pub const ALL: &'static [Self] = &[
         Self::UnknownPrincipal,
         Self::UnknownTenant,
+        Self::UnknownProject,
         Self::TenantNotAdministrable,
         Self::CrossTenant,
         Self::OutOfScope,
@@ -1380,6 +1402,7 @@ impl DenialReason {
         match self {
             Self::UnknownPrincipal => "unknown-principal",
             Self::UnknownTenant => "unknown-tenant",
+            Self::UnknownProject => "unknown-project",
             Self::TenantNotAdministrable => "tenant-not-administrable",
             Self::CrossTenant => "cross-tenant",
             Self::OutOfScope => "out-of-scope",
@@ -1526,8 +1549,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::super::fixtures::{
-        display_name, human, principal_id, project_id, state, state_with_directory, tenant,
-        tenant_id, workload, workload_key,
+        display_name, human, principal_id, project, project_id, state, state_with_directory,
+        tenant, tenant_id, workload, workload_key,
     };
     use super::*;
     use crate::desired_state::TenantLifecycle;
@@ -2037,6 +2060,53 @@ mod tests {
             .expect_err("a tenant that does not exist is not reachable either");
         assert_eq!(unknown.reason(), DenialReason::UnknownTenant);
         assert_eq!(unknown.public_reason(), denial.public_reason());
+    }
+
+    /// A caller pairing its *own* tenant with a project that is not that tenant's:
+    /// inside its grant by scope containment, which compares tenants, and a
+    /// contradiction the decision has to catch itself.
+    #[test]
+    fn a_caller_cannot_pair_its_tenant_with_a_project_it_does_not_own() {
+        let mut state = state_with_directory();
+        state
+            .insert(tenant(11, "globex"))
+            .and_then(|state| state.insert(project(&tenant_id(11), 12, "edge")))
+            .expect("a second tenant with a project of its own");
+        let (tenancy, directory) = directory(&state);
+        let tenant = tenant_id(1);
+        for project in [
+            // Another tenant's project, and a project nothing declares.
+            project_id(12),
+            project_id(97),
+        ] {
+            let denial = directory
+                .authorize(
+                    &tenancy,
+                    &caller_human("admin"),
+                    request(
+                        Surface::Alias,
+                        Action::Read,
+                        ResourceScope::Project { tenant, project },
+                    ),
+                )
+                .expect_err("a project of another tenant is not this tenant's project");
+            assert_eq!(denial.reason(), DenialReason::UnknownProject);
+            assert_eq!(denial.public_reason(), "forbidden");
+        }
+        directory
+            .authorize(
+                &tenancy,
+                &caller_human("admin"),
+                request(
+                    Surface::Alias,
+                    Action::Read,
+                    ResourceScope::Project {
+                        tenant,
+                        project: project_id(2),
+                    },
+                ),
+            )
+            .expect("its own tenant's project is still reachable");
     }
 
     #[test]

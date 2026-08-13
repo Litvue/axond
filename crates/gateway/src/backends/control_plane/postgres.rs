@@ -1431,38 +1431,56 @@ async fn insert_audit_event(
 /// slug — the partial index says so — so this is never how a deletion is
 /// undone; restoring one is republishing that tenant as `active`, and it fails
 /// here only when some *other* live tenant took the name meanwhile.
+///
+/// Ownership is the second condition, and reaches this the same way. A revision
+/// that moves a project to another tenant is a state the domain accepts — it
+/// checks ownership within one revision, not across two — and the composite
+/// `(tenant_id, project_id)` foreign key held by any principal scoped into that
+/// project refuses the update, with no `ON UPDATE` action to cascade it. That
+/// refusal is as permanent as a taken name: the fix is a revision that moves the
+/// principals too, not a retry.
 fn projection_failure(
     operation: &str,
     noun: &'static str,
     slug: &str,
     error: &tokio_postgres::Error,
 ) -> ControlPlaneError {
-    if let Some(db) = error.as_db_error().filter(|db| is_collision(db)) {
-        // Which constraint was violated, rather than an assumption about which one
-        // it was: a projected row can collide over a name, an OIDC subject, or a
-        // key digest, and a row whose identity clashes is not a name to rename.
-        // A caller that named no slug — the directory, projected as a set — is told
-        // what collided instead of being told its empty name is taken.
-        if slug.is_empty() {
-            return denied(format!(
-                "projecting the {noun}s of this revision collides with a row this deployment \
-                 already holds{}: {}{}; the colliding row is retained until a revision deletes \
-                 it, so no retry clears this",
-                db.constraint()
-                    .map_or_else(String::new, |name| format!(" ({name})")),
-                db.message(),
-                // The detail names the colliding value, which the message does not.
-                db.detail()
-                    .map_or_else(String::new, |detail| format!(" — {detail}")),
-            ));
-        }
+    let Some(db) = error.as_db_error().filter(|db| is_projection_refusal(db)) else {
+        return unavailable(operation, error);
+    };
+    // Which constraint was violated, rather than an assumption about which one it
+    // was: a projected row can collide over a name, an OIDC subject, or a key
+    // digest, or contradict an ownership row, and reporting all of them as a name
+    // clash describes the wrong conflict and the wrong remedy. A name a live row
+    // holds is the one a caller renames, so it keeps its own typed refusal; the
+    // rest name what they contradicted, since there is no name to change.
+    if *db.code() != SqlState::FOREIGN_KEY_VIOLATION && !slug.is_empty() {
         return ControlPlaneError::NameTaken {
             noun,
             name: slug.to_owned(),
             holder: db.constraint().map(ToOwned::to_owned),
         };
     }
-    unavailable(operation, error)
+    let subject = if slug.is_empty() {
+        format!("projecting the {noun}s of this revision")
+    } else {
+        format!("projecting the {noun} `{slug}`")
+    };
+    let conflict = if *db.code() == SqlState::FOREIGN_KEY_VIOLATION {
+        "contradicts an ownership row this deployment already holds"
+    } else {
+        "collides with a row this deployment already holds"
+    };
+    denied(format!(
+        "{subject} {conflict}{}: {}{}; the conflicting row stands until a revision changes it, so \
+         no retry clears this",
+        db.constraint()
+            .map_or_else(String::new, |name| format!(" ({name})")),
+        db.message(),
+        // The detail names the colliding value, which the message does not.
+        db.detail()
+            .map_or_else(String::new, |detail| format!(" — {detail}")),
+    ))
 }
 
 fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
@@ -1471,13 +1489,17 @@ fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
         .is_some_and(|db| db.code() == &SqlState::UNIQUE_VIOLATION)
 }
 
-/// Whether a failure is a row this deployment already holds refusing to be
-/// duplicated — a unique index, or the deferred exclusion constraint that carries
-/// tenant names.
-fn is_collision(db: &tokio_postgres::error::DbError) -> bool {
+/// Whether a projection failure is a state this deployment already holds refusing
+/// the revision: a duplicate (a unique index, or the deferred exclusion
+/// constraints that carry names and identities), or a contradicted ownership row
+/// (the composite foreign keys). None of the three is transient, and reporting
+/// one as an outage asks a caller to retry against a state no retry reaches.
+fn is_projection_refusal(db: &tokio_postgres::error::DbError) -> bool {
     matches!(
         *db.code(),
-        SqlState::UNIQUE_VIOLATION | SqlState::EXCLUSION_VIOLATION
+        SqlState::UNIQUE_VIOLATION
+            | SqlState::EXCLUSION_VIOLATION
+            | SqlState::FOREIGN_KEY_VIOLATION
     )
 }
 
@@ -3581,6 +3603,87 @@ mod tests {
         );
     }
 
+    /// A project moving to another tenant, with the principal scoped into it. Every
+    /// intermediate row set is inconsistent — the project belongs to one tenant and
+    /// the principal claims the other — and the state as declared is not, so the
+    /// composite ownership key is settled with the names rather than row by row.
+    #[tokio::test]
+    async fn a_project_may_move_to_another_tenant_with_what_is_scoped_into_it() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let scoped = |tenant: u64, version| {
+            IdentityBody::new(
+                principal_id(44),
+                DisplayName::parse("Builder").expect("a display name"),
+                Credential::Oidc {
+                    issuer: "https://idp.example".to_owned(),
+                    subject: "builder".to_owned(),
+                },
+                [Role::Developer],
+            )
+            .expect("an identity granting a role")
+            .version_at(
+                ResourceScope::Project {
+                    tenant: tenant_id(tenant),
+                    project: project_id(3),
+                },
+                Slug::parse("builder").expect("a slug"),
+                version,
+            )
+        };
+        let first_version = ResourceVersionNumber::FIRST;
+        let mut before = state();
+        before
+            .insert(tenant(11, "globex"))
+            .and_then(|state| state.insert(project(&tenant_id(1), 3, "edge")))
+            .and_then(|state| state.insert(scoped(1, first_version)))
+            .expect("two tenants, a project of one, and a developer in that project");
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "owned", before.clone()))
+            .await
+            .expect("the original ownership publishes");
+
+        let second = first_version.next();
+        let mut moved = before;
+        moved
+            .supersede(
+                project_body(3, 11, "Edge")
+                    .version_at(Slug::parse("edge").expect("a slug"), second),
+            )
+            .and_then(|state| state.supersede(scoped(11, second)))
+            .expect("a project and its developer moving together is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "move",
+                moved,
+                92,
+            ))
+            .await
+            .expect("a reassignment the state declares consistently must publish");
+
+        assert_eq!(
+            store
+                .column(&format!(
+                    "SELECT tenant_id FROM axond_cp_project WHERE project_id = '{}'",
+                    project_id(3)
+                ))
+                .await,
+            vec![tenant_id(11).to_string()]
+        );
+        assert_eq!(
+            store
+                .column(&format!(
+                    "SELECT tenant_id FROM axond_cp_principal WHERE principal_id = '{}'",
+                    principal_id(44)
+                ))
+                .await,
+            vec![tenant_id(11).to_string()],
+            "the principal moved with the project it is scoped into"
+        );
+    }
+
     /// Disabling and then deleting a tenant is a transition on the projected row,
     /// and neither transition takes the tenant's history with it.
     #[tokio::test]
@@ -3923,6 +4026,17 @@ mod tests {
             ))
             .await
             .expect("record a refusal against the other tenant");
+        // A refusal that names no tenant, attempted by the *other* tenant's
+        // workload: shared in what was asked for, and not in who asked.
+        let mut theirs = denial(96, ResourceScope::Deployment, DenialReason::OutOfScope);
+        theirs.actor = Actor::Workload {
+            tenant: tenant_id(11),
+            principal: principal_id(36),
+        };
+        store
+            .record_denial(&theirs)
+            .await
+            .expect("record a deployment-scoped refusal by another tenant's workload");
 
         // A login role with no bypass, granted only reads: the shape of a
         // read-only replica consumer or a reporting job.
@@ -3972,7 +4086,11 @@ mod tests {
             .await
             .expect("read")
             .get(0);
-        assert_eq!(denials, 0, "another tenant's refusals are not visible");
+        assert_eq!(
+            denials, 0,
+            "another tenant's refusals — including a deployment-scoped one its workload \
+             attempted — are not visible"
+        );
 
         // Grants have no tenant column of their own: a grant is this tenant's
         // exactly when the principal holding it is, and a session that could read

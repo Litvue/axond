@@ -52,12 +52,29 @@ Two properties worth knowing before you plan capacity or retention:
   principal cannot be scoped into another tenant's project. Migration 0002 also
   adds row-level-security policies keyed on `axond.tenant_id`: a session that sets
   it sees deployment-wide rows and that tenant's, and a session that does not set
-  it — the publisher — is unrestricted. The policies cover every table that names
-  a tenant, including the two that name one indirectly: a grant is filtered
-  through its principal and an audit event through its mutation, so the
-  administrative journal and the roles it granted are inside the same wall as the
-  rows they describe. Authorization decisions stay in the service layer; the
-  policies are defence in depth.
+  it — the publisher — is unrestricted. Authorization decisions stay in the
+  service layer; the policies are defence in depth.
+
+  What is inside the wall: every table that names a tenant
+  (`axond_cp_resource_version`, `axond_cp_tenant`, `axond_cp_project`,
+  `axond_cp_principal`, `axond_cp_access_denial`, `axond_cp_mutation`), and every
+  table that names one indirectly, filtered through the row that owns it — a grant
+  through its principal, an audit event through its mutation, a manifest line and
+  a dependency edge through the resource version they point at, a deduplication
+  record through the mutation it replays. A refusal or a change that names *no*
+  tenant is shared state, but its actor is not: a deployment-scoped row attributed
+  to a workload is filtered by that workload's tenant too, so a pinned session
+  cannot read which service accounts of other tenants attempted what.
+
+  What is deliberately outside it: `axond_cp_revision`, `axond_cp_revision_blob`,
+  `axond_cp_blob`, `axond_cp_desired`, and `axond_cp_schema_migration`. A revision
+  is the whole deployment's desired state, so there is no tenant to attribute the
+  chain, the head, or a content digest to, and hiding a revision from a tenant
+  would hide the revision carrying that tenant's own state. These rows expose that
+  a deployment has a publication history and how long it is — ids, a parent link,
+  checksums, blob digests and sizes — and no tenant id, slug, body, or actor. A
+  pinned session can count revisions whose contents it cannot read; that is the
+  residual, and it is a boundary rather than an omission.
 - **A retained name stays taken.** A tenant or project a later revision stops
   declaring keeps its row and its name. Publishing a *different* tenant under a
   retained name is refused rather than reported as a temporary failure: no retry

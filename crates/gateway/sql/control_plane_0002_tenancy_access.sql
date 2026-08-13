@@ -94,7 +94,8 @@ $$;
 -- rather than a service-layer convention.
 CREATE TABLE IF NOT EXISTS axond_cp_project (
     project_id   text        PRIMARY KEY CHECK (project_id ~ '^prj_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
-    tenant_id    text        NOT NULL REFERENCES axond_cp_tenant (tenant_id),
+    tenant_id    text        NOT NULL REFERENCES axond_cp_tenant (tenant_id)
+                                 DEFERRABLE INITIALLY DEFERRED,
     slug         text        NOT NULL CHECK (length(slug) BETWEEN 1 AND 63),
     revision_id  text        NOT NULL,
     updated_at   timestamptz NOT NULL DEFAULT now(),
@@ -146,8 +147,18 @@ CREATE TABLE IF NOT EXISTS axond_cp_principal (
         (identity_kind = 'human' AND issuer IS NOT NULL AND subject IS NOT NULL AND key_digest IS NULL)
         OR (identity_kind = 'workload' AND issuer IS NULL AND subject IS NULL AND tenant_id IS NOT NULL)
     ),
-    FOREIGN KEY (tenant_id) REFERENCES axond_cp_tenant (tenant_id),
+    -- Deferred for the reason the names above are. Ownership is a property of the
+    -- revision: a revision that moves a project to another tenant, and the
+    -- principals scoped into it with it, is consistent as a state and inconsistent
+    -- at every point but the last while the projection writes it row by row. An
+    -- immediate key would refuse it depending on which id sorted first, and the
+    -- composite key has no `ON UPDATE` action to cascade instead. Settled with the
+    -- rest inside the projection, so a state that really is contradictory is still
+    -- refused there rather than at commit.
+    FOREIGN KEY (tenant_id) REFERENCES axond_cp_tenant (tenant_id)
+        DEFERRABLE INITIALLY DEFERRED,
     FOREIGN KEY (tenant_id, project_id) REFERENCES axond_cp_project (tenant_id, project_id)
+        DEFERRABLE INITIALLY DEFERRED
 );
 
 -- One sign-in resolves to one principal, and a minted key authenticates one
@@ -371,19 +382,31 @@ CREATE POLICY axond_cp_principal_isolation ON axond_cp_principal
         OR tenant_id = current_setting('axond.tenant_id', true)
     );
 
+-- A refusal is filtered by the tenant it named *and* by the tenant whose
+-- workload attempted it. A deployment-scoped denial names no tenant, so the row
+-- itself is shared state — but when a workload made the attempt the row carries
+-- that workload's tenant and principal id, and a session pinned to one tenant
+-- reading those would learn which service accounts of every other tenant tried
+-- to administer the deployment and what they tried. The read API treats
+-- `denials(None, ..)` as a platform-scoped page; this is the same rule, one
+-- layer down.
 ALTER TABLE axond_cp_access_denial ENABLE ROW LEVEL SECURITY;
 ALTER TABLE axond_cp_access_denial FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS axond_cp_access_denial_isolation ON axond_cp_access_denial;
 CREATE POLICY axond_cp_access_denial_isolation ON axond_cp_access_denial
     USING (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
-        OR tenant_id IS NULL
-        OR tenant_id = current_setting('axond.tenant_id', true)
+        OR (
+            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
+            AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
+        )
     )
     WITH CHECK (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
-        OR tenant_id IS NULL
-        OR tenant_id = current_setting('axond.tenant_id', true)
+        OR (
+            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
+            AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
+        )
     );
 
 -- The administrative journal. A pinned session that could read every mutation
@@ -393,21 +416,30 @@ CREATE POLICY axond_cp_access_denial_isolation ON axond_cp_access_denial
 ALTER TABLE axond_cp_mutation ENABLE ROW LEVEL SECURITY;
 ALTER TABLE axond_cp_mutation FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS axond_cp_mutation_isolation ON axond_cp_mutation;
+-- Attribution is filtered alongside scope, for the reason a denial's is: a
+-- deployment-scoped change made by a tenant's workload is shared in what it
+-- changed and not in who changed it.
 CREATE POLICY axond_cp_mutation_isolation ON axond_cp_mutation
     USING (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
-        OR tenant_id IS NULL
-        OR tenant_id = current_setting('axond.tenant_id', true)
+        OR (
+            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
+            AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
+        )
     )
     WITH CHECK (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
-        OR tenant_id IS NULL
-        OR tenant_id = current_setting('axond.tenant_id', true)
+        OR (
+            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
+            AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
+        )
     );
 
--- The two tables with no tenant column of their own are filtered through the row
+-- The tables with no tenant column of their own are filtered through the row
 -- that owns them: a grant through its principal, an audit event through its
--- mutation. The subquery is itself subject to that table's policy, so the
+-- mutation, a manifest line and a dependency edge through the resource version
+-- they point at, a deduplication record through the mutation it replays. The
+-- subquery is itself subject to that table's policy, so the
 -- ownership question is answered by the same wall rather than by a second copy
 -- of it — and a grant whose principal a pinned session cannot see is a grant it
 -- cannot see either.
