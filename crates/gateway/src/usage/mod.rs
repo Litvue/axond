@@ -664,7 +664,10 @@ pub async fn build_runtime(
     // and how a shipping pipeline can legitimately collect it. It is warned
     // about because an acknowledgement is only worth what the destination is:
     // once every destination has acknowledged an event, retention forgets it.
-    if durable.iter().all(|sink| sink.kind == UsageSinkKind::Stdout) {
+    if durable
+        .iter()
+        .all(|sink| sink.kind == UsageSinkKind::Stdout)
+    {
         tracing::warn!(
             journal = store.name(),
             retain_acknowledged_seconds = capacity.retain_acknowledged.as_secs(),
