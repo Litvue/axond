@@ -424,6 +424,11 @@ impl AvailabilityIndexBuilder {
     /// rather than being demoted to a fallback. A slot that already holds the declared
     /// look is left untouched, so an ordinary refresh that redeclares what it read
     /// reports no out-of-order arrivals.
+    ///
+    /// The conclusion a record carries counts even when the look that reached it is
+    /// gone from both slots: declaring a target a complete listing dropped discredits
+    /// an older positive the receiving index retained, exactly as the listing itself
+    /// would have.
     #[must_use]
     pub fn record(mut self, key: AvailabilityKey, record: AvailabilityRecord) -> Self {
         let entry = self.records.entry(key).or_default();
@@ -473,6 +478,18 @@ impl AvailabilityIndexBuilder {
                     .definitive_at
                     .map_or(declared, |held| held.max(declared)),
             );
+            // A retained positive older than the conclusion this key has now reached
+            // is discredited by it, exactly as the arriving complete listing would
+            // have discredited it. The conclusive look itself may be long gone from
+            // both slots — displaced from the current one by a failed refresh — so
+            // without this the watermark would rise past a positive that outlives it.
+            if entry
+                .last_known_good
+                .as_ref()
+                .is_some_and(|retained| Some(retained.observed_at) < entry.definitive_at)
+            {
+                entry.last_known_good = None;
+            }
         }
         self
     }

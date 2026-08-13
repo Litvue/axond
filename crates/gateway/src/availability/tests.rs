@@ -526,6 +526,43 @@ fn a_look_refused_from_both_slots_of_one_record_counts_once() {
     );
 }
 
+/// A record whose conclusive look has already been displaced from both slots — a
+/// complete listing that dropped the target, then a failed refresh — still carries
+/// that conclusion as a watermark, and declaring it must discredit an older positive
+/// the receiving index retained.
+#[test]
+fn a_declared_conclusion_discredits_a_retained_positive_that_predates_it() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let dropped_then_unreachable = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 500))
+        .observe(outage(scope, "gpt-4o", 600))
+        .build()
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held")
+        .clone();
+    assert_eq!(dropped_then_unreachable.last_known_good, None);
+    assert_eq!(dropped_then_unreachable.definitive_at, Some(at(500)));
+
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 300, None))
+        .record(key(scope, "gpt-4o"), dropped_then_unreachable)
+        .build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(700));
+    assert_ne!(
+        verdict.state,
+        AvailabilityState::Available,
+        "a listing that dropped the target is not undone by handing the record over"
+    );
+    assert_eq!(verdict.state, AvailabilityState::Unknown);
+    assert!(
+        !verdict.last_known_good,
+        "the stale positive is discredited"
+    );
+}
+
 /// A hand-built record can carry a retained look newer than its current one, which
 /// no observed sequence produces. Evidence follows the newer of the two, or the
 /// record would report a refusal while holding newer positive evidence.
