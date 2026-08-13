@@ -210,7 +210,9 @@ and loses the active snapshot.
    absent from metrics and from the status response, where it would be unbounded.
 4. **Decide by age, not by the alert.** Age is when this gateway last confirmed
    the content current — an import or a `304`, not a retrieval time the document
-   claims — so a freshly imported offline seed reads as fresh. `active_age_ms`
+   claims — so a freshly imported offline seed reads as fresh
+   (`LastKnownGoodCatalog::admit_as_of` stamps that for imports which never came
+   from a refresh, seeding at boot being the one that exists). `active_age_ms`
    against your own tolerance for stale model metadata is the actual decision.
    Hours are usually uninteresting; days mean pricing and capability facts are
    drifting from upstream.

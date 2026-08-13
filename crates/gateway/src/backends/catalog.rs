@@ -2197,6 +2197,13 @@ impl LastKnownGoodCatalog {
     /// [`SourceValidators::carry_over`] rather than replacing them — an
     /// intermediary that serves identical bytes without an `ETag` must not cost
     /// the tag that still describes them.
+    ///
+    /// The snapshot keeps the `fetched_at` it arrived with, which is a retrieval
+    /// time its *source* stated. Age is how long ago this process confirmed the
+    /// content, so anything importing on this process's behalf — a scheduler, or a
+    /// boot path seeding from
+    /// [`seed_snapshot`](super::models_dev::seed_snapshot), whose fixture states
+    /// the day it was cut — wants [`admit_as_of`](Self::admit_as_of) instead.
     pub fn admit(&mut self, mut snapshot: CatalogSnapshot) -> Admission {
         let content_id = snapshot.content.content_id();
         let admission = match self.active.as_ref() {
@@ -2216,6 +2223,21 @@ impl LastKnownGoodCatalog {
         self.consecutive_refusals = 0;
         self.last_refusal = None;
         admission
+    }
+
+    /// Admit `snapshot` as content this process confirmed at `checked_at`.
+    ///
+    /// The stamping [`record_refresh`](Self::record_refresh) does, available to
+    /// the paths that never see a [`CatalogRefresh`] — boot-time seeding is the
+    /// one that exists — so "a freshly imported catalogue reads as fresh" holds
+    /// wherever content becomes active, and not only where a refresh drove it.
+    pub fn admit_as_of(
+        &mut self,
+        mut snapshot: CatalogSnapshot,
+        checked_at: SystemTime,
+    ) -> Admission {
+        snapshot.source.fetched_at = checked_at;
+        self.admit(snapshot)
     }
 
     /// Record that the source answered [`CatalogRefresh::Unchanged`], so the
@@ -2322,9 +2344,8 @@ impl LastKnownGoodCatalog {
                         .content_id(),
                 }))
             }
-            Ok(CatalogRefresh::Updated(mut snapshot)) => {
-                snapshot.source.fetched_at = checked_at;
-                Ok(Refreshed::Admitted(self.admit(*snapshot)))
+            Ok(CatalogRefresh::Updated(snapshot)) => {
+                Ok(Refreshed::Admitted(self.admit_as_of(*snapshot, checked_at)))
             }
             Err(error) => {
                 self.record_refusal(error.refusal());
@@ -3578,6 +3599,31 @@ mod tests {
         assert_eq!(
             report.active.expect("an active catalogue").fetched_at,
             checked_at
+        );
+    }
+
+    /// The same holds for content that never came from a refresh: the bundled
+    /// seed states the day it was cut, and a boot path importing it is confirming
+    /// content now, not months ago.
+    #[test]
+    fn a_seeded_import_is_aged_from_the_import_and_not_from_the_fixture() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        let booted_at =
+            crate::backends::models_dev::seed_fetched_at() + Duration::from_secs(90 * 86_400);
+        let seed = crate::backends::models_dev::seed_snapshot();
+        assert_eq!(
+            seed.source.fetched_at,
+            crate::backends::models_dev::seed_fetched_at()
+        );
+
+        assert!(matches!(
+            catalogue.admit_as_of(seed, booted_at),
+            Admission::Initial { .. }
+        ));
+        assert_eq!(
+            catalogue.report(booted_at).active_age(),
+            Some(Duration::ZERO),
+            "a seed imported now is as current as this process has confirmed anything"
         );
     }
 
