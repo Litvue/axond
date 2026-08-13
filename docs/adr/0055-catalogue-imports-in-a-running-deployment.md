@@ -57,6 +57,12 @@ inherited from `[control_plane]` when omitted, and the connection string reaches
 The default is `source = "none"`: no client is built, no connection is opened,
 and no task is spawned. Upgrading acquires no upstream dependency.
 
+`[catalog]` is boot-owned. A reload validates an edited section and emits an
+operator-visible `catalog_changed` restart warning, but does not replace the
+source, store, client, or refresh task. The published serving snapshot keeps
+the boot-time catalogue settings until restart, so status and configuration
+cannot report an importer that is not actually running.
+
 `HttpCatalogFetch` is the production fetch, and the same one the tests exercise:
 conditional `GET` carrying the stored ETag and `Last-Modified`, `304` as
 `NotModified`, an explicit request timeout, and a body read under a ceiling

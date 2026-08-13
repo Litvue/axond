@@ -672,9 +672,17 @@ restart. `[[namespace]]` changes are reloadable and appear in the reported
 namespace delta, but the namespace count used for in-memory budget retention
 floors is captured at boot and does not resize until restart. `[server] bind`,
 `[transport]`, `[admission]`, `[[usage_sink]]`, `[usage_journal]`, `[budget]`,
-`[rate_limit]`, and
-`[revocation]` changes warn and are ignored until restart; this includes
-`limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
+`[rate_limit]`, `[revocation]`, and `[catalog]` changes warn and are ignored
+until restart;
+this includes `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
+The catalogue candidate is still fully validated, but the running snapshot
+keeps the boot-time `[catalog]` settings so it cannot claim that a new source,
+store, or refresh schedule is active when the importer task is still using the
+old one. Restart after changing `[catalog]`; the applied reload log includes
+`catalog_changed = true` and a restart warning.
+The same log entry sets `restart_required = true` for catalogue and other
+boot-owned changes; `changed` only reports live serving state applied by the
+reload.
 
 ## `[[usage_sink]]` — Tier 0 by default; Tier 2 for `postgres`
 

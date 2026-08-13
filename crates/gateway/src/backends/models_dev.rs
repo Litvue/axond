@@ -84,11 +84,10 @@ use serde_json::value::RawValue;
 use super::catalog::{
     CatalogContent, CatalogContentError, CatalogError, CatalogModelEntry, CatalogProvider,
     CatalogRefresh, CatalogSnapshot, CatalogSource, ETag, HttpDate, InvalidCatalogId, JsonPointer,
-    Modality,
-    ModelCapability, ModelFacts, ModelField, ModelId, ModelLifecycle, ModelLimits, ObservedPrice,
-    ObservedRate, PriceRates, PriceTier, PriceTierThreshold, ProviderEndpoint, ProviderOffering,
-    RawPayload, Refusable, Refusal, RefusalReason, SchemaVersion, SourceValidators, excerpt,
-    excerpt_list, excerpt_located, source_snapshot,
+    Modality, ModelCapability, ModelFacts, ModelField, ModelId, ModelLifecycle, ModelLimits,
+    ObservedPrice, ObservedRate, PriceRates, PriceTier, PriceTierThreshold, ProviderEndpoint,
+    ProviderOffering, RawPayload, Refusable, Refusal, RefusalReason, SchemaVersion,
+    SourceValidators, excerpt, excerpt_list, excerpt_located, source_snapshot,
 };
 use super::{Capabilities, Capability};
 use crate::desired_state::canonical::{CanonicalError, CanonicalValue};

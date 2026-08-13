@@ -1011,6 +1011,37 @@ env = "AXOND_KEY"
 namespace = "platform"
 "#;
 
+    /// The production observation plan, not only the status route's projection,
+    /// must mark an enabled importer as configured. Otherwise the component
+    /// would remain `disabled` forever even though the background task is
+    /// running and the catalogue report is available to operators.
+    #[test]
+    fn catalogue_imports_enable_the_catalogue_status_component() {
+        let plan = ReplicaObservability::plan_with_catalogue(
+            None,
+            &crate::budget::NoBudget,
+            &crate::rate_limit::NoLimit,
+            &crate::revocation::NoDenylist,
+            Some(Arc::new(CatalogStatus::new())),
+        );
+
+        assert_eq!(plan.components(), &[Component::Catalogue]);
+        let (observability, refresher) = ReplicaObservability::observing(plan);
+        assert!(refresher.is_some());
+        let catalogue = observability
+            .status
+            .view()
+            .components
+            .into_iter()
+            .find(|observed| observed.component == Component::Catalogue)
+            .expect("the catalogue component is in every status view");
+        assert_eq!(
+            catalogue.state,
+            crate::status::ComponentState::Unavailable,
+            "enabled-but-not-yet-observed is not disabled"
+        );
+    }
+
     /// Availability is projected onto a snapshot, not compiled into it: a built
     /// snapshot knows nothing, and attaching an index leaves every config section
     /// exactly as compilation produced it (#206).

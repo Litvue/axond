@@ -419,3 +419,9 @@ providers, aliases, credential labels, and gateway-key env-var names, and bumps
 
 If a replica's generation lags the fleet, it missed a reload — its file or its
 process environment differs. Restarting it is always safe: it is stateless.
+
+The applied reload log also carries `catalog_changed` and
+`restart_required`. When `catalog_changed` is `true`, the
+`[catalog]` edit was validated but the boot-owned importer, and the serving
+snapshot's catalogue settings, remain unchanged; the warning immediately after
+the log line tells the operator to restart.
