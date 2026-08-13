@@ -1362,13 +1362,22 @@ pub enum CatalogChange {
     ModelRemoved {
         model: ModelId,
     },
+    /// A provider began offering the model under `published`.
+    ///
+    /// Named by the id it is published under, not by its provider alone: that
+    /// pair is what identifies an offering (see [`CatalogModelEntry::offerings`]),
+    /// so a provider gaining one of two aliases would otherwise be a report
+    /// indistinguishable from gaining the other.
     OfferingAdded {
         model: ModelId,
         provider: ProviderId,
+        published: String,
     },
+    /// A provider stopped offering the model under `published`.
     OfferingRemoved {
         model: ModelId,
         provider: ProviderId,
+        published: String,
     },
     /// The provider-neutral record changed, gained values, or lost them.
     ///
@@ -1449,6 +1458,16 @@ impl CatalogChange {
             | Self::CapabilitiesChanged { provider, .. }
             | Self::MetadataChanged { provider, .. }
             | Self::PriceChanged { provider, .. } => Some(provider),
+        }
+    }
+
+    /// The id a request would have used, for the changes that name one.
+    pub fn published(&self) -> Option<&str> {
+        match self {
+            Self::OfferingAdded { published, .. } | Self::OfferingRemoved { published, .. } => {
+                Some(published)
+            }
+            _ => None,
         }
     }
 
@@ -1558,6 +1577,7 @@ impl CatalogDiff {
                     changes.push(CatalogChange::OfferingAdded {
                         model: (*id).clone(),
                         provider: offering.provider.clone(),
+                        published: offering.published_model_id.clone(),
                     });
                 }
             }
@@ -1571,6 +1591,7 @@ impl CatalogDiff {
                     changes.push(CatalogChange::OfferingRemoved {
                         model: (*id).clone(),
                         provider: offering.provider.clone(),
+                        published: offering.published_model_id.clone(),
                     });
                 }
             }
@@ -1602,6 +1623,7 @@ impl CatalogDiff {
                     changes.push(CatalogChange::OfferingAdded {
                         model: (*id).clone(),
                         provider: offering.provider.clone(),
+                        published: offering.published_model_id.clone(),
                     });
                     continue;
                 };
@@ -1612,6 +1634,7 @@ impl CatalogDiff {
                     changes.push(CatalogChange::OfferingRemoved {
                         model: (*id).clone(),
                         provider: offering.provider.clone(),
+                        published: offering.published_model_id.clone(),
                     });
                 }
             }
@@ -1622,6 +1645,7 @@ impl CatalogDiff {
                 .cmp(&right.model())
                 .then_with(|| left.provider().cmp(&right.provider()))
                 .then_with(|| left.rank().cmp(&right.rank()))
+                .then_with(|| left.published().cmp(&right.published()))
         });
         Self { changes }
     }
@@ -1990,6 +2014,59 @@ mod tests {
         assert_eq!(diff.counts().prices_changed, 1);
         assert_eq!(diff.counts().offerings_added, 0);
         assert_eq!(diff.counts().offerings_removed, 0);
+    }
+
+    /// An offering that arrives or leaves is named by the id a request would
+    /// have used: an alias moving beside a sibling alias would otherwise be a
+    /// report indistinguishable from the sibling's.
+    #[test]
+    fn an_offering_that_comes_or_goes_names_the_id_callers_would_have_sent() {
+        let held = offering("openai", "gpt-4o", None);
+        let mut first = held.clone();
+        first.published_model_id = "gpt-4o-latest".to_owned();
+        let mut second = held.clone();
+        second.published_model_id = "gpt-4o-2024".to_owned();
+
+        let before = content(vec![held.clone()]);
+        let after = content(vec![held.clone(), first, second]);
+        let model = ModelId::parse("gpt-4o").expect("fixture id");
+        let provider = ProviderId::parse("openai").expect("fixture id");
+
+        let added = after.diff(&before);
+        assert_eq!(
+            added.changes(),
+            [
+                CatalogChange::OfferingAdded {
+                    model: model.clone(),
+                    provider: provider.clone(),
+                    published: "gpt-4o-2024".to_owned(),
+                },
+                CatalogChange::OfferingAdded {
+                    model: model.clone(),
+                    provider: provider.clone(),
+                    published: "gpt-4o-latest".to_owned(),
+                },
+            ],
+            "two aliases arriving are two distinguishable changes"
+        );
+
+        let removed = before.diff(&after);
+        assert_eq!(
+            removed.changes(),
+            [
+                CatalogChange::OfferingRemoved {
+                    model: model.clone(),
+                    provider: provider.clone(),
+                    published: "gpt-4o-2024".to_owned(),
+                },
+                CatalogChange::OfferingRemoved {
+                    model,
+                    provider,
+                    published: "gpt-4o-latest".to_owned(),
+                },
+            ],
+            "and withdrawing them names which callable id went"
+        );
     }
 
     fn price(input: u64, output: u64) -> ObservedPrice {
