@@ -1,0 +1,828 @@
+//! Deterministic tests for the availability contract: precedence, expiry,
+//! last-known-good retention, cross-tenant isolation, and redaction.
+//!
+//! Every test fixes `now` explicitly. Availability is a function of an instant, so
+//! a test that read the wall clock would be asserting a property of the machine it
+//! ran on.
+
+use std::time::{Duration, SystemTime};
+
+use super::*;
+use crate::desired_state::{ProjectId, TenantId, Uuid7};
+use crate::status::StatusScope;
+
+const SECOND: Duration = Duration::from_secs(1);
+
+fn at(seconds: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+fn uuid(seed: u64) -> Uuid7 {
+    Uuid7::from_parts(seed, 0, seed).expect("seeds are in range")
+}
+
+fn tenant(seed: u64) -> TenantId {
+    TenantId::new(uuid(seed))
+}
+
+fn project(seed: u64) -> ProjectId {
+    ProjectId::new(uuid(seed))
+}
+
+fn target(model: &str) -> TargetRef {
+    TargetRef::parse("openai", model).expect("a well-formed target")
+}
+
+fn key(scope: ScopeRef, model: &str) -> AvailabilityKey {
+    AvailabilityKey::new(scope, target(model))
+}
+
+/// A complete, positive listing observation for one scope and target.
+fn present(scope: ScopeRef, model: &str, observed: u64, ttl: Option<u64>) -> DiscoveryObservation {
+    let observation = DiscoveryObservation::new(
+        scope,
+        target(model),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(observed),
+    );
+    match ttl {
+        Some(ttl) => observation.expiring_at(at(observed + ttl)),
+        None => observation,
+    }
+}
+
+/// A complete listing that does not carry the target: the one definitive
+/// negative.
+fn absent(scope: ScopeRef, model: &str, observed: u64) -> DiscoveryObservation {
+    DiscoveryObservation::new(
+        scope,
+        target(model),
+        DiscoveryResult::Absent,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(observed),
+    )
+}
+
+/// A look that failed partway: the discovery-outage shape.
+fn outage(scope: ScopeRef, model: &str, observed: u64) -> DiscoveryObservation {
+    DiscoveryObservation::new(
+        scope,
+        target(model),
+        DiscoveryResult::Indeterminate,
+        DiscoveryCompleteness::Partial,
+        DiscoverySource::ProviderListing,
+        at(observed),
+    )
+    .detailed("HTTP 503 from https://api.example.test/v1/models?key=sk-live-should-never-be-read")
+}
+
+/// A record whose five single-valued dimensions all permit.
+fn permitting() -> AvailabilityRecord {
+    AvailabilityRecord {
+        entitlement: Entitlement::Granted,
+        runtime: RuntimeHealth::Healthy,
+        ..AvailabilityRecord::enabled()
+    }
+}
+
+#[test]
+fn a_target_with_fresh_complete_positive_evidence_is_available() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, Some(60)))
+        .build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(120));
+    assert_eq!(verdict.state, AvailabilityState::Available);
+    assert_eq!(verdict.reason, AvailabilityReason::Observed);
+    assert_eq!(verdict.decided_by, DecidedBy::Discovery);
+    assert_eq!(verdict.observed_at, Some(at(100)));
+    assert_eq!(verdict.expires_at, Some(at(160)));
+    assert!(!verdict.last_known_good);
+    assert!(verdict.state.permits_attempt());
+}
+
+/// The ladder, one rung at a time: each dimension in turn is the only one that
+/// objects, and the verdict names it. The order is the contract — a change here
+/// is a change to which authority a caller is told to go and talk to.
+#[test]
+fn precedence_is_deterministic_and_names_the_dimension_that_decided() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let cases: &[(
+        AvailabilityRecord,
+        AvailabilityState,
+        AvailabilityReason,
+        DecidedBy,
+    )] = &[
+        (
+            AvailabilityRecord {
+                presence: CataloguePresence::Absent,
+                ..permitting()
+            },
+            AvailabilityState::Unavailable,
+            AvailabilityReason::NotInCatalogue,
+            DecidedBy::Catalogue,
+        ),
+        (
+            AvailabilityRecord {
+                presence: CataloguePresence::Withdrawn,
+                ..permitting()
+            },
+            AvailabilityState::Unavailable,
+            AvailabilityReason::WithdrawnFromCatalogue,
+            DecidedBy::Catalogue,
+        ),
+        (
+            AvailabilityRecord {
+                policy: PolicyDecision::Denied,
+                ..permitting()
+            },
+            AvailabilityState::Denied,
+            AvailabilityReason::PolicyDenied,
+            DecidedBy::Policy,
+        ),
+        (
+            AvailabilityRecord {
+                policy: PolicyDecision::Indeterminate,
+                ..permitting()
+            },
+            AvailabilityState::Unknown,
+            AvailabilityReason::PolicyIndeterminate,
+            DecidedBy::Policy,
+        ),
+        (
+            AvailabilityRecord {
+                enablement: Enablement::NotEnabled,
+                ..permitting()
+            },
+            AvailabilityState::Denied,
+            AvailabilityReason::NotEnabled,
+            DecidedBy::Enablement,
+        ),
+        (
+            AvailabilityRecord {
+                entitlement: Entitlement::Missing,
+                ..permitting()
+            },
+            AvailabilityState::Denied,
+            AvailabilityReason::EntitlementMissing,
+            DecidedBy::Entitlement,
+        ),
+        (
+            AvailabilityRecord {
+                entitlement: Entitlement::Revoked,
+                ..permitting()
+            },
+            AvailabilityState::Denied,
+            AvailabilityReason::EntitlementRevoked,
+            DecidedBy::Entitlement,
+        ),
+        (
+            AvailabilityRecord {
+                entitlement: Entitlement::Unknown,
+                ..permitting()
+            },
+            AvailabilityState::Unknown,
+            AvailabilityReason::EntitlementUnknown,
+            DecidedBy::Entitlement,
+        ),
+        (
+            AvailabilityRecord {
+                runtime: RuntimeHealth::Unavailable,
+                ..permitting()
+            },
+            AvailabilityState::Unavailable,
+            AvailabilityReason::RuntimeUnavailable,
+            DecidedBy::Runtime,
+        ),
+    ];
+
+    for (record, state, reason, decided_by) in cases {
+        let index = AvailabilityIndex::builder()
+            .record(key(scope, "gpt-4o"), record.clone())
+            // Positive evidence throughout, so the verdict comes from the
+            // dimension under test and never from the absence of a look.
+            .observe(present(scope, "gpt-4o", 100, None))
+            .build();
+        let verdict = index.evaluate(&key(scope, "gpt-4o"), at(120));
+        assert_eq!(
+            (verdict.state, verdict.reason, verdict.decided_by),
+            (*state, *reason, *decided_by),
+            "record {record:?}"
+        );
+    }
+}
+
+/// A policy denial outranks a positive listing, and a catalogue absence outranks
+/// the denial: the ladder is ordered, not a set of independent vetoes.
+#[test]
+fn a_higher_rung_decides_even_when_a_lower_one_would_object_differently() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                presence: CataloguePresence::Absent,
+                policy: PolicyDecision::Denied,
+                enablement: Enablement::NotEnabled,
+                entitlement: Entitlement::Missing,
+                runtime: RuntimeHealth::Unavailable,
+                ..permitting()
+            },
+        )
+        .observe(absent(scope, "gpt-4o", 100))
+        .build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(120));
+    assert_eq!(verdict.decided_by, DecidedBy::Catalogue);
+    assert_eq!(verdict.reason, AvailabilityReason::NotInCatalogue);
+}
+
+#[test]
+fn a_key_the_index_does_not_hold_is_unknown_rather_than_available_or_denied() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let empty = AvailabilityIndex::empty();
+    assert!(empty.is_empty());
+
+    let verdict = empty.evaluate(&key(scope, "gpt-4o"), at(1));
+    assert_eq!(verdict, Availability::no_record());
+    assert_eq!(verdict.state, AvailabilityState::Unknown);
+    assert_eq!(verdict.reason, AvailabilityReason::NoEvidence);
+    assert_eq!(verdict.decided_by, DecidedBy::NoRecord);
+}
+
+/// Only a complete negative denies. A partial listing that does not mention the
+/// model, a provider with no listing endpoint, and an untrustworthy answer are
+/// all `unknown` — and each says which, so an operator can tell a broken probe
+/// from an unsupported provider.
+#[test]
+fn incomplete_discovery_is_unknown_and_never_a_denial() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let cases = [
+        (
+            DiscoveryCompleteness::Partial,
+            AvailabilityReason::DiscoveryIncomplete,
+        ),
+        (
+            DiscoveryCompleteness::Unsupported,
+            AvailabilityReason::DiscoveryUnsupported,
+        ),
+        (
+            DiscoveryCompleteness::Unreliable,
+            AvailabilityReason::DiscoveryUnreliable,
+        ),
+    ];
+
+    for (completeness, reason) in cases {
+        for result in [DiscoveryResult::Present, DiscoveryResult::Absent] {
+            let observation = DiscoveryObservation::new(
+                scope,
+                target("gpt-4o"),
+                result,
+                completeness,
+                DiscoverySource::ProviderListing,
+                at(100),
+            );
+            let index = AvailabilityIndex::builder()
+                .record(key(scope, "gpt-4o"), permitting())
+                .observe(observation)
+                .build();
+            let verdict = index.evaluate(&key(scope, "gpt-4o"), at(120));
+            assert_eq!(
+                (verdict.state, verdict.reason),
+                (AvailabilityState::Unknown, reason),
+                "{completeness:?} {result:?} must not be definitive"
+            );
+        }
+    }
+}
+
+/// Expiry moves evidence towards *less* confidence in both directions: an expired
+/// positive is stale, and an expired denial stops denying.
+#[test]
+fn expiry_downgrades_positive_evidence_to_stale_and_a_denial_to_unknown() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let positive = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, Some(60)))
+        .build();
+
+    // One second before expiry, and exactly at it: the boundary is inclusive, so
+    // evidence does not count for the instant it expires.
+    let before = positive.evaluate(&key(scope, "gpt-4o"), at(160) - SECOND);
+    assert_eq!(before.state, AvailabilityState::Available);
+    let at_expiry = positive.evaluate(&key(scope, "gpt-4o"), at(160));
+    assert_eq!(at_expiry.state, AvailabilityState::Stale);
+    assert_eq!(at_expiry.reason, AvailabilityReason::EvidenceExpired);
+    assert_eq!(
+        at_expiry.expires_at,
+        Some(at(160)),
+        "a stale verdict still says which evidence expired and when"
+    );
+    assert!(at_expiry.state.permits_attempt());
+
+    let denial = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 100).expiring_at(at(160)))
+        .build();
+    assert_eq!(
+        denial.evaluate(&key(scope, "gpt-4o"), at(159)).state,
+        AvailabilityState::Denied
+    );
+    let expired_denial = denial.evaluate(&key(scope, "gpt-4o"), at(161));
+    assert_eq!(
+        (expired_denial.state, expired_denial.reason),
+        (
+            AvailabilityState::Unknown,
+            AvailabilityReason::EvidenceExpired
+        ),
+        "a denial that rested on an expired look is no longer a denial"
+    );
+}
+
+#[test]
+fn evidence_without_an_expiry_never_expires() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(100_000_000));
+    assert_eq!(verdict.state, AvailabilityState::Available);
+    assert_eq!(verdict.expires_at, None);
+}
+
+/// The outage case, end to end: a look that fails keeps the last positive
+/// evidence, and the verdict says it is resting on it.
+#[test]
+fn a_discovery_outage_preserves_the_last_known_good_state() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, Some(600)))
+        .observe(outage(scope, "gpt-4o", 200))
+        .observe(outage(scope, "gpt-4o", 300))
+        .build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(400));
+    assert_eq!(verdict.state, AvailabilityState::Available);
+    assert_eq!(verdict.reason, AvailabilityReason::LastKnownGood);
+    assert!(verdict.last_known_good);
+    assert_eq!(verdict.observed_at, Some(at(100)));
+
+    // And when the retained evidence itself expires, the deployment is told it is
+    // stale rather than quietly kept available.
+    let expired = index.evaluate(&key(scope, "gpt-4o"), at(700));
+    assert_eq!(expired.state, AvailabilityState::Stale);
+    assert!(expired.last_known_good);
+}
+
+#[test]
+fn a_definitive_negative_discredits_the_retained_positive() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, Some(600)))
+        .observe(absent(scope, "gpt-4o", 200))
+        .build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(300));
+    assert_eq!(verdict.state, AvailabilityState::Denied);
+    assert_eq!(verdict.reason, AvailabilityReason::DiscoveryAbsent);
+    assert!(!verdict.last_known_good);
+    assert_eq!(
+        index
+            .record(&key(scope, "gpt-4o"))
+            .expect("the record exists")
+            .last_known_good,
+        None,
+        "a complete listing that dropped the target retains no positive evidence"
+    );
+}
+
+/// Certainty only rises on definitive evidence. Every non-definitive observation
+/// is applied to an index in a known state and must not make it more confident.
+#[test]
+fn unknown_and_stale_evidence_is_never_silently_upgraded() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let denied = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 100))
+        .build();
+    let before = denied.evaluate(&key(scope, "gpt-4o"), at(150));
+    assert_eq!(before.state, AvailabilityState::Denied);
+
+    for completeness in [
+        DiscoveryCompleteness::Partial,
+        DiscoveryCompleteness::Unsupported,
+        DiscoveryCompleteness::Unreliable,
+    ] {
+        let after = AvailabilityIndexBuilder::from_index(&denied)
+            .observe(DiscoveryObservation::new(
+                scope,
+                target("gpt-4o"),
+                DiscoveryResult::Present,
+                completeness,
+                DiscoverySource::ProviderProbe,
+                at(200),
+            ))
+            .build()
+            .evaluate(&key(scope, "gpt-4o"), at(250));
+        assert_eq!(
+            after.state,
+            AvailabilityState::Unknown,
+            "a {completeness:?} look claiming presence must not become available"
+        );
+        assert!(after.state.certainty() < before.state.certainty());
+    }
+
+    // A stale verdict is not repaired by a look that establishes nothing either.
+    let stale = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, Some(10)))
+        .build();
+    assert_eq!(
+        stale.evaluate(&key(scope, "gpt-4o"), at(200)).state,
+        AvailabilityState::Stale
+    );
+    let after_outage = AvailabilityIndexBuilder::from_index(&stale)
+        .observe(outage(scope, "gpt-4o", 150))
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(200));
+    assert_eq!(after_outage.state, AvailabilityState::Stale);
+    assert!(after_outage.last_known_good);
+}
+
+#[test]
+fn an_observation_older_than_the_one_held_is_ignored() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let builder = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 300))
+        .observe(present(scope, "gpt-4o", 100, None));
+    assert_eq!(builder.superseded(), 1);
+    let index = builder.build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(400));
+    assert_eq!(
+        verdict.state,
+        AvailabilityState::Denied,
+        "a late arrival from a slow probe does not rewind the index"
+    );
+
+    // Which makes the order observations arrive in irrelevant: both orders of the
+    // same two looks evaluate identically.
+    let forwards = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .observe(absent(scope, "gpt-4o", 300))
+        .build();
+    assert_eq!(
+        forwards.evaluate(&key(scope, "gpt-4o"), at(400)),
+        verdict.clone()
+    );
+}
+
+/// One tenant's evidence decides one tenant's verdict. A listing taken with tenant
+/// A's credentials describes A's account, and a model absent from it must not deny
+/// tenant B — which is why observations are scoped and records are keyed by scope.
+#[test]
+fn evidence_never_crosses_a_tenant_or_a_project_boundary() {
+    let acme = ScopeRef::tenant(tenant(1));
+    let globex = ScopeRef::tenant(tenant(2));
+    let acme_core = ScopeRef::project(tenant(1), project(3));
+    let index = AvailabilityIndex::builder()
+        .record(key(acme, "gpt-4o"), permitting())
+        .record(key(globex, "gpt-4o"), permitting())
+        .record(key(acme_core, "gpt-4o"), permitting())
+        .observe(absent(acme, "gpt-4o", 100))
+        .observe(present(globex, "gpt-4o", 100, None))
+        .build();
+
+    assert_eq!(
+        index.evaluate(&key(acme, "gpt-4o"), at(200)).state,
+        AvailabilityState::Denied
+    );
+    assert_eq!(
+        index.evaluate(&key(globex, "gpt-4o"), at(200)).state,
+        AvailabilityState::Available
+    );
+    assert_eq!(
+        index.evaluate(&key(acme_core, "gpt-4o"), at(200)),
+        Availability::no_record(),
+        "a project scope inherits no evidence from its tenant in this contract"
+    );
+
+    // A scoped read reaches one scope's targets and no other's.
+    let scoped = index.evaluate_scope(&globex, at(200));
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].0, target("gpt-4o"));
+    assert_eq!(scoped[0].1.state, AvailabilityState::Available);
+    assert!(
+        index
+            .evaluate_scope(&ScopeRef::tenant(tenant(9)), at(200))
+            .is_empty()
+    );
+}
+
+#[test]
+fn evaluating_the_whole_index_is_deterministic() {
+    let acme = ScopeRef::tenant(tenant(1));
+    let globex = ScopeRef::tenant(tenant(2));
+    let build = |reversed: bool| {
+        let keys = [
+            (globex, "gpt-4o-mini"),
+            (acme, "gpt-4o"),
+            (globex, "gpt-4o"),
+            (acme, "gpt-4o-mini"),
+        ];
+        let mut builder = AvailabilityIndex::builder();
+        let ordered: Vec<_> = if reversed {
+            keys.iter().rev().copied().collect()
+        } else {
+            keys.to_vec()
+        };
+        for (scope, model) in ordered {
+            builder = builder
+                .record(key(scope, model), permitting())
+                .observe(present(scope, model, 100, None));
+        }
+        builder.build()
+    };
+
+    let forwards = build(false);
+    assert_eq!(
+        forwards,
+        build(true),
+        "insertion order is not part of an index"
+    );
+    let evaluated: Vec<String> = forwards
+        .evaluate_all(at(200))
+        .into_iter()
+        .map(|(key, verdict)| format!("{key} {}", verdict.state.as_str()))
+        .collect();
+    assert_eq!(
+        evaluated,
+        [
+            format!("{acme} openai/gpt-4o available"),
+            format!("{acme} openai/gpt-4o-mini available"),
+            format!("{globex} openai/gpt-4o available"),
+            format!("{globex} openai/gpt-4o-mini available"),
+        ],
+        "records evaluate scope-first, then target"
+    );
+}
+
+/// The redaction floor: operator-facing detail is collected, logged, and has no
+/// path into a verdict — in any scope.
+#[test]
+fn observation_detail_never_reaches_a_verdict() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let observation = outage(scope, "gpt-4o", 200);
+    let detail = observation
+        .detail
+        .clone()
+        .expect("the fixture carries detail");
+    assert!(detail.contains("sk-live"));
+
+    let index = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                credential: Some(
+                    CredentialRef::parse("openai-primary").expect("a well-formed reference"),
+                ),
+                ..permitting()
+            },
+        )
+        .observe(observation)
+        .build();
+
+    for scope_seen in [StatusScope::Deployment, StatusScope::Namespace] {
+        let verdict = index
+            .evaluate(&key(scope, "gpt-4o"), at(300))
+            .for_scope(scope_seen);
+        let rendered = format!("{verdict:?}");
+        assert!(!rendered.contains("sk-live"), "{rendered}");
+        assert!(!rendered.contains("api.example.test"), "{rendered}");
+        assert!(
+            !rendered.contains("openai-primary"),
+            "a credential reference is provenance, not part of a verdict: {rendered}"
+        );
+    }
+}
+
+/// What a namespace-scoped reader loses: the deployment's discovery mechanism and
+/// the reasons that describe it. What it keeps: its own state and when the
+/// evidence behind it expires.
+#[test]
+fn a_namespace_scoped_verdict_coarsens_operator_only_reasons() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, Some(600)))
+        .observe(outage(scope, "gpt-4o", 200))
+        .build();
+    let operator = index.evaluate(&key(scope, "gpt-4o"), at(300));
+    let tenant_view = operator.for_scope(StatusScope::Namespace);
+
+    assert_eq!(operator.source, Some(DiscoverySource::ProviderListing));
+    assert_eq!(
+        tenant_view.source, None,
+        "how the deployment discovers models is not a tenant's business"
+    );
+    assert_eq!(tenant_view.state, operator.state);
+    assert_eq!(tenant_view.reason, AvailabilityReason::LastKnownGood);
+    assert_eq!(tenant_view.expires_at, operator.expires_at);
+
+    // An operator-only reason coarsens, and its dimension is not named.
+    let unreliable = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(outage(scope, "gpt-4o", 200))
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(300));
+    assert_eq!(unreliable.reason, AvailabilityReason::DiscoveryIncomplete);
+    assert_eq!(unreliable.decided_by, DecidedBy::Discovery);
+    let coarsened = unreliable.for_scope(StatusScope::Namespace);
+    assert_eq!(coarsened.state, AvailabilityState::Unknown);
+    assert_eq!(coarsened.reason, AvailabilityReason::Unspecified);
+    assert_eq!(coarsened.decided_by, DecidedBy::Undisclosed);
+
+    // A runtime verdict is the other operator-only dimension.
+    let runtime = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                runtime: RuntimeHealth::Unavailable,
+                ..permitting()
+            },
+        )
+        .observe(present(scope, "gpt-4o", 100, None))
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(300))
+        .for_scope(StatusScope::Namespace);
+    assert_eq!(runtime.state, AvailabilityState::Unavailable);
+    assert_eq!(runtime.reason, AvailabilityReason::Unspecified);
+
+    // And a reason about the tenant's own access survives intact.
+    let denied = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                entitlement: Entitlement::Revoked,
+                ..permitting()
+            },
+        )
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(300))
+        .for_scope(StatusScope::Namespace);
+    assert_eq!(denied.reason, AvailabilityReason::EntitlementRevoked);
+    assert_eq!(denied.decided_by, DecidedBy::Entitlement);
+}
+
+/// Every bounded vocabulary is closed and its codes are distinct: these values are
+/// metric label values and response fields, so a duplicate or an unlisted variant
+/// is a contract break rather than a cosmetic slip.
+#[test]
+fn every_vocabulary_is_closed_and_its_codes_are_distinct() {
+    fn distinct(codes: Vec<&'static str>) {
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), codes.len(), "duplicate code in {codes:?}");
+        assert!(
+            codes.iter().all(|code| !code.is_empty()
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')),
+            "{codes:?}"
+        );
+    }
+
+    distinct(
+        AvailabilityState::ALL
+            .iter()
+            .map(|state| state.as_str())
+            .collect(),
+    );
+    distinct(
+        AvailabilityReason::ALL
+            .iter()
+            .map(|reason| reason.code())
+            .collect(),
+    );
+    distinct(DecidedBy::ALL.iter().map(|by| by.as_str()).collect());
+    distinct(
+        DiscoverySource::ALL
+            .iter()
+            .map(|source| source.as_str())
+            .collect(),
+    );
+    distinct(
+        DiscoveryCompleteness::ALL
+            .iter()
+            .map(|completeness| completeness.as_str())
+            .collect(),
+    );
+    distinct(
+        DiscoveryResult::ALL
+            .iter()
+            .map(|result| result.as_str())
+            .collect(),
+    );
+    distinct(
+        CataloguePresence::ALL
+            .iter()
+            .map(|presence| presence.as_str())
+            .collect(),
+    );
+    distinct(Enablement::ALL.iter().map(|value| value.as_str()).collect());
+    distinct(
+        Entitlement::ALL
+            .iter()
+            .map(|value| value.as_str())
+            .collect(),
+    );
+    distinct(
+        PolicyDecision::ALL
+            .iter()
+            .map(|value| value.as_str())
+            .collect(),
+    );
+    distinct(
+        RuntimeHealth::ALL
+            .iter()
+            .map(|value| value.as_str())
+            .collect(),
+    );
+}
+
+#[test]
+fn a_reference_is_bounded_printable_and_typed() {
+    assert_eq!(
+        ProviderRef::parse("openai").expect("valid").as_str(),
+        "openai"
+    );
+    // Upstream model ids carry characters a slug may not, which is why references
+    // are their own type rather than a `Slug`.
+    for model in [
+        "gpt-4.1",
+        "llama3.1:8b",
+        "meta-llama/Llama-3-8b",
+        "gpt-4o@2024",
+    ] {
+        assert_eq!(ModelRef::parse(model).expect("valid").as_str(), model);
+    }
+
+    assert_eq!(
+        ModelRef::parse(""),
+        Err(InvalidToken::Empty { kind: "model" })
+    );
+    let long = "m".repeat(Token::MAX_LEN + 1);
+    assert_eq!(
+        ModelRef::parse(&long),
+        Err(InvalidToken::TooLong {
+            kind: "model",
+            length: Token::MAX_LEN + 1,
+            max: Token::MAX_LEN,
+        })
+    );
+    // A newline would let a name forge a second log record; a space, a tab, and a
+    // control character are refused for the same reason.
+    for hostile in [
+        "gpt-4o\ninjected",
+        "gpt 4o",
+        "gpt\t4o",
+        "gpt-4o\u{7f}",
+        "gpt\u{feff}4o",
+    ] {
+        assert!(
+            matches!(
+                ModelRef::parse(hostile),
+                Err(InvalidToken::Unprintable { .. })
+            ),
+            "{hostile:?} must be refused"
+        );
+    }
+}
+
+#[test]
+fn a_scope_renders_its_tenant_and_project() {
+    let tenant_wide = ScopeRef::tenant(tenant(1));
+    assert!(tenant_wide.is_tenant_wide());
+    assert_eq!(tenant_wide.to_string(), tenant(1).to_string());
+
+    let scoped = ScopeRef::project(tenant(1), project(3));
+    assert!(!scoped.is_tenant_wide());
+    assert_eq!(
+        scoped.to_string(),
+        format!("{}/{}", tenant(1), project(3)),
+        "a project scope is named beyond its tenant"
+    );
+    assert_ne!(tenant_wide, scoped);
+}

@@ -49,7 +49,7 @@ unnoticed one.
 | `routes.rs` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
 | Namespace resolution, `credentials.rs` pool lookup, `allow_platform_fallback`, budget/rate-limit keys, operator views | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
 | `backends/secrets.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
-| `backends/catalog.rs`, `aliases.rs`, `/v1/models`, alias scope, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
+| `backends/catalog.rs`, `aliases.rs`, `availability/`, `/v1/models`, alias scope, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `usage/`, `telemetry/`, control-plane journal | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
 
@@ -223,8 +223,9 @@ rather than only in the changelog.
 **Fires on** any change to what a caller may discover or invoke: alias scope
 patterns in `crates/gateway/src/aliases.rs`, alias-to-target mapping and wire
 families, the `/v1/models` projection, catalogue ingestion in
-`crates/gateway/src/backends/catalog.rs`, pricing metadata, and any new route
-that exposes model or provider metadata.
+`crates/gateway/src/backends/catalog.rs`, derived availability and discovery
+evaluation in `crates/gateway/src/availability/`, pricing metadata, and any new
+route that exposes model or provider metadata.
 
 **Regression tests.** Pattern semantics are the entitlement boundary:
 `patterns_match_case_sensitively_and_union`, `prefix_does_not_subsume_other_globs`,
@@ -239,14 +240,37 @@ catalogue data must never become an entitlement or an admission dependency. A
 new route is also covered mechanically: `ops/check-docs.py` fails a registered
 route that the [compatibility contract](../compatibility.md) does not document.
 
+Derived availability is evidence, never entitlement, and its tests hold that
+line: `evidence_never_crosses_a_tenant_or_a_project_boundary` (one tenant's
+discovery evidence cannot decide another's verdict),
+`unknown_and_stale_evidence_is_never_silently_upgraded` and
+`incomplete_discovery_is_unknown_and_never_a_denial` (a partial look neither
+grants nor revokes), `a_discovery_outage_preserves_the_last_known_good_state`
+(an outage costs freshness, not access),
+`observation_detail_never_reaches_a_verdict` and
+`a_namespace_scoped_verdict_coarsens_operator_only_reasons` (a verdict carries no
+provider body, credential, or discovery mechanism a tenant may read), and
+`projecting_availability_leaves_the_config_untouched` (an index is projected
+beside a snapshot and can never enlarge what is served).
+
 **Threat model and ADRs.** [ADR 0020](../adr/0020-alias-wire-family-validation.md)
 and [ADR 0012](../adr/0012-native-provider-routes.md) bound wire families and
 native routes; `CatalogSource`'s background-only placement is in
 [backend contracts](../maintainers/backend-contracts.md). Item 2 of the security
 review's accepted-risk section is why `/v1/models` is authenticated and scoped —
-re-read it before changing that projection.
+re-read it before changing that projection. Derived availability needs no new
+reasoning: it is a projection beside an immutable snapshot, which
+[ADR 0002](../adr/0002-stateless-by-default-stateful-by-opt-in.md) and
+[ADR 0011](../adr/0011-config-hot-reload.md) already bound, and it is evaluated per
+tenancy scope, which trigger 2's isolation reasoning already covers.
 
-**Release impact.** Entitlement changes are visible to clients: a pattern
+**Release impact.** Availability contracts are inert on their own: nothing
+constructs an index, `/v1/models` and readiness are unchanged, and no request
+reads a verdict, so a release carrying only the contracts changes no observable
+behaviour and needs no migration note. The slice that wires an evaluation into
+admission does, and it fires this trigger again.
+
+Entitlement changes are visible to clients: a pattern
 semantics change can silently grant or revoke access at upgrade, so it needs a
 migration note saying which existing configurations change meaning. Route and
 wire-family additions are compatibility-contract entries; pricing changes affect

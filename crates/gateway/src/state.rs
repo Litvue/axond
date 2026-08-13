@@ -24,6 +24,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::admission::AdmissionControl;
 use crate::aliases::AliasScope;
+use crate::availability::AvailabilityIndex;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
 use crate::convergence::secrets::ResolvedSecrets;
@@ -93,6 +94,19 @@ pub struct ConfigSnapshot {
     /// the administrator's call returns. A request never reaches the secret store,
     /// because everything it could ask for is already in the snapshot it holds.
     secrets: ResolvedSecrets,
+    /// Derived availability evidence, projected onto the snapshot rather than
+    /// resolved from the config (#206).
+    ///
+    /// Carried *beside* the config, never inside it: an availability index says
+    /// what is currently reachable, and the config says what the deployment
+    /// declares. Keeping the two apart is what makes the direction of authority
+    /// one-way — a projection cannot add a model, a namespace, or a credential, so
+    /// no amount of discovery evidence can enlarge what is served.
+    ///
+    /// [`ConfigSnapshot::build`] always produces the empty index: this slice is
+    /// contract only, nothing polls a provider, and no request consults a verdict.
+    #[allow(dead_code)]
+    availability: Arc<AvailabilityIndex>,
 }
 
 pub struct ResolvedMinting {
@@ -396,6 +410,10 @@ impl ConfigSnapshot {
             gateway_minting,
             gateway_token_epochs,
             secrets,
+            // Never a populated index, and never an optimistic one: a snapshot is
+            // compiled from configuration, and availability is derived afterwards
+            // by whatever produced the evidence.
+            availability: Arc::new(AvailabilityIndex::empty()),
         })
     }
 
@@ -406,6 +424,27 @@ impl ConfigSnapshot {
     /// of the type rather than a convention.
     pub const fn secrets(&self) -> &ResolvedSecrets {
         &self.secrets
+    }
+
+    /// The derived availability index this snapshot carries.
+    #[allow(dead_code)]
+    pub fn availability(&self) -> &AvailabilityIndex {
+        &self.availability
+    }
+
+    /// Project a derived availability index onto a snapshot that has not been
+    /// published yet.
+    ///
+    /// Consuming, deliberately: a published snapshot is immutable and replaced
+    /// whole ([`AppState::publish`]), so availability is attached on the way
+    /// to publication rather than mutated underneath a reader holding the `Arc`.
+    /// Nothing else about the snapshot changes — the config, the credential graph,
+    /// and the circuits are the ones compilation produced.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
+        self.availability = availability;
+        self
     }
 
     pub async fn resolve_principal(
@@ -516,6 +555,8 @@ pub fn adapter_for(kind: ProviderKind) -> Box<dyn ProviderAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::availability::{AvailabilityKey, AvailabilityRecord, ScopeRef, TargetRef};
+    use crate::desired_state::{TenantId, Uuid7};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -559,6 +600,51 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 env = "AXOND_KEY"
 namespace = "platform"
 "#;
+
+    /// Availability is projected onto a snapshot, not compiled into it: a built
+    /// snapshot knows nothing, and attaching an index leaves every config section
+    /// exactly as compilation produced it (#206).
+    #[test]
+    fn projecting_availability_leaves_the_config_untouched() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "secret".to_owned())]);
+        let snapshot =
+            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("the key resolves");
+        assert!(
+            snapshot.availability().is_empty(),
+            "a compiled snapshot carries no derived evidence, and no optimistic default"
+        );
+
+        let scope = ScopeRef::tenant(TenantId::new(
+            Uuid7::from_parts(1, 0, 1).expect("a valid id"),
+        ));
+        let target = TargetRef::parse("openai", "gpt-4o-preview").expect("a well-formed target");
+        let index = AvailabilityIndex::builder()
+            .record(
+                AvailabilityKey::new(scope, target),
+                AvailabilityRecord::enabled(),
+            )
+            .build();
+
+        let models: Vec<String> = snapshot
+            .config
+            .model
+            .iter()
+            .map(|model| model.name.clone())
+            .collect();
+        let projected = snapshot.with_availability(Arc::new(index));
+        assert_eq!(projected.availability().len(), 1);
+        assert_eq!(
+            projected
+                .config
+                .model
+                .iter()
+                .map(|model| model.name.clone())
+                .collect::<Vec<_>>(),
+            models,
+            "an index describes reachability and can never enlarge what is served"
+        );
+        assert!(projected.config.model("gpt-4o-preview").is_none());
+    }
 
     /// A declared key whose env var is unset or empty is a boot failure, not a
     /// silently dropped entry that would widen or empty the key table.
