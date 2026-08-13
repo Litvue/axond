@@ -594,12 +594,11 @@ async fn serve() -> anyhow::Result<()> {
     // size (ADR 0031).
     let (observability, status_refresher) = match admin.control_plane.as_ref() {
         Some(store) => {
-            let (observability, refresher) =
-                state::ReplicaObservability::observing(Arc::clone(store));
+            let (observability, refresher) = ReplicaObservability::observing(Arc::clone(store));
             tracing::info!(component = "control_plane", "dependency status observed");
             (observability, Some(refresher))
         }
-        None => (state::ReplicaObservability::stateless(), None),
+        None => (ReplicaObservability::stateless(), None),
     };
 
     let bind = config.server.bind;
