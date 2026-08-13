@@ -106,7 +106,12 @@ positive does not resurrect a target a later complete listing dropped. Two looks
 bearing the same instant resolve the same way whichever lands first — the negative
 holds, because two answers about one instant are not evidence of reachability — and
 only a strictly *later* look lowers certainty, so an inconclusive probe sharing the
-instant of a complete listing cannot soften a denial into a routable `unknown`.
+instant of a complete listing cannot soften a denial into a routable `unknown`. A
+*later* failed refresh does lower it: it is newer information than the listing that
+dropped the target, and holding the refusal would let one listing decide indefinitely
+on evidence a later probe could not reproduce. It is a drop in certainty and never a
+rise — the target does not become `available` again, and the `unknown` it falls to is
+routable only under explicit enablement.
 Declared evidence goes through the same retention and ordering path as an observed
 look: a projection handing the builder a whole record has its listing retained for
 the outage that follows, has a complete listing which dropped the target discredit

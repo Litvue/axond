@@ -574,6 +574,54 @@ fn an_older_declared_look_does_not_rewind_the_current_slot() {
     assert_eq!(held.observed_at, at(600));
 }
 
+/// A *later* failed refresh is newer information than the absence it follows, so the
+/// denial drops to `unknown` rather than standing on evidence a later probe could not
+/// reproduce. A drop in certainty, never a rise: the target is not reported
+/// `available` again, and the uncertainty is routable only under enablement.
+#[test]
+fn a_later_failed_refresh_lowers_a_denial_to_uncertainty_and_never_to_availability() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let denied = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 500))
+        .build();
+    assert_eq!(
+        denied.evaluate(&key(scope, "gpt-4o"), at(600)).state,
+        AvailabilityState::Denied
+    );
+
+    let after_outage = AvailabilityIndexBuilder::from_index(&denied)
+        .observe(outage(scope, "gpt-4o", 700))
+        .build();
+
+    let verdict = after_outage.evaluate(&key(scope, "gpt-4o"), at(800));
+    assert_eq!(verdict.state, AvailabilityState::Unknown);
+    assert!(
+        !verdict.last_known_good,
+        "the absence cleared the retained positive, so nothing was resurrected"
+    );
+    assert!(
+        verdict.state.certainty() < AvailabilityState::Available.certainty(),
+        "a failed refresh lowers certainty and never restores availability"
+    );
+
+    let unenabled = AvailabilityIndexBuilder::from_index(&after_outage)
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                enablement: Enablement::NotEnabled,
+                ..permitting()
+            },
+        )
+        .build();
+    assert!(
+        !unenabled
+            .evaluate(&key(scope, "gpt-4o"), at(800))
+            .permits_attempt(),
+        "the uncertainty it drops to is routable only where a scope chose it"
+    );
+}
+
 /// The mirror of the two-definitive-looks tie-break: certainty falls to a later
 /// look, never to one merely sharing the instant a conclusion was reached, or an
 /// inconclusive probe racing a complete listing would soften a denial into a

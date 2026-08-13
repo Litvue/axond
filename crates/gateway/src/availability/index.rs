@@ -78,7 +78,12 @@
 //!   a target a later complete listing dropped. Two looks bearing the same instant
 //!   resolve the same way whichever lands first: the negative holds, and an
 //!   inconclusive look sharing a conclusion's instant does not soften it either —
-//!   only a *later* look lowers certainty;
+//!   only a *later* look lowers certainty. A later one does, including after a
+//!   denial: a failed refresh is newer information than the complete listing that
+//!   dropped the target, so the verdict falls to `unknown` rather than keeping a
+//!   refusal standing on evidence a later probe could not reproduce. That is a drop
+//!   in certainty and never a rise — the target is not reported `available` again,
+//!   and the uncertainty is routable only under explicit enablement;
 //! - nothing ever infers a positive from a non-definitive look. Certainty only
 //!   rises when definitive evidence arrives, which is what
 //!   [`AvailabilityState::certainty`] makes testable.
