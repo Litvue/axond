@@ -307,6 +307,38 @@ fn catalog_scenarios() -> Vec<(&'static str, CatalogInput<'static>)> {
     };
     vec![
         ("reordered-and-reprinted", edited(CatalogEdit::None)),
+        // These are acceptance-critical refusal paths, so pin them as named
+        // scenarios rather than relying only on corpus discovery. Each still
+        // runs through the in-memory fetch, strict parse, and last-known-good
+        // admission checks in `catalog_import`.
+        (
+            "empty-catalogue",
+            CatalogInput::Payload {
+                bytes: include_bytes!("../../seeds/catalog_import/drift-empty.json"),
+                etag: None,
+            },
+        ),
+        (
+            "provider-less-catalogue",
+            CatalogInput::Payload {
+                bytes: include_bytes!("../../seeds/catalog_import/drift-missing-providers.json"),
+                etag: None,
+            },
+        ),
+        (
+            "empty-provider-section",
+            CatalogInput::Payload {
+                bytes: include_bytes!("../../seeds/catalog_import/drift-providers-empty.json"),
+                etag: None,
+            },
+        ),
+        (
+            "malformed-catalogue",
+            CatalogInput::Payload {
+                bytes: include_bytes!("../../seeds/catalog_import/drift-not-json.json"),
+                etag: None,
+            },
+        ),
         (
             "unknown-field",
             edited(CatalogEdit::Unknown {
@@ -387,6 +419,12 @@ const EXPECTED_CATALOG_CLASSES: &[(&str, &str)] = &[
     // Key order and whitespace are not content: the same catalogue, re-rendered,
     // is not an update.
     ("reordered-and-reprinted", "rendered"),
+    // Empty and provider-less documents are not usable catalogues, and malformed
+    // bytes must preserve the last-known-good snapshot through the offline path.
+    ("empty-catalogue", "content"),
+    ("provider-less-catalogue", "schema"),
+    ("empty-provider-section", "content"),
+    ("malformed-catalogue", "not_json"),
     // Additive drift is tolerated rather than refused, and adds nothing.
     ("unknown-field", "unknown_field_ignored"),
     ("price-only", "price_changed"),

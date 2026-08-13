@@ -2379,6 +2379,8 @@ mod tests {
             "unknown-status",
             "price-precision",
             "empty",
+            "missing-providers",
+            "providers-empty",
             "control-character",
             "model-key-ambiguous",
         ] {
