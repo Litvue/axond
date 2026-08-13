@@ -19,7 +19,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::routing::{MethodRouter, get, post};
 use serde::Deserialize;
 
@@ -241,6 +241,37 @@ struct CatalogueQuery {
     billable: Option<bool>,
 }
 
+/// Catalogue queries are deliberately small and finite: the route has one
+/// required scope key and five optional filters. Bounding the raw query before
+/// deserialization keeps malformed input from turning into an unbounded error
+/// detail and prevents a client from spending parser work on fields this route
+/// could never use.
+pub(super) const CATALOGUE_MAX_QUERY_BYTES: usize = 2 * 1024;
+pub(super) const CATALOGUE_MAX_QUERY_PARAMS: usize = 6;
+
+fn validate_catalogue_query(uri: &Uri) -> Result<(), AdminError> {
+    let query = uri.query().unwrap_or_default();
+    if query.len() > CATALOGUE_MAX_QUERY_BYTES {
+        return Err(AdminError::RequestInvalid {
+            schema: "catalogue",
+            detail: format!("query exceeds the {CATALOGUE_MAX_QUERY_BYTES}-byte limit"),
+        });
+    }
+
+    let parameters = query
+        .split('&')
+        .filter(|parameter| !parameter.is_empty())
+        .count();
+    if parameters > CATALOGUE_MAX_QUERY_PARAMS {
+        return Err(AdminError::RequestInvalid {
+            schema: "catalogue",
+            detail: format!("query has more than {CATALOGUE_MAX_QUERY_PARAMS} parameters"),
+        });
+    }
+
+    Ok(())
+}
+
 /// One tenant's management catalogue: what it has enabled, what names route to
 /// it, and why a model is not routable.
 ///
@@ -252,9 +283,11 @@ async fn catalogue(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
     headers: HeaderMap,
+    uri: Uri,
     query: Result<Query<CatalogueQuery>, QueryRejection>,
 ) -> Result<Conditional<CatalogueView>, AdminError> {
     const SCHEMA: &str = "catalogue";
+    validate_catalogue_query(&uri)?;
     let Query(query) = query.map_err(|rejection| AdminError::RequestInvalid {
         schema: SCHEMA,
         detail: rejection.body_text(),

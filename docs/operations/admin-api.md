@@ -186,6 +186,10 @@ the answer as authoritative, so the filters this build cannot yet evaluate —
 catalogue-import and availability slices' metadata — are refused by the same rule,
 and the response names the same gap in `pending`:
 
+The query is bounded to 2 KiB and six parameters (the required `tenant` plus the
+five supported filters). Repeated parameters are rejected by the query parser;
+there is no “last value wins” interpretation for a catalogue filter.
+
 ```json
 {
   "revision": "rev_...",
