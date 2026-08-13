@@ -37,8 +37,9 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use support::schema::{self, Schema};
 use support::stateful::{self, ControlPlane};
 use support::{GATEWAY_KEY, boot, client};
 
@@ -645,6 +646,69 @@ async fn migrate_prepares_a_control_plane_before_replicas_start() {
 
     // The schema drops with `control_plane`, on this path and on every failing
     // one.
+}
+
+/// A fixture's schema is claimed *before* it is created, so a setup step that
+/// fails between the `CREATE` and the fixture existing still takes it with it —
+/// the window a long-lived CI database would otherwise accumulate one abandoned
+/// schema per failed run in.
+#[tokio::test]
+async fn a_setup_that_fails_after_creating_its_schema_leaves_nothing_behind() {
+    let Some(dsn) = stateful::postgres_dsn() else {
+        eprintln!("skipping: AXOND_TEST_POSTGRES_DSN is not set");
+        return;
+    };
+    let schema = format!(
+        "axond_it_claim_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a monotonic wall clock")
+            .as_nanos()
+    );
+    /// The arranged failure, so the case cannot pass on some other panic.
+    const ARRANGED: &str = "a setup step failed after the schema existed";
+
+    // On a thread with a runtime of its own: the failure has to unwind without
+    // taking this test with it, and a current-thread runtime cannot be
+    // re-entered from the destructor that does the cleanup.
+    let failure = std::thread::spawn({
+        let (dsn, schema) = (dsn.clone(), schema.clone());
+        move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the failing setup")
+                .block_on(async move {
+                    let claimed = Schema::create(&dsn, &schema).await;
+                    assert!(
+                        schema::exists(&dsn, claimed.name()).await,
+                        "the arranged setup created its schema, or the case proves nothing"
+                    );
+                    // `claimed` is still a local, so the unwind is what has to
+                    // clean up — the point of the case.
+                    panic!("{ARRANGED}");
+                });
+        }
+    })
+    .join();
+
+    let Err(panic) = failure else {
+        panic!("the arranged setup returned instead of failing");
+    };
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains(ARRANGED),
+        "the setup failed for the arranged reason, not another: {message}"
+    );
+    assert!(
+        !schema::exists(&dsn, &schema).await,
+        "the failed setup left the schema {schema} behind"
+    );
 }
 
 // ── Gates whose wiring has not landed ────────────────────────────────────────
