@@ -75,6 +75,18 @@ Two properties worth knowing before you plan capacity or retention:
   checksums, blob digests and sizes — and no tenant id, slug, body, or actor. A
   pinned session can count revisions whose contents it cannot read; that is the
   residual, and it is a boundary rather than an omission.
+
+  Two preconditions before you apply 0002 to a deployment that is already
+  running. The policies are `FORCE`d so that they bind the table owner too — the
+  single-role install is the common one, and enabling row-level security that the
+  owning role bypasses would claim a wall that is not there — and `ALTER TABLE …
+  FORCE ROW LEVEL SECURITY` requires the migrating role to *own* every table it
+  names, so a deployment whose DDL is applied by a DBA role separate from the
+  application role must run 0002 as the owner rather than as the migrator. And any
+  reader outside the gateway — a reporting job, a replica consumer — that already
+  sets `axond.tenant_id` on its sessions for its own reasons starts seeing
+  filtered rows the moment 0002 lands, silently and with no error: unset it there,
+  or accept that the reader is now tenant-scoped.
 - **A retained name stays taken.** A tenant or project a later revision stops
   declaring keeps its row and its name. Publishing a *different* tenant under a
   retained name is refused rather than reported as a temporary failure: no retry
