@@ -64,6 +64,14 @@ struct Instruments {
     status_component_state: Gauge<u64>,
     status_observation_age: Gauge<u64>,
     status_refreshes: Counter<u64>,
+    // Recorded by whoever schedules catalogue refresh, which `serve` does not
+    // construct yet — the same reason `crate::backends` is contract only.
+    #[allow(dead_code)]
+    catalog_refusals: Counter<u64>,
+    #[allow(dead_code)]
+    catalog_active_age: Gauge<u64>,
+    #[allow(dead_code)]
+    catalog_consecutive_refusals: Gauge<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -300,6 +308,28 @@ impl Instruments {
             status_refreshes: meter
                 .u64_counter("axond.status.refreshes")
                 .with_description("Background status refresh attempts, by component and outcome.")
+                .build(),
+            catalog_refusals: meter
+                .u64_counter("axond.catalog.refusals")
+                .with_description(
+                    "Catalogue imports refused, by typed reason. The previously imported \
+                     catalogue stays active, so this is the only signal a refusal produces.",
+                )
+                .build(),
+            catalog_active_age: meter
+                .u64_gauge("axond.catalog.active_age")
+                .with_unit("ms")
+                .with_description(
+                    "Age of the active catalogue: how long since its content was last \
+                     admitted or confirmed unchanged.",
+                )
+                .build(),
+            catalog_consecutive_refusals: meter
+                .u64_gauge("axond.catalog.consecutive_refusals")
+                .with_description(
+                    "Catalogue imports refused in a row, reset by any admitted or \
+                     confirmed-unchanged import.",
+                )
                 .build(),
         }
     }
@@ -690,6 +720,42 @@ pub fn record_status_refresh(component: &'static str, outcome: &'static str) {
             KeyValue::new("axond.status.outcome", outcome),
         ],
     );
+}
+
+/// Count one refused catalogue import, by its bounded reason.
+///
+/// The reason and nothing else: the pointer, source URL, and error text the
+/// refusal also carries are unbounded over one upstream document, and belong to
+/// the log line the import wrote.
+#[allow(dead_code)]
+pub fn record_catalog_refusal(reason: crate::backends::catalog::RefusalReason) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .catalog_refusals
+        .add(1, &[KeyValue::new("axond.catalog.reason", reason.as_str())]);
+}
+
+/// Publish what is operationally true about the catalogue right now.
+///
+/// Recorded from a [`CatalogReport`](crate::backends::catalog::CatalogReport) so
+/// the gauges, the alert, and the status response cannot disagree. A deployment
+/// that has never imported reports no age rather than a zero one: an age of zero
+/// reads as "just refreshed", which is the opposite of the truth.
+#[allow(dead_code)]
+pub fn record_catalog_state(report: &crate::backends::catalog::CatalogReport) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    if let Some(age) = report.active_age() {
+        instruments
+            .catalog_active_age
+            .record(u64::try_from(age.as_millis()).unwrap_or(u64::MAX), &[]);
+    }
+    instruments
+        .catalog_consecutive_refusals
+        .record(u64::from(report.consecutive_refusals), &[]);
 }
 
 /// Publish a target's circuit state. Ordered failover (which owns the breaker)

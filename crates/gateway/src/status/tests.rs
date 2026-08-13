@@ -235,6 +235,18 @@ fn no_response_field_can_carry_free_text() {
         SnapshotSource::ControlPlane.as_str(),
         SnapshotSource::LastKnownGood.as_str(),
     ]);
+    permitted.extend(crate::backends::catalog::REFUSAL_REASONS);
+    // The one exception, and it is permitted by value rather than by shape: the
+    // digest of the content this process itself normalized, and nothing that
+    // merely looks like one.
+    let catalogue = refused_catalogue();
+    let report = catalogue.report(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30));
+    let active_id = report
+        .active
+        .expect("something is active")
+        .content_id
+        .short();
+    permitted.push(&active_id);
 
     fn strings(value: &Value, found: &mut Vec<String>) {
         match value {
@@ -246,10 +258,11 @@ fn no_response_field_can_carry_free_text() {
     }
 
     for scope in [StatusScope::Namespace, StatusScope::Deployment] {
-        let response = incident_view().project(
+        let response = incident_view().project_with_catalogue(
             scope,
             crate::shutdown::Phase::Serving,
             Some(&incident_revision()),
+            Some(&report),
         );
         let serialized = serde_json::to_value(&response).expect("serializes");
         let mut found = Vec::new();
@@ -296,6 +309,120 @@ fn observation_detail_never_reaches_a_view() {
     let rendered = serde_json::to_string(&response).expect("serializes");
     assert!(!rendered.contains("postgres://"));
     assert!(rendered.contains("\"reason\":\"unreachable\""));
+}
+
+/// A catalogue that imported once and has been refusing ever since — the state
+/// the operator surface exists for.
+fn refused_catalogue() -> crate::backends::catalog::LastKnownGoodCatalog {
+    use crate::backends::catalog::{LastKnownGoodCatalog, Refusal, RefusalReason};
+    use crate::backends::models_dev::{ModelsDevAdapter, SEED_PAYLOAD};
+
+    let snapshot = ModelsDevAdapter::default()
+        .parse(
+            SEED_PAYLOAD.as_bytes(),
+            crate::backends::catalog::SourceValidators::etag("\"seed\""),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .expect("the shipped seed parses");
+    let mut catalogue = LastKnownGoodCatalog::new();
+    catalogue.admit(snapshot);
+    catalogue.record_refusal(Refusal::new(RefusalReason::Unreachable));
+    catalogue.record_refusal(Refusal::at(
+        RefusalReason::Price,
+        crate::backends::catalog::JsonPointer::new("")
+            .child("openai")
+            .child("models"),
+    ));
+    catalogue
+}
+
+/// What a refused import buys an operator: the content still being served, how
+/// far behind it is, and the alert condition — all at deployment scope, and none
+/// of it at a tenant's.
+#[test]
+fn the_catalogue_surface_is_operator_only_and_answers_the_page() {
+    let catalogue = refused_catalogue();
+    let report = catalogue.report(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(7_200));
+
+    let operator = incident_view().project_with_catalogue(
+        StatusScope::Deployment,
+        crate::shutdown::Phase::Serving,
+        Some(&incident_revision()),
+        Some(&report),
+    );
+    let summary = operator.catalogue.expect("the operator sees the catalogue");
+    assert_eq!(
+        summary.content_id,
+        Some(
+            catalogue
+                .active()
+                .expect("something is active")
+                .content
+                .content_id()
+                .short()
+        ),
+        "the id names the content actually being served"
+    );
+    assert_eq!(summary.active_age_ms, Some(7_200_000));
+    assert_eq!(summary.consecutive_refusals, 2);
+    assert_eq!(summary.last_refusal, Some("price"));
+    assert!(
+        summary.persistent_refusal,
+        "the surface and the alert fire on the same condition"
+    );
+
+    let tenant = incident_view().project_with_catalogue(
+        StatusScope::Namespace,
+        crate::shutdown::Phase::Serving,
+        Some(&incident_revision()),
+        Some(&report),
+    );
+    assert!(
+        tenant.catalogue.is_none(),
+        "which content a replica imported is not a tenant's business"
+    );
+    assert!(
+        tenant
+            .components
+            .iter()
+            .any(|component| component.component == Component::Catalogue.as_str()),
+        "a tenant still learns whether the catalogue component is healthy"
+    );
+}
+
+/// The one `String` in a status response earns its exception: it is a
+/// fixed-width digest of content this process hashed, and nothing the payload,
+/// the URL, or the parser said travels beside it.
+#[test]
+fn the_catalogue_surface_carries_no_free_text_beyond_its_digest() {
+    let catalogue = refused_catalogue();
+    let report = catalogue.report(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+    let response = incident_view().project_with_catalogue(
+        StatusScope::Deployment,
+        crate::shutdown::Phase::Serving,
+        Some(&incident_revision()),
+        Some(&report),
+    );
+    let summary = response.catalogue.clone().expect("a catalogue summary");
+    let short = summary.content_id.expect("an active id");
+    assert_eq!(short.len(), crate::backends::catalog::CONTENT_ID_SHORT_HEX);
+    assert!(short.chars().all(|character| character.is_ascii_hexdigit()));
+
+    let rendered = serde_json::to_string(&response).expect("serializes");
+    for leak in [
+        "models.dev",
+        "https://",
+        "/openai/models",
+        "gpt-4o",
+        HOSTILE_DETAIL,
+    ] {
+        assert!(!rendered.contains(leak), "`{leak}` reached a response");
+    }
+    let reasons: Vec<&str> = crate::backends::catalog::REFUSAL_REASONS.to_vec();
+    assert!(
+        reasons.contains(&summary.last_refusal.expect("a reason")),
+        "the reason is a vocabulary word, not the message it came from"
+    );
 }
 
 fn registry_with(

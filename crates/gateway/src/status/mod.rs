@@ -27,10 +27,13 @@
 //!
 //! **What it reports is bounded and redacted by type.** Every field of
 //! [`StatusResponse`] is a bool, a number, or a `&'static str` drawn from a
-//! closed vocabulary — [`Component`], [`ComponentState`], [`StatusReason`]. There
-//! is nowhere to put a DSN, a token, a raw backend error, or an unfiltered
-//! rejection detail, so redaction is not a filter that can be forgotten. The
-//! operator-facing detail a probe *does* collect rides on
+//! closed vocabulary — [`Component`], [`ComponentState`], [`StatusReason`],
+//! [`RefusalReason`](crate::backends::catalog::RefusalReason) — with one
+//! deliberate exception, [`CatalogueSummary::content_id`]: a fixed-width digest
+//! of content this process hashed, deployment-scope only, and argued for on the
+//! type. There is nowhere to put a DSN, a token, a raw backend error, or an
+//! unfiltered rejection detail, so redaction is not a filter that can be
+//! forgotten. The operator-facing detail a probe *does* collect rides on
 //! [`ComponentObservation::detail`], which is logged and never projected into a
 //! response.
 //!
@@ -38,9 +41,10 @@
 //! for one namespace gets [`StatusScope::Namespace`], which keeps only the
 //! components that describe its own request path, coarsens every reason code to
 //! the tenant-safe vocabulary, coarsens observation ages to whole seconds, and
-//! drops the deployment's revision summary entirely. No response carries a
-//! namespace, subject, credential, alias, or revision identifier in any scope, so
-//! there is no cross-tenant metadata to leak in the first place.
+//! drops the deployment's revision and catalogue summaries entirely. No
+//! response carries a namespace, subject, credential, alias, or revision
+//! identifier in any scope, so there is no cross-tenant metadata to leak in the
+//! first place.
 //!
 //! # Contract only
 //!
@@ -60,6 +64,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::backends::FailureCategory;
+use crate::backends::catalog::CatalogReport;
 use crate::convergence::{RevisionReport, SnapshotSource};
 use crate::shutdown::Phase;
 
@@ -491,6 +496,23 @@ impl StatusView {
         phase: Phase,
         revision: Option<&RevisionReport>,
     ) -> StatusResponse {
+        self.project_with_catalogue(scope, phase, revision, None)
+    }
+
+    /// Project this view, including what is operationally true about the model
+    /// catalogue.
+    ///
+    /// `catalogue` is deployment-scope-only for the same reason `revision` is:
+    /// which content a replica imported, and how far behind it has fallen, is
+    /// how the operator runs the deployment. A tenant still learns that the
+    /// catalogue component is degraded, which is all it can act on.
+    pub fn project_with_catalogue(
+        &self,
+        scope: StatusScope,
+        phase: Phase,
+        revision: Option<&RevisionReport>,
+        catalogue: Option<&CatalogReport>,
+    ) -> StatusResponse {
         let visible: Vec<&Observed> = self
             .components
             .iter()
@@ -518,6 +540,10 @@ impl StatusView {
                 StatusScope::Deployment => revision.map(RevisionSummary::from_report),
                 StatusScope::Namespace => None,
             },
+            catalogue: match scope {
+                StatusScope::Deployment => catalogue.map(CatalogueSummary::from_report),
+                StatusScope::Namespace => None,
+            },
         }
     }
 }
@@ -536,9 +562,10 @@ fn coarsen_age(age: Duration, scope: StatusScope) -> u64 {
 /// The authenticated status response.
 ///
 /// Every field is a bool, a number, or a `&'static str` from a closed
-/// vocabulary. That is the redaction guarantee: there is no `String` field for a
-/// DSN, a token, a raw backend error, an unfiltered rejection detail, or any
-/// tenant identifier to be written into, in this scope or another.
+/// vocabulary, save the one digest documented on [`CatalogueSummary`]. That is
+/// the redaction guarantee: there is no `String` field for a DSN, a token, a raw
+/// backend error, an unfiltered rejection detail, or any tenant identifier to be
+/// written into, in this scope or another.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusResponse {
     pub object: &'static str,
@@ -553,6 +580,8 @@ pub struct StatusResponse {
     pub components: Vec<ComponentStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<RevisionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalogue: Option<CatalogueSummary>,
 }
 
 /// One component, as one caller may see it.
@@ -566,6 +595,59 @@ pub struct ComponentStatus {
     /// caller can tell "observed healthy a second ago" from "healthy the last
     /// time anything succeeded".
     pub observed_age_ms: u64,
+}
+
+/// The model catalogue an operator is serving metadata from, and whether it is
+/// still advancing.
+///
+/// Answers, in one read, the two questions a refused import raises: *what is
+/// active* and *how stale is it*. Without this an operator can see refusals
+/// climbing on a dashboard and have no way to tell which content the replica is
+/// actually serving, or whether the last import merely arrived late.
+///
+/// `content_id` is the one `String` in a status response, and it is exactly as
+/// bounded as the rest: [`CONTENT_ID_SHORT_HEX`] hex digits of a SHA-256 this
+/// process computed over its own normalized content
+/// ([`CatalogContentId::short`]). No upstream text, no source URL, no error
+/// message, and no pointer reaches it — those stay in the log line the import
+/// produced — and it is deployment-scope-only, so it is never a cross-tenant
+/// identifier. It is emphatically not a metric label: the catalogue metrics
+/// carry the bounded refusal reason and nothing else.
+///
+/// [`CONTENT_ID_SHORT_HEX`]: crate::backends::catalog::CONTENT_ID_SHORT_HEX
+/// [`CatalogContentId::short`]: crate::backends::catalog::CatalogContentId::short
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogueSummary {
+    /// The active content's short digest, absent before a first import.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
+    /// How long ago the active content was last confirmed current. Absent when
+    /// nothing is active — which is not staleness, it is a deployment that has
+    /// never imported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_age_ms: Option<u64>,
+    pub consecutive_refusals: u32,
+    /// The last refusal's bounded reason, from
+    /// [`RefusalReason`](crate::backends::catalog::RefusalReason).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refusal: Option<&'static str>,
+    /// Whether refusals have persisted across more than one import. The same
+    /// condition the alert fires on, so the page and the surface agree.
+    pub persistent_refusal: bool,
+}
+
+impl CatalogueSummary {
+    pub fn from_report(report: &CatalogReport) -> Self {
+        Self {
+            content_id: report.active.map(|active| active.content_id.short()),
+            active_age_ms: report
+                .active
+                .map(|active| u64::try_from(active.age.as_millis()).unwrap_or(u64::MAX)),
+            consecutive_refusals: report.consecutive_refusals,
+            last_refusal: report.last_refusal.map(|reason| reason.as_str()),
+            persistent_refusal: report.persistent_refusal(),
+        }
+    }
 }
 
 /// The deployment's convergence state, reduced to bounded fields.

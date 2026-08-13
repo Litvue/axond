@@ -86,7 +86,7 @@ use super::catalog::{
     CatalogRefresh, CatalogSnapshot, CatalogSource, ETag, InvalidCatalogId, JsonPointer, Modality,
     ModelCapability, ModelFacts, ModelField, ModelId, ModelLifecycle, ModelLimits, ObservedPrice,
     ObservedRate, PriceRates, PriceTier, PriceTierThreshold, ProviderEndpoint, ProviderOffering,
-    SchemaVersion, SourceValidators, source_snapshot,
+    Refusable, Refusal, RefusalReason, SchemaVersion, SourceValidators, source_snapshot,
 };
 use super::{Capabilities, Capability};
 use crate::desired_state::canonical::{CanonicalError, CanonicalValue};
@@ -181,10 +181,56 @@ impl ModelsDevError {
     }
 }
 
+/// Each parse failure's bounded reason, and the location it was decided at.
+///
+/// One arm per variant rather than a catch-all: a new variant is a compile
+/// error here, which is the point — a refusal mode nobody classified would
+/// otherwise be counted as [`RefusalReason::Unknown`] and be invisible on the
+/// dashboard that matters.
+impl Refusable for ModelsDevError {
+    fn refusal(&self) -> Refusal {
+        match self {
+            Self::UnsupportedEndpoint { .. } => Refusal::new(RefusalReason::UnsupportedEndpoint),
+            Self::NotJson { .. } => Refusal::new(RefusalReason::NotJson),
+            Self::Schema { .. } => Refusal::new(RefusalReason::Schema),
+            Self::IdMismatch { pointer, .. } => {
+                Refusal::at(RefusalReason::IdMismatch, pointer.clone())
+            }
+            Self::Identifier { pointer, .. } => {
+                Refusal::at(RefusalReason::Identifier, pointer.clone())
+            }
+            Self::UnknownStatus { pointer, .. } => {
+                Refusal::at(RefusalReason::UnknownStatus, pointer.clone())
+            }
+            Self::UnknownModality { pointer, .. } => {
+                Refusal::at(RefusalReason::UnknownModality, pointer.clone())
+            }
+            Self::Price { pointer, .. } => Refusal::at(RefusalReason::Price, pointer.clone()),
+            Self::UnknownTierType { pointer, .. } => {
+                Refusal::at(RefusalReason::UnknownTierType, pointer.clone())
+            }
+            Self::DuplicateTier { pointer } => {
+                Refusal::at(RefusalReason::DuplicateTier, pointer.clone())
+            }
+            Self::NeutralPrice { pointer } => {
+                Refusal::at(RefusalReason::NeutralPrice, pointer.clone())
+            }
+            Self::UncanonicalizableText { pointer, .. } => {
+                Refusal::at(RefusalReason::UncanonicalizableText, pointer.clone())
+            }
+            Self::AmbiguousModelKey { pointer, .. } => {
+                Refusal::at(RefusalReason::AmbiguousModelKey, pointer.clone())
+            }
+            Self::Content { .. } => Refusal::new(RefusalReason::Content),
+        }
+    }
+}
+
 impl From<ModelsDevError> for CatalogError {
     fn from(error: ModelsDevError) -> Self {
         Self::Invalid {
             backend: BACKEND,
+            refusal: error.refusal(),
             message: error.to_string(),
         }
     }
@@ -1371,15 +1417,33 @@ const fn misconfigured(status: u16) -> bool {
     matches!(status, 400..=499) && !matches!(status, 408 | 429)
 }
 
+impl Refusable for FetchError {
+    fn refusal(&self) -> Refusal {
+        Refusal::new(match self {
+            Self::Transport { .. } => RefusalReason::Unreachable,
+            Self::Status { status } if *status == 401 || *status == 403 => RefusalReason::Denied,
+            // A status only the operator's URL can fix is counted apart from an
+            // upstream that is merely down, so a run of refusals reads as the
+            // misconfiguration it is rather than as an outage.
+            Self::Status { status } if misconfigured(*status) => RefusalReason::UnsupportedEndpoint,
+            Self::Status { .. } => RefusalReason::Unreachable,
+            Self::TooLarge { .. } => RefusalReason::Oversized,
+        })
+    }
+}
+
 impl From<FetchError> for CatalogError {
     fn from(error: FetchError) -> Self {
+        let refusal = error.refusal();
         match error {
             FetchError::Status { status } if status == 401 || status == 403 => Self::Denied {
                 backend: BACKEND,
+                refusal,
                 message: error.to_string(),
             },
             FetchError::Status { status } if misconfigured(status) => Self::Misconfigured {
                 backend: BACKEND,
+                refusal,
                 message: error.to_string(),
             },
             // The document itself is unusable, so the next identical request
@@ -1391,6 +1455,7 @@ impl From<FetchError> for CatalogError {
             },
             error => Self::Unavailable {
                 backend: BACKEND,
+                refusal,
                 message: error.to_string(),
             },
         }
@@ -2529,8 +2594,14 @@ mod tests {
             CatalogError::from(FetchError::Status { status: 403 }),
             CatalogError::Denied {
                 backend: BACKEND,
+                refusal: Refusal::new(RefusalReason::Denied),
                 message: "upstream answered HTTP 403".to_owned(),
             }
+        );
+        assert_eq!(
+            error.refused_by().reason(),
+            RefusalReason::Unreachable,
+            "an outage is a transport refusal, not a denial"
         );
     }
 
@@ -2545,12 +2616,18 @@ mod tests {
                 error,
                 CatalogError::Misconfigured {
                     backend: BACKEND,
+                    refusal: Refusal::new(RefusalReason::UnsupportedEndpoint),
                     message: format!("upstream answered HTTP {status}"),
                 },
                 "HTTP {status} says the configured URL is wrong"
             );
             assert!(!error.retryable(), "HTTP {status} cannot be retried away");
             assert_eq!(error.category(), FailureCategory::NotFound);
+            assert_eq!(
+                error.refused_by().reason(),
+                RefusalReason::UnsupportedEndpoint,
+                "HTTP {status} is counted apart from an upstream that is down"
+            );
         }
 
         for status in [408, 429, 500, 502, 503, 504] {
@@ -2612,6 +2689,7 @@ mod tests {
             error,
             CatalogError::Invalid {
                 backend: BACKEND,
+                refusal: Refusal::new(RefusalReason::Oversized),
                 message: format!("payload exceeds the {ceiling}-byte ceiling"),
             }
         );
@@ -2645,6 +2723,7 @@ mod tests {
             source.refresh(None).await.expect_err("too large to parse"),
             CatalogError::Invalid {
                 backend: BACKEND,
+                refusal: Refusal::new(RefusalReason::Oversized),
                 message: format!("payload exceeds the {ceiling}-byte ceiling"),
             }
         );

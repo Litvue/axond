@@ -62,7 +62,7 @@
 //! projection borrows, adds no state, and is not a second place facts live.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
@@ -179,7 +179,26 @@ impl CatalogContentId {
     pub const fn checksum(self) -> Checksum {
         self.0
     }
+
+    /// The first [`CONTENT_ID_SHORT_HEX`] hex digits of the digest.
+    ///
+    /// The form an operator surface may carry. A full digest and a short one are
+    /// equally unbounded over a deployment's lifetime — neither may be a metric
+    /// label — but a short one is fixed-width, derived from bytes this process
+    /// hashed rather than from upstream text, and long enough to match against
+    /// the id an import logged.
+    pub fn short(self) -> String {
+        self.0
+            .as_bytes()
+            .iter()
+            .take(CONTENT_ID_SHORT_HEX / 2)
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 }
+
+/// The width of [`CatalogContentId::short`], in hex digits.
+pub const CONTENT_ID_SHORT_HEX: usize = 16;
 
 impl std::fmt::Display for CatalogContentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -225,22 +244,215 @@ pub enum CatalogRefresh {
     Updated(Box<CatalogSnapshot>),
 }
 
+/// Why an import did not become the active catalogue, as a bounded label.
+///
+/// A refusal is durable — the previously admitted content stays active — so the
+/// reason has to survive as far as a metric, and a metric label may not be
+/// upstream text. Every arm is therefore a fixed string chosen by the code that
+/// classified the failure, never a fragment of the payload: the vocabulary's
+/// size is a property of this enum, and the location that caused the refusal
+/// travels beside it as a [`JsonPointer`] rather than inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RefusalReason {
+    /// The source could not be reached, or did not answer.
+    Unreachable,
+    /// The source refused the request on authentication or authorization
+    /// grounds.
+    Denied,
+    /// The payload is larger than a refresh will hold.
+    Oversized,
+    /// The configured URL is not a document this source can read.
+    UnsupportedEndpoint,
+    /// The bytes are not JSON.
+    NotJson,
+    /// JSON, but not this source's document shape.
+    Schema,
+    /// A record's key disagrees with the `id` it embeds.
+    IdMismatch,
+    /// An identifier the domain will not hold.
+    Identifier,
+    /// A lifecycle status this build does not model.
+    UnknownStatus,
+    /// A modality this build does not model.
+    UnknownModality,
+    /// A price the gateway cannot represent exactly, or one stated in part.
+    Price,
+    /// A price tier of an unrecognized kind.
+    UnknownTierType,
+    /// Two prices for one tier threshold.
+    DuplicateTier,
+    /// A price published where prices do not belong.
+    NeutralPrice,
+    /// Free text that normalized content has no canonical form for.
+    UncanonicalizableText,
+    /// A provider-local model key that resolves to more than one model.
+    AmbiguousModelKey,
+    /// Normalized content that is not internally consistent.
+    Content,
+    /// Classified as a refusal this vocabulary has no code for. Present so a new
+    /// failure mode degrades to a safe label instead of tempting a caller to
+    /// pass through the error's text.
+    Unknown,
+}
+
+/// Every refusal reason, in [`RefusalReason::ALL`] order.
+///
+/// Duplicated as strings so the metric catalogue can name the vocabulary in a
+/// const context; a test asserts the two never drift.
+pub const REFUSAL_REASONS: &[&str] = &[
+    "unreachable",
+    "denied",
+    "oversized",
+    "unsupported_endpoint",
+    "not_json",
+    "schema",
+    "id_mismatch",
+    "identifier",
+    "unknown_status",
+    "unknown_modality",
+    "price",
+    "unknown_tier_type",
+    "duplicate_tier",
+    "neutral_price",
+    "uncanonicalizable_text",
+    "ambiguous_model_key",
+    "content",
+    "unknown",
+];
+
+impl RefusalReason {
+    pub const ALL: &'static [Self] = &[
+        Self::Unreachable,
+        Self::Denied,
+        Self::Oversized,
+        Self::UnsupportedEndpoint,
+        Self::NotJson,
+        Self::Schema,
+        Self::IdMismatch,
+        Self::Identifier,
+        Self::UnknownStatus,
+        Self::UnknownModality,
+        Self::Price,
+        Self::UnknownTierType,
+        Self::DuplicateTier,
+        Self::NeutralPrice,
+        Self::UncanonicalizableText,
+        Self::AmbiguousModelKey,
+        Self::Content,
+        Self::Unknown,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Denied => "denied",
+            Self::Oversized => "oversized",
+            Self::UnsupportedEndpoint => "unsupported_endpoint",
+            Self::NotJson => "not_json",
+            Self::Schema => "schema",
+            Self::IdMismatch => "id_mismatch",
+            Self::Identifier => "identifier",
+            Self::UnknownStatus => "unknown_status",
+            Self::UnknownModality => "unknown_modality",
+            Self::Price => "price",
+            Self::UnknownTierType => "unknown_tier_type",
+            Self::DuplicateTier => "duplicate_tier",
+            Self::NeutralPrice => "neutral_price",
+            Self::UncanonicalizableText => "uncanonicalizable_text",
+            Self::AmbiguousModelKey => "ambiguous_model_key",
+            Self::Content => "content",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One refused import: the bounded reason, and where in the payload it was
+/// decided.
+///
+/// The two are separated on purpose. The reason is what a counter is labelled
+/// by and is bounded by [`RefusalReason`]; the pointer names one location in one
+/// upstream document, is unbounded over that document's keys, and is therefore
+/// for a log line, an alert body, or an operator surface — never a label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    reason: RefusalReason,
+    pointer: Option<JsonPointer>,
+}
+
+impl Refusal {
+    pub const fn new(reason: RefusalReason) -> Self {
+        Self {
+            reason,
+            pointer: None,
+        }
+    }
+
+    /// A refusal decided at a location in the payload.
+    pub fn at(reason: RefusalReason, pointer: JsonPointer) -> Self {
+        Self {
+            reason,
+            pointer: Some(pointer),
+        }
+    }
+
+    pub const fn reason(&self) -> RefusalReason {
+        self.reason
+    }
+
+    /// The location that caused the refusal, when the classifier had one.
+    ///
+    /// This is what an alert names so an operator can open the raw snapshot at
+    /// the offending field instead of re-deriving it from prose.
+    pub const fn pointer(&self) -> Option<&JsonPointer> {
+        self.pointer.as_ref()
+    }
+}
+
+/// A failure that can name why it refused an import, in the bounded vocabulary.
+///
+/// Implemented by every error an import can fail with, so
+/// [`LastKnownGoodCatalog::admit_result`] can count a refusal by reason without
+/// knowing which layer produced it, and so a new error type has to state its
+/// reason rather than arrive as free text.
+pub trait Refusable {
+    fn refusal(&self) -> Refusal;
+}
+
+impl Refusable for CatalogError {
+    fn refusal(&self) -> Refusal {
+        match self {
+            Self::Unavailable { refusal, .. }
+            | Self::Invalid { refusal, .. }
+            | Self::Denied { refusal, .. }
+            | Self::Misconfigured { refusal, .. } => refusal.clone(),
+        }
+    }
+}
+
 /// Why a refresh failed.
+///
+/// Every arm carries a [`Refusal`] rather than only its message, because the
+/// message is the one thing that cannot be counted: a source's typed error is
+/// flattened to text at this boundary, and a scheduler holding only text would
+/// have to parse it back to label a metric.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CatalogError {
     #[error("catalogue source `{backend}` unavailable: {message}")]
     Unavailable {
         backend: &'static str,
+        refusal: Refusal,
         message: String,
     },
     #[error("catalogue source `{backend}` returned unusable metadata: {message}")]
     Invalid {
         backend: &'static str,
+        refusal: Refusal,
         message: String,
     },
     #[error("catalogue source `{backend}` refused the request: {message}")]
     Denied {
         backend: &'static str,
+        refusal: Refusal,
         message: String,
     },
     /// The source cannot serve a catalogue at all — the configured URL answers
@@ -252,8 +464,30 @@ pub enum CatalogError {
     #[error("catalogue source `{backend}` cannot serve a catalogue: {message}")]
     Misconfigured {
         backend: &'static str,
+        refusal: Refusal,
         message: String,
     },
+}
+
+impl CatalogError {
+    /// The bounded reason this failure refused an import.
+    pub const fn refused_by(&self) -> &Refusal {
+        match self {
+            Self::Unavailable { refusal, .. }
+            | Self::Invalid { refusal, .. }
+            | Self::Denied { refusal, .. }
+            | Self::Misconfigured { refusal, .. } => refusal,
+        }
+    }
+
+    /// An unreachable source.
+    pub const fn unavailable(backend: &'static str, message: String) -> Self {
+        Self::Unavailable {
+            backend,
+            refusal: Refusal::new(RefusalReason::Unreachable),
+            message,
+        }
+    }
 }
 
 impl BackendFailure for CatalogError {
@@ -1858,29 +2092,38 @@ pub enum Admission {
 /// also holding the thing that went stale, and every rejection carries a JSON
 /// Pointer to the location that caused it.
 ///
-/// Whoever schedules refresh must therefore ship, with it: a refusal counter
-/// labelled by reason, the active snapshot's
-/// [`SourceSnapshot::fetched_at`] exported as an age, and an alert when refusals
-/// persist across more than one interval — tracked in
-/// [#241](https://github.com/Litvue/axond/issues/241). For that age to mean
-/// "last confirmed current" rather than "last changed", an unchanged answer is
-/// recorded through [`LastKnownGoodCatalog::record_unchanged`], which also takes
-/// the validators the `304` itself stated. It can act on the categories too
-/// rather than counting every failure alike: [`CatalogError::Unavailable`] is
-/// worth retrying, while [`CatalogError::Misconfigured`],
-/// [`CatalogError::Denied`] and [`CatalogError::Invalid`] are not — retrying them
-/// only buries an operator's own misconfiguration under "upstream is down".
-/// Staleness degrades
-/// metadata quality only: no enablement, admission, or billing decision reads
-/// this snapshot, so a stale catalogue is never an outage.
+/// A scheduler is still not this slice's business, but the *observability* of a
+/// refusal no longer waits for one: this type counts consecutive refusals and
+/// keeps the last one's bounded [`Refusal`], and [`LastKnownGoodCatalog::report`]
+/// projects both — with the active snapshot's [`SourceSnapshot::fetched_at`] as
+/// an age and its [`CatalogContentId`] — into a [`CatalogReport`] that a metric
+/// exporter, an alert, and the operator status surface all read. For that age to
+/// mean "last confirmed current" rather than "last changed", an unchanged answer
+/// is recorded through [`LastKnownGoodCatalog::record_unchanged`], which also
+/// takes the validators the `304` itself stated. A scheduler can act on the
+/// categories too rather than retrying every failure alike:
+/// [`CatalogError::Unavailable`] is worth retrying, while
+/// [`CatalogError::Misconfigured`], [`CatalogError::Denied`] and
+/// [`CatalogError::Invalid`] are not — retrying them only buries an operator's
+/// own misconfiguration under "upstream is down".
+///
+/// Staleness degrades metadata quality only: no enablement, admission, or
+/// billing decision reads this snapshot, so a stale catalogue is never an
+/// outage, and nothing here is wired into readiness.
 #[derive(Debug, Default)]
 pub struct LastKnownGoodCatalog {
     active: Option<CatalogSnapshot>,
+    consecutive_refusals: u32,
+    last_refusal: Option<Refusal>,
 }
 
 impl LastKnownGoodCatalog {
     pub const fn new() -> Self {
-        Self { active: None }
+        Self {
+            active: None,
+            consecutive_refusals: 0,
+            last_refusal: None,
+        }
     }
 
     pub fn active(&self) -> Option<&CatalogSnapshot> {
@@ -1928,6 +2171,8 @@ impl LastKnownGoodCatalog {
             },
         };
         self.active = Some(snapshot);
+        self.consecutive_refusals = 0;
+        self.last_refusal = None;
         admission
     }
 
@@ -1959,18 +2204,115 @@ impl LastKnownGoodCatalog {
         };
         active.source.validators.carry_over(validators);
         active.source.fetched_at = checked_at;
+        self.consecutive_refusals = 0;
+        self.last_refusal = None;
         true
     }
 
     /// Admit a parse result, leaving the active snapshot untouched on failure.
-    pub fn admit_result<E>(
+    ///
+    /// A failure is also *counted* here, by its bounded [`Refusal`], because this
+    /// is the one place that sees both the refusal and the run of refusals before
+    /// it. The error itself is returned unchanged, so a caller still logs the
+    /// typed detail — pointer included — that a metric may not carry.
+    pub fn admit_result<E: Refusable>(
         &mut self,
         parsed: Result<CatalogSnapshot, E>,
     ) -> Result<Admission, (E, Option<&CatalogSnapshot>)> {
         match parsed {
             Ok(snapshot) => Ok(self.admit(snapshot)),
-            Err(error) => Err((error, self.active.as_ref())),
+            Err(error) => {
+                self.record_refusal(error.refusal());
+                Err((error, self.active.as_ref()))
+            }
         }
+    }
+
+    /// Count a refusal that happened before there was anything to admit — a
+    /// transport failure, an oversized body — so "this catalogue has stopped
+    /// advancing" does not depend on how far the import got.
+    pub fn record_refusal(&mut self, refusal: Refusal) {
+        self.consecutive_refusals = self.consecutive_refusals.saturating_add(1);
+        self.last_refusal = Some(refusal);
+    }
+
+    /// How many imports in a row have been refused. Zero after any admitted or
+    /// confirmed-unchanged import.
+    pub const fn consecutive_refusals(&self) -> u32 {
+        self.consecutive_refusals
+    }
+
+    /// The most recent refusal, still holding its pointer for a log line.
+    pub const fn last_refusal(&self) -> Option<&Refusal> {
+        self.last_refusal.as_ref()
+    }
+
+    /// What an operator is told about this catalogue, as of `now`.
+    ///
+    /// One projection for three consumers — metrics, alerts, the status response
+    /// — so a refusal cannot be visible on a dashboard and absent from the
+    /// surface an operator reads during the page.
+    pub fn report(&self, now: SystemTime) -> CatalogReport {
+        CatalogReport {
+            active: self.active.as_ref().map(|snapshot| ActiveCatalog {
+                content_id: snapshot.content.content_id(),
+                fetched_at: snapshot.source.fetched_at,
+                age: now
+                    .duration_since(snapshot.source.fetched_at)
+                    .unwrap_or_default(),
+            }),
+            consecutive_refusals: self.consecutive_refusals,
+            last_refusal: self.last_refusal.as_ref().map(Refusal::reason),
+        }
+    }
+}
+
+/// How many consecutive refusals make a catalogue's staleness worth waking
+/// someone for.
+///
+/// Two, not one: a single refused import is an upstream having a bad minute and
+/// the previous content is still active, while a second consecutive refusal is
+/// the first evidence that the catalogue has stopped advancing across intervals
+/// rather than within one. The threshold is a count rather than a duration so it
+/// means the same thing whatever cadence a scheduler eventually runs at.
+pub const PERSISTENT_REFUSAL_THRESHOLD: u32 = 2;
+
+/// The active snapshot, as an operator sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveCatalog {
+    pub content_id: CatalogContentId,
+    pub fetched_at: SystemTime,
+    /// How long ago the active content was last confirmed current — admitted, or
+    /// answered `304`. This is what grows while imports are being refused.
+    pub age: Duration,
+}
+
+/// What is operationally true about a catalogue: what is active, how old it is,
+/// and whether imports are being refused.
+///
+/// Bounded by construction. The only unbounded value a catalogue could offer —
+/// the raw payload, the source URL, an error message, a JSON Pointer — is not
+/// here: the identity is a digest this process computed, and the reason is a
+/// [`RefusalReason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogReport {
+    /// `None` before a first successful import, which is not a refusal: a
+    /// deployment that has never imported has nothing stale.
+    pub active: Option<ActiveCatalog>,
+    pub consecutive_refusals: u32,
+    pub last_refusal: Option<RefusalReason>,
+}
+
+impl CatalogReport {
+    /// Whether refusals have persisted across more than one import attempt. The
+    /// alert condition, evaluated on data rather than restated by each consumer.
+    pub const fn persistent_refusal(&self) -> bool {
+        self.consecutive_refusals >= PERSISTENT_REFUSAL_THRESHOLD
+    }
+
+    /// The age of the active content, when there is any.
+    pub fn active_age(&self) -> Option<Duration> {
+        self.active.map(|active| active.age)
     }
 }
 
@@ -2684,11 +3026,15 @@ mod tests {
             }
         );
 
-        let rejected: Result<CatalogSnapshot, &str> = Err("schema drift");
+        let rejected: Result<CatalogSnapshot, CatalogError> = Err(CatalogError::Invalid {
+            backend: "test",
+            refusal: Refusal::new(RefusalReason::Schema),
+            message: "schema drift".to_owned(),
+        });
         let (error, active) = catalogue
             .admit_result(rejected)
             .expect_err("a drifted payload is refused");
-        assert_eq!(error, "schema drift");
+        assert_eq!(error.refused_by().reason(), RefusalReason::Schema);
         assert_eq!(
             active.map(|snapshot| snapshot.source.content_id),
             Some(good.source.content_id)
@@ -2830,6 +3176,189 @@ mod tests {
             source.refresh(None).await,
             Ok(CatalogRefresh::Updated(_))
         ));
+    }
+
+    /// The vocabulary is duplicated as strings so the metric catalogue can name
+    /// it in a const; the duplicate has to stay exactly the enum.
+    #[test]
+    fn the_refusal_vocabulary_and_its_string_duplicate_agree() {
+        let reasons: Vec<&str> = RefusalReason::ALL
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect();
+        assert_eq!(REFUSAL_REASONS, reasons.as_slice());
+        let unique: BTreeSet<&str> = reasons.iter().copied().collect();
+        assert_eq!(unique.len(), reasons.len(), "a reason is named twice");
+    }
+
+    /// A short id is what an operator surface may carry: fixed-width, and a
+    /// prefix of the digest an import logged rather than a re-derivation of it.
+    #[test]
+    fn a_short_content_id_is_a_fixed_width_prefix_of_its_digest() {
+        let content = content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]);
+        let short = content.content_id().short();
+        assert_eq!(short.len(), CONTENT_ID_SHORT_HEX);
+        assert!(short.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(content.content_id().checksum().to_string().contains(&short));
+        assert_eq!(
+            short,
+            content.content_id().short(),
+            "the same content is the same id"
+        );
+    }
+
+    /// The point of the whole slice: refusals are counted and named while the
+    /// content an operator is serving stays exactly where it was.
+    #[test]
+    fn consecutive_refusals_accumulate_without_disturbing_what_is_active() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        let good = snapshot(
+            content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]),
+            SourceValidators::etag("\"one\""),
+        );
+        catalogue.admit(good.clone());
+        let report = catalogue.report(SystemTime::UNIX_EPOCH);
+        assert_eq!(report.consecutive_refusals, 0);
+        assert!(!report.persistent_refusal());
+
+        catalogue.record_refusal(Refusal::new(RefusalReason::Unreachable));
+        let report = catalogue.report(SystemTime::UNIX_EPOCH);
+        assert_eq!(report.consecutive_refusals, 1);
+        assert_eq!(report.last_refusal, Some(RefusalReason::Unreachable));
+        assert!(
+            !report.persistent_refusal(),
+            "one bad minute upstream is not a page"
+        );
+
+        catalogue.record_refusal(Refusal::at(
+            RefusalReason::Schema,
+            JsonPointer::new("").child("models"),
+        ));
+        let report = catalogue.report(SystemTime::UNIX_EPOCH);
+        assert_eq!(report.consecutive_refusals, PERSISTENT_REFUSAL_THRESHOLD);
+        assert_eq!(report.last_refusal, Some(RefusalReason::Schema));
+        assert!(
+            report.persistent_refusal(),
+            "a second refusal is the catalogue no longer advancing"
+        );
+        assert_eq!(
+            report.active.map(|active| active.content_id),
+            Some(good.content.content_id()),
+            "and none of it changed what is being served"
+        );
+        assert_eq!(
+            catalogue.last_refusal().and_then(Refusal::pointer),
+            Some(&JsonPointer::new("").child("models")),
+            "the pointer survives for the log line that a metric may not carry"
+        );
+    }
+
+    /// A run of refusals is a run, not a tally: anything that proves the
+    /// catalogue is current again ends it.
+    #[test]
+    fn a_confirmed_import_ends_the_run_of_refusals() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        catalogue.admit(snapshot(
+            content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]),
+            SourceValidators::etag("\"one\""),
+        ));
+        catalogue.record_refusal(Refusal::new(RefusalReason::NotJson));
+        catalogue.record_refusal(Refusal::new(RefusalReason::NotJson));
+        assert!(
+            catalogue
+                .report(SystemTime::UNIX_EPOCH)
+                .persistent_refusal()
+        );
+
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+        assert!(catalogue.record_unchanged(SourceValidators::etag("\"one\""), later));
+        let report = catalogue.report(later);
+        assert_eq!(report.consecutive_refusals, 0);
+        assert_eq!(report.last_refusal, None);
+        assert_eq!(
+            report.active_age(),
+            Some(Duration::ZERO),
+            "a 304 is evidence the held content is current, not merely unchanged"
+        );
+
+        catalogue.record_refusal(Refusal::new(RefusalReason::NotJson));
+        catalogue.admit(snapshot(
+            content(vec![offering("openai", "gpt-4o", Some(price(1, 3)))]),
+            SourceValidators::etag("\"two\""),
+        ));
+        assert_eq!(
+            catalogue.report(later).consecutive_refusals,
+            0,
+            "an admitted import ends the run too"
+        );
+    }
+
+    /// Age is the operator's answer to "how far behind is this": it is measured
+    /// from the active snapshot's `fetched_at`, and it keeps growing across
+    /// refusals rather than being reset by the attempt that failed.
+    #[test]
+    fn active_age_grows_across_refusals_and_never_runs_backwards() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        assert_eq!(
+            catalogue.report(SystemTime::UNIX_EPOCH).active_age(),
+            None,
+            "a deployment that never imported has nothing stale"
+        );
+
+        let imported_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut fresh = snapshot(
+            content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]),
+            SourceValidators::etag("\"one\""),
+        );
+        fresh.source.fetched_at = imported_at;
+        catalogue.admit(fresh);
+
+        catalogue.record_refusal(Refusal::new(RefusalReason::Oversized));
+        assert_eq!(
+            catalogue
+                .report(imported_at + Duration::from_secs(3_600))
+                .active_age(),
+            Some(Duration::from_secs(3_600))
+        );
+        assert_eq!(
+            catalogue
+                .report(imported_at - Duration::from_secs(60))
+                .active_age(),
+            Some(Duration::ZERO),
+            "a clock that stepped backwards reads as fresh, never as negative"
+        );
+    }
+
+    /// Refusing through the admission boundary counts the refusal for free:
+    /// a scheduler cannot observe the error and forget the series.
+    #[test]
+    fn admitting_a_failure_counts_it_by_its_typed_reason() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        let refused: Result<CatalogSnapshot, CatalogError> = Err(CatalogError::Invalid {
+            backend: "test",
+            refusal: Refusal::at(
+                RefusalReason::Price,
+                JsonPointer::new("").child("cost").child("input"),
+            ),
+            message: "https://models.dev/api.json: price is not a number".to_owned(),
+        });
+        let (error, active) = catalogue
+            .admit_result(refused)
+            .expect_err("a refused import");
+        assert!(active.is_none(), "there was nothing to keep active");
+        assert_eq!(error.refused_by().reason(), RefusalReason::Price);
+
+        let report = catalogue.report(SystemTime::UNIX_EPOCH);
+        assert_eq!(report.consecutive_refusals, 1);
+        assert_eq!(report.last_refusal, Some(RefusalReason::Price));
+        assert!(
+            !report
+                .last_refusal
+                .expect("a reason")
+                .as_str()
+                .contains('/'),
+            "the reason is a vocabulary word, never the pointer or the URL beside it"
+        );
     }
 
     #[tokio::test]

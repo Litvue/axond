@@ -131,6 +131,9 @@ metric and a usage row can never disagree.
 | `axond.status.component_state` | gauge | `axond.status.component` | Last observed dependency state: `0` disabled, `1` ok, `2` degraded, `3` unavailable — a severity ladder, so `>= 2` is trouble and the stateless posture (`disabled` everywhere) sits below `ok` rather than above `unavailable`. Bounded label set — no tenant, subject, or credential identity. |
 | `axond.status.observation_age` | gauge (ms) | `axond.status.component` | Age of the cached observation behind that state; a rising age means the refresher, not the dependency, is the problem. |
 | `axond.status.refreshes` | counter | `axond.status.component`, `axond.status.outcome` | Background refresh attempts and how they ended. |
+| `axond.catalog.refusals` | counter | `axond.catalog.reason` | Catalogue imports refused, by typed reason: `unreachable`, `denied`, `oversized`, `not_json`, `schema`, `id_mismatch`, `identifier`, `unknown_status`, `unknown_modality`, `price`, `unknown_tier_type`, `duplicate_tier`, `neutral_price`, `uncanonicalizable_text`, `ambiguous_model_key`, `content`, `unsupported_endpoint`, `unknown`. A refusal keeps the previous catalogue active, so nothing else moves when one happens. The JSON Pointer and message the refusal also carries are logged, never labelled. |
+| `axond.catalog.active_age` | gauge (ms) | — | How long since the active catalogue was last confirmed current — admitted, or answered `304`. Absent, not zero, before a first import. |
+| `axond.catalog.consecutive_refusals` | gauge | — | Imports refused in a row. Reset by any admitted or confirmed-unchanged import. |
 
 Every instrument and label above is declared in a catalogue inside the binary,
 and tests fail if the code builds an instrument or records a label the catalogue
@@ -162,7 +165,45 @@ readable from a scrape endpoint
 | Budget ledger pressure | `axond.budget.retained_subjects` near configured `max_subjects` | Leading indicator that the bound is approaching; watch it before capacity denials occur. |
 | Namespace budget exhausted | `axond.budget.namespace_denials` > 0 | The whole namespace is out of budget, so *every* subject in it is being denied — not one noisy caller. Raise `namespace_limit_microdollars` or investigate what is spending. |
 | TTFT regression | `axond.request.time_to_first_token` p95 | Provider degradation shows here before total latency moves. |
+| Catalogue has stopped advancing | `axond.catalog.consecutive_refusals` >= 2 | Refusals have persisted across more than one import, so this is not one bad minute upstream: model metadata is frozen at whatever was last admitted, and `axond.catalog.active_age` is how far behind it now is. Runbook below. Not an availability alert — requests are unaffected. |
 | Upstream stalls | `axond.upstream.timeouts` rising | Split by `axond.timeout`: `connect` is egress or DNS, `response_headers` is an overloaded provider, `stream_idle` is a half-dead connection, and `overall` means the failover budget was spent before the attempt was dispatched. Then split by `axond.timeout.bound`: `walk_budget` means `failover.overall_timeout_ms` is too tight for how slow the target became. |
+
+### Runbook: refused catalogue imports
+
+A refused import is durable by design: the last successfully imported catalogue
+stays active, so nothing is served from a half-parsed document and no request
+path changes. That also means the only evidence is the signals above — hence the
+alert at two consecutive refusals rather than one.
+
+None of this is an availability incident. Catalogue freshness is not an
+admission, entitlement, billing, readiness, or liveness dependency: a stale
+catalogue degrades metadata quality (a new model or a changed published price is
+not yet known), and observed prices are metadata that never activate billing on
+their own ([ADR 0037](./adr/0037-catalogue-source-imports.md)). Do not fail a
+replica out, roll back, or restart on this alert; a restart imports nothing new
+and loses the active snapshot.
+
+1. **Read the reason.** Split `axond.catalog.refusals` by `axond.catalog.reason`.
+   `unreachable` / `denied` / `oversized` are the fetch: egress, a mirror, an
+   auth-ing proxy, or a body past the ceiling. Everything else is the document
+   itself — upstream published something this schema refuses.
+2. **Read what is active.** The authenticated deployment-scope status response
+   carries `catalogue.content_id` (the short digest of the content actually
+   being served), `catalogue.active_age_ms`, `catalogue.consecutive_refusals`,
+   and `catalogue.last_refusal`. Tenant-scoped responses do not: a tenant sees
+   only that the `catalogue` component is healthy or degraded.
+3. **Find the location.** The refusal's log line carries the JSON Pointer into
+   the payload and the typed error the parser produced. That pointer is the
+   whole diagnosis for a schema, price, or identifier refusal; it is deliberately
+   absent from metrics and from the status response, where it would be unbounded.
+4. **Decide by age, not by the alert.** `active_age_ms` against your own
+   tolerance for stale model metadata is the actual decision. Hours are usually
+   uninteresting; days mean pricing and capability facts are drifting from
+   upstream.
+5. **Fix the source, not the gateway.** Restore reachability, or pin/mirror a
+   payload that parses. A refusal that reflects genuine upstream drift is a
+   parser change, and the pointer from step 3 is what the change is written
+   against.
 
 ## Usage records
 
