@@ -301,7 +301,15 @@ impl AdminService {
         Self::permits_material(grant, AdminAction::WriteSecrets, owner)?;
         let store = self.secret_store()?;
         if next == SecretLifecycle::Tombstoned {
-            self.refuse_destroying_referenced_material(reference)
+            // Establish ownership before looking at desired-state references:
+            // that state is deployment-wide, so consulting it first would let
+            // a caller distinguish a foreign reference that is in service
+            // from one that is absent or retired.
+            store
+                .describe(owner, &reference)
+                .await
+                .map_err(log_secret)?;
+            self.refuse_destroying_referenced_material(owner, reference)
                 .await?;
         }
         let transition = store
@@ -353,6 +361,7 @@ impl AdminService {
     /// direction that cannot take a serving deployment down.
     async fn refuse_destroying_referenced_material(
         &self,
+        owner: SecretOwner,
         reference: SecretRef,
     ) -> Result<(), AdminError> {
         let store = self.store()?;
@@ -370,7 +379,7 @@ impl AdminService {
         // is material nothing loses by destroying.
         let pinned = credentials
             .required_secrets()
-            .any(|(_, pinned)| pinned == reference);
+            .any(|(pinned_owner, pinned)| pinned_owner == owner && pinned == reference);
         if pinned {
             return Err(AdminError::SecretInUse { reference });
         }
@@ -394,7 +403,7 @@ pub(super) fn lifecycle_of(
     SecretLifecycle::parse(text).ok_or_else(|| AdminError::RequestInvalid {
         schema,
         detail: format!(
-            "`lifecycle`: `{text}` is not a state; one of {}",
+            "`lifecycle` must be one of {}",
             SecretLifecycle::ALL
                 .iter()
                 .map(|state| state.as_str())
@@ -439,4 +448,22 @@ pub(super) fn material_of(
         });
     }
     Ok(material)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lifecycle_of;
+
+    #[test]
+    fn an_invalid_lifecycle_does_not_echo_the_caller_value_to_response_or_log() {
+        let caller_value = "sk-lifecycle-value-must-not-echo";
+        let error = lifecycle_of("secret_lifecycle", caller_value).expect_err("invalid state");
+
+        assert!(!error.to_string().contains(caller_value));
+        assert!(
+            !error
+                .operator_detail()
+                .is_some_and(|detail| detail.contains(caller_value))
+        );
+    }
 }

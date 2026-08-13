@@ -2320,6 +2320,76 @@ async fn one_tenants_administrator_cannot_reach_another_tenants_material() {
 }
 
 #[tokio::test]
+async fn tombstoning_a_foreign_pinned_version_is_not_an_existence_probe() {
+    let deployment = Deployment::new();
+    let ours = fixtures::tenant_id(1).to_string();
+    let theirs = fixtures::tenant_id(2).to_string();
+    let foreign_owner = crate::desired_state::secrets::SecretOwner::tenant(fixtures::tenant_id(2));
+    let foreign_reference = fixtures::secret_ref(12);
+
+    deployment.secrets.seed(
+        foreign_owner,
+        foreign_reference,
+        MATERIAL,
+        crate::desired_state::SecretLifecycle::Active,
+    );
+
+    // The desired state pins the foreign version as resolvable. A caller that
+    // owns tenant 1 must still receive the same not-found answer as for an
+    // unreferenced foreign version: ownership is established before this
+    // deployment-wide reference-use check.
+    let mut tenant = tenant_document();
+    tenant["resource"]["tenant"] = json!(theirs);
+    tenant["resource"]["slug"] = json!("globex");
+    let mut provider = provider_document();
+    provider["resource"]["tenant"] = json!(theirs);
+    let mut credential = credential_document();
+    credential["resource"]["tenant"] = json!(theirs);
+    credential["resource"]["secret"] = json!(foreign_reference.secret.to_string());
+
+    let mut head = deployment
+        .publish(
+            "/tenants",
+            "key-foreign-1",
+            EXPECTED_REVISION_EMPTY,
+            &tenant,
+        )
+        .await;
+    head = deployment
+        .publish("/providers", "key-foreign-2", &head, &provider)
+        .await;
+    deployment
+        .publish("/credentials", "key-foreign-3", &head, &credential)
+        .await;
+
+    let (status, pinned_refusal) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({
+                "tenant": ours,
+                "reference": foreign_reference.to_string(),
+                "lifecycle": "tombstoned",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{pinned_refusal}");
+    assert_eq!(pinned_refusal["error"]["type"], "secret_not_found");
+
+    let (status, absent_refusal) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({
+                "tenant": ours,
+                "reference": fixtures::secret_ref(99).to_string(),
+                "lifecycle": "tombstoned",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{absent_refusal}");
+    assert_eq!(absent_refusal["error"]["type"], "secret_not_found");
+}
+
+#[tokio::test]
 async fn a_body_that_carries_material_is_refused_without_echoing_it() {
     let deployment = Deployment::new();
     let tenant = owning_tenant();
@@ -2342,6 +2412,26 @@ async fn a_body_that_carries_material_is_refused_without_echoing_it() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
     assert_eq!(refusal["error"]["type"], "secret_material_refused");
+
+    // A lifecycle value is not material by type, but it is still caller input
+    // and must not be copied into either the response or operator detail.
+    let lifecycle_value = "sk-lifecycle-value-must-not-echo";
+    let (status, refusal) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({
+                "tenant": tenant,
+                "reference": fixtures::secret_ref(12).to_string(),
+                "lifecycle": lifecycle_value,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "admin_request_invalid");
+    assert!(
+        !refusal.to_string().contains(lifecycle_value),
+        "caller input reached the response: {refusal}"
+    );
 
     // A reference that names no version is refused: every operation here is
     // aimed at an exact version.
