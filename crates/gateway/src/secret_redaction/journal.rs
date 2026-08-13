@@ -11,6 +11,13 @@
 //! check — an audit event's payload, a hydration cache, a debugging column added
 //! later. `SELECT t::text FROM <table> t` renders whatever is there.
 //!
+//! The material has to be *in the process* for that to mean anything. A test
+//! that published bodies without ever holding a key would sweep a journal that
+//! never had one to store, and would stay green if a body started carrying
+//! plaintext tomorrow. So the sentinels are staged into a store and resolved out
+//! of it here, held live across every assertion, and the sweep is checked
+//! against the resolved values before it is trusted against the schema.
+//!
 //! These tests require Postgres in CI (`AXOND_TEST_REQUIRE_SERVICES=1` makes a
 //! missing DSN a panic rather than a skip), so a green run means they ran.
 
@@ -18,11 +25,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio_postgres::Config;
 
-use super::harness::{PROVIDER_MATERIAL, ROTATED_MATERIAL, first, state_pinning, sweep};
+use super::harness::{
+    PROVIDER_MATERIAL, ROTATED_MATERIAL, first, material, owner, state_pinning, sweep,
+};
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
+use crate::backends::fakes::InMemorySecrets;
+use crate::backends::secrets::SecretResolver as _;
 use crate::desired_state::{
-    DesiredState, ExpectedRevision, ResourceVersionNumber, RevisionId, fixtures,
+    DesiredState, ExpectedRevision, ResourceVersionNumber, RevisionId, SecretLifecycle, SecretRef,
+    fixtures,
 };
 
 /// A journal on a schema of its own, or `None` when no Postgres is configured
@@ -106,6 +118,35 @@ async fn dump(schema: &str) -> String {
     dumped
 }
 
+/// Stage each `(reference, plaintext)` pair into a store and resolve it back,
+/// returning the plaintext the store handed over.
+///
+/// The store is dropped; the material is not. What the caller holds is the same
+/// thing the runtime holds between a compilation and a publication — a resolved
+/// key, alive in the process that is talking to the journal — which is the only
+/// state in which "the journal never saw it" is a claim with content.
+async fn live_material(pairs: &[(SecretRef, &'static str)]) -> Vec<String> {
+    let secrets = InMemorySecrets::new();
+    let mut resolved = Vec::with_capacity(pairs.len());
+    for (reference, plaintext) in pairs {
+        secrets.seed(
+            owner(),
+            *reference,
+            SecretLifecycle::Active,
+            material(plaintext),
+        );
+        resolved.push(
+            secrets
+                .resolve(owner(), reference)
+                .await
+                .expect("active material resolves")
+                .expose()
+                .to_owned(),
+        );
+    }
+    resolved
+}
+
 async fn publish(
     store: &PostgresControlPlane,
     key: &str,
@@ -132,6 +173,15 @@ async fn no_durable_row_or_read_carries_secret_material() {
     };
     let sweep = sweep();
     let rotated = first().rotated();
+
+    // The material exists, in this process, for as long as the journal is being
+    // swept: `resolved` is held to the end of the test so nothing here can pass
+    // because the key was never around to leak.
+    let resolved =
+        live_material(&[(first(), PROVIDER_MATERIAL), (rotated, ROTATED_MATERIAL)]).await;
+    for (label, plaintext) in [("provider", &resolved[0]), ("rotated", &resolved[1])] {
+        sweep.assert_present("the material resolved out of the store", label, plaintext);
+    }
 
     let first_revision = publish(
         &store,
@@ -219,5 +269,5 @@ async fn no_durable_row_or_read_carries_secret_material() {
         rows.contains(&identifier) || rows.contains(&hexed),
         "the credential's secret reference must be durable, or the sweep proves nothing"
     );
-    assert_ne!(PROVIDER_MATERIAL, ROTATED_MATERIAL);
+    drop(resolved);
 }

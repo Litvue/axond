@@ -266,21 +266,22 @@ impl FakeProvider {
         Self::spawn(Some(Arc::new(Semaphore::new(0)))).await
     }
 
-    /// A provider that is not there: a port that was bound long enough to be
-    /// unique and then closed, so a dispatch to it fails at the transport.
+    /// A provider that is not there, so a dispatch to it fails at the transport.
     ///
     /// Transport failure is the interesting error case for redaction because the
     /// error value carries the request that failed, and a request carries a
     /// credential.
-    pub(crate) async fn unreachable() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback port");
-        let addr = listener.local_addr().expect("a bound address");
-        drop(listener);
+    ///
+    /// The address is a privileged loopback port rather than an ephemeral one
+    /// that was bound and released: releasing a port only makes it *probably*
+    /// free, and the sibling providers in this suite bind `127.0.0.1:0`
+    /// concurrently, so the kernel could hand one of them the very port this
+    /// dispatch was supposed to be refused by. Nothing in the suite can bind
+    /// port 1, so the refusal is immediate and certain.
+    pub(crate) fn unreachable() -> Self {
         let (_, arrivals) = mpsc::unbounded_channel();
         Self {
-            base_url: format!("http://{addr}"),
+            base_url: "http://127.0.0.1:1".to_owned(),
             presented: Arc::new(Mutex::new(Vec::new())),
             release: None,
             arrivals: tokio::sync::Mutex::new(arrivals),

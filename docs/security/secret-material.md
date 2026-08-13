@@ -61,7 +61,8 @@ lacks either is theatre:
   surface and the sentinel's label without reprinting the material.
 - **Every assertion has a tripwire.** Each test also asserts that the material
   really was in play — that the fake provider was presented with it, or that the
-  store resolves it, or that the reference is durable — so "nothing leaked"
+  store resolves it — the journal test holds material resolved out of a store
+  live across every sweep, so "nothing leaked"
   cannot silently degrade into "nothing happened".
 
 ## Running it
