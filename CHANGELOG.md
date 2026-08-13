@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.29](https://github.com/Litvue/axond/compare/v0.3.28...v0.3.29) (2026-08-13)
+
+
+### Bug Fixes
+
+* **ops:** refuse a history applied out of order, and lex a block's own body ([#304](https://github.com/Litvue/axond/issues/304)) ([dbb8f5e](https://github.com/Litvue/axond/commit/dbb8f5ea6ab4943178bbf46f5cacedcc0ef25e12))
+
+
+### Documentation
+
+* **observability:** state the exporter expiration the stall rule depends on ([#300](https://github.com/Litvue/axond/issues/300)) ([2300fda](https://github.com/Litvue/axond/commit/2300fda4b2218e350a83a5164cb5d8b2b967c820))
+
+
+### Tests
+
+* **qualification:** add provider and backend fault matrix ([#271](https://github.com/Litvue/axond/issues/271)) ([efc8909](https://github.com/Litvue/axond/commit/efc89095ae349dbda05793619a1ef811bb93ff3f))
+* **security:** count secret store reads by version, not by credential ([#284](https://github.com/Litvue/axond/issues/284)) ([b8d1937](https://github.com/Litvue/axond/commit/b8d193710d1b1f9bacc1527e24411fa58bf09139))
+
 ## [0.3.28](https://github.com/Litvue/axond/compare/v0.3.27...v0.3.28) (2026-08-13)
 
 
