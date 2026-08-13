@@ -93,14 +93,15 @@ CREATE UNIQUE INDEX CONCURRENTLY axond_usage_request_id_key
     ON axond_usage (request_id);
 ```
 
-Understand what that trades before you do, though: the Postgres sink inserts
-without `ON CONFLICT`, and retries a batch whose commit outcome it never learned.
-With the index in place that retry hits a duplicate key, fails the whole
-transaction, and counts the entire batch — rows that are in fact already
-committed — as `records_dropped{axond.drop_reason="sink_error"}`. So the index
-buys a table that cannot hold a duplicate row, at the cost of a false alarm on
-the metric below. Until the sink writes `ON CONFLICT (request_id) DO NOTHING`,
-deduplicating in the reader is the quieter choice.
+The sink's insert ends in `ON CONFLICT DO NOTHING`, which carries no target: it
+does nothing on the shipped DDL, and with the unique index in place it absorbs
+the duplicate a retry or an outbox redelivery presents, so the retry commits and
+nothing is counted as
+`records_dropped{axond.drop_reason="sink_error"}`. The index is therefore worth
+adding wherever the rows allow it — it is what makes the table itself
+duplicate-free rather than leaving every reader to deduplicate, and a
+billing-grade deployment (`docs/operations/usage-outbox.md`), where redelivery is
+routine, should have it.
 
 Ids are time-ordered, but by **admission**, not settlement: one is minted when the
 gateway accepts a request, and rows are written when requests end. A long stream's
@@ -144,10 +145,17 @@ observable:
 Alert on the second one. A sustained non-zero rate means the buffer
 (`buffer_capacity`) or the destination is undersized for the offered load.
 
-This is the **telemetry-grade** delivery mode, and it is the only one the gateway
-offers today. The opt-in **billing-grade** mode — an accepted request's event is
-durable before the request settles, replayed until a consumer acknowledges it —
-is specified as the `UsageJournal` contract in `crates/gateway/src/usage/journal.rs`
-and tracked by [#155](https://github.com/Litvue/axond/issues/155). Nothing
-constructs a journal yet, so no configuration turns it on and no sink's behaviour
-changes.
+This is the **telemetry-grade** delivery mode and it is the default: a record the
+fan-out accepted is not a record that was written, so these rows are telemetry
+rather than an accounting source.
+
+`[usage_journal] backend = "postgres"` opts into the **billing-grade** mode
+instead ([ADR 0049](./adr/0049-billing-grade-usage-outbox.md)): the event is
+appended to a durable outbox before the request is answered, replayed into these
+same sinks until they acknowledge it, and a request whose event could not be made
+durable is answered `503 usage_not_durable` rather than `200`. The row shape does
+not change — the guarantee about whether the row eventually exists does. Delivery
+is still at-least-once, so the deduplication advice above is unchanged and
+becomes load-bearing: the outbox *will* redeliver after a crash, always with the
+same `request_id`. Setup, recovery, poison handling, and alerts are in the
+[usage outbox guide](./operations/usage-outbox.md).

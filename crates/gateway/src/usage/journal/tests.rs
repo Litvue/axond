@@ -14,8 +14,10 @@ use super::super::tests::sample_record;
 use super::oracle::InMemoryUsageJournal;
 use super::*;
 
-/// A settled record for `subject`, with a fresh event identity.
-fn event_for(subject: &str) -> UsageEvent {
+/// A settled record for `subject`, with a fresh event identity. Shared with the
+/// worker's and the Postgres outbox's tests, which assert the same contract
+/// against a different implementation of it.
+pub(crate) fn event_for(subject: &str) -> UsageEvent {
     let mut record = sample_record();
     record.request_id = next_request_id().to_string();
     record.subject = subject.to_owned();
@@ -26,7 +28,7 @@ fn event() -> UsageEvent {
     event_for("GW_INBOUND_ACME_KEY")
 }
 
-fn consumer(name: &str) -> ConsumerId {
+pub(crate) fn consumer(name: &str) -> ConsumerId {
     ConsumerId::parse(name).expect("a valid consumer name")
 }
 
@@ -272,6 +274,50 @@ async fn acknowledging_twice_acknowledges_once() {
     assert_eq!(stats.quarantined, 0);
 }
 
+/// Whether a store resolves a claim in one statement or one at a time, the set
+/// of verdicts has to be the same — otherwise a worker's delivered count and
+/// its warnings would depend on the backend.
+#[tokio::test]
+async fn acknowledging_a_claim_at_once_answers_for_each_of_its_events() {
+    let journal = InMemoryUsageJournal::new();
+    let billing = consumer("billing");
+    for subject in ["acme", "globex", "initech"] {
+        journal.append(&event_for(subject)).await.expect("append");
+    }
+    let claimed = journal.claim(&billing, claim(10)).await.expect("claim");
+    assert_eq!(claimed.len(), 3);
+    journal
+        .quarantine(&claimed[2].id, PoisonReason::Malformed)
+        .await
+        .expect("quarantine");
+
+    let ids: Vec<DeliveryId> = claimed
+        .iter()
+        .map(|delivery| delivery.id.clone())
+        .chain([DeliveryId {
+            consumer: billing.clone(),
+            event: next_request_id(),
+            attempt: 1,
+        }])
+        .collect();
+    let verdicts = journal.ack_all(&ids).await;
+
+    assert!(verdicts[0].is_ok() && verdicts[1].is_ok());
+    assert!(
+        matches!(verdicts[2], Err(JournalError::Quarantined { .. })),
+        "an acknowledgement may not release a quarantine, however it is batched: {:?}",
+        verdicts[2]
+    );
+    assert!(
+        verdicts[3].is_ok(),
+        "an event the journal no longer holds has nothing left to redeliver: {:?}",
+        verdicts[3]
+    );
+    let stats = journal.stats(&billing).await.expect("stats");
+    assert_eq!(stats.pending, 0, "{stats:?}");
+    assert_eq!(stats.quarantined, 1, "{stats:?}");
+}
+
 #[tokio::test]
 async fn a_delivery_that_was_never_claimed_cannot_be_acknowledged() {
     let journal = InMemoryUsageJournal::new();
@@ -288,12 +334,20 @@ async fn a_delivery_that_was_never_claimed_cannot_be_acknowledged() {
         "{error:?}"
     );
 
+    // An id the journal holds no event for is indistinguishable from one it has
+    // pruned — no store keeps a tombstone per acknowledged event — so it is
+    // absorbed rather than refused. What matters is that it changes nothing.
     let unknown = DeliveryId {
         consumer: consumer("billing"),
         event: next_request_id(),
         attempt: 1,
     };
-    assert!(journal.ack(&unknown).await.is_err());
+    journal.ack(&unknown).await.expect("nothing to acknowledge");
+    let stats = journal
+        .stats(&consumer("billing"))
+        .await
+        .expect("no consumer was registered by it");
+    assert_eq!(stats.pending, 1, "{stats:?}");
 }
 
 #[tokio::test]
@@ -885,6 +939,43 @@ async fn drop_oldest_bounds_storage_and_counts_what_it_lost() {
     );
     let stats = journal.stats(&billing).await.expect("stats");
     assert_eq!(stats.dropped, 1, "a lossy policy has to report its cost");
+}
+
+/// A row can leave the journal while a consumer is still delivering it: a lossy
+/// capacity policy drops it, retention prunes it, or an append reclaims it to make
+/// room. The acknowledgement that follows has to be `Ok`, because there is nothing
+/// left to redeliver and a refusal would only make the consumer report a
+/// redelivery that cannot happen — and undercount what it really delivered.
+#[tokio::test]
+async fn acknowledging_an_event_the_journal_no_longer_holds_is_not_an_error() {
+    let journal = InMemoryUsageJournal::with_capacity(Capacity {
+        max_events: 1,
+        policy: CapacityPolicy::DropOldest,
+        ..Capacity::BILLING_GRADE
+    });
+    let billing = consumer("billing");
+    journal.append(&event()).await.expect("append");
+    let claimed = journal.claim(&billing, claim(1)).await.expect("claim");
+    // The destination write happens here, and the event is dropped underneath it.
+    journal
+        .append(&event_for("acme-two"))
+        .await
+        .expect("a lossy policy makes room rather than refusing");
+
+    journal
+        .ack(&claimed[0].id)
+        .await
+        .expect("the event it delivered is gone, which is not the consumer's fault");
+    // Quarantine is the exception: it exists to leave a poison count and a row an
+    // operator can look at, and a dropped row leaves neither to talk about.
+    let error = journal
+        .quarantine(&claimed[0].id, PoisonReason::Malformed)
+        .await
+        .expect_err("there is nothing left to set aside");
+    assert!(
+        matches!(error, JournalError::NotOutstanding { .. }),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

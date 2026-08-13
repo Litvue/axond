@@ -14,9 +14,9 @@
 //! The listening socket is already bound, the usage sinks already own
 //! connections and flush tasks, and the budget store, rate limiter, and
 //! revocation store already own their state, so changes to `[server] bind`,
-//! `[[usage_sink]]`, `[budget]` (including `limit_microdollars`),
-//! `[rate_limit]`, and `[revocation]` are reported and ignored until the next
-//! restart.
+//! `[[usage_sink]]`, `[usage_journal]`, `[budget]` (including
+//! `limit_microdollars`), `[rate_limit]`, and `[revocation]` are reported and
+//! ignored until the next restart.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use crate::config::{
     AdmissionConfig, BudgetConfig, Config, ConfigError, Mode, RateLimitConfig, Reload,
-    RevocationConfig, Transport, UsageSinkConfig,
+    RevocationConfig, Transport, UsageJournalConfig, UsageSinkConfig,
 };
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
@@ -53,6 +53,7 @@ struct Boot {
     mode: Mode,
     bind: SocketAddr,
     usage_sink: Vec<UsageSinkConfig>,
+    usage_journal: UsageJournalConfig,
     budget: BudgetConfig,
     rate_limit: RateLimitConfig,
     revocation: RevocationConfig,
@@ -81,6 +82,7 @@ impl Reloader {
                 mode: booted.config.mode,
                 bind: booted.config.server.bind,
                 usage_sink: booted.config.usage_sink.clone(),
+                usage_journal: booted.config.usage_journal.clone(),
                 budget: booted.config.budget.clone(),
                 rate_limit: booted.config.rate_limit.clone(),
                 revocation: booted.config.revocation.clone(),
@@ -260,6 +262,9 @@ pub struct ReloadSummary {
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
     pub usage_sinks_changed: bool,
+    /// `[usage_journal]` differs from the outbox the delivery worker was built
+    /// with.
+    pub usage_journal_changed: bool,
     /// `[budget]` differs from the booted store configuration.
     pub budget_changed: bool,
     /// `[rate_limit]` differs from the booted limiter configuration.
@@ -462,6 +467,7 @@ impl ReloadSummary {
             },
             bind_changed: boot.bind != after_config.server.bind,
             usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
+            usage_journal_changed: boot.usage_journal != after_config.usage_journal,
             budget_changed: boot.budget != after_config.budget,
             rate_limit_changed: boot.rate_limit != after_config.rate_limit,
             revocation_changed: boot.revocation != after_config.revocation,
@@ -513,6 +519,12 @@ impl ReloadSummary {
         if self.usage_sinks_changed {
             tracing::warn!(
                 "`[[usage_sink]]` changed, but sinks own live connections; restart to apply it"
+            );
+        }
+        if self.usage_journal_changed {
+            tracing::warn!(
+                "`[usage_journal]` changed, but the outbox connection and its delivery worker are \
+                 built at boot; restart to apply it"
             );
         }
         if self.budget_changed {
@@ -1164,6 +1176,7 @@ env = "GW_ADMIN_BREAKGLASS"
             mode: before.config.mode,
             bind: before.config.server.bind,
             usage_sink: before.config.usage_sink.clone(),
+            usage_journal: before.config.usage_journal.clone(),
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
             revocation: before.config.revocation.clone(),
@@ -1196,6 +1209,7 @@ env = "GW_ADMIN_BREAKGLASS"
             mode: before.config.mode,
             bind: before.config.server.bind,
             usage_sink: before.config.usage_sink.clone(),
+            usage_journal: before.config.usage_journal.clone(),
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
             revocation: before.config.revocation.clone(),
@@ -1235,6 +1249,7 @@ env = "GW_ADMIN_BREAKGLASS"
             mode: disabled.config.mode,
             bind: disabled.config.server.bind,
             usage_sink: disabled.config.usage_sink.clone(),
+            usage_journal: disabled.config.usage_journal.clone(),
             budget: disabled.config.budget.clone(),
             rate_limit: disabled.config.rate_limit.clone(),
             revocation: disabled.config.revocation.clone(),
@@ -1304,6 +1319,7 @@ env = "GW_ADMIN_BREAKGLASS"
             mode: before.config.mode,
             bind: before.config.server.bind,
             usage_sink: before.config.usage_sink.clone(),
+            usage_journal: before.config.usage_journal.clone(),
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
             revocation: before.config.revocation.clone(),
@@ -1870,6 +1886,33 @@ targets = [
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("budget removal is valid");
         assert!(!summary.budget_changed);
+    }
+
+    /// Turning billing-grade usage recording on or off is a restart, because the
+    /// outbox connection and its delivery worker are built once. An operator who
+    /// edits the section and reloads has to be told that, or they will believe a
+    /// serving process is journaling when it is not.
+    #[tokio::test]
+    async fn usage_journal_changes_are_reported_as_restart_required() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[[usage_sink]]\nkind = \"stdout\"\n\n[usage_journal]\nbackend = \"postgres\"\ndsn_env = \"AXOND_USAGE_OUTBOX_DSN\"\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("journal candidate is valid");
+        assert!(summary.usage_journal_changed);
+        assert!(summary.usage_sinks_changed);
+        assert!(summary.is_empty(), "neither is applied by a reload");
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("journal removal is valid");
+        assert!(!summary.usage_journal_changed);
     }
 
     #[tokio::test]

@@ -403,9 +403,10 @@ targets = [
 # Replacing material under the same verifier `kid` is reported as changed with
 # a short fingerprint; a new `kid` remains available for overlap rotation.
 #
-# `[server] bind`, `[[usage_sink]]`, and `[budget]` changes are reported with a
-# warning and otherwise ignored — the socket is already bound, sinks own live
-# connections, and the budget store owns its reservations, so all need a
+# `[server] bind`, `[[usage_sink]]`, `[usage_journal]`, and `[budget]` changes
+# are reported with a warning and otherwise ignored — the socket is already
+# bound, sinks own live connections, the usage outbox owns its connection and
+# delivery worker, and the budget store owns its reservations, so all need a
 # restart. This includes changes to the budget's `limit_microdollars`. See
 # docs/adr/0011-config-hot-reload.md.
 
@@ -459,6 +460,59 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 
 # [[usage_sink]]
 # kind = "stdout"
+
+# ── Billing-grade usage delivery (optional) ───────────────────────────────────
+# Omit for the default: the sinks above are best effort, off the request path,
+# and a stalled destination drops records with a count rather than delaying a
+# request. Good telemetry, not an accounting source.
+#
+# Turn this on and every settled usage event is appended to a durable outbox
+# *before the request is answered*, then replayed into those same sinks until
+# they acknowledge it: at-least-once, replayed after a restart, ordered per
+# (namespace, subject), deduplicated by the consumer on `request_id`. Apply
+# ops/postgres/usage_outbox_v1.sql first, and read
+# docs/operations/usage-outbox.md — this adds a failure mode to the request
+# path. See docs/adr/0049-billing-grade-usage-outbox.md.
+
+# [usage_journal]
+# # none (default) | postgres.
+# backend = "postgres"
+# # Env var holding the outbox connection string; a secret, so referenced by
+# # name. `sslmode=require` turns on TLS.
+# dsn_env = "AXOND_USAGE_JOURNAL_DSN"
+# # Schema the outbox tables live in. One unqualified identifier.
+# schema = "billing"
+# # Apply the shipped outbox DDL at boot. Off by default: most deployments give
+# # the gateway's role no DDL rights.
+# create_schema = false
+# # Name the delivery state is kept under. Stable across restarts — a new name
+# # replays everything still retained as first deliveries.
+# consumer = "billing"
+# # Bounds. `max_events` is the outbox's size, and retention — counted from
+# # when the request was observed, not from its acknowledgement — must exceed
+# # the longest retry horizon a caller has: pruning an acknowledged event
+# # forgets its idempotency key, so a much later retry would append a copy.
+# max_events = 1_000_000
+# max_delivery_attempts = 8
+# retain_acknowledged_seconds = 86_400
+# # What a full outbox does: refuse (default; answers 503 usage_not_durable and
+# # keeps the promise) | drop-oldest (bounded but lossy, counted durably).
+# capacity_policy = "refuse"
+# # What a request does when its event could not be journaled: refuse (default)
+# # | serve (answer anyway and count the event as lost).
+# on_undurable = "refuse"
+# # Bounds on the append a request waits for, and on connecting.
+# operation_timeout_ms = 5_000
+# connect_timeout_ms = 5_000
+# # One is reserved for the worker's claims; the rest bound the appends this
+# # replica can have in flight. Two is the floor.
+# connections = 8
+# # Delivery worker: events per claim, how long a claim stays invisible to
+# # other claimants (also how long recovery from a dead worker takes), and how
+# # long to wait after finding nothing.
+# claim_batch = 256
+# lease_seconds = 30
+# poll_interval_ms = 250
 
 # ---------------------------------------------------------------------------
 # Budget — spend caps on the request path

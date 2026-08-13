@@ -18,7 +18,9 @@ deployment unit. Read the release's `CHANGELOG.md` entry before every rollout.
 2. Read every breaking-change and migration entry since the deployed version.
 3. Validate the candidate configuration against the new binary in a staging or
    canary environment.
-4. Apply additive Postgres usage migrations before deploying writers.
+4. Apply additive Postgres usage migrations before deploying writers, including
+   `ops/postgres/usage_outbox_v1.sql` before any replica that enables
+   `[usage_journal] backend = "postgres"`.
 5. Complete any stop-the-fleet Redis/Postgres budget migration before starting
    namespace-cap-aware replicas.
 6. Verify ingress streaming behavior and client retries.
@@ -72,6 +74,14 @@ This sequence is executed on every change against a fleet of real replicas behin
 a readiness-driven balancer, including the rollback limits below:
 [rollout qualification](./rollout.md).
 
+A billing-grade replica also drains its usage outbox within that budget, and
+reports what it could not deliver. Undelivered events are not lost — the
+replacement replica claims them once the leases expire — so
+`usage_journal_drained=false` is a backlog to watch, not an incident. Events an
+older replica cannot read because a newer replica wrote them are skipped rather
+than condemned, so a mixed-version fleet is safe in both directions of the roll
+([usage outbox](./usage-outbox.md#upgrades-and-version-skew)).
+
 ## Migrations that are not rolling
 
 Exact namespace-wide budgets require a stopped fleet:
@@ -87,6 +97,12 @@ an unsafe mix fails loudly rather than undercounting spend.
 Usage schema migrations are additive and should be applied before the new
 binary. Missing usage columns cause off-path sink drops rather than request
 failure, which still makes migration ordering operationally important.
+
+That last sentence stops being true for a billing-grade deployment: with
+`[usage_journal] backend = "postgres"` the outbox is on the request path, so a
+missing or unreadable outbox table is `503 usage_not_durable` per request under
+the default policy, not an off-path drop. Apply outbox DDL before the writers,
+and drain the outbox before rolling back to a build that predates a row version.
 
 ## Rollback
 

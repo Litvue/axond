@@ -43,6 +43,8 @@ use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
 use crate::shutdown::Lifecycle;
 use crate::status::registry::CachedStatusRegistry;
+use crate::usage::UsageDelivery;
+#[cfg(test)]
 use crate::usage::UsageFanout;
 
 pub use crate::principals::InboundKey;
@@ -52,7 +54,9 @@ pub struct AppState(pub Arc<Inner>);
 
 pub struct Inner {
     pub dispatcher: HttpDispatcher,
-    pub usage: UsageFanout,
+    /// How a terminated request's usage leaves the process. Telemetry-grade by
+    /// default; a durable append when a journal is configured.
+    pub usage: Arc<UsageDelivery>,
     pub budget: Box<dyn BudgetStore>,
     /// Process-level ceilings. Like the HTTP client's bounds these own state
     /// built at boot, so a reloaded `[admission]` section applies on restart.
@@ -81,7 +85,7 @@ pub struct Inner {
 
 /// What a replica reports about itself, as distinct from what it serves.
 ///
-/// Passed in rather than built inside [`AppState::new_with_rate_limiter`] because
+/// Passed in rather than built inside [`AppState::with_resources`] because
 /// the two fields have no stateless implementation to default to *usefully*: a
 /// stateless replica has an all-`disabled` registry and no convergence, and a
 /// stateful one is handed the registry its probes publish into and the status the
@@ -608,6 +612,7 @@ impl AppState {
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_rate_limiter(
         config: Config,
         env: &HashMap<String, String>,
@@ -627,12 +632,37 @@ impl AppState {
         )
     }
 
-    /// The full constructor: what this replica serves, plus what it reports about
-    /// itself.
+    /// What this replica serves, plus what it reports about itself, for a
+    /// deployment whose usage is telemetry-grade. The boot path builds its
+    /// delivery first and calls [`AppState::with_resources`].
+    #[cfg(test)]
     pub fn new_with_observability(
         config: Config,
         env: &HashMap<String, String>,
         usage: UsageFanout,
+        budget: Box<dyn BudgetStore>,
+        rate_limiter: Box<dyn RateLimiter>,
+        revocation: Box<dyn RevocationStore>,
+        observability: ReplicaObservability,
+    ) -> Result<Self, SnapshotError> {
+        Self::with_resources(
+            config,
+            env,
+            Arc::new(UsageDelivery::telemetry(usage)),
+            budget,
+            rate_limiter,
+            revocation,
+            observability,
+        )
+    }
+
+    /// The boot path: every process-level resource is already connected, usage
+    /// delivery included, so a deployment that cannot reach a datastore it asked
+    /// for has already failed before this is called.
+    pub fn with_resources(
+        config: Config,
+        env: &HashMap<String, String>,
+        usage: Arc<UsageDelivery>,
         budget: Box<dyn BudgetStore>,
         rate_limiter: Box<dyn RateLimiter>,
         revocation: Box<dyn RevocationStore>,
