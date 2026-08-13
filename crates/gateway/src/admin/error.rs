@@ -380,6 +380,9 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
             ("tenant_scoped_dependency", Some(*from))
         }
         ValidationError::Tenancy(_) => ("tenancy", None),
+        // #243's credential records validate by their own rules; the resource is
+        // named by the inner error's message, and the material never is.
+        ValidationError::Credential(_) => ("provider_credential", None),
         ValidationError::AuditMutationMismatch { .. } => ("audit_mutation_mismatch", None),
         ValidationError::Canonical(_) => ("not_canonical", None),
     }

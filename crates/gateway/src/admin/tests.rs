@@ -854,6 +854,11 @@ async fn convergence_is_projected_from_replica_state_without_reading_the_backend
 // ---------------------------------------------------------------------------
 
 /// A state whose bodies contain unmistakably secret-looking values.
+///
+/// Deliberately not a provider credential: since #243 a credential body cannot
+/// carry material at all, so it would prove nothing here. Redaction has to hold
+/// for *any* body, including one whose schema this slice knows nothing about,
+/// because the projections never read a body — they carry its checksum.
 fn state_with_secret_looking_bodies() -> DesiredState {
     let tenant = fixtures::tenant_id(1);
     let mut state = DesiredState::new();
@@ -861,7 +866,7 @@ fn state_with_secret_looking_bodies() -> DesiredState {
         .insert(fixtures::tenant(1, "acme"))
         .and_then(|state| {
             state.insert(ResourceVersion::new(
-                fixtures::reference(ResourceKind::ProviderCredential, 3),
+                fixtures::reference(ResourceKind::Policy, 3),
                 ResourceScope::Tenant(tenant),
                 Slug::parse("primary").expect("a slug"),
                 ResourceBody::Inline(CanonicalValue::map([(
@@ -890,6 +895,7 @@ async fn no_secret_looking_value_reaches_a_diff_a_state_read_or_a_response() {
         .expect("a publication");
     let base = crate::desired_state::RevisionId::parse(first.revision().unwrap()).unwrap();
 
+    // "Rotation" here is just a second version of the same resource.
     let rotated = {
         let tenant = fixtures::tenant_id(1);
         let mut state = DesiredState::new();
@@ -897,7 +903,7 @@ async fn no_secret_looking_value_reaches_a_diff_a_state_read_or_a_response() {
             .insert(fixtures::tenant(1, "acme"))
             .and_then(|state| {
                 state.insert(ResourceVersion::new(
-                    fixtures::reference(ResourceKind::ProviderCredential, 3)
+                    fixtures::reference(ResourceKind::Policy, 3)
                         .at(crate::desired_state::ResourceVersionNumber::FIRST.next()),
                     ResourceScope::Tenant(tenant),
                     Slug::parse("primary").expect("a slug"),
@@ -923,15 +929,15 @@ async fn no_secret_looking_value_reaches_a_diff_a_state_read_or_a_response() {
         .await
         .expect("a dry run of the rotation");
 
-    // The rotation is visible — one updated resource, with a changed content
+    // The change is visible — one updated resource, with a changed content
     // checksum — and neither value is.
     assert_eq!(outcome.diff.summary.updated, 1);
     let delta = outcome
         .diff
         .resources
         .iter()
-        .find(|delta| delta.kind == "provider-credential")
-        .expect("the credential changed");
+        .find(|delta| delta.kind == "policy")
+        .expect("the body-bearing resource changed");
     let before = delta.previous_body.as_ref().expect("a previous body");
     let after = delta.body.as_ref().expect("a new body");
     assert_ne!(before.content, after.content, "a rotation must be visible");
