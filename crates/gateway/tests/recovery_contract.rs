@@ -23,7 +23,7 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use support::recovery::{self, BLOCKING_ISSUES, Capability, Evidence, Readiness, Status};
+use support::recovery::{self, BLOCKING_ISSUES, Capability, Evidence, Readiness, Runner, Status};
 
 #[test]
 fn every_scenario_the_issue_names_is_committed_exactly_once() {
@@ -250,6 +250,61 @@ fn the_dependency_map_is_complete_in_both_directions() {
     );
 }
 
+/// A slice may leave the dependency map, but only by saying what became of it.
+/// Deleting the last claim on a slice is indistinguishable from deleting the
+/// stage that needed it, so a retirement is recorded, cannot also be a live
+/// blocker, cannot still be named by a stage, and has to be accounted for in
+/// the operator contract with the issue that still tracks the rest of it.
+#[test]
+fn a_retired_blocker_says_what_became_of_the_slice() {
+    let manifest = recovery::load();
+    let live: BTreeSet<u32> = BLOCKING_ISSUES.into_iter().collect();
+    let contract = recovery::contract_text();
+
+    let committed: BTreeSet<u32> = manifest.retired_blockers.iter().map(|r| r.issue).collect();
+    let recorded: BTreeSet<u32> = recovery::RETIRED_BLOCKERS.iter().map(|(i, _)| *i).collect();
+    assert_eq!(
+        committed,
+        recorded,
+        "{} and RETIRED_BLOCKERS disagree about which slices were retired",
+        recovery::MANIFEST_RELATIVE
+    );
+    for retired in &manifest.retired_blockers {
+        assert!(
+            retired.became.len() > 80,
+            "#{}: the manifest has to say what became of a retired slice, not {:?}",
+            retired.issue,
+            retired.became
+        );
+    }
+
+    for (issue, became) in recovery::RETIRED_BLOCKERS {
+        assert!(
+            !live.contains(&issue),
+            "#{issue} is both retired and a live blocker"
+        );
+        assert!(
+            became.len() > 80,
+            "#{issue}: a retirement needs a reason a reader can act on, not {became:?}"
+        );
+        for scenario in &manifest.scenarios {
+            for stage in &scenario.stages {
+                assert!(
+                    stage.blocked_on.iter().all(|d| d.issue != issue),
+                    "{}/{}: waits on retired slice #{issue}",
+                    scenario.id,
+                    stage.id
+                );
+            }
+        }
+        assert!(
+            contract.contains(&format!("#{issue}")),
+            "{} does not say what became of retired slice #{issue}",
+            recovery::CONTRACT_RELATIVE
+        );
+    }
+}
+
 /// The honesty gate at the scenario level: a scenario is executable exactly
 /// when every stage of it is, so a scenario cannot be reported as qualified
 /// while the half that offers traffic is still waiting on a slice.
@@ -274,6 +329,50 @@ fn a_scenario_is_executable_only_when_every_stage_of_it_is() {
                 scenario.id
             ),
         }
+    }
+}
+
+/// A stage that runs names the lane that runs it, and a stage that does not
+/// names none. The runner is what `ops/check-recovery-evidence.py` reads to
+/// decide which artifacts a lane owes: an executable stage without one would
+/// be a stage no lane is checked for, which is exactly the shape of evidence
+/// quietly going missing.
+#[test]
+fn every_executable_stage_names_the_lane_that_runs_it() {
+    let manifest = recovery::load();
+    let mut per_runner: BTreeMap<Runner, Vec<String>> = BTreeMap::new();
+
+    for scenario in &manifest.scenarios {
+        for stage in &scenario.stages {
+            let id = format!("{}/{}", scenario.id, stage.id);
+            match (stage.status, stage.runner) {
+                (Status::Executable, Some(runner)) => {
+                    per_runner.entry(runner).or_default().push(id);
+                }
+                (Status::Executable, None) => {
+                    panic!("{id}: an executable stage must name the lane that runs it")
+                }
+                (Status::Blocked, Some(runner)) => panic!(
+                    "{id}: a blocked stage cannot claim the `{}` lane runs it",
+                    runner.as_str()
+                ),
+                (Status::Blocked, None) => {}
+            }
+        }
+    }
+
+    for runner in Runner::ALL {
+        assert!(
+            per_runner.contains_key(&runner),
+            "the `{}` lane runs no stage; either it is dead or its stages were dropped",
+            runner.as_str()
+        );
+        assert!(
+            recovery::contract_text().contains(&format!("`{}`", runner.as_str())),
+            "{} does not say what the `{}` lane runs",
+            recovery::CONTRACT_RELATIVE,
+            runner.as_str()
+        );
     }
 }
 
@@ -315,6 +414,59 @@ fn the_prose_contract_and_the_manifest_agree() {
             "{} does not say what {} holds",
             recovery::CONTRACT_RELATIVE,
             class.as_str()
+        );
+    }
+}
+
+/// The two lanes write into one evidence directory, and a reader compares the
+/// artifacts in it. That only holds while they agree on the schema: the shell
+/// lane's recorder repeats the version the driver's `EVIDENCE_SCHEMA_VERSION`
+/// declares, and a bump on one side that is not made on the other silently
+/// produces a directory holding two schemas under one version number.
+#[test]
+fn the_two_lanes_write_the_same_artifact_schema() {
+    let root = recovery::workspace_root();
+    let driver = std::fs::read_to_string(root.join("crates/gateway/src/qualification/evidence.rs"))
+        .expect("the driver's evidence module is readable");
+    let declared = driver
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("pub(crate) const EVIDENCE_SCHEMA_VERSION: u32 = ")
+                .and_then(|rest| rest.trim_end_matches(';').parse::<u32>().ok())
+        })
+        .expect("the driver declares an evidence schema version");
+
+    for lane in ["ops/recovery-evidence.py", "ops/check-recovery-evidence.py"] {
+        let source = std::fs::read_to_string(root.join(lane)).expect("the lane script is readable");
+        let repeated = source
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("SCHEMA_VERSION = ")
+                    .and_then(|rest| rest.trim().parse::<u32>().ok())
+            })
+            .unwrap_or_else(|| panic!("{lane} declares no SCHEMA_VERSION"));
+        assert_eq!(
+            repeated, declared,
+            "{lane} writes schema {repeated} and the driver writes {declared}"
+        );
+    }
+}
+
+/// Every stage the manifest calls executable is owed an artifact, and the
+/// checker is what turns a lane that produced none into a failure rather than
+/// an empty upload. It reads the manifest, so it must accept every lane the
+/// manifest names — a lane it rejects is a lane nothing checks.
+#[test]
+fn the_evidence_checker_accepts_every_lane_the_manifest_names() {
+    let checker =
+        std::fs::read_to_string(recovery::workspace_root().join("ops/check-recovery-evidence.py"))
+            .expect("the evidence checker is readable");
+    for runner in Runner::ALL {
+        assert!(
+            checker.contains(&format!("\"{}\"", runner.as_str())),
+            "ops/check-recovery-evidence.py cannot be run for the `{}` lane",
+            runner.as_str()
         );
     }
 }

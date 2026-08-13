@@ -72,25 +72,38 @@ only a long run can exercise have no run behind them."""
 [[slice]]
 id = "recovery"
 issue = 219
-status = "declared"
+status = "harnessed"
 question = """
 What a stateful deployment serves, refuses, and converges to across a \
 control-plane outage, a cold boot, a credential rotation, and a restore."""
 covers = ["backend_outage", "control_plane_outage"]
 manifest = "qualification/recovery/manifest.toml"
-# Not a driver: it measures nothing, it only stops the committed scenarios from
-# decaying into a wish list while their dependencies land.
+# In the crate rather than in `tests/`, because a stage holds a replica's
+# reconciler, its signed cache, and a real control plane at once and then takes
+# the database away from underneath them (ADR 0037). The second lane is
+# `ops/restore-drill.sh`, which recovers a database and hands it to a replica.
+driver = "crates/gateway/src/qualification/recovery.rs"
+# Keeps the committed scenarios from decaying into a wish list while the stages
+# that need a served request wait on their dependencies.
 contract_test = "crates/gateway/tests/recovery_contract.rs"
 contract = "docs/operations/recovery-qualification.md"
 adr = "docs/adr/0037-recovery-qualification-harness.md"
+reduced_lane = "cargo test --workspace"
+heavy_lane = ".github/workflows/ci.yml"
+# The tier that would evidence the slice: every scenario's serving stage run
+# against a real fleet. No such run exists, which is what keeps this slice
+# harnessed rather than evidenced.
+heavy_tier = "serving"
 retained = []
 outstanding = """
-Every scenario is blocked: a stateful replica has no revision to serve until \
-the resource slices land, so the committed scenarios are a contract and the \
-driver only checks that the contract stays honest."""
+Nine stages run against a real Postgres and retain evidence — the outage, the \
+three cold boots, journal convergence, a logical restore, and a point-in-time \
+recovery — but every scenario still has a blocked stage, because a stateful \
+replica cannot serve a projected revision, so nothing that needs an offered \
+request is measured."""
 # Mirrors the union of the recovery manifest's own dependency map, and is
 # checked against it.
-blocked_on = [144, 145, 146, 147, 148, 149, 150, 155, 158, 159]
+blocked_on = [144, 145, 146, 147, 148, 149, 150, 155, 158]
 
 # The fault slice: what a failing dependency does to a request.
 [[slice]]

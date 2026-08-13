@@ -5079,6 +5079,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 
     #[tokio::test]
     async fn buffered_pool_dispatch_emits_parented_lease_spans() {
+        use tracing::instrument::WithSubscriber as _;
         let base_url = rate_limiting_upstream("sk-rate-limited").await;
         let cfg = Config::from_toml_str(&format!(
             r#"
@@ -5152,17 +5153,22 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("axond-test")));
         let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
         let dispatch = tracing::Dispatch::new(subscriber);
-        let response = tokio::spawn(async move {
-            let _default = tracing::dispatcher::set_default(&dispatch);
-            router(state)
-                .oneshot(
-                    authorized("/v1/chat/completions")
-                        .body(Body::from(body))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        })
+        // The subscriber travels with the future, not with the thread that
+        // spawned it: `set_default` is thread-local, so a task the runtime
+        // resumes on another worker after an await would record nothing.
+        let response = tokio::spawn(
+            async move {
+                router(state)
+                    .oneshot(
+                        authorized("/v1/chat/completions")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+            .with_subscriber(dispatch),
+        )
         .await
         .unwrap();
 

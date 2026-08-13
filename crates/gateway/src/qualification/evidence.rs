@@ -26,7 +26,7 @@ use serde::Serialize;
 
 /// The artifact schema. Bumped when a field a reader depends on changes
 /// meaning, so an old artifact is recognisable rather than misread.
-pub(crate) const EVIDENCE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 /// Where a stage's evidence lands, relative to the workspace root.
 pub(crate) const EVIDENCE_DIR: &str = "target/recovery";
@@ -39,6 +39,10 @@ pub(crate) struct Artifact {
     /// The stage within it. `scenario/stage` is the key the manifest and the
     /// driver registry agree on.
     pub(crate) stage: String,
+    /// The lane that produced it, as the manifest spells it. A lane is checked
+    /// against the stages it claims, so the artifact says which lane wrote it
+    /// rather than leaving that to the file name.
+    pub(crate) runner: String,
     pub(crate) capability: String,
     /// The evidence classes the manifest says this stage retains, echoed so a
     /// reader can check the artifact against the contract without loading it.
@@ -51,6 +55,16 @@ pub(crate) struct Artifact {
     /// machine-readable evidence.
     pub(crate) observations: BTreeMap<String, Observation>,
     pub(crate) gates: Vec<Verdict>,
+    /// The conditions the stage itself requires — the ones that are not
+    /// manifest gate fields, like "the snapshot generation did not move during
+    /// the outage".
+    ///
+    /// They are recorded rather than asserted so that a stage that fails still
+    /// writes its evidence: an `assert!` in the middle of a stage unwinds
+    /// before the artifact is written, which turns a real regression into a
+    /// missing file, and a missing file is the one failure mode a retained
+    /// evidence directory cannot describe.
+    pub(crate) checks: Vec<Verdict>,
 }
 
 impl Artifact {
@@ -71,6 +85,7 @@ impl Artifact {
     pub(crate) fn failures(&self) -> Vec<&Verdict> {
         self.gates
             .iter()
+            .chain(&self.checks)
             .filter(|verdict| verdict.outcome == Outcome::Failed)
             .collect()
     }
@@ -83,12 +98,14 @@ impl Artifact {
             .filter(|verdict| verdict.outcome != Outcome::NotEvaluated)
             .count();
         format!(
-            "{}/{}: {} events, {} observations, {evaluated}/{} gates evaluated, {} failed",
+            "{}/{}: {} events, {} observations, {evaluated}/{} gates evaluated, {} checks, {} \
+             failed",
             self.scenario,
             self.stage,
             self.timeline.len(),
             self.observations.len(),
             self.gates.len(),
+            self.checks.len(),
             self.failures().len(),
         )
     }
@@ -184,6 +201,7 @@ pub(crate) enum Outcome {
 pub(crate) struct Recorder {
     scenario: String,
     stage: String,
+    runner: String,
     capability: String,
     evidence: Vec<String>,
     schema: String,
@@ -194,12 +212,14 @@ pub(crate) struct Recorder {
     timeline: Vec<Event>,
     observations: BTreeMap<String, Observation>,
     gates: Vec<Verdict>,
+    checks: Vec<Verdict>,
 }
 
 impl Recorder {
     pub(crate) fn new(
         scenario: &str,
         stage: &str,
+        runner: &str,
         capability: &str,
         evidence: &[&str],
         schema: &str,
@@ -208,6 +228,7 @@ impl Recorder {
         Self {
             scenario: scenario.to_owned(),
             stage: stage.to_owned(),
+            runner: runner.to_owned(),
             capability: capability.to_owned(),
             evidence: evidence.iter().map(|class| (*class).to_owned()).collect(),
             schema: schema.to_owned(),
@@ -221,6 +242,7 @@ impl Recorder {
             timeline: Vec::new(),
             observations: BTreeMap::new(),
             gates: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -271,11 +293,55 @@ impl Recorder {
         });
     }
 
+    /// Record a condition the stage requires, comparing what it expected with
+    /// what it saw.
+    ///
+    /// This is the driver's `assert_eq!`, with the difference that matters: it
+    /// keeps running to the end of the stage and fails through the artifact, so
+    /// the evidence for the failure is written before the failure is raised.
+    pub(crate) fn require(
+        &mut self,
+        check: &str,
+        expected: impl std::fmt::Display,
+        observed: impl std::fmt::Display,
+        detail: impl Into<String>,
+    ) {
+        let (expected, observed) = (expected.to_string(), observed.to_string());
+        let met = expected == observed;
+        self.checks.push(Verdict {
+            gate: check.to_owned(),
+            bound: expected,
+            observed,
+            outcome: if met { Outcome::Met } else { Outcome::Failed },
+            detail: detail.into(),
+        });
+    }
+
+    /// The same, for a condition that is already a boolean.
+    pub(crate) fn require_that(&mut self, check: &str, held: bool, detail: impl Into<String>) {
+        self.require(check, true, held, detail);
+    }
+
+    /// Whether a check this stage recorded held — for the few places where the
+    /// stage cannot carry on meaningfully once one has failed.
+    ///
+    /// A name nothing recorded did not hold: the names are free-form strings, so
+    /// a typo would otherwise read as a pass and carry the stage on.
+    pub(crate) fn held(&self, check: &str) -> bool {
+        let mut recorded = self
+            .checks
+            .iter()
+            .filter(|verdict| verdict.gate == check)
+            .peekable();
+        recorded.peek().is_some() && recorded.all(|verdict| verdict.outcome != Outcome::Failed)
+    }
+
     pub(crate) fn finish(self) -> Artifact {
         Artifact {
             schema_version: EVIDENCE_SCHEMA_VERSION,
             scenario: self.scenario,
             stage: self.stage,
+            runner: self.runner,
             capability: self.capability,
             evidence: self.evidence,
             run: RunMeta {
@@ -289,6 +355,7 @@ impl Recorder {
             timeline: self.timeline,
             observations: self.observations,
             gates: self.gates,
+            checks: self.checks,
         }
     }
 }
@@ -307,6 +374,7 @@ mod tests {
         Recorder::new(
             "control-plane-outage",
             "journal-outage",
+            "stateful-tests",
             "control_plane_outage",
             &["outage_timeline"],
             "recovery_1",
@@ -337,6 +405,27 @@ mod tests {
             "only the evaluated, unmet gate fails the stage"
         );
         assert!(artifact.summary().contains("2/3 gates evaluated"));
+    }
+
+    /// The caveat this schema exists to close: a stage whose condition failed
+    /// still produces an artifact, and the artifact is what fails the run.
+    #[test]
+    fn a_failed_check_fails_the_stage_through_the_artifact() {
+        let mut recorder = recorder();
+        recorder.require("active_revision_survived_the_cut", "rev_1", "rev_1", "held");
+        recorder.require_that("the_publish_was_retryable", false, "it was not");
+        assert!(recorder.held("active_revision_survived_the_cut"));
+        assert!(!recorder.held("the_publish_was_retryable"));
+        assert!(
+            !recorder.held("a_check_nobody_recorded"),
+            "an unrecorded condition did not hold, so a mistyped name cannot read as a pass"
+        );
+
+        let artifact = recorder.finish();
+        let failures = artifact.failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].gate, "the_publish_was_retryable");
+        assert!(artifact.summary().contains("2 checks, 1 failed"));
     }
 
     /// The provenance a reader needs to know whether two artifacts are

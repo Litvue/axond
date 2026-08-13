@@ -253,15 +253,24 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-targets: false
+      - name: Note when this lane started
+        run: echo "lane_started_ms=$(($(date +%s%N) / 1000000))" >>"$GITHUB_ENV"
       - run: cargo test -p axond --all-features --locked
         env:
           AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
           AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
           AXOND_TEST_REQUIRE_SERVICES: "1"
       # The recovery stages that run today are part of the suite above, and
-      # their point is the evidence they retain (ADR 0037), so it is kept.
-      # `warn`: an earlier target failing stops the suite before the recovery
-      # stages run, and that lane's finding is the failing test.
+      # their point is the evidence they retain (ADR 0037). A passing suite that
+      # left no artifact is the failure an evidence directory cannot describe on
+      # its own, so it is checked against the manifest rather than inferred from
+      # the upload: every stage the manifest gives this lane owes a file here.
+      - name: Check the stateful lane retained its evidence
+        run: |
+          python3 ops/check-recovery-evidence.py --runner stateful-tests \
+            --since-unix-ms "$lane_started_ms"
+      # `warn` on the upload: an earlier target failing stops the suite before
+      # the recovery stages run, and that lane's finding is the failing test.
       - name: Publish the recovery evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -385,6 +394,7 @@ jobs:
           python3 ops/check-docs.py
           python3 ops/check-release-config.py --self-test
           python3 ops/check-release-config.py
+          python3 ops/check-recovery-evidence.py --self-test
           shellcheck install.sh ops/publish-image-index.sh \
             ops/verify-image-evidence.sh ops/check-compose-platform.sh \
             ops/check-installer-download.sh ops/check-index-promotion.sh \
@@ -664,8 +674,34 @@ jobs:
           cache-targets: false
       - name: Build the binary the drill verifies restores with
         run: cargo build -p axond --locked
+      # The lane's Python runs on the floor the contributor flow supports, not on
+      # whatever the runner ships, so the recovery scripts are exercised there
+      # rather than only on a Python that happens to have `tomllib`.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.10'
+      - name: Provision the ops venv the contributor recipes use
+        run: |
+          python3 -m venv target/ops-venv
+          target/ops-venv/bin/pip install --quiet --require-virtualenv \
+            --require-hashes -r ops/deploy-requirements.txt
+      # The drill checks itself at the end — it runs the same evidence checker
+      # for its own lane — so a drill that skipped a stage fails here rather than
+      # uploading a partial directory.
       - name: Restore a logical dump and recover to a chosen point in time
-        run: bash ops/restore-drill.sh
+        env:
+          AXOND_PYTHON: ${{ github.workspace }}/target/ops-venv/bin/python
+        run: |
+          target/ops-venv/bin/python --version
+          target/ops-venv/bin/python ops/check-recovery-evidence.py --self-test
+          bash ops/restore-drill.sh
+      - name: Publish the restore evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: restore-drill-evidence
+          path: target/recovery/*.json
+          if-no-files-found: warn
 
   # Whether a rolling update completes is a scheduling outcome, not a manifest
   # property: kube-scheduler counting skew across ReplicaSets decides it, and no

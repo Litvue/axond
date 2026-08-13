@@ -658,7 +658,9 @@ def check_recovery_drill(workflow: dict[str, Any], page: str, drill: str) -> lis
             failures.append(
                 f"docs/operations/backup-and-recovery.md: {wanted} is not documented"
             )
-    if "the write after the target is not replayed" not in drill:
+    # The drill names its checks as evidence identifiers, so the assertion is
+    # `the_write_after_the_target_is_not_replayed` rather than a sentence.
+    if "the_write_after_the_target_is_not_replayed" not in drill:
         failures.append(
             "ops/restore-drill.sh: the assertion that the post-target write is absent is gone; "
             "without it a recovery that replayed the whole WAL passes the drill"
@@ -1006,7 +1008,9 @@ def self_test() -> int:
     expect_failure(
         "drill without its asymmetric assertion",
         check_recovery_drill(
-            workflow, recovery, drill.replace("the write after the target is not replayed", "present")
+            workflow,
+            recovery,
+            drill.replace("the_write_after_the_target_is_not_replayed", "a_write"),
         ),
     )
 
