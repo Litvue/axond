@@ -912,7 +912,19 @@ impl AvailabilityEvidence {
             .collect::<BTreeMap<_, _>>();
         let mut pending_orphaned = self.lock(&self.orphaned);
         let previous_orphaned = pending_orphaned.clone();
-        pending_orphaned.retain(|key, _| projected.index().record(key).is_none());
+        // Cleanup is forgotten only for a key this derivation *speaks for*: one
+        // whose record now holds evidence, so the write replaces those rows, or
+        // carries a definitive watermark, so the write clears them. A key the
+        // revision merely describes again has an empty record, and an empty
+        // record claims no evidence key at all — dropping the entry there would
+        // leave the pre-removal rows durable with nothing left to remove them,
+        // and the next restart would read them back as evidence.
+        pending_orphaned.retain(|key, _| {
+            projected
+                .index()
+                .record(key)
+                .is_none_or(|record| !record.holds_evidence())
+        });
         pending_orphaned.extend(orphaned);
         drop(pending_orphaned);
         *self.lock(&self.replaced) = Some(Superseded {

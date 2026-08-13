@@ -742,6 +742,55 @@ fn removed_targets_have_a_bounded_orphan_evidence_lifecycle() {
     assert_eq!(write.cleared(), &[]);
 }
 
+/// Describing a key again is not the same as owning its evidence: a re-enabled
+/// target that has not been looked at yet projects an empty record, which claims
+/// no evidence key, so the queued cleanup for its pre-removal rows has to survive
+/// the re-description or those rows stay durable forever.
+#[test]
+fn a_re_described_key_without_evidence_keeps_its_orphan_cleanup() {
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+    evidence.observe(DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(90),
+    ));
+    evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("the target projects");
+    evidence
+        .derive(&DesiredState::new(), &resolved(40))
+        .expect("removing the target projects");
+
+    let restored = evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("reintroducing the target projects");
+    assert!(
+        restored
+            .index()
+            .record(&deployment.key())
+            .is_some_and(|record| !record.holds_evidence()),
+        "a re-described target starts from no evidence of its own"
+    );
+
+    let write = evidence.persistable();
+    assert!(write.rows().is_empty());
+    assert_eq!(
+        write.cleared(),
+        &[EvidenceClear::new(deployment.key(), at(90))],
+        "the detached rows are still the ones this replica has to remove"
+    );
+
+    evidence.acknowledge_persisted(&write);
+    assert!(
+        evidence.persistable().cleared().is_empty(),
+        "cleanup a writer applied is not asked for twice"
+    );
+}
+
 #[test]
 fn persisted_orphan_cleanup_is_removed_after_successful_write() {
     let deployment = Deployment::new().entitled().governed();

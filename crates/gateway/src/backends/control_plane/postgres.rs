@@ -28,7 +28,7 @@
 //!   opaque secret *reference*; plaintext lives in the secret store, and no value
 //!   from a body is ever logged.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1118,12 +1118,11 @@ impl ObservationStore for PostgresControlPlane {
                     .transaction()
                     .await
                     .map_err(|error| unavailable("begin an observation write", &error))?;
-                // A replica may be behind another replica. Replace only evidence
-                // no newer than this write, so a stale projection cannot erase a
-                // look the other replica learned later. The cutoff is per key:
-                // rows are a whole-record replacement, while an explicit clear
-                // carries the newest observation it owns. `ON CONFLICT DO NOTHING`
-                // preserves a row that won the race with a still-stale writer.
+                // A replica may be behind another replica. A key's replacement is
+                // whole-record — a record whose retained look was discredited has
+                // to stop having a stored one, which an upsert alone cannot say —
+                // so the watermark is per key: the newest instant this write owns
+                // for it, across its rows and its explicit clear.
                 let mut replaced: BTreeMap<AvailabilityKey, SystemTime> = BTreeMap::new();
                 for row in &rows {
                     replaced
@@ -1137,26 +1136,54 @@ impl ObservationStore for PostgresControlPlane {
                         .and_modify(|before| *before = (*before).max(clear.before))
                         .or_insert(clear.before);
                 }
-                for (key, before) in replaced {
+                let mut behind: BTreeSet<AvailabilityKey> = BTreeSet::new();
+                for (key, before) in &replaced {
+                    let tenant = key.scope.tenant.to_string();
+                    let project = key.scope.project.map(|project| project.to_string());
+                    let provider = key.target.provider.as_str();
+                    let model = key.target.model.as_str();
+                    // Locked, then compared: the write is a replacement of every
+                    // slot the key has, so a key the store knows more about than
+                    // this replica does is left entirely alone rather than
+                    // half-replaced. Deleting up to this watermark and inserting
+                    // over it is not enough on its own — a fallback older than
+                    // this write's current look would be deleted on behalf of a
+                    // row that then loses the insert to a newer current row, and
+                    // the deployment would be left holding less evidence than
+                    // either replica has.
+                    let held = transaction
+                        .query(
+                            "SELECT observed_at FROM axond_cp_availability_observation \
+                             WHERE tenant_id = $1 AND project_id IS NOT DISTINCT FROM $2 \
+                             AND provider = $3 AND model = $4 FOR UPDATE",
+                            &[&tenant, &project, &provider, &model],
+                        )
+                        .await
+                        .map_err(|error| {
+                            observation_write_failure("read evidence being replaced", &error)
+                        })?;
+                    let newest = held
+                        .iter()
+                        .map(|row| row.get::<_, SystemTime>(0))
+                        .max()
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    if newest > *before {
+                        behind.insert(key.clone());
+                        continue;
+                    }
                     transaction
                         .execute(
                             "DELETE FROM axond_cp_availability_observation \
                              WHERE tenant_id = $1 AND project_id IS NOT DISTINCT FROM $2 \
                              AND provider = $3 AND model = $4 AND observed_at <= $5",
-                            &[
-                                &key.scope.tenant.to_string(),
-                                &key.scope.project.map(|project| project.to_string()),
-                                &key.target.provider.as_str(),
-                                &key.target.model.as_str(),
-                                &before,
-                            ],
+                            &[&tenant, &project, &provider, &model, before],
                         )
                         .await
                         .map_err(|error| {
                             observation_write_failure("replace discovery evidence", &error)
                         })?;
                 }
-                for row in &rows {
+                for row in rows.iter().filter(|row| !behind.contains(&row.key)) {
                     // `detail` is dropped at the boundary rather than filtered on
                     // read: a probe's error body is not evidence, and a column
                     // holding it would be readable from every backup.
@@ -6156,6 +6183,87 @@ mod tests {
         let rows = store.load(Some(scope)).await.expect("read evidence");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].observation.is_same_look(&newer));
+    }
+
+    /// A behind replica's current look can be newer than another replica's stored
+    /// fallback and older than its stored current one. Replacing the key at that
+    /// watermark would delete the fallback on behalf of a row the newer current
+    /// look then keeps out, so the key is left alone entirely instead.
+    #[tokio::test]
+    async fn a_behind_replicas_write_does_not_erase_a_newer_records_fallback() {
+        let Some((store, dsn, schema)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(ExpectedRevision::Empty, "state", state()))
+            .await
+            .expect("a tenant exists to own evidence");
+
+        let scope = ScopeRef::tenant(tenant_id(1));
+        let key = AvailabilityKey::new(scope, observation_target());
+        let current = look(
+            scope,
+            DiscoveryResult::Absent,
+            DiscoveryCompleteness::Complete,
+            instant(300),
+        );
+        let fallback = look(
+            scope,
+            DiscoveryResult::Present,
+            DiscoveryCompleteness::Complete,
+            instant(200),
+        );
+        store
+            .save(&EvidenceWrite::of_rows(vec![
+                StoredObservation {
+                    key: key.clone(),
+                    slot: ObservationSlot::Current,
+                    observation: current.clone(),
+                    definitive_at: Some(instant(300)),
+                },
+                StoredObservation {
+                    key: key.clone(),
+                    slot: ObservationSlot::LastKnownGood,
+                    observation: fallback.clone(),
+                    definitive_at: Some(instant(200)),
+                },
+            ]))
+            .await
+            .expect("replica A writes both slots");
+
+        let replica_b = second_store(&dsn, &schema).await;
+        replica_b
+            .save(&EvidenceWrite::of_rows(vec![StoredObservation {
+                key: key.clone(),
+                slot: ObservationSlot::Current,
+                observation: look(
+                    scope,
+                    DiscoveryResult::Absent,
+                    DiscoveryCompleteness::Complete,
+                    instant(250),
+                ),
+                definitive_at: Some(instant(250)),
+            }]))
+            .await
+            .expect("replica B writes the only look it holds");
+
+        let rows = store.load(Some(scope)).await.expect("read evidence");
+        assert_eq!(
+            rows.len(),
+            2,
+            "a behind replica replaces neither slot of a record it knows less about"
+        );
+        let held: Vec<(ObservationSlot, SystemTime)> = rows
+            .iter()
+            .map(|row| (row.slot, row.observation.observed_at))
+            .collect();
+        assert_eq!(
+            held,
+            vec![
+                (ObservationSlot::Current, instant(300)),
+                (ObservationSlot::LastKnownGood, instant(200)),
+            ]
+        );
     }
 
     /// A stale discovery writer naming a tenant the journal no longer owns is a

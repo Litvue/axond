@@ -240,7 +240,10 @@ pub trait ObservationStore: Send + Sync {
     /// [`EvidenceWrite::cleared`] beside them — otherwise the one case where
     /// stored evidence must disappear is the one case a row set cannot express.
     /// The store only replaces rows at or before the write's observation
-    /// watermark, so a stale replica cannot erase a newer replica's knowledge.
+    /// watermark, and leaves a key entirely alone when it holds anything newer
+    /// than that watermark, so a stale replica cannot erase a newer replica's
+    /// knowledge — including the fallback slot of a record whose current look
+    /// this write is newer than.
     ///
     /// Atomic across both halves: a write that deleted the cleared keys and then
     /// failed to insert the rows would leave a replica remembering less than it
