@@ -25,7 +25,7 @@ pub const GATEWAY_KEY: &str = "test-inbound-key";
 /// The environment variable carrying a boot's private inbound key. Its value is
 /// unique per boot, which is what lets a readiness probe tell this child apart
 /// from a sibling test process serving the same loopback port.
-const BOOT_KEY_ENV: &str = "GW_BOOT_KEY";
+pub const BOOT_KEY_ENV: &str = "GW_BOOT_KEY";
 /// Upstream credentials the gateway is expected to inject, asserted on the
 /// fake upstream's recorded requests.
 pub const OPENAI_KEY: &str = "test-upstream-openai-key";
@@ -144,8 +144,10 @@ pub struct Axond {
     /// This boot's own config directory, removed with the process that read it.
     config_dir: PathBuf,
     output: Arc<Mutex<Output>>,
-    /// The threads draining the child's pipes into `output`, kept so a failed
-    /// boot can wait for them before quoting what the child said.
+    /// The threads draining the child's pipes into `output`, kept so a caller
+    /// can wait for them to reach EOF before quoting what the child said: the
+    /// last lines a process writes are the ones it flushes on its way out, and
+    /// reading the buffer the instant the child is reaped would miss them.
     readers: Vec<JoinHandle<()>>,
 }
 
@@ -448,6 +450,24 @@ impl Axond {
         }
     }
 
+    /// Wait until the readers of the child's stdout and stderr have reached
+    /// EOF, up to `within`. An exited child is reaped before the pipe it wrote
+    /// to has been drained, so a caller that reads the buffer immediately after
+    /// [`Axond::await_exit`] can miss the very lines a shutdown flush emits.
+    pub async fn settle_output(&self, within: Duration) {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if self
+                .readers
+                .iter()
+                .all(std::thread::JoinHandle::is_finished)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Wait for `/readyz` to report the drain, up to `within`. Returns the last
     /// status seen, so a test can distinguish "still ready" from "gone".
     pub async fn await_not_ready(&self, within: Duration) -> Option<reqwest::StatusCode> {
@@ -515,7 +535,10 @@ fn free_addr() -> SocketAddr {
     listener.local_addr().expect("a bound address")
 }
 
-fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str) -> String {
+/// The config a boot with these arguments is given. Public so a harness can
+/// preflight the exact bytes a replica will be started from *before* starting
+/// it, which is the order a deployment gate runs in.
+pub fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str) -> String {
     let price = format!(
         "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
     );

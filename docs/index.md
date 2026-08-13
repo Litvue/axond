@@ -71,6 +71,9 @@ and operate it.
 - [Endurance qualification](./operations/endurance.md) — the twelve-hour mixed
   workload, what a long run leaves behind, and the leak and accounting
   properties it gates on.
+- [Rollout qualification](./operations/rollout.md) — the rolling upgrade executed
+  against a real fleet: drain, readiness removal, replacement, mixed-version
+  windows, rollback limits, and the evidence a run leaves behind.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
 - [Control-plane revision journal](./operations/control-plane-journal.md) — the

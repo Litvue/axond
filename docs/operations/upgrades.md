@@ -64,6 +64,10 @@ that end before response commitment.
 Replica-local circuits and credential health start empty on replacement. Shared
 budgets, rate limits, revocation, and durable usage retain backend state.
 
+This sequence is executed on every change against a fleet of real replicas behind
+a readiness-driven balancer, including the rollback limits below:
+[rollout qualification](./rollout.md).
+
 ## Migrations that are not rolling
 
 Exact namespace-wide budgets require a stopped fleet:

@@ -11,6 +11,7 @@ pub mod capacity;
 pub mod endurance;
 pub mod gateway;
 pub mod recovery;
+pub mod rollout;
 pub mod stateful;
 pub mod tenancy;
 pub mod upstream;

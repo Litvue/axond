@@ -138,6 +138,16 @@ jobs:
           name: endurance-results-smoke
           path: target/endurance/smoke/*.json
           if-no-files-found: warn
+      # Likewise for the reduced rollout scenarios (ADR 0041). This lane has no
+      # database, so their rollback fence records itself as skipped; the
+      # `stateful-tests` lane below evaluates it.
+      - name: Publish the reduced rollout results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rollout-results-reduced
+          path: target/rollout/**/*.json
+          if-no-files-found: warn
 
   stateful-tests:
     name: Stateful tests
@@ -186,6 +196,15 @@ jobs:
         with:
           name: recovery-evidence
           path: target/recovery/*.json
+          if-no-files-found: warn
+      # This lane has the control plane the forward-only rollback fence needs, so
+      # its rollout artifacts are the ones that record the fence as evaluated.
+      - name: Publish the stateful rollout results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rollout-results-stateful
+          path: target/rollout/**/*.json
           if-no-files-found: warn
 
   sdk-compat:
