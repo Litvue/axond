@@ -584,37 +584,6 @@ async fn serve() -> anyhow::Result<()> {
         "administrative surface"
     );
 
-    // What this replica can say about itself: every dependency it opened is
-    // observed, on that dependency's own connection where the driver allows it,
-    // and nothing this deployment did not configure is. A stateless replica with
-    // no shared store therefore reports every component `disabled` without
-    // opening a socket. No posture touches `/readyz`: readiness is "do I hold a
-    // snapshot", and a probe that consulted a dependency would multiply one
-    // outage by the fleet size (ADR 0031).
-    let plan = ReplicaObservability::plan(
-        admin
-            .control_plane
-            .as_ref()
-            .map(|observed| (Arc::clone(&observed.store), observed.pacing.clone())),
-        budget.as_ref(),
-        rate_limiter.as_ref(),
-        revocation.as_ref(),
-    );
-    if !plan.is_empty() {
-        tracing::info!(
-            components = plan
-                .components()
-                .iter()
-                .map(|component| component.as_str())
-                .collect::<Vec<_>>()
-                .join(","),
-            refresh_interval_ms = plan.pacing().refresh_interval.as_millis() as u64,
-            staleness_budget_ms = plan.pacing().staleness_budget.as_millis() as u64,
-            "dependency status observed"
-        );
-    }
-    let (observability, status_refresher) = ReplicaObservability::observing(plan);
-
     // Metadata ingestion, brought up before the listener and owned by a task of
     // its own: every import runs off the request path, and a request cannot reach
     // the source or the store even indirectly (#146). A deployment that imports
@@ -647,8 +616,34 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
 
-    let bind = config.server.bind;
-    let watching = config.reload.watch;
+    // What this replica can say about itself: every dependency it opened is
+    // observed, including the bounded catalogue report when imports are enabled.
+    // No posture touches `/readyz`.
+    let plan = ReplicaObservability::plan_with_catalogue(
+        admin
+            .control_plane
+            .as_ref()
+            .map(|observed| (Arc::clone(&observed.store), observed.pacing.clone())),
+        budget.as_ref(),
+        rate_limiter.as_ref(),
+        revocation.as_ref(),
+        catalogue.as_ref().map(|handle| Arc::clone(handle.status())),
+    );
+    if !plan.is_empty() {
+        tracing::info!(
+            components = plan
+                .components()
+                .iter()
+                .map(|component| component.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            refresh_interval_ms = plan.pacing().refresh_interval.as_millis() as u64,
+            staleness_budget_ms = plan.pacing().staleness_budget.as_millis() as u64,
+            "dependency status observed"
+        );
+    }
+    let (observability, status_refresher) = ReplicaObservability::observing(plan);
+
     // The catalogue report is added to whatever posture this replica already
     // observes: importing metadata is orthogonal to administering a control
     // plane, and a replica may do either, both, or neither.
@@ -656,6 +651,9 @@ async fn serve() -> anyhow::Result<()> {
         None => observability,
         Some(handle) => observability.with_catalogue(Arc::clone(handle.status())),
     };
+
+    let bind = config.server.bind;
+    let watching = config.reload.watch;
     let state = AppState::new_with_policy(
         config,
         &env,

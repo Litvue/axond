@@ -48,11 +48,13 @@
 //!
 //! # What is observed
 //!
-//! One component, today: a replica in `mode = "stateful"` probes the control
-//! plane ([`probes::ControlPlaneProbe`]) on the store its administrative surface
-//! was built on, wired in
+//! A stateful replica probes the control plane
+//! ([`probes::ControlPlaneProbe`]) on the store its administrative surface was
+//! built on, wired in
 //! [`ReplicaObservability::observing`](crate::state::ReplicaObservability::observing).
-//! A stateless replica opens no store and observes nothing.
+//! An enabled catalogue import adds a cache-only catalogue probe
+//! ([`probes::CatalogProbe`]); a stateless replica otherwise opens no store and
+//! observes nothing.
 //!
 //! Every other component reports [`ComponentState::Disabled`] until the slice
 //! that owns its backend adds a probe and enables it — the two go together, since

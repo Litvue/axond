@@ -7422,14 +7422,12 @@ max_ttl = "15m"
         .await
         .expect("an offline catalogue starts")
         .expect("an enabled catalogue yields a handle");
-        let observability = || ReplicaObservability {
-            status: observed_registry(),
-            revision: None,
-            catalogue: Some(Arc::clone(handle.status())),
-        };
+        let (observability, refresher) =
+            ReplicaObservability::stateless_with_catalogue(Arc::clone(handle.status()));
+        refresher.refresh_once().await;
+        let state = status_state(observability);
 
-        let (status, body) =
-            status_response(status_state(observability()), Some(OPERATOR_KEY)).await;
+        let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
         assert_eq!(status, StatusCode::OK);
         let catalogue = &body["catalogue"];
         assert!(
@@ -7451,8 +7449,15 @@ max_ttl = "15m"
             !rendered.contains("models.dev"),
             "the summary names no upstream URL: {rendered}"
         );
+        let catalogue_component = body["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .find(|entry| entry["component"] == "catalogue")
+            .expect("catalogue component");
+        assert_eq!(catalogue_component["state"], "ok", "{body}");
 
-        let (status, body) = status_response(status_state(observability()), Some(TENANT_KEY)).await;
+        let (status, body) = status_response(state, Some(TENANT_KEY)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["scope"], "namespace");
         assert!(

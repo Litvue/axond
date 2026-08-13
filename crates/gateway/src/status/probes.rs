@@ -23,9 +23,82 @@ use super::registry::StatusRefresher;
 use super::registry::{ComponentProbe, MIN_REFRESH_INTERVAL, StatusSettings};
 use super::{Component, ComponentObservation, StatusReason};
 use crate::backends::BackendFailure;
+use crate::backends::catalog::RefusalReason;
+use crate::backends::catalog_runtime::CatalogStatus;
 use crate::backends::control_plane::postgres::ControlPlaneSettings;
 use crate::backends::control_plane::{ControlPlaneStore, StatusProbeAdmission};
 use crate::backends::health::BackendHealth;
+
+/// Observes the last bounded report produced by the off-request-path catalogue
+/// importer. The probe never fetches or opens the catalogue backend; it only
+/// reads the same in-memory status handle that the authenticated status route
+/// already projects.
+pub struct CatalogProbe {
+    status: Arc<CatalogStatus>,
+}
+
+impl CatalogProbe {
+    pub fn new(status: Arc<CatalogStatus>) -> Self {
+        Self { status }
+    }
+}
+
+const fn catalogue_reason(reason: RefusalReason) -> StatusReason {
+    match reason {
+        RefusalReason::Unreachable => StatusReason::Unreachable,
+        RefusalReason::Denied => StatusReason::PermissionDenied,
+        RefusalReason::NotJson => StatusReason::PayloadCorrupt,
+        RefusalReason::Schema => StatusReason::SchemaIncompatible,
+        RefusalReason::UnsupportedEndpoint
+        | RefusalReason::Oversized
+        | RefusalReason::IdMismatch
+        | RefusalReason::Identifier
+        | RefusalReason::UnknownStatus
+        | RefusalReason::UnknownModality
+        | RefusalReason::Price
+        | RefusalReason::UnknownTierType
+        | RefusalReason::DuplicateTier
+        | RefusalReason::NeutralPrice
+        | RefusalReason::UncanonicalizableText
+        | RefusalReason::AmbiguousModelKey
+        | RefusalReason::Content
+        | RefusalReason::NotRetained
+        | RefusalReason::UnsolicitedUnchanged
+        | RefusalReason::Unknown => StatusReason::ValidationRejected,
+    }
+}
+
+#[async_trait]
+impl ComponentProbe for CatalogProbe {
+    fn component(&self) -> Component {
+        Component::Catalogue
+    }
+
+    async fn observe(&self) -> ComponentObservation {
+        match self.status.report() {
+            None => ComponentObservation::unavailable(
+                Component::Catalogue,
+                StatusReason::Unknown,
+                "catalogue has no completed import".to_owned(),
+            ),
+            Some(report) => match report.last_refusal {
+                None => ComponentObservation::ok(Component::Catalogue),
+                Some(reason) => {
+                    let observation = if report.active.is_some() {
+                        ComponentObservation::degraded
+                    } else {
+                        ComponentObservation::unavailable
+                    };
+                    observation(
+                        Component::Catalogue,
+                        catalogue_reason(reason),
+                        format!("catalogue import refused: {}", reason.as_str()),
+                    )
+                }
+            },
+        }
+    }
+}
 
 /// Observes the control plane a stateful replica administers against.
 ///

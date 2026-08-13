@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::config::{
-    AdmissionConfig, BudgetConfig, Config, ConfigError, Mode, RateLimitConfig, Reload,
-    RevocationConfig, Transport, UsageJournalConfig, UsageSinkConfig,
+    AdmissionConfig, BudgetConfig, CatalogConfig, Config, ConfigError, Mode, RateLimitConfig,
+    Reload, RevocationConfig, Transport, UsageJournalConfig, UsageSinkConfig,
 };
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
@@ -59,6 +59,7 @@ struct Boot {
     revocation: RevocationConfig,
     transport: Transport,
     admission: AdmissionConfig,
+    catalog: CatalogConfig,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -88,6 +89,7 @@ impl Reloader {
                 revocation: booted.config.revocation.clone(),
                 transport: booted.config.transport.clone(),
                 admission: booted.config.admission.clone(),
+                catalog: booted.config.catalog.clone(),
             },
             path,
             state,
@@ -343,6 +345,8 @@ pub struct ReloadSummary {
     /// `[admission]` differs from the ceilings admission control was built with.
     /// Validated on reload, applied on restart.
     pub admission_changed: bool,
+    /// `[catalog]` differs from the catalogue importer built at boot.
+    pub catalog_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -539,6 +543,7 @@ impl ReloadSummary {
             revocation_changed: boot.revocation != after_config.revocation,
             transport_changed: boot.transport != after_config.transport,
             admission_changed: boot.admission != after_config.admission,
+            catalog_changed: boot.catalog != after_config.catalog,
         }
     }
 
@@ -574,6 +579,7 @@ impl ReloadSummary {
             budget_changed = self.budget_changed,
             rate_limit_changed = self.rate_limit_changed,
             revocation_changed = self.revocation_changed,
+            catalog_changed = self.catalog_changed,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -637,6 +643,11 @@ impl ReloadSummary {
         if self.admission_changed {
             tracing::warn!(
                 "`[admission]` changed, but the admission ceilings are already serving requests; restart to apply them"
+            );
+        }
+        if self.catalog_changed {
+            tracing::warn!(
+                "`[catalog]` changed, but the catalogue importer is built at boot; restart to apply it"
             );
         }
     }
@@ -1261,6 +1272,7 @@ env = "GW_ADMIN_BREAKGLASS"
             revocation: before.config.revocation.clone(),
             transport: before.config.transport.clone(),
             admission: before.config.admission.clone(),
+            catalog: before.config.catalog.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1294,6 +1306,7 @@ env = "GW_ADMIN_BREAKGLASS"
             revocation: before.config.revocation.clone(),
             transport: before.config.transport.clone(),
             admission: before.config.admission.clone(),
+            catalog: before.config.catalog.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1334,6 +1347,7 @@ env = "GW_ADMIN_BREAKGLASS"
             revocation: disabled.config.revocation.clone(),
             transport: disabled.config.transport.clone(),
             admission: disabled.config.admission.clone(),
+            catalog: disabled.config.catalog.clone(),
         };
 
         let added = ReloadSummary::between(&boot, &disabled, &enabled);
@@ -1404,6 +1418,7 @@ env = "GW_ADMIN_BREAKGLASS"
             revocation: before.config.revocation.clone(),
             transport: before.config.transport.clone(),
             admission: before.config.admission.clone(),
+            catalog: before.config.catalog.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(summary.gateway_minting.changed, vec!["enabled".to_owned()]);
@@ -2171,6 +2186,28 @@ targets = [
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("budget removal is valid");
         assert!(!summary.budget_changed);
+    }
+
+    #[tokio::test]
+    async fn catalogue_changes_are_reported_as_restart_required() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[catalog]\nsource = \"seed\"\nstore = \"in-memory\"\nbootstrap = \"seed\"\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("catalogue candidate is valid");
+        assert!(summary.catalog_changed);
+        assert!(summary.is_empty(), "catalogue importer is boot-owned");
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("catalogue removal is valid");
+        assert!(!summary.catalog_changed);
     }
 
     /// Turning billing-grade usage recording on or off is a restart, because the

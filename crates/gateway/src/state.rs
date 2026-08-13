@@ -49,9 +49,10 @@ use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
 use crate::shutdown::Lifecycle;
 use crate::status::Component;
-use crate::status::probes::{BackendProbe, ControlPlaneProbe};
+use crate::status::probes::{BackendProbe, CatalogProbe, ControlPlaneProbe};
 use crate::status::registry::{
-    CachedStatusRegistry, ObservationPlan, StatusRefresher, StatusSettings,
+    CachedStatusRegistry, ComponentProbe, ObservationPlan, StatusRefresher, StatusSettings,
+};
 };
 use crate::usage::UsageDelivery;
 #[cfg(test)]
@@ -193,6 +194,24 @@ impl ReplicaObservability {
         plan
     }
 
+    /// Extend the deployment-derived observation plan with the bounded
+    /// process-local catalogue report, when one is running.
+    pub fn plan_with_catalogue(
+        control_plane: Option<(Arc<dyn ControlPlaneStore>, StatusSettings)>,
+        budget: &dyn BudgetStore,
+        rate_limiter: &dyn RateLimiter,
+        revocation: &dyn RevocationStore,
+        catalogue: Option<Arc<CatalogStatus>>,
+    ) -> ObservationPlan {
+        let mut plan = Self::plan(control_plane, budget, rate_limiter, revocation);
+        if let Some(catalogue) = catalogue {
+            let mut pacing = StatusSettings::default();
+            pacing.enabled.push(Component::Catalogue);
+            plan.observe(Arc::new(CatalogProbe::new(catalogue)), pacing);
+        }
+        plan
+    }
+
     /// Report on the catalogue the background import is keeping current.
     ///
     /// Separate from the constructors because catalogue imports are orthogonal to
@@ -202,6 +221,25 @@ impl ReplicaObservability {
     pub fn with_catalogue(mut self, catalogue: Arc<CatalogStatus>) -> Self {
         self.catalogue = Some(catalogue);
         self
+    }
+
+    /// The stateless posture with a process-local catalogue import.
+    pub fn stateless_with_catalogue(catalogue: Arc<CatalogStatus>) -> (Self, StatusRefresher) {
+        let mut settings = StatusSettings::default();
+        settings.enabled.push(Component::Catalogue);
+        let status = Arc::new(CachedStatusRegistry::new(settings, Arc::new(SystemClock)));
+        let refresher = StatusRefresher::new(
+            Arc::clone(&status),
+            vec![Arc::new(CatalogProbe::new(Arc::clone(&catalogue)))],
+        );
+        (
+            Self {
+                status,
+                revision: None,
+                catalogue: Some(catalogue),
+            },
+            refresher,
+        )
     }
 }
 
