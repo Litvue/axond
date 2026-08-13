@@ -107,10 +107,12 @@ pub enum Surface {
     Alias,
     /// Routing, budget, and rate-limit policy.
     Policy,
-    /// The audit trail itself. Readable, never writable: nothing in this model
-    /// offers an action on an audit event, so an operator who can reach the
-    /// database is the only one who can alter one, and that is the boundary a
-    /// retention policy defends rather than a role.
+    /// The audit trail itself. Readable, never writable — by any role, the
+    /// platform administrator included, which is why [`Role::actions`] answers
+    /// this surface before it consults the role. An administrator who can delete
+    /// audit events can delete the record of their own, so altering one stays an
+    /// operation for whoever can reach the database, bounded by retention and
+    /// backups rather than by a grant.
     AuditTrail,
     /// Usage and spend. Separated from [`Surface::Price`] because reading what a
     /// tenant was charged and deciding what it is charged are different jobs.
@@ -262,7 +264,8 @@ impl fmt::Display for Action {
 pub enum Role {
     /// Runs the deployment. Every surface, every action, deployment-wide —
     /// including creating and deleting tenants, which no tenant-scoped role can
-    /// do.
+    /// do. One exception, and it is the deliberate one: writing the audit trail,
+    /// because a trail its administrator can edit does not record administrators.
     PlatformAdmin,
     /// Runs one tenant. Everything inside it, except creating or deleting the
     /// tenant itself: a tenant that could delete itself could also delete the
@@ -351,14 +354,22 @@ impl Role {
             Action::Rotate,
         ];
         match (self, surface) {
-            // Runs the deployment: no cell is narrowed, because the role exists
-            // to be the one that is not.
+            // The audit trail is read-only for every role, before any role's own
+            // row is consulted — including the platform administrator's. An
+            // administrator who can delete audit events can delete the evidence
+            // of their own actions, which is the one power a trail exists to
+            // deny. Altering one stays a database operation, defended by
+            // retention and backups rather than by a grant.
+            (Self::BillingViewer | Self::Developer, Surface::AuditTrail) => NONE,
+            (_, Surface::AuditTrail) => READ,
+            // Runs the deployment: no other cell is narrowed, because the role
+            // exists to be the one that is not.
             (Self::PlatformAdmin, _) => Action::ALL,
             // Its own tenant is readable and renameable; its existence is not
             // its own to decide.
             (Self::TenantAdmin, Surface::Tenant) => &[Action::Read, Action::Update],
             (Self::TenantAdmin, Surface::Provider | Surface::Credential) => OPERATE,
-            (Self::TenantAdmin, Surface::AuditTrail | Surface::Billing) => READ,
+            (Self::TenantAdmin, Surface::Billing) => READ,
             (Self::TenantAdmin, _) => MANAGE,
             (Self::Operator, Surface::Provider | Surface::Credential) => OPERATE,
             (Self::Operator, Surface::Model | Surface::Alias) => MANAGE,
@@ -369,7 +380,6 @@ impl Role {
                 | Surface::Principal
                 | Surface::Price
                 | Surface::Policy
-                | Surface::AuditTrail
                 | Surface::Billing,
             ) => READ,
             (
@@ -1583,38 +1593,45 @@ mod tests {
         for &role in Role::ALL {
             for &surface in Surface::ALL {
                 for &action in Action::ALL {
-                    let expected = match role {
-                        Role::PlatformAdmin => true,
-                        Role::TenantAdmin => match surface {
-                            Surface::Tenant => {
-                                matches!(action, Action::Read | Action::Update)
-                            }
-                            Surface::AuditTrail | Surface::Billing => action == Action::Read,
-                            Surface::Provider | Surface::Credential => true,
-                            _ => action != Action::Rotate,
-                        },
-                        Role::Operator => match surface {
-                            Surface::Provider | Surface::Credential => true,
-                            Surface::Model | Surface::Alias => action != Action::Rotate,
-                            _ => action == Action::Read,
-                        },
-                        Role::BillingViewer => {
-                            action == Action::Read
-                                && matches!(
-                                    surface,
-                                    Surface::Tenant
-                                        | Surface::Project
-                                        | Surface::Price
-                                        | Surface::Billing
-                                )
-                        }
-                        Role::Developer => match surface {
-                            Surface::Alias => action != Action::Rotate,
-                            Surface::Project | Surface::Model | Surface::Price => {
+                    // The audit trail is read-only for everyone who holds it at
+                    // all, so it is stated once, above the roles.
+                    let expected = if surface == Surface::AuditTrail {
+                        action == Action::Read
+                            && !matches!(role, Role::BillingViewer | Role::Developer)
+                    } else {
+                        match role {
+                            Role::PlatformAdmin => true,
+                            Role::TenantAdmin => match surface {
+                                Surface::Tenant => {
+                                    matches!(action, Action::Read | Action::Update)
+                                }
+                                Surface::Billing => action == Action::Read,
+                                Surface::Provider | Surface::Credential => true,
+                                _ => action != Action::Rotate,
+                            },
+                            Role::Operator => match surface {
+                                Surface::Provider | Surface::Credential => true,
+                                Surface::Model | Surface::Alias => action != Action::Rotate,
+                                _ => action == Action::Read,
+                            },
+                            Role::BillingViewer => {
                                 action == Action::Read
+                                    && matches!(
+                                        surface,
+                                        Surface::Tenant
+                                            | Surface::Project
+                                            | Surface::Price
+                                            | Surface::Billing
+                                    )
                             }
-                            _ => false,
-                        },
+                            Role::Developer => match surface {
+                                Surface::Alias => action != Action::Rotate,
+                                Surface::Project | Surface::Model | Surface::Price => {
+                                    action == Action::Read
+                                }
+                                _ => false,
+                            },
+                        }
                     };
                     assert_eq!(
                         role.permits(surface, action),
@@ -1647,16 +1664,26 @@ mod tests {
                 }
             }
         }
-        // Nothing may write the audit trail, whatever else it holds.
+        // Nothing may write the audit trail, whatever else it holds — including
+        // the role that holds everything else.
         for &role in Role::ALL {
             for &action in Action::ALL {
                 if action.is_write() {
-                    assert_eq!(
-                        role.permits(Surface::AuditTrail, action),
-                        role == Role::PlatformAdmin,
+                    assert!(
+                        !role.permits(Surface::AuditTrail, action),
+                        "{role} may {action} the audit trail"
                     );
                 }
             }
+        }
+        // And reading it stays a role a deployment grants deliberately: finance
+        // and application developers are not auditors.
+        for &role in Role::ALL {
+            assert_eq!(
+                role.permits(Surface::AuditTrail, Action::Read),
+                !matches!(role, Role::BillingViewer | Role::Developer),
+                "{role} reads the audit trail"
+            );
         }
     }
 
