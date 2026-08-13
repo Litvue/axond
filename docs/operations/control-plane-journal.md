@@ -61,7 +61,15 @@ Two properties worth knowing before you plan capacity or retention:
 - **A retained name stays taken.** A tenant or project a later revision stops
   declaring keeps its row and its name. Publishing a *different* tenant under a
   retained name is refused rather than reported as a temporary failure: no retry
-  clears it, and the refusal names the conflict.
+  clears it, and the refusal names the conflict. Releasing a tenant's name means
+  publishing a revision that still declares that tenant, at `lifecycle =
+  "deleted"` and at the next version number of its *last published* version —
+  republishing a version number with different content is refused, so read the
+  current number out of the journal (`SELECT version FROM
+  axond_cp_resource_version WHERE resource_id = …`) rather than assuming it. Two
+  owners may also exchange names within one revision, and two principals may
+  exchange sign-ins or keys, since uniqueness is judged on the state a revision
+  declares rather than on the order its rows are written.
 - **A disabled tenant serves nothing.** Only an active tenant's projects become
   servable namespaces. Disabling is what stops traffic; the rows stay for the
   history that points at them.

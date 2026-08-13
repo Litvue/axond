@@ -150,17 +150,44 @@ CREATE TABLE IF NOT EXISTS axond_cp_principal (
     FOREIGN KEY (tenant_id, project_id) REFERENCES axond_cp_project (tenant_id, project_id)
 );
 
--- One sign-in resolves to one principal. Without this, two rows could claim the
--- same `(issuer, subject)` and "who is this?" would depend on which row a query
--- happened to return first.
-CREATE UNIQUE INDEX IF NOT EXISTS axond_cp_principal_oidc_idx
-    ON axond_cp_principal (issuer, subject)
-    WHERE identity_kind = 'human';
+-- One sign-in resolves to one principal, and a minted key authenticates one
+-- workload. Without these, two rows could claim the same `(issuer, subject)` or
+-- the same digest and "who is this?" would depend on which row a query happened
+-- to return first.
+--
+-- Deferred exclusion constraints rather than partial unique indexes, for the
+-- reason a tenant's name is one: an index cannot be deferred, and reassigning
+-- two administrators' sign-ins — or handing one workload's key to another — is a
+-- state the directory accepts, which passes through an intermediate row set
+-- holding the same identity twice. The projection settles them once every row is
+-- written.
+DROP INDEX IF EXISTS axond_cp_principal_oidc_idx;
+DROP INDEX IF EXISTS axond_cp_principal_key_digest_idx;
 
--- A minted key authenticates at most one workload, for the same reason.
-CREATE UNIQUE INDEX IF NOT EXISTS axond_cp_principal_key_digest_idx
-    ON axond_cp_principal (key_digest)
-    WHERE key_digest IS NOT NULL;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'axond_cp_principal'::regclass
+          AND conname = 'axond_cp_principal_oidc_unique'
+    ) THEN
+        ALTER TABLE axond_cp_principal
+            ADD CONSTRAINT axond_cp_principal_oidc_unique
+            EXCLUDE (issuer WITH =, subject WITH =) WHERE (identity_kind = 'human')
+            DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'axond_cp_principal'::regclass
+          AND conname = 'axond_cp_principal_key_digest_unique'
+    ) THEN
+        ALTER TABLE axond_cp_principal
+            ADD CONSTRAINT axond_cp_principal_key_digest_unique
+            EXCLUDE (key_digest WITH =) WHERE (key_digest IS NOT NULL)
+            DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS axond_cp_principal_tenant_idx
     ON axond_cp_principal (tenant_id, identity_kind);

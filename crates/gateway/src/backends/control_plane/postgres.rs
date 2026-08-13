@@ -1127,17 +1127,6 @@ async fn project_tenancy(
             })?;
     }
 
-    // The two name constraints are deferred, so that a revision in which two
-    // tenants or two projects trade names is judged on the state it declares
-    // rather than on the order its rows were written in. Checking them here rather
-    // than leaving them to commit is what keeps a violation attributable: at
-    // commit the error would arrive with no operation to name, and after the
-    // publication had otherwise succeeded.
-    transaction
-        .execute("SET CONSTRAINTS ALL IMMEDIATE", &[])
-        .await
-        .map_err(|error| projection_failure("settle owner names", "name", "", &error))?;
-
     let declared: Vec<String> = directory
         .principals()
         .map(|principal| principal.body.principal().to_string())
@@ -1220,6 +1209,17 @@ async fn project_tenancy(
                 .map_err(|error| unavailable("grant role", &error))?;
         }
     }
+
+    // The name and identity constraints are deferred, so that a revision in which
+    // two tenants, two projects, or two principals trade what identifies them is
+    // judged on the state it declares rather than on the order its rows were
+    // written in. Settling them here rather than leaving them to commit is what
+    // keeps a violation attributable: at commit the error would arrive with no
+    // operation to name, and after the publication had otherwise succeeded.
+    transaction
+        .execute("SET CONSTRAINTS ALL IMMEDIATE", &[])
+        .await
+        .map_err(|error| projection_failure("settle names and identities", "name", "", &error))?;
     Ok(())
 }
 
@@ -1579,9 +1579,9 @@ mod tests {
         workload_key,
     };
     use crate::desired_state::{
-        Actor, AuditEventId, Checksum, DesiredState, ExpectedRevision, MutationId, PrincipalId,
-        ResourceKind, ResourceScope, ResourceVersionNumber, Slug, TenantLifecycle, Uuid7,
-        ValidationError, WorkloadKey, oracle::InMemoryControlPlane,
+        Actor, AuditEventId, Checksum, DesiredState, DisplayName, ExpectedRevision, IdentityBody,
+        MutationId, PrincipalId, ResourceKind, ResourceScope, ResourceVersionNumber, Role, Slug,
+        TenantLifecycle, Uuid7, ValidationError, WorkloadKey, oracle::InMemoryControlPlane,
     };
 
     /// Each test owns a schema, so the journal's fixed object names do not make
@@ -3485,6 +3485,99 @@ mod tests {
                 .column("SELECT slug FROM axond_cp_project ORDER BY project_id")
                 .await,
             vec!["edge", "core"]
+        );
+    }
+
+    /// Two administrators exchanging sign-ins, and two workloads exchanging keys,
+    /// in one revision. Like a traded name this is valid desired state — the
+    /// directory refuses a *shared* identity, not a reassigned one — so it must not
+    /// depend on which `PrincipalId` the projection writes first.
+    #[tokio::test]
+    async fn two_principals_may_trade_identities_in_one_revision() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let tenant = tenant_id(1);
+        let identity = |seed: u64, slug: &str, credential: Credential, version| {
+            IdentityBody::new(
+                principal_id(seed),
+                DisplayName::parse(slug).expect("a display name"),
+                credential,
+                [Role::TenantAdmin],
+            )
+            .expect("an identity granting a role")
+            .version_at(
+                ResourceScope::Tenant(tenant),
+                Slug::parse(slug).expect("a slug"),
+                version,
+            )
+        };
+        let oidc = |subject: &str| Credential::Oidc {
+            issuer: "https://idp.example".to_owned(),
+            subject: subject.to_owned(),
+        };
+        let key = |seed: u8| Credential::MintedKey {
+            digest: Some(Checksum::of(workload_key(seed).as_bytes())),
+        };
+        let first_version = ResourceVersionNumber::FIRST;
+        let mut before = state();
+        before
+            .insert(identity(40, "ada", oidc("ada"), first_version))
+            .and_then(|state| state.insert(identity(41, "grace", oidc("grace"), first_version)))
+            .and_then(|state| state.insert(identity(42, "builder", key(0xa1), first_version)))
+            .and_then(|state| state.insert(identity(43, "deployer", key(0xa2), first_version)))
+            .expect("two humans and two workloads of one tenant are valid");
+        let first = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "directory",
+                before.clone(),
+            ))
+            .await
+            .expect("the original directory publishes");
+
+        // Each principal keeps its id, its name, and its roles, and takes the
+        // sign-in or the key the other is giving up.
+        let second = first_version.next();
+        let mut swapped = before;
+        swapped
+            .supersede(identity(40, "ada", oidc("grace"), second))
+            .and_then(|state| state.supersede(identity(41, "grace", oidc("ada"), second)))
+            .and_then(|state| state.supersede(identity(42, "builder", key(0xa2), second)))
+            .and_then(|state| state.supersede(identity(43, "deployer", key(0xa1), second)))
+            .expect("a state in which identities are exchanged is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "reassign",
+                swapped,
+                91,
+            ))
+            .await
+            .expect("identities that are exchanged rather than shared must publish");
+
+        assert_eq!(
+            store
+                .column(
+                    "SELECT subject FROM axond_cp_principal WHERE subject IS NOT NULL \
+                     ORDER BY principal_id"
+                )
+                .await,
+            vec!["grace", "ada"],
+            "each administrator signs in as the subject the other gave up"
+        );
+        assert_eq!(
+            store
+                .column(
+                    "SELECT key_digest FROM axond_cp_principal WHERE key_digest IS NOT NULL \
+                     ORDER BY principal_id"
+                )
+                .await,
+            vec![
+                Checksum::of(workload_key(0xa2).as_bytes()).to_string(),
+                Checksum::of(workload_key(0xa1).as_bytes()).to_string(),
+            ],
+            "and each workload authenticates with the key the other gave up"
         );
     }
 
