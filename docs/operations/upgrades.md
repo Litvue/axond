@@ -111,6 +111,12 @@ rather than dropping rows. Mixed versions are safe in both directions: the
 columns are nullable, and an older binary neither writes nor reads them. Rolling
 back does not require dropping them.
 
+Price-book bodies are now written as `axond.price-book.v2`; the new
+`catalog_version` field is part of the immutable book identity. Retained v1 books
+remain readable for compatibility but have no numeric catalogue version, so new
+requests charged from one record `catalog_version = 0` until the book is
+republished as v2.
+
 The usage *outbox* is stricter still for a billing-grade deployment: with
 `[usage_journal] backend = "postgres"` the outbox is on the request path, so a
 missing or unreadable outbox table is `503 usage_not_durable` per request under

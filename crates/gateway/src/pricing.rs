@@ -28,17 +28,18 @@ use crate::state::ConfigSnapshot;
 
 /// The immutable pricing state a charge was computed against.
 ///
-/// Three identities rather than one number: the price-book resource *version*
+/// Four identities rather than one number: the price-book resource *version*
 /// answers "which approved document", its checksum answers "the same document on
-/// every replica", and the catalogue content id answers "against which observed
-/// catalogue was it approved". A monotonic counter answers none of them, which is
-/// why the legacy `catalog_version` placeholder is derived from the version here
-/// rather than kept as the whole answer.
+/// every replica", and the catalogue content id plus resource version answer
+/// "which observed catalogue was it approved against". The legacy numeric
+/// usage field now carries the latter version; the other identities remain
+/// available for audit and cross-replica comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PriceIdentity {
     book: ResourceRef,
     checksum: Checksum,
     catalog: CatalogContentId,
+    catalog_version: u64,
 }
 
 impl PriceIdentity {
@@ -48,6 +49,10 @@ impl PriceIdentity {
             book: pricing.book(),
             checksum: pricing.checksum(),
             catalog: pricing.catalog(),
+            catalog_version: match pricing.catalog_version() {
+                Some(version) => version.get(),
+                None => 0,
+            },
         }
     }
 
@@ -57,10 +62,18 @@ impl PriceIdentity {
         self.book.to_string()
     }
 
-    /// The book's version number on its own, for the numeric field a usage row
-    /// has carried since the first schema.
+    /// The book's version number on its own. The usage row carries this in the
+    /// `price_book` resource reference; its numeric `catalog_version` is the
+    /// catalogue resource version instead.
+    #[allow(dead_code)]
     pub const fn version(&self) -> u64 {
         self.book.version.get()
+    }
+
+    /// The catalogue resource version the approved book was based on, or `0`
+    /// for a retained legacy book without that provenance.
+    pub const fn catalog_version(&self) -> u64 {
+        self.catalog_version
     }
 
     /// The checksum of the approved body, `sha256:`-prefixed.
@@ -123,13 +136,13 @@ impl RequestPrice {
         self.identity
     }
 
-    /// The numeric price-book version a usage row records: `0` when no approved
-    /// book priced the request, which is exactly what the placeholder meant
-    /// before there was a version to record.
+    /// The numeric catalogue resource version a usage row records: `0` when no
+    /// approved v2 book priced the request, or when a retained legacy v1 book
+    /// has not yet been republished with catalogue version provenance.
     pub const fn catalog_version(&self) -> u64 {
         match &self.identity {
             None => 0,
-            Some(identity) => identity.version(),
+            Some(identity) => identity.catalog_version(),
         }
     }
 }
@@ -329,6 +342,7 @@ mod tests {
     fn book(input_nanos: u64, output_nanos: u64) -> PriceBookBody {
         PriceBookBody::new(
             fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
             Approval::Approved {
                 by: fixtures::actor(),
                 at: EffectiveInstant::EPOCH,
@@ -389,7 +403,14 @@ mod tests {
         );
         let identity = resolved.identity().expect("the charge names its book");
         assert_eq!(identity.version(), pricing.book().version.get());
-        assert_eq!(resolved.catalog_version(), identity.version());
+        assert_eq!(
+            resolved.catalog_version(),
+            fixtures::catalog_version().get()
+        );
+        assert_eq!(
+            identity.catalog_version(),
+            fixtures::catalog_version().get()
+        );
         assert_eq!(identity.catalog(), pricing.catalog().to_string());
         assert_eq!(identity.checksum(), pricing.checksum().to_string());
     }
@@ -408,15 +429,18 @@ mod tests {
     /// nobody approved.
     #[test]
     fn a_draft_book_prices_nothing_it_covers() {
-        let body = PriceBookBody::new(fixtures::catalog_content_id(), Approval::Draft).with_rule(
-            fixtures::price_rule(
-                fixtures::priced_target("openai", "gpt-4o"),
-                RulePrecedence::Baseline,
-                EffectiveInterval::from(EffectiveInstant::EPOCH),
-                2_500_000,
-                10_000_000,
-            ),
-        );
+        let body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            Approval::Draft,
+        )
+        .with_rule(fixtures::price_rule(
+            fixtures::priced_target("openai", "gpt-4o"),
+            RulePrecedence::Baseline,
+            EffectiveInterval::from(EffectiveInstant::EPOCH),
+            2_500_000,
+            10_000_000,
+        ));
         let pricing = PriceBooks::of(&fixtures::state_with_price_book(&body))
             .expect("a draft book is servable state")
             .snapshot_at(EffectiveInstant::EPOCH)
@@ -434,14 +458,18 @@ mod tests {
     #[test]
     fn a_refusal_names_no_price_book_to_the_caller_and_all_of_it_to_the_log() {
         let approved = fixtures::approved_pricing_snapshot();
-        let draft_body = PriceBookBody::new(fixtures::catalog_content_id(), Approval::Draft)
-            .with_rule(fixtures::price_rule(
-                fixtures::priced_target("openai", "gpt-4o"),
-                RulePrecedence::Baseline,
-                EffectiveInterval::from(EffectiveInstant::EPOCH),
-                2_500_000,
-                10_000_000,
-            ));
+        let draft_body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            Approval::Draft,
+        )
+        .with_rule(fixtures::price_rule(
+            fixtures::priced_target("openai", "gpt-4o"),
+            RulePrecedence::Baseline,
+            EffectiveInterval::from(EffectiveInstant::EPOCH),
+            2_500_000,
+            10_000_000,
+        ));
         let draft = PriceBooks::of(&fixtures::state_with_price_book(&draft_body))
             .expect("a draft book is servable state")
             .snapshot_at(EffectiveInstant::EPOCH)
@@ -512,8 +540,8 @@ mod tests {
         // 2 000 000 nano-dollars per million tokens is 2 000 micro-dollars.
         assert_eq!(opened.cost_microdollars(usage(1_000_000, 1_000_000)), 6_000);
         assert_eq!(later.cost_microdollars(usage(1_000_000, 1_000_000)), 12_000);
-        assert_eq!(opened.catalog_version(), 1);
-        assert_eq!(later.catalog_version(), 2);
+        assert_eq!(opened.catalog_version(), 3);
+        assert_eq!(later.catalog_version(), 3);
     }
 
     /// Rollback is republication, not mutation: the earlier body comes back as a
@@ -558,6 +586,7 @@ mod tests {
         };
         let body = PriceBookBody::new(
             fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
             Approval::Approved {
                 by: fixtures::actor(),
                 at: EffectiveInstant::EPOCH,

@@ -143,7 +143,7 @@ scope, and slug. Seven schemas exist today:
 | `axond.policy.v1` | the policy of a tenant or a project | `schema`, `tenant_id`, `project_id` (project documents only), `epoch`, `budget_limit_microdollars`, `namespace_budget_limit_microdollars` (optional), `reservation_ttl_seconds`, `max_in_flight_per_subject`, `lease_ttl_seconds`, `minimum_token_epoch` |
 | `axond.model-enablement.v1` | a tenant's or project's permission to use one catalogue offering | `schema`, `enablement_id`, `tenant_id`, `project_id` (a project's only), `offering_id`, `catalog_snapshot`, `wire_family`, `state`, `observed_price` (optional), `approved_price` (optional) |
 | `axond.model-alias.v1` | a project-scoped name for an ordered list of enablements | `schema`, `alias_id`, `tenant_id`, `project_id`, `wire_family`, `state`, `targets` |
-| `axond.price-book.v1` | the deployment's approved price book | `schema`, `catalog_content_id`, `currency`, `unit`, `approval`, `rules` |
+| `axond.price-book.v2` | the deployment's approved price book | `schema`, `catalog_content_id`, `catalog_version`, `currency`, `unit`, `approval`, `rules` |
 
 Six rules hold for every body schema, present and future:
 

@@ -712,6 +712,7 @@ mod tests {
         let pricing = snapshot.pricing().expect("the revision carries pricing");
         assert!(pricing.is_approved());
         assert_eq!(pricing.catalog(), fixtures::catalog_content_id());
+        assert_eq!(pricing.catalog_version(), Some(fixtures::catalog_version()));
         assert_eq!(
             pricing
                 .price(&ProviderId::parse("openai").expect("id"), "gpt-4o")
@@ -758,15 +759,18 @@ mod tests {
     /// operator can see what is staged without it billing anything.
     #[tokio::test]
     async fn a_draft_book_publishes_its_identity_and_no_prices() {
-        let body = PriceBookBody::new(fixtures::catalog_content_id(), Approval::Draft).with_rule(
-            fixtures::price_rule(
-                fixtures::priced_target("openai", "gpt-4o"),
-                RulePrecedence::Baseline,
-                EffectiveInterval::from(EffectiveInstant::EPOCH),
-                1_000,
-                1_000,
-            ),
-        );
+        let body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            Approval::Draft,
+        )
+        .with_rule(fixtures::price_rule(
+            fixtures::priced_target("openai", "gpt-4o"),
+            RulePrecedence::Baseline,
+            EffectiveInterval::from(EffectiveInstant::EPOCH),
+            1_000,
+            1_000,
+        ));
         let compiler = RevisionCompiler::with_secrets(
             bootstrap(),
             env(),

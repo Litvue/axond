@@ -364,6 +364,13 @@ pub(crate) fn catalog_content_id() -> CatalogContentId {
     CatalogContentId::from_checksum(Checksum::of(b"fixture catalogue content"))
 }
 
+/// The catalogue resource version a fixture price book was approved against.
+/// It intentionally differs from the price-book fixture version so propagation
+/// tests cannot pass by accidentally reading the book's version.
+pub(crate) fn catalog_version() -> ResourceVersionNumber {
+    ResourceVersionNumber::new(3).expect("fixture catalogue version is non-zero")
+}
+
 pub(crate) fn priced_target(provider: &str, model: &str) -> PricedTarget {
     PricedTarget::new(
         ProviderId::parse(provider).expect("fixture provider id"),
@@ -396,6 +403,7 @@ pub(crate) fn price_rule(
 pub(crate) fn approved_price_book() -> PriceBookBody {
     PriceBookBody::new(
         catalog_content_id(),
+        catalog_version(),
         Approval::Approved {
             by: actor(),
             at: EffectiveInstant::EPOCH,

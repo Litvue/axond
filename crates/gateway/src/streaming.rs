@@ -1359,7 +1359,11 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         accounting.settle(Status::Ok);
         let record = settled(&ledger).await;
 
-        assert_eq!(record["catalog_version"], pricing.book().version.get());
+        assert_eq!(
+            record["catalog_version"],
+            crate::desired_state::fixtures::catalog_version().get()
+        );
+        assert_ne!(record["catalog_version"], pricing.book().version.get());
         assert_eq!(record["price_book"], pricing.book().to_string());
         assert_eq!(
             record["price_book_checksum"],

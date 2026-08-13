@@ -32,10 +32,10 @@ meaning, and how they are allowed to change. The design rationale is
 | `cache_read_tokens` | `bigint` | Prompt tokens read from the provider cache, disjoint from `input_tokens`. |
 | `cache_write_tokens` | `bigint` | Prompt tokens written to the provider cache. |
 | `cost_microdollars` | `bigint` | Cost in micro-dollars, priced from the target's catalog entry. |
-| `catalog_version` | `bigint` | Resource version of the approved price book the cost was computed against, or `0` when the request was priced by the configuration file's own rates. |
+| `catalog_version` | `bigint` | Resource version of the catalogue the approved price book was computed against, or `0` for configuration-priced rows and retained legacy v1 price books without catalogue-version provenance. |
 | `price_book` | `text` | Exact price-book resource reference and version the rates came from, rendered `price/<resource id>@v<version>` (e.g. `price/res_0190f2c1-6f6a-7c2e-9d3a-6f1c2b4d5e60@v3`); NULL for a file-priced row. |
 | `price_book_checksum` | `text` | Canonical checksum of that book's body — the same rates always produce the same checksum, so a republished (rolled-back) book is recognisable as the one that was audited before. NULL for a file-priced row. |
-| `price_catalog` | `text` | Content identity of the catalogue the book was approved against; NULL for a file-priced row. |
+| `price_catalog` | `text` | Content identity of the catalogue the book was approved against; NULL for a file-priced row. Pair with `catalog_version` to identify the catalogue resource version. |
 | `latency_ms` | `bigint` | End-to-end gateway latency. |
 | `attempts` | `bigint` | Upstream target attempts across the alias's targets; retry count is `attempts - 1`, and `1` means the first target served. |
 | `started_at` | `timestamptz` | `recorded_at - latency_ms`. |
@@ -82,8 +82,9 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
 - Naming the pricing a row was charged against (`price_book`,
   `price_book_checksum`, `price_catalog`) is **not** a bump: the three columns
   are nullable, and `catalog_version` keeps its type and its `0` for a row
-  priced by configuration, which is what every row before this change was. A
-  reader that groups by pricing treats `price_book IS NULL` as "configured
+  priced by configuration. New v2 price books populate it with the catalogue
+  resource version; a retained v1 book has no such provenance and records `0`.
+  A reader that groups by pricing treats `price_book IS NULL` as "configured
   rates" ([ADR 0056](./adr/0056-request-path-pricing.md)).
 - A price change is never retroactive. A new publication is a new price-book
   version written into new rows; settled rows are never rewritten, so what a

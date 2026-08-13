@@ -262,9 +262,14 @@ interface — read it at your own risk.
 ### Desired-state schemas and approved price books
 
 Stateful mode's desired state is versioned by schema identifier per body, not by
-one revision format. A price book declares `axond.price-book.v1`
+one revision format. A price book declares `axond.price-book.v2`
 ([ADR 0046](./adr/0046-approved-price-books.md)), and a replica reads only the
 schemas its build knows:
+
+`axond.price-book.v1` remains readable as a legacy shape but is no longer
+written. It has no `catalog_version`, so a request charged from a retained v1
+book reports the compatibility value `catalog_version = 0` until the book is
+republished as v2.
 
 - Adding an optional field to a body **is** a schema bump. Bodies are read
   strictly — an unknown schema, an unknown field, a missing field, a wrong type,

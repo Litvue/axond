@@ -2885,7 +2885,11 @@ mod tests {
             PriceIdentity::of(&pricing),
         );
         let (row, _, _) = build_record(args(approved));
-        assert_eq!(row.catalog_version, pricing.book().version.get());
+        assert_eq!(
+            row.catalog_version,
+            crate::desired_state::fixtures::catalog_version().get()
+        );
+        assert_ne!(row.catalog_version, pricing.book().version.get());
         assert_eq!(
             row.price_book.as_deref(),
             Some(pricing.book().to_string()).as_deref()

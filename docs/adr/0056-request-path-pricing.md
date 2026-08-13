@@ -98,12 +98,12 @@ hold is taken against and the amount the settlement charges therefore come from
 one immutable value.
 
 **A row names its pricing in four columns, three of them nullable.**
-`catalog_version` becomes the price book's resource version where a book applies
-and keeps its `0` where the file prices the request — the compatibility meaning
-of `0` is now "priced by configuration", which is exactly what it has always
-meant in practice. `price_book`, `price_book_checksum`, and `price_catalog` are
-new, nullable, and absent from a file-priced row, so an existing consumer parses
-new rows unchanged. They are added by an additive migration
+`catalog_version` carries the catalogue resource version recorded by the v2
+price book where a book applies. It keeps its `0` for configuration-priced rows
+and retained v1 books that have no numeric catalogue provenance.
+`price_book`, `price_book_checksum`, and `price_catalog` are new, nullable, and
+absent from a file-priced row, so an existing consumer parses new rows unchanged.
+They are added by an additive migration
 (`usage_v2_001_add_price_identity.sql`), which the Postgres sink requires to have
 been applied: it compares the table's columns against the ones it binds while it
 connects and refuses to boot naming the file to apply, so an existing
