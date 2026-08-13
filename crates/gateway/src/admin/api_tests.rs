@@ -984,6 +984,35 @@ async fn a_document_that_is_not_its_schema_is_refused_before_the_control_plane()
     );
 }
 
+/// The three budget settings share one lower bound, so a refusal that named the
+/// last one checked would send an administrator to edit a field that was right:
+/// the message names the setting they actually set to zero.
+#[tokio::test]
+async fn a_zero_budget_cap_is_refused_against_the_setting_the_caller_wrote() {
+    let deployment = Deployment::new();
+    let cases = [
+        ("subject_limit_microdollars", json!(0)),
+        ("namespace_limit_microdollars", json!(0)),
+        ("reservation_ttl_seconds", json!(0)),
+    ];
+    for (field, value) in cases {
+        let mut document = policy_document();
+        document["resource"][field] = value;
+        let (status, body) = deployment
+            .post("/policies", "key-1", EXPECTED_REVISION_EMPTY, &document)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+        assert_eq!(body["error"]["type"], "admin_request_invalid", "{body}");
+        let message = body["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field}: a message naming the field"));
+        assert!(
+            message.contains(&format!("`{field}`")),
+            "{field} was set to zero, and the refusal says: {message}"
+        );
+    }
+}
+
 /// Nothing here removes a resource, so the audit trail may not say one was
 /// removed: `delete` is accepted only for a document that retires the resource
 /// through its own lifecycle, and refused for one that leaves it serving.

@@ -434,6 +434,19 @@ pub struct BudgetPolicy {
     reservation_ttl_seconds: u64,
 }
 
+/// The bound a [`BudgetPolicy`] triple broke, named by the surface that read
+/// it: the stored document and the admin request spell the same three settings
+/// differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetBound {
+    /// The cap on one `(scope, subject)` pair.
+    SubjectLimit,
+    /// The cap on everything the scope spends.
+    NamespaceLimit,
+    /// How long a reservation is held.
+    ReservationTtl,
+}
+
 impl BudgetPolicy {
     /// A cap of zero is refused, on either scope, exactly as the bootstrap file
     /// refuses one ([`Config::validate_budget`](crate::config::Config)): it
@@ -468,6 +481,23 @@ impl BudgetPolicy {
             namespace_limit_microdollars,
             reservation_ttl_seconds,
         })
+    }
+
+    /// Which of the three bounds a rejected triple broke. Every caller of
+    /// [`BudgetPolicy::new`] names a field in its refusal, and the three share
+    /// one error, so the choice lives here rather than being re-derived — and
+    /// re-derived differently — at each surface.
+    pub const fn unmet_bound(
+        subject_limit_microdollars: u64,
+        namespace_limit_microdollars: Option<u64>,
+    ) -> BudgetBound {
+        if subject_limit_microdollars == 0 {
+            BudgetBound::SubjectLimit
+        } else if let Some(0) = namespace_limit_microdollars {
+            BudgetBound::NamespaceLimit
+        } else {
+            BudgetBound::ReservationTtl
+        }
     }
 
     /// The cap on one `(scope, subject)` pair.
@@ -698,12 +728,10 @@ impl PolicyBody {
             |source| {
                 // Three fields share one bound, so the refusal names the one that
                 // broke it rather than the last one passed.
-                let field = if subject_limit == 0 {
-                    BUDGET_LIMIT_FIELD
-                } else if namespace_limit == Some(0) {
-                    NAMESPACE_BUDGET_LIMIT_FIELD
-                } else {
-                    RESERVATION_TTL_FIELD
+                let field = match BudgetPolicy::unmet_bound(subject_limit, namespace_limit) {
+                    BudgetBound::SubjectLimit => BUDGET_LIMIT_FIELD,
+                    BudgetBound::NamespaceLimit => NAMESPACE_BUDGET_LIMIT_FIELD,
+                    BudgetBound::ReservationTtl => RESERVATION_TTL_FIELD,
                 };
                 bound(field, source)
             },

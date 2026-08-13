@@ -37,13 +37,13 @@ use serde::de::DeserializeOwned;
 use super::error::AdminError;
 use super::service::DesiredStateEdit;
 use crate::desired_state::{
-    AliasTarget, BlobKind, BlobRef, BudgetPolicy, CatalogOffering, Checksum, ConcurrencyPolicy,
-    DesiredState, DisplayName, ModelAliasBody, ModelEnablementBody, ModelLifecycle, ModelOwner,
-    ObservedPrice, OfferingId, PolicyBody, PolicyEpoch, PolicyScope, ProjectBody, ProjectId,
-    ProviderBody, ProviderCredentialBody, ResourceBody, ResourceId, ResourceKind, ResourceRef,
-    ResourceScope, ResourceVersion, ResourceVersionNumber, RevocationPolicy, SecretId,
-    SecretLifecycle, SecretOwner, SecretRef, SecretVersion, Slug, Surface, TenantBody, TenantId,
-    TenantLifecycle, ValidationError, WireFamily,
+    AliasTarget, BlobKind, BlobRef, BudgetBound, BudgetPolicy, CatalogOffering, Checksum,
+    ConcurrencyPolicy, DesiredState, DisplayName, ModelAliasBody, ModelEnablementBody,
+    ModelLifecycle, ModelOwner, ObservedPrice, OfferingId, PolicyBody, PolicyEpoch, PolicyScope,
+    ProjectBody, ProjectId, ProviderBody, ProviderCredentialBody, ResourceBody, ResourceId,
+    ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
+    RevocationPolicy, SecretId, SecretLifecycle, SecretOwner, SecretRef, SecretVersion, Slug,
+    Surface, TenantBody, TenantId, TenantLifecycle, ValidationError, WireFamily,
 };
 
 /// What a handler contributes to a mutation: where it applies, and what it does.
@@ -693,7 +693,19 @@ impl AdminResourceRequest for PolicyRequest {
             self.namespace_limit_microdollars,
             self.reservation_ttl_seconds,
         )
-        .map_err(|error| malformed::<Self>("reservation_ttl_seconds", &error.to_string()))?;
+        .map_err(|error| {
+            // The three settings share one bound, so the refusal names the one
+            // the administrator actually set wrongly.
+            let field = match BudgetPolicy::unmet_bound(
+                self.subject_limit_microdollars,
+                self.namespace_limit_microdollars,
+            ) {
+                BudgetBound::SubjectLimit => "subject_limit_microdollars",
+                BudgetBound::NamespaceLimit => "namespace_limit_microdollars",
+                BudgetBound::ReservationTtl => "reservation_ttl_seconds",
+            };
+            malformed::<Self>(field, &error.to_string())
+        })?;
         let concurrency =
             ConcurrencyPolicy::new(self.max_in_flight_per_subject, self.lease_ttl_seconds)
                 .map_err(|error| {

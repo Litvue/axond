@@ -82,6 +82,13 @@ impl Ceilings {
 /// to be denied rather than miss one that succeeded while a publication landed.
 /// A budget reservation settles explicitly, so its store calls [`PolicyHold::kept`]
 /// once admitted and pairs the count with [`Ceilings::exit`] at settlement.
+///
+/// The count outlives the *request*, not just the caller: a shared-store acquire
+/// that overran its caller's wait may still have written a lease, so the
+/// in-flight round trip and the compensating release that removes such a lease
+/// each hold the generation too. An empty drain list therefore means no request
+/// is running under the generation *and* nothing it admitted is left in the
+/// store — which is what a stop-the-fleet migration needs it to mean.
 #[derive(Debug)]
 pub struct PolicyHold {
     ceilings: Ceilings,
