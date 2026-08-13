@@ -39,6 +39,7 @@ mod key_material;
 mod mint;
 mod ops;
 mod policy;
+mod pricing;
 mod principals;
 mod rate_limit;
 mod redis_support;

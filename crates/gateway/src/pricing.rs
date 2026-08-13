@@ -16,7 +16,7 @@
 //!    book when the target names a catalogue offering the book prices, and the
 //!    `[[model]]` rates otherwise — never by a merge of the two.
 //! 3. A target the approved book *should* price but does not is ineligible: it
-//!    stays discoverable and is not routable under a budget (ADR 0052).
+//!    stays discoverable and is not routable under a budget (ADR 0053).
 
 use gateway_core::catalog::{ModelPrice, Usage};
 

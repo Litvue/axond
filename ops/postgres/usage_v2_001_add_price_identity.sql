@@ -8,7 +8,7 @@
 --
 -- These columns name the immutable pricing a row was charged against: the
 -- approved price-book resource version, the checksum of its body, and the
--- catalogue content it was approved against (docs/adr/0052-request-path-pricing.md).
+-- catalogue content it was approved against (docs/adr/0053-request-path-pricing.md).
 -- They are NULL for a request the file configuration priced, and for every row
 -- written before they existed.
 --
