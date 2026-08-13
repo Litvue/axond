@@ -118,7 +118,10 @@ async fn nothing_a_pinned_session_can_read_names_the_other_tenant() {
     for (label, id) in [
         ("its own tenant", caller().to_string()),
         ("its own project", fixtures::project_id(2).to_string()),
-        ("its own administrator", fixtures::principal_id(31).to_string()),
+        (
+            "its own administrator",
+            fixtures::principal_id(31).to_string(),
+        ),
     ] {
         assert!(
             ours.contains(&id),
@@ -236,7 +239,9 @@ async fn a_pinned_session_cannot_write_another_tenants_rows() {
         ),
         (
             "disabling the other tenant",
-            format!("UPDATE axond_cp_tenant SET lifecycle = 'disabled' WHERE tenant_id = '{theirs}'"),
+            format!(
+                "UPDATE axond_cp_tenant SET lifecycle = 'disabled' WHERE tenant_id = '{theirs}'"
+            ),
         ),
         (
             "deleting the other tenant's principals",

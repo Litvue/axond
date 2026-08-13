@@ -86,7 +86,10 @@ async fn each_tenants_project_is_its_own_namespace_and_borrows_nothing() {
             !namespace.allow_platform_fallback,
             "{id} may borrow the platform's credentials without being told to"
         );
-        assert!(!namespace.default, "{id} was promoted to the deployment default");
+        assert!(
+            !namespace.default,
+            "{id} was promoted to the deployment default"
+        );
     }
 
     // The bootstrap's own namespace is untouched: a projection fills sections, it

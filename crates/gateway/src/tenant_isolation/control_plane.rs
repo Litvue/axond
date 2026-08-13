@@ -35,6 +35,7 @@ use crate::admin::error::AdminError;
 use crate::admin::protocol::{AuditSummary, MutationPreconditions, MutationRequest, WriteMode};
 use crate::admin::reads::HistoryRequest;
 use crate::admin::service::{AdminService, DesiredStateEdit, MutationResult};
+use crate::desired_state::access::DenialPage;
 use crate::desired_state::{
     DesiredState, ExpectedRevision, IdempotencyKey, MutationKind, ResourceScope, RevisionId,
     Surface, fixtures,
@@ -82,7 +83,11 @@ async fn published(journal: &Journal) -> (AdminService, RevisionId) {
     let outcome = service
         .apply(
             &grant(AdminAction::Publish, ResourceScope::Deployment),
-            &request("two-tenants", ExpectedRevision::Empty, ResourceScope::Deployment),
+            &request(
+                "two-tenants",
+                ExpectedRevision::Empty,
+                ResourceScope::Deployment,
+            ),
             &replace_with(two_tenant_state()),
         )
         .await
@@ -152,7 +157,10 @@ async fn a_tenant_scoped_administrator_cannot_publish_into_another_tenant() {
         .await
         .expect_err("a tenant-scoped grant does not add another tenant's credential");
 
-    for (surface, error) in [("a claimed scope", &claimed), ("an out-of-scope edit", &reached)] {
+    for (surface, error) in [
+        ("a claimed scope", &claimed),
+        ("an out-of-scope edit", &reached),
+    ] {
         assert_eq!(error.code(), "admin_forbidden", "{surface}: {error}");
         assert_eq!(error.status(), axum::http::StatusCode::FORBIDDEN);
         let envelope = serde_json::to_string(&error.envelope()).expect("a serialisable envelope");
@@ -184,7 +192,7 @@ async fn a_tenant_scoped_administrator_cannot_publish_into_another_tenant() {
                 other => panic!("a denial read is per tenant, not {other:?}"),
             };
             store
-                .denials(Some(tenant), 10)
+                .denials(&DenialPage::for_scope(Some(tenant)), 10)
                 .await
                 .expect("the denial trail")
         }
@@ -201,7 +209,7 @@ async fn a_tenant_scoped_administrator_cannot_publish_into_another_tenant() {
     }
     assert!(
         store
-            .denials(None, 10)
+            .denials(&DenialPage::for_scope(None), 10)
             .await
             .expect("the deployment-scoped denial trail")
             .is_empty(),

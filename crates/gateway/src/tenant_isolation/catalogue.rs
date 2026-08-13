@@ -57,7 +57,11 @@ async fn a_tenants_credentials_are_never_another_tenants() {
         .collect();
     let theirs: Vec<_> = credentials.of_owner(SecretOwner::tenant(other())).collect();
     assert_eq!(mine.len(), 1, "the caller's credentials: {mine:?}");
-    assert_eq!(theirs.len(), 1, "the other tenant's credentials: {theirs:?}");
+    assert_eq!(
+        theirs.len(),
+        1,
+        "the other tenant's credentials: {theirs:?}"
+    );
     assert_ne!(
         mine[0].reference, theirs[0].reference,
         "both tenants resolved to one credential"
@@ -183,7 +187,11 @@ async fn a_tenants_policy_governs_only_its_own_scopes() {
     );
 
     for (label, scope, expected) in [
-        ("the caller's own tenant", PolicyScope::Tenant(caller()), mine),
+        (
+            "the caller's own tenant",
+            PolicyScope::Tenant(caller()),
+            mine,
+        ),
         (
             "the caller's own project",
             PolicyScope::Project {

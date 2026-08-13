@@ -74,7 +74,14 @@ pub(crate) fn two_tenant_state() -> DesiredState {
     let credential = fixtures::credential(&other(), 13, "secondary");
     state
         .insert(credential.clone())
-        .and_then(|state| state.insert(fixtures::alias(&other(), 14, "steady", &[credential.reference])))
+        .and_then(|state| {
+            state.insert(fixtures::alias(
+                &other(),
+                14,
+                "steady",
+                &[credential.reference],
+            ))
+        })
         .and_then(|state| state.insert(fixtures::tenant_policy(1, 1)))
         .and_then(|state| state.insert(fixtures::tenant_policy(11, 1)))
         .expect("two tenants that reference nothing of each other's are valid");
