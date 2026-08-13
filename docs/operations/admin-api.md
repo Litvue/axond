@@ -142,7 +142,7 @@ record, or a state read.
 An availability read names which authority refused — the catalogue, the
 enablement, the tenant's entitlement, policy, discovery, or this replica's own
 health — and never claims a model is available because the catalogue carries it
-([ADR 0051](../adr/0051-stateful-availability-projection-and-discovery-persistence.md)).
+([ADR 0052](../adr/0052-stateful-availability-projection-and-discovery-persistence.md)).
 A replica that derives no view answers `"deriving": false` rather than an empty
 list of targets, and a caller without deployment-wide authority sees a verdict
 with the discovery source dropped and operator-only reasons coarsened — the
