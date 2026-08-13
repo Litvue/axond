@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.36](https://github.com/Litvue/axond/compare/v0.3.35...v0.3.36) (2026-08-13)
+
+
+### Features
+
+* **admin:** expose aliases in tenant catalogues ([4e5513d](https://github.com/Litvue/axond/commit/4e5513dfc4dafacec82325899fc046f8a56f9d7c))
+* **admin:** expose aliases in tenant catalogues ([e169870](https://github.com/Litvue/axond/commit/e169870c72479d02a70db34aa2244f8a3994bf27))
+* **ops:** identify replicas in fleet observability ([26110d4](https://github.com/Litvue/axond/commit/26110d4720577322b56589cf181cc70894808296))
+* **ops:** identify replicas in fleet observability ([0c20b72](https://github.com/Litvue/axond/commit/0c20b722b9c617988e6836405e9299df38cb2a76))
+
 ## [0.3.35](https://github.com/Litvue/axond/compare/v0.3.34...v0.3.35) (2026-08-13)
 
 
