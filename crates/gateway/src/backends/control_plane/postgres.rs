@@ -1492,13 +1492,18 @@ fn projection_failure(
     // Which constraint was violated, rather than an assumption about which one it
     // was: a projected row can collide over a name, an OIDC subject, or a key
     // digest, or contradict an ownership row, and reporting all of them as a name
-    // clash describes the wrong conflict and the wrong remedy. A name a live row
-    // holds is the one a caller renames, so it keeps its own typed refusal; the
-    // rest name what they contradicted, since there is no name to change.
-    if *db.code() != SqlState::FOREIGN_KEY_VIOLATION && !slug.is_empty() {
+    // clash describes the wrong conflict and the wrong remedy. Only a name has a
+    // remedy the caller can act on, so only a name keeps the typed refusal; the
+    // rest name the constraint they contradicted.
+    if is_name_conflict(db) {
+        let taken = if slug.is_empty() {
+            colliding_value(db).unwrap_or_else(|| slug.to_owned())
+        } else {
+            slug.to_owned()
+        };
         return ControlPlaneError::NameTaken {
             noun,
-            name: slug.to_owned(),
+            name: taken,
             holder: db.constraint().map(ToOwned::to_owned),
         };
     }
@@ -1542,6 +1547,30 @@ fn is_projection_refusal(db: &tokio_postgres::error::DbError) -> bool {
             | SqlState::EXCLUSION_VIOLATION
             | SqlState::FOREIGN_KEY_VIOLATION
     )
+}
+
+/// Whether the constraint a projection violated is one of the two that carry a
+/// *name*, as opposed to an identity or an ownership row. Read off the constraint
+/// rather than off the operation, because the deferred constraints are settled for
+/// the revision as a whole and the row that lost is only named by the error.
+fn is_name_conflict(db: &tokio_postgres::error::DbError) -> bool {
+    db.constraint()
+        .is_some_and(|name| name.ends_with("_slug_unique"))
+}
+
+/// The name that collided, out of the detail Postgres attaches to a duplicate:
+/// `Key (tenant_id, slug)=(ten_…, core) already exists`. Only the last column of
+/// the key is a name — the others scope it — so this is the value a caller
+/// changes.
+fn colliding_value(db: &tokio_postgres::error::DbError) -> Option<String> {
+    let detail = db.detail()?;
+    let values = detail.split_once(")=(")?.1;
+    let values = values.split_once(')')?.0;
+    values
+        .rsplit(", ")
+        .next()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn audit_event(row: &Row) -> Result<AuditEvent, IntegrityError> {
@@ -3958,15 +3987,16 @@ mod tests {
                      ORDER BY lifecycle"
                 )
                 .await,
-            vec!["active"],
-            "exactly one tenant holds the name, and it is the restored one"
+            vec!["active", "deleted"],
+            "one live tenant holds the name; the retired row keeps the name it held"
         );
         assert_eq!(
             store
-                .column("SELECT count(*)::text FROM axond_cp_tenant WHERE lifecycle = 'deleted'")
-                .await,
-            vec!["1"],
-            "the tenant that held the name is retired, not erased"
+                .column("SELECT tenant_id FROM axond_cp_tenant WHERE lifecycle = 'active'")
+                .await
+                .len(),
+            1,
+            "exactly one tenant is live, and the restore is it"
         );
     }
 
@@ -4023,7 +4053,7 @@ mod tests {
             .load_revision(dropped.id)
             .await
             .expect("the revision it just published hydrates");
-        let tenancy = Tenancy::of(&published.state()).expect("the published tenancy resolves");
+        let tenancy = Tenancy::of(published.state()).expect("the published tenancy resolves");
         assert!(
             !tenancy.is_served(tenant_id(11)) && tenancy.tenant(tenant_id(11)).is_none(),
             "the projection and the published snapshot disagree about who is served"
@@ -4324,13 +4354,7 @@ mod tests {
                      ORDER BY relname"
                 )
                 .await,
-            vec![
-                "axond_cp_blob".to_owned(),
-                "axond_cp_head".to_owned(),
-                "axond_cp_revision".to_owned(),
-                "axond_cp_revision_blob".to_owned(),
-                "axond_cp_schema_migration".to_owned(),
-            ],
+            vec!["axond_cp_schema_migration".to_owned()],
             "the unwalled tables are not the ones 0002 and the runbook name"
         );
     }

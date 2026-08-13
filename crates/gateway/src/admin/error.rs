@@ -448,9 +448,6 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
         // refusal is about without quoting the rates it states.
         ValidationError::Pricing(pricing) => ("price_book", Some(pricing.reference())),
         ValidationError::AuditMutationMismatch { .. } => ("audit_mutation_mismatch", None),
-        ValidationError::VersionNotAdvanced { proposed, .. } => {
-            ("version_not_advanced", Some(*proposed))
-        }
         ValidationError::Canonical(_) => ("not_canonical", None),
     }
 }

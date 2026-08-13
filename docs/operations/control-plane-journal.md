@@ -66,17 +66,19 @@ Two properties worth knowing before you plan capacity or retention:
   to a workload is filtered by that workload's tenant too, so a pinned session
   cannot read which service accounts of other tenants attempted what.
 
-  What is deliberately outside it: `axond_cp_revision`, `axond_cp_revision_blob`,
-  `axond_cp_blob`, `axond_cp_head`, and `axond_cp_schema_migration` — the five
-  tables 0001 creates that 0002 leaves without a policy, and the same five a
-  `pg_class.relrowsecurity` audit reports. A revision
-  is the whole deployment's desired state, so there is no tenant to attribute the
-  chain, the head, or a content digest to, and hiding a revision from a tenant
-  would hide the revision carrying that tenant's own state. These rows expose that
-  a deployment has a publication history and how long it is — ids, a parent link,
-  checksums, blob digests and sizes — and no tenant id, slug, body, or actor. A
-  pinned session can count revisions whose contents it cannot read; that is the
-  residual, and it is a boundary rather than an omission.
+  The publication chain — `axond_cp_head`, `axond_cp_revision`,
+  `axond_cp_revision_entry`, `axond_cp_revision_blob`, `axond_cp_blob`,
+  `axond_cp_resource_dependency` — has no tenant column to key a policy on, since
+  one revision is every tenant's desired state at one instant, so it is walled the
+  only way it can be: readable by the unpinned publisher and by nothing else. A
+  session pinned to a tenant reads its own rows through the tables above and none
+  of the chain that published them.
+
+  What is deliberately outside the wall is one table, `axond_cp_schema_migration`
+  — the schema's own version, which belongs to no tenant and is what an operator
+  reads to know which migrations ran. It is also exactly what a
+  `pg_class.relrowsecurity` audit reports as unprotected, so the list and the
+  database agree.
 
   Two preconditions before you apply 0002 to a deployment that is already
   running. The policies are `FORCE`d so that they bind the table owner too — the
