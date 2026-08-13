@@ -20,4 +20,4 @@ pub mod sampler;
 
 pub use manifest::{Ending, Manifest, Profile, Tier};
 pub use result::EnduranceResult;
-pub use run::{DURATION_ENV, run};
+pub use run::{DURATION_ENV, requested_duration, run, trend};

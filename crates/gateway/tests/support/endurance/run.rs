@@ -168,7 +168,7 @@ struct Attempt {
 pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> EnduranceResult {
     let _offering = load_lock().lock().await;
     let mut scale = *profile.scale(tier);
-    let requested = requested_duration(&scale, tier);
+    let requested = requested_duration(&scale, tier, std::env::var(DURATION_ENV).ok().as_deref());
     // Recorded on the artifact, not just used: a dispatched run at a shorter
     // duration is segmented to match, and the echo has to say what it was.
     scale.segment_ms = segment_ms(&scale, requested);
@@ -297,9 +297,9 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
 
 /// How long the run was asked to last, and who asked.
 #[derive(Clone, Copy)]
-struct Requested {
-    duration: Duration,
-    source: &'static str,
+pub struct Requested {
+    pub duration: Duration,
+    pub source: &'static str,
 }
 
 /// How long a segment lasts. The manifest's length, except when the run was
@@ -314,11 +314,9 @@ fn segment_ms(scale: &Scale, requested: Requested) -> u64 {
 /// The override belongs to the soak alone. Both tiers live in one test binary,
 /// so honouring it for the smoke tier would make a five-hour dispatch offer
 /// five hours twice and be killed by the runner before it published anything.
-fn requested_duration(scale: &Scale, tier: Tier) -> Requested {
-    let override_ms = (tier == Tier::Soak)
-        .then(|| std::env::var(DURATION_ENV).ok())
-        .flatten();
-    match override_ms.and_then(|value| value.trim().parse::<u64>().ok()) {
+pub fn requested_duration(scale: &Scale, tier: Tier, override_ms: Option<&str>) -> Requested {
+    let asked = override_ms.filter(|_| tier == Tier::Soak);
+    match asked.and_then(|value| value.trim().parse::<u64>().ok()) {
         Some(ms) => Requested {
             duration: Duration::from_millis(ms),
             source: "environment",
@@ -1059,7 +1057,7 @@ fn resources(
 /// Fit the per-segment medians. A slope needs both enough segments and enough
 /// wall clock to be a slope rather than a rounding error of the first minute,
 /// so `fitted` records whether the drift gates may be believed.
-fn trend(all: &[Segment], scale: &Scale) -> Trend {
+pub fn trend(all: &[Segment], scale: &Scale) -> Trend {
     // Only the segments that had load offered through them: the last one is
     // the settle and quiesce wait, and an idle reading at the end would pull
     // the fitted slope down by exactly as much as the process gave back.

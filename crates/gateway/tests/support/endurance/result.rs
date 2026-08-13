@@ -320,6 +320,43 @@ pub struct Segment {
     pub awaiting_first_byte_peak: u64,
 }
 
+impl Segment {
+    /// A segment carrying only what the trend is fitted through, for asserting
+    /// on the fit without offering hours of load to produce one.
+    pub fn fitted_through(
+        index: usize,
+        under_load: bool,
+        started_ms: u128,
+        elapsed_ms: u128,
+        rss_kib: u64,
+    ) -> Self {
+        Self {
+            index,
+            under_load,
+            started_ms,
+            elapsed_ms,
+            offered: 0,
+            accepted: 0,
+            unplanned_errors: 0,
+            offered_rps: 0.0,
+            latency_ms: None,
+            ttft_ms: None,
+            usage_records: 0,
+            samples: 1,
+            rss_kib_median: Some(rss_kib),
+            rss_kib_peak: Some(rss_kib),
+            sockets_median: None,
+            sockets_peak: None,
+            fds_median: None,
+            fds_peak: None,
+            cpu_seconds: None,
+            cpu_utilization: None,
+            in_flight_peak: 0,
+            awaiting_first_byte_peak: 0,
+        }
+    }
+}
+
 /// Least-squares slopes through the per-segment medians, in units per hour.
 /// A replica that ends where it started has a slope near zero whatever its
 /// peaks were, which is the property "no unbounded growth" actually names.

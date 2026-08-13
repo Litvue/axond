@@ -166,6 +166,103 @@ fn the_ending_rotation_is_deterministic_and_interleaved() {
     }
 }
 
+/// The duration override belongs to the soak. Both tiers live in this binary,
+/// so a smoke tier that honoured it would offer the dispatched hours a second
+/// time — and the dispatched job, sized for one soak, would be killed by the
+/// runner before it published anything.
+#[test]
+fn the_duration_override_moves_the_soak_tier_and_leaves_the_smoke_tier_committed() {
+    let (manifest, _) = endurance::manifest::load();
+    for profile in &manifest.profiles {
+        let smoke = endurance::requested_duration(&profile.smoke, Tier::Smoke, Some("18000000"));
+        assert_eq!(
+            (smoke.duration.as_millis() as u64, smoke.source),
+            (profile.smoke.duration_ms, "manifest"),
+            "{}: the smoke tier took the soak's dispatched duration",
+            profile.id
+        );
+
+        let soak = endurance::requested_duration(&profile.soak, Tier::Soak, Some("18000000"));
+        assert_eq!(
+            (soak.duration.as_millis() as u64, soak.source),
+            (18_000_000, "environment"),
+            "{}: the soak tier ignored its dispatched duration",
+            profile.id
+        );
+
+        // An unset or unreadable override is the manifest's tier, said so on
+        // the artifact: a run recorded as dispatched that was not is evidence
+        // of a duration nobody asked for.
+        for asked in [None, Some("not a duration")] {
+            let taken = endurance::requested_duration(&profile.soak, Tier::Soak, asked);
+            assert_eq!(
+                (taken.duration.as_millis() as u64, taken.source),
+                (profile.soak.duration_ms, "manifest"),
+                "{}: {asked:?} did not fall back to the committed soak",
+                profile.id
+            );
+        }
+    }
+}
+
+/// The window after the load stops — records settling, upstream bodies closing,
+/// the process going idle — is minutes of a segment with nothing offered in it.
+/// Fitting the drift slope through it would read ordinary teardown as memory
+/// coming back, and at the smoke tier that idle segment is longer than every
+/// real one.
+#[test]
+fn the_idle_settle_segment_is_kept_out_of_the_trend_and_the_segment_count() {
+    let (manifest, _) = endurance::manifest::load();
+    let profile = manifest
+        .profiles
+        .first()
+        .expect("the manifest commits a profile");
+    let scale = &profile.soak;
+    let segment_ms = 900_000_u128;
+
+    // Eight segments of flat resident memory: a replica that ends where it
+    // started, which is what the gate asks for.
+    let mut segments: Vec<endurance::result::Segment> = (0..8)
+        .map(|index| {
+            endurance::result::Segment::fitted_through(
+                index,
+                true,
+                index as u128 * segment_ms,
+                segment_ms,
+                200_000,
+            )
+        })
+        .collect();
+    let under_load = endurance::trend(&segments, scale);
+    assert_eq!(under_load.segments, 8);
+    assert!(under_load.fitted, "{under_load:?}");
+    assert_eq!(
+        under_load.rss_kib_per_hour.map(|slope| slope.abs() < 1e-6),
+        Some(true),
+        "flat segments must fit a flat slope: {under_load:?}"
+    );
+
+    // The same run, plus the idle reading taken after it: half the resident
+    // memory, and nothing offered during it.
+    segments.push(endurance::result::Segment::fitted_through(
+        8,
+        false,
+        8 * segment_ms,
+        180_000,
+        100_000,
+    ));
+    let with_idle = endurance::trend(&segments, scale);
+    assert_eq!(
+        (with_idle.segments, with_idle.rss_kib_per_hour),
+        (under_load.segments, under_load.rss_kib_per_hour),
+        "the post-load segment changed the fit it is excluded from"
+    );
+    assert_eq!(
+        with_idle.last_quarter_rss_kib, under_load.last_quarter_rss_kib,
+        "the idle reading reached the last-quarter median"
+    );
+}
+
 async fn qualify(tier: Tier) {
     let (manifest, text) = endurance::manifest::load();
     let mut failures = Vec::new();
