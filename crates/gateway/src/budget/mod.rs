@@ -41,7 +41,7 @@ use async_trait::async_trait;
 
 use crate::config::{BudgetBackend, BudgetConfig, StoreUnavailable};
 use crate::desired_state::policy::PolicyGeneration;
-use crate::policy::{BudgetCaps, Ceilings, Unenforceable, should_report};
+use crate::policy::{BudgetCaps, Ceilings, Unenforceable, denied};
 use crate::telemetry::metrics;
 
 pub use postgres::PostgresBudget;
@@ -615,7 +615,7 @@ impl SharedSettings {
             // because the condition belongs to the published view and repeating
             // it per request scales the log with traffic rather than with the
             // problem.
-            if should_report(Unenforceable::Ungoverned, backend, namespace) {
+            if denied(Unenforceable::Ungoverned, backend, namespace) {
                 tracing::warn!(
                     backend,
                     namespace,
@@ -626,7 +626,7 @@ impl SharedSettings {
             return None;
         };
         if caps.namespace_microdollars.is_some() != self.namespace_scope {
-            if should_report(Unenforceable::Layout, backend, namespace) {
+            if denied(Unenforceable::Layout, backend, namespace) {
                 tracing::error!(
                     backend,
                     namespace,

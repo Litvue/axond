@@ -94,8 +94,10 @@ last known good policy keeps serving. Publish a tenant-level document as the
 floor **before** projecting namespaces to it; the preflight table's "every
 projected namespace is governed" row is that check.
 
-Every such denial is counted (`policy` denial metrics are per request); the log
-line explaining it is sampled — once per condition, backend and namespace, then
+Every such denial is counted on `axond.policy.unenforceable_denials`
+(`axond.policy.condition = ungoverned`, or `layout` when the published cap and
+the store's key layout disagree), once per request; the log line explaining it
+is sampled — once per condition, backend and namespace, then
 at most once a minute for as long as it lasts — so a namespace that stays
 ungoverned under load produces an operator signal rather than a log flood.
 
@@ -215,6 +217,7 @@ would make already-revoked tokens work again; issue new credentials instead.
 | Revisions rejected with `refused` | An epoch regression, a fork, or an unsafe field change | Read the refusal; publish forward under a higher epoch |
 | Revisions rejected with `withdrawn` | A document was removed from a namespace still being served | Delete the namespace, or publish a document for it |
 | Revisions rejected with `ungoverned` | The revision projects a namespace no document governs | Publish a tenant-level document as the floor, then project the namespace |
-| Requests denied for one namespace only | No document governs it — only reachable from a bootstrap gap, not from a publication | Publish a tenant-level document |
+| `axond.policy.unenforceable_denials{condition="ungoverned"}` climbing | No document governs that namespace — only reachable from a bootstrap gap, not from a publication | Publish a tenant-level document |
+| `axond.policy.unenforceable_denials{condition="layout"}` climbing | The published cap and the key layout this process booted on disagree | [Migrate the layout](#migrating-the-layout) |
 | A tightening never finishes draining | Long-lived requests still hold the old generation | Wait, or drain the replica |
 | Control plane unreachable | Last-known-good policy keeps being enforced | Nothing; convergence resumes on its own |

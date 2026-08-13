@@ -84,7 +84,10 @@ Alongside them:
   signal. One second of lag is convergence working; ten minutes is an incident.
 - **reason** — the stage that refused the last candidate: `unavailable`,
   `incompatible`, `corrupt`, `not_found`, `projection`, `validation`, `secret`,
-  `snapshot`, `pricing`, or `clock`.
+  `snapshot`, `pricing`, or `clock` — or, when the candidate compiled but its
+  policy was refused before it could be enforced, `unsupported`, `migration`,
+  `refused`, `withdrawn`, or `ungoverned` ([policy
+  activation](./policy-activation.md#classification-live-drain-migration-refused)).
 - **source** — `control-plane` or `last-known-good`. A replica reporting
   `last-known-good` booted from its cache and may be serving something older
   than desired.

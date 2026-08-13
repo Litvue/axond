@@ -69,6 +69,7 @@ struct Instruments {
     rate_limit_denials: Counter<u64>,
     rate_limit_capacity_denials: Counter<u64>,
     rate_limit_unavailable_denials: Counter<u64>,
+    policy_unenforceable_denials: Counter<u64>,
     revocation_denials: Counter<u64>,
     revocation_unavailable_denials: Counter<u64>,
     status_component_state: Gauge<u64>,
@@ -354,6 +355,13 @@ impl Instruments {
             rate_limit_unavailable_denials: meter
                 .u64_counter("axond.rate_limit.unavailable_denials")
                 .with_description("Rate-limit admissions denied because the store was unavailable.")
+                .build(),
+            policy_unenforceable_denials: meter
+                .u64_counter("axond.policy.unenforceable_denials")
+                .with_description(
+                    "Admissions denied because no published policy governs the namespace, or \
+                     because the active policy disagrees with the store's key layout.",
+                )
                 .build(),
             revocation_denials: meter
                 .u64_counter("axond.revocation.denials")
@@ -861,6 +869,26 @@ pub fn record_rate_limit_unavailable_denial() {
         return;
     };
     instruments.rate_limit_unavailable_denials.add(1, &[]);
+}
+
+/// Record an admission denied because this replica has no enforceable policy
+/// for the namespace — either nothing governs it, or the active document
+/// disagrees with the layout the store booted on.
+///
+/// The store is healthy in both cases, so these are counted apart from the
+/// unavailable-denial counters. The explanatory log is sampled
+/// (`crate::policy::ungoverned`); this is not.
+pub fn record_policy_unenforceable_denial(condition: &'static str, store: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.policy_unenforceable_denials.add(
+        1,
+        &[
+            KeyValue::new("axond.policy.condition", condition),
+            KeyValue::new("axond.policy.store", store),
+        ],
+    );
 }
 
 pub fn record_revocation_denial() {

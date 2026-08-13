@@ -15,9 +15,7 @@ use tokio::sync::{Semaphore, SemaphorePermit, oneshot};
 
 use super::{PermitRelease, RateLimitError, RateLimitKey, RateLimitPermit, RateLimiter};
 use crate::config::StoreUnavailable;
-use crate::policy::{
-    ActivePolicy, Ceilings, ConcurrencyCaps, PolicyHold, Unenforceable, should_report,
-};
+use crate::policy::{ActivePolicy, Ceilings, ConcurrencyCaps, PolicyHold, Unenforceable, denied};
 use crate::redis_support::{RedisConnection as SharedConnection, RedisRecovery as SharedRecovery};
 use crate::telemetry::metrics;
 
@@ -516,7 +514,7 @@ impl RateLimiter for RedisRateLimiter {
             // Sampled, not per request: the namespace is ungoverned until a
             // publication governs it, so the log would otherwise grow with the
             // traffic being denied rather than with the condition.
-            if should_report(Unenforceable::Ungoverned, self.name(), &key.namespace) {
+            if denied(Unenforceable::Ungoverned, self.name(), &key.namespace) {
                 tracing::warn!(
                     namespace = %key.namespace,
                     "no policy governs this namespace, so its concurrency limit cannot be \

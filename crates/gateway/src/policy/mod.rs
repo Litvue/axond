@@ -55,7 +55,7 @@ pub(crate) mod view;
 
 pub use activation::{Activation, ActivationRefusal, BackendSupport};
 pub use source::{Ceilings, PolicyHold};
-pub(crate) use ungoverned::{Unenforceable, should_report};
+pub(crate) use ungoverned::{Unenforceable, denied};
 pub use view::{ActivePolicy, BudgetCaps, ConcurrencyCaps, PolicyView};
 
 use std::collections::HashMap;

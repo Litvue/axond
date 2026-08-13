@@ -67,7 +67,9 @@ state — a candidate serving a namespace no document governs is refused before 
 is installed — so the denial belongs to a bootstrap gap, not to a revision. In
 stateful mode the bootstrap file cannot declare a namespace at all, so "governed
 by a published document" is the only way a namespace is served. The condition
-belongs to the view rather than to the request, so it is counted per denial and
+belongs to the view rather than to the request, so it is counted per denial on
+`axond.policy.unenforceable_denials` — apart from the unavailable-denial
+counters, because the store is healthy and only the limit is missing — and
 explained in the log once per condition, backend and namespace, and at most once
 a minute thereafter: a bootstrap gap under production traffic must not turn the
 log into the outage.

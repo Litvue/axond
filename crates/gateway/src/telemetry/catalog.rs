@@ -730,6 +730,15 @@ pub const CATALOG: &[MetricSpec] = &[
         labels: &[],
     },
     MetricSpec {
+        name: "axond.policy.unenforceable_denials",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[
+            Label::closed("axond.policy.condition", &["ungoverned", "layout"]),
+            Label::closed("axond.policy.store", &["redis", "postgres"]),
+        ],
+    },
+    MetricSpec {
         name: "axond.revocation.denials",
         kind: InstrumentKind::Counter,
         unit: None,
