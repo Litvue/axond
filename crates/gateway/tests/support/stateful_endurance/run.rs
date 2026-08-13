@@ -1099,7 +1099,7 @@ impl Supervisor<'_> {
 
 /// How long a retiring replica has to exit. Its own config advertises an eight
 /// second deadline, and this leaves room for the signal and the wait.
-const RETIRE_BOUND_MS: u64 = 15_000;
+pub const RETIRE_BOUND_MS: u64 = 15_000;
 
 /// How much load must follow the last replacement. A restart the workload
 /// finished before proves nothing — `unavailable = 0` is satisfied by a

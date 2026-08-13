@@ -918,17 +918,28 @@ fn the_endurance_smoke_lane_is_bounded_above_its_committed_contract() {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .expect("the lane is bounded rather than left on the six-hour default");
 
-    // What the committed contract can spend at most: every profile's smoke
-    // workload, the tail a late rolling restart may add to it, and the two
-    // settles that follow it (the driver's, then the durable table's).
+    // What the committed contract can spend at most, per profile the lane runs:
+    // the smoke workload, the tail a late rolling restart may add to it, the two
+    // settles that follow it (the driver's, then the durable table's), and the
+    // worst case of the things the script waits on inside the run — every
+    // replica retiring on its bound and its replacement taking the whole
+    // unready allowance to answer, and each of the three revisions converging
+    // only at `max_convergence_ms`. Those overlap the workload rather than
+    // following it, so counting them separately is deliberately pessimistic.
+    const REVISIONS: u64 = 3;
     let (manifest, _) = stateful_endurance::load();
     let contract: u64 = manifest
         .profiles
         .iter()
         .map(|profile| {
+            let restart = profile.slo.replicas as u64
+                * (stateful_endurance::run::RETIRE_BOUND_MS
+                    + profile.termination.abort_after_unready_ms);
             profile.smoke.duration_ms
                 + stateful_endurance::run::POST_RESTART_LOAD.as_millis() as u64
                 + 2 * profile.termination.settle_ms
+                + restart
+                + REVISIONS * profile.slo.max_convergence_ms
         })
         .sum();
     // Plus the build: the lane caches dependencies but not the target directory,

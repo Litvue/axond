@@ -332,12 +332,16 @@ jobs:
     # false`, so the whole gateway is compiled with every feature from cold
     # before the run starts, and the run itself is the manifest's 90 s workload
     # plus the tail the rolling restart may add plus two 120 s settles (the
-    # driver's and the durable table's). Ten minutes left almost nothing for the
-    # build, so a slow runner failed a required gate for a reason that had
-    # nothing to do with the change under test. Thirty leaves the build room and
-    # still ends a wedged replica or backend well before the default six hours.
-    # `the_endurance_smoke_lane_is_bounded_above_its_committed_contract` fails if
-    # the manifest's own bounds ever grow into this.
+    # driver's and the durable table's) plus the worst case of what the script
+    # waits on inside it — each replica retiring on its bound with its
+    # replacement taking the whole unready allowance, and three revisions
+    # converging only at `max_convergence_ms`. Ten minutes left almost nothing
+    # for the build, so a slow runner failed a required gate for a reason that
+    # had nothing to do with the change under test. Thirty leaves the build room
+    # and still ends a wedged replica or backend well before the default six
+    # hours. `the_endurance_smoke_lane_is_bounded_above_its_committed_contract`
+    # computes that worst case from the manifest and fails if it ever grows into
+    # this bound.
     timeout-minutes: 30
     services:
       postgres:
