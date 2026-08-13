@@ -1526,6 +1526,21 @@ fn declares_a_price_book(resource: &ResourceVersion) -> bool {
     })
 }
 
+/// Whether a price row carries a `schema` that is present and is not an
+/// identifier.
+///
+/// Such a row belongs to no slice: the marker deciding whose rules read it is
+/// itself unreadable, so skipping it as another slice's business would leave
+/// damage unreported by every reader.
+fn carries_a_damaged_schema(resource: &ResourceVersion) -> bool {
+    let ResourceBody::Inline(CanonicalValue::Map(fields)) = &resource.body else {
+        return false;
+    };
+    fields
+        .iter()
+        .any(|(field, value)| field == SCHEMA_FIELD && !matches!(value, CanonicalValue::String(_)))
+}
+
 /// The price books of one revision, resolved once.
 ///
 /// Built by [`PriceBooks::of`], which [`DesiredState::validate`] calls, so
@@ -1558,6 +1573,14 @@ impl PriceBooks {
             // them here would refuse a revision this build otherwise serves
             // correctly, and it bills nothing from them either way.
             if resource.scope != ResourceScope::Deployment && !declares_a_price_book(resource) {
+                // Unless there is no marker left to attribute it by, in which
+                // case no slice's rules claim the row and this reader is the one
+                // that saw it.
+                if carries_a_damaged_schema(resource) {
+                    return Err(PricingError::DamagedSchema {
+                        reference: resource.reference,
+                    });
+                }
                 continue;
             }
             // Before the body is read *and* before the scope is judged, so a
@@ -2392,6 +2415,39 @@ mod tests {
             PriceBooks::of(&state).expect("a tenant's rate row is not this slice's to read");
         assert!(books.book().is_none(), "and it prices nothing");
         assert!(books.snapshot_at(at(1)).is_none());
+    }
+
+    /// But attribution needs a marker to read. A tenant's rate row whose `schema`
+    /// is present and is not an identifier names no slice at all, so skipping it
+    /// as another slice's business would leave the damage reported by nobody.
+    #[test]
+    fn a_tenant_rate_row_whose_marker_is_damaged_is_refused_here() {
+        let row = fixtures::price(&fixtures::tenant_id(1), 7, "acme-rate");
+        for marker in [
+            CanonicalValue::integer(1),
+            CanonicalValue::List(vec![CanonicalValue::string(PRICE_BOOK_SCHEMA)]),
+            CanonicalValue::map([(SCHEMA_FIELD, CanonicalValue::string(PRICE_BOOK_SCHEMA))]),
+        ] {
+            let mut state = fixtures::state();
+            state
+                .insert(ResourceVersion::new(
+                    row.reference,
+                    row.scope.clone(),
+                    row.slug.clone(),
+                    ResourceBody::Inline(CanonicalValue::map([(SCHEMA_FIELD, marker.clone())])),
+                ))
+                .expect("a distinct reference");
+
+            let error = PriceBooks::of(&state).expect_err("a marker no release wrote is refused");
+            assert!(
+                matches!(error, PricingError::DamagedSchema { .. }),
+                "{marker:?}: {error}"
+            );
+            assert!(
+                !error.is_incompatible(),
+                "storage to repair, not a build to roll forward: {error}"
+            );
+        }
     }
 
     #[test]
