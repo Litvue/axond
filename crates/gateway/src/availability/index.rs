@@ -42,11 +42,14 @@
 //!    the index does not hold at all.
 //! 8. **Runtime impairment.** Intermittent failure short of tripping is not a
 //!    refusal — the breaker would still attempt the target (ADR 0008) — so it
-//!    lowers a positive or uncertain verdict to `unknown` rather than withdrawing
+//!    lowers a positive or stale verdict to `unknown` rather than withdrawing
 //!    the target, and a flaky target does not report as plainly `available`. It only
 //!    lowers: a conclusion the evidence reached stands, because local flakiness is
 //!    no reason to stop reporting that a complete listing no longer carries the
-//!    model.
+//!    model, and a verdict already at `unknown` keeps its own reason — a provider
+//!    that cannot be enumerated is not relabelled as a flaky replica. When it does
+//!    lower one, the evidence rides along, so a lowered `stale` verdict still
+//!    reports when its evidence was taken and when it expired.
 //!
 //! Ties are impossible by construction: exactly one rung decides, and the verdict
 //! records which one in [`Availability::decided_by`].
@@ -345,12 +348,17 @@ impl AvailabilityIndex {
         // ever *lowers*, though: a conclusion the evidence reached is left standing,
         // because local flakiness is not a reason to stop reporting that a provider's
         // complete listing no longer carries the model.
-        if record.runtime == RuntimeHealth::Impaired && evidence.state.permits_attempt() {
-            return Availability::decided(
-                AvailabilityState::Unknown,
-                AvailabilityReason::RuntimeImpaired,
-                DecidedBy::Runtime,
-            );
+        // It also has nothing to add to a verdict that is already uncertain: an
+        // unlistable provider stays reported as unlistable, rather than losing that
+        // to "this replica is flaky", because a rung that lowers nothing does not get
+        // to relabel why. And when it does lower one, the evidence rides along, so a
+        // lowered `stale` verdict still says when the evidence expired.
+        if record.runtime == RuntimeHealth::Impaired
+            && evidence.state.permits_attempt()
+            && evidence.state.certainty() > AvailabilityState::Unknown.certainty()
+        {
+            return evidence
+                .lowered_to_unknown(AvailabilityReason::RuntimeImpaired, DecidedBy::Runtime);
         }
         evidence
     }

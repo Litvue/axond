@@ -392,6 +392,24 @@ impl Availability {
         self
     }
 
+    /// The same verdict lowered to `Unknown` for `reason`, decided by
+    /// `decided_by`, keeping the evidence it was resting on.
+    ///
+    /// For a rung that reduces certainty without replacing the evidence — runtime
+    /// impairment is the only one — so a tenant still learns when the evidence was
+    /// taken and when it expires, which is what a lowered `stale` verdict would
+    /// otherwise lose.
+    pub const fn lowered_to_unknown(
+        mut self,
+        reason: AvailabilityReason,
+        decided_by: DecidedBy,
+    ) -> Self {
+        self.state = AvailabilityState::Unknown;
+        self.reason = reason;
+        self.decided_by = decided_by;
+        self
+    }
+
     /// Whether an attempt against the target is allowed to be made at all.
     ///
     /// Both halves matter. The state must not be a refusal, *and* some dimension

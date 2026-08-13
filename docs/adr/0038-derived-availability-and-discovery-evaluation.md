@@ -75,11 +75,15 @@ refusal outranks a tenant's switch while a deployment's *inability to decide* mu
 not: every rung that can answer `unknown` sits below enablement. Runtime health is
 split for the same reason in the other direction: an open circuit is this replica's
 refusal and outranks the evidence, while impairment short of tripping only *lowers*
-a positive or uncertain verdict to `unknown` (the breaker would still attempt the
+a positive or stale verdict to `unknown` (the breaker would still attempt the
 target, [ADR 0008](./0008-target-failover-and-circuit-scope.md)) and leaves a
 conclusion the evidence reached standing — local flakiness is no reason to stop
 reporting that a complete listing no longer carries the model, still less to make
-that target attemptable again.
+that target attemptable again. Because it lowers rather than replaces, it relabels
+nothing it did not lower: a verdict already at `unknown` keeps its own reason, so a
+provider that cannot be enumerated is not reported as a flaky replica, and the
+evidence rides along when it does lower one, so a lowered verdict still reports when
+its evidence was taken and when it expires.
 
 **Completeness is a separate question from the result, and only a complete
 negative may deny.** A `DiscoveryObservation` carries its result, its

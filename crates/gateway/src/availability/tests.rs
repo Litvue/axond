@@ -315,6 +315,89 @@ fn an_impaired_target_loses_certainty_while_an_open_circuit_refuses() {
     );
 }
 
+/// Lowering a verdict is not relabelling it. Impairment lowers certainty, so it has
+/// nothing to say about a verdict already at `unknown`: an operator looking at a
+/// provider that cannot be enumerated must not be told instead that this replica is
+/// flaky, and the two send them to different places.
+#[test]
+fn an_impaired_replica_does_not_relabel_an_already_uncertain_verdict() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let impaired = || AvailabilityRecord {
+        runtime: RuntimeHealth::Impaired,
+        ..permitting()
+    };
+
+    let unlistable = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), impaired())
+        .observe(outage(scope, "gpt-4o", 100))
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(120));
+    assert_eq!(
+        (unlistable.state, unlistable.reason, unlistable.decided_by),
+        (
+            AvailabilityState::Unknown,
+            AvailabilityReason::DiscoveryIncomplete,
+            DecidedBy::Discovery,
+        ),
+        "the look that could not finish is still why nobody knows"
+    );
+
+    let unlooked = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), impaired())
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(120));
+    assert_eq!(
+        (unlooked.state, unlooked.reason, unlooked.decided_by),
+        (
+            AvailabilityState::Unknown,
+            AvailabilityReason::NoEvidence,
+            DecidedBy::Discovery,
+        ),
+        "\"nobody has looked\" survives a flaky replica"
+    );
+}
+
+/// A lowered verdict keeps the evidence it was resting on: `expires_at` is what a
+/// namespace-scoped reader is promised, and a stale target lowered by impairment must
+/// not stop reporting when its evidence ran out.
+#[test]
+fn a_verdict_impairment_lowers_keeps_its_evidence() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let verdict = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                runtime: RuntimeHealth::Impaired,
+                ..permitting()
+            },
+        )
+        .observe(present(scope, "gpt-4o", 100, Some(50)))
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(200));
+
+    assert_eq!(
+        (verdict.state, verdict.reason, verdict.decided_by),
+        (
+            AvailabilityState::Unknown,
+            AvailabilityReason::RuntimeImpaired,
+            DecidedBy::Runtime,
+        ),
+        "expired positive evidence on a flaky replica is uncertain, not stale"
+    );
+    assert_eq!(verdict.observed_at, Some(at(100)));
+    assert_eq!(
+        verdict.expires_at,
+        Some(at(150)),
+        "a tenant still learns when the evidence ran out"
+    );
+    assert_eq!(verdict.source, Some(DiscoverySource::ProviderListing));
+    assert_eq!(
+        verdict.for_scope(StatusScope::Namespace).expires_at,
+        Some(at(150)),
+        "and keeps it through namespace redaction"
+    );
+}
+
 /// Impairment lowers a verdict and never lifts one: a replica failing on and off is
 /// no reason to stop reporting that a provider's complete listing dropped the
 /// target, and certainly not to make it attemptable again.
