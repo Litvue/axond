@@ -497,9 +497,12 @@ async fn serve() -> anyhow::Result<()> {
     // the listener exists: a stateful replica whose administrative surface cannot
     // come up must fail at boot rather than serve a deployment nobody can
     // administer. In stateless mode this opens nothing at all.
-    let (admin_surface, admin_mode) = admin::runtime::surface(&config, &env)
-        .await
-        .map_err(|e| anyhow::anyhow!("administrative surface configuration failed: {e}"))?;
+    let (admin_surface, admin_mode) =
+        admin::runtime::surface(&config, &env).await.map_err(|e| {
+            anyhow::anyhow!(
+                "a stateful deployment could not bring up its administrative surface: {e}"
+            )
+        })?;
     tracing::info!(
         mode = admin_mode,
         prefix = admin::ADMIN_PREFIX,

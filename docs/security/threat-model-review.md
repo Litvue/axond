@@ -271,7 +271,7 @@ and [ADR 0012](../adr/0012-native-provider-routes.md) bound wire families and
 native routes; the durable entitlement contract — opaque snapshot-pinned offering
 identities, observed versus approved pricing, tenant defaults against project
 overrides, and ordered single-wire-family alias targets — is
-[ADR 0036](../adr/0036-model-enablement-and-alias-contracts.md), and a change to
+[ADR 0038](../adr/0038-model-enablement-and-alias-contracts.md), and a change to
 what an enablement pins or to which targets an alias may name amends it; `CatalogSource`'s background-only placement is in
 [backend contracts](../maintainers/backend-contracts.md). Item 2 of the security
 review's accepted-risk section is why `/v1/models` is authenticated and scoped —
