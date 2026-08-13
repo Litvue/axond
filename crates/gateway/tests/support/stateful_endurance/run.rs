@@ -255,15 +255,10 @@ pub async fn run_with(
     }
     let total_offered = next.load(Ordering::Relaxed) as u64;
     let elapsed = started.elapsed();
-    // The load's tail is its own segment, closed before the settle: folding the
-    // idle wait into the last loaded segment would make the busiest segment
-    // look like the calmest.
-    state.close_segment(elapsed);
-    // A run can end while every replica is still unready. Close that interval
-    // against the run's end before the settle wait, so a failed fleet cannot
-    // disappear from the readiness verdict merely because the driver stopped
-    // sampling it.
-    state.close_readiness_gap(elapsed);
+    // Flush every observation before settlement and grading. The load's tail
+    // is its own segment, and a run can end while every replica is still
+    // unready; neither may disappear when the driver stops sampling it.
+    state.finalize(elapsed);
 
     let settle = Duration::from_millis(profile.termination.settle_ms);
     state.settle(&mut fleet, settle, started).await;
@@ -1673,6 +1668,14 @@ impl State {
         self.open.started_ms = ended_ms;
     }
 
+    /// Flush the observations that must be complete before settlement and
+    /// grading. In particular, an open readiness interval must be scored at
+    /// the run's end even when no later probe observes recovery.
+    fn finalize(&mut self, now: Duration) {
+        self.close_segment(now);
+        self.close_readiness_gap(now);
+    }
+
     /// The longest stretch, while load was being offered, in which the fleet
     /// produced no accounting at all. A gateway that keeps answering while its
     /// usage records stop is the failure this measures, and it is invisible in
@@ -2367,13 +2370,13 @@ mod tests {
         // This is the path run_with takes after the supervisor ends while the
         // fleet is still unready. It must count the interval even without a
         // false-to-true readiness transition to close it.
-        state.close_readiness_gap(Duration::from_millis(850));
+        state.finalize(Duration::from_millis(850));
         assert_eq!(state.telemetry.worst_readiness_gap_ms, 750);
         assert!(state.unready_since.is_none());
 
         // Finalization is idempotent: the normal recovery path must not count
         // the same interval again if it observes the closed state later.
-        state.close_readiness_gap(Duration::from_millis(1_000));
+        state.finalize(Duration::from_millis(1_000));
         assert_eq!(state.telemetry.worst_readiness_gap_ms, 750);
 
         drop(state);
