@@ -80,6 +80,7 @@
 
 pub mod auth;
 pub mod cli;
+pub mod conditional;
 pub mod diff;
 pub mod error;
 pub mod handlers;

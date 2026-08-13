@@ -1108,6 +1108,91 @@ async fn an_audit_page_is_capped_and_says_when_it_truncated() {
 }
 
 #[tokio::test]
+async fn a_convergence_read_matches_while_only_its_elapsed_times_move() {
+    use axum::response::IntoResponse;
+
+    use super::conditional::Conditional;
+    use super::reads::ConvergenceResult;
+
+    let service = AdminService::stateful(Arc::new(InMemoryControlPlane::new()));
+    let report = |lag_ms: u64, active| crate::convergence::RevisionReport {
+        desired: Some(fixtures::revision_id(2)),
+        loaded: Some(fixtures::revision_id(1)),
+        active,
+        source: Some(crate::convergence::SnapshotSource::ControlPlane),
+        generation: 7,
+        lag: std::time::Duration::from_millis(lag_ms),
+        last_convergence: Some(std::time::Duration::from_millis(250)),
+        consecutive_failures: 0,
+        last_rejection: None,
+    };
+    let project = |report: &crate::convergence::RevisionReport| {
+        service
+            .convergence(&grant(AdminAction::ReadConvergence), Some(report))
+            .expect("a convergence projection")
+    };
+    let answer = |result: ConvergenceResult, conditional: Option<&str>| {
+        let mut headers = HeaderMap::new();
+        if let Some(validator) = conditional {
+            headers.insert(
+                axum::http::header::IF_NONE_MATCH,
+                HeaderValue::from_str(validator).expect("a conditional"),
+            );
+        }
+        let identity = result.identity();
+        Conditional::identified_by(&headers, result, &identity).into_response()
+    };
+
+    let behind = project(&report(3_000, Some(fixtures::revision_id(1))));
+    let response = answer(behind, None);
+    assert_eq!(response.status(), StatusCode::OK);
+    let validator = response
+        .headers()
+        .get(axum::http::header::ETAG)
+        .expect("a validator")
+        .to_str()
+        .expect("a readable validator")
+        .to_owned();
+    // Weak, because the body it labels is not byte-stable: `lag_ms` grows every
+    // millisecond this replica stays behind.
+    assert!(validator.starts_with("W/\""), "{validator}");
+    // Per-caller, so no shared cache may reuse it for another administrator.
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-cache"),
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::VARY)
+            .and_then(|value| value.to_str().ok()),
+        Some("authorization"),
+    );
+
+    // Still behind, three seconds later: the state a reconciler is waiting on has
+    // not changed, so the poll it pays for is a header comparison. Validating by
+    // the response bytes would answer `200` here forever.
+    let later = project(&report(6_000, Some(fixtures::revision_id(1))));
+    let response = answer(later, Some(&validator));
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+    // The revision it was waiting for is now active: the validator must move.
+    let converged = project(&report(0, Some(fixtures::revision_id(2))));
+    let response = answer(converged, Some(&validator));
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_ne!(
+        response
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(validator.as_str()),
+    );
+}
+
+#[tokio::test]
 async fn convergence_is_projected_from_replica_state_without_reading_the_backend() {
     let inner = Arc::new(InMemoryControlPlane::new());
     let counting = Arc::new(CountingStore::new(inner));
