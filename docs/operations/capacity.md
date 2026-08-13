@@ -120,16 +120,16 @@ What the envelope says, in operator terms:
 - **Sockets scale with concurrency, roughly two per in-flight stream** — one
   inbound, one upstream. 300 concurrent streams held ~727 descriptors. A
   refused caller costs an inbound descriptor too, until it is told no: the
-  `shedding` row above holds four times the sockets of any other profile while
+  `shedding` row above holds 2.5 times the sockets of any other profile while
   admitting eight requests. Size `ulimit -n` for the load offered, not for the
   load admitted, and set it alongside `admission.max_in_flight_streams`.
 - **Resident memory is bounded by concurrency and body size, not by request
-  count.** 40 000 buffered requests cost the same ~47 MiB as 400 would; 256 KiB
-  bodies at 64 concurrent cost ~68 MiB. Bodies are buffered before dispatch
+  count.** 40 000 buffered requests cost the same ~48 MiB as 400 would; 256 KiB
+  bodies at 64 concurrent cost ~71 MiB. Bodies are buffered before dispatch
   (ADR 0030), so `admission.max_request_bytes` × concurrency is the term to
   reason about.
 - **CPU saturates before memory.** Every profile that served its load used
-  2.1–4.8 cores of the 8 available at these concurrencies. On this workload
+  2.2–4.8 cores of the 8 available at these concurrencies. On this workload
   shape, a replica is CPU-bound; scale on CPU, and remember `[admission]`
   ceilings are *per replica*.
 

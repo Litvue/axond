@@ -512,14 +512,54 @@ def self_test() -> int:
         "[[profile]]\n"
         'id = "streaming"\n'
         "elapsed_ms = 8000\n"
+        "offered = 8000\n"
+        "accepted = 8000\n"
         "accepted_rps = 1000.0\n"
         "peak_rss_kib = 51200\n"
         "peak_sockets = 700\n"
         "cpu_seconds = 24.0\n"
+        "\n[[profile]]\n"
+        'id = "buffered"\n'
+        "elapsed_ms = 5000\n"
+        "offered = 40000\n"
+        "accepted = 40000\n"
+        "accepted_rps = 8000.0\n"
+        "peak_rss_kib = 49152\n"
+        "peak_sockets = 320\n"
+        "cpu_seconds = 20.0\n"
+        "\n[[profile]]\n"
+        'id = "response-size"\n'
+        "elapsed_ms = 5000\n"
+        "offered = 6000\n"
+        "accepted = 6000\n"
+        "accepted_rps = 1200.0\n"
+        "peak_rss_kib = 72704\n"
+        "peak_sockets = 150\n"
+        "cpu_seconds = 20.0\n"
+        "\n[[profile]]\n"
+        'id = "shedding"\n'
+        "elapsed_ms = 2000\n"
+        "offered = 20000\n"
+        "accepted = 8\n"
+        "accepted_rps = 4.0\n"
+        "peak_rss_kib = 71680\n"
+        "peak_sockets = 1750\n"
+        "cpu_seconds = 2.6\n"
     )
     envelope = (
         "| `streaming` | 300 | 8 000 | 1 000 | 275 ms | 299 ms | 669 ms | 62 ms "
-        "| 50 MiB | 700 | 3.0 |\n\n300 concurrent streams held ~700 descriptors.\n"
+        "| 50 MiB | 700 | 3.0 |\n"
+        "| `buffered` | 128 | 40 000 | 8 000 | 16 ms | 25 ms | 31 ms | — "
+        "| 48 MiB | 320 | 4.0 |\n"
+        "| `response-size` | 64 | 6 000 | 1 200 | 44 ms | 75 ms | 94 ms | — "
+        "| 71 MiB | 150 | 4.0 |\n"
+        "| `shedding` | 512 | 20 000 | 4.0 | 19 ms | 64 ms | 83 ms | — "
+        "| 70 MiB | 1 750 | 1.3 |\n\n"
+        "300 concurrent streams held ~700 descriptors, and the `shedding` row "
+        "holds 2.5 times the sockets of any other profile.\n"
+        "40 000 buffered requests cost the same ~48 MiB as 400 would; 256 KiB "
+        "bodies at 64 concurrent cost ~71 MiB.\n"
+        "Every profile that served its load used 3.0–4.0 cores.\n"
     )
     assert capacity_envelope_failures(record, envelope) == []
 
@@ -530,6 +570,15 @@ def self_test() -> int:
     superseded = capacity_envelope_failures(record, envelope.replace("| 700 |", "| 733 |"))
     assert len(superseded) == 1, superseded
     assert "peak sockets" in superseded[0], superseded
+    # Prose drifts on its own, and reads as advice rather than as a measurement.
+    for was, now, expected in [
+        ("cost ~71 MiB", "cost ~80 MiB", "large-body memory rule of thumb"),
+        ("holds 2.5 times", "holds 4 times", "shedding socket multiple"),
+        ("used 3.0–4.0 cores", "used 3.0–6.0 cores", "upper end of the CPU range"),
+    ]:
+        moved = capacity_envelope_failures(record, envelope.replace(was, now))
+        assert len(moved) == 1, (was, moved)
+        assert expected in moved[0], (was, moved)
 
     # A renamed profile and an unreadable cell are reported, not raised: a gate
     # that tracebacks tells a contributor nothing about what to fix.
@@ -767,7 +816,95 @@ def capacity_envelope_failures(record: str, page: str) -> list[str]:
                 f"docs/operations/capacity.md: the descriptor rule of thumb says "
                 f"~{shown}, the retained record peaked at {streamed:.0f}"
             )
+
+    failures.extend(capacity_prose_failures(profiles, page))
     return failures
+
+
+def cores(profile: dict) -> float | None:
+    """Cores a profile used, the way the page prints them."""
+    elapsed = profile.get("elapsed_ms") or 0.0
+    if not elapsed or "cpu_seconds" not in profile:
+        return None
+    return profile["cpu_seconds"] / (elapsed / 1000)
+
+
+def capacity_prose_failures(profiles: dict, page: str) -> list[str]:
+    """The rules of thumb below the table are the table, said in words.
+
+    They drift more quietly than the cells do, because nothing about a bulleted
+    sentence looks like a measurement — and an operator sizing a host reads the
+    sentence, not the row.
+    """
+    failures: list[str] = []
+    served = {
+        name: profile
+        for name, profile in profiles.items()
+        if profile.get("accepted") and profile["accepted"] == profile.get("offered")
+    }
+    stated: list[tuple[str, str, float | None, float]] = [
+        (
+            "the buffered memory rule of thumb",
+            r"cost the same ~([\d.]+) MiB",
+            (profiles.get("buffered", {}).get("peak_rss_kib") or 0.0) / 1024 or None,
+            1.0,
+        ),
+        (
+            "the large-body memory rule of thumb",
+            r"at 64 concurrent cost ~([\d.]+) MiB",
+            (profiles.get("response-size", {}).get("peak_rss_kib") or 0.0) / 1024 or None,
+            1.0,
+        ),
+        (
+            "the shedding socket multiple",
+            r"holds ([\d.]+) times the sockets",
+            shedding_socket_multiple(profiles),
+            0.2,
+        ),
+        (
+            "the lower end of the CPU range",
+            r"served its load used\s+([\d.]+)–[\d.]+ cores",
+            min((cores(p) for p in served.values() if cores(p) is not None), default=None),
+            0.05,
+        ),
+        (
+            "the upper end of the CPU range",
+            r"served its load used\s+[\d.]+–([\d.]+) cores",
+            max((cores(p) for p in served.values() if cores(p) is not None), default=None),
+            0.05,
+        ),
+    ]
+    for label, pattern, measured, slack in stated:
+        shown = re.search(pattern, page)
+        if not shown:
+            failures.append(
+                f"docs/operations/capacity.md: {label} is gone from the page; "
+                f"restate it or drop its check"
+            )
+        elif measured is None:
+            failures.append(
+                f"docs/operations/capacity.md: {label} has nothing in the retained "
+                f"record to check against; re-run the tier"
+            )
+        elif abs(float(shown.group(1)) - measured) > slack:
+            failures.append(
+                f"docs/operations/capacity.md: {label} says {shown.group(1)}, "
+                f"the retained record measured {measured:.1f}"
+            )
+    return failures
+
+
+def shedding_socket_multiple(profiles: dict) -> float | None:
+    """How many times the sockets `shedding` holds over the next-largest profile."""
+    shedding = profiles.get("shedding", {}).get("peak_sockets")
+    others = [
+        profile["peak_sockets"]
+        for name, profile in profiles.items()
+        if name != "shedding" and profile.get("peak_sockets")
+    ]
+    if not shedding or not others:
+        return None
+    return shedding / max(others)
 
 
 def check_capacity_envelope() -> list[str]:
