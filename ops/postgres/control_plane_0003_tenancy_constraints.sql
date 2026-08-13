@@ -247,21 +247,26 @@ CREATE POLICY axond_cp_access_denial_isolation ON axond_cp_access_denial
         )
     );
 
--- The journal, for the same reason: a deployment-scoped change made by a tenant's
--- workload is shared in what it changed and not in who changed it.
+-- The journal, by the same rule and therefore in the same shape: a change that
+-- names this tenant is this tenant's, whoever made it — hiding it would hide a
+-- tenant's own change history, and its audit events and idempotency records with
+-- it, since those are walled through this table. Only the deployment-scoped rows,
+-- which a pinned session reads without being their subject, withhold the actor.
 DROP POLICY IF EXISTS axond_cp_mutation_isolation ON axond_cp_mutation;
 CREATE POLICY axond_cp_mutation_isolation ON axond_cp_mutation
     USING (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR tenant_id = current_setting('axond.tenant_id', true)
         OR (
-            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
+            tenant_id IS NULL
             AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
         )
     )
     WITH CHECK (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR tenant_id = current_setting('axond.tenant_id', true)
         OR (
-            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
+            tenant_id IS NULL
             AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
         )
     );
