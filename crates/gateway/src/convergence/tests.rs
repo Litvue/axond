@@ -64,12 +64,15 @@ impl Replica {
         )
         .expect("the bootstrap config is servable");
         let clock = ManualClock::new();
+        let secrets = super::secrets::testing::permissive();
+        let ledger = Arc::clone(secrets.ledger());
         let reconciler = Arc::new(Reconciler::new(
             Arc::clone(store) as Arc<dyn ControlPlaneStore>,
-            Arc::new(RevisionCompiler::new(
+            Arc::new(RevisionCompiler::with_secrets(
                 bootstrap(),
                 env(),
                 PolicyProjection::over(TenancyProjection),
+                secrets,
             )),
             Arc::new(state.clone()),
             settings(),
@@ -81,6 +84,7 @@ impl Replica {
             state,
             clock,
             reconciler,
+            ledger,
         }
     }
 
