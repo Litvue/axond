@@ -258,11 +258,12 @@ successive versions are successive revisions of the same document ([ADR
   optional field is therefore a complete statement — "this scope has no scope-wide
   cap" — rather than an omission to be filled in. A scope with no document at all
   has no published policy, and the bootstrap file's limits stand.
-- **A generation is an `epoch` plus the revision that published it.** The epoch is
-  advanced by the operator when a document's content changes; the revision id says
-  which publication carried it. Neither half identifies a generation alone: two
-  publications can carry one epoch (a restored backup, a forked control plane), and
-  a revision id says which publication but not whether the change was material. A
+- **A generation is a scope and an `epoch`, plus the revision that published it.**
+  The epoch is advanced by the operator when a document's content changes; the
+  revision id says which publication carried it. No part identifies a generation
+  alone: two publications can carry one epoch (a restored backup, a forked control
+  plane), a revision id says which publication but not whether the change was
+  material, and an epoch counts within its own scope rather than across scopes. A
   generation therefore also carries a digest of the document's content, which is
   what separates those two cases.
 - **A document restated by a later revision is the same policy, not a fork.** A
@@ -288,12 +289,12 @@ successive versions are successive revisions of the same document ([ADR
   disruptive as its worst field.
 - **Stale writers fail closed.** A writer is admitted only when it holds the policy
   the fence is enforcing — the active epoch and the active content, whichever
-  revision carried it. An older epoch, an epoch this replica has not adopted, and
-  the same epoch stating different content all deny; refusing anything but the
-  enforced policy is what makes an unknown generation deny instead of enforcing
-  something nobody serves. Adoption is monotonic in what is enforced: onto a higher
-  epoch, or onto the active document as a later revision restates it, never onto a
-  different document.
+  revision carried it. An older epoch, an epoch this replica has not adopted, the
+  same epoch stating different content, and any generation of another scope all
+  deny; refusing anything but the enforced policy is what makes an unknown
+  generation deny instead of enforcing something nobody serves. Adoption is
+  monotonic in what is enforced: onto a higher epoch of the same scope, or onto the
+  active document as a later revision restates it, never onto a different document.
 - **What bootstrap owns stays in `axond.toml`.** Which backend enforces a limit,
   the DSN it connects with, the table or key prefix it lays state out under, and the
   stance to take when that store is unreachable (`on_unavailable`) are not policy

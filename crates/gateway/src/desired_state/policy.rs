@@ -44,8 +44,10 @@
 //! # Generation: an epoch plus the revision that published it
 //!
 //! A document declares an `epoch`; the revision that carries it has a
-//! [`RevisionId`]. Together they are a [`PolicyGeneration`], and that pair — not
-//! either half — is what a writer holds and what a fence compares.
+//! [`RevisionId`]. Together — with the scope they are the policy of, since an
+//! epoch counts within one scope and says nothing across scopes — they are a
+//! [`PolicyGeneration`], and that whole, not any part of it, is what a writer
+//! holds and what a fence compares.
 //!
 //! The epoch alone is not enough: two publications can carry the same epoch (a
 //! forked control plane, a restored backup), and a writer admitted on epoch
@@ -57,25 +59,26 @@
 //! not advance it — which is what makes the epoch a usable order.
 //!
 //! A generation therefore carries the document's content, digested as a
-//! [`PolicyContent`], as well. A
-//! revision is whole desired state, so every revision restates every policy
-//! document it carries: a revision that changed an unrelated resource still hands
-//! out a generation with a new revision id for a document whose epoch and content
-//! never moved. That carry-forward is the ordinary case, and it is exactly what
-//! distinguishes it from a fork — same epoch, *different* content.
+//! [`PolicyContent`], as well. A revision is whole desired state, so every
+//! revision restates every policy document it carries: a revision that changed an
+//! unrelated resource still hands out a generation with a new revision id for a
+//! document whose epoch and content never moved. That carry-forward is the
+//! ordinary case, and it is exactly what distinguishes it from a fork — same
+//! epoch, *different* content.
 //!
 //! # Stale writers fail closed
 //!
 //! [`PolicyFence`] admits a writer that holds the policy the fence is enforcing —
 //! the active epoch and the active content, whichever revision carried it — and
 //! refuses every other case: an older epoch, a newer epoch this replica has not
-//! adopted, and the same epoch stating a different policy. Refusing a seemingly
-//! newer generation is deliberate — a writer that may enforce anything it can
-//! claim is newer is not fenced at all — and refusing anything but the enforced
-//! policy means an unknown generation denies instead of admitting
-//! unenforced. Adoption follows the same rule: it moves onto a higher epoch, and
-//! onto the active document as a later revision restates it, never onto a
-//! different policy. That is the same posture as an unreachable budget store
+//! adopted, the same epoch stating a different policy, and any generation of
+//! another scope. Refusing a seemingly newer generation is deliberate — a writer
+//! that may enforce anything it can claim is newer is not fenced at all — and
+//! refusing anything but the enforced policy means an unknown generation denies
+//! instead of admitting unenforced. Adoption follows the same rule: it moves onto
+//! a higher epoch of the same scope, and onto the active document as a later
+//! revision restates it, never onto a different policy. That is the same posture
+//! as an unreachable budget store
 //! ([`UnavailablePolicy::Deny`](crate::budget::UnavailablePolicy)): an
 //! unenforceable cap must not silently admit.
 //!
@@ -110,17 +113,16 @@ use std::fmt;
 
 use super::canonical::{Canonical, CanonicalValue, Checksum};
 use super::ids::{InvalidId, ProjectId, ResourceId, RevisionId, Slug, TenantId};
+use super::record::{BodyError, PROJECT_ID_FIELD, Record, SCHEMA_FIELD, TENANT_ID_FIELD};
 use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
 };
 use super::revision::DesiredState;
+use super::tenancy::InvalidDisplayName;
 
 /// The policy body schema this build reads and writes.
 pub const POLICY_SCHEMA: &str = "axond.policy.v1";
 
-const SCHEMA_FIELD: &str = "schema";
-const TENANT_ID_FIELD: &str = "tenant_id";
-const PROJECT_ID_FIELD: &str = "project_id";
 const EPOCH_FIELD: &str = "epoch";
 const BUDGET_LIMIT_FIELD: &str = "budget_limit_microdollars";
 const NAMESPACE_BUDGET_LIMIT_FIELD: &str = "namespace_budget_limit_microdollars";
@@ -183,7 +185,8 @@ pub enum PolicyError {
     ///
     /// Its own arm rather than [`UnknownField`](Self::UnknownField): the field is
     /// not one a future schema may add, so the refusal states the boundary
-    /// instead of reading as a version skew.
+    /// instead of reading as a version skew. These names are what this schema
+    /// *reserves* in the shared reader.
     #[error(
         "{reference} carries `{field}`, which the bootstrap file owns and a published policy may not set"
     )]
@@ -191,11 +194,13 @@ pub enum PolicyError {
         reference: ResourceRef,
         field: String,
     },
-    #[error("{reference} field `{field}` is not {expected}")]
+    #[error(
+        "{reference} field `{field}` is not the type `{}` defines",
+        POLICY_SCHEMA
+    )]
     FieldType {
         reference: ResourceRef,
         field: &'static str,
-        expected: &'static str,
     },
     #[error("{reference} field `{field}` is not an id: {source}")]
     MalformedId {
@@ -204,15 +209,12 @@ pub enum PolicyError {
         #[source]
         source: InvalidId,
     },
-    /// The bound is boxed because [`InvalidPolicy`] names a canonical integer,
-    /// whose alignment would otherwise pad out every `Result` that can carry a
-    /// policy refusal.
     #[error("{reference} field `{field}` is out of range: {source}")]
     FieldRange {
         reference: ResourceRef,
         field: &'static str,
         #[source]
-        source: Box<InvalidPolicy>,
+        source: InvalidPolicy,
     },
     #[error("{reference} carries {declared}, but its resource identity is {identity}")]
     IdentityMismatch {
@@ -246,10 +248,10 @@ impl PolicyError {
     /// A *bound* is the exception, for the reason a display name is tenancy's: the
     /// rules a schema's values are held to can tighten within one identifier, so a
     /// value below a minimum this build enforces may be one an earlier build wrote
-    /// and accepted, and storage is intact. A value that is not representable at
-    /// all — negative, or past what this build counts in — is damage: every
-    /// release has written these fields as unsigned counters, so no tightening
-    /// produces one.
+    /// and accepted, and storage is intact. A value that is not a counter at all —
+    /// negative, or past what these fields count in — is not a bound but a shape,
+    /// and the reader reports it as [`FieldType`](Self::FieldType): damage, since
+    /// every release has written these fields as unsigned counters.
     ///
     /// [`TenancyError::is_incompatible`]: super::tenancy::TenancyError::is_incompatible
     pub fn is_incompatible(&self) -> bool {
@@ -260,7 +262,7 @@ impl PolicyError {
             Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
                 *field == SCHEMA_FIELD
             }
-            Self::FieldRange { source, .. } => source.is_tightenable(),
+            Self::FieldRange { .. } => true,
             Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
@@ -298,23 +300,6 @@ impl PolicyError {
 pub enum InvalidPolicy {
     #[error("{value} is below the minimum of {min}")]
     TooSmall { value: u64, min: u64 },
-    #[error("{value} does not fit the range this build enforces")]
-    NotRepresentable { value: i128 },
-}
-
-impl InvalidPolicy {
-    /// Whether a release could have written this value and had it accepted.
-    ///
-    /// A minimum is a rule rather than a shape, and rules tighten within one
-    /// schema identifier, so a stored value below one is read as a release skew
-    /// ([`PolicyError::is_incompatible`]). A value outside the range these fields
-    /// are counted in was never writable, so it is damage.
-    pub const fn is_tightenable(&self) -> bool {
-        match self {
-            Self::TooSmall { .. } => true,
-            Self::NotRepresentable { .. } => false,
-        }
-    }
 }
 
 /// A policy generation counter an operator advances when a document's content
@@ -610,6 +595,7 @@ impl PolicyBody {
     /// both, and never guessed at inside the body.
     pub fn generation(&self, source: RevisionId) -> PolicyGeneration {
         PolicyGeneration {
+            scope: self.scope,
             epoch: self.epoch,
             source,
             content: self.content(),
@@ -651,11 +637,12 @@ impl PolicyBody {
     /// Read a policy resource's body, binding it to its envelope: identity to the
     /// reference, governed scope to the envelope's scope.
     pub fn read(resource: &ResourceVersion) -> Result<Self, PolicyError> {
-        let record = Record::open(
+        let record = Record::<PolicyError>::open_reserving(
             resource,
             ResourceKind::Policy,
             Self::SCHEMA,
             Self::KNOWN_FIELDS,
+            BOOTSTRAP_OWNED_FIELDS,
         )?;
         let tenant = record.tenant()?;
         let scope = match record.optional_project()? {
@@ -670,31 +657,30 @@ impl PolicyBody {
                 scoped: resource.scope.clone(),
             });
         }
-        let epoch = record.bounded(EPOCH_FIELD, PolicyEpoch::new)?;
+        let bound = |field: &'static str, source: InvalidPolicy| PolicyError::FieldRange {
+            reference: resource.reference,
+            field,
+            source,
+        };
+        let epoch = PolicyEpoch::new(record.integer(EPOCH_FIELD)?)
+            .map_err(|source| bound(EPOCH_FIELD, source))?;
         let budget = BudgetPolicy::new(
             record.integer(BUDGET_LIMIT_FIELD)?,
             record.optional_integer(NAMESPACE_BUDGET_LIMIT_FIELD)?,
             record.integer(RESERVATION_TTL_FIELD)?,
         )
-        .map_err(|source| PolicyError::FieldRange {
-            reference: resource.reference,
-            field: RESERVATION_TTL_FIELD,
-            source: Box::new(source),
-        })?;
+        .map_err(|source| bound(RESERVATION_TTL_FIELD, source))?;
         let max_in_flight = record.integer(MAX_IN_FLIGHT_FIELD)?;
         let lease_ttl = record.integer(LEASE_TTL_FIELD)?;
         let concurrency = ConcurrencyPolicy::new(max_in_flight, lease_ttl).map_err(|source| {
-            PolicyError::FieldRange {
-                reference: resource.reference,
-                // Two fields share one bound, so the refusal names the one that
-                // broke it rather than the first one checked.
-                field: if max_in_flight == 0 {
-                    MAX_IN_FLIGHT_FIELD
-                } else {
-                    LEASE_TTL_FIELD
-                },
-                source: Box::new(source),
-            }
+            // Two fields share one bound, so the refusal names the one that broke
+            // it rather than the first one checked.
+            let field = if max_in_flight == 0 {
+                MAX_IN_FLIGHT_FIELD
+            } else {
+                LEASE_TTL_FIELD
+            };
+            bound(field, source)
         })?;
         Ok(Self {
             scope,
@@ -822,29 +808,44 @@ impl fmt::Display for PolicyContent {
     }
 }
 
-/// The identity of one published policy document: the epoch its content was
-/// published under, the policy that content *is*, and the revision that carried
-/// it.
+/// The identity of one published policy document: the scope it governs, the
+/// epoch its content was published under, the policy that content *is*, and the
+/// revision that carried it.
 ///
-/// No part identifies a generation alone — see the module docs — so the three are
-/// one type rather than fields a caller could compare separately. The revision is
-/// provenance: it says which publication a writer read, and is what makes two
-/// documents claiming one epoch distinguishable. The content is what says whether
-/// those two documents are the same policy or a fork.
+/// No part identifies a generation alone — see the module docs — so the four are
+/// one type rather than fields a caller could compare separately. The scope is
+/// what the epoch counts within: epochs are monotonic per scope and unrelated
+/// across scopes, so a generation without its scope would compare as ordered
+/// against a document governing something else. The revision is provenance: it
+/// says which publication a writer read, and is what makes two documents claiming
+/// one epoch distinguishable. The content is what says whether those two
+/// documents are the same policy or a fork.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PolicyGeneration {
+    scope: PolicyScope,
     epoch: PolicyEpoch,
     source: RevisionId,
     content: PolicyContent,
 }
 
 impl PolicyGeneration {
-    pub const fn new(epoch: PolicyEpoch, source: RevisionId, content: PolicyContent) -> Self {
+    pub const fn new(
+        scope: PolicyScope,
+        epoch: PolicyEpoch,
+        source: RevisionId,
+        content: PolicyContent,
+    ) -> Self {
         Self {
+            scope,
             epoch,
             source,
             content,
         }
+    }
+
+    /// The tenant or project whose policy this generation is.
+    pub const fn scope(&self) -> PolicyScope {
+        self.scope
     }
 
     pub const fn epoch(&self) -> PolicyEpoch {
@@ -863,11 +864,14 @@ impl PolicyGeneration {
 
     /// Whether this generation's content was published after `other`'s.
     ///
-    /// Strictly by epoch: two generations of one epoch stating *different*
-    /// policies are not ordered, they are a fork, and [`PolicyFence`] refuses one
-    /// rather than picking a winner.
+    /// Within one scope, and strictly by epoch: two generations of one epoch
+    /// stating *different* policies are not ordered, they are a fork, and
+    /// [`PolicyFence`] refuses one rather than picking a winner. Two generations
+    /// of *different* scopes are not ordered either — an epoch counts within the
+    /// scope that published it, so a higher one from another tenant says nothing
+    /// about this one.
     pub fn supersedes(&self, other: &Self) -> bool {
-        self.epoch > other.epoch
+        self.scope == other.scope && self.epoch > other.epoch
     }
 
     /// Whether both generations enforce the same policy under the same epoch,
@@ -878,7 +882,7 @@ impl PolicyGeneration {
     /// every policy document — and false for two different documents sharing an
     /// epoch, which is the fork a fence must refuse.
     pub fn same_policy(&self, other: &Self) -> bool {
-        self.epoch == other.epoch && self.content == other.content
+        self.scope == other.scope && self.epoch == other.epoch && self.content == other.content
     }
 
     /// Whether this generation is `other` carried into a different revision:
@@ -890,47 +894,100 @@ impl PolicyGeneration {
 
 impl fmt::Display for PolicyGeneration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "epoch {} from revision {}", self.epoch, self.source)
+        write!(
+            f,
+            "epoch {} of {} from revision {}",
+            self.epoch, self.scope, self.source
+        )
+    }
+}
+
+/// A generation a fence was offered, beside the generation it enforces.
+///
+/// One type for both refusals, and boxed in each, because a generation names its
+/// scope and digests its content: two of them inline would pad out every `Result`
+/// a fenced call site returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Offered {
+    /// The generation offered: a writer's, or one to adopt.
+    pub offered: PolicyGeneration,
+    /// The generation the fence enforces.
+    pub active: PolicyGeneration,
+}
+
+impl Offered {
+    pub const fn new(offered: PolicyGeneration, active: PolicyGeneration) -> Self {
+        Self { offered, active }
     }
 }
 
 /// Why a writer was fenced out.
 ///
-/// Three arms rather than one, because they are three different operational
-/// stories, and only the first is the ordinary one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// Several arms rather than one, because they are different operational stories,
+/// and only the first is the ordinary one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Fenced {
     /// The ordinary case: the writer holds a generation the fleet has moved past.
-    #[error("writer holds {writer}, which the active {active} has moved past")]
-    Stale {
-        writer: PolicyGeneration,
-        active: PolicyGeneration,
-    },
+    #[error("writer holds {}, which the active {} has moved past", .0.offered, .0.active)]
+    Stale(Box<Offered>),
     /// A writer claiming a generation this replica has not adopted. Refused
     /// rather than trusted: a writer that may enforce anything it can claim is
     /// newer than the active generation is not fenced at all.
-    #[error("writer holds {writer}, which is ahead of the active {active}")]
-    Ahead {
-        writer: PolicyGeneration,
-        active: PolicyGeneration,
-    },
+    #[error("writer holds {}, which is ahead of the active {}", .0.offered, .0.active)]
+    Ahead(Box<Offered>),
     /// The same epoch stating a *different* policy: two publications claiming one
     /// generation, which a restored backup or a forked control plane produces. A
     /// revision that merely restates the active document is not this — see
     /// [`PolicyGeneration::carries_forward`].
-    #[error("writer holds {writer}, which claims the epoch of the active {active}")]
-    Forked {
-        writer: PolicyGeneration,
-        active: PolicyGeneration,
-    },
+    #[error("writer holds {}, which claims the epoch of the active {}", .0.offered, .0.active)]
+    Forked(Box<Offered>),
+    /// A generation governing something else entirely: a fence enforces one
+    /// scope's policy, and a writer holding another scope's document is not late
+    /// or early but wired wrong.
+    #[error(
+        "writer holds {}, which is not the policy the active {} enforces",
+        .0.offered,
+        .0.active
+    )]
+    OtherScope(Box<Offered>),
+}
+
+impl Fenced {
+    /// The generation the fenced-out writer held.
+    pub fn writer(&self) -> PolicyGeneration {
+        self.offered().offered
+    }
+
+    /// The generation the fence enforces.
+    pub fn active(&self) -> PolicyGeneration {
+        self.offered().active
+    }
+
+    fn offered(&self) -> &Offered {
+        match self {
+            Self::Stale(offered)
+            | Self::Ahead(offered)
+            | Self::Forked(offered)
+            | Self::OtherScope(offered) => offered,
+        }
+    }
 }
 
 /// Why a fence refused to move.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("cannot adopt {next} over the active {active}")]
-pub struct NotAnAdvance {
-    pub active: PolicyGeneration,
-    pub next: PolicyGeneration,
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("cannot adopt {} over the active {}", .0.offered, .0.active)]
+pub struct NotAnAdvance(pub Box<Offered>);
+
+impl NotAnAdvance {
+    /// The generation that was not an advance.
+    pub fn next(&self) -> PolicyGeneration {
+        self.0.offered
+    }
+
+    /// The generation the fence enforces, and kept.
+    pub fn active(&self) -> PolicyGeneration {
+        self.0.active
+    }
 }
 
 /// The generation a scope's policy is currently enforced under, and the gate every
@@ -940,6 +997,10 @@ pub struct NotAnAdvance {
 /// policy the fence is actively enforcing, so an older, forked, or newer
 /// generation denies. Nothing here writes anything — it is the contract a later
 /// activation slice enforces with.
+///
+/// One scope's, throughout: a generation names the scope it governs, so a fence
+/// holding a tenant's policy refuses a project's document rather than adopting it
+/// on a higher epoch and then denying every writer the scope actually has.
 ///
 /// "The policy it is enforcing" rather than "the revision it came from": a
 /// revision restates every policy document it carries, so a revision that changed
@@ -966,19 +1027,22 @@ impl PolicyFence {
     ///
     /// Admits the active generation, and the same policy under the same epoch from
     /// another revision — the same document, carried forward. Everything else
-    /// denies, including a generation this replica has not adopted.
+    /// denies, including a generation this replica has not adopted and one
+    /// governing another scope.
     pub fn admit(&self, writer: PolicyGeneration) -> Result<(), Fenced> {
         if writer.same_policy(&self.active) {
             return Ok(());
         }
-        let (writer, active) = (writer, self.active);
-        if writer.epoch < active.epoch {
-            Err(Fenced::Stale { writer, active })
-        } else if writer.epoch > active.epoch {
-            Err(Fenced::Ahead { writer, active })
+        let offered = Box::new(Offered::new(writer, self.active));
+        Err(if writer.scope != self.active.scope {
+            Fenced::OtherScope(offered)
+        } else if writer.epoch < self.active.epoch {
+            Fenced::Stale(offered)
+        } else if writer.epoch > self.active.epoch {
+            Fenced::Ahead(offered)
         } else {
-            Err(Fenced::Forked { writer, active })
-        }
+            Fenced::Forked(offered)
+        })
     }
 
     /// Move the fence onto a generation that supersedes the active one, or onto
@@ -987,14 +1051,12 @@ impl PolicyFence {
     /// A generation that neither advances the epoch nor carries the active
     /// document forward is refused, so adopting is monotonic in what is
     /// *enforced*: a replica cannot be walked backwards onto an older policy, nor
-    /// sideways onto a different policy claiming the active epoch, but it can
-    /// follow the fleet onto the revision now serving the same policy.
+    /// sideways onto a different policy claiming the active epoch, nor onto
+    /// another scope's document however high its epoch, but it can follow the
+    /// fleet onto the revision now serving the same policy.
     pub fn adopt(&mut self, next: PolicyGeneration) -> Result<(), NotAnAdvance> {
         if !next.supersedes(&self.active) && !next.carries_forward(&self.active) {
-            return Err(NotAnAdvance {
-                active: self.active,
-                next,
-            });
+            return Err(NotAnAdvance(Box::new(Offered::new(next, self.active))));
         }
         self.active = next;
         Ok(())
@@ -1379,164 +1441,76 @@ impl PolicySnapshot {
     }
 }
 
-/// A strict reader over one inline policy record.
-struct Record<'a> {
-    reference: ResourceRef,
-    fields: &'a [(String, CanonicalValue)],
-}
-
-impl<'a> Record<'a> {
-    fn open(
-        resource: &'a ResourceVersion,
-        kind: ResourceKind,
-        schema: &'static str,
-        known: &[&str],
-    ) -> Result<Self, PolicyError> {
-        let reference = resource.reference;
-        if reference.kind != kind {
-            return Err(PolicyError::Kind {
-                reference,
-                expected: kind,
-                found: reference.kind,
-            });
+impl BodyError for PolicyError {
+    fn kind(reference: ResourceRef, expected: ResourceKind, found: ResourceKind) -> Self {
+        Self::Kind {
+            reference,
+            expected,
+            found,
         }
-        let ResourceBody::Inline(value) = &resource.body else {
-            return Err(PolicyError::NotInline { reference });
-        };
-        let CanonicalValue::Map(fields) = value else {
-            return Err(PolicyError::NotARecord { reference });
-        };
-        let record = Self { reference, fields };
-        let declared = record.string(SCHEMA_FIELD)?;
-        if declared != schema {
-            return Err(PolicyError::Schema {
-                reference,
-                expected: schema,
-                found: declared.to_owned(),
-            });
-        }
-        // A bootstrap-owned name is refused before the unknown-field rule, so the
-        // boundary is reported as itself rather than as a version skew.
-        if let Some((field, _)) = fields
-            .iter()
-            .find(|(field, _)| BOOTSTRAP_OWNED_FIELDS.contains(&field.as_str()))
-        {
-            return Err(PolicyError::BootstrapOwned {
-                reference,
-                field: field.clone(),
-            });
-        }
-        if let Some((field, _)) = fields
-            .iter()
-            .find(|(field, _)| field != SCHEMA_FIELD && !known.contains(&field.as_str()))
-        {
-            return Err(PolicyError::UnknownField {
-                reference,
-                schema,
-                field: field.clone(),
-            });
-        }
-        Ok(record)
     }
 
-    fn field(&self, field: &'static str) -> Option<&'a CanonicalValue> {
-        self.fields
-            .iter()
-            .find(|(name, _)| name == field)
-            .map(|(_, value)| value)
+    fn not_inline(reference: ResourceRef) -> Self {
+        Self::NotInline { reference }
     }
 
-    fn string(&self, field: &'static str) -> Result<&'a str, PolicyError> {
-        match self.field(field).ok_or(PolicyError::MissingField {
-            reference: self.reference,
+    fn not_a_record(reference: ResourceRef) -> Self {
+        Self::NotARecord { reference }
+    }
+
+    fn schema(reference: ResourceRef, expected: &'static str, found: String) -> Self {
+        Self::Schema {
+            reference,
+            expected,
+            found,
+        }
+    }
+
+    fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
+        Self::MissingField { reference, field }
+    }
+
+    fn unknown_field(reference: ResourceRef, schema: &'static str, field: String) -> Self {
+        Self::UnknownField {
+            reference,
+            schema,
             field,
-        })? {
-            CanonicalValue::String(text) => Ok(text),
-            _ => Err(PolicyError::FieldType {
-                reference: self.reference,
-                field,
-                expected: "a string",
-            }),
         }
     }
 
-    /// An unsigned integer field, refusing a value this build cannot enforce
-    /// rather than saturating it into one it can.
-    fn integer(&self, field: &'static str) -> Result<u64, PolicyError> {
-        self.optional_integer(field)?
-            .ok_or(PolicyError::MissingField {
-                reference: self.reference,
-                field,
-            })
+    /// The names in [`BOOTSTRAP_OWNED_FIELDS`], which this schema reserves.
+    fn reserved_field(reference: ResourceRef, _schema: &'static str, field: String) -> Self {
+        Self::BootstrapOwned { reference, field }
     }
 
-    fn optional_integer(&self, field: &'static str) -> Result<Option<u64>, PolicyError> {
-        let Some(value) = self.field(field) else {
-            return Ok(None);
-        };
-        let CanonicalValue::Integer(value) = value else {
-            return Err(PolicyError::FieldType {
-                reference: self.reference,
-                field,
-                expected: "an integer",
-            });
-        };
-        u64::try_from(*value)
-            .map(Some)
-            .map_err(|_| PolicyError::FieldRange {
-                reference: self.reference,
-                field,
-                source: Box::new(InvalidPolicy::NotRepresentable { value: *value }),
-            })
+    fn field_type(reference: ResourceRef, field: &'static str) -> Self {
+        Self::FieldType { reference, field }
     }
 
-    /// An integer field parsed through the same bound an authored value passes.
-    fn bounded<T>(
-        &self,
-        field: &'static str,
-        parse: impl FnOnce(u64) -> Result<T, InvalidPolicy>,
-    ) -> Result<T, PolicyError> {
-        parse(self.integer(field)?).map_err(|source| PolicyError::FieldRange {
-            reference: self.reference,
+    fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self {
+        Self::MalformedId {
+            reference,
             field,
-            source: Box::new(source),
-        })
-    }
-
-    fn tenant(&self) -> Result<TenantId, PolicyError> {
-        TenantId::parse(self.string(TENANT_ID_FIELD)?).map_err(|source| PolicyError::MalformedId {
-            reference: self.reference,
-            field: TENANT_ID_FIELD,
             source,
-        })
-    }
-
-    fn optional_project(&self) -> Result<Option<ProjectId>, PolicyError> {
-        if self.field(PROJECT_ID_FIELD).is_none() {
-            return Ok(None);
         }
-        ProjectId::parse(self.string(PROJECT_ID_FIELD)?)
-            .map(Some)
-            .map_err(|source| PolicyError::MalformedId {
-                reference: self.reference,
-                field: PROJECT_ID_FIELD,
-                source,
-            })
     }
 
-    fn identity(
-        &self,
-        declared: impl fmt::Display,
-        identity: ResourceId,
-    ) -> Result<(), PolicyError> {
-        if self.reference.id == identity {
-            Ok(())
-        } else {
-            Err(PolicyError::IdentityMismatch {
-                reference: self.reference,
-                declared: declared.to_string(),
-                identity: self.reference.id,
-            })
+    /// Unreachable: `axond.policy.v1` has no prose in it, so no field of a policy
+    /// body is read as a display name. The arm exists because the shared reader's
+    /// contract is total.
+    fn malformed_display_name(
+        reference: ResourceRef,
+        field: &'static str,
+        _source: InvalidDisplayName,
+    ) -> Self {
+        Self::FieldType { reference, field }
+    }
+
+    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self {
+        Self::IdentityMismatch {
+            reference,
+            declared,
+            identity,
         }
     }
 }
@@ -1790,7 +1764,6 @@ mod tests {
             Err(PolicyError::FieldType {
                 reference,
                 field: EPOCH_FIELD,
-                expected: "an integer",
             })
         );
         assert_eq!(
@@ -1800,7 +1773,7 @@ mod tests {
             Err(PolicyError::FieldRange {
                 reference,
                 field: EPOCH_FIELD,
-                source: Box::new(InvalidPolicy::TooSmall { value: 0, min: 1 }),
+                source: InvalidPolicy::TooSmall { value: 0, min: 1 },
             }),
             "zero is not an epoch, so an unset counter cannot read as a valid one"
         );
@@ -1808,12 +1781,11 @@ mod tests {
             PolicyBody::read(&edited(|fields| {
                 set(fields, LEASE_TTL_FIELD, CanonicalValue::integer(-30i32));
             })),
-            Err(PolicyError::FieldRange {
+            Err(PolicyError::FieldType {
                 reference,
                 field: LEASE_TTL_FIELD,
-                source: Box::new(InvalidPolicy::NotRepresentable { value: -30 }),
             }),
-            "a value this build cannot enforce is refused, not saturated into one it can"
+            "a value that is not an unsigned counter is a shape refusal, not a bound"
         );
         assert_eq!(
             PolicyBody::read(&edited(|fields| {
@@ -1822,7 +1794,7 @@ mod tests {
             Err(PolicyError::FieldRange {
                 reference,
                 field: LEASE_TTL_FIELD,
-                source: Box::new(InvalidPolicy::TooSmall { value: 0, min: 1 }),
+                source: InvalidPolicy::TooSmall { value: 0, min: 1 },
             }),
             "a refusal names the field that broke a bound, not the one checked first"
         );
@@ -1833,7 +1805,7 @@ mod tests {
             Err(PolicyError::FieldRange {
                 reference,
                 field: MAX_IN_FLIGHT_FIELD,
-                source: Box::new(InvalidPolicy::TooSmall { value: 0, min: 1 }),
+                source: InvalidPolicy::TooSmall { value: 0, min: 1 },
             })
         );
         assert!(matches!(
@@ -1933,17 +1905,15 @@ mod tests {
             PolicyError::FieldType {
                 reference,
                 field: EPOCH_FIELD,
-                expected: "an integer",
             },
             PolicyError::IdentityMismatch {
                 reference,
                 declared: tenant_scope().to_string(),
                 identity: reference.id,
             },
-            PolicyError::FieldRange {
+            PolicyError::FieldType {
                 reference,
                 field: LEASE_TTL_FIELD,
-                source: Box::new(InvalidPolicy::NotRepresentable { value: -30 }),
             },
         ] {
             assert!(
@@ -1958,11 +1928,9 @@ mod tests {
         let below_a_bound = PolicyError::FieldRange {
             reference,
             field: LEASE_TTL_FIELD,
-            source: Box::new(InvalidPolicy::TooSmall { value: 0, min: 1 }),
+            source: InvalidPolicy::TooSmall { value: 0, min: 1 },
         };
         assert!(below_a_bound.is_incompatible(), "{below_a_bound}");
-        assert!(InvalidPolicy::TooSmall { value: 0, min: 1 }.is_tightenable());
-        assert!(!InvalidPolicy::NotRepresentable { value: -30 }.is_tightenable());
     }
 
     #[test]
@@ -2120,7 +2088,7 @@ mod tests {
         assert_eq!(generation.content(), content);
         assert_eq!(
             generation,
-            PolicyGeneration::new(PolicyEpoch::FIRST, first, content)
+            PolicyGeneration::new(tenant_scope(), PolicyEpoch::FIRST, first, content)
         );
 
         let carried = set.snapshot(second).generation(tenant_scope()).unwrap();
@@ -2157,35 +2125,37 @@ mod tests {
     fn a_writer_of_any_generation_but_the_active_one_fails_closed() {
         let (first, second) = (revision_id(1), revision_id(2));
         let content = tenant_policy_body(1, 4).content();
-        let active = PolicyGeneration::new(PolicyEpoch::new(4).unwrap(), first, content);
+        let active =
+            PolicyGeneration::new(tenant_scope(), PolicyEpoch::new(4).unwrap(), first, content);
         let fence = PolicyFence::new(active);
         assert_eq!(fence.active(), active);
         assert_eq!(fence.admit(active), Ok(()));
 
-        let stale = PolicyGeneration::new(PolicyEpoch::new(3).unwrap(), first, content);
+        let stale =
+            PolicyGeneration::new(tenant_scope(), PolicyEpoch::new(3).unwrap(), first, content);
         assert_eq!(
             fence.admit(stale),
-            Err(Fenced::Stale {
-                writer: stale,
-                active
-            })
+            Err(Fenced::Stale(Box::new(Offered::new(stale, active))))
         );
 
         // A generation this replica has not adopted is refused rather than
         // trusted: a writer that may enforce anything it claims is newer is not
         // fenced at all.
-        let ahead = PolicyGeneration::new(PolicyEpoch::new(5).unwrap(), second, content);
+        let ahead = PolicyGeneration::new(
+            tenant_scope(),
+            PolicyEpoch::new(5).unwrap(),
+            second,
+            content,
+        );
         assert_eq!(
             fence.admit(ahead),
-            Err(Fenced::Ahead {
-                writer: ahead,
-                active
-            })
+            Err(Fenced::Ahead(Box::new(Offered::new(ahead, active))))
         );
 
         // The same epoch stating a different policy — a restored backup, a forked
         // control plane — is refused rather than resolved in someone's favour.
         let forked = PolicyGeneration::new(
+            tenant_scope(),
             PolicyEpoch::new(4).unwrap(),
             second,
             PolicyBody::new(
@@ -2199,10 +2169,7 @@ mod tests {
         );
         assert_eq!(
             fence.admit(forked),
-            Err(Fenced::Forked {
-                writer: forked,
-                active
-            })
+            Err(Fenced::Forked(Box::new(Offered::new(forked, active))))
         );
         assert!(!forked.supersedes(&active) && !active.supersedes(&forked));
         assert!(!forked.carries_forward(&active));
@@ -2214,26 +2181,43 @@ mod tests {
         assert_eq!(fence.active(), ahead);
         assert_eq!(
             fence.admit(active),
-            Err(Fenced::Stale {
-                writer: active,
-                active: ahead
-            })
+            Err(Fenced::Stale(Box::new(Offered::new(active, ahead))))
         );
         assert_eq!(
             fence.adopt(active),
-            Err(NotAnAdvance {
-                active: ahead,
-                next: active
-            })
+            Err(NotAnAdvance(Box::new(Offered::new(active, ahead))))
         );
         assert_eq!(
             fence.adopt(forked),
-            Err(NotAnAdvance {
-                active: ahead,
-                next: forked
-            })
+            Err(NotAnAdvance(Box::new(Offered::new(forked, ahead))))
         );
         assert_eq!(fence.active(), ahead, "a refused adoption changes nothing");
+    }
+
+    #[test]
+    fn a_fence_cannot_be_walked_onto_another_scopes_policy() {
+        // An epoch counts within the scope that published it, so another scope's
+        // document is not a later publication of this one however high its epoch:
+        // a miswired fence must refuse to move rather than adopt a policy none of
+        // its writers hold and deny all of them.
+        let elsewhere = project_policy_body(2, 9, 99).generation(revision_id(2));
+        let active = tenant_policy_body(1, 4).generation(revision_id(1));
+        assert!(!elsewhere.supersedes(&active) && !elsewhere.carries_forward(&active));
+        assert!(!elsewhere.same_policy(&active));
+
+        let mut fence = PolicyFence::new(active);
+        assert_eq!(
+            fence.adopt(elsewhere),
+            Err(NotAnAdvance(Box::new(Offered::new(elsewhere, active))))
+        );
+        assert_eq!(fence.active(), active);
+        assert_eq!(
+            fence.admit(elsewhere),
+            Err(Fenced::OtherScope(Box::new(Offered::new(
+                elsewhere, active
+            )))),
+            "and a writer holding it is wired wrong rather than late or early"
+        );
     }
 
     #[test]
@@ -2268,6 +2252,7 @@ mod tests {
         // not adoptable in either.
         assert_eq!(fence.adopt(published), Ok(()));
         let forked = PolicyGeneration::new(
+            tenant_scope(),
             published.epoch(),
             revision_id(3),
             PolicyBody::new(
@@ -2281,12 +2266,9 @@ mod tests {
         );
         assert_eq!(
             fence.adopt(forked),
-            Err(NotAnAdvance {
-                active: published,
-                next: forked
-            })
+            Err(NotAnAdvance(Box::new(Offered::new(forked, published))))
         );
-        assert!(matches!(fence.admit(forked), Err(Fenced::Forked { .. })));
+        assert!(matches!(fence.admit(forked), Err(Fenced::Forked(_))));
 
         // The transition model agrees: restating a document changes nothing.
         let body = tenant_policy_body(1, published.epoch().get());

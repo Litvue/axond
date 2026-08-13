@@ -96,7 +96,7 @@ pub use mutation::{
 #[allow(unused_imports)]
 pub use policy::{
     BOOTSTRAP_OWNED_FIELDS, BudgetPolicy, ConcurrencyPolicy, Fenced, InvalidPolicy, NotAnAdvance,
-    POLICY_SCHEMA, PolicyBody, PolicyContent, PolicyDocument, PolicyEpoch, PolicyError,
+    Offered, POLICY_SCHEMA, PolicyBody, PolicyContent, PolicyDocument, PolicyEpoch, PolicyError,
     PolicyFence, PolicyGeneration, PolicyScope, PolicySet, PolicySnapshot, PolicyTransition,
     RevocationPolicy, TransitionClass, TransitionReason,
 };

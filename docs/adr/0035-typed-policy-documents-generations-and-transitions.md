@@ -58,23 +58,26 @@ minimum_token_epoch
   whole. An absent optional field is therefore a complete statement ("this scope
   has no scope-wide cap") rather than an omission to fill in, and a scope with no
   document has no published policy at all, leaving the bootstrap file's limits.
-- **A generation is an epoch, the revision that carried it, and the content it
-  states.** The operator advances `epoch` when content changes; the revision id
-  is provenance. Neither identifies a publication alone: two publications can
-  carry one epoch (a restored backup, a forked control plane), and a revision id
-  says which publication but not whether the change was material. Because a
-  revision is whole desired state, every revision restates every policy document
-  it carries, so a generation also carries a digest of the document's content —
-  which is what separates the ordinary carry-forward from a fork.
+- **A generation is a scope, an epoch, the revision that carried it, and the
+  content it states.** The operator advances `epoch` when content changes; the
+  revision id is provenance. No part identifies a publication alone: two
+  publications can carry one epoch (a restored backup, a forked control plane), a
+  revision id says which publication but not whether the change was material, and
+  an epoch counts within its own scope, so a higher one from another tenant orders
+  nothing. Because a revision is whole desired state, every revision restates every
+  policy document it carries, so a generation also carries a digest of the
+  document's content — which is what separates the ordinary carry-forward from a
+  fork.
 - **Stale writers fail closed, and carry-forward is not staleness.** A writer is
   admitted only when it holds the policy the fence is enforcing: the active epoch
   and the active content, whichever revision carried it. An older epoch, an epoch
-  this replica has not adopted, and the same epoch stating *different* content all
-  deny — the same posture as an unreachable budget store
+  this replica has not adopted, the same epoch stating *different* content, and any
+  generation of another scope all deny — the same posture as an unreachable budget store
   (`on_unavailable = "deny"`): an unenforceable cap must not silently admit.
-  Adoption is monotonic in what is enforced: onto a higher epoch, or onto the
-  active document as a later revision restates it, never onto a different
-  document.
+  Adoption is monotonic in what is enforced: onto a higher epoch of the same scope,
+  or onto the active document as a later revision restates it, never onto a
+  different document. A fence that could be walked onto another scope's document
+  would then deny every writer the scope actually has.
 - **A change is classified by what activating it would require.** `live` (looser
   limits, longer TTLs, a higher token floor, or a republication that changes
   nothing), `drain` (tighter caps, shorter TTLs — safe once what was admitted
