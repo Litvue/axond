@@ -78,12 +78,18 @@ projection traces back to the catalogue it came from.
 `Removed`, `Renamed`, and `Refiled` (the id still works but now names another
 model). A rename is its own class, not a removal beside an addition, because the
 pair is what a caller has to act on. Renames are only ever looked for within one
-`(provider, model)` group, matched by offering content first and then
-positionally over sorted ids, so the classification is a function of the two
-projections; anything left over stays an addition or a removal rather than being
-paired to balance the two sides. Facts, prices, and lifecycle are *not*
-re-reported here — those are `CatalogDiff`'s classes, and reporting them twice
-would make a refresh's change count depend on how many views a caller built.
+`(provider, model)` group, and only between offerings whose content matches —
+same facts, same price, different id — because that is the evidence that the
+*same* offering moved. Anything left over stays an addition or a removal: two ids
+of one model that differ in price or limits are not substitutes, and reporting
+them as a rename would tell an operator to move traffic onto different terms.
+Facts, prices, and lifecycle are *not* re-reported here — those are
+`CatalogDiff`'s classes, and reporting them twice would make a refresh's change
+count depend on how many views a caller built. Two predicates separate the two
+audiences a diff has: `breaks_requests()` is true when an id a caller sends
+stopped working, and `resolves_elsewhere()` when an id keeps working but reaches
+a differently identified model, which is what anything keyed by `ModelId` — an
+entitlement in #205, a route — has to reconsider.
 
 ### State tier
 

@@ -627,6 +627,10 @@ impl ProjectionDiff {
 
     /// Whether any request that worked against the previous projection has to
     /// be changed to keep working: an id was withdrawn or renamed.
+    ///
+    /// A refiled id is *not* one of these — it still resolves — but what it
+    /// resolves to is now a differently identified model, which is
+    /// [`Self::resolves_elsewhere`].
     pub fn breaks_requests(&self) -> bool {
         self.changes.iter().any(|change| {
             matches!(
@@ -634,6 +638,15 @@ impl ProjectionDiff {
                 CallableChange::Removed { .. } | CallableChange::Renamed { .. }
             )
         })
+    }
+
+    /// Whether any id that keeps working now reaches a different model, which is
+    /// what anything keyed by [`ModelId`] — an entitlement, a route — has to
+    /// reconsider even though no request has to change.
+    pub fn resolves_elsewhere(&self) -> bool {
+        self.changes
+            .iter()
+            .any(|change| matches!(change, CallableChange::Refiled { .. }))
     }
 }
 
@@ -643,11 +656,13 @@ impl ProjectionDiff {
 /// A rename is only ever looked for within one `(provider, model)` group: an id
 /// that reaches a different model, or that a different provider publishes, is a
 /// different offering by construction, never a renaming of this one. Within a
-/// group, pairing is by the offering's content first (a provider that renames
-/// an id usually states everything else identically), then positionally over
-/// ids in sorted order, so the result depends on the two projections and not on
-/// traversal. Whatever is left over stays a removal or an addition — a rename is
-/// never invented to balance the two sides.
+/// group, the only pairing is by the offering's content — same facts, same
+/// price, different id — because that is the evidence that the *same* offering
+/// is now published under a new id, which is what a rename asserts and what a
+/// caller acts on by rewriting requests. Two ids of one model whose content
+/// differs are a removal and an addition however convenient a pairing would be:
+/// telling an operator to send `to` where they sent `from` is wrong when the two
+/// are not substitutes.
 fn renames(
     withdrawn: &mut Vec<&CallableOffering<'_>>,
     appeared: &mut Vec<&CallableOffering<'_>>,
@@ -674,29 +689,15 @@ fn renames(
     let mut changes = Vec::new();
     let mut paired_withdrawn = BTreeSet::new();
     let mut paired_appeared = BTreeSet::new();
-    for ((provider, model), (before, after)) in groups {
-        let mut unpaired_after: Vec<usize> = after;
-        let mut unpaired_before = Vec::new();
+    for ((provider, model), (before, mut unpaired_after)) in groups {
         for from in before {
-            let matched = unpaired_after
+            let Some(position) = unpaired_after
                 .iter()
-                .position(|to| withdrawn[from].content() == appeared[*to].content());
-            match matched {
-                Some(position) => {
-                    let to = unpaired_after.remove(position);
-                    paired_withdrawn.insert(from);
-                    paired_appeared.insert(to);
-                    changes.push(CallableChange::Renamed {
-                        provider: provider.clone(),
-                        model: (*model).clone(),
-                        from: withdrawn[from].published_model_id().to_owned(),
-                        to: appeared[to].published_model_id().to_owned(),
-                    });
-                }
-                None => unpaired_before.push(from),
-            }
-        }
-        for (from, to) in unpaired_before.into_iter().zip(unpaired_after) {
+                .position(|to| withdrawn[from].content() == appeared[*to].content())
+            else {
+                continue;
+            };
+            let to = unpaired_after.remove(position);
             paired_withdrawn.insert(from);
             paired_appeared.insert(to);
             changes.push(CallableChange::Renamed {
@@ -738,6 +739,8 @@ mod tests {
     const CROSS_PROVIDER: &str = include_str!("fixtures/models_dev/catalog.cross-provider.json");
     const CROSS_PROVIDER_RENAMED: &str =
         include_str!("fixtures/models_dev/catalog.cross-provider-renamed.json");
+    const CROSS_PROVIDER_SUBSTITUTED: &str =
+        include_str!("fixtures/models_dev/catalog.cross-provider-substituted.json");
     const UNAUTHORED: &str = include_str!("fixtures/models_dev/catalog.aliases-unauthored.json");
     const AMBIGUOUS: &str = include_str!("fixtures/models_dev/drift.model-key-ambiguous.json");
 
@@ -955,6 +958,32 @@ mod tests {
         );
     }
 
+    /// A withdrawal and an addition in one provider's ids for one model are not
+    /// a rename when they are not the same offering: telling an operator to send
+    /// the new id where they sent the old one would move traffic onto different
+    /// limits at a different price.
+    #[test]
+    fn an_id_replaced_by_a_differently_priced_one_is_not_a_rename() {
+        let before = content(CROSS_PROVIDER);
+        let after = content(CROSS_PROVIDER_SUBSTITUTED);
+        let previous = ModelProjection::project(&before).expect("a projection");
+        let current = ModelProjection::project(&after).expect("a projection");
+
+        let diff = current.diff(&previous);
+        assert_eq!(
+            diff.counts(),
+            ProjectionDiffCounts {
+                added: 1,
+                removed: 2,
+                renamed: 0,
+                refiled: 0,
+            },
+            "same provider, same model, and still not substitutes"
+        );
+        assert!(diff.breaks_requests());
+        assert!(!diff.resolves_elsewhere());
+    }
+
     /// Adding an alias is an addition, and nothing else: the ids that already
     /// worked are not reported as changed because a sibling appeared.
     #[test]
@@ -1013,6 +1042,10 @@ mod tests {
             "every id a caller could send still works; the alias now names the authored model"
         );
         assert!(!diff.breaks_requests());
+        assert!(
+            diff.resolves_elsewhere(),
+            "but what the id reaches is now identified differently"
+        );
         assert_eq!(
             diff.changes(),
             [CallableChange::Refiled {
