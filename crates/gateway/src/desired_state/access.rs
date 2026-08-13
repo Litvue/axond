@@ -1142,9 +1142,17 @@ impl Directory {
                 };
             }
             Caller::Human { issuer, subject } => self.human(issuer, subject),
-            Caller::Workload { principal, tenant } => self
-                .principal(*principal)
-                .filter(|found| found.tenant() == Some(*tenant)),
+            // The kind is checked as well as the tenant, so the two caller shapes
+            // are symmetric: `Caller::Human` resolves through an index that holds
+            // only OIDC identities, and a workload claim naming a human's
+            // principal id — which is not a secret, it is a published resource id
+            // — must not authorize with that human's roles and record the change
+            // as that human. Callers are expected to come from
+            // [`Directory::authenticate_workload`]; this is the decision point
+            // refusing to depend on that.
+            Caller::Workload { principal, tenant } => self.principal(*principal).filter(|found| {
+                found.body.kind() == IdentityKind::Workload && found.tenant() == Some(*tenant)
+            }),
         };
         let Some(principal) = principal else {
             return deny(DenialReason::UnknownPrincipal);
@@ -2052,6 +2060,38 @@ mod tests {
                 principal: principal_id(33),
             }
         );
+    }
+
+    /// A workload claim naming a human is not that human.
+    ///
+    /// A `PrincipalId` is a published resource id rather than a secret, so a
+    /// caller path that built `Caller::Workload` from a request-supplied id —
+    /// instead of from the principal `authenticate_workload` returned — would
+    /// otherwise authorize with a tenant administrator's roles and record the
+    /// change as that person.
+    #[test]
+    fn a_workload_claim_naming_a_human_authorizes_as_nobody() {
+        let state = state_with_directory();
+        let (tenancy, directory) = directory(&state);
+        let tenant = tenant_id(1);
+        let denial = directory
+            .authorize(
+                &tenancy,
+                &Caller::Workload {
+                    tenant,
+                    // The tenant administrator of this very tenant: the claim is
+                    // wrong about the kind and about nothing else.
+                    principal: principal_id(31),
+                },
+                request(
+                    Surface::Principal,
+                    Action::Create,
+                    ResourceScope::Tenant(tenant),
+                ),
+            )
+            .expect_err("a human's id does not authenticate a workload");
+        assert_eq!(denial.reason(), DenialReason::UnknownPrincipal);
+        assert_eq!(denial.public_reason(), "forbidden");
     }
 
     #[test]
