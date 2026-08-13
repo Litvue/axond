@@ -250,6 +250,54 @@ fn the_dependency_map_is_complete_in_both_directions() {
     );
 }
 
+/// Durable inventory is the only recovery stage that can claim restoration of
+/// the state introduced by the catalogue, pricing, and SecretStore slices.
+/// Keep those edges exact: attaching one to serving or reconvergence would
+/// either make the wrong stage appear unblocked or overstate what the restore
+/// drill proves.
+#[test]
+fn durable_inventory_owns_the_secret_catalogue_and_pricing_dependencies() {
+    let manifest = recovery::load();
+    let owners = |issue| {
+        manifest
+            .scenarios
+            .iter()
+            .flat_map(|scenario| {
+                scenario.stages.iter().flat_map(move |stage| {
+                    stage
+                        .blocked_on
+                        .iter()
+                        .filter(move |dependency| dependency.issue == issue)
+                        .map(move |_| format!("{}/{}", scenario.id, stage.id))
+                })
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let expected = |stages: &[&str]| {
+        stages
+            .iter()
+            .map(|stage| (*stage).to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+
+    assert_eq!(
+        owners(145),
+        expected(&[
+            "backup-restore/durable-inventory",
+            "secret-rotation/rotation",
+        ])
+    );
+    assert_eq!(owners(146), expected(&["backup-restore/durable-inventory"]));
+    assert_eq!(owners(147), expected(&["backup-restore/durable-inventory"]));
+    assert_eq!(
+        owners(158),
+        expected(&[
+            "cold-boot-no-cache/readiness",
+            "cold-boot-invalid-cache/readiness",
+        ])
+    );
+}
+
 /// A slice may leave the dependency map, but only by saying what became of it.
 /// Deleting the last claim on a slice is indistinguishable from deleting the
 /// stage that needed it, so a retirement is recorded, cannot also be a live
