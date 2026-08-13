@@ -58,7 +58,11 @@ diagnostic_concurrency_exceeded` beyond it — rather than by
 replica while still refusing an unbounded poller. A wider sixty-four-deep
 ceiling outside authentication refuses the same way, so a flood of credentials
 that turn out to be worthless cannot spend unbounded verification and
-revocation-store work on a route admission does not cover.
+revocation-store work on a route admission does not cover. That wider ceiling is
+split by what checking the credential costs — minted tokens may hold at most
+forty-eight of it, the other sixteen being reachable only by credentials that
+resolve in memory — so a slow revocation store cannot refuse the static operator
+key that reads status through its outage.
 
 Responses is forwarded natively with only `model` rewritten and streaming is
 byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones

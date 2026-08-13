@@ -22,7 +22,7 @@ use gateway_core::{
 use gateway_transport::{HttpDispatcher, build_client};
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::admission::AdmissionControl;
+use crate::admission::{AdmissionControl, DiagnosticCredential};
 use crate::aliases::AliasScope;
 use crate::availability::AvailabilityIndex;
 use crate::budget::BudgetStore;
@@ -558,6 +558,16 @@ impl ConfigSnapshot {
 
     pub fn principal_store_name(&self, presented: &Presented<'_>) -> &'static str {
         self.principals.owner_name(presented)
+    }
+
+    /// What authenticating this credential will cost, before any of it is spent:
+    /// whether resolving it can reach a backend, or only memory.
+    pub fn diagnostic_credential(&self, presented: &Presented<'_>) -> DiagnosticCredential {
+        if self.principals.resolves_in_memory(presented) {
+            DiagnosticCredential::Local
+        } else {
+            DiagnosticCredential::Minted
+        }
     }
 
     /// How many inbound gateway keys are enforced. For the boot log and reload

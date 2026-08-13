@@ -349,7 +349,10 @@ capacity under separate `axond_admission_in_flight` resources, `diagnostic` and
 `diagnostic_auth`, because one read holds a slot in each: summing them would
 report every reader twice against a denominator that is neither bound. A
 `diagnostic_auth` series near sixty-four with `diagnostic` near zero is a flood
-of credentials that are not being accepted, not eight busy operators.
+of credentials that are not being accepted, not eight busy operators — and one
+pinned at forty-eight is that flood arriving as minted tokens, which is the share
+they are held to precisely so the remaining sixteen stay reachable by a static
+key.
 
 ### A replica is stuck draining
 
@@ -378,7 +381,15 @@ diagnostic_concurrency_exceeded`. The second ceiling is the wider one because it
 sits *outside* authentication, where an anonymous caller can reach it: it bounds
 the signature checks and revocation lookups a flood would otherwise spend, while
 the narrow one is inside, where only a caller that proved it may ask can spend a
-slot. Neither is configurable. Poll serially when scripting a fleet sweep.
+slot.
+
+That outer ceiling is split by what the credential costs to check: minted tokens
+may hold at most forty-eight of the sixty-four, and the remaining sixteen are
+reachable only by credentials that resolve in memory. So a revocation store that
+is *slow* rather than down cannot park every permit in token verifications and
+refuse the static operator key — which matters because that key is what the
+revocation-outage entry above tells you to triage with. Neither number is
+configurable. Poll serially when scripting a fleet sweep.
 
 ## Bounded drill-down
 

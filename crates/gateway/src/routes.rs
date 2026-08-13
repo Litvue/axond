@@ -52,7 +52,7 @@ use serde_json::{Value, json};
 use tracing::{Instrument, debug, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::admission::{AdmissionPermit, RequestKind};
+use crate::admission::{AdmissionPermit, DiagnosticCredential, RequestKind};
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
@@ -494,12 +494,29 @@ async fn diagnostic_middleware(
 /// together mean neither an anonymous flood can close the route to operators
 /// nor a credentialled one can spend the replica's CPU and revocation store
 /// without limit.
+///
+/// Which partition of it a request may take is decided here, from the shape of
+/// the credential alone — the only thing known before the credential is spent.
+/// A token's verification can block on the revocation store, so tokens are held
+/// to their own share and cannot fill the share that resolves in memory: the
+/// operator's static key is the credential the runbook sends through a
+/// revocation outage, and a store that is slow rather than down must not be
+/// able to refuse it.
 async fn diagnostic_authentication_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, GatewayError> {
-    let _permit = state.0.admission.admit_diagnostic_authentication()?;
+    let credential =
+        presented_credential(request.headers()).map_or(DiagnosticCredential::Local, |credential| {
+            state
+                .config()
+                .diagnostic_credential(&Presented { credential })
+        });
+    let _permit = state
+        .0
+        .admission
+        .admit_diagnostic_authentication(credential)?;
     Ok(next.run(request).await)
 }
 
@@ -737,23 +754,30 @@ async fn list_models(
     Ok(Json(json!({ "object": "list", "data": data })))
 }
 
-/// Resolve the caller's namespace + subject from the inbound key. Every request
-/// must present a configured gateway key: authentication fails closed, and a
-/// snapshot with no key never reaches a request (ADR 0013).
+/// The credential a request presents, before anything is known about whether it
+/// is one.
 ///
-/// The key travels as `Authorization: Bearer` or, because that is what an
-/// Anthropic SDK pointed at the gateway sends, as `x-api-key`. Both name the
-/// same gateway key; the scheme is the client's, not a second credential space.
-async fn authenticate(
-    snapshot: &ConfigSnapshot,
-    headers: &HeaderMap,
-) -> Result<InboundKey, GatewayError> {
-    let credential = headers
+/// It travels as `Authorization: Bearer` or, because that is what an Anthropic
+/// SDK pointed at the gateway sends, as `x-api-key`. Both name the same gateway
+/// key; the scheme is the client's, not a second credential space. Shared with
+/// the diagnostic pre-authentication ceiling, which has to partition on the same
+/// string authentication will later resolve.
+fn presented_credential(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
-        .ok_or(GatewayError::Unauthorized)?;
+}
+
+/// Resolve the caller's namespace + subject from the inbound key. Every request
+/// must present a configured gateway key: authentication fails closed, and a
+/// snapshot with no key never reaches a request (ADR 0013).
+async fn authenticate(
+    snapshot: &ConfigSnapshot,
+    headers: &HeaderMap,
+) -> Result<InboundKey, GatewayError> {
+    let credential = presented_credential(headers).ok_or(GatewayError::Unauthorized)?;
     let presented = Presented { credential };
     let store = snapshot.principal_store_name(&presented);
     let principal = match snapshot.resolve_principal(&presented).await {
@@ -7038,15 +7062,28 @@ max_ttl = "15m"
             status: observed_registry(),
             revision: None,
         });
-        let held: Vec<_> = (0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTICS)
-            .map(|_| {
-                state
-                    .0
-                    .admission
-                    .admit_diagnostic_authentication()
-                    .expect("under the ceiling")
-            })
-            .collect();
+        let mut held = Vec::new();
+        for (credential, capacity) in [
+            (
+                DiagnosticCredential::Minted,
+                crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS,
+            ),
+            (
+                DiagnosticCredential::Local,
+                crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_KEYS,
+            ),
+        ] {
+            for _ in 0..capacity {
+                held.push(
+                    state
+                        .0
+                        .admission
+                        .admit_diagnostic_authentication(credential)
+                        .expect("under the ceiling"),
+                );
+            }
+        }
+        assert_eq!(held.len(), crate::admission::MAX_AUTHENTICATING_DIAGNOSTICS);
 
         // The credential is never reached, so an invalid one and the operator's
         // own are refused alike: the bound is on the verification, not the
@@ -7077,6 +7114,48 @@ max_ttl = "15m"
         drop(held);
         let (status, _) = status_response(state, Some(OPERATOR_KEY)).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The pre-authentication ceiling is partitioned rather than pooled,
+    /// because its two halves cost different things: a minted token is a
+    /// revocation-store round trip, a static key a comparison in memory. Pooled,
+    /// a store that is *slow* rather than down would park every permit in token
+    /// verifications and refuse the operator's static key — the credential the
+    /// runbook sends through exactly that outage.
+    #[tokio::test]
+    async fn a_token_flood_cannot_close_the_route_to_a_static_key() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let flood: Vec<_> = (0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic_authentication(DiagnosticCredential::Minted)
+                    .expect("under the token share")
+            })
+            .collect();
+
+        // Another token waits behind the flood rather than behind the store.
+        let (status, body) = status_response(state.clone(), Some("axt1.another-one")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "diagnostic_concurrency_exceeded");
+
+        // The operator is not behind it: nothing about that credential can reach
+        // the store the flood is parked on.
+        let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a token flood held the route closed against a static key: {body}"
+        );
+        // Including a *wrong* static key, which costs the same comparison and so
+        // shares the same share of the ceiling.
+        let (status, _) = status_response(state.clone(), Some("not-a-key")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        drop(flood);
     }
 
     /// `main` merges this router with the administrative surface, which nests

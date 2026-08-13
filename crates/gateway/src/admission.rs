@@ -79,7 +79,49 @@ pub const MAX_IN_FLIGHT_DIAGNOSTICS: usize = 8;
 /// any of them — while still being a number rather than the process's memory.
 /// Refusing here costs no I/O, so the refusal is cheap even when the flood is
 /// not.
+///
+/// Partitioned rather than pooled: see
+/// [`MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS`].
 pub const MAX_AUTHENTICATING_DIAGNOSTICS: usize = 64;
+
+/// How much of that ceiling a credential whose verification does *I/O* may hold.
+///
+/// A minted token costs a revocation-store round trip; a static key costs a
+/// constant-time comparison in memory. Pooled, the slow half decides the fast
+/// half's fate: a revocation store that is slow rather than down parks sixty-four
+/// token verifications in the pool and the operator's static key — the one
+/// credential that reads status *through* a revocation outage, which is the
+/// runbook's whole triage instruction — is refused behind them.
+///
+/// So the pool is partitioned by what the credential will cost, which is legible
+/// from its shape before any of it is spent. Tokens may fill this much of it and
+/// no more; the remainder
+/// ([`MAX_AUTHENTICATING_DIAGNOSTIC_KEYS`]) is reachable only by credentials that
+/// resolve in memory, so a slow store cannot close the route on the credential
+/// that outlives it.
+pub const MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS: usize = 48;
+
+/// The rest of the ceiling, held out for credentials that resolve in memory.
+///
+/// A flood of *garbage* lands here too — an unparseable credential is refused
+/// without I/O, so it cannot be told from a static key before it is checked —
+/// but these permits are held for microseconds rather than for a store's
+/// timeout, so the partition drains at the speed of a memcmp no matter who is
+/// flooding it. What it excludes is precisely the work that can block.
+pub const MAX_AUTHENTICATING_DIAGNOSTIC_KEYS: usize =
+    MAX_AUTHENTICATING_DIAGNOSTICS - MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS;
+
+/// What authenticating this credential will cost, as far as it can be known
+/// before it is spent: the credential's shape, and nothing about who presented
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticCredential {
+    /// A `axt1.` minted token: signature verification plus a revocation-store
+    /// lookup, so it can block on a backend.
+    Minted,
+    /// Anything else, including nothing at all: resolved from memory.
+    Local,
+}
 
 /// Largest ceiling a semaphore-backed bound may carry. Config validation refuses
 /// anything larger, so an absurd number is a typed boot error rather than an
@@ -229,7 +271,10 @@ pub struct AdmissionControl {
     streams: Option<Arc<Semaphore>>,
     queue: Option<Arc<Semaphore>>,
     diagnostics: Arc<Semaphore>,
-    authenticating_diagnostics: Arc<Semaphore>,
+    /// The two partitions of the pre-authentication ceiling, keyed by what the
+    /// credential's verification will cost.
+    authenticating_tokens: Arc<Semaphore>,
+    authenticating_keys: Arc<Semaphore>,
     tenants: Arc<TenantTable>,
 }
 
@@ -242,7 +287,8 @@ impl AdmissionControl {
                 .map(|n| Arc::new(Semaphore::new(n))),
             queue: limits.queue_capacity.map(|n| Arc::new(Semaphore::new(n))),
             diagnostics: Arc::new(Semaphore::new(MAX_IN_FLIGHT_DIAGNOSTICS)),
-            authenticating_diagnostics: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTICS)),
+            authenticating_tokens: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS)),
+            authenticating_keys: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTIC_KEYS)),
             tenants: Arc::new(TenantTable {
                 limit: limits.max_in_flight_per_tenant,
                 max_tenants: limits.max_tenants,
@@ -321,8 +367,21 @@ impl AdmissionControl {
     /// [`AdmissionRejection::Diagnostics`] as the inner ceiling: both mean "this
     /// replica is answering as many status reads as it will", and a caller has
     /// no action that distinguishes them.
-    pub fn admit_diagnostic_authentication(&self) -> Result<DiagnosticPermit, AdmissionRejection> {
-        let permit = Arc::clone(&self.authenticating_diagnostics)
+    ///
+    /// The partition comes from the credential's shape rather than its holder,
+    /// because nothing about the holder is known yet — see
+    /// [`MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS`] for why a shared pool would let
+    /// a slow revocation store decide whether an operator's static key is
+    /// admitted.
+    pub fn admit_diagnostic_authentication(
+        &self,
+        credential: DiagnosticCredential,
+    ) -> Result<DiagnosticPermit, AdmissionRejection> {
+        let partition = match credential {
+            DiagnosticCredential::Minted => &self.authenticating_tokens,
+            DiagnosticCredential::Local => &self.authenticating_keys,
+        };
+        let permit = Arc::clone(partition)
             .try_acquire_owned()
             .map_err(|_| reject(AdmissionRejection::Diagnostics))?;
         metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC_AUTH);

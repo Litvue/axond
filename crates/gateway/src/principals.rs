@@ -803,6 +803,22 @@ impl PrincipalStoreChain {
         self.config.resolve(presented).await
     }
 
+    /// Whether resolving this credential can only touch memory.
+    ///
+    /// A shape-owning store is one that verifies rather than compares — a
+    /// signature, and the revocation lookup behind it — so it can block on a
+    /// backend; the configured keys cannot. Derived from the declared shapes
+    /// rather than from a second list of prefixes, so a store added later is
+    /// classified by the same declaration that routes it.
+    pub(crate) fn resolves_in_memory(&self, presented: &Presented<'_>) -> bool {
+        !self.stores.iter().any(|store| {
+            store
+                .shapes()
+                .iter()
+                .any(|shape| presented.credential.starts_with(shape))
+        })
+    }
+
     pub(crate) fn config_count(&self) -> usize {
         self.config.count()
     }
