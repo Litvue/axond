@@ -59,6 +59,16 @@ impl ControlPlaneProbe {
     ///   (`connect_timeout`);
     /// * and the health call itself is bounded by `operation_timeout` again.
     ///
+    /// That budgets for *one* administrative operation ahead of the probe, which
+    /// is the depth the store's fair queue reaches under the traffic an admin
+    /// API sees: publishes and migrations are operator actions, not request-path
+    /// work. Several concurrently queued slow operations would push the probe
+    /// past its timeout and publish `unavailable`/`timeout`, and that is left as
+    /// the honest reading — a control plane whose queue is deeper than a
+    /// diagnostic can wait out is one the next administrative request will also
+    /// wait behind. Budgeting for an unbounded queue instead would mean a probe
+    /// that can never report a timeout at all.
+    ///
     /// The refresh interval sits above that so a round cannot overlap the next,
     /// and the staleness budget above *that* so a single slow round does not
     /// coarsen every component to `stale`. A deployment that wants a faster
