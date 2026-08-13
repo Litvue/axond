@@ -395,9 +395,11 @@ impl AdmissionControl {
     /// Admit one diagnostic *authentication*, or shed it before any of the work
     /// authenticating costs is done.
     ///
-    /// The permit is held across authentication and released when the response
-    /// is, so what it bounds is concurrent signature verification and revocation
-    /// lookups on a route that admission does not cover. Refused with the same
+    /// The permit is held across authentication and given back the moment the
+    /// credential is settled — before the handler runs, not when the response
+    /// ends — so what it bounds is exactly concurrent signature verification and
+    /// revocation lookups on a route that admission does not cover, and a share
+    /// drains at the speed of the check rather than of the answer. Refused with the same
     /// [`AdmissionRejection::Diagnostics`] as the inner ceiling: both mean "this
     /// replica is answering as many status reads as it will", and a caller has
     /// no action that distinguishes them.

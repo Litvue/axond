@@ -390,9 +390,12 @@ is *slow* rather than down cannot park every permit in token verifications and
 refuse the static operator key — which matters because that key is what the
 revocation-outage entry above tells you to triage with — and neither can a flood
 that needs no credential to mount. What the shares cannot separate is a wrong
-static key from a right one, since telling them apart *is* the check; that costs
-a comparison in memory, so the sixteen drain at that speed however hard they are
-being hit. None of the numbers is configurable. Poll serially when scripting a
+static key from a right one, since telling them apart *is* the check; those
+contend for the same sixteen. A permit is returned as soon as the credential is
+settled rather than when the response is, though, so that share drains at the
+speed of a comparison in memory however hard it is being hit — answering is
+bounded by the eight, and a slow reader cannot hold an authentication permit.
+None of the numbers is configurable. Poll serially when scripting a
 fleet sweep.
 
 ## Bounded drill-down

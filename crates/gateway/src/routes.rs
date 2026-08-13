@@ -523,12 +523,27 @@ async fn diagnostic_authentication_middleware(
                 .diagnostic_credential(&Presented { credential })
         },
     );
-    let _permit = state
+    let permit = state
         .0
         .admission
         .admit_diagnostic_authentication(credential)?;
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(AuthenticatingPermit(Arc::new(permit)));
     Ok(next.run(request).await)
 }
+
+/// The pre-authentication permit, carried on the request so that
+/// [`authenticate_middleware`] can give it back the moment the credential is
+/// settled.
+///
+/// Holding it to the end of the response would make the share drain at the speed
+/// of *answering*, not of authenticating, which is the opposite of what it is
+/// for: sixteen slow readers would then close the in-memory share against the
+/// static key, and the inner ceiling already bounds the answering.
+#[derive(Clone)]
+struct AuthenticatingPermit(Arc<crate::admission::DiagnosticPermit>);
 
 /// Reserve a slot for a request and hold it until the response body is fully
 /// delivered, so an open SSE stream counts as in-flight for as long as it runs.
@@ -868,6 +883,9 @@ async fn authenticate_middleware(
         );
         return Err(GatewayError::ScopeInsufficient(capability));
     }
+    // Authentication is over, whatever it cost, so the permit that bounded it
+    // goes back before the handler runs rather than after.
+    drop(request.extensions_mut().remove::<AuthenticatingPermit>());
     request.extensions_mut().insert(snapshot);
     request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
@@ -7208,6 +7226,38 @@ max_ttl = "15m"
 
         drop(anonymous);
         drop(flood);
+    }
+
+    /// The outer permit bounds *authenticating*, so it is given back where
+    /// authentication ends — `authenticate_middleware` takes it off the request
+    /// before the handler runs — rather than where the response does. Otherwise
+    /// a share would drain at the speed of answering, and a slow reader rather
+    /// than an expensive credential would be what closed the route.
+    #[tokio::test]
+    async fn an_answered_read_does_not_keep_its_authentication_permit() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        // One request per permit in the in-memory share, answered in sequence:
+        // if the permit outlived authentication these would exhaust it, since
+        // nothing here waits for a previous one to be released.
+        for _ in 0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_KEYS + 1 {
+            let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        // Every one of them is back, not merely most of them.
+        let held: Vec<_> = (0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_KEYS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic_authentication(DiagnosticCredential::Local)
+                    .expect("the answered reads returned every permit they took")
+            })
+            .collect();
+        drop(held);
     }
 
     /// `main` merges this router with the administrative surface, which nests
