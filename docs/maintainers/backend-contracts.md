@@ -22,13 +22,14 @@ policy, and one consistency model on both — and it would imply that any backen
 can serve any responsibility, which is precisely how Redis ends up holding the
 system of record.
 
-## The seven contracts
+## The eight contracts
 
 | Contract | Owns | Permitted implementations | Callable from | Module |
 | --- | --- | --- | --- | --- |
 | `ControlPlaneStore` | Durable desired state: revisions, manifests, resource versions, audit | Postgres | Control plane only | `crates/gateway/src/backends/control_plane.rs` |
 | `SecretStore` | Wrapped secret material and unwrapping | Encrypted Postgres (first), external secret managers later | Snapshot compilation only | `crates/gateway/src/backends/secrets.rs` |
 | `CatalogSource` | Model metadata ingestion | models.dev | Background refresh only | `crates/gateway/src/backends/catalog.rs` |
+| `CatalogStore` | Durable retention of imported catalogue snapshots | Postgres / in-memory | Background refresh only | `crates/gateway/src/backends/catalog_store.rs` |
 | `BudgetStore` | Spend caps | none / in-memory / Redis / Postgres | Request path (opt-in) | `crates/gateway/src/budget/` |
 | `RateLimiter` | Inbound admission | none / in-memory / Redis | Request path (opt-in) | `crates/gateway/src/rate_limit/` |
 | `RevocationStore` | Precise minted-token `jti` revocation | none / Redis / Postgres | Request path (opt-in) | `crates/gateway/src/revocation/` |
@@ -60,7 +61,7 @@ property the ADR's availability argument rests on:
   `SecretStore` lives here: a snapshot is publishable only once every credential
   it needs is already resolved in memory, so a request never unwraps a secret.
 - `Background` — periodic maintenance with no request or boot dependency
-  (`CatalogSource`).
+  (`CatalogSource`, `CatalogStore`).
 
 A `ControlPlane`, `SnapshotCompilation`, or `Background` contract appearing in a
 request handler is a bug, not a slow path. The tests enforce the declaration;
@@ -199,6 +200,17 @@ exist, and never activates a price — `ObservedPrice` is the rate the upstream
 mutation. `CatalogRefresh::Unchanged` is a first-class answer so "the upstream
 has nothing new" cannot be confused with "the upstream now lists no models",
 which would retire every model.
+
+That holds now that something drives refresh on a schedule
+([ADR 0051](../adr/0051-durable-catalogue-snapshots-and-refresh-orchestration.md)).
+`CatalogRefresher` writes an import to `CatalogStore` *before* it becomes
+active, so a deployment never serves a catalogue it could not retain; a refusal
+of any kind — upstream, parse, storage, timeout — leaves the active catalogue
+alone and is counted, durably, so staleness survives a restart. What a new
+catalogue would mean for existing enablements is a `RefreshImpact` report: which
+pins are behind, and which enabled offerings the upstream has stopped
+publishing. Acting on either is an administrative mutation, so an operator does
+it.
 
 ## The desired-state domain the control plane stores
 
