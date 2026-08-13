@@ -84,7 +84,7 @@ never be upgraded by editing the manifest alone.
 | `recovery-convergence/administration` | blocked | The audit trail read through an authenticated surface. |
 | `secret-rotation/rotation` | blocked | Rotating material behind a credential reference without a redeployment. |
 | `secret-rotation/serving` | blocked | Requests authenticated with the rotated material. |
-| `backup-restore/restore` | runs | A deployment published through `axond admin` is dumped, restored into a database no replica ever wrote, and read back by a replica booted on it: same head, same checksum, whole revision chain, whole resource set, and a publication against the restored head accepted. |
+| `backup-restore/restore` | runs | A deployment published through `axond admin` is dumped, restored into a database no replica ever wrote, and read back by a replica booted on it: same head, same checksum, whole revision chain, whole resource set, a publication against the restored head accepted, and `/readyz` plus inference refuse closed until a serving snapshot exists. |
 | `backup-restore/administration` | runs | The audit trail read back through the authenticated surface of that replica, refused there without a credential, and checked to name a credential's reference rather than any material. |
 | `backup-restore/durable-inventory` | blocked | The wrapped secret material, catalogue snapshots, and price books a restore must bring back beyond the journal and its tenancy. |
 | `backup-restore/reconvergence` | blocked | Replicas converging onto the restored journal. |
