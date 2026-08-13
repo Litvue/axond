@@ -8,6 +8,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import tempfile
@@ -287,15 +288,17 @@ def workflow_job_targets(workflow: str, job: str) -> list[str]:
     return matrix_targets(text, job)
 
 
-def matrix_targets(workflow_text: str, job: str) -> list[str]:
+def job_block(workflow_text: str, job: str) -> str:
     block = re.search(
         rf"^  {re.escape(job)}:\n(.*?)(?=^  \S|\Z)",
         workflow_text,
         re.MULTILINE | re.DOTALL,
     )
-    if block is None:
-        return []
-    return re.findall(r"^\s+target:\s*(\S+)\s*$", block.group(1), re.MULTILINE)
+    return block.group(1) if block else ""
+
+
+def matrix_targets(workflow_text: str, job: str) -> list[str]:
+    return re.findall(r"^\s+target:\s*(\S+)\s*$", job_block(workflow_text, job), re.MULTILINE)
 
 
 def smoke_matrix_failures(
@@ -346,6 +349,143 @@ def check_smoke_matrix() -> list[str]:
         workflow_job_targets("ci.yml", "binary-smoke"),
         workflow_job_targets("release-please.yml", "release-binaries"),
         (ROOT / "docs/compatibility.md").read_text(encoding="utf-8"),
+    )
+
+
+def document_section(document: str, heading: str) -> str:
+    """One `##` section of a page, or the empty string when it is absent."""
+    if heading not in document:
+        return ""
+    start = document.index(heading)
+    end = document.find("\n## ", start + len(heading))
+    return document[start : end if end != -1 else len(document)]
+
+
+def sdk_matrix_failures(
+    python_pins: dict[str, str],
+    node_pins: dict[str, str],
+    python_runtime: str,
+    node_runtime: str,
+    document: str,
+) -> list[str]:
+    """The documented provider-SDK matrix names the versions the lanes install.
+
+    The compatibility contract restates the exact SDK and runtime versions,
+    because "an OpenAI SDK works" is not the claim — *this* release of it does,
+    and a reader deciding whether their pin is covered needs the number. A
+    restated number drifts silently: bumping `tests/compat/requirements.in` or
+    `tests/compat-ts/package.json` leaves the page asserting compatibility with a
+    release CI stopped exercising, which is the one thing this page must not do.
+    So the pins, the runtimes CI actually sets up, and the table are one set.
+    """
+    section = document_section(document, "## Clients")
+    if not section:
+        return ["docs/compatibility.md: the '## Clients' section is missing"]
+    failures: list[str] = []
+    for owner, required, pins, spelling in (
+        ("tests/compat/requirements.in", ("openai", "anthropic"), python_pins, "{}=={}"),
+        (
+            "tests/compat-ts/package.json",
+            ("openai", "@anthropic-ai/sdk"),
+            node_pins,
+            "{}@{}",
+        ),
+    ):
+        for name in required:
+            version = pins.get(name)
+            if version is None:
+                failures.append(f"{owner}: the {name!r} pin the compatibility lane runs on is missing")
+                continue
+            pin = spelling.format(name, version)
+            if f"`{pin}`" not in section:
+                failures.append(
+                    f"docs/compatibility.md: the client matrix does not name `{pin}`, "
+                    f"the pin {owner} installs"
+                )
+    for runtime, version, owner in (
+        ("Python", python_runtime, "the sdk-compat lane in ci.yml"),
+        ("Node", node_runtime, "tests/compat-ts/.nvmrc"),
+    ):
+        if not version:
+            failures.append(f"{owner}: no {runtime} version is declared for the compatibility lane")
+        elif f"{runtime} {version}" not in section:
+            failures.append(
+                f"docs/compatibility.md: the client matrix does not name "
+                f"{runtime} {version}, the runtime {owner} sets up"
+            )
+    for lane in ("tests/compat", "tests/compat-ts"):
+        if lane not in section:
+            failures.append(
+                f"docs/compatibility.md: the client matrix does not link the {lane} lane "
+                "that exercises it"
+            )
+    return failures
+
+
+def sdk_pins(text: str) -> dict[str, str]:
+    """Exact `name==version` pins from a requirements input, ranges ignored."""
+    return dict(re.findall(r"^([A-Za-z0-9_.-]+)==(\S+)\s*$", text, re.MULTILINE))
+
+
+def check_sdk_matrix() -> list[str]:
+    manifest = json.loads((ROOT / "tests/compat-ts/package.json").read_text(encoding="utf-8"))
+    python_runtime = re.search(
+        r"^\s+python-version:\s*'?([\d.]+)'?\s*$",
+        job_block((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"), "sdk-compat"),
+        re.MULTILINE,
+    )
+    node = (ROOT / "tests/compat-ts/.nvmrc").read_text(encoding="utf-8").strip()
+    return sdk_matrix_failures(
+        sdk_pins((ROOT / "tests/compat/requirements.in").read_text(encoding="utf-8")),
+        manifest.get("dependencies", {}),
+        python_runtime.group(1) if python_runtime else "",
+        # The table names the major line a customer would recognise; the exact
+        # runtime pin lives in `.nvmrc`, which the lane reads directly.
+        node.split(".")[0],
+        (ROOT / "docs/compatibility.md").read_text(encoding="utf-8"),
+    )
+
+
+def disclosure_routing_failures(policy: str, chooser: str) -> list[str]:
+    """The issue chooser sends a reporter to the channel the policy publishes.
+
+    `SECURITY.md` is only reachable by someone who went looking for it; the
+    chooser is what a reporter sees. If the two disagree — a moved advisory
+    channel, a chooser link that rots — the failure mode is a vulnerability filed
+    as a public issue, which cannot be undone by triaging it well.
+    """
+    advisory = re.search(r"https://github\.com/[\w.-]+/[\w.-]+/security/advisories/new", policy)
+    if advisory is None:
+        return ["SECURITY.md: no private vulnerability reporting URL to route the issue chooser to"]
+    failures: list[str] = []
+    if advisory.group(0) not in chooser:
+        failures.append(
+            f".github/ISSUE_TEMPLATE/config.yml: no contact link to {advisory.group(0)}, "
+            "the reporting channel SECURITY.md publishes"
+        )
+    if "SECURITY.md" not in chooser:
+        failures.append(
+            ".github/ISSUE_TEMPLATE/config.yml: the chooser does not link SECURITY.md, "
+            "so scope and response targets are a search away from the report form"
+        )
+    if "contact_links" not in chooser:
+        failures.append(
+            ".github/ISSUE_TEMPLATE/config.yml: no `contact_links`, so GitHub shows no "
+            "chooser and the routing is invisible"
+        )
+    return failures
+
+
+def check_disclosure_routing() -> list[str]:
+    chooser = ROOT / ".github/ISSUE_TEMPLATE/config.yml"
+    if not chooser.is_file():
+        return [
+            ".github/ISSUE_TEMPLATE/config.yml: the issue chooser is missing; without it "
+            "'New issue' offers no private reporting channel"
+        ]
+    return disclosure_routing_failures(
+        (ROOT / "SECURITY.md").read_text(encoding="utf-8"),
+        chooser.read_text(encoding="utf-8"),
     )
 
 
@@ -419,6 +559,73 @@ def self_test() -> int:
         smoke_matrix_failures(["gnu"], [], document),
     ):
         assert len(empty) == 1 and "declares no target" in empty[0], empty
+
+    clients = (
+        "## Clients\n\n"
+        "| Runtime | SDKs | Lane |\n"
+        "| Python 3.12 | `openai==2.50.0`, `anthropic==0.120.0` | [`tests/compat`](../tests/compat) |\n"
+        "| Node 22 | `openai@7.4.0`, `@anthropic-ai/sdk@0.115.0` | [`tests/compat-ts`](../tests/compat-ts) |\n"
+        "\n## Supported platforms\n\n`openai@9.9.9` is not a client claim.\n"
+    )
+    python_pins = {"openai": "2.50.0", "anthropic": "0.120.0", "pytest": "9.1.1"}
+    node_pins = {"openai": "7.4.0", "@anthropic-ai/sdk": "0.115.0"}
+    assert sdk_pins("openai==2.50.0\nanthropic==0.120.0\nranged>=1\n") == {
+        "openai": "2.50.0",
+        "anthropic": "0.120.0",
+    }
+    assert (
+        sdk_matrix_failures(python_pins, node_pins, "3.12", "22", clients) == []
+    ), sdk_matrix_failures(python_pins, node_pins, "3.12", "22", clients)
+
+    # The bump nobody carried into the contract: the drift this gate exists for,
+    # and a version that appears only in a later section does not count as named.
+    bumped = sdk_matrix_failures(
+        python_pins | {"openai": "2.51.0"}, node_pins, "3.12", "22", clients
+    )
+    assert len(bumped) == 1, bumped
+    assert "does not name `openai==2.51.0`" in bumped[0], bumped
+    elsewhere = sdk_matrix_failures(
+        python_pins, node_pins | {"openai": "9.9.9"}, "3.12", "22", clients
+    )
+    assert len(elsewhere) == 1, elsewhere
+    assert "does not name `openai@9.9.9`" in elsewhere[0], elsewhere
+    # A lane whose manifest lost an SDK entirely is a coverage claim with nothing
+    # behind it, reported against the owner file rather than the page.
+    dropped = sdk_matrix_failures(python_pins, {"openai": "7.4.0"}, "3.12", "22", clients)
+    assert len(dropped) == 1 and "'@anthropic-ai/sdk' pin" in dropped[0], dropped
+
+    # A runtime the lane moved, an undeclared one, and a missing section.
+    for runtime, expected in (("3.13", "Python 3.13"), ("", "no Python version")):
+        moved = sdk_matrix_failures(python_pins, node_pins, runtime, "22", clients)
+        assert len(moved) == 1 and expected in moved[0], (runtime, moved)
+    node_moved = sdk_matrix_failures(python_pins, node_pins, "3.12", "24", clients)
+    assert len(node_moved) == 1 and "Node 24" in node_moved[0], node_moved
+    unlinked = sdk_matrix_failures(
+        python_pins, node_pins, "3.12", "22", clients.replace("tests/compat-ts", "elsewhere")
+    )
+    assert len(unlinked) == 1 and "tests/compat-ts lane" in unlinked[0], unlinked
+    absent = sdk_matrix_failures(python_pins, node_pins, "3.12", "22", "# Compatibility\n")
+    assert absent == ["docs/compatibility.md: the '## Clients' section is missing"], absent
+
+    # The chooser against the policy it is supposed to route to.
+    policy = "Use [Report a vulnerability](https://github.com/Litvue/axond/security/advisories/new)."
+    routed = (
+        "contact_links:\n"
+        "  - url: https://github.com/Litvue/axond/security/advisories/new\n"
+        "  - url: https://github.com/Litvue/axond/blob/main/SECURITY.md\n"
+    )
+    assert disclosure_routing_failures(policy, routed) == []
+    # A chooser that outlived the channel it points at: a public issue is where a
+    # report lands when this is wrong, so both halves fail loudly.
+    stale_channel = disclosure_routing_failures(
+        policy, routed.replace("Litvue/axond/security", "Litvue/old-name/security")
+    )
+    assert len(stale_channel) == 1, stale_channel
+    assert "no contact link to" in stale_channel[0], stale_channel
+    assert len(disclosure_routing_failures(policy, "contact_links: []\n")) == 2
+    unpublished = disclosure_routing_failures("Email us.", routed)
+    assert len(unpublished) == 1, unpublished
+    assert "no private vulnerability reporting URL" in unpublished[0], unpublished
 
     named = release_script_trigger_failures(
         "run: ops/docker-smoke.sh\nrun: python ops/binary-smoke.py x\n",
@@ -967,6 +1174,8 @@ def main(argv: list[str]) -> int:
     failures.extend(check_route_contract())
     failures.extend(check_msrv_documented())
     failures.extend(check_smoke_matrix())
+    failures.extend(check_sdk_matrix())
+    failures.extend(check_disclosure_routing())
     failures.extend(check_release_script_triggers())
     failures.extend(check_review_trigger_tests())
     failures.extend(check_front_door_size())

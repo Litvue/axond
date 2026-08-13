@@ -416,11 +416,18 @@ claim here cannot drift from what CI and the release actually do:
 | Rust floor and published API | `rust-version` in [`Cargo.toml`](../Cargo.toml); [`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml) for accepted breaks | the required `msrv` and `api-compat` lanes |
 
 Adding a target, an SDK, or a supported version means editing the owner file
-above; this document describes the policy and does not restate the values it
-cannot enforce. It does enforce that the three lists agree: `ops/check-docs.py`
-fails if a released target has no `binary-smoke` lane, if a smoked target is not
-published, or if either is missing from this document. So a new target arrives
-with its smoke coverage or not at all.
+above; this document describes the policy and restates a value only where a gate
+holds the restatement to its owner. `ops/check-docs.py` is that gate:
+
+- a released target with no `binary-smoke` lane fails, as does a smoked target
+  that is never published, or either missing from the platform table above — so a
+  new target arrives with its smoke coverage or not at all;
+- every SDK version and runtime in the [client matrix](#clients) must be the one
+  its owner file pins and the lane installs, so a pin bump that stops here is a
+  failing gate rather than a compatibility claim about a release CI no longer
+  exercises;
+- the MSRV section must name the floor `Cargo.toml` declares and the toolchain
+  pinned in `rust-toolchain.toml`.
 
 Every released target is booted and served, not merely compiled. On each change
 and again at the tag, for the exact binary that is archived,
