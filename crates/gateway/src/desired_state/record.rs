@@ -306,8 +306,10 @@ impl<'a, E: BodyError> Record<'a, E> {
     /// extended inside `approved_price` or inside a target must be a typed
     /// compatibility refusal, exactly as one extended at the top level is.
     /// The refusal names the path (`approved_price.effective_from`) so an
-    /// operator can tell which sub-record the field appeared in.
-    pub(super) fn nested(
+    /// operator can tell which sub-record the field appeared in, which is what
+    /// separates this from [`nested`](Self::nested): the same strictness,
+    /// reported against the path rather than against the bare key.
+    pub(super) fn sub_record(
         &self,
         value: &'a CanonicalValue,
         field: &'static str,

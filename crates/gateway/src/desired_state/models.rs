@@ -976,7 +976,7 @@ fn lifecycle(record: &ModelRecord<'_>) -> Result<ModelLifecycle, ModelError> {
 /// A required value of a nested record, named by its `path` — `approved_price.price_id`
 /// rather than `approved_price` — so an absence names the value that is absent.
 ///
-/// The sub-record itself is opened by [`Record::nested`], which holds it to its
+/// The sub-record itself is opened by [`Record::sub_record`], which holds it to its
 /// own field list, so a key a newer release added inside it is an unknown field
 /// rather than a value this build drops.
 fn nested<'a>(
@@ -1270,7 +1270,7 @@ impl ModelEnablementBody {
         let observed = match record.optional_value(OBSERVED_PRICE_FIELD) {
             None => None,
             Some(value) => {
-                let sub = record.nested(
+                let sub = record.sub_record(
                     value,
                     OBSERVED_PRICE_FIELD,
                     MODEL_ENABLEMENT_SCHEMA,
@@ -1287,7 +1287,7 @@ impl ModelEnablementBody {
         let approved = match record.optional_value(APPROVED_PRICE_FIELD) {
             None => None,
             Some(value) => {
-                let sub = record.nested(
+                let sub = record.sub_record(
                     value,
                     APPROVED_PRICE_FIELD,
                     MODEL_ENABLEMENT_SCHEMA,
@@ -1589,7 +1589,7 @@ impl ModelAliasBody {
         let targets = targets
             .iter()
             .map(|target| {
-                let sub = record.nested(
+                let sub = record.sub_record(
                     target,
                     TARGETS_FIELD,
                     MODEL_ALIAS_SCHEMA,
