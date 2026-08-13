@@ -4083,6 +4083,54 @@ mod tests {
         );
     }
 
+    /// Applying the wall twice is not a broken database.
+    ///
+    /// An operator upgrading a running deployment may apply 0002 by hand — the
+    /// migrating role has to own these tables for `FORCE ROW LEVEL SECURITY`, and
+    /// a deployment whose DDL role is not its application role runs it out of
+    /// band — so a second application has to be a no-op rather than a collision
+    /// on a constraint or a policy name that leaves the schema half-walled.
+    #[tokio::test]
+    async fn the_tenancy_migration_is_idempotent_when_an_operator_reapplies_it() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let tenancy = schema::MIGRATIONS
+            .iter()
+            .find(|migration| migration.name.contains("tenancy"))
+            .expect("the tenancy migration ships");
+
+        store
+            .attempt(tenancy.sql)
+            .await
+            .expect("re-applying the tenancy migration must not fail");
+
+        // Applied twice, the wall is still forced rather than merely enabled: a
+        // policy the owning role bypasses is the failure this asserts against.
+        assert_eq!(
+            store
+                .column(
+                    "SELECT relname::text FROM pg_class \
+                     WHERE relnamespace = current_schema()::regnamespace \
+                     AND relrowsecurity AND NOT relforcerowsecurity \
+                     ORDER BY relname"
+                )
+                .await,
+            Vec::<String>::new(),
+            "a table left enabled but unforced by the second application"
+        );
+        // And publishing still works, so the second application did not leave a
+        // constraint the projection now violates.
+        store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "after a re-apply",
+                state_with_directory(),
+            ))
+            .await
+            .expect("a revision publishes against a twice-migrated schema");
+    }
+
     /// Row-level security, against a role that cannot bypass it: the wall behind
     /// the service layer, tested the only way it can be — as a session that is
     /// pinned to one tenant and still asks for everything.
