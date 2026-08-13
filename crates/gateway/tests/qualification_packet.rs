@@ -223,9 +223,8 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
         });
         let (manifest, manifest_sha256) = packet::load_slice_manifest(slice_manifest);
         let profiles: BTreeSet<String> = manifest
-            .profiles
-            .iter()
-            .map(|profile| profile.id.clone())
+            .workloads()
+            .map(|workload| workload.id.clone())
             .collect();
 
         for relative in &slice.retained {
@@ -410,20 +409,28 @@ fn the_packet_and_its_prose_agree() {
 
     for slice in &packet.slices {
         let id = slice.id.as_str();
+        // The slice's own row, not the page as a whole: every rung word appears
+        // in the ladder table below the rows, so a page-wide search for the
+        // status word is satisfied by the ladder no matter what the row says.
+        let row = contract
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{id}` |")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} has no row for the {id} slice",
+                    packet::CONTRACT_RELATIVE
+                )
+            });
         assert!(
-            contract.contains(id),
-            "{} never mentions the {id} slice",
-            packet::CONTRACT_RELATIVE
-        );
-        assert!(
-            contract.contains(&format!("#{}", slice.issue)),
-            "{} never cites #{}, the issue that owns {id}",
+            row.contains(&format!("#{}", slice.issue)),
+            "{}: the {id} row does not cite #{}, the issue that owns it",
             packet::CONTRACT_RELATIVE,
             slice.issue
         );
         assert!(
-            contract.contains(slice.status.as_str()),
-            "{} never states that {id} is {}",
+            row.contains(&format!("`{}`", slice.status.as_str())),
+            "{}: the {id} row does not state that it is {} \u{2014} the page and the \
+             packet disagree about how far it got",
             packet::CONTRACT_RELATIVE,
             slice.status.as_str()
         );
