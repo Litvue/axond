@@ -212,6 +212,17 @@ pins are behind, and which enabled offerings the upstream has stopped
 publishing. Acting on either is an administrative mutation, so an operator does
 it.
 
+Reading an enablement back against a catalogue goes through `PinnedCatalog`
+([ADR 0054](../adr/0054-resolving-pinned-catalogue-offerings.md)), the one place
+that maps a pinned `OfferingId` onto the `CallableId` a request would send. It
+answers about the snapshot it was built over and nothing else: a pin naming a
+different payload digest is `OtherSnapshot` rather than resolved through the
+active catalogue, and a provider publishing one model under several callable ids
+is `Ambiguous` rather than guessed, because choosing between them is an
+enablement decision. It is a projection — no store, no client, no request-path
+I/O — and its withdrawal answer is tested to agree with `RefreshImpact`, so the
+operator report and the resolver derive identity once.
+
 ## The desired-state domain the control plane stores
 
 `ControlPlaneStore` is expressed in `crates/gateway/src/desired_state/`, which
