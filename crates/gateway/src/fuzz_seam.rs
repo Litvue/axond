@@ -38,6 +38,7 @@ mod error;
 mod key_material;
 mod mint;
 mod ops;
+mod policy;
 mod principals;
 mod rate_limit;
 mod redis_support;
