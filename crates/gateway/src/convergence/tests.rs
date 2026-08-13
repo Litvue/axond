@@ -1770,18 +1770,19 @@ async fn a_discovery_outage_ages_a_verdict_without_touching_convergence() {
     .await;
     let (replica, evidence) = Replica::deriving(&store);
     let key = availability_key();
-    let looked_at = SystemTime::now();
-    evidence.observe(
-        DiscoveryObservation::new(
-            key.scope,
-            key.target.clone(),
-            DiscoveryResult::Present,
-            DiscoveryCompleteness::Complete,
-            DiscoverySource::ProviderListing,
-            looked_at,
-        )
-        .expiring_at(looked_at + Duration::from_secs(60)),
-    );
+    let look = DiscoveryObservation::new(
+        key.scope,
+        key.target.clone(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        SystemTime::now(),
+    )
+    .expiring_at(SystemTime::now() + Duration::from_secs(60));
+    // A look carries its instant at the resolution storage keeps, so the verdict
+    // is read against what the look holds rather than against the clock.
+    let looked_at = look.observed_at;
+    evidence.observe(look);
     replica
         .reconciler
         .converge_once(telemetry::CONVERGENCE_POLLED)

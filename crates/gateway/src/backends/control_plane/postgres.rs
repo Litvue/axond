@@ -5816,6 +5816,53 @@ mod tests {
         );
     }
 
+    /// A look taken at an arbitrary instant is the same look after storage.
+    ///
+    /// A look's instant is its identity — replay detection compares it, and the
+    /// definitive watermark is ordered by it — so an instant the column rounds
+    /// would make a restored look a different one: the reload would count as
+    /// evidence arriving out of order, and a restored positive could compare
+    /// older than the watermark its own conclusion set and be discarded.
+    #[tokio::test]
+    async fn a_looks_instant_survives_the_column_it_is_stored_in() {
+        let Some((store, _dsn, _schema)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(ExpectedRevision::Empty, "state", state()))
+            .await
+            .expect("a tenant exists to own evidence");
+
+        let scope = ScopeRef::tenant(tenant_id(1));
+        let key = AvailabilityKey::new(scope, observation_target());
+        // Nanoseconds the column cannot keep, as `SystemTime::now()` supplies.
+        let taken = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        let observation = look(
+            scope,
+            DiscoveryResult::Present,
+            DiscoveryCompleteness::Complete,
+            taken,
+        )
+        .expiring_at(taken + Duration::from_secs(600));
+        store
+            .save(&[StoredObservation {
+                key,
+                slot: ObservationSlot::Current,
+                observation: observation.clone(),
+                definitive_at: Some(observation.observed_at),
+            }])
+            .await
+            .expect("evidence is written");
+
+        let read = store.load(None).await.expect("evidence is read back");
+        assert_eq!(read.len(), 1);
+        assert!(
+            read[0].observation.is_same_look(&observation),
+            "a stored look is the look that was stored"
+        );
+        assert_eq!(read[0].definitive_at, Some(observation.observed_at));
+    }
+
     /// A record is replaced whole, so a retained look a later conclusion
     /// discredited does not sit in storage waiting for the next restart.
     #[tokio::test]
