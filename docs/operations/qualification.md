@@ -59,8 +59,8 @@ quietly describing a workload that no longer exists.
 
 | Record | Tier | Runner | Commit |
 | --- | --- | --- | --- |
-| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `cc01944` |
-| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `cc01944` |
+| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `9fde41b` |
+| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `9fde41b` |
 
 Both were produced on an 8 vCPU cloud VM from a **debug build**, which is what
 `cargo test` builds. They are the first envelope, not a fleet baseline: a release
