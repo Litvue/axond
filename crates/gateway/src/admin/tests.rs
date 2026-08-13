@@ -17,7 +17,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, State};
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::routing::{get, post};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -29,7 +29,7 @@ use super::auth::{
 };
 use super::diff::SemanticDiff;
 use super::error::AdminError;
-use super::fakes::{CountingStore, FakeAdminAuthenticator, FakeAdminAuthorizer};
+use super::fakes::{CountingStore, FakeAdminAuthenticator, FakeAdminAuthorizer, FlakyStore};
 use super::protocol::{
     ADMIN_PREFIX, AuditSummary, DRY_RUN_HEADER, EXPECTED_REVISION_HEADER, IDEMPOTENCY_KEY_HEADER,
     MutationPreconditions, MutationRequest, WriteMode,
@@ -751,6 +751,44 @@ async fn history_is_a_bounded_parent_walk_with_a_cursor() {
 }
 
 #[tokio::test]
+async fn a_control_plane_outage_mid_walk_is_reported_rather_than_served_as_a_short_page() {
+    let oracle = Arc::new(InMemoryControlPlane::new());
+    let service = service(&oracle);
+    let first = publish_fixture(&service, "key-0").await;
+    service
+        .apply(
+            &grant(AdminAction::Publish),
+            &request(
+                "key-1",
+                ExpectedRevision::Exactly(crate::desired_state::RevisionId::parse(&first).unwrap()),
+                WriteMode::Apply,
+            ),
+            &replace_with(fixtures::state_with_renamed_alias()),
+        )
+        .await
+        .expect("a second publication");
+
+    // The head loads, its parent does not: a truncated page here would report a
+    // one-entry history that looks complete, and hide the outage.
+    let flaky = AdminService::stateful(Arc::new(FlakyStore::failing_manifests_after(
+        oracle.clone(),
+        1,
+    )));
+    let error = flaky
+        .history(
+            &grant(AdminAction::ReadHistory),
+            HistoryRequest {
+                limit: HistoryLimit::parse(HistoryLimit::MAX).unwrap(),
+                start: None,
+            },
+        )
+        .await
+        .expect_err("an outage is not the end of the history");
+    assert_eq!(error.code(), "control_plane_unavailable");
+    assert!(error.retryable());
+}
+
+#[tokio::test]
 async fn an_audit_page_is_capped_and_says_when_it_truncated() {
     use crate::desired_state::{AuditEvent, AuditEventId, MutationId};
     use std::time::SystemTime;
@@ -1344,6 +1382,46 @@ async fn an_unknown_admin_path_answers_in_the_admin_envelope() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["type"], "admin_route_not_found");
+}
+
+#[tokio::test]
+async fn a_known_admin_path_reached_with_the_wrong_method_answers_in_the_admin_envelope() {
+    let store = Arc::new(InMemoryControlPlane::new());
+    let (status, body) = send(
+        api(Some(store.clone())),
+        // A read route reached with a write method: the method fallback answers,
+        // and it answers before authentication, so no credential is needed.
+        Request::post(format!("{ADMIN_PREFIX}/state"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["error"]["type"], "admin_method_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(store.published_revisions(), 0);
+}
+
+#[tokio::test]
+async fn a_precondition_header_that_is_not_readable_text_is_invalid_rather_than_absent() {
+    // Bytes outside visible ASCII are a legal header value and an illegal
+    // precondition. The dry-run case is the dangerous one: read as "absent", a
+    // rehearsal would publish.
+    let unreadable = HeaderValue::from_bytes(b"\xff\xfe").expect("a legal header value");
+    let cases = [
+        (IDEMPOTENCY_KEY_HEADER, "idempotency_key_invalid"),
+        (EXPECTED_REVISION_HEADER, "expected_revision_invalid"),
+        (DRY_RUN_HEADER, "dry_run_invalid"),
+    ];
+    for (header, expected) in cases {
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY_HEADER, "key-1".parse().unwrap());
+        headers.insert(EXPECTED_REVISION_HEADER, "empty".parse().unwrap());
+        headers.insert(header, unreadable.clone());
+        let error = MutationPreconditions::from_headers(&headers)
+            .expect_err("an unreadable precondition is refused");
+        assert_eq!(error.code(), expected, "{header}");
+    }
 }
 
 #[test]

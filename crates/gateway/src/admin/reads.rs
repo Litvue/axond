@@ -112,8 +112,16 @@ impl RevisionRecord {
 pub struct RevisionPage {
     pub revisions: Vec<RevisionRecord>,
     pub limit: u32,
-    /// The revision to pass as `start` for the next page. `None` when the walk
-    /// reached the first revision, or the parent it named is no longer retained.
+    /// The revision to pass as `start` for the next page, and `None` when the
+    /// walk reached a revision with no parent or one the store no longer retains.
+    ///
+    /// A cursor is emitted without being loaded, so a page boundary that happens
+    /// to fall on the retention edge names a revision that may be pruned before
+    /// the caller asks for it. Following it then answers `revision_not_found`
+    /// rather than an empty page: a start the caller named is checked, whether it
+    /// came from a cursor or from an operator's hand, because "the revision you
+    /// asked to resume from is gone" and "there is nothing more" are different
+    /// facts about a paginated history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_start: Option<String>,
 }

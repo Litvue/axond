@@ -24,7 +24,8 @@ use axum::http::HeaderMap;
 
 use super::error::AdminError;
 use crate::desired_state::{
-    ExpectedRevision, IdempotencyKey, MutationKind, ResourceScope, RevisionId,
+    ExpectedRevision, IdempotencyKey, InvalidIdempotencyKey, MutationKind, ResourceScope,
+    RevisionId,
 };
 
 /// The route prefix the administrative surface is mounted under. Disjoint from
@@ -111,30 +112,57 @@ impl MutationPreconditions {
     /// at all, and telling it about concurrency first would send it to the wrong
     /// fix.
     pub fn from_headers(headers: &HeaderMap) -> Result<Self, AdminError> {
-        let idempotency_key = headers
-            .get(IDEMPOTENCY_KEY_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(AdminError::IdempotencyKeyRequired)?;
-        let idempotency_key =
-            IdempotencyKey::parse(idempotency_key).map_err(AdminError::IdempotencyKeyInvalid)?;
-        let expected = headers
-            .get(EXPECTED_REVISION_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(AdminError::ExpectedRevisionRequired)?;
-        let expected = parse_expected_revision(expected)?;
-        let mode = match headers
-            .get(DRY_RUN_HEADER)
-            .and_then(|value| value.to_str().ok())
-        {
-            None | Some("false") => WriteMode::Apply,
-            Some("true") => WriteMode::DryRun,
-            Some(_) => return Err(AdminError::DryRunInvalid),
+        let idempotency_key = match text(headers, IDEMPOTENCY_KEY_HEADER) {
+            Header::Absent => return Err(AdminError::IdempotencyKeyRequired),
+            // Unreadable is invalid, not absent: the caller sent a key, and it is
+            // not one. `Unprintable` is the same refusal the domain gives a key
+            // whose characters are visible but not printable, and for the same
+            // reason — this token becomes a durable map key and a log field.
+            Header::Unreadable => {
+                return Err(AdminError::IdempotencyKeyInvalid(
+                    InvalidIdempotencyKey::Unprintable,
+                ));
+            }
+            Header::Text(value) => {
+                IdempotencyKey::parse(value).map_err(AdminError::IdempotencyKeyInvalid)?
+            }
+        };
+        let expected = match text(headers, EXPECTED_REVISION_HEADER) {
+            Header::Absent => return Err(AdminError::ExpectedRevisionRequired),
+            Header::Unreadable => return Err(AdminError::ExpectedRevisionInvalid),
+            Header::Text(value) => parse_expected_revision(value)?,
+        };
+        // Unreadable is refused rather than read as `false`: a caller that asked
+        // for a rehearsal must never be published for real because its header did
+        // not survive the wire.
+        let mode = match text(headers, DRY_RUN_HEADER) {
+            Header::Absent | Header::Text("false") => WriteMode::Apply,
+            Header::Text("true") => WriteMode::DryRun,
+            Header::Unreadable | Header::Text(_) => return Err(AdminError::DryRunInvalid),
         };
         Ok(Self {
             expected,
             idempotency_key,
             mode,
         })
+    }
+}
+
+/// What a header slot holds, keeping "absent" and "present but not text" apart.
+///
+/// The distinction is the difference between a client that forgot a precondition
+/// and one whose precondition did not survive the wire, and — for the dry-run
+/// header — between refusing a mutation and publishing it.
+enum Header<'a> {
+    Absent,
+    Unreadable,
+    Text(&'a str),
+}
+
+fn text<'a>(headers: &'a HeaderMap, name: &str) -> Header<'a> {
+    match headers.get(name) {
+        None => Header::Absent,
+        Some(value) => value.to_str().map_or(Header::Unreadable, Header::Text),
     }
 }
 

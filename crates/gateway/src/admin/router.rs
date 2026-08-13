@@ -133,6 +133,13 @@ pub(crate) fn mount(api: Arc<AdminApi>, specs: Vec<AdminRouteSpec>) -> Router {
             router.route(spec.path, route)
         })
         .fallback(unknown_route)
+        // Both fallbacks, because both are part of the declared vocabulary: a
+        // client branching on `AdminError::CODES` must never meet axum's empty
+        // body. The method fallback runs outside the authentication layer, which
+        // is attached per route — a wrong method on an administrative path is a
+        // protocol mistake, and answering it does not need an identity or reveal
+        // whether one would have been accepted.
+        .method_not_allowed_fallback(wrong_method)
         .with_state(api);
     Router::new().nest(ADMIN_PREFIX, inner)
 }
@@ -147,6 +154,11 @@ pub fn router(api: Arc<AdminApi>) -> Router {
 /// body.
 async fn unknown_route() -> AdminError {
     AdminError::RouteNotFound
+}
+
+/// A known `/admin/v1` path reached with a method it does not serve.
+async fn wrong_method() -> AdminError {
+    AdminError::MethodNotAllowed
 }
 
 /// Authenticate once per administrative request, and parse the preconditions a

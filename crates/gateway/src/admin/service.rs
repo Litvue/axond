@@ -220,10 +220,13 @@ impl AdminService {
             }
             let manifest = match store.load_manifest(id).await {
                 Ok(manifest) => manifest,
-                // The head or the caller's cursor must exist; an ancestor that no
-                // longer does is retention, and ends the page.
-                Err(error) if revisions.is_empty() => return Err(log_store(error)),
-                Err(_) => break,
+                // Retention, and only retention, ends the page: an ancestor the
+                // store no longer keeps is expected, while an outage or unreadable
+                // storage is an operator alert and must not be served as a short
+                // page that looks complete. The head or the caller's cursor is
+                // never allowed to be missing either — the caller named it.
+                Err(ControlPlaneError::RevisionNotFound(_)) if !revisions.is_empty() => break,
+                Err(error) => return Err(log_store(error)),
             };
             next = manifest.parent;
             revisions.push(RevisionRecord::of(&manifest));

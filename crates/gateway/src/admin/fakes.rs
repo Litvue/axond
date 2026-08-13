@@ -156,6 +156,72 @@ impl AdminAuthorizer for FakeAdminAuthorizer {
     }
 }
 
+/// The in-memory oracle, with manifest reads that start failing part-way
+/// through a walk.
+///
+/// The history walk is the one read that makes several store calls to answer one
+/// request, so it is the one place where a mid-read failure could be mistaken for
+/// the end of the data. Failing the *n*-th manifest load is how that is provoked.
+pub(crate) struct FlakyStore {
+    inner: Arc<InMemoryControlPlane>,
+    manifest_loads: AtomicUsize,
+    fail_manifest_after: usize,
+}
+
+impl FlakyStore {
+    pub(crate) fn failing_manifests_after(inner: Arc<InMemoryControlPlane>, loads: usize) -> Self {
+        Self {
+            inner,
+            manifest_loads: AtomicUsize::new(0),
+            fail_manifest_after: loads,
+        }
+    }
+}
+
+#[async_trait]
+impl ControlPlaneStore for FlakyStore {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn health(&self) -> Result<(), ControlPlaneError> {
+        self.inner.health().await
+    }
+
+    async fn desired_revision(&self) -> Result<Option<RevisionId>, ControlPlaneError> {
+        self.inner.desired_revision().await
+    }
+
+    async fn load_manifest(&self, id: RevisionId) -> Result<RevisionManifest, ControlPlaneError> {
+        if self.manifest_loads.fetch_add(1, Ordering::Relaxed) >= self.fail_manifest_after {
+            return Err(ControlPlaneError::Unavailable {
+                backend: self.inner.name(),
+                message: "fake control plane went away mid-walk".to_owned(),
+            });
+        }
+        self.inner.load_manifest(id).await
+    }
+
+    async fn load_revision(&self, id: RevisionId) -> Result<LoadedRevision, ControlPlaneError> {
+        self.inner.load_revision(id).await
+    }
+
+    async fn publish_revision(
+        &self,
+        candidate: RevisionCandidate,
+    ) -> Result<RevisionManifest, ControlPlaneError> {
+        self.inner.publish_revision(candidate).await
+    }
+
+    async fn audit_trail(&self, id: RevisionId) -> Result<Vec<AuditEvent>, ControlPlaneError> {
+        self.inner.audit_trail(id).await
+    }
+}
+
 /// The in-memory oracle, plus a count of how many times it was consulted.
 pub(crate) struct CountingStore {
     inner: Arc<InMemoryControlPlane>,
