@@ -35,7 +35,7 @@ use crate::availability::{
 };
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::desired_state::oracle::InMemoryControlPlane;
-use crate::desired_state::{ResourceScope, fixtures};
+use crate::desired_state::{DenialPage, ResourceScope, fixtures};
 
 const TOKEN: &str = "human-admin-token";
 const ISSUER: &str = "https://idp.example";
@@ -1703,6 +1703,33 @@ async fn an_availability_read_must_name_the_tenant_it_asks_about() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["type"], "admin_request_invalid");
+
+    // And the same answer for a caller who could never have asked deployment-wide:
+    // the request shape is refused before any authority is consulted, so a tenant
+    // administrator's typo is not answered with a forbidden — nor recorded as one
+    // in the denial trail.
+    let (index, mine, _) = two_tenant_index();
+    let scoped = Deployment::deriving(
+        FakeAdminAuthorizer::permissive().within(&[ResourceScope::Tenant(mine.tenant)]),
+        index,
+        RuntimeObservations::none(),
+    );
+
+    let (status, body) = scoped.get("/availability").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "admin_request_invalid");
+    let denials = ControlPlaneStore::denials(
+        scoped.store.as_ref(),
+        &DenialPage::for_scope(Some(mine.tenant)),
+        10,
+    )
+    .await
+    .expect("the denial trail");
+    assert!(
+        denials.is_empty(),
+        "a malformed query is not an access denial: {denials:?}"
+    );
 }
 
 /// A project's enablements are *overrides* of its tenant's, so a project that

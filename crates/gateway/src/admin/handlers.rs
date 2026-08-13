@@ -332,6 +332,18 @@ async fn availability(
         schema: "availability",
         detail: rejection.body_text(),
     })?;
+    // Refused before any authority is consulted: an availability read is always
+    // about a tenant, so a query that names none is a malformed request rather
+    // than an attempt on the deployment. Authorizing it first would answer a
+    // tenant-scoped caller's typo with a forbidden — and write it to the denial
+    // trail an investigator later has to rule out. The service's own check stays
+    // where it is, as the defence in depth it already was.
+    if query.tenant.is_none() && query.project.is_none() {
+        return Err(AdminError::RequestInvalid {
+            schema: "availability",
+            detail: "`tenant`: an availability read must name the tenant it asks about".to_owned(),
+        });
+    }
     let scope = scope_of(
         "availability",
         query.tenant.as_deref(),
