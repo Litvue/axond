@@ -193,22 +193,31 @@ impl PostgresSecrets {
     /// `create_table = false` is [`SecretError::Denied`], because a store that
     /// carried on would fail every candidate revision at compile time with an
     /// error that pointed at the wrong thing.
+    ///
+    /// Neither step is blanket-`Unavailable` like the statements below are: the
+    /// two failures an operator actually hits here — no privilege to create the
+    /// table, and no table to read — are permanent, and telling on-call to wait
+    /// for a database that is answering fine would send them the wrong way.
     async fn prepare_schema(&self, client: &Client) -> Result<(), SecretError> {
         if self.settings.create_table {
-            client
-                .batch_execute(SCHEMA_DDL)
-                .await
-                .map_err(|error| unavailable("apply secret-store schema", &error))?;
+            client.batch_execute(SCHEMA_DDL).await.map_err(|error| {
+                boot_failure("apply secret-store schema", &error, || {
+                    "Grant the connecting role `CREATE` on the schema and ownership of \
+                     `axond_secret`, or apply `ops/postgres/secret_store_v1.sql` yourself and set \
+                     `create_table = false` under `[secret_store]`."
+                        .to_owned()
+                })
+            })?;
         }
         client
             .query_one("SELECT count(*) FROM axond_secret WHERE false", &[])
             .await
             .map_err(|error| {
-                denied(format!(
-                    "the secret store's `axond_secret` table is not readable ({error}). Apply \
-                     `ops/postgres/secret_store_v1.sql`, or set `create_table = true` under \
+                boot_failure("read the secret store's `axond_secret` table", &error, || {
+                    "Apply `ops/postgres/secret_store_v1.sql`, or set `create_table = true` under \
                      `[secret_store]` to let boot apply it."
-                ))
+                        .to_owned()
+                })
             })?;
         Ok(())
     }
@@ -472,6 +481,9 @@ impl SecretStore for PostgresSecrets {
                 // administrators rotating one secret serialize on it instead of
                 // both computing the same next version.
                 let current = Self::locked_descriptor(&transaction, owner, &reference).await?;
+                // Only a tombstone refuses: rotating from a revoked version is
+                // how withdrawn material is replaced, and it mints a successor
+                // rather than returning the revoked version to service.
                 if current.lifecycle.is_terminal() {
                     return Err(SecretError::Lifecycle {
                         reference,
@@ -650,6 +662,29 @@ fn unavailable_message(message: impl Into<String>) -> SecretError {
     SecretError::Unavailable {
         backend: BACKEND,
         message: message.into(),
+    }
+}
+
+/// A boot-time failure while doing `operation`, split by who has to act.
+///
+/// A `SQLSTATE` means the server understood the statement and refused it: a
+/// missing table, a missing grant, a read-only transaction. Those are
+/// [`SecretError::Denied`] and carry `remedy`, because retrying them forever
+/// changes nothing. An error without one never reached a server — a dropped
+/// connection, a TLS failure — so it is [`SecretError::Unavailable`] and the
+/// operator's answer is to wait.
+fn boot_failure(
+    operation: &str,
+    error: &tokio_postgres::Error,
+    remedy: impl FnOnce() -> String,
+) -> SecretError {
+    match error.code() {
+        Some(code) => denied(format!(
+            "could not {operation} ({}: {error}). {}",
+            code.code(),
+            remedy()
+        )),
+        None => unavailable(operation, error),
     }
 }
 
@@ -1086,6 +1121,83 @@ mod tests {
                 .rotate(owner(), &staged, SecretMaterial::new(String::new()))
                 .await,
             Err(SecretError::Invalid(_))
+        ));
+
+        drop_schema(&schema).await;
+    }
+
+    /// A database that refuses to create the table has answered, so the answer is
+    /// a refusal with the grant to fix — not an outage the replica should retry
+    /// until somebody notices the message names the wrong problem.
+    #[tokio::test]
+    async fn a_schema_the_table_cannot_be_created_in_is_refused_not_an_outage() {
+        let Some(dsn) = postgres_dsn() else {
+            return;
+        };
+        // A search path naming no existing schema: `CREATE TABLE` has nowhere to
+        // go and Postgres says so with a `SQLSTATE`, which is the same shape as
+        // the privilege failure an operator actually hits.
+        let error = PostgresSecrets::connect(
+            &dsn,
+            SecretStoreSettings {
+                schema: Some(format!(
+                    "axond_absent_{}",
+                    Uuid7Generator::new().next().to_string().replace('-', "")
+                )),
+                create_table: true,
+                ..SecretStoreSettings::default()
+            },
+            kek(19),
+        )
+        .await
+        .expect_err("the table cannot be created there");
+
+        assert_eq!(error.category(), FailureCategory::Denied);
+        let message = error.to_string();
+        assert!(message.contains("create_table"), "{message}");
+    }
+
+    /// Rotation from a revoked base is permitted, and deliberately: it mints a
+    /// fresh version rather than returning the revoked one to service, which is
+    /// how an operator replaces material they have just withdrawn. The revoked
+    /// version stays revoked and stays unresolvable.
+    #[tokio::test]
+    async fn rotating_from_a_revoked_version_mints_a_successor_and_leaves_it_revoked() {
+        let Some((store, schema)) = store(23).await else {
+            return;
+        };
+        let staged = store
+            .stage(owner(), SecretMaterial::new(PLAINTEXT.to_owned()))
+            .await
+            .expect("a staged version");
+        store
+            .transition(owner(), &staged.reference, SecretLifecycle::Revoked)
+            .await
+            .expect("a withdrawal");
+
+        let rotated = store
+            .rotate(
+                owner(),
+                &staged.reference,
+                SecretMaterial::new("sk-replacement".to_owned()),
+            )
+            .await
+            .expect("a replacement for withdrawn material");
+
+        assert_eq!(rotated.reference, staged.reference.rotated());
+        assert_eq!(rotated.lifecycle, SecretLifecycle::Staged);
+        assert_eq!(
+            store
+                .describe(owner(), &staged.reference)
+                .await
+                .expect("the base version")
+                .lifecycle,
+            SecretLifecycle::Revoked,
+            "the withdrawn version does not come back"
+        );
+        assert!(matches!(
+            store.resolve(owner(), &staged.reference).await,
+            Err(SecretError::Lifecycle { .. })
         ));
 
         drop_schema(&schema).await;

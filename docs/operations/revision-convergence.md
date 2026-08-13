@@ -394,8 +394,12 @@ The refusal reason is the triage key.
   the secret store while the candidate was compiled: the version is withdrawn
   (`disabled`, `revoked`, or `tombstoned`), belongs to another owner, was never
   staged, is sealed under a KEK this deployment no longer has, or the store is
-  down. Material a serving snapshot already holds is unaffected — the replica keeps
-  serving it, because a candidate is compiled in full before anything is published
+  down. A credential whose own body records the withdrawal is *skipped* rather
+  than resolved, so the revision that withdraws material still compiles; the
+  rejection above is the disagreement — a body that says `active` over a store row
+  that says otherwise. Material a serving snapshot already holds is unaffected —
+  the replica keeps serving it, because a candidate is compiled in full before
+  anything is published
   ([ADR 0039](../adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
   A *booting* replica is stricter than a serving one here, and deliberately: an
   unreachable control plane falls back to the last-known-good cache, but an

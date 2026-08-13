@@ -152,7 +152,7 @@ impl Reloader {
         let _entered = span.enter();
         let current = self.state.config();
 
-        match self.candidate(env, current.generation + 1) {
+        match self.candidate(env, &current, current.generation + 1) {
             Ok(candidate) => {
                 let summary = ReloadSummary::between(&self.boot, &current, &candidate);
                 let generation = candidate.generation;
@@ -187,9 +187,18 @@ impl Reloader {
 
     /// Build the candidate snapshot. Nothing here touches the running state, so
     /// a failure at any step is a no-op for the serving config.
+    ///
+    /// The candidate inherits `current`'s resolved secret material rather than
+    /// starting empty: a file reload is not a convergence step and has no
+    /// resolver to unwrap anything with, so publishing an empty set would drop
+    /// the material the reconciler resolved — and zeroize it as the old snapshot
+    /// went — leaving the replica serving without credentials it holds. Editing
+    /// the file cannot change which versions a revision pins; only a new revision
+    /// can, and that path resolves them.
     fn candidate(
         &self,
         env: &HashMap<String, String>,
+        current: &ConfigSnapshot,
         generation: u64,
     ) -> Result<ConfigSnapshot, ReloadError> {
         let config = Config::load(&self.path)?;
@@ -201,7 +210,12 @@ impl Reloader {
                 config.mode.as_str()
             ))));
         }
-        Ok(ConfigSnapshot::build(config, env, generation)?)
+        Ok(ConfigSnapshot::build_with(
+            config,
+            env,
+            generation,
+            current.secrets().clone(),
+        )?)
     }
 
     fn watch_settings(&self) -> Reload {
@@ -971,6 +985,54 @@ scope = ["chat", "models"]
         );
         let aliases = listed_aliases(&state).await;
         assert!(aliases.contains(&"acme-fast".to_string()));
+    }
+
+    /// A file reload republishes the snapshot, and the durable material the
+    /// reconciler unwrapped has to survive that: a reload has no resolver, so
+    /// publishing an empty set would drop every resolved version — zeroizing it
+    /// as the old snapshot went — and leave the replica serving credentials it
+    /// can no longer open.
+    #[tokio::test]
+    async fn a_reload_carries_the_resolved_material_the_running_snapshot_holds() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let materialization = crate::convergence::secrets::testing::permissive();
+        let resolved = materialization
+            .resolve(&crate::desired_state::fixtures::state())
+            .await
+            .expect("the fixture's material resolves");
+        let held = resolved.references();
+        assert!(!held.is_empty(), "the fixture pins material");
+
+        // A replica that converged once: the reconciler's snapshot, owning the
+        // versions its compilation resolved.
+        let state = state_from(&file);
+        state.publish(
+            ConfigSnapshot::build_with(
+                Config::load(file.path()).expect("valid boot config"),
+                &inbound_env(),
+                0,
+                resolved,
+            )
+            .expect("a servable snapshot"),
+        );
+        let reloader = Reloader::new(file.path(), state.clone());
+
+        file.rewrite(&format!("{PLATFORM_ONLY}\n[reload]\nwatch = false\n"));
+        reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("candidate is valid");
+
+        assert_eq!(state.config().generation, 1, "the edit was applied");
+        assert_eq!(
+            state.config().secrets().references(),
+            held,
+            "the reloaded snapshot holds the same versions"
+        );
+        assert_eq!(
+            materialization.ledger().retained(),
+            held,
+            "and nothing was released, so nothing was zeroized"
+        );
     }
 
     /// The mode picks which authority owns durable resources, which a serving

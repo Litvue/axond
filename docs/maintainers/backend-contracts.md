@@ -148,7 +148,10 @@ Three properties of it are enforced by types rather than by review
   returns a permitted move, an idempotent `Unchanged`, or `ForbiddenTransition`
   for every ordered pair of `staged`/`active`/`disabled`/`revoked`/`tombstoned`.
   Only `staged` and `active` resolve; `revoked` never returns to service; a
-  tombstone destroys the bytes.
+  tombstone destroys the bytes. A revoked version can still be *rotated from* —
+  that mints a fresh `staged` successor, which is how withdrawn material is
+  replaced, and leaves the revoked version revoked and unresolvable. Only a
+  tombstone refuses rotation.
 
 The trait is split so that resolving cannot mint: `SecretResolver` has `resolve`
 and `exists`, and `SecretStore: SecretResolver` adds `stage`, `rotate`,
