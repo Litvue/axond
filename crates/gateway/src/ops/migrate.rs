@@ -503,6 +503,36 @@ mod tests {
         dsn: String,
     }
 
+    /// Cluster-wide state a test made, undone however the test ends.
+    ///
+    /// A role and a schema outlive the test that created them, and a failing
+    /// assertion panics past any cleanup written at the end of the body, so
+    /// repeated failures accumulate roles holding grants on dropped schemas.
+    /// Dropping runs the undo statement on a thread of its own: this runs inside
+    /// a Tokio worker, which cannot block on a runtime, and there is no async
+    /// `Drop` to hand the work to instead.
+    struct Cleanup {
+        dsn: String,
+        sql: String,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let (dsn, sql) = (self.dsn.clone(), self.sql.clone());
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime to clean up on")
+                    .block_on(async move {
+                        let _ = client(&dsn).await.batch_execute(&sql).await;
+                    });
+            })
+            .join()
+            .expect("clean up what the test created");
+        }
+    }
+
     impl Fixture {
         /// A connection of the test's own, so what the commands did is observed
         /// from outside them.
@@ -909,6 +939,17 @@ mod tests {
             // Not a superuser: this database cannot host the case.
             return;
         }
+        // A role is cluster-wide, unlike the schema this fixture owns, so it goes
+        // however this test ends — including through a failing assertion.
+        let _role_cleanup = Cleanup {
+            dsn: fixture.dsn.clone(),
+            sql: format!(
+                "REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM {role};
+                 REVOKE ALL ON SCHEMA {} FROM {role};
+                 DROP ROLE {role}",
+                fixture.schema, fixture.schema
+            ),
+        };
         // The premise, asserted rather than assumed: this role cannot read the
         // adopted tables at all. A relation probe still answers for it, because it
         // asks `pg_class` — which no grant governs — whether the object exists.
@@ -1005,18 +1046,6 @@ mod tests {
             fixture.ledger().await.is_empty(),
             "a refused adoption must not record a baseline"
         );
-
-        // A role is cluster-wide, unlike the schema this fixture owns, so it is
-        // this test's to clean up or every local run leaves one behind.
-        client
-            .batch_execute(&format!(
-                "REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM {role};
-                 REVOKE ALL ON SCHEMA {} FROM {role};
-                 DROP ROLE {role}",
-                fixture.schema, fixture.schema
-            ))
-            .await
-            .expect("drop the role this test created");
     }
 
     /// Another install's journal on the same search path is not evidence about
@@ -1043,6 +1072,10 @@ mod tests {
             ))
             .await
             .expect("create the neighbouring schema");
+        let _neighbour_cleanup = Cleanup {
+            dsn: fixture.dsn.clone(),
+            sql: format!("DROP SCHEMA {neighbour} CASCADE"),
+        };
         for migration in schema::MIGRATIONS.iter() {
             client
                 .batch_execute(migration.sql)
