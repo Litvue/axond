@@ -29,6 +29,7 @@ use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, Seri
 use super::credentials::{CredentialError, Credentials};
 use super::ids::{AuditEventId, MutationId, RevisionId, Slug};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
+use super::policy::{PolicyError, PolicySet};
 use super::resource::{BlobRef, ResourceRef, ResourceScope, ResourceVersion};
 use super::tenancy::{Tenancy, TenancyError};
 
@@ -74,6 +75,8 @@ pub enum ValidationError {
     Tenancy(#[from] TenancyError),
     #[error("this revision's provider credentials are not valid: {0}")]
     Credential(#[from] CredentialError),
+    #[error("this revision's policy is not valid: {0}")]
+    Policy(#[from] PolicyError),
     #[error("audit event {audit} records mutation {recorded}, not this candidate's {mutation}")]
     AuditMutationMismatch {
         audit: AuditEventId,
@@ -257,6 +260,11 @@ impl DesiredState {
         // opinion about it here (#198).
         Credentials::of(self)?;
 
+        // A policy document states the scope it governs in tenancy's own terms
+        // too, so it is read after the view that owns those terms rather than
+        // forming a second opinion about them (#208).
+        PolicySet::of(self)?;
+
         Ok(())
     }
 
@@ -411,6 +419,8 @@ pub enum BodySkew {
     Tenancy(TenancyError),
     #[error(transparent)]
     Credential(CredentialError),
+    #[error(transparent)]
+    Policy(PolicyError),
 }
 
 impl From<TenancyError> for BodySkew {
@@ -425,12 +435,19 @@ impl From<CredentialError> for BodySkew {
     }
 }
 
+impl From<PolicyError> for BodySkew {
+    fn from(error: PolicyError) -> Self {
+        Self::Policy(error)
+    }
+}
+
 impl BodySkew {
     /// The resource the refusal is about, whichever schema refused it.
     pub const fn reference(&self) -> ResourceRef {
         match self {
             Self::Tenancy(error) => error.reference(),
             Self::Credential(error) => error.reference(),
+            Self::Policy(error) => error.reference(),
         }
     }
 }
@@ -521,6 +538,9 @@ impl IntegrityError {
             }
             ValidationError::Credential(credential) if credential.is_incompatible() => {
                 Self::Incompatible(BodySkew::Credential(credential))
+            }
+            ValidationError::Policy(policy) if policy.is_incompatible() => {
+                Self::Incompatible(BodySkew::Policy(policy))
             }
             other => Self::Invalid(other),
         }
