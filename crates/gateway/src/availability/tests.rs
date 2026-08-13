@@ -617,6 +617,30 @@ fn overlapping_probes_produce_the_same_index_whichever_lands_first() {
     assert!(expected.last_known_good);
 }
 
+/// A target a complete listing dropped stays dropped. An older positive that lands
+/// afterwards must not become the fallback, or the next inconclusive look would
+/// resurrect a model the provider says it no longer offers.
+#[test]
+fn a_late_positive_cannot_resurrect_a_target_a_newer_complete_listing_dropped() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 300))
+        .observe(present(scope, "gpt-4o", 100, None))
+        .observe(outage(scope, "gpt-4o", 400))
+        .build();
+
+    let record = index.record(&key(scope, "gpt-4o")).expect("a held record");
+    assert!(
+        record.last_known_good.is_none(),
+        "an older positive is not evidence against a newer complete listing"
+    );
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(420));
+    assert_ne!(verdict.state, AvailabilityState::Available);
+    assert!(!verdict.last_known_good);
+}
+
 /// Retained evidence counts as "held" for the out-of-order guard too: a record
 /// whose last-known-good was declared without a current observation must not let an
 /// older look re-adopt evidence it predates.

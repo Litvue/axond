@@ -63,12 +63,13 @@
 //!   listing that no longer carries the target is precisely the evidence that the
 //!   retained positive is wrong;
 //! - the current slot always holds the newest look, so an older arrival from a slow
-//!   probe cannot rewind it, and the retained positive is displaced only by
-//!   evidence newer than itself. The two age independently, which is what makes
-//!   the index independent of the order observations arrive in: a definitive
-//!   positive that lands after a newer inconclusive look is still retained as
-//!   last-known-good, and a definitive negative that predates the retained
-//!   positive does not discredit it;
+//!   probe cannot rewind it, while what is *retained* is judged against the newest
+//!   definitive look held. The two age independently, which is what makes the index
+//!   independent of the order observations arrive in: a definitive look that lands
+//!   after a newer *inconclusive* one still counts, while one that predates a
+//!   conclusive answer cannot overturn it in either direction — an older negative
+//!   does not discredit a later positive, and an older positive does not resurrect
+//!   a target a later complete listing dropped;
 //! - nothing ever infers a positive from a non-definitive look. Certainty only
 //!   rises when definitive evidence arrives, which is what
 //!   [`AvailabilityState::certainty`] makes testable.
@@ -388,22 +389,27 @@ impl AvailabilityIndexBuilder {
     /// Record a discovery observation.
     ///
     /// The two slots age independently, which is what makes the result independent
-    /// of arrival order: the current slot keeps the newest observation, and the
-    /// retained positive is only ever displaced by evidence newer than *itself*.
-    /// The rest of the rules are in the module docs.
+    /// of arrival order: the current slot keeps the newest observation, and what is
+    /// retained is decided against the newest *definitive* look held. The rest of
+    /// the rules are in the module docs.
     #[must_use]
     pub fn observe(mut self, observation: DiscoveryObservation) -> Self {
         let entry = self.records.entry(observation.key()).or_default();
-        // Judged against the retained positive alone. A definitive look that
-        // predates it says nothing about it — the provider's answer at an earlier
-        // instant cannot discredit a later one — while a slow definitive positive
-        // that lands after a newer inconclusive look is still the best evidence
-        // held, and dropping it would cost the very fallback an outage needs.
-        let outranks_retained = entry
-            .last_known_good
-            .as_ref()
-            .is_none_or(|retained| observation.observed_at >= retained.observed_at);
-        if outranks_retained {
+        // Judged against the newest *definitive* evidence held, in either slot. A
+        // look that predates a conclusive answer says nothing about it — neither an
+        // older negative discrediting a later positive, nor an older positive
+        // resurrecting a target a later complete listing dropped — while a slow
+        // definitive look that lands after a newer *inconclusive* one is still the
+        // best evidence held, and dropping it would cost the fallback an outage
+        // needs.
+        let newest_definitive = entry
+            .discovery
+            .iter()
+            .chain(entry.last_known_good.iter())
+            .filter(|held| held.is_definitive())
+            .map(|held| held.observed_at)
+            .max();
+        if newest_definitive.is_none_or(|held| observation.observed_at >= held) {
             if observation.is_positive() {
                 entry.last_known_good = Some(observation.clone());
             } else if observation.is_definitive() {
