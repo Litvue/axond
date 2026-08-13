@@ -90,7 +90,7 @@ pub struct Inner {
 
 /// What a replica reports about itself, as distinct from what it serves.
 ///
-/// Passed in rather than built inside [`AppState::with_resources`] because
+/// Passed in rather than built inside [`AppState::new_with_policy`] because
 /// the two fields have no stateless implementation to default to *usefully*: a
 /// stateless replica has an all-`disabled` registry and no convergence, and a
 /// stateful one is handed the registry its probes publish into and the status the
