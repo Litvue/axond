@@ -24,6 +24,27 @@
 //!   so a handler cannot publish without an idempotency key and an expected
 //!   revision — it would have nothing to build a candidate from.
 //!
+//! # What the unauthenticated fallbacks disclose
+//!
+//! The 404/405 split answers before authentication, so an anonymous caller can
+//! tell a registered administrative path from an unregistered one and thereby
+//! enumerate the route table. That is deliberate and acceptable under
+//! [ADR 0027][adr]: the administrative route table is published API surface,
+//! identical in every deployment and documented, so hiding it protects nothing —
+//! while the alternative, answering `404` to a wrong method, would make a
+//! client's own protocol mistake indistinguishable from a typo, on the surface
+//! an operator reaches during an incident.
+//!
+//! What the fallbacks must never disclose is anything a credential would have
+//! decided: they never state whether a credential was presented, whether one
+//! would have been accepted, or what the deployment contains. They read no
+//! request state, consult neither authority, and touch no backend, so the answer
+//! to a wrong method is the same for an anonymous caller and an administrator.
+//! ADR 0027's disjointness rule is unaffected — enumerating paths grants no
+//! authority over any of them.
+//!
+//! [adr]: https://github.com/Litvue/axond/blob/main/docs/adr/0027-stateless-and-stateful-operating-modes.md
+//!
 //! # Contract only
 //!
 //! [`admin_route_specs`] is empty in this slice, and `serve` does not mount this
@@ -138,7 +159,8 @@ pub(crate) fn mount(api: Arc<AdminApi>, specs: Vec<AdminRouteSpec>) -> Router {
         // body. The method fallback runs outside the authentication layer, which
         // is attached per route — a wrong method on an administrative path is a
         // protocol mistake, and answering it does not need an identity or reveal
-        // whether one would have been accepted.
+        // whether one would have been accepted. See the module docs on what the
+        // 404/405 split does and does not disclose.
         .method_not_allowed_fallback(wrong_method)
         .with_state(api);
     Router::new().nest(ADMIN_PREFIX, inner)

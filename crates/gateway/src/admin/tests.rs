@@ -25,7 +25,8 @@ use tower::ServiceExt;
 
 use super::auth::{
     AdminAction, AdminAuthError, AdminAuthenticator, AdminAuthorizer, AdminCredential, AdminGrant,
-    AdminIdentity, AdminPresented, BreakglassAttribution, INFERENCE_KEY_HEADER,
+    AdminIdentity, AdminPresented, BREAKGLASS_OPERATOR_HEADER, BREAKGLASS_REASON_HEADER,
+    BreakglassAttribution, INFERENCE_KEY_HEADER, InvalidAttribution, PresentedAttribution,
 };
 use super::diff::SemanticDiff;
 use super::error::AdminError;
@@ -229,7 +230,7 @@ async fn an_inference_credential_carries_no_administrative_authority() {
     // authenticator, is simply not in the administrative population.
     let presented = AdminPresented {
         credential: AdminCredential::new("gateway-static-key"),
-        attribution: None,
+        attribution: PresentedAttribution::Absent,
     };
     assert_eq!(
         authenticator.authenticate(&presented).await,
@@ -264,7 +265,7 @@ async fn breakglass_use_is_attributed_and_kept_distinguishable_from_a_human() {
     let authenticator = authenticator();
     let unattributed = AdminPresented {
         credential: AdminCredential::new(BREAKGLASS_SECRET),
-        attribution: None,
+        attribution: PresentedAttribution::Absent,
     };
     let error = authenticator
         .authenticate(&unattributed)
@@ -278,7 +279,7 @@ async fn breakglass_use_is_attributed_and_kept_distinguishable_from_a_human() {
     let identity = authenticator
         .authenticate(&AdminPresented {
             credential: AdminCredential::new(BREAKGLASS_SECRET),
-            attribution: Some(
+            attribution: PresentedAttribution::Present(
                 BreakglassAttribution::parse("ops-oncall", "idp outage, ticket OPS-42")
                     .expect("a valid attribution"),
             ),
@@ -322,7 +323,7 @@ async fn an_identity_provider_outage_is_not_a_rejection() {
     let error = authenticator
         .authenticate(&AdminPresented {
             credential: AdminCredential::new(HUMAN_TOKEN),
-            attribution: None,
+            attribution: PresentedAttribution::Absent,
         })
         .await
         .expect_err("the identity provider is down");
@@ -425,6 +426,88 @@ async fn a_scoped_grant_cannot_change_a_resource_outside_its_scope() {
         )
         .await
         .expect("a tenant-scoped change to a tenant-scoped resource");
+}
+
+#[tokio::test]
+async fn a_scoped_grant_cannot_read_the_deployment_wide_projections() {
+    let store = Arc::new(InMemoryControlPlane::new());
+    let service = service(&store);
+    let revision = publish_fixture(&service, "key-1").await;
+    let revision = crate::desired_state::RevisionId::parse(&revision).expect("a revision id");
+    let tenant = ResourceScope::Tenant(fixtures::tenant_id(1));
+    let scoped = |action| AdminGrant::granted(human(), action, tenant.clone());
+
+    // Every projection is of the whole deployment, so the right action at a
+    // narrower scope is not authority to read it: otherwise a tenant
+    // administrator sees every other tenant's resources, history and audit.
+    for error in [
+        service
+            .desired_state(&scoped(AdminAction::ReadState))
+            .await
+            .expect_err("deployment-wide state needs deployment authority"),
+        service
+            .history(&scoped(AdminAction::ReadHistory), HistoryRequest::default())
+            .await
+            .expect_err("deployment-wide history needs deployment authority"),
+        service
+            .audit(&scoped(AdminAction::ReadAudit), revision)
+            .await
+            .expect_err("a deployment-wide audit trail needs deployment authority"),
+    ] {
+        assert_eq!(error.code(), "admin_forbidden");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn a_stray_attribution_header_does_not_reject_an_administrator() {
+    // One header, or an unreadable one, is not usable attribution — but it is
+    // also not a reason to refuse a caller who is not using breakglass, because
+    // nothing has yet decided which credential population it belongs to.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {HUMAN_TOKEN}")).unwrap(),
+    );
+    headers.insert(
+        BREAKGLASS_OPERATOR_HEADER,
+        HeaderValue::from_static("ops-oncall"),
+    );
+    let presented = AdminPresented::from_headers(&headers).expect("a presented OIDC credential");
+    assert_eq!(
+        presented.attribution,
+        PresentedAttribution::Invalid(InvalidAttribution::Missing)
+    );
+
+    headers.insert(
+        BREAKGLASS_REASON_HEADER,
+        HeaderValue::from_bytes(b"\xff not text").unwrap(),
+    );
+    let presented = AdminPresented::from_headers(&headers).expect("a presented OIDC credential");
+    // Unreadable stays distinct from absent, as it does for the mutation
+    // preconditions.
+    assert_eq!(
+        presented.attribution,
+        PresentedAttribution::Invalid(InvalidAttribution::Unprintable)
+    );
+
+    let authenticator = authenticator();
+    let identity = authenticator
+        .authenticate(&presented)
+        .await
+        .expect("a stray attribution header does not unauthenticate a human");
+    assert_eq!(identity, human());
+
+    // The same half-filled attribution refuses breakglass, which is where
+    // attribution is required.
+    let error = authenticator
+        .authenticate(&AdminPresented {
+            credential: AdminCredential::new(BREAKGLASS_SECRET),
+            attribution: PresentedAttribution::Invalid(InvalidAttribution::Missing),
+        })
+        .await
+        .expect_err("breakglass must name an operator and a reason");
+    assert_eq!(AdminError::from(error).code(), "admin_unauthenticated");
 }
 
 // ---------------------------------------------------------------------------
@@ -1481,6 +1564,60 @@ async fn a_known_admin_path_reached_with_the_wrong_method_answers_in_the_admin_e
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(body["error"]["type"], "admin_method_not_allowed");
     assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(store.published_revisions(), 0);
+}
+
+#[tokio::test]
+async fn the_unauthenticated_fallbacks_reveal_the_route_table_and_nothing_credentialed() {
+    // Enumeration is the accepted cost: the route table is published surface, so
+    // a registered path answers 405 and an unregistered one 404 without a
+    // credential. What must not vary is anything a credential would decide — the
+    // answer is identical anonymous, with a valid administrative credential, and
+    // with an inference credential, and it names neither.
+    let store = Arc::new(InMemoryControlPlane::new());
+    let bearer = format!("Bearer {HUMAN_TOKEN}");
+    let credentials: [Option<(&str, &str)>; 3] = [
+        None,
+        Some((axum::http::header::AUTHORIZATION.as_str(), &bearer)),
+        Some((INFERENCE_KEY_HEADER, "gateway-static-key")),
+    ];
+    for credential in credentials {
+        let mut request = Request::post(format!("{ADMIN_PREFIX}/state"));
+        if let Some((header, value)) = credential {
+            request = request.header(header, value);
+        }
+        let (status, body) = send(
+            api(Some(store.clone())),
+            request.body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{credential:?}");
+        assert_eq!(body["error"]["type"], "admin_method_not_allowed");
+        let rendered = body.to_string();
+        for material in [
+            HUMAN_TOKEN,
+            BREAKGLASS_SECRET,
+            "gateway-static-key",
+            "unauthenticated",
+        ] {
+            assert!(
+                !rendered.contains(material),
+                "a method refusal says nothing about credentials: {rendered}"
+            );
+        }
+    }
+
+    // And an unregistered path stays a 404, which is the enumeration this
+    // documents rather than hides.
+    let (status, body) = send(
+        api(Some(store.clone())),
+        Request::post(format!("{ADMIN_PREFIX}/nonexistent"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["type"], "admin_route_not_found");
     assert_eq!(store.published_revisions(), 0);
 }
 

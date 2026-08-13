@@ -169,26 +169,6 @@ impl BreakglassAttribution {
         })
     }
 
-    /// The attribution a request carries, if it carries one.
-    ///
-    /// `None` means the headers are absent, which is only an error once an
-    /// authenticator has decided the credential *is* the breakglass one:
-    /// attribution headers on an OIDC request are not required.
-    pub fn from_headers(headers: &HeaderMap) -> Result<Option<Self>, AdminAuthError> {
-        let operator = headers
-            .get(BREAKGLASS_OPERATOR_HEADER)
-            .and_then(|value| value.to_str().ok());
-        let reason = headers
-            .get(BREAKGLASS_REASON_HEADER)
-            .and_then(|value| value.to_str().ok());
-        match (operator, reason) {
-            (None, None) => Ok(None),
-            (operator, reason) => Self::parse(operator.unwrap_or(""), reason.unwrap_or(""))
-                .map(Some)
-                .map_err(AdminAuthError::Attribution),
-        }
-    }
-
     pub fn operator(&self) -> &str {
         &self.operator
     }
@@ -387,19 +367,73 @@ impl AdminAuthError {
     }
 }
 
+/// What the breakglass attribution headers amounted to.
+///
+/// Three states rather than two, and no refusal here, because only an
+/// authenticator knows whether the presented credential is the breakglass one.
+/// An OIDC administrator carrying a stray or half-filled attribution header is
+/// not an unauthenticated caller, so a malformed attribution is *carried* to the
+/// decision that cares about it instead of ending the request before it. Absent
+/// and unreadable are kept apart for the same reason
+/// [`MutationPreconditions`](super::protocol::MutationPreconditions) keeps them
+/// apart: a header that could not be read is not a header that was not sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresentedAttribution {
+    /// Neither header was sent.
+    Absent,
+    /// Attribution was attempted and is not usable.
+    Invalid(InvalidAttribution),
+    Present(BreakglassAttribution),
+}
+
+impl PresentedAttribution {
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        let field = |name: &str| headers.get(name).map(|value| value.to_str().ok());
+        match (
+            field(BREAKGLASS_OPERATOR_HEADER),
+            field(BREAKGLASS_REASON_HEADER),
+        ) {
+            (None, None) => Self::Absent,
+            // A header whose bytes are not text cannot be an attribution, and is
+            // not the same thing as a header that was left out.
+            (Some(None), _) | (_, Some(None)) => Self::Invalid(InvalidAttribution::Unprintable),
+            (operator, reason) => {
+                fn text(value: Option<Option<&str>>) -> &str {
+                    value.flatten().unwrap_or("")
+                }
+                match BreakglassAttribution::parse(text(operator), text(reason)) {
+                    Ok(attribution) => Self::Present(attribution),
+                    Err(error) => Self::Invalid(error),
+                }
+            }
+        }
+    }
+
+    /// The attribution breakglass requires, or why this request cannot use it.
+    ///
+    /// Called only once a credential has been recognized as the breakglass one:
+    /// that is where an absent or malformed attribution becomes a refusal.
+    pub fn require(&self) -> Result<BreakglassAttribution, AdminAuthError> {
+        match self {
+            Self::Present(attribution) => Ok(attribution.clone()),
+            Self::Invalid(error) => Err(AdminAuthError::Attribution(*error)),
+            Self::Absent => Err(AdminAuthError::Attribution(InvalidAttribution::Missing)),
+        }
+    }
+}
+
 /// What a request presented, before anything is decided about it.
 #[derive(Debug, Clone)]
 pub struct AdminPresented {
     pub credential: AdminCredential,
-    /// Present only when the caller sent the breakglass attribution headers.
-    pub attribution: Option<BreakglassAttribution>,
+    pub attribution: PresentedAttribution,
 }
 
 impl AdminPresented {
     pub fn from_headers(headers: &HeaderMap) -> Result<Self, AdminAuthError> {
         Ok(Self {
             credential: AdminCredential::from_headers(headers)?,
-            attribution: BreakglassAttribution::from_headers(headers)?,
+            attribution: PresentedAttribution::from_headers(headers),
         })
     }
 }

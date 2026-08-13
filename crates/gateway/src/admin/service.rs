@@ -11,7 +11,9 @@
 //! 2. **Authority.** The service takes an [`AdminGrant`], not an identity, and
 //!    checks that the grant covers a mutating action at the scope the request
 //!    names. An authenticated-but-unauthorized caller cannot reach step 3,
-//!    because it has no grant to pass.
+//!    because it has no grant to pass. The reads are held to the same standard
+//!    rather than to the action alone: every projection here is deployment-wide,
+//!    so reading one takes deployment authority.
 //! 3. **Read the complete desired state.** The head revision is read once and
 //!    hydrated whole. There is no partial read and no diff to apply: a revision
 //!    *is* the complete state, so a candidate is built from state that was
@@ -239,9 +241,28 @@ impl AdminService {
         Ok(())
     }
 
+    /// Check a grant covers a *deployment-wide* answer.
+    ///
+    /// Every projection here is of the complete deployment: a revision is the
+    /// whole desired state, and history and audit are the whole deployment's.
+    /// None of them can be narrowed to one tenant without becoming a different
+    /// answer, so reading them requires authority over the deployment rather
+    /// than trust that each future handler asked its authorizer for a scope wide
+    /// enough to justify what came back — which is what made the read paths the
+    /// lenient half of the authority model the mutation path enforces. Scoped
+    /// projections, which a tenant administrator could be given, do not exist
+    /// yet and are #143's to add.
+    fn permits_deployment_read(grant: &AdminGrant, action: AdminAction) -> Result<(), AdminError> {
+        Self::permits(grant, action)?;
+        if grant.scope() != &ResourceScope::Deployment {
+            return Err(AdminError::Forbidden(AdminAuthError::ScopeNotPermitted));
+        }
+        Ok(())
+    }
+
     /// The complete desired state, projected.
     pub async fn desired_state(&self, grant: &AdminGrant) -> Result<StateView, AdminError> {
-        Self::permits(grant, AdminAction::ReadState)?;
+        Self::permits_deployment_read(grant, AdminAction::ReadState)?;
         let store = self.store()?;
         let revision = store.load_desired_revision().await.map_err(log_store)?;
         StateView::of(revision.as_ref())
@@ -259,7 +280,7 @@ impl AdminService {
         grant: &AdminGrant,
         request: HistoryRequest,
     ) -> Result<RevisionPage, AdminError> {
-        Self::permits(grant, AdminAction::ReadHistory)?;
+        Self::permits_deployment_read(grant, AdminAction::ReadHistory)?;
         let store = self.store()?;
         let mut next = match request.start {
             Some(start) => Some(start),
@@ -299,7 +320,7 @@ impl AdminService {
         grant: &AdminGrant,
         revision: RevisionId,
     ) -> Result<AuditPage, AdminError> {
-        Self::permits(grant, AdminAction::ReadAudit)?;
+        Self::permits_deployment_read(grant, AdminAction::ReadAudit)?;
         let store = self.store()?;
         let events = store.audit_trail(revision).await.map_err(log_store)?;
         Ok(AuditPage::of(revision, &events))
@@ -315,7 +336,7 @@ impl AdminService {
         grant: &AdminGrant,
         report: &RevisionReport,
     ) -> Result<ConvergenceResult, AdminError> {
-        Self::permits(grant, AdminAction::ReadConvergence)?;
+        Self::permits_deployment_read(grant, AdminAction::ReadConvergence)?;
         self.store()?;
         Ok(ConvergenceResult::of(report))
     }

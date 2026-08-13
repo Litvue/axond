@@ -19,7 +19,7 @@ use secrecy::SecretString;
 
 use super::auth::{
     AdminAction, AdminAuthError, AdminAuthenticator, AdminAuthorizer, AdminGrant, AdminIdentity,
-    AdminPresented, InvalidAttribution,
+    AdminPresented,
 };
 use crate::backends::Capabilities;
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
@@ -80,10 +80,9 @@ impl AdminAuthenticator for FakeAdminAuthenticator {
         {
             // Breakglass works during an identity-provider outage: that is what
             // it is for, so the outage flag deliberately does not gate it.
-            let attribution = presented
-                .attribution
-                .clone()
-                .ok_or(AdminAuthError::Attribution(InvalidAttribution::Missing))?;
+            // Attribution becomes mandatory here, once the credential is known to
+            // be the breakglass one, and not before.
+            let attribution = presented.attribution.require()?;
             return Ok(AdminIdentity::Breakglass {
                 attribution,
                 credential: label.clone(),
