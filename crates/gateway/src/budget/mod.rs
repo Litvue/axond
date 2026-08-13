@@ -41,7 +41,7 @@ use async_trait::async_trait;
 
 use crate::config::{BudgetBackend, BudgetConfig, StoreUnavailable};
 use crate::desired_state::policy::PolicyGeneration;
-use crate::policy::{BudgetCaps, Ceilings, Unenforceable, denied};
+use crate::policy::{BudgetCaps, Ceilings, PolicyHold, Unenforceable, denied};
 use crate::telemetry::metrics;
 
 pub use postgres::PostgresBudget;
@@ -446,7 +446,9 @@ impl BudgetStore for InMemoryBudget {
                         reason,
                         "budget ledger capacity denied"
                     );
-                    let admission = self.unavailable.admission("in_memory", &reason);
+                    // Nothing was written, so nothing is uncertain: this denial
+                    // is the store refusing a ledger, not a lost answer.
+                    let admission = self.unavailable.admission("in_memory", &reason, None);
                     if matches!(&admission, Admission::Denied(Denial::StoreUnavailable)) {
                         metrics::record_budget_capacity_denial();
                     }
@@ -510,9 +512,44 @@ impl From<StoreUnavailable> for UnavailablePolicy {
     }
 }
 
+/// A reserve whose outcome the caller never learned, and the hold it took
+/// before making it.
+///
+/// A lost response is not a lost side effect: the Lua script may have written
+/// the reservation, or the transaction may have committed, before the
+/// connection broke. The id is gone with the answer, so nothing will ever
+/// settle that entry — it is reclaimed by the reservation TTL it was written
+/// with, and until then the generation that priced it is still represented in
+/// the store. So the hold outlives the request by exactly that long, and a
+/// drain keeps meaning what the runbook says: nothing the generation admitted
+/// is left in the store.
+pub(crate) struct Uncertain {
+    pub(crate) hold: PolicyHold,
+    /// The TTL the reservation would have been written with.
+    pub(crate) reservation_ttl: Duration,
+}
+
 impl UnavailablePolicy {
     /// The admission for a reservation the store could not answer.
-    fn admission(self, backend: &'static str, error: &dyn std::fmt::Display) -> Admission {
+    ///
+    /// `uncertain` carries the caller's hold when the failed call may have left
+    /// a reservation behind; the hold is then kept for that reservation's whole
+    /// TTL rather than dropped, on both stances — a fail-closed denial does not
+    /// un-write what the store may have committed. It is `None` only where the
+    /// failure provably precedes any side effect.
+    fn admission(
+        self,
+        backend: &'static str,
+        error: &dyn std::fmt::Display,
+        uncertain: Option<Uncertain>,
+    ) -> Admission {
+        if let Some(Uncertain {
+            hold,
+            reservation_ttl,
+        }) = uncertain
+        {
+            hold.linger(reservation_ttl);
+        }
         match self {
             Self::Deny => {
                 tracing::error!(
@@ -887,11 +924,11 @@ mod tests {
     async fn an_unreachable_store_denies_by_default_and_admits_when_told_to() {
         let error = "connection refused";
         assert_eq!(
-            UnavailablePolicy::Deny.admission("redis", &error),
+            UnavailablePolicy::Deny.admission("redis", &error, None),
             Admission::Denied(Denial::StoreUnavailable)
         );
         assert!(matches!(
-            UnavailablePolicy::Allow.admission("redis", &error),
+            UnavailablePolicy::Allow.admission("redis", &error, None),
             Admission::Allowed(_)
         ));
     }
@@ -1059,6 +1096,78 @@ mod tests {
                 .caps(crate::policy::ungoverned::BUDGET_REDIS, "acme/core")
                 .is_none()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_store_error_keeps_the_generation_for_the_reservation_ttl() {
+        use std::sync::Arc;
+
+        use crate::config::NamespacePolicy;
+        use crate::desired_state::fixtures::{project_id, tenant_id};
+        use crate::desired_state::policy::PolicyScope;
+        use crate::policy::PolicyRuntime;
+        use crate::policy::fixtures::{detailed, generation};
+        use crate::policy::view::tests::governed;
+
+        let scope = PolicyScope::Project {
+            tenant: tenant_id(1),
+            project: project_id(1),
+        };
+        let ttl_seconds = 300;
+        let body = detailed(scope, 1, 1_000, None, ttl_seconds, 8, 60, 0);
+        let held = generation(&body, 1);
+        let runtime = Arc::new(PolicyRuntime::bootstrap(&governed(
+            "acme/core",
+            NamespacePolicy {
+                body,
+                generation: held,
+            },
+        )));
+        let ceilings = Ceilings::published(&runtime);
+        let reservation_ttl = Duration::from_secs(ttl_seconds);
+
+        // A reserve whose answer was lost may have written its reservation
+        // anyway, and no settlement can ever remove it: the id went with the
+        // answer. Both stances therefore keep the generation counted for as
+        // long as the store can hold that entry, rather than reporting a drain
+        // complete while spend priced by the superseded document survives.
+        for stance in [UnavailablePolicy::Deny, UnavailablePolicy::Allow] {
+            let hold = PolicyHold::take(&ceilings, Some(held));
+            assert_eq!(runtime.outstanding(held), 1);
+            let admission = stance.admission(
+                "redis",
+                &"connection reset by peer",
+                Some(Uncertain {
+                    hold,
+                    reservation_ttl,
+                }),
+            );
+            match (&stance, &admission) {
+                // Fail-open admits the request unenforced, so nothing downstream
+                // will settle against the generation — the linger is the only
+                // accounting left.
+                (UnavailablePolicy::Allow, Admission::Allowed(reservation)) => {
+                    assert!(reservation.id.is_empty());
+                    assert_eq!(reservation.generation, None);
+                }
+                (UnavailablePolicy::Deny, Admission::Denied(Denial::StoreUnavailable)) => {}
+                other => panic!("unexpected admission: {other:?}"),
+            }
+
+            tokio::time::sleep(reservation_ttl - Duration::from_secs(1)).await;
+            assert_eq!(
+                runtime.outstanding(held),
+                1,
+                "{stance:?}: the generation stays counted while the store may still hold the \
+                 reservation"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                runtime.outstanding(held),
+                0,
+                "{stance:?}: and is released once that reservation can only have expired"
+            );
+        }
     }
 
     #[tokio::test]

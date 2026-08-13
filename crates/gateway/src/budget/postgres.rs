@@ -29,7 +29,7 @@ use tokio_postgres::{Client, Config};
 
 use super::{
     Admission, BudgetError, BudgetKey, BudgetStore, Denial, ExceededScope, Reservation,
-    SharedSettings,
+    SharedSettings, Uncertain,
 };
 use crate::policy::{BudgetCaps, PolicyHold};
 use crate::telemetry::metrics;
@@ -651,7 +651,16 @@ impl BudgetStore for PostgresBudget {
                 }
                 Admission::Denied(Denial::Exceeded)
             }
-            Err(e) => self.settings.unavailable.admission(BACKEND, &e),
+            // The transaction may have committed before the response was lost,
+            // so the hold outlives the request by that reservation's TTL.
+            Err(e) => self.settings.unavailable.admission(
+                BACKEND,
+                &e,
+                Some(Uncertain {
+                    hold,
+                    reservation_ttl: governing.caps.reservation_ttl,
+                }),
+            ),
         }
     }
 

@@ -48,7 +48,7 @@ use redis::{AsyncCommands, Script, ScriptInvocation};
 
 use super::{
     Admission, BudgetError, BudgetKey, BudgetStore, Denial, ExceededScope, Reservation,
-    SharedSettings,
+    SharedSettings, Uncertain,
 };
 use crate::policy::PolicyHold;
 use crate::telemetry::metrics;
@@ -850,7 +850,16 @@ impl BudgetStore for RedisBudget {
             }
             Ok(2) => exceeded(key, ExceededScope::Namespace),
             Ok(_) => exceeded(key, ExceededScope::Subject),
-            Err(e) => self.settings.unavailable.admission(BACKEND, &e),
+            // The script may have written the reservation before the response
+            // was lost, so the hold outlives the request by that entry's TTL.
+            Err(e) => self.settings.unavailable.admission(
+                BACKEND,
+                &e,
+                Some(Uncertain {
+                    hold,
+                    reservation_ttl: caps.reservation_ttl,
+                }),
+            ),
         }
     }
 

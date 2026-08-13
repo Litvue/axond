@@ -13,6 +13,7 @@
 //! code has one path, not one per mode.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::desired_state::policy::PolicyGeneration;
 
@@ -89,6 +90,17 @@ impl Ceilings {
 /// each hold the generation too. An empty drain list therefore means no request
 /// is running under the generation *and* nothing it admitted is left in the
 /// store — which is what a stop-the-fleet migration needs it to mean.
+///
+/// A budget reserve whose answer was *lost* is the hardest case, and it is not
+/// exempt: the script may have written the reservation, or the transaction may
+/// have committed, before the connection broke, and the id went with the
+/// answer, so no settlement will ever exit it. Ending the hold there would let
+/// a drain read empty while the store still holds spend priced by the
+/// generation being migrated away from — under `on_unavailable = "allow"`
+/// especially, where the request is admitted unenforced and looks like a
+/// success. So such a hold is *lingered* ([`PolicyHold::linger`]) for the
+/// reservation TTL the entry would have carried, which is exactly how long the
+/// store can keep it.
 #[derive(Debug)]
 pub struct PolicyHold {
     ceilings: Ceilings,
@@ -111,6 +123,28 @@ impl PolicyHold {
     /// counted after this guard goes away.
     pub fn kept(mut self) {
         self.kept = true;
+    }
+
+    /// Keep the count for `ttl`, then release it, without holding up the caller.
+    ///
+    /// For the admission whose outcome is unknown: nothing will settle it, so
+    /// the only honest release is the deadline the store itself will reclaim the
+    /// entry on. The cost is one sleeping task per failed reserve for the length
+    /// of a reservation TTL — bounded by the outage, and cheaper than a drain
+    /// that reports done while the ledger disagrees.
+    pub fn linger(self, ttl: Duration) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    tokio::time::sleep(ttl).await;
+                    drop(self);
+                });
+            }
+            // No runtime to outlive the caller on (a synchronous test, or
+            // shutdown): releasing now is all this thread can do, and it is what
+            // a process that is going away would do anyway.
+            Err(_) => drop(self),
+        }
     }
 }
 

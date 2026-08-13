@@ -156,6 +156,18 @@ call denies, so it can briefly name a request that is about to be turned away
 but never misses one that was admitted. Zero therefore means what a migration
 needs it to mean: nothing is running under the superseded document.
 
+**Including the admissions nobody can settle.** A reserve whose answer is lost —
+the script may have written the reservation, or the transaction committed, before
+the connection broke — may leave an entry in the store for an id the caller no
+longer has, so no settlement will ever remove it. Rather than report that
+generation drained, the replica keeps counting it for one
+`reservation_ttl_seconds`, which is exactly how long the store can keep the
+entry. This is true on both stances, and it matters most under
+`on_unavailable = "allow"`, where the request is admitted unenforced and would
+otherwise look like a clean miss. So a drain during a budget-store outage takes
+up to a reservation TTL longer to reach zero, and needs no manual wait on top of
+it.
+
 ## Rolling back
 
 **Roll back by publishing the old values forward: a new document, a higher epoch,
