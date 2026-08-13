@@ -51,6 +51,10 @@ def heading_slugs(text: str) -> set[str]:
     first, so `` ### `Cargo.toml` drift `` is reachable as `#cargotoml-drift`.
     Explicit `<a id>`/`<a name>` targets count too, and a `#` inside a fenced
     block is code rather than a heading.
+
+    An underscore is a word character, so it survives into the slug: emphasis is
+    undone only where it is paired around a word, and `` `[credential_pool]` ``
+    keeps its underscore rather than becoming `credentialpool`.
     """
     slugs = {anchor for anchor in re.findall(r'<a\s+(?:id|name)="([^"]+)"', text)}
     fenced = False
@@ -65,7 +69,8 @@ def heading_slugs(text: str) -> set[str]:
             continue
         title = re.sub(r"`([^`]*)`", r"\1", heading.group(1))
         title = re.sub(r"!?\[([^]]*)\]\([^)]*\)", r"\1", title)
-        title = re.sub(r"[*_]", "", title)
+        title = re.sub(r"\*+", "", title)
+        title = re.sub(r"(?<![\w])_+([^_]+)_+(?![\w])", r"\1", title)
         slugs.add(re.sub(r"[^\w\- ]", "", title.lower()).strip().replace(" ", "-"))
     return slugs
 
@@ -423,6 +428,7 @@ def self_test() -> int:
         "# Releasing\n\n"
         "## Version classification\n\n"
         "### `Cargo.toml` drift, **checked**\n\n"
+        "### `[credential_pool]` — _Tier 0_\n\n"
         '<a id="legacy-anchor"></a>\n\n'
         "```text\n# Not a heading\n```\n"
     )
@@ -430,6 +436,8 @@ def self_test() -> int:
         "releasing",
         "version-classification",
         "cargotoml-drift-checked",
+        # An underscore in a configuration key is not emphasis and must survive.
+        "credential_pool--tier-0",
         "legacy-anchor",
     }, heading_slugs(page)
     assert "not-a-heading" not in heading_slugs(page)
