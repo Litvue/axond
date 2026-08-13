@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.26](https://github.com/Litvue/axond/compare/v0.3.25...v0.3.26) (2026-08-13)
+
+
+### Documentation
+
+* **release:** say why a merge commit duplicates a changelog entry ([#274](https://github.com/Litvue/axond/issues/274)) ([2bdf865](https://github.com/Litvue/axond/commit/2bdf8652d78d76d23915f9c46ee1440982858098))
+
 ## [0.3.25](https://github.com/Litvue/axond/compare/v0.3.24...v0.3.25) (2026-08-13)
 
 
