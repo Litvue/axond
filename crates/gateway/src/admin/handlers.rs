@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::routing::{MethodRouter, get, post};
 use serde::Deserialize;
@@ -147,11 +148,19 @@ struct HistoryQuery {
     start: Option<String>,
 }
 
+/// A query string the extractor cannot read is refused in the administrative
+/// envelope, for the reason [`publish`] takes raw bytes: axum's own rejection is
+/// plain text with no `error.type`, and a client branching on
+/// [`AdminError::CODES`] would meet a body it cannot parse.
 async fn history(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
-    Query(query): Query<HistoryQuery>,
+    query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Result<Json<RevisionPage>, AdminError> {
+    let Query(query) = query.map_err(|rejection| AdminError::RequestInvalid {
+        schema: "history",
+        detail: rejection.body_text(),
+    })?;
     let grant = api.authorize(
         &identity,
         AdminAction::ReadHistory,

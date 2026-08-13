@@ -723,6 +723,15 @@ async fn history_is_bounded_newest_first_and_audit_names_the_actor() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["type"], "history_limit_invalid");
 
+    // A query string the extractor cannot read is still an administrative
+    // refusal: a client branching on `AdminError::CODES` never meets a body it
+    // cannot parse.
+    for query in ["/history?limit=abc", "/history?page=2"] {
+        let (status, body) = deployment.get(query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(body["error"]["type"], "admin_request_invalid", "{query}");
+    }
+
     let (status, audit) = deployment.get(&format!("/audit/{head}")).await;
     assert_eq!(status, StatusCode::OK);
     let events = audit["events"].as_array().expect("events");
