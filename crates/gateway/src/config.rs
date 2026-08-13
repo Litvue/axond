@@ -22,6 +22,9 @@ use serde::{Deserialize, Deserializer};
 
 use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
+use crate::backends::catalog_refresh::{Bootstrap, RefreshSchedule};
+use crate::backends::catalog_store::postgres::CatalogStoreSettings;
+use crate::convergence::backoff::BackoffPolicy;
 use crate::desired_state::policy::{PolicyBody, PolicyGeneration};
 use crate::desired_state::{ProjectId, SecretRef, TenantId};
 use crate::principals::Capability;
@@ -115,6 +118,12 @@ pub struct Config {
     /// Precise minted-token revocation. Defaults to no denylist.
     #[serde(default)]
     pub revocation: RevocationConfig,
+    /// The upstream catalogue this deployment imports provider and model
+    /// metadata from, and how often. Defaults to `backend = "none"`: nothing is
+    /// fetched, and an operator's own resources are the whole catalogue
+    /// (ADR 0043, ADR 0051).
+    #[serde(default)]
+    pub catalog: CatalogConfig,
 }
 
 /// Which authority owns durable resources for the whole process (ADR 0027).
@@ -152,7 +161,7 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 25] = [
+const OVERRIDE_KEYS: [&str; 26] = [
     "mode",
     "server",
     "control_plane",
@@ -178,6 +187,7 @@ const OVERRIDE_KEYS: [&str; 25] = [
     "rate_limit",
     "admission",
     "revocation",
+    "catalog",
 ];
 
 /// Whether one segment of a namespace id is a slug: ASCII alphanumerics, `-`,
@@ -1630,6 +1640,232 @@ impl Default for RevocationConfig {
     }
 }
 
+/// Where imported provider and model metadata comes from, where the imports are
+/// kept, and how often one is attempted (ADR 0043, ADR 0051).
+///
+/// Every field is process-local: a catalogue import is *ingestion*, not a
+/// durable resource an operator declares, so this section is read in both modes
+/// rather than being surrendered to the control plane in a stateful one. What it
+/// produces — immutable snapshots and an active pointer — is durable, and
+/// `store` is what decides whether they survive a restart.
+///
+/// The default is inert. Nothing is fetched, nothing is stored, and no task is
+/// spawned, so a deployment that hand-authors its models keeps exactly the
+/// behaviour it has today and no third party is contacted on its behalf.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CatalogConfig {
+    /// Which upstream is imported. `none` disables the whole pipeline.
+    #[serde(default)]
+    pub source: CatalogSourceBackend,
+    /// Where imported snapshots are retained. `in-memory` is a single-replica
+    /// development convenience and is refused in a stateful deployment, which
+    /// must not lose its catalogue history to a restart.
+    #[serde(default)]
+    pub store: CatalogStoreBackend,
+    /// The models.dev document to fetch. Only `/catalog.json` is supported: the
+    /// other published documents have different shapes.
+    #[serde(default)]
+    pub source_url: Option<String>,
+    /// The env var holding the retention DSN. Defaults to the control plane's,
+    /// so a stateful deployment does not name the same database twice.
+    #[serde(default)]
+    pub dsn_env: Option<String>,
+    /// The schema retention tables live in.
+    #[serde(default)]
+    pub schema: Option<String>,
+    /// Whether retention creates its tables if they are absent.
+    #[serde(default = "default_catalog_create_table")]
+    pub create_table: bool,
+    /// How long between scheduled refresh attempts.
+    #[serde(default = "default_catalog_refresh_interval_seconds")]
+    pub refresh_interval_seconds: u64,
+    /// The bound on one attempt: the conditional fetch *and* its retention.
+    #[serde(default = "default_catalog_refresh_timeout_seconds")]
+    pub refresh_timeout_seconds: u64,
+    /// The first delay after a refusal, doubled per consecutive refusal.
+    #[serde(default = "default_catalog_retry_initial_seconds")]
+    pub retry_initial_seconds: u64,
+    /// The ceiling that doubling converges to.
+    #[serde(default = "default_catalog_retry_max_seconds")]
+    pub retry_max_seconds: u64,
+    /// What an empty store starts from: nothing, or the bundled seed, which lets
+    /// a deployment with no egress serve a known catalogue.
+    #[serde(default)]
+    pub bootstrap: CatalogBootstrap,
+    /// The most of one answer that is ever held in memory.
+    #[serde(default = "default_catalog_max_payload_bytes")]
+    pub max_payload_bytes: usize,
+    /// Bounded timeout for the retention connection.
+    #[serde(default = "default_catalog_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Bounded timeout for each retention operation.
+    #[serde(default = "default_catalog_operation_timeout_ms")]
+    pub operation_timeout_ms: u64,
+}
+
+/// Which upstream provides imported metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogSourceBackend {
+    /// No import at all: the operator's own resources are the catalogue.
+    #[default]
+    None,
+    /// models.dev over HTTPS, conditionally.
+    ModelsDev,
+    /// The bundled seed only, with no network at all — an air-gapped
+    /// deployment's whole source.
+    Seed,
+}
+
+impl CatalogSourceBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ModelsDev => "models-dev",
+            Self::Seed => "seed",
+        }
+    }
+}
+
+/// Where imported snapshots are retained.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogStoreBackend {
+    /// Process memory: lost on restart, so every boot re-imports.
+    #[default]
+    InMemory,
+    /// Postgres, keyed by content identity, with a transactional active pointer.
+    Postgres,
+}
+
+impl CatalogStoreBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InMemory => "in-memory",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+/// What an empty store starts from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogBootstrap {
+    /// Nothing until an import succeeds.
+    #[default]
+    Empty,
+    /// The bundled seed, admitted without claiming upstream confirmation.
+    Seed,
+}
+
+impl Default for CatalogConfig {
+    fn default() -> Self {
+        Self {
+            source: CatalogSourceBackend::None,
+            store: CatalogStoreBackend::InMemory,
+            source_url: None,
+            dsn_env: None,
+            schema: None,
+            create_table: default_catalog_create_table(),
+            refresh_interval_seconds: default_catalog_refresh_interval_seconds(),
+            refresh_timeout_seconds: default_catalog_refresh_timeout_seconds(),
+            retry_initial_seconds: default_catalog_retry_initial_seconds(),
+            retry_max_seconds: default_catalog_retry_max_seconds(),
+            bootstrap: CatalogBootstrap::Empty,
+            max_payload_bytes: default_catalog_max_payload_bytes(),
+            connect_timeout_ms: default_catalog_connect_timeout_ms(),
+            operation_timeout_ms: default_catalog_operation_timeout_ms(),
+        }
+    }
+}
+
+impl CatalogConfig {
+    /// Whether anything at all is imported.
+    ///
+    /// The one question boot asks: a disabled section spawns no task, opens no
+    /// connection, and builds no HTTP client.
+    pub fn enabled(&self) -> bool {
+        self.source != CatalogSourceBackend::None
+    }
+
+    /// The document a models.dev import fetches.
+    pub fn url(&self) -> &str {
+        self.source_url
+            .as_deref()
+            .unwrap_or(crate::backends::models_dev::MODELS_DEV_CATALOG_URL)
+    }
+
+    /// The pacing the background refresh runs at.
+    ///
+    /// Built here rather than validated field by field, so the coherence rules a
+    /// schedule already states — a timeout inside its interval, a backoff
+    /// ceiling that cannot make a refusing deployment refresh less often than a
+    /// healthy one — are checked at boot by their owner.
+    pub fn schedule(&self) -> RefreshSchedule {
+        RefreshSchedule {
+            interval: Duration::from_secs(self.refresh_interval_seconds),
+            timeout: Duration::from_secs(self.refresh_timeout_seconds),
+            backoff: BackoffPolicy {
+                initial: Duration::from_secs(self.retry_initial_seconds),
+                max: Duration::from_secs(self.retry_max_seconds),
+                multiplier: 2,
+            },
+        }
+    }
+
+    /// What an empty store starts from.
+    pub fn bootstrap_mode(&self) -> Bootstrap {
+        match self.bootstrap {
+            CatalogBootstrap::Empty => Bootstrap::Empty,
+            CatalogBootstrap::Seed => Bootstrap::Seed,
+        }
+    }
+
+    /// The retention settings a Postgres store connects with.
+    pub fn store_settings(&self) -> CatalogStoreSettings {
+        CatalogStoreSettings {
+            schema: self.schema.clone(),
+            create_table: self.create_table,
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            operation_timeout: Duration::from_millis(self.operation_timeout_ms),
+        }
+    }
+}
+
+fn default_catalog_create_table() -> bool {
+    true
+}
+
+/// Six hours: models.dev publishes on the order of days, and a conditional
+/// request that answers `304` costs one round trip and no transfer.
+fn default_catalog_refresh_interval_seconds() -> u64 {
+    21_600
+}
+
+fn default_catalog_refresh_timeout_seconds() -> u64 {
+    60
+}
+
+fn default_catalog_retry_initial_seconds() -> u64 {
+    60
+}
+
+fn default_catalog_retry_max_seconds() -> u64 {
+    3_600
+}
+
+fn default_catalog_max_payload_bytes() -> usize {
+    crate::backends::models_dev::MAX_PAYLOAD_BYTES
+}
+
+fn default_catalog_connect_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_catalog_operation_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_revocation_timeout_ms() -> u64 {
     250
 }
@@ -2305,6 +2541,7 @@ impl Config {
                 )));
             }
         }
+        self.validate_catalog()?;
         Ok(())
     }
 
@@ -2380,8 +2617,8 @@ impl Config {
              cannot also be declared in TOML: {}. Import them through `/admin/v1` and publish a \
              revision instead; bootstrap TOML carries `mode`, `[server]`, `[transport]`, \
              `[reload]`, telemetry (`[[usage_sink]]`), `[control_plane]`, `[secret_store]`, \
-             `[[admin_breakglass]]`, and backend selection plus DSN references for the opt-in \
-             `[budget]`, `[rate_limit]`, and `[revocation]` backends",
+             `[[admin_breakglass]]`, `[catalog]`, and backend selection plus DSN references for \
+             the opt-in `[budget]`, `[rate_limit]`, and `[revocation]` backends",
             sections.join(", ")
         )))
     }
@@ -3082,6 +3319,87 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "admission.queue_capacity requires admission.max_in_flight: nothing queues when \
                  the global ceiling is off"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The catalogue import section, checked as the set it is.
+    ///
+    /// A disabled section is not checked at all beyond being disabled: fields
+    /// left at their defaults describe an import that will never be attempted,
+    /// and refusing to boot over them would make the inert default fragile.
+    ///
+    /// Enabled, the rules are the ones a background loop cannot recover from: a
+    /// zero interval or timeout is a busy loop or an instant abandonment, a
+    /// backoff ceiling below its first delay never converges, retention needs a
+    /// DSN reference it can resolve *by name* (the value stays in the
+    /// environment), and a stateful deployment may not retain its catalogue in
+    /// memory it is about to lose.
+    fn validate_catalog(&self) -> Result<(), ConfigError> {
+        let catalog = &self.catalog;
+        if !catalog.enabled() {
+            return Ok(());
+        }
+        for (field, value) in [
+            ("refresh_interval_seconds", catalog.refresh_interval_seconds),
+            ("refresh_timeout_seconds", catalog.refresh_timeout_seconds),
+            ("retry_initial_seconds", catalog.retry_initial_seconds),
+            ("retry_max_seconds", catalog.retry_max_seconds),
+            ("connect_timeout_ms", catalog.connect_timeout_ms),
+            ("operation_timeout_ms", catalog.operation_timeout_ms),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "catalog.{field} must be at least 1"
+                )));
+            }
+        }
+        if catalog.max_payload_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "catalog.max_payload_bytes must be at least 1".into(),
+            ));
+        }
+        catalog
+            .schedule()
+            .validate()
+            .map_err(|error| ConfigError::Invalid(format!("catalog: {error}")))?;
+        if catalog.source == CatalogSourceBackend::ModelsDev {
+            crate::backends::models_dev::ModelsDevAdapter::new(catalog.url())
+                .map_err(|error| ConfigError::Invalid(format!("catalog.source_url: {error}")))?;
+        } else if catalog.source_url.is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "catalog `{}`: `source_url` applies only to `models-dev`",
+                catalog.source.as_str()
+            )));
+        }
+        if catalog.store == CatalogStoreBackend::Postgres {
+            let dsn_env = catalog
+                .dsn_env
+                .as_deref()
+                .or_else(|| {
+                    self.control_plane
+                        .as_ref()
+                        .and_then(|plane| plane.dsn_env.as_deref())
+                })
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            if dsn_env.is_none() {
+                return Err(ConfigError::Invalid(
+                    "catalog `postgres`: `dsn_env` must name the env var holding the connection \
+                     string (or configure `[control_plane]`, whose `dsn_env` it inherits)"
+                        .into(),
+                ));
+            }
+            if let Some(schema) = catalog.schema.as_deref() {
+                validate_schema_name("catalog.schema", schema)?;
+            }
+        } else if self.mode == Mode::Stateful {
+            return Err(ConfigError::Invalid(
+                "catalog `in-memory`: a stateful deployment must retain imported catalogues in \
+                 `postgres`, since an in-memory store loses every snapshot and its provenance on \
+                 restart"
                     .into(),
             ));
         }
@@ -5402,5 +5720,154 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
             [("platform", true)]
         );
         assert_eq!(parsed.mode, config.mode);
+    }
+
+    /// The default is inert: a file that never mentions `[catalog]` imports
+    /// nothing, reaches no network, and opens no connection. #146 adds a source
+    /// an operator may enable, not a fetch every deployment starts performing.
+    #[test]
+    fn a_file_that_does_not_configure_a_catalogue_imports_none() {
+        let config = Config::from_toml_str(VALID).expect("the stateless example still parses");
+        assert_eq!(config.catalog.source, CatalogSourceBackend::None);
+        assert!(
+            !config.catalog.enabled(),
+            "an unconfigured catalogue must not import"
+        );
+    }
+
+    /// What a file is refused for, whether it is refused while loading or while
+    /// its bounds are checked. Which of the two stages a rule lives in is an
+    /// implementation detail to an operator reading the message.
+    fn catalogue_refusal(toml: &str) -> String {
+        match Config::from_toml_str(toml) {
+            Err(error) => error.to_string(),
+            Ok(config) => config
+                .validate_process_local_bounds()
+                .expect_err("the configuration was expected to be refused")
+                .to_string(),
+        }
+    }
+
+    /// A file that must be accepted, with its catalogue section.
+    fn catalogue_config(toml: &str) -> Config {
+        let config = Config::from_toml_str(toml).expect("the configuration must be accepted");
+        config
+            .validate_process_local_bounds()
+            .expect("the configuration must be accepted");
+        config
+    }
+
+    /// Every bound the background loop depends on is checked as a *set* at boot:
+    /// a zero interval is a busy loop against an upstream, a zero timeout
+    /// abandons every import instantly, and a backoff ceiling below its first
+    /// delay never describes a retry.
+    #[test]
+    fn a_catalogue_bound_of_zero_is_refused_at_boot() {
+        for field in [
+            "refresh_interval_seconds",
+            "refresh_timeout_seconds",
+            "retry_initial_seconds",
+            "retry_max_seconds",
+            "connect_timeout_ms",
+            "operation_timeout_ms",
+            "max_payload_bytes",
+        ] {
+            let refusal = catalogue_refusal(&format!(
+                "{VALID}\n[catalog]\nsource = \"models-dev\"\n{field} = 0\n"
+            ));
+            assert!(
+                refusal.contains(field),
+                "the refusal must name `{field}`, said: {refusal}"
+            );
+        }
+
+        let refusal = catalogue_refusal(&format!(
+            "{VALID}\n[catalog]\nsource = \"models-dev\"\nretry_initial_seconds = \
+             600\nretry_max_seconds = 60\n"
+        ));
+        assert!(
+            !refusal.is_empty(),
+            "a backoff ceiling below its first delay is not a schedule"
+        );
+    }
+
+    /// A URL the models.dev adapter does not recognise is refused where it is
+    /// written rather than at the first refresh: an operator who typo'd the
+    /// document path learns at boot, not from a stale catalogue six hours later.
+    #[test]
+    fn a_catalogue_source_url_is_checked_against_the_adapter() {
+        let config = catalogue_config(&format!(
+            "{VALID}\n[catalog]\nsource = \"models-dev\"\nsource_url = \
+             \"https://models.dev/catalog.json\"\n"
+        ));
+        assert_eq!(config.catalog.url(), "https://models.dev/catalog.json");
+
+        let refusal = catalogue_refusal(&format!(
+            "{VALID}\n[catalog]\nsource = \"models-dev\"\nsource_url = \
+             \"https://models.dev/nope\"\n"
+        ));
+        assert!(
+            refusal.contains("catalog.json"),
+            "the refusal must name the document that is supported, said: {refusal}"
+        );
+
+        // A source that reaches no network has no URL to configure, and silently
+        // ignoring one would hide that the file's endpoint is not being used.
+        let refusal = catalogue_refusal(&format!(
+            "{VALID}\n[catalog]\nsource = \"seed\"\nsource_url = \
+             \"https://models.dev/catalog.json\"\n"
+        ));
+        assert!(
+            refusal.contains("source_url"),
+            "`source_url` applies only to the models.dev source, said: {refusal}"
+        );
+    }
+
+    /// Retention needs its DSN *by name*: the connection string stays in the
+    /// environment, and the config holds the name of the variable holding it.
+    /// A deployment that already configured `[control_plane]` inherits its name
+    /// rather than repeating it.
+    #[test]
+    fn postgres_retention_needs_a_dsn_reference_it_can_resolve() {
+        let refusal = catalogue_refusal(&format!(
+            "{VALID}\n[catalog]\nsource = \"models-dev\"\nstore = \"postgres\"\n"
+        ));
+        assert!(
+            refusal.contains("dsn_env"),
+            "the refusal must name the missing reference, said: {refusal}"
+        );
+
+        let config = catalogue_config(&format!(
+            "{VALID}\n[catalog]\nsource = \"models-dev\"\nstore = \"postgres\"\ndsn_env = \
+             \"AXOND_CATALOG_DSN\"\n"
+        ));
+        assert!(
+            !format!("{:?}", config.catalog).contains("postgres://"),
+            "the config must never hold a connection string"
+        );
+
+        catalogue_config(&format!(
+            "{STATEFUL}\n[catalog]\nsource = \"models-dev\"\nstore = \"postgres\"\n"
+        ));
+    }
+
+    /// A stateful deployment may not retain imported catalogues in memory it is
+    /// about to lose. The in-memory store is a development affordance, and
+    /// letting a stateful mode select it would substitute a process-local store
+    /// for the durable contract without saying so — while `[catalog]` itself
+    /// stays bootstrap-owned, like every other backend selection.
+    #[test]
+    fn a_stateful_deployment_may_not_retain_its_catalogue_in_memory() {
+        let refusal = catalogue_refusal(&format!(
+            "{STATEFUL}\n[catalog]\nsource = \"models-dev\"\nstore = \"in-memory\"\n"
+        ));
+        assert!(
+            refusal.contains("postgres"),
+            "the refusal must say where a stateful catalogue is retained, said: {refusal}"
+        );
+
+        catalogue_config(&format!(
+            "{STATEFUL}\n[catalog]\nsource = \"models-dev\"\nstore = \"postgres\"\n"
+        ));
     }
 }

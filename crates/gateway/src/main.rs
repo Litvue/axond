@@ -615,8 +615,47 @@ async fn serve() -> anyhow::Result<()> {
     }
     let (observability, status_refresher) = ReplicaObservability::observing(plan);
 
+    // Metadata ingestion, brought up before the listener and owned by a task of
+    // its own: every import runs off the request path, and a request cannot reach
+    // the source or the store even indirectly (#146). A deployment that imports
+    // nothing — the default — builds no client and opens no connection.
+    //
+    // The stop signal fires after serving ends rather than at `SIGTERM`, which
+    // is the cheap end of the trade: an import already in flight is abandoned no
+    // later than the drain it cannot outlive, and nothing in the drain waits on
+    // it.
+    let (stop_catalogue, catalogue_stopped) = tokio::sync::oneshot::channel::<()>();
+    let catalogue = backends::catalog_runtime::start(
+        &config.catalog,
+        config
+            .control_plane
+            .as_ref()
+            .and_then(|plane| plane.dsn_env.as_deref()),
+        &env,
+        async move {
+            let _ = catalogue_stopped.await;
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("catalogue import configuration failed: {e}"))?;
+    if catalogue.is_some() {
+        tracing::info!(
+            source = config.catalog.source.as_str(),
+            store = config.catalog.store.as_str(),
+            interval_s = config.catalog.refresh_interval_seconds,
+            "catalogue imports"
+        );
+    }
+
     let bind = config.server.bind;
     let watching = config.reload.watch;
+    // The catalogue report is added to whatever posture this replica already
+    // observes: importing metadata is orthogonal to administering a control
+    // plane, and a replica may do either, both, or neither.
+    let observability = match catalogue.as_ref() {
+        None => observability,
+        Some(handle) => observability.with_catalogue(Arc::clone(handle.status())),
+    };
     let state = AppState::new_with_policy(
         config,
         &env,
@@ -715,6 +754,11 @@ async fn serve() -> anyhow::Result<()> {
     if let Some(refreshing) = refreshing {
         let _ = refreshing.await;
     }
+
+    // Nothing below waits on the import: its work is metadata, and the budget
+    // that follows belongs to spend that was already incurred.
+    drop(catalogue);
+    let _ = stop_catalogue.send(());
 
     // One budget for the whole post-serving sequence, not one per step: what an
     // orchestrator's termination grace period has to cover is the total, and the

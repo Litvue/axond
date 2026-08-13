@@ -25,6 +25,8 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::admission::{AdmissionControl, DiagnosticCredential};
 use crate::aliases::AliasScope;
 use crate::availability::{AvailabilityIndex, AvailabilityReader, RuntimeObservations};
+use crate::backends::catalog::CatalogReport;
+use crate::backends::catalog_runtime::CatalogStatus;
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::health::BackendHealth;
 use crate::budget::BudgetStore;
@@ -92,6 +94,11 @@ pub struct Inner {
     /// [`AdminApi::with_convergence`](crate::admin::router::AdminApi::with_convergence):
     /// two instances would let one replica tell two convergence stories.
     pub revision: Option<Arc<RevisionStatus>>,
+    /// What the background catalogue import last reported, when this deployment
+    /// imports one at all. A read of a mutex over a bounded report: the request
+    /// path never reaches the source or the store, and holding this handle is
+    /// what makes that structural rather than a rule (ADR 0043).
+    pub catalogue: Option<Arc<CatalogStatus>>,
     config: ArcSwap<ConfigSnapshot>,
 }
 
@@ -105,6 +112,7 @@ pub struct Inner {
 pub struct ReplicaObservability {
     pub status: Arc<CachedStatusRegistry>,
     pub revision: Option<Arc<RevisionStatus>>,
+    pub catalogue: Option<Arc<CatalogStatus>>,
 }
 
 impl ReplicaObservability {
@@ -114,6 +122,7 @@ impl ReplicaObservability {
         Self {
             status: Arc::new(CachedStatusRegistry::stateless()),
             revision: None,
+            catalogue: None,
         }
     }
 
@@ -146,6 +155,7 @@ impl ReplicaObservability {
                 // no convergence state to report and an empty report would be a
                 // false all-clear (#142).
                 revision: None,
+                catalogue: None,
             },
             Some(refresher),
         )
@@ -181,6 +191,17 @@ impl ReplicaObservability {
             plan.observe(Arc::new(BackendProbe::new(component, health)), pacing);
         }
         plan
+    }
+
+    /// Report on the catalogue the background import is keeping current.
+    ///
+    /// Separate from the constructors because catalogue imports are orthogonal to
+    /// the mode: a stateless deployment may import metadata into a development
+    /// store, and a stateful one may import none at all.
+    #[must_use]
+    pub fn with_catalogue(mut self, catalogue: Arc<CatalogStatus>) -> Self {
+        self.catalogue = Some(catalogue);
+        self
     }
 }
 
@@ -819,6 +840,7 @@ impl AppState {
             lifecycle: Arc::new(Lifecycle::new()),
             status: observability.status,
             revision: observability.revision,
+            catalogue: observability.catalogue,
             config: ArcSwap::from_pointee(snapshot),
         })))
     }
@@ -836,6 +858,18 @@ impl AppState {
     /// This replica's convergence report, when it converges at all.
     pub fn revision_report(&self) -> Option<RevisionReport> {
         self.0.revision.as_ref().map(|status| status.report())
+    }
+
+    /// What the catalogue import last reported, when this deployment imports.
+    ///
+    /// `None` covers both "imports nothing" and "has not finished its first
+    /// attempt", which are the same thing to a caller: there is nothing to say
+    /// about a catalogue yet.
+    pub fn catalogue_report(&self) -> Option<CatalogReport> {
+        self.0
+            .catalogue
+            .as_ref()
+            .and_then(|catalogue| catalogue.report())
     }
 
     /// The config snapshot a request runs against. Taken once per request and

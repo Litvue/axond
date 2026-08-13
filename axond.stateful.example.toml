@@ -126,3 +126,14 @@ id = "breakglass"
 # kind = "postgres"
 # dsn_env = "AXOND_USAGE_POSTGRES_DSN"
 # create_table = false
+
+# ── Imported model metadata (opt-in) ────────────────────────────────────────
+# Bootstrap-owned like every other backend selection: `[catalog]` says where the
+# import reads from and where it retains, not which models a tenant may call. A
+# stateful deployment retains in Postgres, inheriting [control_plane].dsn_env
+# unless it names its own. Apply ops/postgres/catalog_v1.sql before enabling.
+
+# [catalog]
+# source = "models-dev" # none (default) | models-dev | seed
+# store = "postgres" # required in this mode when a source is enabled
+# refresh_interval_seconds = 21_600

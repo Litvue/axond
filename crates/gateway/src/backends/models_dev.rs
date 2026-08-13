@@ -83,7 +83,8 @@ use serde_json::value::RawValue;
 
 use super::catalog::{
     CatalogContent, CatalogContentError, CatalogError, CatalogModelEntry, CatalogProvider,
-    CatalogRefresh, CatalogSnapshot, CatalogSource, ETag, InvalidCatalogId, JsonPointer, Modality,
+    CatalogRefresh, CatalogSnapshot, CatalogSource, ETag, HttpDate, InvalidCatalogId, JsonPointer,
+    Modality,
     ModelCapability, ModelFacts, ModelField, ModelId, ModelLifecycle, ModelLimits, ObservedPrice,
     ObservedRate, PriceRates, PriceTier, PriceTierThreshold, ProviderEndpoint, ProviderOffering,
     RawPayload, Refusable, Refusal, RefusalReason, SchemaVersion, SourceValidators, excerpt,
@@ -1617,6 +1618,103 @@ pub trait CatalogFetch: Send + Sync {
     ) -> Result<FetchResponse, FetchError>;
 }
 
+/// The [`CatalogFetch`] a deployment uses: one conditional HTTP `GET`, streamed
+/// under a ceiling.
+///
+/// It is the *only* HTTP client this crate builds outside the provider transport,
+/// and it is built by the background catalogue worker rather than by shared
+/// state, so nothing on the request path holds a handle that could reach
+/// models.dev.
+///
+/// The conditional headers are sent from what the catalogue already holds, and
+/// whatever the answer states is taken back: a `304` costs one round trip and no
+/// transfer, which is what makes a frequent refresh interval cheap for the
+/// upstream as well as for the deployment.
+pub struct HttpCatalogFetch {
+    client: reqwest::Client,
+    limit: usize,
+}
+
+impl std::fmt::Debug for HttpCatalogFetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpCatalogFetch")
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpCatalogFetch {
+    /// A client bounded by `timeout` end to end.
+    ///
+    /// The timeout is the client's own rather than only the refresher's, so a
+    /// connection that stalls mid-body is abandoned by the layer holding the
+    /// socket instead of being left for a cancelled task to drop.
+    pub fn new(timeout: Duration) -> Result<Self, FetchError> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|error| FetchError::Transport {
+                message: error.to_string(),
+            })?;
+        Ok(Self {
+            client,
+            limit: MAX_PAYLOAD_BYTES,
+        })
+    }
+
+    /// Hold less than [`MAX_PAYLOAD_BYTES`] of any one answer.
+    #[must_use]
+    pub const fn holding_at_most(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
+#[async_trait]
+impl CatalogFetch for HttpCatalogFetch {
+    async fn get(
+        &self,
+        url: &str,
+        validators: Option<&SourceValidators>,
+    ) -> Result<FetchResponse, FetchError> {
+        let mut request = self.client.get(url);
+        if let Some(ETag(etag)) = validators.and_then(|validators| validators.etag.as_ref()) {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(HttpDate(date)) =
+            validators.and_then(|validators| validators.last_modified.as_ref())
+        {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, date);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| FetchError::Transport {
+                message: error.to_string(),
+            })?;
+        let validators = SourceValidators {
+            etag: response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| ETag(value.to_owned())),
+            last_modified: response
+                .headers()
+                .get(reqwest::header::LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| HttpDate(value.to_owned())),
+        };
+        match response.status().as_u16() {
+            304 => Ok(FetchResponse::NotModified { validators }),
+            200 => Ok(FetchResponse::Payload {
+                bytes: bounded_body(response, self.limit).await?,
+                validators,
+            }),
+            status => Err(FetchError::Status { status }),
+        }
+    }
+}
+
 /// The models.dev source: a conditional fetch, then a strict parse.
 ///
 /// Background use only. Nothing constructs one on the request path, and this
@@ -1692,7 +1790,7 @@ mod tests {
     use axum::routing::get;
 
     use super::super::catalog::{
-        Admission, CatalogChange, HttpDate, LastKnownGoodCatalog, ModelCapability, ProviderId,
+        Admission, CatalogChange, LastKnownGoodCatalog, ModelCapability, ProviderId,
     };
     use super::super::{BackendFailure, FailureCategory};
     use super::*;
@@ -2684,69 +2782,13 @@ mod tests {
             .into_response()
     }
 
-    /// The minimal `reqwest` fetch the test drives the source through.
-    struct HttpFetch {
-        client: reqwest::Client,
-        limit: usize,
-    }
-
-    impl HttpFetch {
-        fn new() -> Self {
-            Self {
-                client: reqwest::Client::new(),
-                limit: MAX_PAYLOAD_BYTES,
-            }
-        }
-
-        const fn holding_at_most(mut self, limit: usize) -> Self {
-            self.limit = limit;
-            self
-        }
-    }
-
-    #[async_trait]
-    impl CatalogFetch for HttpFetch {
-        async fn get(
-            &self,
-            url: &str,
-            validators: Option<&SourceValidators>,
-        ) -> Result<FetchResponse, FetchError> {
-            let mut request = self.client.get(url);
-            if let Some(ETag(etag)) = validators.and_then(|validators| validators.etag.as_ref()) {
-                request = request.header(reqwest::header::IF_NONE_MATCH, etag);
-            }
-            if let Some(HttpDate(date)) =
-                validators.and_then(|validators| validators.last_modified.as_ref())
-            {
-                request = request.header(reqwest::header::IF_MODIFIED_SINCE, date);
-            }
-            let response = request
-                .send()
-                .await
-                .map_err(|error| FetchError::Transport {
-                    message: error.to_string(),
-                })?;
-            let validators = SourceValidators {
-                etag: response
-                    .headers()
-                    .get(reqwest::header::ETAG)
-                    .and_then(|value| value.to_str().ok())
-                    .map(|value| ETag(value.to_owned())),
-                last_modified: response
-                    .headers()
-                    .get(reqwest::header::LAST_MODIFIED)
-                    .and_then(|value| value.to_str().ok())
-                    .map(|value| HttpDate(value.to_owned())),
-            };
-            match response.status().as_u16() {
-                304 => Ok(FetchResponse::NotModified { validators }),
-                200 => Ok(FetchResponse::Payload {
-                    bytes: bounded_body(response, self.limit).await?,
-                    validators,
-                }),
-                status => Err(FetchError::Status { status }),
-            }
-        }
+    /// The production fetch, bounded the way a background refresh bounds it.
+    ///
+    /// The tests drive the shipped [`HttpCatalogFetch`] rather than a stand-in, so
+    /// the conditional-request behaviour asserted here is the behaviour a
+    /// deployment gets.
+    fn fetch() -> HttpCatalogFetch {
+        HttpCatalogFetch::new(Duration::from_secs(30)).expect("a client builds")
     }
 
     /// Serve `payload` from a local `catalog.json`, and count the transfers.
@@ -2774,7 +2816,7 @@ mod tests {
     #[tokio::test]
     async fn a_conditional_refresh_transfers_nothing_when_the_upstream_is_unchanged() {
         let (adapter, transfers) = upstream(IDENTITY).await;
-        let source = ModelsDevSource::new(adapter, HttpFetch::new());
+        let source = ModelsDevSource::new(adapter, fetch());
         let mut catalogue = LastKnownGoodCatalog::new();
 
         let CatalogRefresh::Updated { snapshot, .. } =
@@ -2923,7 +2965,7 @@ mod tests {
     async fn an_oversized_payload_is_refused_rather_than_held() {
         let ceiling = IDENTITY.len() - 1;
         let (adapter, transfers) = upstream(IDENTITY).await;
-        let source = ModelsDevSource::new(adapter, HttpFetch::new().holding_at_most(ceiling));
+        let source = ModelsDevSource::new(adapter, fetch().holding_at_most(ceiling));
 
         let error = source
             .refresh(None)
