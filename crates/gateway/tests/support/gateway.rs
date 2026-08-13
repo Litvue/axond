@@ -144,8 +144,10 @@ pub struct Axond {
     /// This boot's own config directory, removed with the process that read it.
     config_dir: PathBuf,
     output: Arc<Mutex<Output>>,
-    /// The threads draining the child's pipes into `output`, kept so a failed
-    /// boot can wait for them before quoting what the child said.
+    /// The threads draining the child's pipes into `output`, kept so a caller
+    /// can wait for them to reach EOF before quoting what the child said: the
+    /// last lines a process writes are the ones it flushes on its way out, and
+    /// reading the buffer the instant the child is reaped would miss them.
     readers: Vec<JoinHandle<()>>,
 }
 
@@ -445,6 +447,24 @@ impl Axond {
                 None if Instant::now() >= deadline => return None,
                 None => tokio::time::sleep(Duration::from_millis(20)).await,
             }
+        }
+    }
+
+    /// Wait until the readers of the child's stdout and stderr have reached
+    /// EOF, up to `within`. An exited child is reaped before the pipe it wrote
+    /// to has been drained, so a caller that reads the buffer immediately after
+    /// [`Axond::await_exit`] can miss the very lines a shutdown flush emits.
+    pub async fn settle_output(&self, within: Duration) {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if self
+                .readers
+                .iter()
+                .all(std::thread::JoinHandle::is_finished)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

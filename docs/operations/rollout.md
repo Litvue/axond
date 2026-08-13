@@ -53,7 +53,7 @@ Hard failures — all of them environment-independent:
 | `max_usage_record_loss` | One usage record per request, all flushed before the process exits. |
 | `max_readiness_removal_ms` | How long after `SIGTERM` the balancer still considers the replica ready. |
 | `max_replacement_admission_ms` | How long a new replica takes from boot to carrying traffic. |
-| `max_drain_exit_slack_ms` | Termination inside `drain_grace_ms + deadline_ms + flush_timeout_ms`. |
+| `max_drain_exit_slack_ms` | How far past `drain_grace_ms + deadline_ms + flush_timeout_ms` a termination may run. |
 | `min_mixed_version_requests` | The mixed-version window genuinely served both revisions. |
 
 Also asserted: the pinned buffered request finished after the signal rather than

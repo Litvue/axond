@@ -203,7 +203,12 @@ pub struct ReplicaRecord {
     pub id: String,
     pub revision: String,
     /// When the balancer first routed to it, as an offset from the run's start.
+    /// Timeline context, not a duration: a late replacement in a long run has a
+    /// large offset and a fast admission.
     pub admitted_at_ms: Option<u128>,
+    /// How long the replica took to go from added to carrying traffic. The
+    /// admission the surge is judged on.
+    pub admission_took_ms: Option<u128>,
     pub withdrawn_at_ms: Option<u128>,
     pub requests_served: u64,
     pub requests_after_withdrawal: u64,
@@ -248,6 +253,9 @@ pub struct DrainRecord {
     /// How long the process took to exit, and whether it exited cleanly.
     pub exited_after_ms: Option<u128>,
     pub exit_clean: bool,
+    /// The bound the process advertises: drain grace, shutdown deadline, and
+    /// sink flush. The harness waits longer than this before giving up, so an
+    /// exit that overruns is recorded rather than made impossible.
     pub exit_budget_ms: u128,
     /// Requests the balancer sent here after recording the withdrawal.
     pub requests_after_withdrawal: u64,

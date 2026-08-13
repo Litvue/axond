@@ -38,17 +38,26 @@ pub const REVISION_HEADER: &str = "x-axond-revision";
 /// process is actually away.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// What the balancer currently believes about one member. Readiness and
+/// withdrawal live under one lock rather than in separate atomics, so a request
+/// picked while the member was ready can never be attributed to the withdrawal
+/// that happened after the pick.
+#[derive(Default)]
+struct Health {
+    ready: bool,
+    /// Whether readiness has ever been observed, which is what makes admission
+    /// distinguishable from "not yet probed".
+    admitted: bool,
+    admitted_at: Option<Duration>,
+    withdrawn_at: Option<Duration>,
+}
+
 /// One replica in rotation.
 pub struct Member {
     pub id: String,
     pub revision: String,
     pub base_url: String,
-    ready: AtomicBool,
-    /// Whether readiness has ever been observed, which is what makes admission
-    /// distinguishable from "not yet probed".
-    admitted: AtomicBool,
-    admitted_at: Mutex<Option<Duration>>,
-    withdrawn_at: Mutex<Option<Duration>>,
+    health: Mutex<Health>,
     forwards: AtomicU64,
     forwards_after_withdrawal: AtomicU64,
     refusals: AtomicU64,
@@ -60,10 +69,7 @@ impl Member {
             id,
             revision,
             base_url,
-            ready: AtomicBool::new(false),
-            admitted: AtomicBool::new(false),
-            admitted_at: Mutex::new(None),
-            withdrawn_at: Mutex::new(None),
+            health: Mutex::new(Health::default()),
             forwards: AtomicU64::new(0),
             forwards_after_withdrawal: AtomicU64::new(0),
             refusals: AtomicU64::new(0),
@@ -71,20 +77,20 @@ impl Member {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::SeqCst)
+        self.health.lock().expect("ingress lock").ready
     }
 
     /// When the ingress first saw this member ready, as an offset from the run's
     /// start.
     pub fn admitted_at(&self) -> Option<Duration> {
-        *self.admitted_at.lock().expect("ingress lock")
+        self.health.lock().expect("ingress lock").admitted_at
     }
 
     /// When the ingress first saw an admitted member stop being ready — the
     /// instant a rolling deployment cares about, because from here on no caller
     /// may be sent to it.
     pub fn withdrawn_at(&self) -> Option<Duration> {
-        *self.withdrawn_at.lock().expect("ingress lock")
+        self.health.lock().expect("ingress lock").withdrawn_at
     }
 
     pub fn forwards(&self) -> u64 {
@@ -104,16 +110,14 @@ impl Member {
     }
 
     fn observe(&self, ready: bool, elapsed: Duration) {
-        let was = self.ready.swap(ready, Ordering::SeqCst);
+        let mut health = self.health.lock().expect("ingress lock");
+        let was = std::mem::replace(&mut health.ready, ready);
         if ready {
-            if !self.admitted.swap(true, Ordering::SeqCst) {
-                *self.admitted_at.lock().expect("ingress lock") = Some(elapsed);
+            if !std::mem::replace(&mut health.admitted, true) {
+                health.admitted_at = Some(elapsed);
             }
-        } else if was && self.admitted.load(Ordering::SeqCst) {
-            let mut withdrawn = self.withdrawn_at.lock().expect("ingress lock");
-            if withdrawn.is_none() {
-                *withdrawn = Some(elapsed);
-            }
+        } else if was && health.admitted && health.withdrawn_at.is_none() {
+            health.withdrawn_at = Some(elapsed);
         }
     }
 }
@@ -162,8 +166,11 @@ impl IngressState {
     }
 
     /// The next ready member, round-robin, skipping `exclude` — the members that
-    /// already refused this request.
-    fn pick(&self, exclude: &[String]) -> Option<Arc<Member>> {
+    /// already refused this request. Also reports whether that member had
+    /// already been withdrawn when it was chosen: read under the same lock as
+    /// its readiness, so a withdrawal recorded a moment later cannot be blamed
+    /// on a request the balancer was entitled to place.
+    fn pick(&self, exclude: &[String]) -> Option<(Arc<Member>, bool)> {
         let members = self.members();
         if members.is_empty() {
             return None;
@@ -171,7 +178,13 @@ impl IngressState {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         (0..members.len()).find_map(|offset| {
             let member = &members[(start + offset) % members.len()];
-            (member.is_ready() && !exclude.contains(&member.id)).then(|| member.clone())
+            if exclude.contains(&member.id) {
+                return None;
+            }
+            let health = member.health.lock().expect("ingress lock");
+            health
+                .ready
+                .then(|| (member.clone(), health.withdrawn_at.is_some()))
         })
     }
 }
@@ -323,11 +336,11 @@ async fn proxy(State(state): State<Arc<IngressState>>, request: Request) -> Resp
     // than retried forever.
     let budget = state.members().len().max(1);
     for _ in 0..budget {
-        let Some(member) = state.pick(&refused) else {
+        let Some((member, withdrawn)) = state.pick(&refused) else {
             break;
         };
         member.forwards.fetch_add(1, Ordering::SeqCst);
-        if member.withdrawn_at().is_some() {
+        if withdrawn {
             member
                 .forwards_after_withdrawal
                 .fetch_add(1, Ordering::SeqCst);

@@ -37,6 +37,11 @@ pub const NEXT: &str = "next";
 /// replaced yet, which is the documented rule made observable.
 pub const NEXT_ONLY_ALIAS: &str = "chat-next-only";
 
+/// How long a retiring replica's output pipe is given to reach EOF once the
+/// process is gone. Generous: it is only ever waited out when a reader thread
+/// is starved, and the alternative is a phantom lost usage record.
+const OUTPUT_SETTLE: Duration = Duration::from_secs(5);
+
 /// The transport bounds every replica is booted with. Written out rather than
 /// defaulted so the recorded config hash pins them: a later change to a shipped
 /// default must not silently move a qualification result.
@@ -177,13 +182,20 @@ impl Fleet {
             .iter()
             .position(|replica| replica.id == id)
             .unwrap_or_else(|| panic!("{id} is not a live replica"));
-        let budget = self.shutdown.budget() + slack;
+        // Two different bounds: the one the process advertises, which is what a
+        // drain is judged against, and the longer one the harness is willing to
+        // wait before calling the termination unbounded. Folding the slack into
+        // the reported budget would make the overrun zero by construction.
+        let budget = self.shutdown.budget();
         let mut replica = self.replicas.remove(index);
         let status = replica
             .process
-            .await_exit(budget.saturating_sub(signalled.elapsed()))
+            .await_exit((budget + slack).saturating_sub(signalled.elapsed()))
             .await;
         let took = status.map(|_| signalled.elapsed());
+        // The records a replica flushes on its way out are written just before
+        // it exits, so the pipe is drained before the buffer is read.
+        replica.process.settle_output(OUTPUT_SETTLE).await;
         let output = replica.process.output();
         let usage_records = replica.process.usage_records();
         self.retired.push(Retired {
@@ -239,9 +251,13 @@ impl Fleet {
 pub struct Drained {
     pub id: String,
     pub revision: Revision,
-    /// How long the process took to exit; `None` if it outlived `budget`.
+    /// How long the process took to exit; `None` if it outlived `budget` plus
+    /// the harness' slack.
     pub took: Option<Duration>,
     pub clean: bool,
+    /// The bound the process itself advertises: drain grace, shutdown deadline,
+    /// and sink flush. Exclusive of the harness' slack, so an overrun is
+    /// measurable.
     pub budget: Duration,
     pub usage_records: Vec<Value>,
     /// Everything the process logged, kept for a failure message.

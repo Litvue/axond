@@ -185,6 +185,11 @@ struct Harness {
     /// offered rather than from what turned up.
     expected_usage: u64,
     mixed_probe: Option<MixedVersion>,
+    /// How long each replica took from being booted to carrying traffic. Kept
+    /// per replica because the offset the balancer records is an offset from the
+    /// run's start, which grows with the run rather than with how slowly a
+    /// replacement was admitted.
+    admissions: BTreeMap<String, Duration>,
 }
 
 impl Harness {
@@ -202,6 +207,7 @@ impl Harness {
             traffic: Vec::new(),
             expected_usage: 0,
             mixed_probe: None,
+            admissions: BTreeMap::new(),
         }
     }
 
@@ -252,6 +258,9 @@ impl Harness {
         let (id, base_url) = (replica.id.clone(), replica.base_url().to_owned());
         self.ingress.add(&id, revision.label, &base_url);
         let admitted = self.ingress.await_admission(&id, bound).await;
+        if admitted.is_some() {
+            self.admissions.insert(id.clone(), booting.elapsed());
+        }
         self.timeline.at(
             "admission",
             "replica-admitted",
@@ -907,6 +916,10 @@ fn fleet_records(harness: &Harness, drains: &[DrainRecord]) -> Vec<ReplicaRecord
                 id: member.id.clone(),
                 revision: member.revision.clone(),
                 admitted_at_ms: member.admitted_at().map(|at| at.as_millis()),
+                admission_took_ms: harness
+                    .admissions
+                    .get(&member.id)
+                    .map(|took| took.as_millis()),
                 withdrawn_at_ms: member.withdrawn_at().map(|at| at.as_millis()),
                 requests_served: member.forwards(),
                 requests_after_withdrawal: member.forwards_after_withdrawal(),
@@ -1019,12 +1032,15 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
             worst(|drain| drain.readiness_removed_after_ms),
             thresholds.max_readiness_removal_ms as f64,
         ),
+        // How long a replacement took to start carrying traffic, not when in the
+        // run it did so: the offset grows with every phase, the admission does
+        // not.
         Verdict::at_most(
             "max_replacement_admission_ms",
             result
                 .fleet
                 .iter()
-                .filter_map(|replica| replica.admitted_at_ms)
+                .filter_map(|replica| replica.admission_took_ms)
                 .max()
                 .unwrap_or_default() as f64,
             thresholds.max_replacement_admission_ms as f64,
