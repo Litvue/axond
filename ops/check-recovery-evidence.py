@@ -227,7 +227,20 @@ def self_test() -> int:
         "evidence": [c for c in stage["evidence"] if c != "revision_loss_boundary"],
     }
 
+    # A leak check that checks for nothing is the one lie the artifacts cannot
+    # carry: it is told by the caller, so it is caught here.
+    os.environ.pop("AXOND_ABSENT_SECRET", None)
+    os.environ["AXOND_PRESENT_SECRET"] = "the-drill-credential"
     complaints: list[str] = []
+    try:
+        resolve_forbidden(["AXOND_PRESENT_SECRET", "AXOND_ABSENT_SECRET"])
+    except SystemExit:
+        pass
+    else:
+        complaints.append("an unset --forbid-env name: the checker accepted it")
+    if resolve_forbidden(["AXOND_PRESENT_SECRET"]) != ["the-drill-credential"]:
+        complaints.append("a set --forbid-env name: the checker did not resolve it")
+
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / f"{scenario['id']}.{stage['id']}.json"
         path.write_text(
@@ -281,8 +294,27 @@ def self_test() -> int:
         for complaint in complaints:
             print(f"  {complaint}", file=sys.stderr)
         return 1
-    print(f"the evidence checker catches {len(cases) + 1} ways an artifact can lie")
+    print(f"the evidence checker catches {len(cases) + 2} ways an artifact can lie")
     return 0
+
+
+def resolve_forbidden(names: list[str]) -> list[str]:
+    """The secret values behind `--forbid-env` names, or a refusal.
+
+    A misspelled or unexported name would otherwise resolve to the empty string
+    and be skipped, so the run would report clean evidence while checking for
+    nothing. The gate is the reason the artifacts can be published, so it fails
+    loudly instead.
+    """
+    missing = [name for name in names if not os.environ.get(name)]
+    if missing:
+        raise SystemExit(
+            "--forbid-env names "
+            + ", ".join(missing)
+            + ", which is unset or empty, so the leak check would pass by checking "
+            "for nothing; export it or drop the flag"
+        )
+    return [os.environ[name] for name in names]
 
 
 def main() -> int:
@@ -305,7 +337,8 @@ def main() -> int:
         metavar="NAME",
         help=(
             "an environment variable whose value no artifact may contain, such as "
-            "the drill's credential; unset or empty names are ignored"
+            "the drill's credential; a name that is unset or empty is an error, "
+            "because a leak check that checks for nothing passes everything"
         ),
     )
     parser.add_argument(
@@ -315,7 +348,7 @@ def main() -> int:
         help="refuse an artifact that began before this instant, in Unix milliseconds",
     )
     args = parser.parse_args()
-    forbid = [os.environ.get(name, "") for name in args.forbid_env]
+    forbid = resolve_forbidden(args.forbid_env)
     if args.self_test:
         return self_test()
     if not args.runner:

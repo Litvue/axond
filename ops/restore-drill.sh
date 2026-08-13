@@ -467,7 +467,7 @@ require "the_audit_trail_names_the_breakglass_actor" breakglass \
   "$(printf '%s' "$audit" | jq -r '.events[0].actor.kind')" \
   "the restored trail attributes the publication to the identity that made it"
 require "the_audit_trail_carries_no_secret_material" clean \
-  "$(printf '%s' "$audit" | grep -qF "$GW_DRILL_BREAKGLASS" && echo leaked || echo clean)" \
+  "$(printf '%s' "$audit" | grep -F "$GW_DRILL_BREAKGLASS" >/dev/null && echo leaked || echo clean)" \
   "an audit read names the credential's env var, never its value"
 
 successes="$(unauthenticated_successes "$logical_endpoint")"
@@ -640,7 +640,7 @@ require "the_audit_trail_survives_the_recovery" true \
   "$(printf '%s' "$audit" | jq '(.events | length) > 0')" \
   "the trail for a revision on the safe side of the target came back with it"
 require "the_audit_trail_carries_no_secret_material" clean \
-  "$(printf '%s' "$audit" | grep -qF "$GW_DRILL_BREAKGLASS" && echo leaked || echo clean)" \
+  "$(printf '%s' "$audit" | grep -F "$GW_DRILL_BREAKGLASS" >/dev/null && echo leaked || echo clean)" \
   "an audit read names the credential's env var, never its value"
 require "the_audit_after_the_target_is_gone" refused \
   "$(admin audit --revision "$post_target_head" >/dev/null 2>&1 && echo readable || echo refused)" \
