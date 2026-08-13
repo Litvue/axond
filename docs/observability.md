@@ -179,7 +179,7 @@ None of this is an availability incident. Catalogue freshness is not an
 admission, entitlement, billing, readiness, or liveness dependency: a stale
 catalogue degrades metadata quality (a new model or a changed published price is
 not yet known), and observed prices are metadata that never activate billing on
-their own ([ADR 0037](./adr/0037-catalogue-source-imports.md)). Do not fail a
+their own ([ADR 0038](./adr/0038-catalogue-source-imports.md)). Do not fail a
 replica out, roll back, or restart on this alert; a restart imports nothing new
 and loses the active snapshot.
 

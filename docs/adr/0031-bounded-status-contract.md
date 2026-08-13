@@ -166,7 +166,7 @@ a config-only deployment at Tier 0.
 - Amended by #241: the deployment-scope response carries one string that is not
   a closed vocabulary, the active catalogue's content id, as a fixed-width prefix
   of a digest this process computed over content it normalized itself
-  ([ADR 0037](./0037-catalogue-source-imports.md)). Nothing upstream said reaches
+  ([ADR 0038](./0038-catalogue-source-imports.md)). Nothing upstream said reaches
   it, it is omitted at namespace scope, and it is not a metric label; the
   free-text sweep that guards this contract now permits exactly that digest and
   nothing else. The rule the exception keeps is the one that matters: a response
