@@ -133,7 +133,11 @@ declaration is handed the key and the evidence separately, it also refuses evide
 naming another scope or target — the observation path derives the key from the look
 and so cannot mis-file one — and counts the refusal, so a projection deriving evidence
 against the wrong key surfaces rather than deciding one tenant's answer from another's
-listing.
+listing. The conclusion such a record declares is refused with it: a mis-filed look
+whose instant were still folded in would discard a positive the receiving scope can
+genuinely reach, which is the same cross-scope decision by timing alone. Replaying
+stored evidence is not disorder either — a look either slot already holds was applied
+when it first arrived, so re-deriving an index reports only genuinely late arrivals.
 
 **Uncertainty is routable only where a scope chose it.** `unknown` and `stale` are
 not refusals, but routability is a property of the whole verdict:

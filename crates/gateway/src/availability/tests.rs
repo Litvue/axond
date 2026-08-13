@@ -776,6 +776,68 @@ fn a_declaration_refuses_evidence_that_names_another_scope() {
     );
 }
 
+/// Refusing a mis-filed look and then folding in the conclusion it reached would leak
+/// the same decision by its timing alone: one scope's listing instant would discard a
+/// positive another scope can genuinely reach.
+#[test]
+fn a_misfiled_declaration_cannot_discredit_another_scope_by_its_timing() {
+    let mine = ScopeRef::tenant(tenant(1));
+    let theirs = ScopeRef::tenant(tenant(2));
+    let builder = AvailabilityIndex::builder()
+        .record(key(mine, "gpt-4o"), permitting())
+        .observe(present(mine, "gpt-4o", 100, None))
+        .record(
+            key(mine, "gpt-4o"),
+            AvailabilityRecord {
+                discovery: Some(absent(theirs, "gpt-4o", 500)),
+                definitive_at: Some(at(500)),
+                ..permitting()
+            },
+        );
+
+    assert_eq!(builder.misfiled(), 1);
+    let index = builder.build();
+    let record = index.record(&key(mine, "gpt-4o")).expect("the key is held");
+    assert_eq!(
+        record.definitive_at,
+        Some(at(100)),
+        "another tenant's conclusion is not this tenant's watermark"
+    );
+    assert_eq!(
+        index.evaluate(&key(mine, "gpt-4o"), at(600)).state,
+        AvailabilityState::Available,
+        "and the model this tenant can reach stays reachable"
+    );
+}
+
+/// Replaying stored evidence in order is not disorder, including the positive a failed
+/// refresh displaced into the retained slot: `superseded` is the operator's signal that
+/// a projection is feeding looks out of order, so it must not fire on a faithful
+/// replay.
+#[test]
+fn replaying_a_retained_look_reports_no_disorder() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .observe(outage(scope, "gpt-4o", 600))
+        .build();
+    let record = index
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held");
+    assert_eq!(
+        record.last_known_good,
+        Some(present(scope, "gpt-4o", 100, None))
+    );
+
+    let builder = AvailabilityIndexBuilder::from_index(&index)
+        .observe(present(scope, "gpt-4o", 100, None))
+        .observe(outage(scope, "gpt-4o", 600));
+
+    assert_eq!(builder.superseded(), 0, "nothing arrived out of order");
+    assert_eq!(builder.build(), index, "and nothing changed");
+}
+
 /// A hand-built record can carry a retained look newer than its current one, which
 /// no observed sequence produces. Evidence follows the newer of the two, or the
 /// record would report a refusal while holding newer positive evidence.

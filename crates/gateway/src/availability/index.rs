@@ -444,25 +444,32 @@ impl AvailabilityIndexBuilder {
     /// the listing itself would have.
     ///
     /// Evidence that names a different scope or target than `key` is refused and
-    /// counted in [`misfiled`](Self::misfiled). [`observe`](Self::observe) derives the
-    /// key from the look itself and so cannot mis-file one; a declaration is handed
-    /// both halves and could disagree, and one scope's listing deciding another's
-    /// verdict is the one thing the keying exists to prevent.
+    /// counted in [`misfiled`](Self::misfiled), and so is the conclusion a record
+    /// carrying it declares — timing drawn from another scope's listing must not decide
+    /// this one's verdict either. [`observe`](Self::observe) derives the key from the
+    /// look itself and so cannot mis-file one; a declaration is handed both halves and
+    /// could disagree, and one scope's listing deciding another's verdict is the one
+    /// thing the keying exists to prevent.
     #[must_use]
     pub fn record(mut self, key: AvailabilityKey, record: AvailabilityRecord) -> Self {
-        let declared_conclusion = record.definitive_at;
         let owned = |evidence: &Option<DiscoveryObservation>| {
             evidence.clone().filter(|look| look.key() == key)
         };
         let retained = owned(&record.last_known_good);
         let current = owned(&record.discovery);
-        self.misfiled += [
+        let misfiled = [
             (&record.last_known_good, &retained),
             (&record.discovery, &current),
         ]
         .iter()
         .filter(|(declared, kept)| declared.is_some() && kept.is_none())
         .count();
+        self.misfiled += misfiled;
+        // A record that mis-names its evidence is not about this key, so its conclusion
+        // is not either: folding the instant in would let one scope's listing timing
+        // discard another scope's positive, which is the cross-scope decision the
+        // refusal above exists to prevent.
+        let declared_conclusion = (misfiled == 0).then_some(record.definitive_at).flatten();
         let entry = self.records.entry(key).or_default();
         // The dimensions are replaced; the evidence and the conclusion are not, so
         // that what the declaration carries can be judged against what the index has
@@ -537,15 +544,20 @@ impl AvailabilityIndexBuilder {
     /// observation, while retention is judged against
     /// [`definitive_at`](AvailabilityRecord::definitive_at) — every conclusive
     /// answer this key has ever reached, not merely the ones still held. Replaying a
-    /// look the current slot already holds discards nothing and is not counted in
+    /// look either slot already holds discards nothing and is not counted in
     /// [`superseded`](Self::superseded), so re-deriving an index from stored evidence
     /// does not report disorder. The rest of the rules are in the module docs.
     #[must_use]
     pub fn observe(mut self, observation: DiscoveryObservation) -> Self {
         let entry = self.records.entry(observation.key()).or_default();
-        // A look the current slot already holds was applied when it first arrived:
-        // re-applying it discards nothing, so it is not an out-of-order arrival.
-        if entry.discovery.as_ref() != Some(&observation) && !Self::admit(entry, observation) {
+        // A look either slot already holds was applied when it first arrived:
+        // re-applying it discards nothing, so it is not an out-of-order arrival. The
+        // retained slot counts as well as the current one, or replaying stored evidence
+        // in order — a positive retained across the failed refresh that displaced it —
+        // would report the disorder the counter exists to distinguish from it.
+        let held = entry.discovery.as_ref() == Some(&observation)
+            || entry.last_known_good.as_ref() == Some(&observation);
+        if !held && !Self::admit(entry, observation) {
             self.superseded += 1;
         }
         self
