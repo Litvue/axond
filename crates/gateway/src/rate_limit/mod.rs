@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
+use crate::backends::health::BackendHealth;
 use crate::config::{BudgetConfig, RateLimitBackend, RateLimitConfig};
 use crate::policy::{Ceilings, PolicyHold};
 use crate::telemetry::metrics;
@@ -106,6 +107,17 @@ impl Drop for RateLimitPermit {
 pub trait RateLimiter: Send + Sync {
     fn name(&self) -> &'static str;
     async fn acquire(&self, key: &RateLimitKey) -> Result<RateLimitPermit, RateLimitError>;
+
+    /// This store's reachability, for the status refresher only.
+    ///
+    /// `None` where there is no remote dependency to be unreachable — `none` and
+    /// `in-memory`, whose component reports `disabled`. Never reachable from a
+    /// request handler: the handle goes to a [`ComponentProbe`].
+    ///
+    /// [`ComponentProbe`]: crate::status::registry::ComponentProbe
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        None
+    }
 }
 
 /// Always-allow. The default posture when no inbound limit is configured.

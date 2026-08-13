@@ -10,10 +10,12 @@ mod postgres;
 mod redis;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
+use crate::backends::health::BackendHealth;
 use crate::config::{RevocationBackend, RevocationConfig, StoreUnavailable};
 
 pub use postgres::PostgresRevocation;
@@ -40,6 +42,16 @@ pub trait RevocationStore: Send + Sync {
     fn name(&self) -> &'static str;
     async fn is_revoked(&self, jti: &str) -> Result<bool, RevocationError>;
     async fn revoke(&self, jti: &str, expires_at: SystemTime) -> Result<(), RevocationError>;
+
+    /// This store's reachability, for the status refresher only.
+    ///
+    /// Deliberately not [`Self::is_revoked`] with a made-up `jti`: a probe must
+    /// not perform a tenant lookup, and a denylist miss is indistinguishable
+    /// from a store that answers everything as unrevoked. `None` for `none`,
+    /// whose component reports `disabled`.
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        None
+    }
 }
 
 pub struct NoDenylist;

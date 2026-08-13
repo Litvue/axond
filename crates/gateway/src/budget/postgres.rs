@@ -22,6 +22,7 @@
 //! reservation row is still the whole hold: it is inserted and deleted once, and
 //! the settlement charges both scopes in the same transaction.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -31,6 +32,7 @@ use super::{
     Admission, BudgetError, BudgetKey, BudgetStore, Denial, ExceededScope, Reservation,
     SharedSettings, Uncertain,
 };
+use crate::backends::health::{BackendHealth, PostgresHealth};
 use crate::policy::{BudgetCaps, PolicyHold};
 use crate::telemetry::metrics;
 use crate::usage::validate_table_name;
@@ -55,6 +57,11 @@ const SCHEMA_DDL_V2: &str = include_str!("../../sql/budget_v2.sql");
 const DEFAULT_TABLE: &str = "axond_budget";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a budget reachability check may take: a connection plus one trivial
+/// statement. Derived from the store's own connect bound so the probe cannot
+/// report a database that is merely slow to accept a session as unreachable.
+const PROBE_BOUND: Duration = Duration::from_secs(CONNECT_TIMEOUT.as_secs() + 5);
 
 /// What a cap-aware replica tells the database about itself, on every connection.
 /// The v2 fence trigger rejects spend and reservation writes from sessions that
@@ -114,6 +121,10 @@ pub struct PostgresBudget {
     config: Config,
     /// Replaced after any failure, so a broken connection is not reused.
     client: tokio::sync::Mutex<Option<Client>>,
+    /// Reachability, for the status refresher. On a session of its own rather
+    /// than the mutex above: a diagnostic must not queue in front of a request
+    /// holding the store's client (see [`PostgresHealth`]).
+    health: Arc<PostgresHealth>,
 }
 
 impl PostgresBudget {
@@ -129,6 +140,7 @@ impl PostgresBudget {
         let store = Self {
             table: settings.table,
             settings: settings.shared,
+            health: Arc::new(PostgresHealth::new("postgres", config.clone(), PROBE_BOUND)),
             config,
             client: tokio::sync::Mutex::new(None),
         };
@@ -613,6 +625,10 @@ impl BudgetStore for PostgresBudget {
         "postgres"
     }
 
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        Some(Arc::clone(&self.health) as Arc<dyn BackendHealth>)
+    }
+
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {
         // The caps and the generation are read once, before the transaction, and
         // carried on the hold: this request is priced by the document that
@@ -706,10 +722,12 @@ mod tests {
     use super::*;
 
     fn store(table: &str) -> PostgresBudget {
+        let config: tokio_postgres::Config = "host=localhost".parse().expect("static dsn");
         PostgresBudget {
             table: table.to_owned(),
             settings: settings(1_000),
-            config: "host=localhost".parse().expect("static dsn"),
+            health: Arc::new(PostgresHealth::new("postgres", config.clone(), PROBE_BOUND)),
+            config,
             client: tokio::sync::Mutex::new(None),
         }
     }
@@ -894,6 +912,35 @@ mod tests {
             replica_a.reserve(&k, 300).await,
             Admission::Denied(Denial::Exceeded)
         );
+    }
+
+    /// The reachability handle opens its own short-lived session rather than
+    /// borrowing the request path's client, so a status round can neither wait
+    /// behind an in-flight reservation nor make one wait behind a `SELECT 1`.
+    /// Holding the request-path client for the duration is the check: a probe
+    /// that used it would deadlock this test instead of answering.
+    #[tokio::test]
+    async fn a_reachability_probe_does_not_queue_behind_the_request_path() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let store = PostgresBudget::connect(
+            &dsn,
+            PostgresBudgetSettings {
+                table: "axond_budget_health_test".to_owned(),
+                create_table: true,
+                shared: settings(1_000),
+            },
+        )
+        .await
+        .expect("connect");
+        let health = store.health().expect("a postgres budget is observable");
+        let guard = store.client.lock().await;
+        tokio::time::timeout(Duration::from_secs(5), health.check())
+            .await
+            .expect("a probe does not wait for the request path")
+            .expect("a reachable database answers");
+        drop(guard);
     }
 
     #[tokio::test]

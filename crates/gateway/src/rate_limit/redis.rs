@@ -14,10 +14,13 @@ use thiserror::Error;
 use tokio::sync::{Semaphore, SemaphorePermit, oneshot};
 
 use super::{PermitRelease, RateLimitError, RateLimitKey, RateLimitPermit, RateLimiter};
+use crate::backends::health::BackendHealth;
 use crate::config::StoreUnavailable;
 use crate::desired_state::policy::PolicyGeneration;
 use crate::policy::{ActivePolicy, Ceilings, ConcurrencyCaps, PolicyHold, Unenforceable, denied};
-use crate::redis_support::{RedisConnection as SharedConnection, RedisRecovery as SharedRecovery};
+use crate::redis_support::{
+    RedisConnection as SharedConnection, RedisHealth, RedisRecovery as SharedRecovery,
+};
 use crate::telemetry::metrics;
 
 const ACQUIRE: &str = r#"
@@ -360,6 +363,10 @@ pub struct RedisRateLimiter {
     retry_semaphore: &'static Semaphore,
     suspect_generation: Arc<AtomicU64>,
     recovery: Arc<SharedRecovery>,
+    /// Reachability, for the status refresher. Reads the same swapped connection
+    /// cell the acquire path reads, so a check after a recovery replacement
+    /// observes the connection leases are actually taken on.
+    health: Arc<RedisHealth>,
 }
 
 #[derive(Debug, Error)]
@@ -404,6 +411,16 @@ impl RedisRateLimiter {
         let recovery =
             SharedRecovery::new(connection.clone(), release_client.clone(), connect_timeout);
         let suspect_generation = recovery.suspect_generation.clone();
+        let health = {
+            // A check may have to wait out one operation timeout and, on a
+            // dropped socket, a reconnection: both are bounds this store is
+            // configured to allow, so neither is evidence of an outage.
+            let probed = Arc::clone(&connection);
+            Arc::new(RedisHealth::new(
+                timeout.saturating_add(connect_timeout),
+                move || probed.load().manager.clone(),
+            ))
+        };
         Ok(Self {
             key_prefix,
             ceilings: Ceilings::fixed(ActivePolicy {
@@ -423,6 +440,7 @@ impl RedisRateLimiter {
             retry_semaphore: release_retry_semaphore(),
             suspect_generation,
             recovery,
+            health,
         })
     }
 
@@ -523,6 +541,10 @@ fn encode_component(component: &str) -> String {
 impl RateLimiter for RedisRateLimiter {
     fn name(&self) -> &'static str {
         "redis"
+    }
+
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        Some(Arc::clone(&self.health) as Arc<dyn BackendHealth>)
     }
 
     async fn acquire(&self, key: &RateLimitKey) -> Result<RateLimitPermit, RateLimitError> {
@@ -1460,6 +1482,33 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(25)).await;
         let released = second.acquire(&key()).await.expect("drop released");
         drop(released);
+    }
+
+    /// The reachability handle exists so status never has to call `acquire`: a
+    /// probe that took a lease would spend the tenant's concurrency on
+    /// monitoring, and at a capacity of one it would deny the next real request
+    /// every round. The `PING` is answered without touching the limit.
+    #[tokio::test]
+    async fn a_reachability_probe_costs_no_concurrency() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let limiter = limiter(
+            &url,
+            format!("axond:test:{}", next_id()),
+            Duration::from_secs(300),
+        )
+        .await;
+        let health = limiter.health().expect("a redis limiter is observable");
+        health.check().await.expect("a reachable redis answers");
+        // The single lease is still there to be taken.
+        let held = limiter.acquire(&key()).await.expect("admitted");
+        health.check().await.expect("a reachable redis answers");
+        assert!(matches!(
+            limiter.acquire(&key()).await,
+            Err(RateLimitError::Exceeded)
+        ));
+        drop(held);
     }
 
     #[tokio::test]

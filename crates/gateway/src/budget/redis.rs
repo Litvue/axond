@@ -40,6 +40,7 @@
 //! reservation hash. That is the cost of exactness (see ADR 0010).
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -50,7 +51,9 @@ use super::{
     Admission, BudgetError, BudgetKey, BudgetStore, Denial, ExceededScope, Reservation,
     SharedSettings, Uncertain,
 };
+use crate::backends::health::BackendHealth;
 use crate::policy::PolicyHold;
+use crate::redis_support::RedisHealth;
 use crate::telemetry::metrics;
 
 const BACKEND: &str = "redis";
@@ -229,7 +232,19 @@ pub struct RedisBudget {
     connection: ConnectionManager,
     reserve: Script,
     settle: Script,
+    /// Reachability, for the status refresher. Built here rather than on demand
+    /// so it shares this store's connection instead of opening one of its own.
+    health: Arc<RedisHealth>,
 }
+
+/// How long a budget reachability check may take.
+///
+/// This store states its own bound because its configuration does not: the
+/// scripts are paced by the connection manager rather than by a configured
+/// operation timeout, so there is no operator-set number to derive from. Chosen
+/// generously relative to a `PING` on a healthy server, since the cost of being
+/// wrong is a page for an outage that is not happening.
+const PROBE_BOUND: Duration = Duration::from_secs(5);
 
 impl RedisBudget {
     /// Connect and prove the server answers, so a wrong URL fails at boot
@@ -254,12 +269,17 @@ impl RedisBudget {
             require_unmigrated_layout(&mut connection, &key_prefix).await?;
             (Script::new(RESERVE), Script::new(SETTLE))
         };
+        let health = {
+            let probed = connection.clone();
+            Arc::new(RedisHealth::new(PROBE_BOUND, move || probed.clone()))
+        };
         Ok(Self {
             settings,
             key_prefix,
             connection,
             reserve,
             settle,
+            health,
         })
     }
 
@@ -811,6 +831,10 @@ fn hash_tag(key: &str) -> Option<&str> {
 impl BudgetStore for RedisBudget {
     fn name(&self) -> &'static str {
         "redis"
+    }
+
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        Some(Arc::clone(&self.health) as Arc<dyn BackendHealth>)
     }
 
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {

@@ -7428,12 +7428,20 @@ max_ttl = "15m"
     #[tokio::test]
     async fn a_stateful_replica_observes_the_control_plane_it_administers() {
         let oracle = Arc::new(crate::desired_state::oracle::InMemoryControlPlane::new());
-        let (observability, refresher) = ReplicaObservability::observing(
-            Arc::clone(&oracle) as Arc<dyn crate::backends::control_plane::ControlPlaneStore>,
-            crate::status::probes::ControlPlaneProbe::pacing(
-                &crate::backends::control_plane::postgres::ControlPlaneSettings::default(),
-            ),
-        );
+        let (observability, refresher) =
+            ReplicaObservability::observing(ReplicaObservability::plan(
+                Some((
+                    Arc::clone(&oracle)
+                        as Arc<dyn crate::backends::control_plane::ControlPlaneStore>,
+                    crate::status::probes::ControlPlaneProbe::pacing(
+                        &crate::backends::control_plane::postgres::ControlPlaneSettings::default(),
+                    ),
+                )),
+                &crate::budget::NoBudget,
+                &crate::rate_limit::NoLimit,
+                &crate::revocation::NoDenylist,
+            ));
+        let refresher = refresher.expect("an observed control plane is refreshed");
         let state = status_state(observability);
 
         refresher.refresh_once().await;

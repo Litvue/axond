@@ -20,11 +20,12 @@ use async_trait::async_trait;
 
 #[cfg(doc)]
 use super::registry::StatusRefresher;
-use super::registry::{ComponentProbe, StatusSettings};
+use super::registry::{ComponentProbe, MIN_REFRESH_INTERVAL, StatusSettings};
 use super::{Component, ComponentObservation, StatusReason};
 use crate::backends::BackendFailure;
 use crate::backends::control_plane::postgres::ControlPlaneSettings;
 use crate::backends::control_plane::{ControlPlaneStore, StatusProbeAdmission};
+use crate::backends::health::BackendHealth;
 
 /// Observes the control plane a stateful replica administers against.
 ///
@@ -84,11 +85,13 @@ impl ControlPlaneProbe {
         // timeout on every round.
         let bounds = settings.status_probe_timeout(1);
         let spacing = settings.connect_timeout.clamp(SPACING, MAX_SPACING);
-        let refresh_interval = bounds.saturating_add(spacing).min(MAX_REFRESH_INTERVAL);
-        // Still strictly below the interval, so rounds cannot overlap, and
-        // unchanged from the store's own bounds wherever the cap does not bite.
-        let probe_timeout = bounds.min(refresh_interval.saturating_sub(SPACING));
-        if probe_timeout < bounds {
+        let pacing = derived(
+            Component::ControlPlane,
+            bounds,
+            spacing,
+            MIN_REFRESH_INTERVAL,
+        );
+        if pacing.probe_timeout < bounds {
             // Said once, at construction, and named as configuration rather than
             // as an outage: an operator who later reads `timeout` on the status
             // page has a boot log line saying the diagnostic will not wait as
@@ -96,33 +99,13 @@ impl ControlPlaneProbe {
             tracing::warn!(
                 component = "control_plane",
                 store_bound_ms = bounds.as_millis() as u64,
-                probe_timeout_ms = probe_timeout.as_millis() as u64,
-                refresh_interval_ms = refresh_interval.as_millis() as u64,
+                probe_timeout_ms = pacing.probe_timeout.as_millis() as u64,
+                refresh_interval_ms = pacing.refresh_interval.as_millis() as u64,
                 "control plane timeouts exceed the observable cadence; the probe will report \
                  timeout for calls the store is still entitled to complete"
             );
         }
-        StatusSettings {
-            probe_timeout,
-            refresh_interval,
-            // Three rounds: one slow round and one missed round are not a stale
-            // observation, and the rule that pages for a refresher which stopped
-            // entirely is `AxondStatusRefresherStalled`. Never below the longest
-            // gap two publications can be apart either — the loop waits an
-            // interval *after* a round finishes, so that gap is the interval plus
-            // a round, not the interval — and never past
-            // [`MAX_STALENESS_BUDGET`], so the replica has already coarsened the
-            // component to `stale` by the time the age rule pages for it.
-            staleness_budget: refresh_interval
-                .saturating_mul(3)
-                .max(
-                    refresh_interval
-                        .saturating_add(probe_timeout)
-                        .saturating_add(spacing),
-                )
-                .min(MAX_STALENESS_BUDGET),
-            enabled: vec![Component::ControlPlane],
-        }
+        pacing
     }
 
     async fn observe_with_status_probe(
@@ -198,6 +181,135 @@ pub const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(4 * 60);
 /// `the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it`.
 pub const MAX_STALENESS_BUDGET: Duration = Duration::from_secs(5 * 60);
 
+/// The pacing a component with these bounds may be observed on.
+///
+/// One function rather than one per probe, because the couplings it enforces are
+/// the registry's, not any component's: a probe timeout strictly below the
+/// interval that schedules it (so rounds cannot overlap), a staleness budget
+/// above the longest gap two publications can be apart (so a slow round is not
+/// reported as stale), and both under the ceilings the alerting pipeline can
+/// see. `bound` is what the backend is entitled to take; `floor` is the fastest
+/// cadence the component is worth observing on.
+fn derived(
+    component: Component,
+    bound: Duration,
+    spacing: Duration,
+    floor: Duration,
+) -> StatusSettings {
+    let refresh_interval = bound
+        .saturating_add(spacing)
+        .max(floor)
+        .min(MAX_REFRESH_INTERVAL);
+    // Strictly below the interval, and unchanged from the backend's own bound
+    // wherever the ceiling does not bite.
+    let probe_timeout = bound.min(refresh_interval.saturating_sub(SPACING));
+    StatusSettings {
+        probe_timeout,
+        refresh_interval,
+        // Three rounds: one slow round and one missed round are not a stale
+        // observation, and the rule that pages for a refresher which stopped
+        // entirely is `AxondStatusRefresherStalled`. Never below the longest gap
+        // two publications can be apart either — the loop waits an interval
+        // *after* a round finishes, so that gap is the interval plus a round, not
+        // the interval — and never past [`MAX_STALENESS_BUDGET`], so the replica
+        // has already coarsened the component to `stale` by the time the age rule
+        // pages for it.
+        staleness_budget: refresh_interval
+            .saturating_mul(3)
+            .max(
+                refresh_interval
+                    .saturating_add(probe_timeout)
+                    .saturating_add(spacing),
+            )
+            .min(MAX_STALENESS_BUDGET),
+        enabled: vec![component],
+    }
+}
+
+/// The fastest a request-path store is worth observing.
+///
+/// A `PING` answers in a millisecond, so the bound alone would put the
+/// diagnostic on a one-second loop against a store the request path is already
+/// using — and a store that is down denies requests, which is a far louder
+/// signal than a status gauge. So the cadence is the metric export cadence
+/// ([`EXPORT_INTERVAL`]): fresh enough that the component's state is never more
+/// than one export behind what an alert rule reads, without turning the
+/// diagnostic into traffic.
+///
+/// [`EXPORT_INTERVAL`]: super::registry::EXPORT_INTERVAL
+pub const BACKEND_REFRESH_FLOOR: Duration = super::registry::EXPORT_INTERVAL;
+
+/// Observes one request-path store through the reachability handle that store
+/// exposes.
+///
+/// The component and the handle are separate arguments because the mapping is
+/// the deployment's, not the store's: the same Redis implementation backs
+/// [`Component::BudgetStore`], [`Component::RateLimitStore`], and
+/// [`Component::RevocationStore`], and a deployment that points all three at one
+/// server still wants three answers — the caps it enforces, the leases it
+/// grants, and the tokens it refuses are three different operator problems even
+/// when they share a socket.
+pub struct BackendProbe {
+    component: Component,
+    health: Arc<dyn BackendHealth>,
+}
+
+impl BackendProbe {
+    pub fn new(component: Component, health: Arc<dyn BackendHealth>) -> Self {
+        Self { component, health }
+    }
+
+    /// The pacing this store's own bounds allow, for the component it backs.
+    pub fn pacing(component: Component, health: &Arc<dyn BackendHealth>) -> StatusSettings {
+        derived(
+            component,
+            health.bound().min(MAX_PROBE_TIMEOUT),
+            SPACING,
+            BACKEND_REFRESH_FLOOR,
+        )
+    }
+}
+
+#[async_trait]
+impl ComponentProbe for BackendProbe {
+    fn component(&self) -> Component {
+        self.component
+    }
+
+    fn begin<'a>(
+        &'a self,
+        _fallback: Duration,
+    ) -> (
+        Duration,
+        std::pin::Pin<Box<dyn std::future::Future<Output = ComponentObservation> + Send + 'a>>,
+    ) {
+        // This store's own bound rather than the registry's fallback: the
+        // registry's is the merge of every enabled component's, so a Redis store
+        // would inherit a Postgres store's patience and report an outage minutes
+        // late — or, with the merge the other way, be cut off mid-call.
+        let timeout = self.health.bound().min(MAX_PROBE_TIMEOUT);
+        (timeout, Box::pin(self.observe()))
+    }
+
+    async fn observe(&self) -> ComponentObservation {
+        match self.health.check().await {
+            Ok(()) => ComponentObservation::ok(self.component),
+            Err(failure) => {
+                let reason = StatusReason::from_failure(failure.category());
+                let detail = format!("{}: {}", self.health.backend(), failure.detail());
+                if reason == StatusReason::Unreachable {
+                    ComponentObservation::unavailable(self.component, reason, detail)
+                } else {
+                    // A store that answered and refused is impaired, not gone:
+                    // `degraded` keeps the critical unreachability alert for an
+                    // outage and routes a rotated credential to whoever owns it.
+                    ComponentObservation::degraded(self.component, reason, detail)
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl ComponentProbe for ControlPlaneProbe {
     fn component(&self) -> Component {
@@ -228,8 +340,9 @@ impl ComponentProbe for ControlPlaneProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::Capabilities;
     use crate::backends::control_plane::ControlPlaneError;
+    use crate::backends::health::HealthFailure;
+    use crate::backends::{Capabilities, FailureCategory};
     use crate::desired_state::oracle::InMemoryControlPlane;
     use crate::desired_state::{
         AccessDenial, AuditEvent, DenialPage, LoadedRevision, RevisionCandidate, RevisionId,
@@ -239,6 +352,7 @@ mod tests {
     use crate::status::registry::{CachedStatusRegistry, StatusRefresher};
 
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -635,5 +749,191 @@ mod tests {
         .await;
         let detail = observation.detail.expect("a failure carries a detail");
         assert!(detail.contains("connection refused"), "{detail}");
+    }
+
+    // ------------------------------------------------------- request-path stores
+
+    /// A store's reachability handle with an answer of the test's choosing, and a
+    /// record of how often it was asked. Neither the trait nor this fake takes an
+    /// input, which is the property the seam exists to have: there is nowhere to
+    /// put a tenant, a key, or a `jti`.
+    struct Answer {
+        result: Box<dyn Fn() -> Result<(), HealthFailure> + Send + Sync>,
+        bound: Duration,
+        delay: Option<Duration>,
+        checks: Arc<AtomicUsize>,
+    }
+
+    impl Answer {
+        fn new(result: impl Fn() -> Result<(), HealthFailure> + Send + Sync + 'static) -> Self {
+            Self {
+                result: Box::new(result),
+                bound: Duration::from_secs(5),
+                delay: None,
+                checks: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn reachable() -> Self {
+            Self::new(|| Ok(()))
+        }
+    }
+
+    #[async_trait]
+    impl BackendHealth for Answer {
+        fn backend(&self) -> &'static str {
+            "redis"
+        }
+
+        fn bound(&self) -> Duration {
+            self.bound
+        }
+
+        async fn check(&self) -> Result<(), HealthFailure> {
+            self.checks.fetch_add(1, Ordering::Relaxed);
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            (self.result)()
+        }
+    }
+
+    fn observing(component: Component, health: Answer) -> BackendProbe {
+        BackendProbe::new(component, Arc::new(health))
+    }
+
+    #[tokio::test]
+    async fn a_reachable_store_is_ok_and_says_nothing_else() {
+        let observation = observing(Component::RateLimitStore, Answer::reachable())
+            .observe()
+            .await;
+        assert_eq!(observation.component, Component::RateLimitStore);
+        assert_eq!(observation.state, ComponentState::Ok);
+        assert_eq!(observation.reason, None);
+        assert_eq!(observation.detail, None);
+    }
+
+    /// The same distinction the control plane draws, for the same reason: a store
+    /// that refused a rotated credential is a credential to fix, and routing it
+    /// to the unreachability alert sends the page to the wrong owner.
+    #[tokio::test]
+    async fn a_store_that_answers_and_refuses_is_degraded_not_unavailable() {
+        let unreachable = observing(
+            Component::BudgetStore,
+            Answer::new(|| Err(HealthFailure::unavailable("connection refused"))),
+        )
+        .observe()
+        .await;
+        assert_eq!(unreachable.state, ComponentState::Unavailable);
+        assert_eq!(unreachable.reason, Some(StatusReason::Unreachable));
+
+        let refusing = observing(
+            Component::BudgetStore,
+            Answer::new(|| {
+                Err(HealthFailure::new(
+                    FailureCategory::Denied,
+                    "WRONGPASS invalid username-password pair",
+                ))
+            }),
+        )
+        .observe()
+        .await;
+        assert_eq!(refusing.state, ComponentState::Degraded);
+        assert_eq!(refusing.reason, Some(StatusReason::PermissionDenied));
+    }
+
+    /// The detail names the implementation and the failure for the operator log,
+    /// and the response has nowhere to put either: every projected field is an
+    /// enum or a number.
+    #[tokio::test]
+    async fn the_stores_message_stays_on_the_detail() {
+        let observation = observing(
+            Component::RevocationStore,
+            Answer::new(|| Err(HealthFailure::unavailable("io error: connection reset"))),
+        )
+        .observe()
+        .await;
+        let detail = observation.detail.expect("a failure carries a detail");
+        assert!(detail.starts_with("redis: "), "{detail}");
+        assert!(detail.contains("connection reset"), "{detail}");
+    }
+
+    /// A fast store must not inherit a slow one's patience. The registry's
+    /// interval is the slowest enabled component's, so a `PING` handed the
+    /// fallback would be given a minute before the refresher called it late —
+    /// long enough for a Redis outage to go unreported through several export
+    /// windows.
+    #[test]
+    fn a_store_is_probed_under_its_own_bound_not_the_registrys() {
+        let mut health = Answer::reachable();
+        health.bound = Duration::from_secs(3);
+        let probe = observing(Component::RateLimitStore, health);
+        let (timeout, _) = probe.begin(Duration::from_secs(90));
+        assert_eq!(timeout, Duration::from_secs(3));
+    }
+
+    /// However patient a store's own configuration is, one round has to stay
+    /// inside what the monitoring pipeline can see, exactly as the control
+    /// plane's does.
+    #[test]
+    fn a_stores_pacing_is_valid_and_bounded_however_it_is_configured() {
+        for bound in [
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+            Duration::from_secs(60 * 60),
+        ] {
+            let mut answer = Answer::reachable();
+            answer.bound = bound;
+            let health: Arc<dyn BackendHealth> = Arc::new(answer);
+            let pacing = BackendProbe::pacing(Component::BudgetStore, &health);
+            assert_eq!(pacing.validate(), Ok(()), "{bound:?}");
+            assert!(
+                pacing.refresh_interval >= BACKEND_REFRESH_FLOOR,
+                "{bound:?}"
+            );
+            assert!(pacing.refresh_interval <= MAX_REFRESH_INTERVAL, "{bound:?}");
+            assert!(pacing.probe_timeout <= MAX_PROBE_TIMEOUT, "{bound:?}");
+            assert!(pacing.staleness_budget <= MAX_STALENESS_BUDGET, "{bound:?}");
+            assert_eq!(pacing.enabled, vec![Component::BudgetStore]);
+        }
+    }
+
+    /// A probe the refresher abandoned still publishes, and the store is asked
+    /// once per round rather than once per reader: the status route reads the
+    /// cache, so a poller cannot turn itself into load on the budget store.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_is_asked_once_per_round_and_a_stuck_check_is_abandoned() {
+        let mut answer = Answer::reachable();
+        answer.bound = Duration::from_millis(50);
+        answer.delay = Some(Duration::from_secs(30));
+        let checks = Arc::clone(&answer.checks);
+        let health: Arc<dyn BackendHealth> = Arc::new(answer);
+        let pacing = BackendProbe::pacing(Component::RateLimitStore, &health);
+        let registry = Arc::new(CachedStatusRegistry::new(
+            pacing,
+            Arc::new(crate::convergence::SystemClock),
+        ));
+        let refresher = StatusRefresher::new(
+            Arc::clone(&registry),
+            vec![Arc::new(BackendProbe::new(
+                Component::RateLimitStore,
+                health,
+            ))],
+        );
+
+        refresher.refresh_once().await;
+        assert_eq!(checks.load(Ordering::Relaxed), 1);
+        let component = registry
+            .view()
+            .components
+            .into_iter()
+            .find(|component| component.component == Component::RateLimitStore)
+            .expect("the enabled component is reported");
+        assert_eq!(component.state, ComponentState::Unavailable);
+        assert_eq!(component.reason, Some(StatusReason::Timeout));
+
+        // Reading the cache again asks the store nothing.
+        let _ = registry.view();
+        assert_eq!(checks.load(Ordering::Relaxed), 1);
     }
 }
