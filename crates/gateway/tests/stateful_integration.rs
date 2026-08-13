@@ -26,7 +26,7 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -360,9 +360,13 @@ fn stateful_boot_refuses_to_serve_an_empty_snapshot() {
         reported.contains("stateful"),
         "the refusal must name the mode it refuses, so an operator can act on it:\n{reported}"
     );
+    // The child's own report, not a probe of `bind`: an ephemeral port is free
+    // the moment the fixture reserves it, so a sibling test that binds the same
+    // port would answer a probe here and fail this scenario for someone else's
+    // reason.
     assert!(
-        TcpStream::connect(bind).is_err(),
-        "a refused boot must not have bound a listener on {bind}"
+        !reported.contains("axond listening"),
+        "a refused boot must not have bound a listener on {bind}:\n{reported}"
     );
 }
 
