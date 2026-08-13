@@ -56,6 +56,20 @@ impl Replica {
         Self::build(store, "openai", Some(cache))
     }
 
+    /// A replica that has a cache to fall back to and a secret store that is
+    /// down: the cold-boot case where the cache cannot rescue the boot.
+    fn with_cache_and_unresolvable_secrets(
+        store: &Arc<InMemoryControlPlane>,
+        cache: LastKnownGood,
+    ) -> Self {
+        Self::assembled(
+            store,
+            "openai",
+            Some(cache),
+            super::secrets::testing::unavailable(),
+        )
+    }
+
     /// A replica whose projection is fine and whose secret store is down: the one
     /// way a candidate fails on *material* rather than on its graph.
     fn with_unresolvable_secrets(store: &Arc<InMemoryControlPlane>) -> Self {
@@ -1082,6 +1096,66 @@ async fn a_candidate_whose_material_does_not_resolve_leaves_the_previous_revisio
     assert_eq!(replica.generation(), 1);
     assert!(replica.served_aliases().contains(&"fast".to_owned()));
     assert_eq!(replica.ledger.retained(), serving);
+}
+
+/// A cold boot is stricter about material than a serving replica is, and the
+/// cache does not soften it: the cached revision pins the same versions the live
+/// one does, so restoring it while the secret store is down would publish a
+/// snapshot with holes in it. Refusing to start is the safe end of that
+/// asymmetry, and it is what `docs/operations/revision-convergence.md` documents
+/// under the `secret` rejection reason — a secret store is a boot dependency of
+/// a stateful replica, like the control plane's database.
+#[tokio::test]
+async fn a_cold_boot_whose_material_does_not_resolve_refuses_to_start() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let path = cache_path("cold-boot-secrets");
+
+    // A replica that could resolve material exports a cache the next boot finds.
+    let warm = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(path.exists(), "converging exported the cache");
+
+    // The next replica boots with a healthy control plane and a store that is
+    // down. Unlike a control-plane outage, this is fatal.
+    let cold = Replica::with_cache_and_unresolvable_secrets(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    let error = cold
+        .reconciler
+        .bootstrap()
+        .await
+        .expect_err("material this replica cannot unwrap is not servable");
+
+    assert!(
+        matches!(error, BootstrapError::Rejected { .. }),
+        "a refusal, not a restore: {error:?}"
+    );
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains(super::secrets::testing::MATERIAL),
+        "the refusal names references, not material: {rendered}"
+    );
+    assert_eq!(cold.generation(), 0, "nothing was published");
+    assert_eq!(cold.report().active, None);
+    assert!(cold.ledger.is_empty(), "a refused boot retains nothing");
+
+    // The same cache boots the moment the store answers again, which is what
+    // makes waiting on it the right operational advice.
+    let recovered = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    assert_eq!(
+        recovered.reconciler.bootstrap().await.expect("it boots"),
+        published
+    );
 }
 
 /// Every exact version a revision's resolvable credentials pin, ordered.
