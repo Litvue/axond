@@ -156,6 +156,16 @@ impl SourceValidators {
 pub struct CatalogContentId(Checksum);
 
 impl CatalogContentId {
+    /// The identity a stored record names.
+    ///
+    /// A price book records the catalogue content it was approved against
+    /// ([`crate::desired_state::pricing`]), so the identity has to survive a round
+    /// trip through a canonical body. Constructing one does not assert that the
+    /// content is held — it names it.
+    pub const fn from_checksum(checksum: Checksum) -> Self {
+        Self(checksum)
+    }
+
     pub const fn checksum(self) -> Checksum {
         self.0
     }

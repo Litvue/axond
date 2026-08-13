@@ -29,6 +29,7 @@ use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
 use crate::convergence::secrets::ResolvedSecrets;
 use crate::credentials::{CredentialError, Credentials};
+use crate::desired_state::pricing::PricingSnapshot;
 use crate::key_material::{self, KeyMaterialError};
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
@@ -107,6 +108,14 @@ pub struct ConfigSnapshot {
     /// contract only, nothing polls a provider, and no request consults a verdict.
     #[allow(dead_code)]
     availability: Arc<AvailabilityIndex>,
+    /// The approved pricing this snapshot serves under, when it was compiled from
+    /// a revision that published a price book (#201).
+    ///
+    /// Part of the snapshot rather than a second published value, because that is
+    /// what makes pricing and routing atomic: a request loads one pointer, so it
+    /// cannot be routed by revision *N+1* and priced by *N*. `None` for a
+    /// file-configured deployment, whose prices are the ones `[[model]]` declares.
+    pricing: Option<PricingSnapshot>,
 }
 
 pub struct ResolvedMinting {
@@ -426,6 +435,7 @@ impl ConfigSnapshot {
             // compiled from configuration, and availability is derived afterwards
             // by whatever produced the evidence.
             availability: Arc::new(AvailabilityIndex::empty()),
+            pricing: None,
         })
     }
 
@@ -483,6 +493,22 @@ impl ConfigSnapshot {
     pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
         self.availability = availability;
         self
+    }
+
+    /// Attach the approved pricing a revision resolved to.
+    ///
+    /// Consuming rather than a setter: a published snapshot is immutable, so
+    /// pricing is attached while the snapshot is still owned by the compiler that
+    /// built it and never after it is visible to a request.
+    #[must_use]
+    pub fn with_pricing(mut self, pricing: PricingSnapshot) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
+
+    /// The approved pricing this snapshot serves under, if any.
+    pub const fn pricing(&self) -> Option<&PricingSnapshot> {
+        self.pricing.as_ref()
     }
 
     pub async fn resolve_principal(

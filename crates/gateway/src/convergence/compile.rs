@@ -13,13 +13,21 @@
 //!    [`Config::validate_compiled`], which *is* the whole-graph gate boot runs on
 //!    a file. An alias pointing at an undefined provider is refused identically
 //!    whether an operator wrote it in TOML or an administrator published it.
-//! 3. **Materialization.** [`SecretMaterialization`] unwraps every exact secret
+//! 3. **Pricing.** The revision's approved price book (#201) is read and resolved
+//!    at the compiling instant into a [`PricingSnapshot`], which is attached to
+//!    the snapshot the routing config produced. Pricing is therefore published
+//!    *with* routing and never separately: a request holds one `Arc`, so it cannot
+//!    be routed by one revision and priced by another. A price book this build
+//!    cannot bill never reaches publication — reading the revision refuses it
+//!    first (see [`CompileError::Pricing`]), before any durable material is
+//!    unwrapped — so the previous snapshot, prices included, keeps serving.
+//! 4. **Materialization.** [`SecretMaterialization`] unwraps every exact secret
 //!    version the revision's typed credentials pin, through the deployment's
 //!    `SecretStore`. This is the only step that awaits, and the only place
 //!    durable material enters the process.
-//! 4. **Snapshot build.** [`ConfigSnapshot::build_with`] resolves credentials,
+//! 5. **Snapshot build.** [`ConfigSnapshot::build_with`] resolves credentials,
 //!    gateway keys, verifiers, and minting material, and takes ownership of the
-//!    material step 3 unwrapped — so every secret a candidate needs is resolved
+//!    material step 4 unwrapped — so every secret a candidate needs is resolved
 //!    *here*, off the request path, before anything is published, and is held for
 //!    exactly as long as the snapshot is.
 //!
@@ -30,10 +38,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 
 use crate::config::{Config, ConfigError};
+use crate::desired_state::pricing::{
+    EffectiveInstant, InvalidInstant, PriceBooks, PricingError, PricingSnapshot,
+};
 use crate::desired_state::{DesiredState, LoadedRevision, ResourceRef, RevisionId};
 use crate::state::{ConfigSnapshot, SnapshotError};
 
@@ -104,6 +116,28 @@ pub enum CompileError {
         #[source]
         source: ConfigError,
     },
+    /// A book that survived being read and then could not be resolved into
+    /// billable rates. Reading a revision validates its price book against this
+    /// same domain, so a bad book is already refused as skew or damage before
+    /// compilation: this is the guard for those two stages disagreeing, kept
+    /// because a compiler may not assume its input was checked.
+    #[error("revision {revision} does not carry pricing this build can bill: {source}")]
+    Pricing {
+        revision: RevisionId,
+        #[source]
+        /// Boxed to keep every compile `Result` narrow; a pricing refusal is a
+        /// wide value that names a target, an interval, and a rate.
+        source: Box<PricingError>,
+    },
+    /// The host's clock is not on the effective-dating timeline, so *which* rates
+    /// are in force has no answer. A refusal rather than a fallback: compiling
+    /// against a clamped instant would activate a rate schedule nobody dated.
+    #[error("revision {revision} cannot be priced against this host's clock: {source}")]
+    Clock {
+        revision: RevisionId,
+        #[source]
+        source: InvalidInstant,
+    },
     #[error("revision {revision} could not be compiled into a runtime snapshot: {source}")]
     Snapshot {
         revision: RevisionId,
@@ -113,11 +147,26 @@ pub enum CompileError {
 }
 
 impl CompileError {
+    /// Every label [`CompileError::reason`] returns, next to the match that
+    /// returns them so a new variant's label is added here in the same edit. The
+    /// metric catalogue and the status vocabulary are both checked against this
+    /// list, so a compile refusal cannot ship a label an alert cannot see.
+    pub const REASONS: &'static [&'static str] = &[
+        "secret",
+        "projection",
+        "validation",
+        "pricing",
+        "clock",
+        "snapshot",
+    ];
+
     /// The revision that was refused.
     pub const fn revision(&self) -> RevisionId {
         match self {
             Self::Projection { revision, .. }
             | Self::Validation { revision, .. }
+            | Self::Pricing { revision, .. }
+            | Self::Clock { revision, .. }
             | Self::Snapshot { revision, .. } => *revision,
         }
     }
@@ -135,6 +184,8 @@ impl CompileError {
             } => "secret",
             Self::Projection { .. } => "projection",
             Self::Validation { .. } => "validation",
+            Self::Pricing { .. } => "pricing",
+            Self::Clock { .. } => "clock",
             Self::Snapshot { .. } => "snapshot",
         }
     }
@@ -177,6 +228,12 @@ pub struct RevisionCompiler<P> {
     /// thing that holds plaintext is not the thing that can change what a
     /// credential points at.
     secrets: Arc<SecretMaterialization>,
+    /// The clock effective-dated pricing is resolved against.
+    ///
+    /// Injected as a function rather than read inline so a test can compile the
+    /// *same* revision at two instants and assert which rules were in force,
+    /// which is the only way boundary behaviour is checkable at all.
+    clock: fn() -> SystemTime,
 }
 
 impl<P: RevisionProjection> RevisionCompiler<P> {
@@ -203,7 +260,15 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
             env,
             projection,
             secrets,
+            clock: SystemTime::now,
         }
+    }
+
+    /// The same compiler, resolving pricing against a fixed clock.
+    #[must_use]
+    pub const fn with_clock(mut self, clock: fn() -> SystemTime) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Which projection this compiler runs, for diagnostics.
@@ -215,6 +280,27 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
     /// for the status surface that reports which versions are held.
     pub fn secrets(&self) -> &Arc<SecretMaterialization> {
         &self.secrets
+    }
+
+    /// Resolve the revision's approved pricing at the compiling instant.
+    ///
+    /// `None` when the revision publishes no price book, which is a valid
+    /// deployment: its offerings are discoverable and simply have no approved
+    /// price.
+    fn pricing(&self, revision: &LoadedRevision) -> Result<Option<PricingSnapshot>, CompileError> {
+        let id = revision.id();
+        let books = PriceBooks::of(revision.state()).map_err(|source| CompileError::Pricing {
+            revision: id,
+            source: Box::new(source),
+        })?;
+        if books.book().is_none() {
+            return Ok(None);
+        }
+        let at = EffectiveInstant::of((self.clock)()).map_err(|source| CompileError::Clock {
+            revision: id,
+            source,
+        })?;
+        Ok(books.snapshot_at(at))
     }
 }
 
@@ -239,6 +325,9 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
                 revision: id,
                 source,
             })?;
+        // Before the snapshot build, so a price book this build cannot bill
+        // refuses the candidate without any secret material being resolved.
+        let pricing = self.pricing(revision)?;
         // Material is unwrapped after the boot gate and before the snapshot: a
         // revision that cannot be served at all does not touch the secret store,
         // and material that cannot be unwrapped is a refusal rather than a
@@ -252,11 +341,15 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
                 revision: id,
                 source,
             })?;
-        ConfigSnapshot::build_with(config, &self.env, generation, secrets).map_err(|source| {
-            CompileError::Snapshot {
+        let snapshot = ConfigSnapshot::build_with(config, &self.env, generation, secrets).map_err(
+            |source| CompileError::Snapshot {
                 revision: id,
                 source,
-            }
+            },
+        )?;
+        Ok(match pricing {
+            None => snapshot,
+            Some(pricing) => snapshot.with_pricing(pricing),
         })
     }
 }
@@ -357,10 +450,16 @@ namespace = "platform"
 
     /// A hydrated revision carrying the domain's standard fixture state.
     pub(crate) fn revision() -> LoadedRevision {
+        revision_with(fixtures::state())
+    }
+
+    /// A hydrated revision carrying `state`, assembled the way one loaded from
+    /// storage is.
+    pub(crate) fn revision_with(state: DesiredState) -> LoadedRevision {
         let candidate = fixtures::candidate(
             crate::desired_state::ExpectedRevision::Empty,
             "first",
-            fixtures::state(),
+            state,
         );
         let manifest = crate::desired_state::RevisionManifest::of(
             fixtures::revision_id(9),
@@ -375,9 +474,17 @@ namespace = "platform"
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{AliasProjection, RefusingProjection, bootstrap, env, revision};
+    use std::time::Duration;
+
+    use super::testing::{
+        AliasProjection, RefusingProjection, bootstrap, env, revision, revision_with,
+    };
     use super::*;
+    use crate::backends::catalog::ProviderId;
     use crate::desired_state::fixtures;
+    use crate::desired_state::pricing::{
+        Approval, EffectiveInterval, PriceBookBody, RulePrecedence,
+    };
 
     #[tokio::test]
     async fn a_projected_revision_compiles_into_a_snapshot_at_the_requested_generation() {
@@ -439,6 +546,117 @@ mod tests {
             .err()
             .expect("the projection refuses");
         assert_eq!(error.reason(), "projection");
+        assert_eq!(error.revision(), fixtures::revision_id(9));
+    }
+
+    /// Pricing is resolved into the *same* snapshot the routing config lands in,
+    /// so a request that reads one reads both: there is no window in which a
+    /// replica routes at a generation whose prices have not arrived yet.
+    #[tokio::test]
+    async fn an_approved_book_is_published_in_the_same_snapshot_as_the_routing_config() {
+        let body = fixtures::approved_price_book();
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap(),
+            env(),
+            AliasProjection { provider: "openai" },
+            crate::convergence::secrets::testing::permissive(),
+        );
+        let snapshot = compiler
+            .compile(&revision_with(fixtures::state_with_price_book(&body)), 3)
+            .await
+            .expect("an approved book is servable");
+        let pricing = snapshot.pricing().expect("the revision carries pricing");
+        assert!(pricing.is_approved());
+        assert_eq!(pricing.catalog(), fixtures::catalog_content_id());
+        assert_eq!(
+            pricing
+                .price(&ProviderId::parse("openai").expect("id"), "gpt-4o")
+                .expect("the book prices the routed target")
+                .input_microdollars_per_million,
+            2_500
+        );
+        // The same snapshot, at the same generation, holds the routing config.
+        assert_eq!(snapshot.generation, 3);
+        assert!(
+            snapshot
+                .config
+                .model
+                .iter()
+                .any(|model| model.name == "fast")
+        );
+    }
+
+    /// A deployment that has approved nothing still serves: its offerings are
+    /// discoverable, and carry no price to bill a budget against.
+    #[tokio::test]
+    async fn a_revision_without_a_price_book_compiles_without_pricing() {
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap(),
+            env(),
+            AliasProjection { provider: "openai" },
+            crate::convergence::secrets::testing::permissive(),
+        );
+        let snapshot = compiler
+            .compile(&revision(), 1)
+            .await
+            .expect("pricing is not a precondition for routing");
+        assert!(snapshot.pricing().is_none());
+        assert!(
+            snapshot
+                .config
+                .model
+                .iter()
+                .any(|model| model.name == "fast")
+        );
+    }
+
+    /// A book awaiting approval publishes its identity and no prices, so an
+    /// operator can see what is staged without it billing anything.
+    #[tokio::test]
+    async fn a_draft_book_publishes_its_identity_and_no_prices() {
+        let body = PriceBookBody::new(fixtures::catalog_content_id(), Approval::Draft).with_rule(
+            fixtures::price_rule(
+                fixtures::priced_target("openai", "gpt-4o"),
+                RulePrecedence::Baseline,
+                EffectiveInterval::from(EffectiveInstant::EPOCH),
+                1_000,
+                1_000,
+            ),
+        );
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap(),
+            env(),
+            AliasProjection { provider: "openai" },
+            crate::convergence::secrets::testing::permissive(),
+        );
+        let snapshot = compiler
+            .compile(&revision_with(fixtures::state_with_price_book(&body)), 1)
+            .await
+            .expect("a draft book does not refuse the candidate");
+        let pricing = snapshot.pricing().expect("the identity is published");
+        assert!(!pricing.is_approved());
+        assert!(pricing.is_empty());
+    }
+
+    /// Pricing is resolved against the host's clock, and a clock off the timeline
+    /// refuses the candidate rather than pricing at an instant it invented.
+    /// Nothing is returned, so whatever is already serving keeps serving.
+    #[tokio::test]
+    async fn a_host_clock_before_the_epoch_refuses_the_candidate_rather_than_guessing() {
+        let body = fixtures::approved_price_book();
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap(),
+            env(),
+            AliasProjection { provider: "openai" },
+            crate::convergence::secrets::testing::permissive(),
+        )
+        .with_clock(|| SystemTime::UNIX_EPOCH - Duration::from_secs(1));
+        let error = compiler
+            .compile(&revision_with(fixtures::state_with_price_book(&body)), 1)
+            .await
+            .err()
+            .expect("an instant off the timeline cannot price a revision");
+        assert_eq!(error.reason(), "clock");
         assert_eq!(error.revision(), fixtures::revision_id(9));
     }
 

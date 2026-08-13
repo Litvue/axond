@@ -22,6 +22,7 @@
 //! | [`policy`] | the complete policy document of a tenant or a project, its generation, and how a change to it may be activated |
 //! | [`models`] | what a tenant may use and what a project calls it: typed model enablements and project-scoped aliases |
 //! | [`providers`] | where a tenant's traffic goes: the endpoint and dialect of one upstream connection, with no material in it |
+//! | [`pricing`] | the approved price book: effective-dated rates a deployment charges, and the pricing identity a snapshot serves under |
 //!
 //! # Three properties everything else rests on
 //!
@@ -48,8 +49,8 @@
 //! It is not wired into the request path. The runtime remains stateless: nothing
 //! here is constructed by `serve`, and no snapshot is compiled from a revision
 //! yet. It is also not a complete body model: [`tenancy`], [`access`],
-//! [`policy`], [`models`], and [`providers`] are the schemas the domain reads,
-//! and catalogue and pricing bodies remain owned by their own slices —
+//! [`policy`], [`models`], [`providers`], and [`pricing`] are the schemas the
+//! domain reads, and catalogue bodies remain owned by their own slice —
 //! [`access::Surface`] names those surfaces so they can be authorized against,
 //! which is not the same as authoring them. A policy document is a contract
 //! rather than an activation: nothing enforces one, and [`PolicyTransition`]
@@ -71,6 +72,7 @@ pub mod ids;
 pub mod models;
 pub mod mutation;
 pub mod policy;
+pub mod pricing;
 pub mod providers;
 pub mod resource;
 pub mod revision;
@@ -116,8 +118,8 @@ pub use models::{
 };
 #[allow(unused_imports)]
 pub use mutation::{
-    Actor, AuditEvent, ExpectedRevision, IdempotencyKey, InvalidIdempotencyKey, Mutation,
-    MutationKind,
+    Actor, AuditEvent, ExpectedRevision, IdempotencyKey, InvalidActor, InvalidIdempotencyKey,
+    Mutation, MutationKind,
 };
 #[allow(unused_imports)]
 pub use policy::{
@@ -125,6 +127,13 @@ pub use policy::{
     Offered, POLICY_SCHEMA, PolicyBody, PolicyContent, PolicyDocument, PolicyEpoch, PolicyError,
     PolicyFence, PolicyGeneration, PolicyScope, PolicySet, PolicySnapshot, PolicyTransition,
     RevocationPolicy, TransitionClass, TransitionReason,
+};
+#[allow(unused_imports)]
+pub use pricing::{
+    Approval, ApprovedRate, ApprovedRates, Currency, EffectiveInstant, EffectiveInterval,
+    InvalidInstant, InvalidInterval, PRICE_BOOK_SCHEMA, PriceBook, PriceBookBody, PriceBooks,
+    PriceOrigin, PriceProvenance, PriceRule, PricedTarget, PricingError, PricingSnapshot,
+    RateRejection, RateUnit, RulePrecedence,
 };
 #[allow(unused_imports)]
 pub use providers::{PROVIDER_SCHEMA, Provider, ProviderBody, ProviderError, Providers};

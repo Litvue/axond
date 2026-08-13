@@ -48,9 +48,6 @@ pub(super) trait BodyError: Sized {
         Self::unknown_field(reference, schema, field)
     }
     fn field_type(reference: ResourceRef, field: &'static str) -> Self;
-    fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self;
-    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self;
-
     /// A field that must be a set of strings and is not.
     ///
     /// Defaulted to the wrong-type refusal, because "a set was expected here" is
@@ -76,6 +73,19 @@ pub(super) trait DisplayNameError: BodyError {
         field: &'static str,
         source: InvalidDisplayName,
     ) -> Self;
+}
+
+/// What a schema whose body *names* things must additionally be able to say.
+///
+/// Split from [`BodyError`] rather than folded into it, because the id-bearing
+/// refusals are only reachable for a schema that reads a typed id or binds its
+/// body's declared identity to the envelope. A schema that reads neither — a
+/// deployment-wide body naming no tenant — would have to carry two arms it can
+/// never reach to get the reader's common checks, and an unreachable arm is a
+/// worse kind of drift than a second trait.
+pub(super) trait IdentifiedBody: BodyError {
+    fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self;
+    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self;
 }
 
 /// One inline record, read strictly.
@@ -179,6 +189,35 @@ impl<'a, E: BodyError> Record<'a, E> {
         Ok((record, schema))
     }
 
+    /// A record nested inside this body: a map that carries no schema of its own,
+    /// because the body it is part of declared one.
+    ///
+    /// A `schema` key inside a nested record is therefore a field this build does
+    /// not know, and is refused as one rather than skipped — dropping it would
+    /// publish a fingerprint over bytes the reader re-wrote.
+    pub(super) fn nested(
+        reference: ResourceRef,
+        schema: &'static str,
+        field: &'static str,
+        value: &'a CanonicalValue,
+        known: &[&str],
+    ) -> Result<Self, E> {
+        let CanonicalValue::Map(fields) = value else {
+            return Err(E::field_type(reference, field));
+        };
+        if let Some((field, _)) = fields
+            .iter()
+            .find(|(field, _)| !known.contains(&field.as_str()))
+        {
+            return Err(E::unknown_field(reference, schema, field.clone()));
+        }
+        Ok(Self {
+            reference,
+            fields,
+            error: std::marker::PhantomData,
+        })
+    }
+
     /// The resource this record is the body of, for a refusal a schema builds
     /// itself.
     pub(super) const fn reference(&self) -> ResourceRef {
@@ -195,11 +234,31 @@ impl<'a, E: BodyError> Record<'a, E> {
     }
 
     pub(super) fn value(&self, field: &'static str) -> Result<&'a CanonicalValue, E> {
-        self.fields
-            .iter()
-            .find(|(name, _)| name == field)
-            .map(|(_, value)| value)
+        self.optional_value(field)
             .ok_or_else(|| E::missing_field(self.reference, field))
+    }
+
+    /// A nested record field, read as strictly as the body containing it.
+    pub(super) fn record(
+        &self,
+        schema: &'static str,
+        field: &'static str,
+        known: &[&str],
+    ) -> Result<Self, E> {
+        Self::nested(self.reference, schema, field, self.value(field)?, known)
+    }
+
+    /// A set-like field's members.
+    ///
+    /// A set and not a list, because a fingerprint taken over the *stored* body
+    /// only sorts and deduplicates members in the set encoding: a list-encoded
+    /// field would give one body as many checksums as its members have orderings,
+    /// and let one member be stated twice.
+    pub(super) fn set(&self, field: &'static str) -> Result<&'a [CanonicalValue], E> {
+        match self.value(field)? {
+            CanonicalValue::Set(members) => Ok(members),
+            _ => Err(E::field_type(self.reference, field)),
+        }
     }
 
     pub(super) fn string(&self, field: &'static str) -> Result<&'a str, E> {
@@ -259,6 +318,16 @@ impl<'a, E: BodyError> Record<'a, E> {
         }
     }
 
+    /// An integer field read as the canonical model stores it, for a schema whose
+    /// own refusals distinguish *why* a value is out of range — a negative rate
+    /// and an unrepresentable one are different things to tell an operator.
+    pub(super) fn signed_integer(&self, field: &'static str) -> Result<i128, E> {
+        match self.value(field)? {
+            CanonicalValue::Integer(value) => Ok(*value),
+            _ => Err(E::field_type(self.reference, field)),
+        }
+    }
+
     /// An integer field a schema defines but a body need not carry.
     ///
     /// Absence and a wrong type stay distinct, for the reason
@@ -272,7 +341,9 @@ impl<'a, E: BodyError> Record<'a, E> {
             Some(_) => Err(E::field_type(self.reference, field)),
         }
     }
+}
 
+impl<'a, E: IdentifiedBody> Record<'a, E> {
     pub(super) fn tenant(&self) -> Result<TenantId, E> {
         self.id(TENANT_ID_FIELD, TenantId::parse)
     }
@@ -331,5 +402,19 @@ impl<'a, E: DisplayNameError> Record<'a, E> {
     pub(super) fn display_name(&self) -> Result<DisplayName, E> {
         DisplayName::parse(self.string(DISPLAY_NAME_FIELD)?)
             .map_err(|source| E::malformed_display_name(self.reference, DISPLAY_NAME_FIELD, source))
+    }
+
+    /// An operator-facing name a body need not carry, in a field of the schema's
+    /// choosing.
+    pub(super) fn optional_display_name(
+        &self,
+        field: &'static str,
+    ) -> Result<Option<DisplayName>, E> {
+        self.optional_string(field)?
+            .map(|text| {
+                DisplayName::parse(text)
+                    .map_err(|source| E::malformed_display_name(self.reference, field, source))
+            })
+            .transpose()
     }
 }

@@ -7,7 +7,7 @@
 use std::time::{Duration, SystemTime};
 
 use super::access::{Credential, IdentityBody, Role, WorkloadKey};
-use super::canonical::{CanonicalValue, Checksum};
+use super::canonical::{Canonical, CanonicalValue, Checksum};
 use super::credentials::ProviderCredentialBody;
 use super::ids::{
     AuditEventId, MutationId, PrincipalId, ProjectId, ResourceId, RevisionId, SecretId, Slug,
@@ -23,6 +23,11 @@ use super::mutation::{
 use super::policy::{
     BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
 };
+use super::pricing::{
+    Approval, ApprovedRate, ApprovedRates, EffectiveInstant, EffectiveInterval, PriceBookBody,
+    PriceBooks, PriceOrigin, PriceProvenance, PriceRule, PricedTarget, PricingSnapshot,
+    RulePrecedence,
+};
 use super::resource::{
     BlobKind, BlobRef, ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion,
     ResourceVersionNumber,
@@ -30,6 +35,7 @@ use super::resource::{
 use super::revision::{DesiredState, RevisionCandidate};
 use super::secrets::{SecretOwner, SecretRef, SecretVersion};
 use super::tenancy::{DisplayName, ProjectBody, TenantBody};
+use crate::backends::catalog::{CatalogContentId, ProviderId};
 
 /// How many resource versions [`state`] contains.
 pub(crate) const DESIRED_STATE_RESOURCES: usize = 5;
@@ -347,6 +353,124 @@ pub(crate) fn state_with_two_blobs() -> DesiredState {
     state.declare_blob(*catalog.body.blob().expect("a blob body"));
     state.insert(catalog).expect("a distinct reference");
     state
+}
+
+/// The catalogue content a fixture price book was approved against.
+///
+/// A named checksum rather than a real import: what a book records is the
+/// *identity*, and a test asserting that the identity survives a round trip must
+/// not depend on the models.dev parser to produce it.
+pub(crate) fn catalog_content_id() -> CatalogContentId {
+    CatalogContentId::from_checksum(Checksum::of(b"fixture catalogue content"))
+}
+
+pub(crate) fn priced_target(provider: &str, model: &str) -> PricedTarget {
+    PricedTarget::new(
+        ProviderId::parse(provider).expect("fixture provider id"),
+        model,
+    )
+}
+
+/// A rule at whole micro-dollars, so it converts, in force from `from`.
+pub(crate) fn price_rule(
+    target: PricedTarget,
+    precedence: RulePrecedence,
+    effective: EffectiveInterval,
+    input_nanos: u64,
+    output_nanos: u64,
+) -> PriceRule {
+    PriceRule::new(
+        target,
+        precedence,
+        effective,
+        ApprovedRates::new(
+            ApprovedRate::from_nanos(input_nanos),
+            ApprovedRate::from_nanos(output_nanos),
+        ),
+        PriceProvenance::stated(PriceOrigin::Catalogue),
+    )
+    .expect("fixture rates convert exactly")
+}
+
+/// An approved book pricing `openai/gpt-4o` from the epoch onwards.
+pub(crate) fn approved_price_book() -> PriceBookBody {
+    PriceBookBody::new(
+        catalog_content_id(),
+        Approval::Approved {
+            by: actor(),
+            at: EffectiveInstant::EPOCH,
+            citation: Some(display_name("CHG-1")),
+        },
+    )
+    .with_rule(price_rule(
+        priced_target("openai", "gpt-4o"),
+        RulePrecedence::Baseline,
+        EffectiveInterval::from(EffectiveInstant::EPOCH),
+        2_500_000,
+        10_000_000,
+    ))
+}
+
+/// A price-book resource version, deployment-scoped as its kind's baseline is.
+pub(crate) fn price_book(body: &PriceBookBody, seed: u64, slug: &str) -> ResourceVersion {
+    body.version(resource_id(seed), Slug::parse(slug).expect("fixture slug"))
+}
+
+/// A retained price book this build cannot bill: its rate is finer than a
+/// micro-dollar, which is what a newer release metering sub-micro-dollar prices
+/// would leave behind. Written directly rather than through [`PriceBookBody`],
+/// because the typed body refuses to construct it.
+pub(crate) fn unbillable_price_book(seed: u64, slug: &str) -> ResourceVersion {
+    let book = approved_price_book();
+    let CanonicalValue::Map(mut fields) = book.canonical() else {
+        panic!("a body is a record");
+    };
+    let Some((_, CanonicalValue::Set(rules))) = fields.iter().find(|(name, _)| name == "rules")
+    else {
+        panic!("a body carries a rule set");
+    };
+    let CanonicalValue::Map(mut rule) = rules.first().expect("one rule").clone() else {
+        panic!("a rule is a record");
+    };
+    rule.retain(|(name, _)| name != "rates");
+    rule.push((
+        "rates".to_owned(),
+        CanonicalValue::map([
+            ("input", CanonicalValue::integer(1_500)),
+            ("output", CanonicalValue::integer(1_000)),
+        ]),
+    ));
+    fields.retain(|(name, _)| name != "rules");
+    fields.push((
+        "rules".to_owned(),
+        CanonicalValue::set([CanonicalValue::map(rule)]),
+    ));
+    ResourceVersion::new(
+        reference(ResourceKind::Price, seed),
+        ResourceScope::Deployment,
+        Slug::parse(slug).expect("fixture slug"),
+        ResourceBody::Inline(CanonicalValue::map(fields)),
+    )
+}
+
+/// [`state`] plus a price book, which is what a deployment that has approved
+/// pricing looks like.
+pub(crate) fn state_with_price_book(body: &PriceBookBody) -> DesiredState {
+    let mut state = state();
+    state
+        .insert(price_book(body, 7, "baseline"))
+        .expect("a distinct reference");
+    state
+}
+
+/// The pricing a converged snapshot serves under, resolved from
+/// [`approved_price_book`] at the epoch. For tests outside the pricing domain
+/// that need a published snapshot's pricing without rebuilding a revision.
+pub(crate) fn approved_pricing_snapshot() -> PricingSnapshot {
+    PriceBooks::of(&state_with_price_book(&approved_price_book()))
+        .expect("the fixture book is servable")
+        .snapshot_at(EffectiveInstant::EPOCH)
+        .expect("the state holds a book")
 }
 
 /// A complete, valid desired state: one tenant, a project, a credential, a

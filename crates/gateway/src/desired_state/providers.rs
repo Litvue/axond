@@ -27,8 +27,8 @@ use super::canonical::{Canonical, CanonicalValue};
 use super::ids::{InvalidId, ProjectId, ResourceId, Slug, TenantId};
 use super::models::WireFamily;
 use super::record::{
-    BodyError, DISPLAY_NAME_FIELD, DisplayNameError, PROJECT_ID_FIELD, Record, SCHEMA_FIELD,
-    TENANT_ID_FIELD,
+    BodyError, DISPLAY_NAME_FIELD, DisplayNameError, IdentifiedBody, PROJECT_ID_FIELD, Record,
+    SCHEMA_FIELD, TENANT_ID_FIELD,
 };
 use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
@@ -203,7 +203,9 @@ impl BodyError for ProviderError {
     fn field_type(reference: ResourceRef, field: &'static str) -> Self {
         Self::FieldType { reference, field }
     }
+}
 
+impl IdentifiedBody for ProviderError {
     fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self {
         Self::MalformedId {
             reference,
