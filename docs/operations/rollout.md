@@ -48,9 +48,10 @@ Hard failures — all of them environment-independent:
 
 | Threshold | Meaning |
 | --- | --- |
-| `max_requests_to_drained_replica` | The balancer never routes to a replica after it has seen it withdraw. |
+| `max_requests_to_drained_replica` | The balancer never routes to a replica after it has seen it withdraw. Taken from two witnesses: the flag selection carried, and the logged dispatch instants recompared with the recorded withdrawal instant. |
 | `max_request_loss` / `max_unavailable_responses` | Every offered request is answered; no `503` during a replacement. |
-| `max_usage_record_loss` | One usage record per request, all flushed before the process exits. |
+| `max_usage_record_loss` | One usage record per request, all flushed before the process exits. A record left behind by a refusal the balancer retried is discounted before the comparison, so a duplicate cannot fill a lost record's place. |
+| `unexplained_usage_record_surplus` / `duplicate_usage_record_ids` | No record beyond what a caller request explains, and no `request_id` recorded twice. |
 | `max_readiness_removal_ms` | How long after `SIGTERM` the balancer still considers the replica ready. |
 | `max_replacement_admission_ms` | How long a new replica takes from boot to carrying traffic. |
 | `max_drain_exit_slack_ms` | How far past `drain_grace_ms + deadline_ms + flush_timeout_ms` a termination may run. |

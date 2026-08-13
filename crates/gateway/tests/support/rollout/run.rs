@@ -23,7 +23,7 @@
 //! request, no lost usage record, a termination inside the bound the process
 //! advertises) do not move with the machine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -184,6 +184,11 @@ struct Harness {
     /// goes, so the denominator of the loss ledger is derived from what was
     /// offered rather than from what turned up.
     expected_usage: u64,
+    /// How many of those records the run expects to be cancellations: one per
+    /// drain, for the stream the shutdown deadline cuts. Any *further*
+    /// cancellation is a request some replica began and never answered a caller
+    /// with, which is what a retried refusal leaves behind.
+    expected_cancelled: u64,
     mixed_probe: Option<MixedVersion>,
     /// How long each replica took from being booted to carrying traffic. Kept
     /// per replica because the offset the balancer records is an offset from the
@@ -206,6 +211,7 @@ impl Harness {
             timeline: Timeline::new(started),
             traffic: Vec::new(),
             expected_usage: 0,
+            expected_cancelled: 0,
             mixed_probe: None,
             admissions: BTreeMap::new(),
         }
@@ -436,8 +442,10 @@ impl Harness {
         let buffered = self.pin(&base_url, pinned::BUFFERED, false).await;
         let stream = self.pin(&base_url, pinned::STREAM, true).await;
         // Both are through the replica's request path and at the upstream, so
-        // both will settle a usage record however the drain ends them.
+        // both will settle a usage record however the drain ends them. The
+        // stream is the one the deadline cuts, so its record is a cancellation.
         self.expected_usage += 2;
+        self.expected_cancelled += 1;
 
         let forwards_before = self.ingress.state.forwards().len();
         let traffic = tokio::spawn(offer(
@@ -529,6 +537,13 @@ impl Harness {
             exit_clean: drained.clean,
             exit_budget_ms: drained.budget.as_millis(),
             requests_after_withdrawal: member.forwards_after_withdrawal(),
+            // Recomputed from the recorded dispatch instants against the
+            // recorded withdrawal instant, rather than from the flag the
+            // selection carried: two witnesses to the same boundary, so the gate
+            // survives the selection stopping to enforce it.
+            dispatches_after_withdrawal: member
+                .withdrawn_at()
+                .map_or(0, |at| member.dispatches_after(at)),
             buffered_in_flight: InFlight {
                 status: buffered.status,
                 completed_after_signal_ms: buffered.ended_after(signalled).as_millis(),
@@ -941,6 +956,31 @@ fn ledger(harness: &Harness, expected: u64, records: &[Value]) -> LossLedger {
         *by_status.entry(status).or_default() += 1;
     }
     let observed = records.len() as u64;
+    let distinct: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|record| record["request_id"].as_str())
+        .collect();
+    let refusals_retried: u64 = harness
+        .ingress
+        .state
+        .members()
+        .iter()
+        .map(|member| member.refusals())
+        .sum();
+    // A caller request the balancer had to retry can leave two records: the
+    // refusing replica settles one for the work it had already started (a
+    // cancellation) and the replica that answered settles another. Those
+    // duplicates are taken off the observed count *before* it is compared with
+    // what the run expected, so a duplicate can never fill the hole a genuinely
+    // lost record leaves.
+    let cancelled = by_status
+        .get("client_cancelled")
+        .copied()
+        .unwrap_or_default();
+    let duplicates = cancelled
+        .saturating_sub(harness.expected_cancelled)
+        .min(refusals_retried);
+    let attributed = observed.saturating_sub(duplicates);
     LossLedger {
         offered: harness.traffic.iter().map(|phase| phase.offered).sum(),
         answered: harness.traffic.iter().map(|phase| phase.answered).sum(),
@@ -950,7 +990,11 @@ fn ledger(harness: &Harness, expected: u64, records: &[Value]) -> LossLedger {
         unavailable: harness.ingress.state.unavailable(),
         usage_records_expected: expected,
         usage_records_observed: observed,
-        usage_records_missing: expected.saturating_sub(observed),
+        usage_records_distinct: distinct.len() as u64,
+        usage_records_retry_duplicates: duplicates,
+        usage_records_missing: expected.saturating_sub(attributed),
+        usage_records_surplus: attributed.saturating_sub(expected),
+        refusals_retried,
         usage_by_status: by_status,
         upstream_streams_open_at_end: harness.fleet.upstream.state.open_streams(),
     }
@@ -996,7 +1040,11 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
             "max_requests_to_drained_replica",
             drains
                 .iter()
-                .map(|drain| drain.requests_after_withdrawal)
+                .map(|drain| {
+                    drain
+                        .requests_after_withdrawal
+                        .max(drain.dispatches_after_withdrawal)
+                })
                 .max()
                 .unwrap_or_default() as f64,
             thresholds.max_requests_to_drained_replica as f64,
@@ -1015,6 +1063,20 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
             "max_usage_record_loss",
             result.loss.usage_records_missing as f64,
             thresholds.max_usage_record_loss as f64,
+        ),
+        // Retry duplicates are already discounted from the count loss is
+        // measured against, so anything still in surplus is double accounting.
+        Verdict::at_most(
+            "unexplained_usage_record_surplus",
+            result.loss.usage_records_surplus as f64,
+            0.0,
+        ),
+        // Records are identified by `request_id`, so a repeated one is the same
+        // event billed twice rather than two requests.
+        Verdict::at_most(
+            "duplicate_usage_record_ids",
+            (result.loss.usage_records_observed - result.loss.usage_records_distinct) as f64,
+            0.0,
         ),
         // Every drain must have been *observed* to leave rotation. A drain with
         // no removal time is a balancer that never noticed, which a maximum over

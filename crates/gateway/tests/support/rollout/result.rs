@@ -257,8 +257,15 @@ pub struct DrainRecord {
     /// sink flush. The harness waits longer than this before giving up, so an
     /// exit that overruns is recorded rather than made impossible.
     pub exit_budget_ms: u128,
-    /// Requests the balancer sent here after recording the withdrawal.
+    /// Requests the balancer sent here after recording the withdrawal, counted
+    /// by the balancer itself. It selects members and reads their withdrawal
+    /// under one lock, so this is an invariant it keeps rather than a discovery.
     pub requests_after_withdrawal: u64,
+    /// The same property recomputed after the fact, from the dispatch instants
+    /// the balancer logged against the withdrawal instant it recorded. The
+    /// witness that can still catch a balancer whose selection stops enforcing
+    /// the rule, because it compares events rather than trusting the selection.
+    pub dispatches_after_withdrawal: u64,
     /// The buffered request that was already in flight when the signal landed.
     pub buffered_in_flight: InFlight,
     /// The stream that was open, and could not finish, when the signal landed.
@@ -321,7 +328,22 @@ pub struct LossLedger {
     /// plus the stream a deadline cut.
     pub usage_records_expected: u64,
     pub usage_records_observed: u64,
+    /// Distinct `request_id`s among them. One terminated request is one event,
+    /// so a repeat is the same event recorded twice.
+    pub usage_records_distinct: u64,
+    /// Records that belong to a caller request some *other* replica went on to
+    /// answer: a replica abandoned mid-drain settles the work it had started and
+    /// still answers `503`, and the balancer retries the caller elsewhere.
+    /// Discounted from the observed count before loss is measured, so a
+    /// duplicate can never fill the hole a lost record leaves.
+    pub usage_records_retry_duplicates: u64,
+    /// Expected minus what is attributable to a caller request.
     pub usage_records_missing: u64,
+    /// Attributable records beyond what the run expected: double accounting.
+    pub usage_records_surplus: u64,
+    /// Refusals the balancer retried elsewhere: the ceiling on how many
+    /// duplicates the run can explain.
+    pub refusals_retried: u64,
     pub usage_by_status: BTreeMap<String, u64>,
     /// Upstream bodies still open once every caller is gone: a leak survives a
     /// rollout as easily as it survives a soak.

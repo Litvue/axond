@@ -49,6 +49,12 @@ struct Health {
     /// distinguishable from "not yet probed".
     admitted: bool,
     admitted_at: Option<Duration>,
+    /// Whether the member stands withdrawn *now*. Cleared when it is seen ready
+    /// again: a probe that timed out once under load is a flap, and a member
+    /// permanently branded by it would fail the zero gate for the rest of the
+    /// run on traffic the balancer was entitled to place.
+    withdrawn: bool,
+    /// When the balancer last took an admitted member out of rotation.
     withdrawn_at: Option<Duration>,
 }
 
@@ -60,6 +66,10 @@ pub struct Member {
     health: Mutex<Health>,
     forwards: AtomicU64,
     forwards_after_withdrawal: AtomicU64,
+    /// When the balancer handed this member a request, as offsets from the run's
+    /// start. Every attempt, including the ones the member refused: the event a
+    /// drain is judged on is the dispatch, not the answer.
+    dispatches: Mutex<Vec<Duration>>,
     refusals: AtomicU64,
 }
 
@@ -72,6 +82,7 @@ impl Member {
             health: Mutex::new(Health::default()),
             forwards: AtomicU64::new(0),
             forwards_after_withdrawal: AtomicU64::new(0),
+            dispatches: Mutex::new(Vec::new()),
             refusals: AtomicU64::new(0),
         }
     }
@@ -86,7 +97,7 @@ impl Member {
         self.health.lock().expect("ingress lock").admitted_at
     }
 
-    /// When the ingress first saw an admitted member stop being ready — the
+    /// When the ingress last saw an admitted member stop being ready — the
     /// instant a rolling deployment cares about, because from here on no caller
     /// may be sent to it.
     pub fn withdrawn_at(&self) -> Option<Duration> {
@@ -98,9 +109,26 @@ impl Member {
     }
 
     /// Requests the balancer sent here *after* it had already recorded the
-    /// withdrawal. The gate: this must be zero.
+    /// withdrawal, counted as it selected them. The gate: this must be zero.
     pub fn forwards_after_withdrawal(&self) -> u64 {
         self.forwards_after_withdrawal.load(Ordering::SeqCst)
+    }
+
+    /// The same property recomputed from the recorded events rather than
+    /// asserted while selecting: dispatches that happened strictly after the
+    /// withdrawal instant. The selection gate holds it at zero by construction,
+    /// so this is what would catch a balancer that stopped holding it.
+    pub fn dispatches_after(&self, withdrawn_at: Duration) -> u64 {
+        self.dispatches
+            .lock()
+            .expect("ingress lock")
+            .iter()
+            .filter(|at| **at > withdrawn_at)
+            .count() as u64
+    }
+
+    fn dispatched(&self, at: Duration) {
+        self.dispatches.lock().expect("ingress lock").push(at);
     }
 
     /// Requests this member refused (a `503` during its drain, or a dropped
@@ -116,7 +144,9 @@ impl Member {
             if !std::mem::replace(&mut health.admitted, true) {
                 health.admitted_at = Some(elapsed);
             }
-        } else if was && health.admitted && health.withdrawn_at.is_none() {
+            health.withdrawn = false;
+        } else if was && health.admitted {
+            health.withdrawn = true;
             health.withdrawn_at = Some(elapsed);
         }
     }
@@ -182,9 +212,7 @@ impl IngressState {
                 return None;
             }
             let health = member.health.lock().expect("ingress lock");
-            health
-                .ready
-                .then(|| (member.clone(), health.withdrawn_at.is_some()))
+            health.ready.then(|| (member.clone(), health.withdrawn))
         })
     }
 }
@@ -340,6 +368,7 @@ async fn proxy(State(state): State<Arc<IngressState>>, request: Request) -> Resp
             break;
         };
         member.forwards.fetch_add(1, Ordering::SeqCst);
+        member.dispatched(state.elapsed());
         if withdrawn {
             member
                 .forwards_after_withdrawal
@@ -429,4 +458,79 @@ fn relayed(member: &Member, status: StatusCode, response: reqwest::Response) -> 
             },
         )))
         .expect("the relayed response builds")
+}
+
+/// The withdrawal rules the routing gate rests on, exercised directly: they are
+/// the difference between a gate that can catch a balancer routing to a draining
+/// replica and one that only ever restates how selection is written.
+///
+/// Plain `#[test]`s rather than a `cfg(test)` module: this is an integration
+/// test crate, where `cfg(test)` is never set and such a module would be
+/// compiled out.
+mod withdrawal_rules {
+    use super::*;
+
+    fn member() -> Member {
+        Member::new(
+            "previous-0".to_owned(),
+            "previous".to_owned(),
+            String::new(),
+        )
+    }
+
+    #[test]
+    fn a_drain_marks_a_member_withdrawn_and_dates_it() {
+        let member = member();
+        member.observe(true, Duration::from_millis(10));
+        member.observe(false, Duration::from_millis(80));
+
+        assert_eq!(member.withdrawn_at(), Some(Duration::from_millis(80)));
+        assert!(member.health.lock().expect("lock").withdrawn);
+    }
+
+    /// A probe that times out once under load is not a drain. Latching the
+    /// withdrawal across the rest of the run would fail the zero gate on traffic
+    /// the balancer was entitled to place, which is a harness artefact rather
+    /// than a rollout defect.
+    #[test]
+    fn a_readiness_flap_does_not_leave_a_member_withdrawn_for_the_run() {
+        let member = member();
+        member.observe(true, Duration::from_millis(10));
+        member.observe(false, Duration::from_millis(20));
+        member.observe(true, Duration::from_millis(30));
+
+        assert!(!member.health.lock().expect("lock").withdrawn);
+        member.dispatched(Duration::from_millis(40));
+        assert_eq!(
+            member.dispatches_after(member.withdrawn_at().expect("the flap is dated")),
+            1,
+            "the recomputed witness counts events, so a flap is visible in it"
+        );
+
+        member.observe(false, Duration::from_millis(50));
+        assert_eq!(
+            member.dispatches_after(member.withdrawn_at().expect("the drain is dated")),
+            0,
+            "and the drain that follows is judged from the drain's own instant"
+        );
+    }
+
+    /// The witness the gate needs: dispatches are compared against the recorded
+    /// withdrawal instant, so a balancer that keeps handing work to a drained
+    /// member is caught even if its selection stops flagging it.
+    #[test]
+    fn dispatches_are_counted_against_the_withdrawal_instant() {
+        let member = member();
+        member.observe(true, Duration::from_millis(10));
+        member.dispatched(Duration::from_millis(30));
+        member.observe(false, Duration::from_millis(40));
+        member.dispatched(Duration::from_millis(41));
+        member.dispatched(Duration::from_millis(90));
+
+        assert_eq!(member.forwards_after_withdrawal(), 0);
+        assert_eq!(
+            member.dispatches_after(member.withdrawn_at().expect("the drain is dated")),
+            2
+        );
+    }
 }
