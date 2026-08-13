@@ -449,8 +449,8 @@ async fn a_refusal_of_authority_is_written_to_the_denial_trail() {
         Some(tenant),
         10,
     )
-        .await
-        .expect("the denial trail");
+    .await
+    .expect("the denial trail");
     assert_eq!(denials.len(), 2, "both refusals are queryable: {denials:?}");
     assert!(
         denials.iter().all(|denial| denial.scope == scoped
@@ -1678,12 +1678,7 @@ async fn publish(
     Extension(preconditions): Extension<MutationPreconditions>,
 ) -> Result<Json<Value>, AdminError> {
     let grant = api
-        .authorize(
-            &identity,
-            AdminAction::Publish,
-            Surface::Tenant,
-            &scope(),
-        )
+        .authorize(&identity, AdminAction::Publish, Surface::Tenant, &scope())
         .await?;
     let outcome = api
         .service

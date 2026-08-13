@@ -166,12 +166,7 @@ impl AdminAuthenticator for BreakglassAuthenticator {
         if !presented.credential.matches(&self.material) {
             return Err(AdminAuthError::UnknownCredential);
         }
-        let attribution = presented
-            .attribution
-            .clone()
-            .ok_or(AdminAuthError::Attribution(
-                super::auth::InvalidAttribution::Missing,
-            ))?;
+        let attribution = presented.attribution.require()?;
         Ok(AdminIdentity::Breakglass {
             attribution,
             credential: self.label.clone(),

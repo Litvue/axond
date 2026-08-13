@@ -29,9 +29,7 @@ use super::reads::{
 use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest};
 use super::router::AdminApi;
 use super::service::MutationOutcome;
-use crate::desired_state::{
-    MutationKind, ProjectId, ResourceScope, RevisionId, Surface, TenantId,
-};
+use crate::desired_state::{MutationKind, ProjectId, ResourceScope, RevisionId, Surface, TenantId};
 
 /// The route table's mutating rows, as method routers.
 pub(super) fn publish_route<R: AdminResourceRequest>() -> MethodRouter<Arc<AdminApi>> {

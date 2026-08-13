@@ -2207,8 +2207,10 @@ mod tests {
     /// and desired state has no way to drop the old one.
     #[test]
     fn a_disabled_enablement_does_not_hold_the_offering_that_replaces_it() {
-        let replacement = enablement_body(33, owner_tenant(), "gpt-4o")
-            .version(Slug::parse("gpt-4o-refreshed").unwrap(), catalog_reference());
+        let replacement = enablement_body(33, owner_tenant(), "gpt-4o").version(
+            Slug::parse("gpt-4o-refreshed").unwrap(),
+            catalog_reference(),
+        );
         let mut state = state_with_models();
         let retired = state
             .resources()
