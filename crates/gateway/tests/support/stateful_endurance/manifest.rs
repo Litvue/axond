@@ -234,29 +234,61 @@ impl Schedule {
 
     /// The windows during which an error is the point rather than a finding.
     pub fn fault_windows(&self, duration: Duration) -> Vec<(Duration, Duration)> {
+        self.fault_windows_of(duration, Injected::EveryDeclaredFault)
+    }
+
+    /// The same, for a run that applies only some of the declared faults: the
+    /// window of a fault nobody injected excuses nothing, because nothing in it
+    /// was caused by this harness.
+    pub fn fault_windows_of(
+        &self,
+        duration: Duration,
+        injected: Injected,
+    ) -> Vec<(Duration, Duration)> {
         let at = |fraction: f64| duration.mul_f64(fraction.clamp(0.0, 1.0));
-        vec![
-            (
-                at(self.upstream_outage_at),
-                at(self.upstream_outage_at + self.upstream_outage_for),
-            ),
-            (
+        let mut windows = vec![(
+            at(self.upstream_outage_at),
+            at(self.upstream_outage_at + self.upstream_outage_for),
+        )];
+        if injected == Injected::EveryDeclaredFault {
+            windows.push((
                 at(self.usage_backend_outage_at),
                 at(self.usage_backend_outage_at + self.usage_backend_outage_for),
-            ),
-        ]
+            ));
+        }
+        windows
     }
 
     /// The same windows, each extended by the recovery allowance: the span in
     /// which a refusal is attributed to the declared fault rather than counted
     /// against the deployment.
     pub fn attribution_windows(&self, duration: Duration) -> Vec<(Duration, Duration)> {
+        self.attribution_windows_of(duration, Injected::EveryDeclaredFault)
+    }
+
+    /// The attribution windows of the faults the run actually applies.
+    pub fn attribution_windows_of(
+        &self,
+        duration: Duration,
+        injected: Injected,
+    ) -> Vec<(Duration, Duration)> {
         let allowance = Duration::from_millis(self.recovery_allowance_ms);
-        self.fault_windows(duration)
+        self.fault_windows_of(duration, injected)
             .into_iter()
             .map(|(from, to)| (from, to + allowance))
             .collect()
     }
+}
+
+/// Which of the script's declared faults a run is able to inject. The
+/// usage-backend outage needs the database to be behind this harness's own
+/// fault gate; a database reached directly is never taken away, so the stretch
+/// of the run the script set aside for that outage must go on being measured
+/// like any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Injected {
+    EveryDeclaredFault,
+    UpstreamFaultsOnly,
 }
 
 /// What a passing run means.

@@ -37,7 +37,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use support::gateway::alias;
 use support::stateful_endurance::fleet;
-use support::stateful_endurance::manifest::{Event, Tier};
+use support::stateful_endurance::manifest::{Event, Injected, Tier};
 use support::stateful_endurance::{self as stateful_endurance, StatefulEnduranceResult};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -835,15 +835,110 @@ fn an_outage_that_was_never_injected_excuses_nothing() {
         );
     }
 
-    // And the run reaches that state exactly where the outage is skipped.
-    let source = include_str!("support/stateful_endurance/run.rs");
+    // Rows and drop reports are only half of it: the same stretch of the run is
+    // what diverts failures away from `max_unplanned_errors` and what excuses a
+    // silent usage stream, through the attribution windows. A fault that was
+    // never injected must be absent from those too, or the strictest gate in the
+    // manifest is quietly suspended for the stretch it was reserved for.
+    let (manifest, _) = stateful_endurance::load();
+    let profile = manifest
+        .profiles
+        .first()
+        .expect("the manifest has a profile");
+    let duration = Duration::from_millis(profile.smoke.duration_ms);
+    let every = profile
+        .schedule
+        .attribution_windows_of(duration, Injected::EveryDeclaredFault);
+    let upstream_only = profile
+        .schedule
+        .attribution_windows_of(duration, Injected::UpstreamFaultsOnly);
+    assert_eq!(
+        every.len(),
+        upstream_only.len() + 1,
+        "only the usage-backend outage's window is dropped"
+    );
+    let usage_outage = *every
+        .iter()
+        .find(|window| !upstream_only.contains(window))
+        .expect("the declared faults include the usage-backend outage");
+    let inside = usage_outage.0 + (usage_outage.1 - usage_outage.0) / 2;
     assert!(
-        source.contains("if reach != Reach::Gated {\n        state.without_usage_outage();"),
-        "a directly reached database leaves the driver with no outage window"
+        stateful_endurance::run::touched(&every, inside, 0.0),
+        "a failure during an injected database outage is the outage's"
     );
     assert!(
-        source.contains("Reach::Direct => durable_counts.distinct,"),
-        "and the durable comparison is then made over the whole run"
+        !stateful_endurance::run::touched(&upstream_only, inside, 0.0),
+        "but one during an outage nobody caused is the deployment's"
+    );
+    // The upstream faults stay the upstream's, whichever set is in force.
+    let upstream = upstream_only
+        .first()
+        .copied()
+        .expect("the upstream outage is always injected");
+    let during_upstream = upstream.0 + (upstream.1 - upstream.0) / 2;
+    assert!(stateful_endurance::run::touched(
+        &upstream_only,
+        during_upstream,
+        0.0
+    ));
+
+    // And the run decides which faults it can cause once, from how the database
+    // is reached, before anything is measured — rather than clearing one of the
+    // two places the outage is recorded after the fact.
+    let source = include_str!("support/stateful_endurance/run.rs");
+    for required in [
+        "Reach::Gated => Injected::EveryDeclaredFault,",
+        "Reach::Direct => Injected::UpstreamFaultsOnly,",
+        "fault_windows: schedule.attribution_windows_of(duration, injected),",
+        "Injected::UpstreamFaultsOnly => durable_counts.distinct,",
+    ] {
+        assert!(
+            source.contains(required),
+            "the driver no longer derives its injected faults from the reach: missing {required:?}"
+        );
+    }
+}
+
+/// The lane that runs the smoke tier is bounded above what the manifest commits
+/// it to rather than near it: the bound is there to end a wedged replica or
+/// backend, and a required gate killed part-way through a run publishes no
+/// evidence and fails for a reason that has nothing to do with the change.
+#[test]
+fn the_endurance_smoke_lane_is_bounded_above_its_committed_contract() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
+    )
+    .expect("the CI workflow is committed");
+    let (_, smoke) = workflow
+        .split_once("  stateful-endurance-smoke:")
+        .expect("CI has a dedicated stateful endurance smoke job");
+    let bound = smoke
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("timeout-minutes:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .expect("the lane is bounded rather than left on the six-hour default");
+
+    // What the committed contract can spend at most: every profile's smoke
+    // workload, the tail a late rolling restart may add to it, and the two
+    // settles that follow it (the driver's, then the durable table's).
+    let (manifest, _) = stateful_endurance::load();
+    let contract: u64 = manifest
+        .profiles
+        .iter()
+        .map(|profile| {
+            profile.smoke.duration_ms
+                + stateful_endurance::run::POST_RESTART_LOAD.as_millis() as u64
+                + 2 * profile.termination.settle_ms
+        })
+        .sum();
+    // Plus the build: the lane caches dependencies but not the target directory,
+    // so it compiles the gateway with every feature from cold on every run.
+    const COLD_BUILD_MINUTES: u64 = 20;
+    let floor = contract.div_ceil(60_000) + COLD_BUILD_MINUTES;
+    assert!(
+        bound >= floor,
+        "the smoke lane is bounded at {bound} minutes, under the {floor} its own manifest and \
+         a cold build need"
     );
 }
 

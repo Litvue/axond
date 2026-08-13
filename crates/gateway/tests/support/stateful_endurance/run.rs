@@ -30,7 +30,7 @@ use super::durable::{self, Durable, Reach};
 use super::fleet::{self, Deployment, Fleet, Revision};
 use super::gate::{Gate, GateCounts, Mode};
 use super::manifest::{
-    DURATION_ENV, Event, Profile, RESULT_SCHEMA_VERSION, Scale, Slo, Stop, Tier,
+    DURATION_ENV, Event, Injected, Profile, RESULT_SCHEMA_VERSION, Scale, Slo, Stop, Tier,
 };
 use super::result::*;
 use crate::support::capacity::result::{Environment, Percentiles, Verdict};
@@ -151,17 +151,23 @@ pub async fn run_with(
     };
 
     let dir = fleet::artifact_dir(tier.as_str());
+    // Which faults this run can actually cause, decided once and before anything
+    // is measured: a database reached directly is never taken away, and the
+    // stretch of the run the script set aside for its outage must go on being
+    // judged like any other rather than excusing whatever happens in it.
+    let injected = match reach {
+        Reach::Gated => Injected::EveryDeclaredFault,
+        Reach::Direct => Injected::UpstreamFaultsOnly,
+    };
     let mut state = State::new(
         &dir,
         dispatch.stem,
         scale,
         profile.schedule,
         duration,
+        injected,
         &tenants,
     );
-    if reach != Reach::Gated {
-        state.without_usage_outage();
-    }
 
     // One client for the workers and the driver alike, as the stateless drivers
     // do: a pool per worker would put the driver's own descriptors and sockets
@@ -264,14 +270,14 @@ pub async fn run_with(
     // A directly reached database was never taken away, so every row it holds
     // was settled at a moment nothing excuses and the comparison is made over
     // the whole run.
-    let durable_outside = match reach {
-        Reach::Gated => {
+    let durable_outside = match injected {
+        Injected::EveryDeclaredFault => {
             let (usage_from, usage_to) = profile.schedule.usage_outage_window(duration);
             durable
                 .distinct_outside(started_at + usage_from, started_at + usage_to)
                 .await
         }
-        Reach::Direct => durable_counts.distinct,
+        Injected::UpstreamFaultsOnly => durable_counts.distinct,
     };
 
     // The samplers are read for the last time before the processes stop: a
@@ -1100,7 +1106,7 @@ const RETIRE_BOUND_MS: u64 = 15_000;
 /// deployment nobody is asking for anything — and a restart that runs long
 /// enough to eat the tail of a short tier would otherwise turn that missing
 /// evidence into a failing assertion rather than into measurement.
-const POST_RESTART_LOAD: Duration = Duration::from_secs(10);
+pub const POST_RESTART_LOAD: Duration = Duration::from_secs(10);
 
 /// When the run stops offering, shared by the workers and the supervising
 /// loop so the two cannot disagree about it — and movable, because the
@@ -1326,6 +1332,7 @@ impl State {
         scale: Scale,
         schedule: super::manifest::Schedule,
         duration: Duration,
+        injected: Injected,
         _tenants: &[Tenant],
     ) -> Self {
         Self {
@@ -1353,8 +1360,15 @@ impl State {
             emitted_outside_usage_window: 0,
             emitted_in_usage_window: 0,
             sink_drops: SinkDrops::default(),
-            usage_window: Some(schedule.usage_outage_window(duration)),
-            fault_windows: schedule.attribution_windows(duration),
+            // Both come from the same decision, so an outage that is not
+            // injected cannot go on excusing errors and silence through the
+            // attribution windows while the row accounting has stopped
+            // excusing anything.
+            usage_window: match injected {
+                Injected::EveryDeclaredFault => Some(schedule.usage_outage_window(duration)),
+                Injected::UpstreamFaultsOnly => None,
+            },
+            fault_windows: schedule.attribution_windows_of(duration, injected),
             last_record_at: None,
             samplers: Vec::new(),
             sample_paths: BTreeMap::new(),
@@ -1564,14 +1578,6 @@ impl State {
                 observed: format!("a usage record was attributed to `{credential}`"),
             });
         }
-    }
-
-    /// Forget the declared usage-backend outage, for a run whose database is
-    /// reached directly and so is never taken away. Without this, records and
-    /// drop reports landing in the *time* the script set aside for an outage
-    /// would be excused by a fault the run never injected.
-    fn without_usage_outage(&mut self) {
-        self.usage_window = None;
     }
 
     /// Fold in one of the fleet's reports of a usage batch it dropped. The

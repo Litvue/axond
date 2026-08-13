@@ -77,14 +77,22 @@ qualification without a datastore is not a smaller one.
 
 Point it at a database on this machine if you want the usage-backend outage
 evaluated. The replicas reach a loopback database through the fault gate, which
-evaluated. The gate forwards PostgreSQL bytes without terminating them, so
-loopback DSNs retain their original host for certificate verification and their
-`sslmode` while `hostaddr` points at the gate. This keeps both `prefer` and
-`require` TLS connections intact while the database outage can still be
-introduced. A DSN naming a host somewhere else is handed to replicas untouched:
-rewriting a remote destination would hand its credentials to a local forwarder,
-so the artifact records the backend as reached `direct` and the usage-backend
-outage as not evaluated.
+forwards PostgreSQL bytes without terminating them, so loopback DSNs retain
+their original host for certificate verification and their `sslmode` while
+`hostaddr` points at the gate. This keeps both `prefer` and `require` TLS
+connections intact while the database outage can still be introduced. A DSN
+naming a host somewhere else is handed to replicas untouched: rewriting a remote
+destination would hand its credentials to a local forwarder, so the artifact
+records the backend as reached `direct` and the usage-backend outage as not
+evaluated.
+
+An outage that is not evaluated excuses nothing. A run against a directly
+reached database judges the stretch the script reserved for the database outage
+like any other: a lost accounting row there counts against
+`max_durable_usage_loss_outside_windows`, a refusal counts against
+`max_unplanned_errors`, and a silent usage stream is measured rather than
+skipped. Only the upstream faults, which this harness does inject whatever the
+database is, attribute anything.
 
 ```bash
 export AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres
