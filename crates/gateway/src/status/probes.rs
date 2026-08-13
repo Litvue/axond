@@ -64,15 +64,28 @@ impl ControlPlaneProbe {
     /// coarsen every component to `stale`. A deployment that wants a faster
     /// diagnostic lowers `[control_plane] operation_timeout_ms`, which is the
     /// honest lever: status can only be as prompt as the backend it reports on.
+    ///
+    /// It is bounded above by [`MAX_REFRESH_INTERVAL`] regardless: a cadence
+    /// slower than the exporter holds a series for is indistinguishable from a
+    /// refresher that stopped, so an operation bound generous enough to outrun
+    /// the monitoring pipeline buys a permanent `AxondStatusRefresherStalled`
+    /// page rather than a patient probe. Past that point the probe is cut off
+    /// early and the round is published as a timeout — an honest "this control
+    /// plane is slower than a diagnostic can wait for", where silence would say
+    /// nothing at all.
     pub fn pacing(settings: &ControlPlaneSettings) -> StatusSettings {
-        let probe_timeout = settings
+        let bounds = settings
             .operation_timeout
             .saturating_mul(2)
             .saturating_add(settings.connect_timeout)
             // A configuration with sub-second bounds still has to leave
             // `refresh_interval` at the one-second floor `validate` requires.
             .max(Duration::from_secs(2));
-        let refresh_interval = probe_timeout.saturating_add(settings.connect_timeout.max(SPACING));
+        let spacing = settings.connect_timeout.clamp(SPACING, MAX_SPACING);
+        let refresh_interval = bounds.saturating_add(spacing).min(MAX_REFRESH_INTERVAL);
+        // Still strictly below the interval, so rounds cannot overlap, and
+        // unchanged from the store's own bounds wherever the cap does not bite.
+        let probe_timeout = bounds.min(refresh_interval.saturating_sub(SPACING));
         StatusSettings {
             probe_timeout,
             refresh_interval,
@@ -85,9 +98,24 @@ impl ControlPlaneProbe {
     }
 }
 
-/// The gap between a round's ceiling and the next round, when the store's own
-/// connect bound is smaller than it.
+/// The gap between a round's ceiling and the next round. Taken from the store's
+/// own connect bound, clamped: a second is enough to keep rounds from
+/// overlapping, and half a minute is already more idle time than a diagnostic
+/// needs between observations.
 const SPACING: Duration = Duration::from_secs(1);
+const MAX_SPACING: Duration = Duration::from_secs(30);
+
+/// The slowest a live component may be observed.
+///
+/// The stall rule reads the *absence* of `axond_status_refreshes`, and absence
+/// is the exporter's decision: it holds the last sample for `metric_expiration`
+/// (5m in the shipped pipeline) and the rule looks back 10m. A cadence at or
+/// above those windows leaves a hole in the series every cycle, which is the
+/// same signal a refresher that died leaves — so a deployment with a very
+/// generous `operation_timeout_ms` would page continuously while healthy. Kept
+/// below the exporter's window, and pinned against it by
+/// `the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it`.
+pub const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60);
 
 #[async_trait]
 impl ComponentProbe for ControlPlaneProbe {
@@ -256,6 +284,13 @@ mod tests {
                 "connect {connect_ms}ms, operation {operation_ms}ms produced {pacing:?}"
             );
             assert_eq!(pacing.enabled, vec![Component::ControlPlane]);
+            // A cadence past the exporter's window is silence, and silence is
+            // what the stall rule pages for.
+            assert!(
+                pacing.refresh_interval <= MAX_REFRESH_INTERVAL,
+                "connect {connect_ms}ms, operation {operation_ms}ms outruns the pipeline: \
+                 {pacing:?}"
+            );
         }
     }
 

@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::*;
 
@@ -124,6 +125,45 @@ fn the_shipped_pipeline_lets_the_stall_rule_see_a_gap() {
         "the exporter holds a series for {expiration} while the stall rule looks back {lookback}, \
          so the series never lapses and the rule can never fire"
     );
+}
+
+/// The other end of the same coupling: a refresher paced slower than the
+/// exporter holds a series for leaves the same hole in `axond_status_refreshes`
+/// that a refresher which *stopped* leaves, so the cap the live pacing is
+/// derived under has to stay below both windows. The cadence comes from operator
+/// configuration ([`crate::status::probes::ControlPlaneProbe::pacing`]), so
+/// without this the two assets and the code that feeds them drift apart
+/// silently — and silence is what the rule reads.
+#[test]
+fn the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it() {
+    fn minutes(duration: &str, source: &str) -> u64 {
+        duration
+            .strip_suffix('m')
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("{source} states a duration in whole minutes: `{duration}`"))
+    }
+
+    let collector = read(COLLECTOR);
+    let expiration = collector
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("metric_expiration:"))
+        .map(str::trim)
+        .expect("the shipped pipeline states the expiration the rule depends on");
+    let rules = read(RULES);
+    let lookback = rules
+        .split_once("absent_over_time(axond_status_refreshes[")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(window, _)| window)
+        .expect("AxondStatusRefresherStalled watches for the absence of the refresh counter");
+
+    let cap = crate::status::probes::MAX_REFRESH_INTERVAL;
+    for (window, source) in [(expiration, COLLECTOR), (lookback, RULES)] {
+        assert!(
+            cap < Duration::from_secs(minutes(window, source) * 60),
+            "a refresher may be paced every {cap:?} while {source} works in {window} windows, so a \
+             healthy replica's series lapses and the stall rule pages"
+        );
+    }
 }
 
 /// Cardinality, from the asset side: the only drill-downs offered are the four
