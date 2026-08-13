@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.21](https://github.com/Litvue/axond/compare/v0.3.20...v0.3.21) (2026-08-13)
+
+
+### Continuous Integration
+
+* **security:** pin GitHub Actions to reviewed commit SHAs and automate pin updates ([#228](https://github.com/Litvue/axond/issues/228)) ([53e4d78](https://github.com/Litvue/axond/commit/53e4d7844891581c3c2f6e3d7bc2bf62e408293f))
+
 ## [0.3.20](https://github.com/Litvue/axond/compare/v0.3.19...v0.3.20) (2026-08-13)
 
 
