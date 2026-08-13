@@ -84,7 +84,7 @@ Alongside them:
   signal. One second of lag is convergence working; ten minutes is an incident.
 - **reason** — the stage that refused the last candidate: `unavailable`,
   `incompatible`, `corrupt`, `not_found`, `projection`, `validation`, `secret`,
-  or `snapshot`.
+  `snapshot`, `pricing`, or `clock`.
 - **source** — `control-plane` or `last-known-good`. A replica reporting
   `last-known-good` booted from its cache and may be serving something older
   than desired.
@@ -118,7 +118,7 @@ deployment, not a restore.
 
 A published resource carries a **body**: a record whose meaning is fixed by an
 explicit schema identifier stored inside it, alongside the resource's identity,
-scope, and slug. Six schemas exist today:
+scope, and slug. Seven schemas exist today:
 
 | Schema | Resource | Fields |
 | --- | --- | --- |
@@ -128,6 +128,7 @@ scope, and slug. Six schemas exist today:
 | `axond.policy.v1` | the policy of a tenant or a project | `schema`, `tenant_id`, `project_id` (project documents only), `epoch`, `budget_limit_microdollars`, `namespace_budget_limit_microdollars` (optional), `reservation_ttl_seconds`, `max_in_flight_per_subject`, `lease_ttl_seconds`, `minimum_token_epoch` |
 | `axond.model-enablement.v1` | a tenant's or project's permission to use one catalogue offering | `schema`, `enablement_id`, `tenant_id`, `project_id` (a project's only), `offering_id`, `catalog_snapshot`, `wire_family`, `state`, `observed_price` (optional), `approved_price` (optional) |
 | `axond.model-alias.v1` | a project-scoped name for an ordered list of enablements | `schema`, `alias_id`, `tenant_id`, `project_id`, `wire_family`, `state`, `targets` |
+| `axond.price-book.v1` | the deployment's approved price book | `schema`, `catalog_content_id`, `currency`, `unit`, `approval`, `rules` |
 
 Six rules hold for every body schema, present and future:
 
@@ -259,6 +260,8 @@ differently:
 | --- | --- | --- |
 | no `schema` field, an unknown `schema`, an unknown field, an unknown `lifecycle` | `incompatible` | storage is intact; run or roll forward to a build that reads the body |
 | contradictory readable rows — one secret with two owners, an unreachable provider, two states for one version, two active versions | invalid, reported `Corrupt` | real repair work on stored rows |
+| a price book stating an approved rate this build cannot bill exactly, an approver kind or field it does not know, a citation its name rules refuse, or a scope it does not serve | `incompatible` | storage is intact; roll forward, or approve a rate this build states |
+| a price book whose rules contradict each other — two rules of one precedence covering one instant, an empty interval, a rate no `ApprovedRate` could have written | invalid, reported `Corrupt` | the body was rewritten underneath the gateway |
 
 A credential body written before this schema existed — no `schema` field — is
 therefore `incompatible` rather than corrupt, as an untyped tenant or project body
@@ -521,6 +524,28 @@ The refusal reason is the triage key.
   not retry into a different answer. During a rolling upgrade, expect it on
   replicas still running the older build. A body that *declares* a schema this
   build reads and then is not one is `corrupt` instead — see the rules above.
+- **A price book this build cannot bill** — an approved rate finer than a
+  micro-dollar, a rate for usage the gateway does not meter, a context tier, or an
+  approval citation its display-name rules refuse is
+  read as release skew and reported as **`incompatible`**; contradictory rules —
+  two of one precedence covering one instant, an empty interval — or a negative or
+  overflowing stored rate is damage and reported as **`corrupt`**. Both are
+  decided when the revision is read, so triage them with the two bullets above
+  and not as a pricing-specific reason. **Every** replica of this build refuses
+  the revision, and the fleet keeps serving the previously published pricing
+  along with its routing; approve a corrected book. See
+  [ADR 0046](../adr/0046-approved-price-books.md) for why none of these are
+  rounded or partially applied.
+- **`pricing`** (reported as `pricing_rejected` on `/status`) — the same refusal
+  reached one stage later, when the book is resolved into billable rates. Reading
+  a revision already rejects every book this build cannot bill, so this reason is
+  a guard against those two stages disagreeing rather than something a bad book
+  produces: treat it as a bug report, and triage the book itself as above.
+- **`clock`** — this replica's clock is not on the effective-dating timeline
+  (before the Unix epoch, or beyond the range an instant represents), so a price
+  book cannot be resolved at "now" without inventing an instant. Replica-specific
+  and a host problem, reported as `clock_unsynchronised` on `/status`: fix time
+  synchronisation.
 - **`corrupt`** / **`not_found`** — the journal itself does not add up. Retrying
   will not clear it; see
   [when a revision will not load](./control-plane-journal.md#when-a-revision-will-not-load).

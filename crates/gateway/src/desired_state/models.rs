@@ -128,7 +128,9 @@ use super::canonical::{
     Canonical, CanonicalError, CanonicalValue, Checksum, InvalidChecksum, SerializerVersion,
 };
 use super::ids::{InvalidId, ProjectId, ResourceId, Slug, TenantId};
-use super::record::{BodyError, PROJECT_ID_FIELD, Record, SCHEMA_FIELD, TENANT_ID_FIELD};
+use super::record::{
+    BodyError, IdentifiedBody, PROJECT_ID_FIELD, Record, SCHEMA_FIELD, TENANT_ID_FIELD,
+};
 use super::resource::{
     BlobKind, ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion,
     ResourceVersionNumber,
@@ -930,7 +932,9 @@ impl BodyError for ModelError {
     fn field_type(reference: ResourceRef, field: &'static str) -> Self {
         Self::FieldType { reference, field }
     }
+}
 
+impl IdentifiedBody for ModelError {
     fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self {
         Self::MalformedId {
             reference,

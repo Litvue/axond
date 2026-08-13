@@ -448,6 +448,77 @@ async fn a_revision_this_build_cannot_read_is_refused_as_an_incompatibility() {
     assert_eq!(replica.served_aliases(), serving);
 }
 
+/// The pricing half of the same promise: a revision whose approved book this
+/// build cannot bill is refused whole, and the replica keeps billing at the
+/// prices it already converged onto rather than at none.
+///
+/// Rollback is republication, so "the previous snapshot stays active" is the only
+/// mechanism that keeps a budget enforceable across a bad publication.
+#[tokio::test]
+async fn a_price_book_this_build_cannot_bill_leaves_the_previous_pricing_active() {
+    let store = control_plane();
+    let body = fixtures::approved_price_book();
+    let first = publish(
+        &store,
+        "first",
+        ExpectedRevision::Empty,
+        fixtures::state_with_price_book(&body),
+    )
+    .await;
+    let replica = Replica::serving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let priced = replica
+        .state
+        .config()
+        .pricing()
+        .expect("the converged snapshot carries pricing")
+        .clone();
+    assert!(priced.is_approved());
+
+    let second = publish(
+        &store,
+        "second",
+        ExpectedRevision::Exactly(first),
+        fixtures::state_with_price_book(&body),
+    )
+    .await;
+    // The retained book row, as a newer release metering finer rates left it.
+    store.rewrite_version(fixtures::unbillable_price_book(7, "baseline"));
+
+    let outcome = replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Rejected { revision, reason }
+                if revision == Some(second) && reason == "incompatible"
+        ),
+        "{outcome:?}"
+    );
+    let report = replica.report();
+    assert_eq!(report.active, Some(first));
+    assert_eq!(report.desired, Some(second));
+    assert_eq!(replica.generation(), 1);
+    // Not merely "some pricing": the same book, checksum, and prices as before.
+    let serving = replica
+        .state
+        .config()
+        .pricing()
+        .expect("pricing is retained, not dropped")
+        .clone();
+    assert_eq!(serving.book(), priced.book());
+    assert_eq!(serving.checksum(), priced.checksum());
+    assert_eq!(
+        serving.targets().collect::<Vec<_>>(),
+        priced.targets().collect::<Vec<_>>()
+    );
+}
+
 /// A control-plane outage degrades to staleness: the replica keeps serving the
 /// revision it already has, reports growing lag, and converges when Postgres
 /// comes back.

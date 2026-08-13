@@ -91,11 +91,24 @@ impl ResourceKind {
     ///   case — a tenant's administrator, a project's workload — and
     ///   [`Directory`](super::access::Directory) holds each role to the scopes it
     ///   may be granted at;
+    /// - a price book is deployment-wide *or* tenant state: the approved baseline
+    ///   a deployment charges is one shared decision (#201), while a
+    ///   tenant-specific rate is that tenant's. The body schema this build reads
+    ///   accepts only the deployment-scoped baseline
+    ///   ([`PricingError::ScopeNotSupported`](super::pricing::PricingError)), so the
+    ///   envelope permits what the model will hold and the body refuses what the
+    ///   routing model cannot yet charge correctly;
     /// - everything else is tenant- or project-scoped, never deployment-wide, so
     ///   no ordinary resource can be authored outside a tenant by accident.
     pub const fn permits(self, scope: &ResourceScope) -> bool {
         match self {
             Self::Tenant | Self::CatalogModel => matches!(scope, ResourceScope::Deployment),
+            Self::Price => matches!(
+                scope,
+                ResourceScope::Deployment
+                    | ResourceScope::Tenant(_)
+                    | ResourceScope::Project { .. }
+            ),
             Self::Project => matches!(scope, ResourceScope::Tenant(_)),
             Self::Identity => true,
             _ => matches!(
@@ -531,6 +544,13 @@ mod tests {
             );
         }
 
+        // A price book is the one kind that is legal at every scope: an approved
+        // baseline is deployment-wide, and a negotiated book belongs to whoever
+        // negotiated it.
+        assert!(ResourceKind::Price.permits(&ResourceScope::Deployment));
+        assert!(ResourceKind::Price.permits(&ResourceScope::Tenant(tenant)));
+        assert!(ResourceKind::Price.permits(&project));
+
         for kind in ResourceKind::ALL {
             if matches!(
                 kind,
@@ -538,6 +558,7 @@ mod tests {
                     | ResourceKind::Project
                     | ResourceKind::CatalogModel
                     | ResourceKind::Identity
+                    | ResourceKind::Price
             ) {
                 continue;
             }
