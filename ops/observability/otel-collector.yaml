@@ -6,6 +6,16 @@
 # unit suffix, which is the spelling the shipped assets use. Flip it and the
 # assets match nothing.
 #
+# This pipeline is written for a collector *per replica* — a sidecar, or a
+# DaemonSet whose exporter is scraped per pod — because that is what gives each
+# replica its own series. axond's resource carries only `service.name`, so a
+# single shared collector receiving OTLP from the whole fleet collapses every
+# replica into one series, and the fleet-spread rules
+# (`AxondFleetRevisionSplit`, `AxondRevisionConvergenceSplit`, and the
+# convergence panels) then read zero for ever. If you must centralise, add a
+# replica-identifying resource attribute upstream and set
+# `resource_to_telemetry_conversion: enabled: true` so it reaches the series.
+#
 # Everything else below is a minimum, not a recommendation: add your own
 # processors, authentication, and exporters as your environment requires.
 receivers:

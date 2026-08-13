@@ -169,13 +169,13 @@ groups:
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-replica-is-shedding-load"
 
       - alert: AxondAdmissionSaturated
-        expr: "max(axond_admission_in_flight{axond_admission_resource=\"request\"}) > 200"
+        expr: "max(axond_admission_in_flight{axond_admission_resource=\"request\"}) > 819"
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "In-flight requests are near the replica's admission ceiling"
-          description: "Leading indicator of shedding. Set this threshold to roughly 80% of admission.max_in_flight for your deployment; the shipped value assumes the documented default."
+          description: "Leading indicator of shedding. Set this threshold to roughly 80% of admission.max_in_flight for your deployment; the shipped 819 is 80% of the documented default of 1024. A single-namespace deployment sheds at max_in_flight_per_tenant instead, so lower it to 80% of that."
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-replica-is-shedding-load"
 
       - alert: AxondNamespaceBudgetExhausted

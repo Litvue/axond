@@ -31,9 +31,14 @@ including one carrying a `credentials:all` claim — receive
 `403 token_scope_insufficient`. A scoped token also needs `credentials` for the
 route. `credentials:all` remains unmintable through `POST /v1/tokens`.
 
-`GET /admin/v1/status` needs the `status` capability, which a scope-less
-`POST /v1/tokens` mint does **not** confer unless a `[gateway_minting] scope`
-ceiling names it ([ADR 0031]). Its scope follows the same direct-operator-authority
+`GET /admin/v1/status` is authenticated, and a *scoped* caller needs the `status`
+capability — which a scope-less `POST /v1/tokens` mint does **not** confer unless
+a `[gateway_minting] scope` ceiling names it ([ADR 0031]). A static
+`[[gateway_key]]` carries no scope claim and so is admitted on its namespace
+authority alone, as it is on every other capability-gated route: a tenant key
+therefore reads its own namespace's projection, which is the tenant view
+described next rather than the operator's. Its scope follows the same
+direct-operator-authority
 rule as the all-namespaces credential view: a scope-less static
 `[[gateway_key]]` in the default namespace sees every component, the deployment's
 reason codes, exact observation ages, and the revision summary, while every other
