@@ -115,6 +115,7 @@ parked credential.
 | `axond.upstream.attempt` | `axond.attempt` (zero-based), `axond.target.provider`, `axond.target.model`, `axond.credential_source`, `axond.status`, `axond.latency_ms`, `axond.ttft_ms`, `axond.timeout` (which phase stalled, when one did), `axond.timeout.bound` (`phase` or `walk_budget`) |
 | `axond.credential.lease` | `axond.credential.id`, `axond.credential_source`, `axond.credential.index`, `axond.status` (`served`, `rate_limited`, `error`, `parked`) |
 | `axond.config.reload` | `axond.reload.trigger`, `axond.reload.outcome`, `axond.config.generation` |
+| `axond.revision.converge` | `axond.revision.trigger` (`boot`, `polled`, `notified`, or `pricing-boundary`), outcome, active/desired revision, lag, and generation |
 
 An inbound `traceparent` is **joined**, not replaced, and the context is
 injected into the upstream request, so a caller's trace runs end to end. Spans

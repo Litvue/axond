@@ -75,6 +75,7 @@ pub mod compile;
 pub mod credentials;
 pub mod lkg;
 pub mod policy;
+pub mod pricing;
 pub mod reconciler;
 pub mod secrets;
 pub mod settings;
@@ -97,6 +98,8 @@ pub use credentials::{CredentialProjection, RuntimeProjection};
 pub use lkg::{LastKnownGood, LastKnownGoodError};
 #[allow(unused_imports)]
 pub use policy::PolicyProjection;
+#[allow(unused_imports)]
+pub use pricing::{PricingSchedule, PricingScheduleError};
 #[allow(unused_imports)]
 pub use reconciler::{BootstrapError, ChangeSignal, Outcome, Reconciler, SnapshotSink};
 #[allow(unused_imports)]

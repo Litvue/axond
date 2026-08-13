@@ -329,6 +329,7 @@ const REVISION_TRIGGER: Label = Label::closed(
         super::CONVERGENCE_BOOT,
         super::CONVERGENCE_POLLED,
         super::CONVERGENCE_NOTIFIED,
+        super::CONVERGENCE_PRICING_BOUNDARY,
     ],
 );
 

@@ -121,18 +121,14 @@ approximation of what was approved, and two replicas cannot disagree about a
 price because they rounded differently.
 
 Effective dating adds a clock to compilation, and this slice resolves against it
-*once* per compilation. So each snapshot is billed at a rate that was in force at
-some instant inside the interval it names, but a future-dated rule does not
-activate on its own: a replica that has already converged onto the revision does
-not recompile when the boundary elapses, while a replica that boots after it
-resolves the later rule, and the two then disagree for as long as neither
-recompiles. The interval the resolution holds over is therefore published as
-`priced_until` on the snapshot and in the publication log — the signal a later
-slice needs in order to recompile when it expires, and the signal an operator
-needs meanwhile to know a scheduled change requires a republication rather than
-waiting for a date. Scheduling that recompilation is not in this slice. A host
-clock that is not on the timeline refuses the candidate rather than pricing at an
-invented instant.
+*once* per compilation. Each snapshot carries the interval over which its
+resolution remains the answer. The convergence layer arms a control-plane timer
+from that interval and recompiles the durable revision at the exact half-open
+boundary, including when the control plane is otherwise idle; it never puts a
+price-book lookup or clock read on the request path. A host clock that is not on
+the timeline refuses the candidate rather than pricing at an invented instant.
+See [ADR 0059](./0059-effective-dated-pricing-activation.md) for the scheduler,
+restart recovery, and failure semantics.
 
 Pricing rides on the snapshot, so whatever publishes a snapshot decides whether
 it has prices — and the file reloader publishes snapshots too. `axond.toml`

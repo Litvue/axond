@@ -38,10 +38,11 @@ pub use metrics::{record_last_known_good, record_revision_rejection};
 #[allow(unused_imports)]
 pub use spans::{
     ATTEMPT_ERROR, ATTEMPT_OK, CONVERGENCE_BOOT, CONVERGENCE_NOTIFIED, CONVERGENCE_POLLED,
-    LEASE_ERROR, LEASE_PARKED, LEASE_RATE_LIMITED, LEASE_SERVED, RELOAD_APPLIED, RELOAD_REJECTED,
-    config_reload_span, credential_lease_span, finish_config_reload, finish_credential_lease,
-    finish_revision_convergence, finish_upstream_attempt, record_attempt_timeout, record_request,
-    record_routing, record_streamed, revision_convergence_span, trace_id, upstream_attempt_span,
+    CONVERGENCE_PRICING_BOUNDARY, LEASE_ERROR, LEASE_PARKED, LEASE_RATE_LIMITED, LEASE_SERVED,
+    RELOAD_APPLIED, RELOAD_REJECTED, config_reload_span, credential_lease_span,
+    finish_config_reload, finish_credential_lease, finish_revision_convergence,
+    finish_upstream_attempt, record_attempt_timeout, record_request, record_routing,
+    record_streamed, revision_convergence_span, trace_id, upstream_attempt_span,
 };
 
 use std::sync::OnceLock;

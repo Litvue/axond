@@ -29,6 +29,17 @@ a whole.
 5. If any of it fails, the replica keeps serving what it already had and reports
    why.
 
+When the published snapshot carries effective-dated pricing, the reconciler also
+arms a timer for `PricingSnapshot::effective().ends()`. At that boundary it
+re-runs the same compile/admit/publish path against the current durable revision,
+even if no administrator has published a new revision and no request arrives.
+The schedule is derived from the snapshot after each successful publication, so
+an `effective_until` boundary can restore a baseline rule or make a target
+ineligible according to the approved-book rules. A failed boundary refresh keeps
+the prior snapshot and retries with the normal bounded backoff. On restart,
+bootstrap resolves the durable book at the current instant and reconstructs the
+next timer; no derived timer state is persisted.
+
 Two consequences worth internalising:
 
 - **Replicas converge independently, so a fleet is briefly mixed.** Two replicas
@@ -46,6 +57,7 @@ Two consequences worth internalising:
 | --- | --- |
 | Notification delivered | Compile time (milliseconds), no poll wait |
 | Notification lost or disabled | Up to one poll interval, plus compile time |
+| Effective-dated pricing boundary | At the boundary, plus compile time; the scheduler is off the request path |
 | Control plane unreachable | Not until it returns; the previous revision keeps serving |
 | Revision refused | Never, until the revision is fixed or replaced |
 
@@ -103,7 +115,7 @@ Alongside them:
 | `axond.revision.rejections` (by `reason`) | Which stage is refusing, and whether it is the store or the state |
 | `axond.revision.consecutive_failures` | Backoff depth; a rising value is a replica that keeps failing |
 | `axond.revision.convergence_duration` (ms) | How long an accepted revision takes to compile and publish |
-| `axond.revision.attempts` (by `trigger`, `outcome`) | Whether convergence is being driven by notifications or by polls |
+| `axond.revision.attempts` (by `trigger`, `outcome`) | Whether convergence is being driven by notifications, polls, or an effective-dated pricing boundary (`pricing-boundary`) |
 | `axond.revision.desired_at` / `axond.revision.active_at` | Publication timestamps embedded in the revision identifiers, for comparing replicas |
 | `axond.revision.last_known_good` (by `outcome`) | Cache exports, export failures, cold-boot restores, and a cache this build cannot read (`incompatible`) |
 | `axond.config.generation` | Which snapshot generation a replica serves |
