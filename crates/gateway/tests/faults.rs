@@ -179,6 +179,53 @@ fn only_a_dsn_the_fault_proxy_can_carry_is_redirected_through_it() {
     }
 }
 
+/// A leakage needle is a secret, and a username is not one. A password-less
+/// connection string would otherwise make the harness scan every surface for
+/// `postgres` — a word the backend's own name puts in the config — and report
+/// the row as leaking its DSN.
+#[test]
+fn only_a_connection_string_that_carries_a_password_yields_a_needle() {
+    let password = fault::run::password_of;
+
+    assert_eq!(
+        password("postgres://postgres:axond-ci@127.0.0.1:5432/postgres"),
+        Some("axond-ci".to_owned())
+    );
+    assert_eq!(
+        password("postgres://postgres@127.0.0.1:5432/postgres"),
+        None
+    );
+    assert_eq!(password("postgres://127.0.0.1:5432/postgres"), None);
+    assert_eq!(password("redis://:@127.0.0.1:6379"), None);
+    assert_eq!(
+        password("redis://:secret@127.0.0.1:6379"),
+        Some("secret".to_owned())
+    );
+}
+
+/// The recorded phase is read out of the shipped message, so it is only
+/// evidence while it reads the words the gateway actually writes.
+#[test]
+fn every_transport_phase_the_gateway_names_is_recognised() {
+    let phase = |message: &str| fault::run::phase_of(message).expect("a named phase");
+
+    assert_eq!(phase("connecting to the provider timed out"), "connect");
+    assert_eq!(
+        phase("timed out waiting for provider response headers"),
+        "response_headers"
+    );
+    assert_eq!(
+        phase("timed out reading the provider response body"),
+        "buffered_body"
+    );
+    assert_eq!(
+        phase("timed out waiting for the next provider stream chunk"),
+        "stream_idle"
+    );
+    assert_eq!(phase("the request's failover budget was spent"), "overall");
+    assert_eq!(fault::run::phase_of("upstream refused the request"), None);
+}
+
 /// Attribution is by the identity a record carries, not by where it landed in
 /// the stream: a backend row primes the tier and probes it before it measures
 /// anything, and settlement is detached from the response, so an earlier

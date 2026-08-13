@@ -153,6 +153,15 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
     let backend = match dsn.as_deref() {
         Some(dsn) => {
             let Some((authority, _)) = redirect(dsn, refused) else {
+                // Same rule as an unset connection string: a lane that demands
+                // the services must not go green on eight skipped rows.
+                assert!(
+                    !services_required(),
+                    "{} must be a plaintext `redis://` or `postgres://` URL when \
+                     AXOND_TEST_REQUIRE_SERVICES=1: the fault proxy carries TCP, and a TLS \
+                     endpoint would skip every state-tier row",
+                    service.expect("a backend row has a service").dsn_env()
+                );
                 return Outcome::Skipped {
                     row: row.id.clone(),
                     reason: "the configured connection string is not a plaintext `redis://` or \
@@ -485,17 +494,19 @@ fn provider_output_bytes(body: &str) -> u64 {
 }
 
 /// The transport phase a typed message names, when it names one. The messages
-/// are part of the shipped contract, so reading them is reading the contract.
-fn phase_of(message: &str) -> Option<String> {
-    for phase in [
-        "response header",
-        "buffered body",
-        "stream idle",
-        "connect",
-        "overall",
+/// are part of the shipped contract, so reading them is reading the contract —
+/// but only if the words read are the words shipped. These are `TimeoutKind`'s
+/// own phrases, mapped to its own names.
+pub fn phase_of(message: &str) -> Option<String> {
+    for (phrase, phase) in [
+        ("connecting to the provider", "connect"),
+        ("waiting for provider response headers", "response_headers"),
+        ("reading the provider response body", "buffered_body"),
+        ("waiting for the next provider stream chunk", "stream_idle"),
+        ("the request's failover budget", "overall"),
     ] {
-        if message.contains(phase) {
-            return Some(phase.replace(' ', "_"));
+        if message.contains(phrase) {
+            return Some(phase.to_owned());
         }
     }
     None
@@ -796,12 +807,17 @@ async fn drop_budget_table(dsn: &str, table: &str) {
     let _ = pump.await;
 }
 
+/// Whether this run refuses to skip a state-tier row.
+fn services_required() -> bool {
+    std::env::var("AXOND_TEST_REQUIRE_SERVICES").as_deref() == Ok("1")
+}
+
 fn dsn_for(service: Service) -> Option<String> {
     match std::env::var(service.dsn_env()) {
         Ok(dsn) if !dsn.trim().is_empty() => Some(dsn),
         _ => {
             assert!(
-                std::env::var("AXOND_TEST_REQUIRE_SERVICES").as_deref() != Ok("1"),
+                !services_required(),
                 "{} is required when AXOND_TEST_REQUIRE_SERVICES=1",
                 service.dsn_env()
             );
@@ -1054,11 +1070,14 @@ fn scan(
     }
 }
 
-fn password_of(dsn: &str) -> Option<String> {
+/// The password in a connection string, if it carries one. Only a userinfo
+/// with a `:` has one: a bare username is not a secret, and scanning the
+/// surfaces for `postgres` would report the backend's own name as a leak.
+pub fn password_of(dsn: &str) -> Option<String> {
     let (_, rest) = dsn.split_once("://")?;
     let authority = rest.split(['/', '?']).next()?;
     let (userinfo, _) = authority.rsplit_once('@')?;
-    let password = userinfo.split_once(':').map_or(userinfo, |(_, pw)| pw);
+    let (_, password) = userinfo.split_once(':')?;
     (!password.is_empty()).then(|| password.to_owned())
 }
 
