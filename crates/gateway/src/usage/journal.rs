@@ -62,7 +62,7 @@ mod tests;
 mod worker;
 
 pub use postgres::{PostgresJournal, PostgresJournalSettings};
-pub use worker::{DeliveryWorker, DrainReport, WorkerHandle, WorkerSettings};
+pub use worker::{DRAIN_MARGIN, DeliveryWorker, DrainReport, WorkerHandle, WorkerSettings};
 
 use std::fmt;
 use std::time::{Duration, SystemTime};

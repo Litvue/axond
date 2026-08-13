@@ -42,7 +42,12 @@ use crate::usage::{ObservedRecord, UsageSink};
 
 /// How long past its budget a worker is waited for, to cover the batch it is
 /// already writing.
-const DRAIN_MARGIN: Duration = Duration::from_secs(1);
+///
+/// Public because a drain costs its caller `budget + DRAIN_MARGIN`, and the
+/// shutdown sequence has one budget to spend across every step: a caller that
+/// cannot see the margin cannot keep the total inside the flush timeout its
+/// operator sized a termination grace period against.
+pub const DRAIN_MARGIN: Duration = Duration::from_secs(1);
 
 /// The bound on a backlog read taken after the delivery budget is spent. Kept
 /// below [`DRAIN_MARGIN`] so a closing read can neither make a worker that
@@ -709,8 +714,23 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Stop the worker without waiting for it, when there is no time left to
+    /// wait honestly.
+    ///
+    /// Returns at once, so a caller whose remaining budget is under
+    /// [`DRAIN_MARGIN`] can still stop delivery without spending time it does
+    /// not have. The report says nothing rather than zeros: the worker may be
+    /// mid-batch, and the events are durable either way.
+    pub fn abandon(self) -> DrainReport {
+        let _ = self.stop.send(Some(Duration::ZERO));
+        DrainReport::default()
+    }
+
     /// Stop claiming new work, spend up to `budget` finishing what is
     /// deliverable, and report what was left.
+    ///
+    /// Costs the caller `budget` plus [`DRAIN_MARGIN`], the allowance for the
+    /// batch the worker is already writing.
     ///
     /// Bounded, and honest about the bound: an outbox that cannot be drained in
     /// time is reported as undelivered rather than waited on, because the events
@@ -1718,6 +1738,40 @@ mod tests {
         // reported as a drained zero, which would read as "safe to decommission".
         assert!(report.counted, "{report:?}");
         assert_eq!(report.undelivered, 3, "{report:?}");
+        assert!(!report.drained, "{report:?}");
+    }
+
+    /// A drain costs its caller its budget *plus* the abandonment margin, so a
+    /// shutdown with less than the margin left cannot ask for one without
+    /// overrunning the flush timeout its operator sized a grace period against.
+    /// Stopping the worker still has to be possible, and has to say nothing
+    /// rather than zeros.
+    #[tokio::test]
+    async fn a_worker_can_be_stopped_without_spending_a_drain_margin_on_it() {
+        let journal = Arc::new(InMemoryUsageJournal::new());
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(Slow(Duration::from_secs(30)))];
+        let handle = DeliveryWorker::new(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::new(sinks),
+            settings(Duration::from_secs(30)),
+        )
+        .spawn();
+        journal
+            .append(&event_for("GW_INBOUND_ACME_KEY"))
+            .await
+            .expect("append");
+
+        let started = Instant::now();
+        let report = handle.abandon();
+        assert!(
+            started.elapsed() < DRAIN_MARGIN,
+            "abandoning waited on the worker: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !report.reported && !report.counted,
+            "a report nobody produced must claim nothing: {report:?}"
+        );
         assert!(!report.drained, "{report:?}");
     }
 

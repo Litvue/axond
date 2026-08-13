@@ -400,8 +400,8 @@ The outbox row carries the `schema_version` it was written at.
 
 ## Shutdown
 
-On shutdown the worker stops claiming new work, spends the remaining shutdown
-budget on what is deliverable, and reports the rest:
+On shutdown the worker stops claiming new work, spends part of the remaining
+shutdown budget on what is deliverable, and reports the rest:
 
 ```text
 INFO shutdown complete usage_journal_drained=false ...
@@ -412,6 +412,13 @@ they are still in the outbox, and the next process claims them. An incomplete
 drain is normal for a large backlog and is not a data-loss event — the only
 data-loss counter is `axond.usage.journal.lost`. Size `[shutdown]` for the drain
 you want, but do not treat the bound as a correctness requirement.
+
+The drain is given half of whatever is left of `flush_timeout_ms` when it starts,
+less the one-second allowance for the batch the worker may already be writing:
+the telemetry export runs after it inside the same budget, and
+`drain_grace_ms + deadline_ms + flush_timeout_ms` stays the whole bound on
+termination. With under a second left the worker is stopped without a wait, and
+its report says nothing rather than zeros.
 
 The worker checks the stop signal between claims, so it stops at its bound rather
 than finishing a long backlog first. If it is stuck inside a destination write it

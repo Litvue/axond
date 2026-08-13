@@ -41,7 +41,7 @@ use crate::usage::journal::{
 };
 
 pub use batch::{BatchSettings, BatchedSink};
-pub use journal::{ConsumerId, DrainReport};
+pub use journal::{ConsumerId, DRAIN_MARGIN, DrainReport};
 pub use otlp::OtlpUsageSink;
 pub use postgres::{PostgresSink, PostgresSinkSettings, tls_connector, validate_table_name};
 

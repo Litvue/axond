@@ -650,8 +650,21 @@ async fn serve() -> anyhow::Result<()> {
     // The journal's own drain, and a distinct report: a backlog left in a durable
     // outbox is delivered by whichever replica claims it next, so it is undelivered
     // work rather than lost usage and must not be logged as a drop.
+    //
+    // It gets half of what is left rather than all of it, and pays its own
+    // abandonment margin out of that share: a drain costs its caller
+    // `budget + DRAIN_MARGIN`, and a drain that spent the whole remainder — the
+    // normal case behind a backlog — would push the process past `flush_timeout`
+    // and leave the telemetry export a deadline already in the past. Under the
+    // margin there is no honest wait left to make, so the worker is stopped
+    // without one.
     let journal_drain: Option<usage::DrainReport> = match usage_worker {
-        Some(worker) => Some(worker.drain(until(flush_by)).await),
+        Some(worker) => Some(
+            match (until(flush_by) / 2).checked_sub(usage::DRAIN_MARGIN) {
+                Some(budget) => worker.drain(budget).await,
+                None => worker.abandon(),
+            },
+        ),
         None => None,
     };
     if let Some(report) = journal_drain.as_ref() {
