@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(
             namespaces(
                 &TenancyProjection
-                    .project(&bootstrap(), &state)
+                    .project(&bootstrap(), &state, revision_id(3))
                     .expect("projectable")
             ),
             ["platform", "acme/core", "globex/core"]
@@ -314,7 +314,7 @@ mod tests {
             assert_eq!(
                 namespaces(
                     &TenancyProjection
-                        .project(&bootstrap(), &suspended)
+                        .project(&bootstrap(), &suspended, revision_id(3))
                         .expect("projectable")
                 ),
                 ["platform", "acme/core"],
