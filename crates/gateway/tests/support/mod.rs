@@ -8,6 +8,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod capacity;
+pub mod endurance;
 pub mod gateway;
 pub mod recovery;
 pub mod upstream;

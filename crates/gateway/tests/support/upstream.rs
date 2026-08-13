@@ -6,7 +6,7 @@
 //! open, which is what makes an upstream connection leak observable: a soak run
 //! asserts opens and closes balance once the clients are gone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -122,7 +122,14 @@ pub struct Recorded {
 struct Counters {
     open: AtomicI64,
     opened: AtomicU64,
+    received: AtomicU64,
 }
+
+/// How many recorded requests the fake keeps. Assertions read the last request,
+/// or all of a handful; an endurance run offers millions, and retaining every
+/// body would make the *harness* the thing that runs out of memory. The count
+/// is exact regardless ([`UpstreamState::received`]).
+const RECORDED_LIMIT: usize = 1024;
 
 /// Fixture bytes, loaded once at boot so replay never touches the filesystem
 /// mid-request.
@@ -172,15 +179,26 @@ pub fn fixture(name: &str) -> Bytes {
 }
 
 pub struct UpstreamState {
-    requests: Mutex<Vec<Recorded>>,
+    requests: Mutex<VecDeque<Recorded>>,
     counters: Counters,
     fixtures: Fixtures,
 }
 
 impl UpstreamState {
-    /// Every request the gateway has made, in arrival order.
+    /// The requests the gateway has made, in arrival order — the most recent
+    /// [`RECORDED_LIMIT`] of them.
     pub fn requests(&self) -> Vec<Recorded> {
-        self.requests.lock().expect("upstream lock").clone()
+        self.requests
+            .lock()
+            .expect("upstream lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// How many requests arrived, whether or not they were retained.
+    pub fn received(&self) -> u64 {
+        self.counters.received.load(Ordering::SeqCst)
     }
 
     pub fn last_request(&self) -> Recorded {
@@ -219,7 +237,7 @@ pub struct FakeUpstream {
 impl FakeUpstream {
     pub async fn start() -> Self {
         let state = Arc::new(UpstreamState {
-            requests: Mutex::new(Vec::new()),
+            requests: Mutex::new(VecDeque::new()),
             counters: Counters::default(),
             fixtures: Fixtures::load(),
         });
@@ -277,11 +295,13 @@ async fn handle(
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
     };
-    state
-        .requests
-        .lock()
-        .expect("upstream lock")
-        .push(Recorded {
+    state.counters.received.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut recorded = state.requests.lock().expect("upstream lock");
+        if recorded.len() == RECORDED_LIMIT {
+            recorded.pop_front();
+        }
+        recorded.push_back(Recorded {
             path: path.clone(),
             model: model.clone(),
             authorization: header("authorization"),
@@ -290,6 +310,7 @@ async fn handle(
             anthropic_beta: header("anthropic-beta"),
             body,
         });
+    }
 
     let anthropic = path == "/messages";
     let responses = path == "/responses";

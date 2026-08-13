@@ -1,0 +1,91 @@
+# The committed endurance manifest: every input the endurance harness reads.
+#
+# Endurance asks a different question from capacity. Capacity asks what one
+# replica costs at a fixed offered load for a few minutes
+# (`qualification/capacity/manifest.toml`); endurance asks whether the same
+# replica is still the same process after half a day of mixed traffic — whether
+# memory, descriptors, sockets, and accounting come back to where they started.
+# Both harnesses record the same provenance, so a result is reproducible from
+# this file plus the committed fixtures and the binary the workspace builds
+# (see docs/operations/endurance.md and ADR 0033).
+#
+# Each profile ships two tiers. `smoke` is a deterministic short run inside
+# `cargo test` on every change — the same driver, the same mix, the same
+# reconciliation, at a duration that fits a test suite. `soak` is the 12–24 hour
+# run, which needs a runner to itself and is dispatched from the `Endurance`
+# workflow.
+#
+# `thresholds` are per tier because two of them are only meaningful over hours:
+# a resource *drift* stated per hour cannot be read off a fifteen-second run
+# without turning noise into a gate. Everything that does not depend on how long
+# the run was — losses, duplicates, leaks, unplanned errors — is asserted on
+# both tiers.
+
+schema_version = 1
+
+[[profile]]
+id = "mixed-endurance"
+description = """
+Sustained mixed traffic: three tenants over two providers and both wire \
+families, buffered and streamed interleaved, with successful, client-cancelled, \
+upstream-dropped, and upstream-faulted endings drawn from a committed weighted \
+rotation."""
+# Seeds the ending rotation. The rotation is a permutation of one full mix
+# cycle, so a run offers exactly the committed proportions and offers them in
+# the same order on every host.
+seed = 20260813
+
+# How many requests of each ending are in one cycle of the rotation. Faults and
+# drops are deliberately a minority: a soak that is mostly failures measures the
+# failure path, not endurance.
+[profile.mix]
+complete = 12
+cancelled = 4
+dropped = 2
+faulted = 1
+
+[profile.smoke]
+duration_ms = 15000
+concurrency = 12
+# Per worker, between requests. Endurance holds a modest rate for a long time
+# rather than saturating the host, which is capacity's job.
+think_time_ms = 5
+sample_interval_ms = 100
+segment_ms = 2500
+
+[profile.smoke.thresholds]
+min_accepted_fraction = 1.0
+max_unplanned_errors = 0
+max_missing_usage_records = 0
+max_duplicate_usage_records = 0
+max_unexpected_usage_statuses = 0
+max_leaked_upstream_streams = 0
+max_settled_socket_excess = 64
+max_rss_growth_kib = 262144
+min_segments = 4
+
+[profile.soak]
+# Twelve hours. The `Endurance` workflow can dispatch a longer or shorter run;
+# the artifact records which duration was asked for and where it came from.
+duration_ms = 43200000
+concurrency = 48
+think_time_ms = 25
+sample_interval_ms = 1000
+segment_ms = 900000
+
+[profile.soak.thresholds]
+min_accepted_fraction = 1.0
+max_unplanned_errors = 0
+max_missing_usage_records = 0
+max_duplicate_usage_records = 0
+max_unexpected_usage_statuses = 0
+max_leaked_upstream_streams = 0
+max_settled_socket_excess = 64
+max_rss_growth_kib = 262144
+# The drift gates: a straight line through the per-segment medians, in units
+# per hour. A replica that ends where it started has a slope near zero whatever
+# its peaks were, which is the property "no unbounded growth" actually names.
+max_rss_drift_kib_per_hour = 8192.0
+max_socket_drift_per_hour = 8.0
+max_fd_drift_per_hour = 8.0
+min_segments = 8

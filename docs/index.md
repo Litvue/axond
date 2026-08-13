@@ -68,6 +68,9 @@ and operate it.
 - [Recovery qualification](./operations/recovery-qualification.md) — the
   committed outage, cold-boot, convergence, rotation, and restore scenarios, the
   evidence each retains, and the slices the harness still waits on.
+- [Endurance qualification](./operations/endurance.md) — the twelve-hour mixed
+  workload, what a long run leaves behind, and the leak and accounting
+  properties it gates on.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
 - [Control-plane revision journal](./operations/control-plane-journal.md) — the
