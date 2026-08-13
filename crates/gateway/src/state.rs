@@ -565,13 +565,17 @@ impl ConfigSnapshot {
     ///
     /// # Reloads re-project, deliberately
     ///
-    /// [`ConfigSnapshot::build`] always yields the empty index, so a reload keeps
+    /// [`ConfigSnapshot::build`] derives no view at all, so a reload keeps
     /// availability only by asking for it:
     ///
     /// ```ignore
     /// let outgoing = state.snapshot();
-    /// let next = ConfigSnapshot::build(config, &env, generation)?
-    ///     .with_availability(outgoing.availability_handle());
+    /// let next = match outgoing.availability_handle() {
+    ///     Some(availability) => {
+    ///         ConfigSnapshot::build(config, &env, generation)?.with_availability(availability)
+    ///     }
+    ///     None => ConfigSnapshot::build(config, &env, generation)?,
+    /// };
     /// ```
     ///
     /// Silent inheritance is the behaviour being refused, not an oversight: evidence
@@ -580,7 +584,15 @@ impl ConfigSnapshot {
     /// about targets the new config may no longer declare. A reload therefore either
     /// re-derives availability or re-projects the outgoing handle because it knows
     /// nothing relevant changed — and either way the choice is visible at the call
-    /// site. Until a projection slice lands, nothing constructs an index at all.
+    /// site.
+    ///
+    /// The file reloader ([`crate::reload`]) makes neither choice today, so a
+    /// watched reload publishes a snapshot deriving nothing and an availability
+    /// read answers `deriving: false` until the next revision is compiled. That is
+    /// reachable only once something constructs an index in a shipped binary, which
+    /// is the discovery slice's own wiring: whichever side takes the looks owns
+    /// deciding whether a config change invalidates them, and the reloader cannot
+    /// answer that for it.
     #[must_use]
     #[allow(dead_code)]
     pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
