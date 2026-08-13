@@ -665,6 +665,17 @@
           "legendFormat": "fastest replica",
           "range": true,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "max by (service_instance_id) (axond_revision_lag)",
+          "legendFormat": "{{service_instance_id}}",
+          "range": true,
+          "refId": "C"
         }
       ],
       "links": [

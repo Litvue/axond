@@ -498,6 +498,32 @@ fn grouping_by_a_label_the_instrument_does_not_declare_is_refused() {
     );
 }
 
+#[test]
+fn a_resource_instance_identity_can_split_fleet_series() {
+    assert_eq!(
+        dashboard_failures(
+            "max by (service_instance_id) (axond_revision_lag{service_instance_id=~\"$replica\"})"
+        ),
+        Vec::new()
+    );
+    assert_eq!(
+        dashboard_failures("max by (service_instance_id) (axond_status_component_state)"),
+        Vec::new()
+    );
+}
+
+#[test]
+fn a_resource_instance_identity_is_a_bounded_dashboard_dimension() {
+    assert_eq!(
+        validate_drill_down(
+            "test dashboard",
+            "replica",
+            "label_values(axond_revision_lag, service_instance_id)"
+        ),
+        Vec::new()
+    );
+}
+
 /// The grouping label belongs to the arm that aggregates it, not to the
 /// expression. A ratio whose numerator can carry the breakdown does not license
 /// the denominator, which cannot.

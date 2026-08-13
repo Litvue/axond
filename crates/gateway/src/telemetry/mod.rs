@@ -49,9 +49,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use opentelemetry::global;
 use opentelemetry::logs::LoggerProvider as _;
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
@@ -65,6 +65,16 @@ use tracing_subscriber::{EnvFilter, Layer};
 /// `service.name` for every exported span and metric, matching the sibling
 /// `actord`/`custodian` services.
 pub const SERVICE_NAME: &str = "axond";
+
+/// Optional deployment-provided identity for fleet-level metric series.
+///
+/// This is a resource attribute rather than a metric label chosen by the
+/// request path: it identifies one process for convergence and dependency
+/// triage without multiplying any series by tenants, models, callers, or
+/// credentials.
+pub const INSTANCE_ID_ENV: &str = "AXOND_INSTANCE_ID";
+
+const MAX_INSTANCE_ID_BYTES: usize = 128;
 
 /// The bound used when a guard is dropped without an explicit
 /// [`TelemetryGuard::shutdown`] — the CLI subcommands and the tests.
@@ -104,6 +114,7 @@ pub struct TelemetryError(String);
 #[derive(Debug, Clone, Default)]
 pub struct TelemetryConfig {
     pub endpoint: Option<String>,
+    instance_id: Option<String>,
 }
 
 impl TelemetryConfig {
@@ -111,15 +122,23 @@ impl TelemetryConfig {
     /// explicit `grpc` protocol is rejected at boot rather than silently
     /// exporting nowhere — config errors fail at boot, not at request time.
     pub fn from_env() -> Result<Self, TelemetryError> {
-        Self::from_values(
+        Self::from_values_with_instance(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().as_deref(),
             std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").ok().as_deref(),
+            std::env::var(INSTANCE_ID_ENV).ok().as_deref(),
         )
     }
 
-    fn from_values(endpoint: Option<&str>, protocol: Option<&str>) -> Result<Self, TelemetryError> {
+    fn from_values_with_instance(
+        endpoint: Option<&str>,
+        protocol: Option<&str>,
+        instance_id: Option<&str>,
+    ) -> Result<Self, TelemetryError> {
         let Some(endpoint) = non_empty(endpoint) else {
-            return Ok(Self::default());
+            return Ok(Self {
+                endpoint: None,
+                instance_id: validate_instance_id(instance_id)?,
+            });
         };
         if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
             return Err(TelemetryError(
@@ -136,6 +155,7 @@ impl TelemetryConfig {
         }
         Ok(Self {
             endpoint: Some(endpoint),
+            instance_id: validate_instance_id(instance_id)?,
         })
     }
 }
@@ -145,6 +165,26 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn validate_instance_id(value: Option<&str>) -> Result<Option<String>, TelemetryError> {
+    let Some(value) = non_empty(value) else {
+        return Ok(None);
+    };
+    if value.len() > MAX_INSTANCE_ID_BYTES {
+        return Err(TelemetryError(format!(
+            "{INSTANCE_ID_ENV} must be at most {MAX_INSTANCE_ID_BYTES} bytes"
+        )));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(TelemetryError(format!(
+            "{INSTANCE_ID_ENV} may contain only ASCII letters, digits, `.`, `_`, and `-`"
+        )));
+    }
+    Ok(Some(value))
 }
 
 /// Owns the provider handles so the process can flush on shutdown. Dropping the
@@ -205,8 +245,13 @@ impl Drop for TelemetryGuard {
     }
 }
 
-fn resource() -> Resource {
-    Resource::builder().with_service_name(SERVICE_NAME).build()
+fn resource(instance_id: Option<&str>) -> Resource {
+    let mut builder = Resource::builder().with_service_name(SERVICE_NAME);
+    if let Some(instance_id) = instance_id {
+        builder =
+            builder.with_attributes([KeyValue::new("service.instance.id", instance_id.to_owned())]);
+    }
+    builder.build()
 }
 
 /// Install the log subscriber and, when an OTLP endpoint is configured, the
@@ -254,7 +299,7 @@ fn init_with(config: TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         .map_err(|e| TelemetryError(format!("OTLP span exporter configuration failed: {e}")))?;
     let tracer_provider = SdkTracerProvider::builder()
         .with_batch_exporter(span_exporter)
-        .with_resource(resource())
+        .with_resource(resource(config.instance_id.as_deref()))
         .build();
 
     let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
@@ -266,7 +311,7 @@ fn init_with(config: TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         .map_err(|e| TelemetryError(format!("OTLP metric exporter configuration failed: {e}")))?;
     let meter_provider = SdkMeterProvider::builder()
         .with_periodic_exporter(metric_exporter)
-        .with_resource(resource())
+        .with_resource(resource(config.instance_id.as_deref()))
         .build();
 
     // Only the usage sink emits through this provider, so it stays idle unless a
@@ -281,7 +326,7 @@ fn init_with(config: TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         .map_err(|e| TelemetryError(format!("OTLP log exporter configuration failed: {e}")))?;
     let logger_provider = SdkLoggerProvider::builder()
         .with_batch_exporter(log_exporter)
-        .with_resource(resource())
+        .with_resource(resource(config.instance_id.as_deref()))
         .build();
     let _ = USAGE_LOGGER.set(logger_provider.logger(USAGE_SCOPE));
 
@@ -323,16 +368,64 @@ mod tests {
 
     #[test]
     fn no_endpoint_means_telemetry_is_off() {
-        let config = TelemetryConfig::from_values(None, None).expect("default config");
+        let config =
+            TelemetryConfig::from_values_with_instance(None, None, None).expect("default config");
         assert!(config.endpoint.is_none());
-        let config = TelemetryConfig::from_values(Some("  "), None).expect("blank is off");
+        let config = TelemetryConfig::from_values_with_instance(Some("  "), None, None)
+            .expect("blank is off");
         assert!(config.endpoint.is_none());
     }
 
     #[test]
     fn rejects_unsupported_protocol_and_scheme() {
-        assert!(TelemetryConfig::from_values(Some("http://collector:4318"), Some("grpc")).is_err());
-        assert!(TelemetryConfig::from_values(Some("collector:4318"), None).is_err());
+        assert!(
+            TelemetryConfig::from_values_with_instance(
+                Some("http://collector:4318"),
+                Some("grpc"),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            TelemetryConfig::from_values_with_instance(Some("collector:4318"), None, None).is_err()
+        );
+    }
+
+    #[test]
+    fn instance_identity_is_optional_bounded_and_validated() {
+        let without =
+            TelemetryConfig::from_values_with_instance(Some("http://collector:4318"), None, None)
+                .expect("an instance id is optional");
+        assert_eq!(without.instance_id, None);
+
+        let with = TelemetryConfig::from_values_with_instance(
+            Some("http://collector:4318"),
+            None,
+            Some("gateway-a_1.example"),
+        )
+        .expect("the documented identity alphabet is accepted");
+        assert_eq!(with.instance_id.as_deref(), Some("gateway-a_1.example"));
+
+        for invalid in ["gateway/a", "gateway a", "gateway:a"] {
+            assert!(
+                TelemetryConfig::from_values_with_instance(
+                    Some("http://collector:4318"),
+                    None,
+                    Some(invalid),
+                )
+                .is_err(),
+                "{invalid} must not become a resource identity"
+            );
+        }
+        let too_long = "x".repeat(MAX_INSTANCE_ID_BYTES + 1);
+        assert!(
+            TelemetryConfig::from_values_with_instance(
+                Some("http://collector:4318"),
+                None,
+                Some(&too_long),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -358,12 +451,23 @@ mod tests {
 
     #[test]
     fn resource_carries_the_service_name() {
-        let resource = resource();
+        let resource = resource(None);
         assert_eq!(
             resource
                 .get(&opentelemetry::Key::from_static_str("service.name"))
                 .map(|v| v.as_str().to_string()),
             Some(SERVICE_NAME.to_string())
+        );
+    }
+
+    #[test]
+    fn resource_carries_the_optional_instance_identity() {
+        let resource = resource(Some("gateway-a"));
+        assert_eq!(
+            resource
+                .get(&opentelemetry::Key::from_static_str("service.instance.id"))
+                .map(|value| value.as_str().to_string()),
+            Some("gateway-a".to_owned())
         );
     }
 }

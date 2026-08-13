@@ -8,6 +8,7 @@ view.
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318   # OTLP/HTTP only
+export AXOND_INSTANCE_ID=axond-replica-a                  # optional, unique per replica
 ```
 
 - **Unset** (the default): JSON logs on stdout and nothing else. No exporter,
@@ -15,9 +16,14 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318   # OTLP/HTTP only
   before they build a single attribute — the request path does no exporter work
   at all. This is a supported production posture, not a degraded one.
 - **Set**: traces, metrics, and (with the OTLP usage sink) usage logs are
-  exported with `service.name = axond`. Only `OTEL_EXPORTER_OTLP_PROTOCOL` of
-  `http/protobuf` is supported; anything else is a boot error rather than a
-  silent no-op.
+  exported with `service.name = axond`. If `AXOND_INSTANCE_ID` is set, the same
+  bounded deployment identity is exported as the OTLP resource attribute
+  `service.instance.id`; the shipped collector converts it to the
+  `service_instance_id` Prometheus label so a fleet alert can identify one
+  replica. It must contain only ASCII letters, digits, `.`, `_`, or `-`, and be
+  at most 128 bytes. It is never populated from tenant, model, caller, or
+  credential data. Only `OTEL_EXPORTER_OTLP_PROTOCOL` of `http/protobuf` is
+  supported; anything else is a boot error rather than a silent no-op.
 
 Logs are always JSON on stdout, filtered by `RUST_LOG` (default
 `info,axond=info`).

@@ -113,6 +113,17 @@ impl MetricSpec {
     }
 }
 
+/// Resource attributes the portable Prometheus assets may use in addition to
+/// an instrument's own labels. The collector turns the OTLP
+/// `service.instance.id` attribute into `service_instance_id`; it is a
+/// deployment-scoped identity for finding one replica, never a tenant/model
+/// dimension.
+const RESOURCE_LABELS: &[Label] = &[Label::open("service.instance.id", LabelClass::Configured)];
+
+pub fn resource_label(key: &str) -> Option<&'static Label> {
+    RESOURCE_LABELS.iter().find(|label| label.key == key)
+}
+
 /// Why a metric name, label key, or asset reference was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CatalogError {
@@ -1204,6 +1215,7 @@ mod tests {
             "gen_ai.request.model",
             "axond.target.model",
             "axond.target.provider",
+            "service.instance.id",
         ] {
             validate_label_key(key).expect("a declared dimension is a legitimate label");
             assert!(
@@ -1228,6 +1240,14 @@ mod tests {
         ] {
             validate_default_label_key(key).expect("bounded labels may be defaults");
         }
+    }
+
+    #[test]
+    fn the_fleet_identity_is_a_configured_resource_label() {
+        let label = resource_label("service.instance.id").expect("catalogued resource label");
+        assert_eq!(label.class, LabelClass::Configured);
+        validate_label_key(label.key).expect("the OTLP resource key is well formed");
+        assert!(validate_default_label_key(label.key).is_err());
     }
 
     #[test]
