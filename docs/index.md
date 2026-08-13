@@ -79,6 +79,9 @@ and operate it.
 - [Revision convergence](./operations/revision-convergence.md) — how a published
   revision reaches replicas, convergence targets, what a replica reports, and
   the signed last-known-good cache.
+- [Stateful integration](./operations/stateful-integration.md) — the #160
+  release gates, who owns each slice, and the harness scenario that proves each
+  gate.
 - [Deployment security model](./security/deployment-model.md) — trust
   boundaries, TLS termination, secret delivery, and image verification.
 - [Secret material in the stateful control plane](./security/secret-material.md)

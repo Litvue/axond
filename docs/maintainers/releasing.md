@@ -42,6 +42,9 @@ release resumes at the first missing crate.
 - `CARGO_REGISTRY_TOKEN` in the protected `crates-io` environment.
 - Actions permission to create pull requests.
 - `CI Success` required on `main`.
+- Squash merge as the only merge method a pull request can use — see
+  [duplicated changelog entries](#duplicated-changelog-entries) for what a merge
+  commit does to the release notes.
 - Private vulnerability reporting enabled on the repository, so the
   [`SECURITY.md`](../../SECURITY.md) advisory link works and reports do not
   arrive as public issues.
@@ -123,6 +126,30 @@ When a break or an MSRV raise did land without a breaking commit title, the fix
 is a new commit on `main` that carries one — release-please then recomputes the
 version. Do not hand-edit the version in the release PR: the next push
 regenerates it.
+
+### Duplicated changelog entries
+
+release-please reads one Conventional Commit per commit on `main`, so it needs
+`main` to be [linear][linear]. A pull request merged with a merge commit puts the
+same change there twice: the branch commit, and the merge commit, whose message
+body GitHub fills with the pull request title (`merge_commit_message: PR_TITLE`).
+Both parse, so both reach the notes, one line per commit:
+
+```text
+* **api-compat:** read the published baseline from styled cargo output (24d0d21)
+* **api-compat:** read the published baseline from styled cargo output (9a765ad)
+```
+
+That is cosmetic and says nothing about the bump — the duplicate is the same
+commit type, so the version release-please computes is the version the single
+entry would have computed. The fix is the merge method, not the release PR:
+release-please force-updates the generated branch on every push to `main`, so an
+edit to its `CHANGELOG.md` is discarded, and squash-merging later pull requests
+cannot retroactively flatten commits already on `main`. For a release that has
+already collected duplicates, land the release as generated and tidy the entry in
+a later commit — the published notes are editable, the tag is not.
+
+[linear]: https://github.com/googleapis/release-please#linear-git-commit-history-use-squash-merge
 
 ## After the first multi-architecture release
 
