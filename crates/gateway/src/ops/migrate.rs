@@ -936,6 +936,33 @@ mod tests {
             "a refused adoption must not record a baseline"
         );
 
+        // The same role able to read everything and to write nothing: the refusal
+        // is the ledger write's, and it says so rather than reporting a migration
+        // this command never runs.
+        client
+            .batch_execute(&format!(
+                "GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {role};
+                 REVOKE INSERT ON {}.axond_cp_schema_migration FROM {role}",
+                fixture.schema, fixture.schema
+            ))
+            .await
+            .expect("let the role read the evidence but not record it");
+        let error = adopt(&fixture.config, &env)
+            .await
+            .expect_err("a baseline that cannot be written is not recorded");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "a rejected write is a grant to make, not an outage: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("recording the adopted baseline"),
+            "adoption runs no migration, so the refusal must not name one: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must not record a baseline"
+        );
+
         // The same role with the ledger read taken away too, so this coverage does
         // not depend on the shipped history ending in a seed row: whatever adoption
         // is refused a read of, it refuses rather than advising a retry.

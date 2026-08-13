@@ -397,9 +397,13 @@ impl PostgresControlPlane {
                     }
                     Baseline::Inconsistent { message } => return Err(denied(message)),
                 };
+                // Named for what it is: adoption runs no migration, so a rejected
+                // ledger write must not send the operator looking at DDL.
                 schema::record_baseline(&transaction, &versions)
                     .await
-                    .map_err(|error| migration_refused_or_unavailable(&error))?;
+                    .map_err(|error| {
+                        refused_or_unavailable("recording the adopted baseline", &error)
+                    })?;
                 // The recorded baseline has to classify as a history this build
                 // can extend, or it is not a baseline: adopting must leave the
                 // database in a state `status` and `apply` already understand.
