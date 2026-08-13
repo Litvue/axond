@@ -1451,6 +1451,7 @@ impl From<FetchError> for CatalogError {
             // Someone has to raise the ceiling or point the source elsewhere.
             FetchError::TooLarge { .. } => Self::Invalid {
                 backend: BACKEND,
+                refusal,
                 message: error.to_string(),
             },
             error => Self::Unavailable {
@@ -2652,6 +2653,11 @@ mod tests {
         });
         assert!(matches!(oversized, CatalogError::Invalid { .. }));
         assert!(!oversized.retryable());
+        assert_eq!(
+            oversized.refused_by().reason(),
+            RefusalReason::Oversized,
+            "a ceiling breach is counted apart from a malformed document"
+        );
     }
 
     /// A declared length is the sender's claim about a body nobody has read yet,
