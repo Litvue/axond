@@ -219,6 +219,7 @@ mod tests {
         RevisionManifest,
     };
     use crate::status::ComponentState;
+    use crate::status::registry::{CachedStatusRegistry, StatusRefresher};
 
     use std::sync::Mutex;
 
@@ -261,6 +262,7 @@ mod tests {
     struct Answering {
         inner: Arc<InMemoryControlPlane>,
         health: Health,
+        health_delay: Option<Duration>,
         probe_timeout: Option<Duration>,
     }
 
@@ -279,6 +281,9 @@ mod tests {
         }
 
         async fn health(&self) -> Result<(), ControlPlaneError> {
+            if let Some(delay) = self.health_delay {
+                tokio::time::sleep(delay).await;
+            }
             (self.health)()
         }
 
@@ -325,6 +330,7 @@ mod tests {
         ControlPlaneProbe::new(Arc::new(Answering {
             inner: Arc::new(InMemoryControlPlane::new()),
             health,
+            health_delay: None,
             probe_timeout: None,
         }))
     }
@@ -373,6 +379,7 @@ mod tests {
         let probe = ControlPlaneProbe::new(Arc::new(Answering {
             inner: Arc::new(InMemoryControlPlane::new()),
             health: healthy(),
+            health_delay: None,
             probe_timeout: Some(expected),
         }));
 
@@ -382,6 +389,53 @@ mod tests {
             "the health probe must budget for all queued operations, not one fixed slot"
         );
         assert_eq!(expected, Duration::from_secs(125));
+    }
+
+    /// The queue-aware timeout is part of the refresher contract, not just a
+    /// number returned by the Postgres settings helper. A fair queue may make a
+    /// healthy health call take the full budget for every operation already in
+    /// front of it; the refresher must let that call finish instead of
+    /// publishing a synthetic timeout that feeds the control-plane alert.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_healthy_probe_is_not_recorded_as_a_timeout() {
+        let settings = ControlPlaneSettings {
+            connect_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(30),
+            ..ControlPlaneSettings::default()
+        };
+        let queued = 3;
+        let probe_timeout = settings.status_probe_timeout(queued);
+        let health_delay = probe_timeout - Duration::from_secs(1);
+        let probe = ControlPlaneProbe::new(Arc::new(Answering {
+            inner: Arc::new(InMemoryControlPlane::new()),
+            health: healthy(),
+            health_delay: Some(health_delay),
+            probe_timeout: Some(probe_timeout),
+        }));
+        let registry = Arc::new(CachedStatusRegistry::new(
+            StatusSettings {
+                refresh_interval: probe_timeout + Duration::from_secs(1),
+                probe_timeout: Duration::from_secs(1),
+                staleness_budget: Duration::from_secs(300),
+                enabled: vec![Component::ControlPlane],
+            },
+            Arc::new(crate::convergence::SystemClock),
+        ));
+        let refresher = StatusRefresher::new(Arc::clone(&registry), vec![Arc::new(probe)]);
+
+        let round = tokio::spawn(async move { refresher.refresh_once().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(health_delay).await;
+        round.await.expect("the refresher does not panic");
+
+        let observed = registry
+            .view()
+            .components
+            .into_iter()
+            .find(|observed| observed.component == Component::ControlPlane)
+            .expect("control plane is reported");
+        assert_eq!(observed.state, ComponentState::Ok);
+        assert_eq!(observed.reason, None);
     }
 
     /// Every derived pacing has to satisfy the registry's own invariants, or the
