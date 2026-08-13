@@ -267,9 +267,10 @@ outcomes need different responses:
   damage is investigated.
 - **Incompatible (`stored revision … is not compatible with this build`).** The
   rows add up and this build cannot read them: a body whose schema identifier or
-  field set belongs to a newer release, a tenant, project, or credential body
-  written before those bodies were typed, a credential naming a lifecycle state
-  this build does not know, or a row — or a whole revision — naming a canonical
+  field set belongs to a newer release, a tenant, project, credential, or
+  model-enablement body written before those bodies were typed, a credential
+  naming a lifecycle state this build does not know, an enablement or alias naming
+  a state or wire family it does not know, or a row — or a whole revision — naming a canonical
   encoding version this build does not write, whether or not this build knows that
   version's name, which a restored backup holding rows from two builds produces.
   (A serializer column naming no version of this encoding at all is unreadable
@@ -284,7 +285,15 @@ outcomes need different responses:
   that is not its scope, two credentials claiming one tenant's secret for another,
   two states for one secret version, or two versions of one secret in service — is
   unreadable, above, not this outcome: those are refused at publication, so a
-  stored revision holding one was written outside the gateway. A body that *declares* a schema this build reads and then is not one —
+  stored revision holding one was written outside the gateway. The same holds for
+  an enablement or alias that contradicts itself or its envelope — an owner that is
+  not its scope, an undeclared catalogue snapshot, two enablements for one offering
+  at one scope, or an alias target that is duplicated, dangling, cross-tenant, or of
+  another wire family. An *alias* body written before these bodies were typed is
+  the documented exception: it is skipped rather than reported, so neither outcome
+  names it — see
+  [resource body schemas](./revision-convergence.md#resource-body-schemas).
+  A body that *declares* a schema this build reads and then is not one —
   a field gone, a field whose type changed — is not this outcome; that is
   unreadable, above, because no version skew produces it. Neither is a tenancy body
   that is not an inline record at all, or one under a kind it does not match: no

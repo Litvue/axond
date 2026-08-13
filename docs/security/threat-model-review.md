@@ -49,7 +49,7 @@ unnoticed one.
 | `routes.rs` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
 | Namespace resolution, `credentials.rs` pool lookup, `allow_platform_fallback`, budget/rate-limit keys, operator views | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
 | `backends/secrets.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
-| `backends/catalog.rs`, `aliases.rs`, `availability/`, `/v1/models`, alias scope, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
+| `backends/catalog.rs`, `aliases.rs`, `availability/`, `desired_state/models.rs`, `/v1/models`, alias scope, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `usage/`, `telemetry/`, control-plane journal | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
 
@@ -224,8 +224,10 @@ rather than only in the changelog.
 patterns in `crates/gateway/src/aliases.rs`, alias-to-target mapping and wire
 families, the `/v1/models` projection, catalogue ingestion in
 `crates/gateway/src/backends/catalog.rs`, derived availability and discovery
-evaluation in `crates/gateway/src/availability/`, pricing metadata, and any new
-route that exposes model or provider metadata.
+evaluation in `crates/gateway/src/availability/`, the durable enablement and alias
+bodies and their publication rules in
+`crates/gateway/src/desired_state/models.rs`, pricing metadata, and any new route
+that exposes model or provider metadata.
 
 **Regression tests.** Pattern semantics are the entitlement boundary:
 `patterns_match_case_sensitively_and_union`, `prefix_does_not_subsume_other_globs`,
@@ -236,8 +238,14 @@ namespace intersection tests in trigger 2. Ingestion must stay inert:
 `observed_pricing_is_metadata_not_activation`,
 `the_source_is_background_only_and_declares_incremental_refresh`, and
 `an_unreachable_source_is_retryable_and_never_a_boot_failure` — upstream
-catalogue data must never become an entitlement or an admission dependency. A
-new route is also covered mechanically: `ops/check-docs.py` fails a registered
+catalogue data must never become an entitlement or an admission dependency. The
+durable side of the same rule: `an_observed_catalogue_rate_is_not_an_approved_price`,
+`an_enablement_is_pinned_to_a_snapshot_the_revision_declares`,
+`an_alias_resolves_in_order_within_its_own_reach_and_one_wire_family`,
+`an_alias_is_a_project_scoped_name_unique_within_its_project`, and
+`an_untyped_enablement_is_refused_rather_than_skipped` — a published entitlement
+names one catalogue, reaches only its own owner, and is never inferred from an
+unreadable row. A new route is also covered mechanically: `ops/check-docs.py` fails a registered
 route that the [compatibility contract](../compatibility.md) does not document.
 
 Derived availability is evidence, never entitlement, and its tests hold that
@@ -259,7 +267,11 @@ the pair.
 
 **Threat model and ADRs.** [ADR 0020](../adr/0020-alias-wire-family-validation.md)
 and [ADR 0012](../adr/0012-native-provider-routes.md) bound wire families and
-native routes; `CatalogSource`'s background-only placement is in
+native routes; the durable entitlement contract — opaque snapshot-pinned offering
+identities, observed versus approved pricing, tenant defaults against project
+overrides, and ordered single-wire-family alias targets — is
+[ADR 0035](../adr/0035-model-enablement-and-alias-contracts.md), and a change to
+what an enablement pins or to which targets an alias may name amends it; `CatalogSource`'s background-only placement is in
 [backend contracts](../maintainers/backend-contracts.md). Item 2 of the security
 review's accepted-risk section is why `/v1/models` is authenticated and scoped —
 re-read it before changing that projection. The availability stance is a decision
@@ -284,7 +296,12 @@ semantics change can silently grant or revoke access at upgrade, so it needs a
 migration note saying which existing configurations change meaning. Route and
 wire-family additions are compatibility-contract entries; pricing changes affect
 budgets, which the [production checklist](../deployment/production-checklist.md)
-already asks operators to review.
+already asks operators to review. A change to an enablement or alias body's schema,
+to its state vocabulary, or to what it pins is a *compatibility* change: say which
+stored revisions the new build stops reading, and record it in the
+[journal runbook](../operations/control-plane-journal.md) and
+[revision convergence](../operations/revision-convergence.md#resource-body-schemas)
+rather than only in the changelog.
 
 ## 5. Persistence, migrations, telemetry, and usage
 

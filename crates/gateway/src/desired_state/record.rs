@@ -49,12 +49,19 @@ pub(super) trait BodyError: Sized {
     }
     fn field_type(reference: ResourceRef, field: &'static str) -> Self;
     fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self;
+    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self;
+}
+
+/// What a schema whose bodies carry a [`DisplayName`] must additionally say.
+///
+/// Separate from [`BodyError`] so a schema with no prose field — a model
+/// enablement, say — does not carry an error arm nothing can construct.
+pub(super) trait DisplayNameError: BodyError {
     fn malformed_display_name(
         reference: ResourceRef,
         field: &'static str,
         source: InvalidDisplayName,
     ) -> Self;
-    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self;
 }
 
 /// One inline record, read strictly.
@@ -122,7 +129,22 @@ impl<'a, E: BodyError> Record<'a, E> {
         Ok(record)
     }
 
-    fn value(&self, field: &'static str) -> Result<&'a CanonicalValue, E> {
+    /// The resource this record is the body of, for a refusal a schema builds
+    /// itself.
+    pub(super) const fn reference(&self) -> ResourceRef {
+        self.reference
+    }
+
+    /// A field's value as it was encoded, for a schema whose field is a nested
+    /// record or a list rather than a scalar.
+    pub(super) fn optional_value(&self, field: &'static str) -> Option<&'a CanonicalValue> {
+        self.fields
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, value)| value)
+    }
+
+    pub(super) fn value(&self, field: &'static str) -> Result<&'a CanonicalValue, E> {
         self.fields
             .iter()
             .find(|(name, _)| name == field)
@@ -212,11 +234,6 @@ impl<'a, E: BodyError> Record<'a, E> {
         self.id(field, parse)
     }
 
-    pub(super) fn display_name(&self) -> Result<DisplayName, E> {
-        DisplayName::parse(self.string(DISPLAY_NAME_FIELD)?)
-            .map_err(|source| E::malformed_display_name(self.reference, DISPLAY_NAME_FIELD, source))
-    }
-
     /// Bind a body's declared identity to the envelope that carries it.
     pub(super) fn identity(
         &self,
@@ -232,5 +249,12 @@ impl<'a, E: BodyError> Record<'a, E> {
                 self.reference.id,
             ))
         }
+    }
+}
+
+impl<'a, E: DisplayNameError> Record<'a, E> {
+    pub(super) fn display_name(&self) -> Result<DisplayName, E> {
+        DisplayName::parse(self.string(DISPLAY_NAME_FIELD)?)
+            .map_err(|source| E::malformed_display_name(self.reference, DISPLAY_NAME_FIELD, source))
     }
 }
