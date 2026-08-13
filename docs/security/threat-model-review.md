@@ -264,7 +264,7 @@ native routes; `CatalogSource`'s background-only placement is in
 review's accepted-risk section is why `/v1/models` is authenticated and scoped —
 re-read it before changing that projection. The availability stance is a decision
 of its own and is written down as
-[ADR 0037](../adr/0037-derived-availability-and-discovery-evaluation.md): five
+[ADR 0038](../adr/0038-derived-availability-and-discovery-evaluation.md): five
 states, the precedence ladder, expiry in both directions, last-known-good
 retention, and the rule that uncertainty is routable only where a scope chose it.
 It inherits rather than revises the snapshot reasoning of

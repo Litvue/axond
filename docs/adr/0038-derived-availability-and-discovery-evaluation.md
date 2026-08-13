@@ -1,4 +1,4 @@
-# 37. Derived availability and discovery evaluation
+# 38. Derived availability and discovery evaluation
 
 Date: 2026-08-12
 
