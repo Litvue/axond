@@ -87,6 +87,7 @@ use super::catalog::{
     SchemaVersion, SourceValidators, source_snapshot,
 };
 use super::{Capabilities, Capability};
+use crate::desired_state::canonical::{CanonicalError, CanonicalValue};
 
 /// The only supported models.dev document.
 pub const MODELS_DEV_CATALOG_URL: &str = "https://models.dev/catalog.json";
@@ -146,6 +147,13 @@ pub enum ModelsDevError {
     DuplicateTier { pointer: JsonPointer },
     #[error("`{pointer}` publishes a price on a provider-neutral record")]
     NeutralPrice { pointer: JsonPointer },
+    /// Free text normalized content cannot hold, named where it was published.
+    #[error("`{pointer}` cannot be held in normalized content: {source}")]
+    UncanonicalizableText {
+        pointer: JsonPointer,
+        #[source]
+        source: CanonicalError,
+    },
     #[error(
         "`{pointer}` offers `{key}`, which could be any of `{}`",
         candidates.join("`, `")
@@ -654,18 +662,23 @@ fn normalize(document: &WireCatalog) -> Result<CatalogContent, ModelsDevError> {
         expect_key(key, &provider.id, &pointer)?;
         providers.push(CatalogProvider {
             id: id.clone(),
-            display_name: text(Some(&provider.name)),
-            doc_url: text(provider.doc.as_deref()),
+            display_name: text(Some(&provider.name), &pointer.child("name"))?,
+            doc_url: text(provider.doc.as_deref(), &pointer.child("doc"))?,
             endpoint: ProviderEndpoint {
-                api_base: text(provider.api.as_deref()),
-                client_package: text(provider.npm.as_deref()),
+                api_base: text(provider.api.as_deref(), &pointer.child("api"))?,
+                client_package: text(provider.npm.as_deref(), &pointer.child("npm"))?,
                 wire_shape: None,
             },
-            env_vars: provider
-                .env
-                .iter()
-                .filter_map(|env| text(Some(env)))
-                .collect(),
+            env_vars: {
+                let env_pointer = pointer.child("env");
+                let mut names = Vec::with_capacity(provider.env.len());
+                for (index, env) in provider.env.iter().enumerate() {
+                    if let Some(name) = text(Some(env), &env_pointer.child(&index.to_string()))? {
+                        names.push(name);
+                    }
+                }
+                names
+            },
             pointer: pointer.clone(),
         });
 
@@ -684,15 +697,17 @@ fn normalize(document: &WireCatalog) -> Result<CatalogContent, ModelsDevError> {
         for (model_key, model) in &provider.models {
             let model_pointer = pointers[model_key.as_str()].clone();
             let model_id = resolved[model_key.as_str()].clone();
-            let endpoint =
-                model
-                    .provider
-                    .as_ref()
-                    .map_or_else(ProviderEndpoint::default, |endpoint| ProviderEndpoint {
-                        api_base: text(endpoint.api.as_deref()),
-                        client_package: text(endpoint.npm.as_deref()),
-                        wire_shape: text(endpoint.shape.as_deref()),
-                    });
+            let endpoint = match model.provider.as_ref() {
+                None => ProviderEndpoint::default(),
+                Some(endpoint) => {
+                    let pointer = model_pointer.child("provider");
+                    ProviderEndpoint {
+                        api_base: text(endpoint.api.as_deref(), &pointer.child("api"))?,
+                        client_package: text(endpoint.npm.as_deref(), &pointer.child("npm"))?,
+                        wire_shape: text(endpoint.shape.as_deref(), &pointer.child("shape"))?,
+                    }
+                }
+            };
             offerings
                 .entry(model_id.clone())
                 .or_default()
@@ -757,17 +772,35 @@ fn field_pointer(offering: &JsonPointer, field: ModelField) -> JsonPointer {
     }
 }
 
-/// Free text as normalized content holds it.
+/// Free text as normalized content holds it, or a refusal naming where it came
+/// from.
 ///
 /// Surrounding whitespace is dropped and interior runs of it collapse to one
 /// space: the upstream publishes names with trailing tabs (`"DeepSeek V3
-/// (Turbo)\t"`), and canonical content holds no control characters. Whitespace
-/// that carries no meaning must not be able to change a content identity or
-/// register as a metadata diff, and text left empty by it is absent rather than
-/// blank.
-fn text(value: Option<&str>) -> Option<String> {
-    let collapsed = value?.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!collapsed.is_empty()).then_some(collapsed)
+/// (Turbo)\t"`). Whitespace that carries no meaning must not be able to change a
+/// content identity or register as a metadata diff, and text left empty by it is
+/// absent rather than blank.
+///
+/// What survives that is checked against the canonical encoder here, where the
+/// pointer to the field is in hand, rather than left for `CatalogContent::new` to
+/// discover across the whole tree: a `\u{7}` in one provider's model name is one
+/// string out of some six thousand offerings, and "the catalogue has no canonical
+/// form" is not an answer an operator can act on.
+fn text(value: Option<&str>, pointer: &JsonPointer) -> Result<Option<String>, ModelsDevError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return Ok(None);
+    }
+    CanonicalValue::string(&collapsed)
+        .to_canonical_bytes()
+        .map_err(|source| ModelsDevError::UncanonicalizableText {
+            pointer: pointer.clone(),
+            source,
+        })?;
+    Ok(Some(collapsed))
 }
 
 fn identifier(key: &str, pointer: &JsonPointer) -> Result<ModelId, ModelsDevError> {
@@ -811,8 +844,8 @@ fn facts(model: &WireModel, pointer: &JsonPointer) -> Result<ModelFacts, ModelsD
         }
     }
     Ok(ModelFacts {
-        display_name: text(Some(&model.name)),
-        family: text(model.family.as_deref()),
+        display_name: text(Some(&model.name), &pointer.child("name"))?,
+        family: text(model.family.as_deref(), &pointer.child("family"))?,
         capabilities,
         input_modalities: modalities(
             &model.modalities.input,
@@ -828,9 +861,15 @@ fn facts(model: &WireModel, pointer: &JsonPointer) -> Result<ModelFacts, ModelsD
             output_tokens: model.limit.output,
         },
         lifecycle: lifecycle(model.status.as_deref(), &pointer.child("status"))?,
-        knowledge_cutoff: text(model.knowledge.as_deref()),
-        release_date: text(model.release_date.as_deref()),
-        last_updated: text(model.last_updated.as_deref()),
+        knowledge_cutoff: text(model.knowledge.as_deref(), &pointer.child("knowledge"))?,
+        release_date: text(
+            model.release_date.as_deref(),
+            &pointer.child("release_date"),
+        )?,
+        last_updated: text(
+            model.last_updated.as_deref(),
+            &pointer.child("last_updated"),
+        )?,
     })
 }
 
@@ -1942,13 +1981,15 @@ mod tests {
             }),
             // Text a canonical form cannot hold is refused, not asserted about:
             // the content would otherwise have no identity, and an import that
-            // cannot be identified cannot be admitted.
+            // cannot be identified cannot be admitted. Refused at the field that
+            // published it, so the answer to "which of six thousand strings?" is
+            // in the error.
             ("control-character", |error| {
                 matches!(
                     error,
-                    ModelsDevError::Content {
-                        source: CatalogContentError::Uncanonicalizable { .. }
-                    }
+                    ModelsDevError::UncanonicalizableText { pointer, source }
+                        if pointer.as_str() == "/providers/openai/models/openai~1gpt-5.5/name"
+                            && *source == CanonicalError::ControlCharacter { codepoint: 0x7 }
                 )
             }),
         ];

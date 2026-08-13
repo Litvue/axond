@@ -1151,6 +1151,13 @@ pub enum CatalogContentError {
     /// A rejection rather than a panic: upstream free text is upstream's to
     /// choose, and a stray control character must cost an import, not the task
     /// running it.
+    ///
+    /// A backstop, and deliberately not the arm an operator should see: this
+    /// canonicalizes the whole tree at once and so can only report *what* was
+    /// wrong, not where. A source adapter is expected to check free text as it
+    /// reads it, while the pointer to the field is in hand — the models.dev
+    /// adapter refuses with `UncanonicalizableText` naming the field — leaving
+    /// this arm for content assembled by some other means.
     #[error("the catalogue has no canonical form: {source}")]
     Uncanonicalizable {
         #[source]
