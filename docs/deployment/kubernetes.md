@@ -231,7 +231,10 @@ fleet become wrong at once. The component answers each:
   surface whichever Service it resolved — including the ingress controller that
   fronts inference. Deny `/admin/v1` at that ingress, or run it on an ingress
   that requires operator identity; the only authentication in front of it today
-  is the break-glass credential in `axond-secrets`.
+  is the break-glass credential in `axond-secrets`. What the manifest gate can
+  enforce, it does: `axond-admin` has to stay `ClusterIP`, and no Ingress in
+  this overlay may route to it, so the boundary is never widened by an edit
+  that never reaches a reviewer.
 
 - **Node drains.** `unhealthyPodEvictionPolicy: AlwaysAllow` on the disruption
   budget. The default (`IfHealthyBudget`) evicts an unready Pod only while the

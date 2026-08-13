@@ -785,6 +785,31 @@ def check_stateful(documents: list[Document]) -> list[str]:
             )
         if admin["spec"].get("selector") != SELECTOR:
             failures.append(f"{label}: the axond-admin Service does not select the axond Pods")
+        # `/admin/v1` shares one listener with inference, so this Service grants
+        # no reachability the NetworkPolicy has not already granted — and must
+        # not be the thing that grants some. A type that allocates a node port
+        # or a cloud load balancer publishes the administrative surface of a
+        # fleet whose only credential is the break-glass secret, outside the
+        # policy that is supposed to decide who reaches it.
+        if admin["spec"].get("type") not in (None, "ClusterIP"):
+            failures.append(
+                f"{label}: the axond-admin Service is {admin['spec']['type']!r}; a surface "
+                "authenticated only by the break-glass credential must not be published off the "
+                "cluster by its own Service — front it with an ingress that requires operator "
+                "identity instead"
+            )
+    for ingress in of_kind(documents, "Ingress"):
+        backends = [
+            path.get("backend", {}).get("service", {}).get("name")
+            for rule in ingress["spec"].get("rules", [])
+            for path in rule.get("http", {}).get("paths", [])
+        ]
+        if "axond-admin" in backends:
+            failures.append(
+                f"{label}: Ingress {ingress['metadata']['name']!r} routes to axond-admin; this "
+                "overlay does not carry the operator authentication that would make publishing "
+                "/admin/v1 safe, so the ingress belongs beside it, not here"
+            )
     if services.get("axond", {}).get("spec", {}).get("publishNotReadyAddresses"):
         failures.append(
             f"{label}: the inference Service publishes not-ready addresses, so an ingress would "
@@ -1005,6 +1030,42 @@ def self_test() -> int:
         if service["metadata"]["name"] == "axond-admin":
             service["spec"].pop("publishNotReadyAddresses")
     expect_failure("an admin Service with no endpoints", check_stateful(unreachable_admin))
+
+    published_admin = copy.deepcopy(stateful)
+    for service in of_kind(published_admin, "Service"):
+        if service["metadata"]["name"] == "axond-admin":
+            service["spec"]["type"] = "LoadBalancer"
+    expect_failure("an admin Service published off the cluster", check_stateful(published_admin))
+
+    ingressed_admin = copy.deepcopy(stateful)
+    ingressed_admin.append(
+        {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "axond-admin", "namespace": "axond"},
+            "spec": {
+                "rules": [
+                    {
+                        "http": {
+                            "paths": [
+                                {
+                                    "path": "/admin",
+                                    "pathType": "Prefix",
+                                    "backend": {
+                                        "service": {
+                                            "name": "axond-admin",
+                                            "port": {"number": 8080},
+                                        }
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        }
+    )
+    expect_failure("an ingress that fronts /admin/v1", check_stateful(ingressed_admin))
 
     routed = copy.deepcopy(stateful)
     for service in of_kind(routed, "Service"):
