@@ -375,6 +375,17 @@ fn expectations(statement: &str) -> Option<Vec<Expectation>> {
     if keyword(0, "CREATE") && keyword(1, "UNIQUE") && keyword(2, "INDEX") {
         return present(Evidence::Index(named(statement, &words, 3)?));
     }
+    // An index dropped is confirmed by its being gone, the same way a dropped
+    // constraint or policy is. `DROP TABLE` is deliberately not here: a table is
+    // what every other piece of evidence about it hangs off, and a file that takes
+    // one away leaves nothing to ask about in its place.
+    if keyword(0, "DROP") && keyword(1, "INDEX") {
+        return Some(vec![Expectation {
+            what: Evidence::Index(named(statement, &words, 2)?),
+            present: false,
+            proof: true,
+        }]);
+    }
     if keyword(0, "INSERT") && keyword(1, "INTO") {
         // Only the idempotent form: a plain `INSERT` cannot be told apart from
         // one that never ran, and re-running it would double the rows.
@@ -481,76 +492,385 @@ fn altered(table: &str, clause: &str) -> Option<Expectation> {
     None
 }
 
-/// The statements a `DO $$ ... $$` block executes, when the block is a loop over
-/// a literal list of names running `format()` templates and nothing else.
+/// What a `DO $$ ... $$` block leaves behind, or `None` for a block this reading
+/// does not recognise from end to end.
 ///
-/// Interpreted, never assumed: the names come out of the block's own array
-/// literal and the SQL out of its own templates, rendered and then read by the
-/// same parser every other statement goes through. So a table added to the list
-/// is evidence adoption checks for, and a change this narrow reading does not
-/// recognise — a condition, a query, a template argument that is not the loop
-/// variable — makes the block unconfirmable and its migration unadoptable, which
-/// is the same fail-closed answer an `UPDATE` gets.
-///
-/// The one shape read is the one a dynamic `ALTER`/`CREATE POLICY` loop has:
+/// Interpreted, never assumed. The shipped history uses procedural blocks for the
+/// three things plain DDL cannot express, and each is read out of the block's own
+/// text rather than answered with a hand-written list of what it happens to do
+/// today, so a change to one of them changes the evidence with it:
 ///
 /// ```sql
-/// DO $$
-/// DECLARE
-///     each text;
-/// BEGIN
-///     FOREACH each IN ARRAY ARRAY['a', 'b'] LOOP
-///         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', each);
-///     END LOOP;
-/// END
-/// $$;
+/// -- 1. The same statement for a list of tables: the names come out of the
+/// --    array, the SQL out of the templates, and each rendered statement is read
+/// --    by the same parser as every other one.
+/// FOREACH each IN ARRAY ARRAY['a', 'b'] LOOP
+///     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', each);
+/// END LOOP;
+/// -- 2. Create-if-absent, which is how a file adds a constraint idempotently.
+/// --    The object is there afterwards either way, so it is ordinary evidence —
+/// --    but only when the guard asks about that very object, because a condition
+/// --    on something else leaves the effect conditional.
+/// IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'a'::regclass
+///                  AND conname = 'a_slug_unique') THEN
+///     ALTER TABLE a ADD CONSTRAINT a_slug_unique UNIQUE (slug) DEFERRABLE;
+/// END IF;
+/// -- 3. Dropping what a catalogue query names, which is how a file replaces a
+/// --    constraint PostgreSQL named for itself. The names are not in the file, so
+/// --    the statements cannot be rendered — the query is the evidence: after the
+/// --    loop it selects nothing. Never proof (it selects nothing against a
+/// --    database that never had them either), always required.
+/// FOR stale IN SELECT conname FROM pg_constraint WHERE conrelid = 'a'::regclass
+///                AND contype = 'u' LOOP
+///     EXECUTE format('ALTER TABLE a DROP CONSTRAINT %I', stale.conname);
+/// END LOOP;
 /// ```
+///
+/// Anything else — a branch whose alternative is not the same final state, a
+/// literal array built from a query, a template argument that is not the loop
+/// value, a loop that does something other than drop what its query named —
+/// leaves the block unconfirmable and its migration unadoptable, the same
+/// fail-closed answer an `UPDATE` gets.
 fn unrolled(statement: &str) -> Option<Vec<Expectation>> {
     let body = quoted(statement)?;
-    let block = statements(body);
-    // `DECLARE one text;` `BEGIN FOREACH ... LOOP <first>;` `<rest>;` ...
-    // `END LOOP;` `END`, which is what the `;` separators leave.
-    let [declaring, opening, executed @ .., closing, ending] = block.as_slice() else {
-        return None;
-    };
-    let declared = words(declaring);
-    let [declare, variable, kind] = declared.as_slice() else {
-        return None;
-    };
-    if !(declare.eq_ignore_ascii_case("DECLARE") && kind.eq_ignore_ascii_case("text")) {
+    interpreted(&statements(body))
+}
+
+/// The effects of a block's chunks, read in order.
+///
+/// The chunks are what `;` leaves, so a control structure's header shares a chunk
+/// with the first statement of its body (`LOOP EXECUTE ...`, `THEN ALTER ...`) and
+/// its `END` is a chunk of its own. `BEGIN`, `DECLARE`, and those `END`s state no
+/// effect; every other chunk must be one this parse can account for.
+fn interpreted(chunks: &[&str]) -> Option<Vec<Expectation>> {
+    let mut expectations = Vec::new();
+    let mut index = 0;
+    while index < chunks.len() {
+        // `BEGIN` opens the body without ending a statement, so it shares a chunk
+        // with the first one.
+        let chunk = after(chunks[index], "BEGIN").unwrap_or(chunks[index]);
+        let words = words(chunk);
+        let word = |position: usize, expected: &str| {
+            words
+                .get(position)
+                .is_some_and(|word| word.eq_ignore_ascii_case(expected))
+        };
+        // A declaration and a structure's end are not effects. A declaration is
+        // not read for its type either: what the loop does with the variable is
+        // what the evidence is derived from, and that is read where it happens.
+        if words.is_empty()
+            || word(0, "DECLARE")
+            || (word(0, "END") && (words.len() == 1 || word(1, "IF") || word(1, "LOOP")))
+        {
+            index += 1;
+            continue;
+        }
+        if word(0, "IF") {
+            let (guard, body, next) = guarded(chunk, chunks, index)?;
+            for statement in body {
+                for expectation in self::expectations(statement)? {
+                    // A guarded statement is evidence only when the guard asks
+                    // about the thing the statement leaves behind: `IF NOT EXISTS
+                    // (this constraint) THEN add it` ends with the constraint
+                    // there whichever way it went, while a condition on anything
+                    // else is a branch, and which branch ran is not in the file.
+                    if !expectation.present || !stated(&expectation.what, &guard) {
+                        return None;
+                    }
+                    expectations.push(expectation);
+                }
+            }
+            index = next;
+            continue;
+        }
+        if let Some(header) = after(chunk, "FOREACH") {
+            let (over, body, next) = looped(header, chunks, index)?;
+            let (variable, names) = listed(&over)?;
+            for name in &names {
+                for statement in &body {
+                    expectations
+                        .extend(self::expectations(&rendered(statement, &variable, name)?)?);
+                }
+            }
+            index = next;
+            continue;
+        }
+        if let Some(header) = after(chunk, "FOR") {
+            let (over, body, next) = looped(header, chunks, index)?;
+            expectations.push(cleared(&over, &body)?);
+            index = next;
+            continue;
+        }
+        expectations.extend(self::expectations(chunk)?);
+        index += 1;
+    }
+    Some(expectations)
+}
+
+/// What follows `keyword` in `text`, when `text` starts with it.
+fn after<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let words = words(text);
+    let first = words.first()?;
+    if !first.eq_ignore_ascii_case(keyword) {
         return None;
     }
-    if !(words(closing) == ["END", "LOOP"] && words(ending) == ["END"]) {
-        return None;
-    }
-    // The loop's header and its first statement share a chunk, because `LOOP` is
-    // not a separator: `BEGIN FOREACH v IN ARRAY ARRAY[...] LOOP EXECUTE ...`.
-    let opened = words(opening);
-    let loops = opened
-        .iter()
-        .position(|word| word.eq_ignore_ascii_case("LOOP"))?;
-    if opened[..loops].len() != 6
-        || !opened[..loops]
-            .iter()
-            .zip(["BEGIN", "FOREACH", variable, "IN", "ARRAY", "ARRAY"])
-            .all(|(word, expected)| word.eq_ignore_ascii_case(expected))
+    Some(text[offset(text, first) + first.len()..].trim())
+}
+
+/// An `IF <guard> THEN` structure: its condition, the statements it guards, and
+/// the chunk after its `END IF`.
+fn guarded<'a>(
+    opening: &'a str,
+    chunks: &[&'a str],
+    index: usize,
+) -> Option<(String, Vec<&'a str>, usize)> {
+    let (head, first) = divided(opening, "THEN")?;
+    // Only `IF NOT EXISTS (...)`: `IF EXISTS` guards a statement whose effect
+    // depends on state this parse cannot reconstruct, and so does a comparison.
+    let condition = words(&head);
+    if !(condition.len() > 3
+        && condition[0].eq_ignore_ascii_case("IF")
+        && condition[1].eq_ignore_ascii_case("NOT")
+        && condition[2].eq_ignore_ascii_case("EXISTS")
+        && condition[3].eq_ignore_ascii_case("SELECT"))
     {
         return None;
     }
-    let header = &opening[..offset(opening, opened[loops])];
+    let (body, next) = bodied(first, chunks, index, &["END", "IF"])?;
+    Some((head, body, next))
+}
+
+/// A `FOREACH`/`FOR ... LOOP` structure: what it iterates over, the statements it
+/// runs, and the chunk after its `END LOOP`.
+fn looped<'a>(
+    opening: &'a str,
+    chunks: &[&'a str],
+    index: usize,
+) -> Option<(String, Vec<&'a str>, usize)> {
+    let (over, first) = divided(opening, "LOOP")?;
+    let (body, next) = bodied(first, chunks, index, &["END", "LOOP"])?;
+    Some((over, body, next))
+}
+
+/// A chunk split at the first top-level occurrence of `keyword`: what came before
+/// it, and what came after.
+fn divided<'a>(chunk: &'a str, keyword: &str) -> Option<(String, &'a str)> {
+    let words = words(chunk);
+    let at = words.iter().position(|word| {
+        word.eq_ignore_ascii_case(keyword)
+            // A word inside the condition's own parentheses is not the separator:
+            // `IF NOT EXISTS (SELECT ... WHERE loop = 1) THEN`.
+            && depth(chunk, offset(chunk, word)) == 0
+    })?;
+    let from = offset(chunk, words[at]);
+    Some((
+        chunk[..from].trim().to_owned(),
+        chunk[from + words[at].len()..].trim(),
+    ))
+}
+
+/// How many parentheses are open at `at`, with comments and literals skipped.
+fn depth(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    let (mut depth, mut index) = (0usize, 0);
+    while index < at {
+        if let Some(region) = skipped(bytes, index) {
+            index = region.end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    depth
+}
+
+/// The statements a structure's body holds: the tail of its own chunk, then the
+/// chunks up to the one that closes it. `None` when nothing closes it, or when a
+/// structure opens inside it — nesting is not read, because the outer structure's
+/// effect would then depend on the inner one's.
+fn bodied<'a>(
+    first: &'a str,
+    chunks: &[&'a str],
+    index: usize,
+    closing: &[&str],
+) -> Option<(Vec<&'a str>, usize)> {
+    let mut body = Vec::new();
+    if !words(first).is_empty() {
+        body.push(first);
+    }
+    for (at, chunk) in chunks.iter().enumerate().skip(index + 1) {
+        let words = words(chunk);
+        if words.len() == closing.len()
+            && words
+                .iter()
+                .zip(closing)
+                .all(|(word, expected)| word.eq_ignore_ascii_case(expected))
+        {
+            return Some((body, at + 1));
+        }
+        if words.first().is_some_and(|word| {
+            [
+                "IF", "FOR", "FOREACH", "WHILE", "LOOP", "CASE", "BEGIN", "END",
+            ]
+            .iter()
+            .any(|structure| word.eq_ignore_ascii_case(structure))
+        }) {
+            return None;
+        }
+        body.push(chunk);
+    }
+    None
+}
+
+/// The loop variable and the literal names a `FOREACH v IN ARRAY ARRAY[...]`
+/// header iterates over.
+fn listed(header: &str) -> Option<(String, Vec<String>)> {
+    let words = words(header);
+    let [variable, over @ ..] = words.as_slice() else {
+        return None;
+    };
+    if !over
+        .iter()
+        .zip(["IN", "ARRAY", "ARRAY"])
+        .all(|(word, expected)| word.eq_ignore_ascii_case(expected))
+        || over.len() != 3
+    {
+        return None;
+    }
     let names = literals(header);
     if names.is_empty() {
         return None;
     }
-    let body = &opening[offset(opening, opened[loops]) + opened[loops].len()..];
-    let mut expectations = Vec::new();
-    for name in &names {
-        for statement in std::iter::once(&body).chain(executed.iter()) {
-            let rendered = rendered(statement, variable, name)?;
-            expectations.extend(self::expectations(&rendered)?);
+    Some(((*variable).to_owned(), names))
+}
+
+/// The evidence a `FOR v IN <query> LOOP EXECUTE format(... DROP CONSTRAINT ...)
+/// END LOOP` leaves: afterwards the query names nothing the file did not declare
+/// itself.
+///
+/// Read only for the one thing it can be: a loop that drops exactly what its own
+/// query named. The rows are not in the file, so no statement can be rendered and
+/// no object can be named — but "this query names nothing" is a question the same
+/// catalogue answers, and it is the loop's own question.
+fn cleared(header: &str, body: &[&str]) -> Option<Expectation> {
+    let (variable, query) = divided(header, "IN")?;
+    if words(&variable).len() != 1 {
+        return None;
+    }
+    for statement in body {
+        // Every statement must drop, and drop something the query named: a loop
+        // that also writes, or that drops a fixed name, is not summarised by its
+        // query being empty.
+        let (dropped, arguments) = templated(statement)?;
+        let words = words(&dropped);
+        let drops = words.windows(2).any(|pair| {
+            pair[0].eq_ignore_ascii_case("DROP") && pair[1].eq_ignore_ascii_case("CONSTRAINT")
+        });
+        if !drops
+            || !arguments
+                .iter()
+                .all(|argument| argument.starts_with(&format!("{}.", variable.trim())))
+        {
+            return None;
         }
     }
-    Some(expectations)
+    Some(Expectation {
+        what: Evidence::Stale {
+            table: literals(query).first()?.clone(),
+            query: catalogued(query)?,
+            // Filled in by `evidence`, which is where the rest of the file — and
+            // so what it declares under a name of its own — is in view.
+            except: Vec::new(),
+        },
+        present: false,
+        proof: false,
+    })
+}
+
+/// A read-only catalogue query naming the constraints it selects, or `None` for
+/// anything else.
+///
+/// Adoption probes with the migration's own query, so what may be probed is
+/// exactly what a `SELECT` over `pg_constraint` can answer: one statement,
+/// changing nothing, yielding the `conname` the loop drops — which the probe needs
+/// too, to tell a definition the migration should have removed from one it went on
+/// to declare itself.
+fn catalogued(query: &str) -> Option<String> {
+    let words = words(query);
+    if !words.first()?.eq_ignore_ascii_case("SELECT") {
+        return None;
+    }
+    if !words
+        .iter()
+        .any(|word| word.eq_ignore_ascii_case("pg_constraint"))
+    {
+        return None;
+    }
+    let (selected, _) = divided(query, "FROM")?;
+    if !self::words(&selected)
+        .iter()
+        .any(|word| word.eq_ignore_ascii_case("conname"))
+    {
+        return None;
+    }
+    if words.iter().any(|word| {
+        [
+            "INSERT", "UPDATE", "DELETE", "ALTER", "DROP", "CREATE", "GRANT", "REVOKE", "TRUNCATE",
+            "COPY", "CALL", "DO", "SET", "LOCK", "NEXTVAL", "PG_SLEEP",
+        ]
+        .iter()
+        .any(|forbidden| word.eq_ignore_ascii_case(forbidden))
+    }) {
+        return None;
+    }
+    Some(query.to_owned())
+}
+
+/// An `EXECUTE format('...', ...)`'s template with its placeholders removed, and
+/// the arguments it fills them from.
+fn templated(statement: &str) -> Option<(String, Vec<String>)> {
+    let words = words(statement);
+    if !(words.first()?.eq_ignore_ascii_case("EXECUTE")
+        && words.get(1)?.eq_ignore_ascii_case("format"))
+    {
+        return None;
+    }
+    let open = statement.find('(')?;
+    let close = statement.rfind(')')?;
+    let arguments = split(statement, open + 1, close);
+    let (template, arguments) = arguments.split_first()?;
+    let quoted = literals(template);
+    let [template] = quoted.as_slice() else {
+        return None;
+    };
+    Some((
+        template.replace("%I", " ").replace("%s", " "),
+        arguments
+            .iter()
+            .map(|argument| argument.trim().to_owned())
+            .collect(),
+    ))
+}
+
+/// Whether a condition asks about the very thing an expectation is about, by
+/// naming every part of it as a literal.
+fn stated(what: &Evidence, condition: &str) -> bool {
+    let literals = literals(condition);
+    let names = match what {
+        Evidence::Table(name) | Evidence::Index(name) | Evidence::Seed(name) => vec![name],
+        Evidence::Column(table, column) => vec![table, column],
+        Evidence::Constraint(table, constraint) => vec![table, constraint],
+        Evidence::Policy(table, policy) => vec![table, policy],
+        Evidence::Guarded(table) | Evidence::Forced(table) => vec![table],
+        Evidence::Stale { .. } => return false,
+    };
+    names
+        .into_iter()
+        .all(|name| literals.iter().any(|literal| literal == name))
 }
 
 /// The body of the first `$tag$ ... $tag$` region in a statement.
@@ -1137,6 +1457,25 @@ enum Evidence {
     Forced(String),
     /// A policy, by the table it guards and its own name.
     Policy(String, String),
+    /// Definitions a migration replaces without being able to name them: the
+    /// constraints PostgreSQL named for itself when an earlier version declared
+    /// them inline. The file finds them with a catalogue query and drops what it
+    /// finds, so the query is the evidence — after the migration it selects
+    /// nothing — and `table` is the one it asks about, for the refusal to name.
+    ///
+    /// Absence only, and never proof: a database that never had those definitions
+    /// answers the same way as one the migration cleaned up.
+    ///
+    /// `except` are the constraints the migration goes on to declare by name. A
+    /// query written to find the old definitions of a rule matches a new one in the
+    /// same shape — v3 drops every check mentioning `actor_kind`, then adds its own
+    /// — so what the migration leaves behind is "nothing this query names, other
+    /// than what this file declares".
+    Stale {
+        table: String,
+        query: String,
+        except: Vec<String>,
+    },
 }
 
 /// Everything a migration must be able to show for itself to be adoptable, or
@@ -1185,6 +1524,22 @@ fn evidence(migration: &Migration) -> Option<Vec<Expectation>> {
             }
         }
     }
+    // What the file declares under a name of its own, which is what a query for
+    // the definitions it replaces must be allowed to find afterwards: v3 drops
+    // every check on the journal mentioning `actor_kind` and then adds one that
+    // does, so "the query names nothing" would be false of a database that ran it.
+    let declared: Vec<String> = evidence
+        .iter()
+        .filter_map(|item| match &item.what {
+            Evidence::Constraint(_, constraint) if item.present => Some(constraint.clone()),
+            _ => None,
+        })
+        .collect();
+    for item in &mut evidence {
+        if let Evidence::Stale { except, .. } = &mut item.what {
+            *except = declared.clone();
+        }
+    }
     Some(evidence)
 }
 
@@ -1201,6 +1556,7 @@ fn described(expectation: &Expectation) -> String {
         (Evidence::Seed(_), false) => format!("{thing} still has its seeded row"),
         (Evidence::Guarded(_) | Evidence::Forced(_), true) => format!("{thing} is not enabled"),
         (Evidence::Guarded(_) | Evidence::Forced(_), false) => format!("{thing} is still enabled"),
+        (Evidence::Stale { .. }, _) => format!("{thing} is still there"),
         (_, true) => format!("{thing} is not present"),
         (_, false) => format!("{thing} is still present"),
     }
@@ -1218,6 +1574,9 @@ fn named_thing(what: &Evidence) -> String {
         Evidence::Guarded(table) => format!("row level security on `{table}`"),
         Evidence::Forced(table) => format!("forced row level security on `{table}`"),
         Evidence::Policy(table, policy) => format!("`{table}`'s `{policy}` policy"),
+        Evidence::Stale { table, .. } => {
+            format!("a definition on `{table}` that this migration replaces")
+        }
     }
 }
 
@@ -1345,6 +1704,52 @@ pub(super) async fn baseline(
                 )
                 .await?
                 .get(0),
+            // The migration's own query, which is the only thing that can answer
+            // for definitions the file never names: `catalogued` admitted it as a
+            // single read of `pg_constraint` and nothing else. Pinned to this
+            // schema like every other probe, by giving the query a search path
+            // holding only the one — it resolves its tables with `::regclass`, and
+            // a neighbouring schema's tables further down the path would otherwise
+            // answer for this one's.
+            Evidence::Stale { query, except, .. } => {
+                transaction
+                    .batch_execute(
+                        "SAVEPOINT stale_definitions; \
+                         SELECT set_config('search_path', current_schema(), true)",
+                    )
+                    .await?;
+                let found = transaction
+                    .query_one(
+                        &format!(
+                            "SELECT EXISTS (\
+                               SELECT 1 FROM ({query}) stale \
+                                WHERE stale.conname <> ALL ($1::text[]))"
+                        ),
+                        &[except],
+                    )
+                    .await;
+                // The savepoint is rolled back either way: the pinned search path
+                // is undone with it, and a query resolving its tables with
+                // `::regclass` against a database where nothing was applied
+                // there raises rather than answering — "no such table" is
+                // "nothing of the kind is there", not an outage to report.
+                transaction
+                    .batch_execute(
+                        "ROLLBACK TO SAVEPOINT stale_definitions; \
+                         RELEASE SAVEPOINT stale_definitions",
+                    )
+                    .await?;
+                match found {
+                    Ok(row) => row.get(0),
+                    Err(error)
+                        if error.code()
+                            == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE) =>
+                    {
+                        false
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         };
         if found {
             confirmed.insert(item);
@@ -1358,29 +1763,23 @@ pub(super) async fn baseline(
 /// Separated from the probing so the shape of the history — a whole version, a
 /// half-applied one, a hole, a version nothing can confirm — is decided by a
 /// function that can be examined directly.
+///
+/// Read prefix by prefix, longest first, because what a migration leaves behind is
+/// only fixed once the versions above it are accounted for: v3 drops indexes v2
+/// created, so "`axond_cp_tenant_slug_idx` is present" is what a v1+v2 database
+/// looks like and "it is gone" is what a v1+v2+v3 one looks like. Asking each
+/// migration about its own statements in isolation would call one of those two
+/// real databases half-applied.
 fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baseline {
-    // Every probe answers about a thing, not about a statement: a table is there
-    // or it is not, a table has a row or it does not. So evidence two migrations
-    // both declare confirms at most one of them, and there is no telling which.
-    // A database that only ever had the first applied would have the second
-    // recorded too, and `apply` would never run it.
-    //
-    // True of a seed target seeded twice, and equally of a relation two
-    // migrations both `CREATE ... IF NOT EXISTS`. Shared evidence is therefore
-    // evidence of nothing, and treated like any other statement adoption cannot
-    // confirm. (Within one migration a repeated relation is one declaration
-    // deduplicated by `evidence`; a repeated seed is not, so it lands here.)
-    let shipped: Vec<Expectation> = migrations.iter().filter_map(evidence).flatten().collect();
-    let mut adoptable: Vec<i32> = Vec::new();
-    let mut absent: Option<i32> = None;
+    let mut declared: Vec<Vec<Expectation>> = Vec::new();
     for migration in migrations {
         // A migration containing a statement whose effect nothing can be asked
         // about — a backfill, an `UPDATE`, a non-idempotent `INSERT`, an `ALTER`
         // clause the catalogue has no answer for — blocks adoption of this
         // database wherever in the history it sits, including the versions below
-        // it. So does one that only takes things away: absence is not evidence a
-        // version ran, because a database that never had the version before it
-        // does not have them either.
+        // it. So does one that leaves nothing of its own behind: absence is not
+        // evidence a version ran, because a database that never had the version
+        // before it does not have those things either.
         //
         // Fail-closed on purpose, in both directions. Recording it on the strength
         // of the objects it happens to create would claim a column or a row that
@@ -1389,8 +1788,8 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
         // database that may already have had it applied out of band. That rerun is
         // precisely the non-idempotent replay adoption exists to prevent, and no
         // ledger row both accounts for the objects and keeps `apply` away.
-        let Some(declared) =
-            evidence(migration).filter(|declared| declared.iter().any(|item| item.present))
+        let Some(items) =
+            evidence(migration).filter(|items| items.iter().any(|item| item.present && item.proof))
         else {
             return Baseline::Inconsistent {
                 message: format!(
@@ -1405,66 +1804,218 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
                 ),
             };
         };
-        if let Some(shared) = declared.iter().find(|item| {
-            shipped
-                .iter()
-                .filter(|other| other.what == item.what)
-                .count()
-                > 1
-        }) {
-            let (what, proves) = match &shared.what {
-                Evidence::Seed(name) => (
-                    format!("seeds `{name}`, which the shipped history seeds more than once"),
-                    "a row in it proves at most one of those inserts and not this one",
-                ),
-                shared => (
-                    format!(
-                        "acts on {}, which more than one shipped migration acts on",
-                        named_thing(shared)
-                    ),
-                    "what the database shows proves at most one of them and not this one",
-                ),
-            };
+        declared.push(items);
+    }
+    // A seed row is the one piece of evidence that does not say how many
+    // statements wrote it: the target has a row or it does not, so two inserts
+    // into one table — in a file or across the history — are each "confirmed" by
+    // the other's row, and a `psql` run that stopped between them would look
+    // finished. Every other kind is a thing that exists once, so a second
+    // migration acting on it is a replacement, handled below by no longer letting
+    // it prove anything.
+    for (migration, items) in migrations.iter().zip(&declared) {
+        if let Some(Evidence::Seed(name)) = items
+            .iter()
+            .map(|item| &item.what)
+            .filter(|what| matches!(what, Evidence::Seed(_)))
+            .find(|what| {
+                declared
+                    .iter()
+                    .flatten()
+                    .filter(|other| &other.what == *what)
+                    .count()
+                    > 1
+            })
+        {
             return Baseline::Inconsistent {
                 message: format!(
-                    "v{} `{}` {what}, so {proves}: whether this version ran is not something \
-                     adoption can confirm. No baseline is adoptable while they all ship: state \
-                     the history with `INSERT INTO {MIGRATION_TABLE} (version, name, checksum)` \
-                     if you own the change that applied it, or drop the empty ledger and apply \
-                     from zero if nothing was.",
+                    "v{} `{}` seeds `{name}`, which the shipped history seeds more than once, so a \
+                     row in it proves at most one of those inserts and not this one: whether this \
+                     version ran is not something adoption can confirm. No baseline is adoptable \
+                     while they all ship: state the history with `INSERT INTO {MIGRATION_TABLE} \
+                     (version, name, checksum)` if you own the change that applied it, or drop the \
+                     empty ledger and apply from zero if nothing was.",
                     migration.version, migration.name,
                 ),
             };
+        }
+    }
+    // Every version needs one thing that is its alone. A thing more than one
+    // shipped migration acts on is proof of neither: a table two files declare
+    // `IF NOT EXISTS`, or a constraint one drops and the next re-adds under the
+    // same name, says at most that one of them ran and not which — and so does an
+    // index a later version takes away, which is there when the earlier version ran
+    // and the later one did not, and also when neither did. A version whose every
+    // effect is shared that way is one no database can be shown to have reached: it
+    // is unadoptable for the reason an `UPDATE` is, and blocks the history for the
+    // same reason, because recording the prefix under it would leave `apply` to
+    // re-run it over a schema that may already have had it.
+    //
+    // Only *every* effect being shared is fatal. A version with one thing of its
+    // own is adoptable on that, which is how the shipped history stays adoptable:
+    // v3 takes v2's indexes away, and v2 is proven by the columns and tables it
+    // alone adds.
+    for (migration, items) in migrations.iter().zip(&declared) {
+        let shared = |what: &Evidence| {
+            declared
+                .iter()
+                .filter(|other| other.iter().any(|item| &item.what == what))
+                .count()
+                > 1
+        };
+        let mut proof = items.iter().filter(|item| item.present && item.proof);
+        if proof.clone().all(|item| shared(&item.what)) {
+            let Some(item) = proof.next() else {
+                unreachable!("a migration with no proof of its own was refused above");
+            };
+            return Baseline::Inconsistent {
+                message: format!(
+                    "v{} `{}` acts on {}, which more than one shipped migration acts on, so what \
+                     the database shows proves at most one of them and not this one: whether this \
+                     version ran is not something adoption can confirm. No baseline is adoptable \
+                     while they all ship: state the history with `INSERT INTO {MIGRATION_TABLE} \
+                     (version, name, checksum)` if you own the change that applied it, or drop the \
+                     empty ledger and apply from zero if nothing was.",
+                    migration.version,
+                    migration.name,
+                    named_thing(&item.what),
+                ),
+            };
+        }
+    }
+    for length in (1..=migrations.len()).rev() {
+        match fitted(&migrations[..length], &declared[..length], confirmed) {
+            // The longest prefix every version of which the database can account
+            // for. Longest first, so a database that really is at v3 is recorded
+            // as v3 rather than refused for the indexes v3 took away.
+            Fit::Baseline => {
+                return Baseline::Applied {
+                    versions: migrations[..length]
+                        .iter()
+                        .map(|migration| migration.version)
+                        .collect(),
+                };
+            }
+            // A version in this prefix is half-way applied, which no baseline
+            // describes: adoption cannot record it, and `apply` cannot run it over
+            // what is there. Refused here rather than falling back to a shorter
+            // prefix, because recording one would leave `apply` to finish a
+            // migration that has already had part of its effect.
+            Fit::Refused { message } => return Baseline::Inconsistent { message },
+            // Nothing shows this database ever reached the top of this prefix, so
+            // try the one below it.
+            Fit::Shorter => {}
+        }
+    }
+    if confirmed.is_empty() {
+        return Baseline::Nothing;
+    }
+    // Objects from the shipped history are there, but no prefix of it accounts for
+    // them: a later version's objects without an earlier one's, or only things a
+    // later version replaced. Named as far as it can be, because "not a prefix" is
+    // a schema an operator has to go and look at.
+    let proven = |items: &Vec<Expectation>| {
+        items
+            .iter()
+            .any(|item| item.present && item.proof && confirmed.contains(&item.what))
+    };
+    let hole = migrations
+        .iter()
+        .zip(&declared)
+        .find(|(_, items)| !proven(items))
+        .map(|(migration, _)| migration.version);
+    let above = migrations
+        .iter()
+        .zip(&declared)
+        .filter(|(migration, items)| Some(migration.version) > hole && proven(items))
+        .map(|(migration, _)| (migration.version, migration.name))
+        .next_back();
+    Baseline::Inconsistent {
+        message: match (hole, above) {
+            (Some(hole), Some((version, name))) => format!(
+                "v{version} `{name}` declares objects that are present while v{hole} declares \
+                 objects that are not; this database is not a prefix of the shipped migration \
+                 history, so no baseline describes it"
+            ),
+            _ => format!(
+                "objects the shipped migrations act on are present, but nothing in this schema \
+                 shows which version put them there — no baseline describes it. State the history \
+                 with `INSERT INTO {MIGRATION_TABLE} (version, name, checksum)` if you own the \
+                 change that applied it."
+            ),
+        },
+    }
+}
+
+/// What a prefix of the shipped history has to say about a database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Fit {
+    /// Every version in the prefix left something only it leaves, and the schema
+    /// is exactly what the prefix ends with: the prefix describes this database.
+    Baseline,
+    /// The prefix went further than this database did.
+    Shorter,
+    /// This database is part-way through one of the prefix's versions.
+    Refused { message: String },
+}
+
+/// Whether a prefix of the shipped history describes what the database shows.
+///
+/// Two questions, and the order matters. Did each version in the prefix leave
+/// something behind that only it leaves — if not, the database never got this far,
+/// which is not a fault. And is the schema what the prefix *ends* with, the last
+/// version to act on a thing deciding whether it is there — if not, some version
+/// is half-way applied, which is.
+fn fitted(
+    migrations: &[Migration],
+    declared: &[Vec<Expectation>],
+    confirmed: &HashSet<Evidence>,
+) -> Fit {
+    // The state the prefix leaves: `ALTER ... ENABLE`, then a later `DISABLE`,
+    // leaves it disabled, and an index v2 creates and v3 drops is gone. The last
+    // version to act on a thing owns it, and owns the refusal that names it.
+    let mut left: Vec<(usize, &Expectation)> = Vec::new();
+    for (index, items) in declared.iter().enumerate() {
+        for item in items {
+            match left.iter_mut().find(|(_, prior)| prior.what == item.what) {
+                Some(owner) => *owner = (index, item),
+                None => left.push((index, item)),
+            }
+        }
+    }
+    // Anything more than one version in the prefix acts on is a replacement, and
+    // proves nothing about which of them ran: a database holding only v1 holds the
+    // constraint v2 drops and re-adds under the same name, and reading that as v2's
+    // work would refuse every v1-only database as half-way through v2. Required
+    // still — a v2 database missing one is partly applied — just never proof.
+    let replaced = |what: &Evidence| {
+        declared
+            .iter()
+            .filter(|items| items.iter().any(|item| &item.what == what))
+            .count()
+            > 1
+    };
+    for (migration, items) in migrations.iter().zip(declared) {
+        let proven = items.iter().any(|item| {
+            item.present && item.proof && !replaced(&item.what) && confirmed.contains(&item.what)
+        });
+        if !proven {
+            return Fit::Shorter;
         }
         // Named by what is actually wrong with each one: a table that is not there
         // and a table that is there without its seed row are different repairs, and
         // an operator told "`axond_cp_head` is not present" about a table that
         // exists would go looking for the wrong thing.
-        let missing: Vec<String> = declared
+        let missing: Vec<String> = left
             .iter()
-            .filter(|item| confirmed.contains(&item.what) != item.present)
-            .map(described)
+            .filter(|(owner, item)| {
+                migrations[*owner].version == migration.version
+                    && confirmed.contains(&item.what) != item.present
+            })
+            .map(|(_, item)| described(item))
             .collect();
-        // Whether the version ran at all is read from what it left behind, never
-        // from what it took away: a database that never had it is missing the
-        // things it dropped too, so counting those would read an untouched
-        // database as half-way through the migration.
-        // Nor from something it replaced: a `DROP` followed by a `CREATE` of the
-        // same object leaves what an earlier version installed indistinguishable
-        // from what this one did, so a database holding only v1 is not half-way
-        // through v2 for holding the constraint v2 would have rewritten. Such a
-        // statement is also the one kind that is safe to reach a second time,
-        // which is what makes leaving the version to `apply` the right answer.
-        let left = declared
-            .iter()
-            .filter(|item| item.present && item.proof && confirmed.contains(&item.what))
-            .count();
-        if left == 0 {
-            absent = absent.or(Some(migration.version));
-            continue;
-        }
         if !missing.is_empty() {
-            return Baseline::Inconsistent {
+            return Fit::Refused {
                 message: format!(
                     "v{} `{}` is only partly applied: {}, so this build cannot record it as \
                      applied and cannot apply it over what is there either. Finish or undo that \
@@ -1475,30 +2026,8 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
                 ),
             };
         }
-        match absent {
-            // Still extending the prefix of versions the database can account for.
-            None => adoptable.push(migration.version),
-            // Objects for a version above one that is absent: the database is
-            // not any prefix of this history, so nothing about it can be
-            // recorded as a baseline.
-            Some(hole) => {
-                return Baseline::Inconsistent {
-                    message: format!(
-                        "v{} `{}` declares objects that are present while v{hole} declares objects \
-                         that are not; this database is not a prefix of the shipped migration \
-                         history, so no baseline describes it",
-                        migration.version, migration.name,
-                    ),
-                };
-            }
-        }
     }
-    if adoptable.is_empty() {
-        return Baseline::Nothing;
-    }
-    Baseline::Applied {
-        versions: adoptable,
-    }
+    Fit::Baseline
 }
 
 /// Record an adopted baseline: the versions whose objects are already there.
@@ -2278,6 +2807,243 @@ mod tests {
                 "a block outside the one shape this reads is unconfirmable: {block}"
             );
         }
+    }
+
+    /// The deferred-constraint migration, which is the shape v2 was not: it
+    /// creates no table, guards every add with `IF NOT EXISTS (SELECT ...)`, drops
+    /// the indexes its constraints replace, and clears definitions PostgreSQL named
+    /// for itself — found by a catalogue query, because the file cannot name them.
+    #[test]
+    fn the_deferred_constraint_migrations_guards_and_cleanups_are_all_confirmable() {
+        let declared = evidence(&MIGRATIONS[2])
+            .expect("v3's statements have to be confirmable, or `adopt` refuses every deployment");
+        for expected in [
+            // The undeferrable indexes v2 created, which v3 replaces with
+            // constraints: a v3 database is one where they are gone, and one that
+            // still has them is one v3 has not run.
+            gone(index("axond_cp_tenant_slug_idx")),
+            present(constraint("axond_cp_tenant", "axond_cp_tenant_slug_unique")),
+            present(constraint(
+                "axond_cp_project",
+                "axond_cp_project_slug_unique",
+            )),
+            present(constraint(
+                "axond_cp_principal",
+                "axond_cp_principal_key_digest_unique",
+            )),
+            present(constraint(
+                "axond_cp_principal",
+                "axond_cp_principal_project_fkey",
+            )),
+            // Added under the name v1 and v2 used — dropped by the loop above it
+            // rather than by name, so what v3's own text leaves is the constraint
+            // being there. Its presence stops being proof of v3 in `reconcile`,
+            // where the other versions that declare it are in view.
+            present(constraint(
+                "axond_cp_mutation",
+                "axond_cp_mutation_actor_attribution",
+            )),
+            replaced(policy("axond_cp_mutation", "axond_cp_mutation_isolation")),
+        ] {
+            assert!(
+                declared.contains(&expected),
+                "v3 has to be adoptable on {}: {declared:#?}",
+                named_thing(&expected.what)
+            );
+        }
+
+        // The four loops that drop what they find. Absence only, and never proof:
+        // a database that never had the inline definitions answers exactly as one
+        // v3 cleaned up. What the file goes on to declare by name is exempt — v3's
+        // journal loop matches every check mentioning `actor_kind` and then adds
+        // one that does, so "the query names nothing" would be false of a database
+        // that ran it.
+        let cleared: Vec<&Expectation> = declared
+            .iter()
+            .filter(|item| matches!(item.what, Evidence::Stale { .. }))
+            .collect();
+        assert_eq!(
+            cleared.len(),
+            4,
+            "each of v3's cleanup loops is evidence: {declared:#?}"
+        );
+        assert!(
+            cleared.iter().all(|item| !item.present && !item.proof),
+            "a definition being gone is required of a v3 database and proof of nothing"
+        );
+        assert!(
+            cleared.iter().any(|item| matches!(
+                &item.what,
+                Evidence::Stale { table, except, .. }
+                    if table == "axond_cp_mutation"
+                        && except.contains(&"axond_cp_mutation_actor_attribution".to_owned())
+            )),
+            "the journal's loop has to admit the check v3 adds itself: {declared:#?}"
+        );
+    }
+
+    /// The two dynamic shapes v3 adds, and the fail-closed edges of each: an add
+    /// guarded by a query is evidence only when the guard asks about the very thing
+    /// it guards, and a loop that drops what its query finds is summarised by that
+    /// query — so the query has to be a single catalogue read naming the
+    /// constraints it selects, and the loop has to do nothing but drop them.
+    #[test]
+    fn a_guarded_add_and_a_cleanup_loop_are_read_only_in_the_shapes_they_summarise() {
+        let block = |body: &str| format!("DO $$\nDECLARE\n stale record;\nBEGIN\n {body}\nEND\n$$");
+
+        let guarded = block(
+            "IF NOT EXISTS (\
+               SELECT 1 FROM pg_constraint \
+                WHERE conrelid = 'one'::regclass AND conname = 'one_unique'\
+             ) THEN \
+               ALTER TABLE one ADD CONSTRAINT one_unique UNIQUE (id) DEFERRABLE; \
+             END IF;",
+        );
+        assert_eq!(
+            expectations(&guarded),
+            Some(vec![present(constraint("one", "one_unique"))]),
+            "a guard that asks about the constraint it adds leaves that constraint"
+        );
+
+        let looped = block(
+            "FOR stale IN \
+               SELECT conname FROM pg_constraint \
+                WHERE conrelid = 'one'::regclass AND contype = 'u' \
+             LOOP \
+               EXECUTE format('ALTER TABLE one DROP CONSTRAINT %I', stale.conname); \
+             END LOOP;",
+        );
+        let cleared = expectations(&looped);
+        let Some([expectation]) = cleared.as_deref() else {
+            panic!("a loop that drops what its own query names is one piece of evidence");
+        };
+        assert!(
+            matches!(&expectation.what, Evidence::Stale { table, .. } if table == "one")
+                && !expectation.present
+                && !expectation.proof,
+            "the loop's evidence is its query naming nothing on `one`: {expectation:?}"
+        );
+
+        for body in [
+            // A guard about something other than what it guards: whether the
+            // branch was taken is then not something the effect can answer.
+            "IF NOT EXISTS (\
+               SELECT 1 FROM pg_constraint WHERE conname = 'other_unique'\
+             ) THEN ALTER TABLE one ADD CONSTRAINT one_unique UNIQUE (id); END IF;",
+            // A guard that is not a single catalogue read.
+            "IF NOT EXISTS (\
+               UPDATE one SET id = 1 RETURNING id\
+             ) THEN ALTER TABLE one ADD CONSTRAINT one_unique UNIQUE (id); END IF;",
+            // A guarded effect that is unconfirmable in its own right.
+            "IF NOT EXISTS (\
+               SELECT 1 FROM pg_constraint WHERE conname = 'one_unique'\
+             ) THEN UPDATE one SET note = 1; END IF;",
+            // A loop that writes as well as drops: its query naming nothing
+            // afterwards says nothing about what else it did.
+            "FOR stale IN SELECT conname FROM pg_constraint WHERE contype = 'u' LOOP \
+               EXECUTE format('ALTER TABLE one DROP CONSTRAINT %I', stale.conname); \
+               EXECUTE format('ALTER TABLE one ADD CONSTRAINT %I UNIQUE (id)', stale.conname); \
+             END LOOP;",
+            // A loop that drops a fixed name rather than what it found.
+            "FOR stale IN SELECT conname FROM pg_constraint WHERE contype = 'u' LOOP \
+               EXECUTE format('ALTER TABLE %I DROP CONSTRAINT one_unique', 'one'); \
+             END LOOP;",
+            // A query the probe cannot ask again: not a read, not of the
+            // constraint catalogue, or not naming the constraints it selects.
+            "FOR stale IN DELETE FROM pg_constraint RETURNING conname LOOP \
+               EXECUTE format('ALTER TABLE one DROP CONSTRAINT %I', stale.conname); \
+             END LOOP;",
+            "FOR stale IN SELECT relname AS conname FROM pg_class LOOP \
+               EXECUTE format('ALTER TABLE one DROP CONSTRAINT %I', stale.conname); \
+             END LOOP;",
+            "FOR stale IN SELECT oid FROM pg_constraint LOOP \
+               EXECUTE format('ALTER TABLE one DROP CONSTRAINT %I', stale.oid); \
+             END LOOP;",
+        ] {
+            let block = block(body);
+            assert_eq!(
+                expectations(&block),
+                None,
+                "a block outside the shapes this reads is unconfirmable: {block}"
+            );
+        }
+    }
+
+    /// A prefix is read with the versions above it in view, because a later
+    /// migration takes earlier ones' objects away: v3 drops the indexes v2 created.
+    /// The longest prefix the database can account for is the baseline — an index
+    /// that is gone is v3's doing when v3 is claimed and a missing effect when it
+    /// is not, and neither reading may be used to record a version the database
+    /// cannot show.
+    #[test]
+    fn a_later_migration_taking_an_earlier_ones_object_away_is_read_as_the_prefix_it_is() {
+        const V1: Migration = Migration {
+            version: 1,
+            name: "first",
+            sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n",
+        };
+        const V2: Migration = Migration {
+            version: 2,
+            name: "indexed",
+            sql: "CREATE TABLE IF NOT EXISTS two (id integer);\n\
+                  CREATE INDEX IF NOT EXISTS one_id ON one (id);\n",
+        };
+        const V3: Migration = Migration {
+            version: 3,
+            name: "constrained",
+            sql: "DROP INDEX IF EXISTS one_id;\n\
+                  ALTER TABLE one ADD CONSTRAINT one_id_unique UNIQUE (id);\n",
+        };
+        let shipped = [V1, V2, V3];
+        let one = table("one");
+        let two = table("two");
+        let indexed = index("one_id");
+        let constrained = constraint("one", "one_id_unique");
+
+        assert_eq!(
+            reconcile(
+                &shipped,
+                &HashSet::from([one.clone(), two.clone(), indexed.clone()])
+            ),
+            Baseline::Applied {
+                versions: vec![1, 2]
+            },
+            "a database with the index v3 drops is one v3 has not run"
+        );
+        assert_eq!(
+            reconcile(
+                &shipped,
+                &HashSet::from([one.clone(), two.clone(), constrained.clone()])
+            ),
+            Baseline::Applied {
+                versions: vec![1, 2, 3]
+            },
+            "the index being gone is what v3 leaves, so its absence is not a hole"
+        );
+
+        // Neither: the index is gone and the constraint that replaces it was never
+        // added, so one of the two stopped in the middle. No prefix describes that,
+        // and recording one would leave `apply` to finish a migration that has
+        // already had part of its effect.
+        let Baseline::Inconsistent { message } =
+            reconcile(&shipped, &HashSet::from([one.clone(), two.clone()]))
+        else {
+            panic!("a database part-way through the replacement has no adoptable baseline");
+        };
+        assert!(
+            message.contains("`one_id` is not present"),
+            "the refusal names the index the prefix it claims leaves behind: {message}"
+        );
+        assert_eq!(
+            reconcile(&shipped, &HashSet::from([one, two, indexed, constrained])),
+            Baseline::Inconsistent {
+                message: "v3 `constrained` is only partly applied: `one_id` is still present, so \
+                          this build cannot record it as applied and cannot apply it over what is \
+                          there either. Finish or undo that migration by hand, then re-run."
+                    .to_owned()
+            },
+            "a database with both is one where v3's `DROP INDEX` has not run"
+        );
     }
 
     /// `CREATE TABLE` with and without `IF NOT EXISTS`, a name followed by a

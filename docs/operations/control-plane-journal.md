@@ -307,6 +307,21 @@ history. Objects v2 would *rewrite* under a name v1 already used (the
 v2: what a file drops and creates again is required of a database it ran on, but is
 never read as proof of which version wrote it.
 
+A later migration also *takes away* what an earlier one left — v3 drops the unique
+indexes v2 created and replaces them with deferrable constraints — so the baseline
+is read with the whole shipped history in view: the last version to act on a thing
+decides whether a database that reached the top of a prefix should still have it.
+One of those indexes still being present says v2 ran and v3 did not; its absence
+alongside v3's constraints says both ran; and the state in between — the index gone
+and the constraint that replaces it never added — is a file stopped in the middle,
+refused rather than recorded as the version below. v3's other two shapes are read
+the same way: an add wrapped in `IF NOT EXISTS (SELECT ... )` is confirmed by the
+constraint it names being there, whichever way the guard went, and a loop that drops
+the constraints PostgreSQL named for itself — names no file can state, which is why
+the loop exists — is confirmed by its own query naming nothing afterwards, asked
+again in this schema, allowing for the constraints the same file goes on to declare
+by name.
+
 What it does instead of recording:
 
 - **No object present.** Nothing was applied out of band, so there is no baseline.
@@ -362,7 +377,9 @@ What it does instead of recording:
   migration declares: a table being present proves at most one of the
   `CREATE TABLE IF NOT EXISTS` statements that declare it, so a later migration
   that only re-declares an earlier one's objects is unconfirmable rather than
-  adopted on their strength. Unadoptable holds even when the same file
+  adopted on their strength — and so is a migration whose every effect another one
+  acts on, including one a later version takes away again, since the object's state
+  proves at most one of them. Unadoptable holds even when the same file
   also creates a table: `psql -f` without a wrapping transaction can abort between
   `CREATE TABLE x` and a following `ALTER TABLE y`, and "x exists" is then not
   evidence the file finished. Adopting the versions below it is no better — the

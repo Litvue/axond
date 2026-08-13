@@ -253,6 +253,61 @@ that row with `psql`, and the command narrows what they can assert rather than
 widening it. Release impact is one new optional command; no existing invocation,
 exit code, or configuration key changes.
 
+## Amendment (2026-08-13): a later version takes earlier ones' objects away
+
+The deferred-constraint migration (v3) is the first shipped file that *replaces*
+rules an earlier version installed rather than adding to them, and it does so in
+three shapes the amendment above did not read. Adoption is extended to all three
+rather than withdrawn, on the same terms: every effect confirmed by one catalogue
+question, and anything outside the shape refused.
+
+- **`DROP INDEX` is confirmed by the index being gone**, like every other `DROP`,
+  and like them it is never proof on its own: a database that never had v2 has no
+  such index either. It is why the prefix is now read *with the versions above it
+  in view* — the last version to act on a thing decides whether it should be there,
+  so the longest prefix the database accounts for is the baseline. An index v2
+  created and v3 dropped being present says v2 ran and v3 did not; its absence with
+  v3's constraints present says both ran; and the two states the prefixes disagree
+  about — the index gone with the constraint never added — are a migration stopped
+  in the middle, refused rather than recorded shorter.
+- **An add guarded by `IF NOT EXISTS (SELECT ... )` is evidence only when the guard
+  asks about the very thing it guards**, which is what v3's blocks do: the guard
+  names the table and the constraint the branch adds, so whether the branch was
+  taken or skipped, the constraint is there afterwards either way and its presence
+  is the same answer. A guard about something else, a guard that is not a single
+  catalogue read, or a guarded effect unconfirmable in its own right makes the block
+  unconfirmable, exactly as a bare `IF` condition did.
+- **A loop that drops what its own catalogue query names is summarised by that
+  query.** v3 removes the constraints PostgreSQL named for itself when v1 and v2
+  declared them inline — a name the file cannot state, which is the whole reason the
+  loop exists — so the evidence is the query returning nothing afterwards, asked
+  again by adoption as the file asked it. Strictly bounded: one `SELECT` over
+  `pg_constraint`, no writing keyword, selecting the `conname` the loop drops, and a
+  body that does nothing but `EXECUTE format('... DROP CONSTRAINT %I', v.conname)`
+  for what the query named. It is absence, so never proof of a version. Two details
+  make it honest rather than approximate: the probe runs with the search path pinned
+  to this schema, like every other probe, because the query resolves its tables with
+  `::regclass` and a neighbour's tables would otherwise answer for this one's; and
+  the constraints the file goes on to declare *by name* are exempt from it, since
+  v3's journal loop matches every check mentioning `actor_kind` and then adds one
+  that does — "the query names nothing" would otherwise be false of every database
+  that ran it.
+
+The evidence-sharing rule is unchanged in substance and stated once more, because
+the third shape widens what counts as sharing: a version needs one thing **more
+than one shipped migration does not act on**. Two files creating the same object,
+one dropping and re-adding what another created, and one taking away what another
+left are the same ambiguity — the object's state proves at most one of them — and a
+version every one of whose effects is shared that way is unadoptable and blocks the
+history, like a statement no catalogue can answer.
+`the_deferred_constraint_migrations_guards_and_cleanups_are_all_confirmable` holds
+v3 to this object by object,
+`a_guarded_add_and_a_cleanup_loop_are_read_only_in_the_shapes_they_summarise` pins
+the fail-closed edge of each shape, and
+`a_later_migration_taking_an_earlier_ones_object_away_is_read_as_the_prefix_it_is`
+covers the four states a replacement leaves. No shipped SQL changes, so the
+checksums and the byte-identity gates are untouched, and no probe writes.
+
 ## Consequences
 
 A schema disagreement, an unset reference, or an unreachable database becomes a

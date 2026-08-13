@@ -1613,6 +1613,15 @@ mod tests {
             "v2's objects must not be there: this is the pre-tenancy manual state"
         );
 
+        // Everything above v1, read out of the shipped history rather than listed:
+        // this state is "the ledger names the prefix the objects account for and
+        // `apply` runs the rest", however long the rest has become.
+        let rest: Vec<i32> = schema::MIGRATIONS
+            .iter()
+            .map(|migration| migration.version)
+            .filter(|version| *version > 1)
+            .collect();
+
         let report = adopt(&fixture.config, &fixture.env)
             .await
             .expect("v1's objects are all present, so v1 is adoptable");
@@ -1620,7 +1629,7 @@ mod tests {
             report.state(),
             Some(&State::Adopted {
                 adopted: named(&[1]),
-                pending: named(&[2]),
+                pending: named(&rest),
             }),
             "{report}"
         );
@@ -1647,7 +1656,7 @@ mod tests {
         assert_eq!(
             applied.state(),
             Some(&State::Applied {
-                applied: named(&[2])
+                applied: named(&rest)
             }),
             "{applied}"
         );
