@@ -62,7 +62,7 @@ use crate::convergence::lkg::testing::{KEY, cache_path};
 use crate::convergence::reconciler::category_reason;
 use crate::convergence::{
     BackoffPolicy, BootstrapError, ConvergenceSettings, LastKnownGood, MaterialLedger, Reconciler,
-    RevisionCompiler, SecretMaterialization, SnapshotSource, SystemClock,
+    RevisionCompiler, RevisionReport, SecretMaterialization, SnapshotSource, SystemClock,
 };
 use crate::desired_state::credentials::ProviderCredentialBody;
 use crate::desired_state::secrets::{SecretOwner, SecretRef};
@@ -606,6 +606,68 @@ fn cache(name: &str) -> LastKnownGood {
     LastKnownGood::new(cache_path(name), KEY).expect("a long enough signing key")
 }
 
+/// Retain all three revision identities the recovery contract promises. They
+/// answer different questions: desired is what the journal asks for, loaded is
+/// what this replica hydrated and compiled, and active is what its snapshot is
+/// actually serving. Keeping them in every executable recovery-driver artifact
+/// makes a partially converged replica distinguishable from one that merely
+/// reports the right active revision.
+fn observe_revision_report(recorder: &mut Recorder, prefix: &str, report: &RevisionReport) {
+    let revision = |id: Option<RevisionId>| {
+        id.map_or_else(|| "none".to_owned(), |revision| revision.to_string())
+    };
+    recorder.observe(
+        &format!("{prefix}_desired_revision"),
+        revision(report.desired),
+    );
+    recorder.observe(
+        &format!("{prefix}_loaded_revision"),
+        revision(report.loaded),
+    );
+    recorder.observe(
+        &format!("{prefix}_active_revision"),
+        revision(report.active),
+    );
+}
+
+#[test]
+fn revision_evidence_retains_desired_loaded_and_active() {
+    let desired = fixtures::revision_id(1);
+    let loaded = fixtures::revision_id(2);
+    let active = fixtures::revision_id(3);
+    let report = RevisionReport {
+        desired: Some(desired),
+        loaded: Some(loaded),
+        active: Some(active),
+        ..RevisionReport::default()
+    };
+    let mut recorder = Recorder::new(
+        "recovery-convergence",
+        "journal-recovery",
+        RUNNER,
+        "recovery_convergence",
+        &["revisions"],
+        "test-schema",
+        "test-identity",
+    );
+
+    observe_revision_report(&mut recorder, "replica", &report);
+    let artifact = recorder.finish();
+    let json = serde_json::to_value(artifact).expect("the test artifact serializes");
+    assert_eq!(
+        json["observations"]["replica_desired_revision"],
+        desired.to_string()
+    );
+    assert_eq!(
+        json["observations"]["replica_loaded_revision"],
+        loaded.to_string()
+    );
+    assert_eq!(
+        json["observations"]["replica_active_revision"],
+        active.to_string()
+    );
+}
+
 // ── Failing through the artifact ─────────────────────────────────────────────
 
 /// The step this stage cannot continue past, as a recorded check rather than an
@@ -695,6 +757,7 @@ async fn control_plane_outage_journal_outage() {
     let generation_before = replica.generation();
     let aliases_before = replica.served_aliases();
     recorder.mark("converged", format!("active revision {active}"));
+    observe_revision_report(&mut recorder, "before_outage", &replica.reconciler.report());
     recorder.observe("active_revision_before_outage", active.to_string());
     recorder.observe("snapshot_generation_before_outage", generation_before);
 
@@ -729,6 +792,7 @@ async fn control_plane_outage_journal_outage() {
     let outcome = replica.reconciler.converge_once("qualification").await;
     recorder.mark("convergence-failed", format!("{outcome:?}"));
     let report = replica.reconciler.report();
+    observe_revision_report(&mut recorder, "during_outage", &report);
     let rejection = demand_ok!(
         recorder,
         "the_failed_attempt_is_reported",
@@ -900,6 +964,7 @@ async fn cold_boot_valid_cache_cold_boot() {
     );
     let took = started.elapsed();
     let report = booting.reconciler.report();
+    observe_revision_report(&mut recorder, "after_cold_boot", &report);
     recorder.mark(
         "cold-boot-restored",
         format!(
@@ -1035,6 +1100,8 @@ async fn cold_boot_no_cache_cold_boot() {
         "a replica with no cache and no journal has nothing to serve"
     );
     let took = started.elapsed();
+    let report = booting.reconciler.report();
+    observe_revision_report(&mut recorder, "after_cold_boot", &report);
     recorder.mark("cold-boot-refused", error.to_string());
     recorder.observe("cold_start_outcome", "refused");
     recorder.observe("cold_start_seconds", took);
@@ -1198,6 +1265,11 @@ async fn cold_boot_invalid_cache_cold_boot() {
             format!("{variant}: a cache that fails its authentication is not a snapshot")
         );
         let cache_refused = matches!(error, BootstrapError::Cache { .. });
+        observe_revision_report(
+            &mut recorder,
+            &format!("{variant}_after_cold_boot"),
+            &booting.reconciler.report(),
+        );
         recorder.require_that(
             "the_refusal_names_the_cache",
             cache_refused,
@@ -1433,18 +1505,7 @@ async fn recovery_convergence_journal_recovery() {
             &format!("converged-{name}"),
             format!("{outcome:?} after the journal returned"),
         );
-        recorder.observe(
-            &format!("{name}_active_revision"),
-            report
-                .active
-                .map_or_else(|| "none".to_owned(), |id| id.to_string()),
-        );
-        recorder.observe(
-            &format!("{name}_desired_revision"),
-            report
-                .desired
-                .map_or_else(|| "none".to_owned(), |id| id.to_string()),
-        );
+        observe_revision_report(&mut recorder, name, &report);
         recorder.observe(&format!("{name}_convergence_lag_seconds"), report.lag);
         recorder.observe(
             &format!("{name}_snapshot_source"),
