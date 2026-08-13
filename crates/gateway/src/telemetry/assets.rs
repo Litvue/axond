@@ -201,6 +201,29 @@ struct Scope {
     selectors: Vec<usize>,
 }
 
+/// The modifiers that introduce a label list: an aggregation's grouping, and a
+/// binary operator's vector matching.
+const MODIFIERS: &[&str] = &["by", "without", "on", "ignoring"];
+
+/// PromQL's aggregation operators — the only identifiers that may be followed by
+/// a grouping modifier instead of their argument list.
+const AGGREGATIONS: &[&str] = &[
+    "sum",
+    "min",
+    "max",
+    "avg",
+    "group",
+    "stddev",
+    "stdvar",
+    "count",
+    "count_values",
+    "bottomk",
+    "topk",
+    "quantile",
+    "limitk",
+    "limit_ratio",
+];
+
 /// The histogram bucket boundary: carried by every histogram, declared by none.
 const IMPLICIT_LABELS: &[&str] = &["le"];
 
@@ -302,8 +325,8 @@ fn selectors(expr: &str) -> Result<Expression, String> {
                     index += 1;
                 }
                 let word: String = bytes[start..index].iter().collect();
-                if opens_a_call(&bytes[index..]) {
-                    if matches!(word.as_str(), "by" | "without" | "on" | "ignoring") {
+                if opens_a_call(&word, &bytes[index..]) {
+                    if MODIFIERS.contains(&word.as_str()) {
                         grouping_depth = Some(depth + 1);
                     }
                     continue;
@@ -367,9 +390,15 @@ fn close_scope(open: &mut Vec<Scope>, grouping: &mut Vec<Grouping>) {
 }
 
 /// Whether an identifier is a function or aggregation name rather than a metric
-/// name: it is followed by its argument list, or by the aggregation modifier that
-/// precedes one (`sum by (...) (...)`).
-fn opens_a_call(rest: &[char]) -> bool {
+/// name: it is followed by its argument list, or — for an aggregation operator
+/// only — by the modifier that precedes one (`sum by (...) (...)`).
+///
+/// The aggregation operators have to be enumerated for the second case, because a
+/// following modifier is equally the shape of vector matching on a metric:
+/// `axond_a / on(axond_namespace) axond_b` and `axond_a or on() vector(0)` name a
+/// series on the left, not a call, and reading them as calls would hide them from
+/// the gate.
+fn opens_a_call(word: &str, rest: &[char]) -> bool {
     let mut index = 0;
     while index < rest.len() && rest[index].is_whitespace() {
         index += 1;
@@ -377,12 +406,15 @@ fn opens_a_call(rest: &[char]) -> bool {
     if rest.get(index) == Some(&'(') {
         return true;
     }
+    if !AGGREGATIONS.contains(&word) {
+        return false;
+    }
     let start = index;
     while index < rest.len() && (rest[index].is_ascii_alphabetic() || rest[index] == '_') {
         index += 1;
     }
-    let word: String = rest[start..index].iter().collect();
-    matches!(word.as_str(), "by" | "without" | "on" | "ignoring")
+    let following: String = rest[start..index].iter().collect();
+    MODIFIERS.contains(&following.as_str())
 }
 
 /// Split a `{...}` body into matchers. Values are always quoted in PromQL, which

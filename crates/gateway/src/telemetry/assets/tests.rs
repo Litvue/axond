@@ -483,6 +483,46 @@ fn the_lexer_separates_metrics_from_grouping_labels_and_functions() {
     );
 }
 
+/// `on`/`ignoring` after an identifier is vector matching on a *metric*, not an
+/// aggregation's grouping, so the left-hand series is still selected — and still
+/// checked. Reading it as a call would hide it from the gate, or refuse the
+/// expression for naming nothing of ours.
+#[test]
+fn a_metric_matched_against_another_vector_is_still_validated() {
+    assert_eq!(
+        dashboard_failures("axond_request_count or on() vector(0)"),
+        Vec::new()
+    );
+    assert_eq!(
+        dashboard_failures(
+            "axond_request_count / on(axond_namespace) group_left() axond_cost_microdollars"
+        ),
+        Vec::new()
+    );
+    let failures = dashboard_failures("axond_request_counts or on() vector(0)");
+    assert!(
+        matches!(
+            failures.as_slice(),
+            [AssetError::UnknownFamily { name, .. }] if name == "axond_request_counts"
+        ),
+        "{failures:?}"
+    );
+    // The label list still binds: vector matching on a label the left-hand
+    // instrument does not declare is the same drift as an undeclared grouping.
+    let failures =
+        dashboard_failures("axond_status_refreshes / on(axond_namespace) axond_request_count");
+    assert!(
+        matches!(
+            failures.as_slice(),
+            [AssetError::Catalog {
+                source: catalog::CatalogError::UndeclaredLabel { metric, key },
+                ..
+            }] if metric == "axond.status.refreshes" && key == "axond_namespace"
+        ),
+        "{failures:?}"
+    );
+}
+
 /// A Prometheus name is ASCII. A stray letter from somewhere else has to be a
 /// refusal with a message: consuming nothing and continuing would spin.
 #[test]
