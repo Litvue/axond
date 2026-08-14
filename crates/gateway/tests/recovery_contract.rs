@@ -251,7 +251,9 @@ fn the_dependency_map_is_complete_in_both_directions() {
 }
 
 /// Durable inventory is the only recovery stage that can claim restoration of
-/// the state introduced by the catalogue, pricing, and SecretStore slices.
+/// the state introduced by the catalogue and SecretStore slices. Pricing has a
+/// separate explicit blocker because origin/main has no operator publication
+/// path for an approved price book.
 /// Keep those edges exact: attaching one to serving or reconvergence would
 /// either make the wrong stage appear unblocked or overstate what the restore
 /// drill proves.
@@ -280,15 +282,9 @@ fn durable_inventory_owns_the_secret_catalogue_and_pricing_dependencies() {
             .collect::<BTreeSet<_>>()
     };
 
-    assert_eq!(
-        owners(145),
-        expected(&[
-            "backup-restore/durable-inventory",
-            "secret-rotation/rotation",
-        ])
-    );
-    assert_eq!(owners(146), expected(&["backup-restore/durable-inventory"]));
-    assert_eq!(owners(147), expected(&["backup-restore/durable-inventory"]));
+    assert_eq!(owners(145), expected(&["secret-rotation/rotation"]));
+    assert_eq!(owners(146), BTreeSet::new());
+    assert_eq!(owners(147), expected(&["backup-restore/pricing-history"]));
     assert_eq!(
         owners(158),
         expected(&[

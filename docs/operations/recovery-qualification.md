@@ -63,8 +63,8 @@ never be upgraded by editing the manifest alone.
 | `cold-boot-invalid-cache` | The same boot against a cache that fails its authentication: readiness is refused and the cache's own failure reported. | refuses |
 | `recovery-convergence` | Postgres returns holding revisions the fleet never saw; every replica converges without intervention. | serves |
 | `secret-rotation` | A provider credential is rotated in the secret store and published; replicas pick it up by converging, with no restart or redeployment. | serves |
-| `backup-restore` | The database is lost and restored from a backup: revisions, tenancy, secret metadata, pricing, and audit rows return together. | serves |
-| `point-in-time-recovery` | Recovery to a chosen target rather than to a backup, with the data-loss boundary measured instead of assumed. | serves |
+| `backup-restore` | The database is lost and restored from a backup: revisions, tenancy, secret metadata, the retained catalogue snapshot, and audit rows return together; approved price-book history remains an explicit qualification blocker. | serves |
+| `point-in-time-recovery` | Recovery to a chosen target rather than to a backup, with the revision, secret metadata, catalogue pointer/payload, audit, and data-loss boundaries measured instead of assumed. | serves |
 
 ## The stages, and what runs today
 
@@ -86,7 +86,8 @@ never be upgraded by editing the manifest alone.
 | `secret-rotation/serving` | blocked | Requests authenticated with the rotated material. |
 | `backup-restore/restore` | runs | A deployment published through `axond admin` is dumped, restored into a database no replica ever wrote, and read back by a replica booted on it: same head, same checksum, whole revision chain, whole resource set, a publication against the restored head accepted, and `/readyz` plus inference refuse closed until a serving snapshot exists. |
 | `backup-restore/administration` | runs | The audit trail read back through the authenticated surface of that replica, refused there without a credential, and checked to name a credential's reference rather than any material. |
-| `backup-restore/durable-inventory` | blocked | The wrapped secret material, catalogue snapshots, and price books a restore must bring back beyond the journal and its tenancy. |
+| `backup-restore/durable-inventory` | runs | A throwaway encrypted secret's metadata/lifecycle and the Postgres-backed catalogue active pointer, content identity, and payload survive logical restore. |
+| `backup-restore/pricing-history` | blocked | Approved, effective-dated price-book history survives with its catalogue identity and version. Origin/main has no operator publication path for this resource, so this lane records an explicit no-op rather than manufacturing SQL-only evidence. |
 | `backup-restore/reconvergence` | blocked | Replicas converging onto the restored journal. |
 | `point-in-time-recovery/recovery` | runs | A base backup plus archived WAL recovered to a target taken between two publications: everything before the target is present, the revision after it is absent, and a replica booted on the promoted cluster reads the pre-target head and accepts a publication against it. |
 | `point-in-time-recovery/administration` | runs | The audit trail on the safe side of the target read back through the authenticated surface; the trail of the revision after it is gone with the revision. |
@@ -175,7 +176,7 @@ evidence fails the build instead of uploading nothing.
 
 ## What a run retains
 
-Nine evidence classes, and the committed scenarios have to cover all of them:
+Eleven evidence classes, and the committed scenarios have to cover all of them:
 
 | Class | Holds |
 | --- | --- |
@@ -189,6 +190,7 @@ Nine evidence classes, and the committed scenarios have to cover all of them:
 | `revision_loss_boundary` | Which revisions a recovery kept and which it left behind, which is what `max_data_loss_revisions` counts. |
 | `fail_open_closed` | Which dependency failed open and which failed closed, per scenario. |
 | `audit_auth` | Administrative authentication and audit outcomes across the window. |
+| `pricing_history` | Whether approved, effective-dated price-book history survived with its catalogue identity and version. |
 
 ## What fails, and what is only recorded
 
@@ -239,16 +241,21 @@ booted on the result.
 The restore lane's own boundary is worth stating plainly, because a restore that
 brings back revisions reads as complete: it qualifies the revision journal, its
 checksums, the tenancy and access projections, the credential *references*, and
-the audit rows. Wrapped secret material and its lifecycle, catalogue snapshots,
-and effective-dated price books are the blocked `durable-inventory` stage, and
-usage records are the blocked `usage-boundary` stage.
+the audit rows. Its executable `durable-inventory` stage now also stages and
+activates a throwaway encrypted secret, then checks only its restored metadata,
+lifecycle, owner, and resolvability; it checks the Postgres-backed catalogue's
+active content pointer, retained history row, and non-empty payload. Approved,
+effective-dated price books remain the separate blocked `pricing-history` stage:
+origin/main has no operator/admin publication path for an approved price-book
+resource, so this audit does not claim pricing evidence from direct SQL. Usage
+records are the blocked `usage-boundary` stage.
 
 | Slice | What the harness needs from it |
 | --- | --- |
 | #144 | Durable tenants, projects, principals, RBAC, and audit boundaries — the tenancy and audit state a restore is checked against. |
-| #145 | The `SecretStore` and the zero-redeploy credential lifecycle that `secret-rotation` is the evidence for, and the secret metadata a restore must bring back. |
-| #146 | Imported catalogue snapshots, so a restored revision's blob references point at content that has to survive with it. |
-| #147 | Effective-dated price books, so a restore covers pricing state and not only routing state. |
+| #145 | The `SecretStore` and the zero-redeploy credential lifecycle that `secret-rotation` is the evidence for; the restore lane now exercises the existing secret metadata/lifecycle surface without claiming rotation evidence. |
+| #146 | Retired for recovery qualification: the restore lane exercises the existing Postgres-backed catalogue store and checks its retained active snapshot. The remaining import/source behavior stays on #146. |
+| #147 | Effective-dated price books. This remains a blocker because origin/main has no operator/admin publication path for an approved book; adding one is outside this bounded evidence slice. |
 | #148 | A revision projection a replica can serve — without it, serving behaviour is asserted about an empty snapshot. |
 | #149 | Tenant model enablement and aliases, so requests offered during an outage resolve to a target. |
 | #150 | Dynamically configurable budgets, rate limits, and revocation, so a converged revision changes policy a request can be observed under. |

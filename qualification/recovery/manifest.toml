@@ -382,26 +382,38 @@ evidence = ["audit_auth"]
 
 [[scenario.stage]]
 id = "durable-inventory"
-status = "blocked"
+status = "executable"
+runner = "restore-drill"
 covers = """
 The durable state a restore has to bring back beyond the journal and its \
-tenancy: wrapped secret material and its lifecycle, imported catalogue \
-snapshots, and effective-dated price books. Named per class rather than \
-counted, because a restore that brought back the revisions and lost the \
-material they reference is a restore that reads as complete."""
+tenancy: wrapped secret metadata and lifecycle, and the retained imported \
+catalogue snapshot selected by its active content pointer. Named per class rather \
+than counted, because a restore that brought back revisions and lost the material \
+or catalogue content they reference is a restore that reads as complete."""
 evidence = ["data_loss_boundary"]
 
-[[scenario.stage.blocked_on]]
-issue = 145
-needs = "the staging and rotation path for wrapped material, so a restore can be checked to bring secret metadata and its lifecycle back with the credentials that reference it"
-
-[[scenario.stage.blocked_on]]
-issue = 146
-needs = "an operator path that imports a catalogue snapshot, so a restored revision's blob references point at content that has to survive with it"
+[[scenario.stage]]
+id = "pricing-history"
+status = "blocked"
+covers = """
+Approved, effective-dated price-book history: the exact approved book, its \
+catalogue content identity and version, and the rules a restore must retain \
+alongside the revision journal. This stage remains explicit rather than claiming \
+pricing evidence from a database fixture the operator cannot publish."""
+evidence = ["pricing_history"]
 
 [[scenario.stage.blocked_on]]
 issue = 147
-needs = "effective-dated price books, so the restore covers pricing state and not only routing and tenancy state"
+needs = "origin/main has the pricing domain and request-path consumers, but no existing operator/admin publication path for an approved effective-dated price-book resource; adding one is outside this bounded recovery/evidence slice and must not be faked with direct SQL"
+
+[[retired_blocker]]
+issue = 146
+became = """
+The durable catalogue state is now covered by `backup-restore/durable-inventory`: \
+the restore drill configures the existing Postgres catalogue store with the \
+offline seed and checks its active pointer, retained content id, and non-empty \
+payload after logical restore. The remaining #146 source/import behavior stays \
+tracked on #146 and is not reintroduced as a recovery blocker."""
 
 [[scenario.stage]]
 id = "reconvergence"

@@ -150,6 +150,22 @@ audit event, and then performs both recoveries:
   revisions, asserting the first revision is present, the second is **not**, and
   the usage, budget, and revocation schemas survived.
 
+The logical-restore lane also exercises the durable state introduced by the
+secret and catalogue slices. It stages and activates a throwaway encrypted
+secret through `axond admin`, configures the bundled catalogue seed in the
+Postgres-backed catalogue store, and publishes a catalogue resource pinned to
+its content id. After `pg_restore`, it checks the secret's owner, version,
+lifecycle, and metadata-only resolvability, plus the catalogue's active pointer,
+retained snapshot history, and payload bytes. The drill never writes those rows
+by hand and the evidence checker rejects the generated provider material as
+well as the breakglass credential.
+
+Approved, effective-dated price-book history is intentionally not asserted by
+this procedure yet. The current main branch has the pricing domain and request
+consumers but no operator/admin publication path for an approved price-book
+resource; the recovery manifest records that as an explicit blocked stage rather
+than treating direct SQL fixture data as production evidence.
+
 Both restored databases are accepted by `axond migrate status` or the drill
 fails. The `Restore and PITR drill` CI lane runs it on every change, so the
 procedure on this page cannot rot into something that no longer restores.
