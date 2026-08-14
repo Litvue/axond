@@ -411,9 +411,8 @@ printf '  published %-12s -> %s\n' tenants "$head"
 # A credential is a *reference* to staged material, never the material. Publish
 # the tenant first so the secret store's ownership check has a durable control-
 # plane resource to authorize against before staging or activating the secret.
-printf '%s' "$GW_DRILL_PROVIDER_KEY" >"${workdir}/provider-key"
-secret_stage_output="$(admin secret stage --tenant "$tenant" \
-  --material-file "${workdir}/provider-key" 2>/dev/null || true)"
+secret_stage_output="$(printf '%s' "$GW_DRILL_PROVIDER_KEY" |
+  admin secret stage --tenant "$tenant" --material-file - 2>/dev/null || true)"
 secret_ref="$(printf '%s' "$secret_stage_output" |
   jq -r '.reference // "missing"' 2>/dev/null || printf 'missing')"
 secret_id="${secret_ref%@*}"

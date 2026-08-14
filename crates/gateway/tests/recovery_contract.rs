@@ -660,6 +660,41 @@ fn restore_drill_normalizes_empty_catalogue_reads_before_observing_them() {
             "missing recovery sentinel: {expected}"
         );
     }
+    for observation in [
+        "observe catalogue_preboot_content_id \"$catalog_restore_content_id\"",
+        "observe catalogue_preboot_raw_digest \"$catalog_restore_raw_digest\"",
+        "observe catalogue_preboot_raw_bytes \"$catalog_restore_raw_bytes\" count",
+        "observe catalogue_preboot_payload_bytes \"$catalog_restore_payload_bytes\" count",
+        "observe catalogue_preboot_snapshot_rows \"$catalog_restore_rows\" count",
+        "observe pitr_catalogue_preboot_content_id \"$pitr_catalog_content_id\"",
+        "observe pitr_catalogue_preboot_raw_digest \"$pitr_catalog_raw_digest\"",
+        "observe pitr_catalogue_preboot_raw_bytes \"$pitr_catalog_raw_bytes\" count",
+        "observe pitr_catalogue_preboot_payload_bytes \"$pitr_catalog_payload_bytes\" count",
+        "observe pitr_catalogue_preboot_snapshot_rows \"$pitr_catalog_rows\" count",
+    ] {
+        assert!(
+            source.contains(observation),
+            "normalized recovery value is not observed: {observation}"
+        );
+    }
+}
+
+/// Secret material is piped directly to the CLI, so the redaction contract does
+/// not depend on a temporary provider-key file surviving cleanup or appearing
+/// in an artifact directory.
+#[test]
+fn restore_drill_streams_provider_material_without_a_temp_file() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    assert!(
+        source.contains("secret_stage_output=\"$(printf '%s' \"$GW_DRILL_PROVIDER_KEY\" |")
+            && source.contains("admin secret stage --tenant \"$tenant\" --material-file -"),
+        "provider material must reach secret staging over stdin"
+    );
+    assert!(
+        !source.contains("provider-key"),
+        "the provider material must not be written to a temporary file"
+    );
 }
 
 /// The drill compares the serialized per-version owner, whose spelling is the
