@@ -810,12 +810,27 @@ fn refuse_withdrawing_a_pinned_snapshot(
 /// desired state, so the candidate carries the dependents forward itself.
 fn publish(state: &mut DesiredState, resource: ResourceVersion) -> Result<(), ValidationError> {
     let current = resource.reference;
-    let superseded = state
-        .version_of(current.kind, current.id)
-        .map(|held| held.reference);
+    let superseded = state.version_of(current.kind, current.id).map(|held| {
+        let was_enabled = if current.kind == ResourceKind::ModelEnablement {
+            ModelEnablementBody::read(held)
+                .ok()
+                .is_some_and(|body| body.is_enabled())
+        } else {
+            false
+        };
+        (held.reference, was_enabled)
+    });
     state.supersede(resource)?;
     match superseded {
-        Some(superseded) => restack(state, superseded, current),
+        Some((superseded, was_enabled)) => {
+            let is_disabling = current.kind == ResourceKind::ModelEnablement
+                && was_enabled
+                && state
+                    .get(&current)
+                    .and_then(|resource| ModelEnablementBody::read(resource).ok())
+                    .is_some_and(|body| !body.is_enabled());
+            restack(state, superseded, current, is_disabling)
+        }
         None => Ok(()),
     }
 }
@@ -826,6 +841,7 @@ fn restack(
     state: &mut DesiredState,
     superseded: ResourceRef,
     current: ResourceRef,
+    disabling_enablement: bool,
 ) -> Result<(), ValidationError> {
     let dependents: Vec<ResourceVersion> = state
         .resources()
@@ -839,16 +855,28 @@ fn restack(
             // An alias names its targets in its *body*, so re-pinning it is a
             // retarget rather than an edge rewrite: the edges follow the body.
             let body = ModelAliasBody::read(&dependent)?;
-            let targets = body.targets().iter().map(|target| {
-                if target.enablement == superseded.id && target.version == superseded.version {
-                    AliasTarget::new(target.enablement, current.version)
-                } else {
-                    *target
-                }
-            });
-            body.clone()
-                .retargeted(targets.collect::<Vec<_>>())
-                .version_at(dependent.slug.clone(), version)
+            let targets = body
+                .targets()
+                .iter()
+                .filter_map(|target| {
+                    if target.enablement == superseded.id && target.version == superseded.version {
+                        if disabling_enablement && body.is_enabled() {
+                            None
+                        } else {
+                            Some(AliasTarget::new(target.enablement, current.version))
+                        }
+                    } else {
+                        Some(*target)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let body = body.retargeted(targets);
+            let body = if disabling_enablement && body.is_enabled() && body.targets().is_empty() {
+                body.transitioned(ModelLifecycle::Disabled)
+            } else {
+                body
+            };
+            body.version_at(dependent.slug.clone(), version)
         } else {
             // Everything else pins by edge alone — an enablement's catalogue
             // pin is the version of the row, while the snapshot digest it read
@@ -866,7 +894,11 @@ fn restack(
         };
         let advanced_reference = advanced.reference;
         state.supersede(advanced)?;
-        restack(state, previous, advanced_reference)?;
+        // A dependent carry-forward changes its edge, not its lifecycle. Only
+        // the original enabled -> disabled enablement transition may remove a
+        // target; republication of an already-disabled enablement must preserve
+        // a disabled alias's historical target for rollback/readability.
+        restack(state, previous, advanced_reference, false)?;
     }
     Ok(())
 }

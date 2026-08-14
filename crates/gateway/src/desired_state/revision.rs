@@ -29,7 +29,7 @@ use super::access::Directory;
 use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, SerializerVersion};
 use super::credentials::{CredentialError, Credentials};
 use super::ids::{AuditEventId, MutationId, ResourceId, RevisionId, Slug};
-use super::models::{ModelEnablementBody, ModelError, Models};
+use super::models::{ModelEnablementBody, ModelError, ModelValidationMode, Models};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::policy::{PolicyError, PolicySet};
 use super::pricing::{PriceBooks, PricingError};
@@ -237,6 +237,22 @@ impl DesiredState {
     /// accepted, and #166 re-runs this on what it hydrated, so a constraint lives
     /// in one place instead of being half-expressed in DDL.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        self.validate_with_model_mode(ModelValidationMode::Strict, None)
+    }
+
+    /// Validate a retained revision while preserving the one legacy model shape
+    /// this build intentionally still reads: an enabled alias targeting a
+    /// disabled enablement. This is for hydration and rollback only; authored
+    /// candidates use [`DesiredState::validate`].
+    pub(crate) fn validate_legacy_read(&self) -> Result<(), ValidationError> {
+        self.validate_with_model_mode(ModelValidationMode::LegacyRead, None)
+    }
+
+    fn validate_with_model_mode(
+        &self,
+        model_validation: ModelValidationMode,
+        legacy_aliases: Option<&BTreeSet<ResourceRef>>,
+    ) -> Result<(), ValidationError> {
         if self.resources.is_empty() {
             return Err(ValidationError::Empty);
         }
@@ -368,7 +384,7 @@ impl DesiredState {
         // reaches its own project's enablements and its tenant's defaults — which
         // is only meaningful once tenancy has agreed the project belongs to the
         // tenant (#205).
-        Models::of(self)?;
+        Models::of_with_mode(self, model_validation, legacy_aliases)?;
 
         Ok(())
     }
@@ -455,6 +471,10 @@ impl Canonical for DesiredState {
 pub struct RevisionCandidate {
     pub expected: ExpectedRevision,
     pub state: DesiredState,
+    /// Candidate alias references that have been proven to be unchanged legacy
+    /// aliases or restack-only carry-forwards. This is bounded validation
+    /// context, not a second complete desired-state snapshot.
+    pub legacy_aliases: BTreeSet<ResourceRef>,
     pub mutation: Mutation,
     pub audit: AuditEvent,
 }
@@ -471,6 +491,32 @@ impl RevisionCandidate {
     /// the same reason a dangling resource reference is, and before #165 stores it
     /// as a foreign key.
     pub fn validated_checksum(&self) -> Result<Checksum, ValidationError> {
+        self.validated_checksum_with(ModelValidationMode::Strict, None)
+    }
+
+    /// Validate a rollback candidate against the retained-revision compatibility
+    /// rules. A rollback republishes an existing immutable state; it is not a
+    /// newly authored model/alias candidate.
+    pub(crate) fn validated_checksum_legacy_read(&self) -> Result<Checksum, ValidationError> {
+        self.validated_checksum_with(ModelValidationMode::LegacyRead, None)
+    }
+
+    /// Validate using the mutation's publication compatibility rule. Rollback
+    /// republishes retained history; other mutations may carry unchanged legacy
+    /// aliases from their base while requiring all authored changes to be strict.
+    pub(crate) fn validated_checksum_for_publication(&self) -> Result<Checksum, ValidationError> {
+        if self.mutation.kind == super::mutation::MutationKind::Rollback {
+            self.validated_checksum_legacy_read()
+        } else {
+            self.validated_checksum_with(ModelValidationMode::Strict, Some(&self.legacy_aliases))
+        }
+    }
+
+    fn validated_checksum_with(
+        &self,
+        model_validation: ModelValidationMode,
+        legacy_aliases: Option<&BTreeSet<ResourceRef>>,
+    ) -> Result<Checksum, ValidationError> {
         if self.audit.mutation != self.mutation.id {
             return Err(ValidationError::AuditMutationMismatch {
                 audit: self.audit.id,
@@ -478,7 +524,8 @@ impl RevisionCandidate {
                 mutation: self.mutation.id,
             });
         }
-        self.state.validate()?;
+        self.state
+            .validate_with_model_mode(model_validation, legacy_aliases)?;
         Ok(self.state.checksum()?)
     }
 }
@@ -538,7 +585,7 @@ impl RevisionManifest {
         created_at: SystemTime,
         candidate: &RevisionCandidate,
     ) -> Result<Self, ValidationError> {
-        let checksum = candidate.validated_checksum()?;
+        let checksum = candidate.validated_checksum_for_publication()?;
         let mut entries = candidate
             .state
             .resources()
@@ -795,7 +842,9 @@ impl LoadedRevision {
                 current,
             });
         }
-        state.validate().map_err(IntegrityError::classify)?;
+        state
+            .validate_legacy_read()
+            .map_err(IntegrityError::classify)?;
 
         for entry in &manifest.entries {
             let Some(resource) = state.get(&entry.reference) else {
@@ -886,9 +935,14 @@ impl LoadedRevision {
 mod tests {
     use super::super::fixtures::{
         DESIRED_STATE_RESOURCES, alias, blob_backed_catalog, catalog_payload, credential, project,
-        reference, resource_id, revision_id, state, tenant, tenant_body, tenant_id,
+        reference, resource_id, revision_id, state, state_with_models, tenant, tenant_body,
+        tenant_id,
     };
     use super::super::ids::Uuid7;
+    use super::super::models::{
+        AliasTarget, ModelAliasBody, ModelEnablementBody, ModelLifecycle, legacy_alias_allowlist,
+    };
+    use super::super::mutation::MutationKind;
     use super::super::resource::{
         BlobKind, ResourceBody, ResourceKind, ResourceVersion, ResourceVersionNumber,
     };
@@ -1354,6 +1408,393 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rebuilt, manifest);
+    }
+
+    #[test]
+    fn a_legacy_enabled_alias_targeting_a_disabled_enablement_hydrates() {
+        let mut state = state_with_models();
+        let target = state
+            .version_of(ResourceKind::ModelEnablement, resource_id(31))
+            .cloned()
+            .expect("the project enablement");
+        let disabled = ModelEnablementBody::read(&target)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled)
+            .version_at(
+                target.slug.clone(),
+                target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        state
+            .supersede(disabled.clone())
+            .expect("disable the target");
+
+        let alias = state
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the project alias");
+        let legacy_alias = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([AliasTarget::new(
+                disabled.reference.id,
+                disabled.reference.version,
+            )])
+            .version_at(alias.slug.clone(), alias.reference.version.next());
+        state
+            .supersede(legacy_alias)
+            .expect("write the historical alias shape");
+
+        assert!(
+            state.validate().is_err(),
+            "new candidates reject the legacy enabled-alias/disabled-target shape"
+        );
+        assert!(
+            candidate(state.clone()).validated_checksum().is_err(),
+            "ordinary publication remains strict"
+        );
+        assert!(
+            candidate(state.clone())
+                .validated_checksum_legacy_read()
+                .is_ok(),
+            "rollback may republish the retained legacy state"
+        );
+        let mut rollback = candidate(state.clone());
+        rollback.mutation.kind = MutationKind::Rollback;
+        rollback.audit.kind = MutationKind::Rollback;
+        RevisionManifest::of(revision_id(43), None, SystemTime::UNIX_EPOCH, &rollback)
+            .expect("store-side manifest validation permits rollback history");
+
+        // A published old revision already has its own checksum and manifest;
+        // assemble that stored representation directly so this test exercises
+        // hydration rather than the strict publication constructor.
+        let candidate = candidate(state.clone());
+        let mut entries = state
+            .resources()
+            .map(ManifestEntry::of)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("manifest entries");
+        entries.sort_by_key(|entry| entry.reference);
+        let mut blobs: Vec<_> = state.blobs().copied().collect();
+        blobs.sort_by_key(|blob| blob.digest);
+        let manifest = RevisionManifest {
+            id: revision_id(42),
+            parent: None,
+            created_at: SystemTime::UNIX_EPOCH,
+            serializer: SerializerVersion::default(),
+            mutation: candidate.mutation.id,
+            entries,
+            blobs,
+            checksum: state.checksum().expect("state checksum"),
+        };
+        let loaded = LoadedRevision::assemble(manifest, state.clone())
+            .expect("legacy published revisions remain readable");
+        assert_eq!(loaded.state(), &state);
+        let resolved = Models::of(loaded.state()).expect("legacy model read");
+        assert_eq!(resolved.aliases().count(), 1);
+        assert_eq!(resolved.enablements().count(), 2);
+    }
+
+    #[test]
+    fn a_one_alias_repair_can_carry_untouched_legacy_aliases_forward() {
+        let mut base = state_with_models();
+        let target = base
+            .version_of(ResourceKind::ModelEnablement, resource_id(31))
+            .cloned()
+            .expect("the project enablement");
+        let disabled = ModelEnablementBody::read(&target)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled)
+            .version_at(
+                target.slug.clone(),
+                target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        base.supersede(disabled.clone())
+            .expect("disable the target");
+
+        let first = base
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the first alias");
+        let legacy_targets = [AliasTarget::new(
+            disabled.reference.id,
+            disabled.reference.version,
+        )];
+        let first_legacy = ModelAliasBody::read(&first)
+            .expect("an alias body")
+            .retargeted(legacy_targets);
+        base.supersede(first_legacy.version_at(first.slug.clone(), first.reference.version.next()))
+            .expect("write the first legacy alias");
+
+        let second_legacy = ModelAliasBody::new(
+            resource_id(33),
+            tenant_id(1),
+            super::super::fixtures::project_id(2),
+            super::super::models::WireFamily::OpenaiChat,
+            legacy_targets,
+        )
+        .version(Slug::parse("slow").expect("alias slug"));
+        base.insert(second_legacy)
+            .expect("write the second legacy alias");
+        assert!(
+            base.validate().is_err(),
+            "the stored shape is legacy-invalid"
+        );
+
+        let mut repaired = base.clone();
+        let first = repaired
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the first alias");
+        let repaired_body = ModelAliasBody::read(&first)
+            .expect("an alias body")
+            .transitioned(ModelLifecycle::Disabled)
+            .retargeted([]);
+        repaired
+            .supersede(repaired_body.version_at(first.slug, first.reference.version.next()))
+            .expect("repair one alias");
+
+        let mut repaired_candidate = candidate(repaired);
+        repaired_candidate.legacy_aliases =
+            legacy_alias_allowlist(&base, &repaired_candidate.state);
+        repaired_candidate
+            .validated_checksum_for_publication()
+            .expect("one-resource repair may carry the untouched legacy alias");
+
+        let mut authored = base.clone();
+        let second = authored
+            .version_of(ResourceKind::Alias, resource_id(33))
+            .cloned()
+            .expect("the second alias");
+        let authored_body = ModelAliasBody::read(&second).expect("an alias body");
+        authored
+            .supersede(authored_body.version_at(second.slug, second.reference.version.next()))
+            .expect("author a new alias version");
+        let mut authored_candidate = candidate(authored);
+        authored_candidate.legacy_aliases =
+            legacy_alias_allowlist(&base, &authored_candidate.state);
+        assert!(
+            authored_candidate
+                .validated_checksum_for_publication()
+                .is_err(),
+            "a newly authored offending alias remains refused"
+        );
+    }
+
+    #[test]
+    fn a_restacked_legacy_alias_may_follow_its_enablement_version() {
+        let mut base = state_with_models();
+        let target = base
+            .version_of(ResourceKind::ModelEnablement, resource_id(31))
+            .cloned()
+            .expect("the project enablement");
+        let disabled = ModelEnablementBody::read(&target)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled)
+            .version_at(
+                target.slug.clone(),
+                target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        base.supersede(disabled.clone())
+            .expect("disable the target");
+        let alias = base
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the project alias");
+        let legacy_alias = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([AliasTarget::new(
+                disabled.reference.id,
+                disabled.reference.version,
+            )]);
+        base.supersede(legacy_alias.version_at(alias.slug.clone(), alias.reference.version.next()))
+            .expect("write the legacy alias");
+
+        let mut restacked = base.clone();
+        let disabled = restacked
+            .version_of(ResourceKind::ModelEnablement, resource_id(31))
+            .cloned()
+            .expect("the disabled enablement");
+        let disabled_next = ModelEnablementBody::read(&disabled)
+            .expect("an enablement body")
+            .version_at(
+                disabled.slug.clone(),
+                disabled.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        restacked
+            .supersede(disabled_next.clone())
+            .expect("advance the disabled enablement");
+        let alias = restacked
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the legacy alias");
+        let restacked_alias = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([AliasTarget::new(
+                disabled_next.reference.id,
+                disabled_next.reference.version,
+            )])
+            .version_at(alias.slug.clone(), alias.reference.version.next());
+        restacked
+            .supersede(restacked_alias)
+            .expect("restack the dependent alias");
+
+        let allowed = legacy_alias_allowlist(&base, &restacked);
+        let restacked_reference = restacked
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .expect("the restacked alias")
+            .reference;
+        assert!(allowed.contains(&restacked_reference));
+        let mut restacked_candidate = candidate(restacked);
+        restacked_candidate.legacy_aliases = allowed;
+        restacked_candidate
+            .validated_checksum_for_publication()
+            .expect("a restack-only target/version carry-forward remains allowed");
+
+        let mut authored = base.clone();
+        let target = authored
+            .version_of(ResourceKind::ModelEnablement, resource_id(31))
+            .cloned()
+            .expect("the disabled enablement");
+        let target_next = ModelEnablementBody::read(&target)
+            .expect("an enablement body")
+            .version_at(
+                target.slug.clone(),
+                target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        authored
+            .supersede(target_next.clone())
+            .expect("advance the disabled enablement");
+        let alias = authored
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the legacy alias");
+        let base_default = base
+            .version_of(ResourceKind::ModelEnablement, resource_id(30))
+            .expect("the tenant default");
+        let authored_alias = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([
+                AliasTarget::new(base_default.reference.id, base_default.reference.version),
+                AliasTarget::new(target_next.reference.id, target_next.reference.version),
+            ])
+            .version_at(alias.slug, alias.reference.version.next());
+        authored
+            .supersede(authored_alias)
+            .expect("author a changed alias");
+        let mut authored_candidate = candidate(authored.clone());
+        authored_candidate.legacy_aliases = legacy_alias_allowlist(&base, &authored);
+        assert!(
+            !authored_candidate
+                .legacy_aliases
+                .iter()
+                .any(|reference| reference.kind == ResourceKind::Alias),
+            "an authored target reorder is not a restack carry-forward"
+        );
+        assert!(
+            authored_candidate
+                .validated_checksum_for_publication()
+                .is_err(),
+            "an authored change to the offending alias remains refused"
+        );
+    }
+
+    #[test]
+    fn a_legacy_alias_with_another_disabled_target_explains_the_required_repair() {
+        let mut base = state_with_models();
+        let legacy_target = base
+            .version_of(ResourceKind::ModelEnablement, resource_id(31))
+            .cloned()
+            .expect("the project enablement");
+        let legacy_disabled = ModelEnablementBody::read(&legacy_target)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled)
+            .version_at(
+                legacy_target.slug.clone(),
+                legacy_target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        base.supersede(legacy_disabled.clone())
+            .expect("write the pre-existing disabled target");
+
+        let alias = base
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the project alias");
+        let default_target = base
+            .version_of(ResourceKind::ModelEnablement, resource_id(30))
+            .cloned()
+            .expect("the tenant default");
+        let legacy_alias = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([
+                AliasTarget::new(
+                    legacy_disabled.reference.id,
+                    legacy_disabled.reference.version,
+                ),
+                AliasTarget::new(
+                    default_target.reference.id,
+                    default_target.reference.version,
+                ),
+            ])
+            .version_at(alias.slug.clone(), alias.reference.version.next());
+        base.supersede(legacy_alias)
+            .expect("write the pre-existing legacy alias");
+
+        let mut candidate_state = base.clone();
+        let default_target = candidate_state
+            .version_of(ResourceKind::ModelEnablement, resource_id(30))
+            .cloned()
+            .expect("the enabled target being disabled");
+        let disabled_default = ModelEnablementBody::read(&default_target)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled)
+            .version_at(
+                default_target.slug.clone(),
+                default_target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        candidate_state
+            .supersede(disabled_default)
+            .expect("disable the requested target");
+        let alias = candidate_state
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the legacy alias");
+        let restacked_alias = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([AliasTarget::new(
+                legacy_disabled.reference.id,
+                legacy_disabled.reference.version,
+            )])
+            .version_at(alias.slug, alias.reference.version.next());
+        candidate_state
+            .supersede(restacked_alias)
+            .expect("restack the alias after removing one target");
+
+        let mut candidate = candidate(candidate_state.clone());
+        candidate.legacy_aliases = legacy_alias_allowlist(&base, &candidate_state);
+        assert!(
+            candidate.legacy_aliases.is_empty(),
+            "a changed target count cannot be treated as a carry-forward"
+        );
+        let error = candidate
+            .validated_checksum_for_publication()
+            .expect_err("the remaining disabled target must keep this unsafe change refused");
+        assert!(
+            error
+                .to_string()
+                .contains("repair or retire this alias before publishing"),
+            "the refusal should tell the operator how to unblock the requested change: {error}"
+        );
+        assert!(matches!(
+            error,
+            ValidationError::Model(ref model)
+                if matches!(**model, super::super::models::ModelError::DisabledTarget { .. })
+        ));
     }
 
     #[test]

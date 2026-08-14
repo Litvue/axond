@@ -377,6 +377,18 @@ readiness, catalogue version kept apart from availability, replica-local health
 overlaid rather than stored, and evidence persisted without the probe's own words
 or any dimension a revision states.
 
+**Trigger 4 answer for PR #344.** This change fires the trigger because it
+changes durable model-alias publication rules. The security property is that a
+newly authored enabled alias cannot advertise a disabled enablement, while a
+legacy published alias with that shape remains readable for history and
+rollback. Regression coverage proves both sides, including legacy hydration,
+strict candidate refusal, enabled-to-disabled restack, and the already-disabled
+republish case. ADR 0042 is amended. Release impact is deliberately asymmetric:
+no retained revision becomes unreadable, but new candidates are stricter and
+must repair the legacy shape before publication. The journal and revision
+convergence runbooks record this compatibility stance and the complete revision
+diff remains the resource-level retirement record.
+
 **Release impact.** Availability contracts are inert on their own: nothing
 constructs an index, `/v1/models` and readiness are unchanged, and no request
 reads a verdict, so a release carrying only the contracts changes no observable

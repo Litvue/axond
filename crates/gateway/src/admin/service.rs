@@ -70,6 +70,7 @@ use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::secrets::SecretStore;
 use crate::config::Mode;
 use crate::convergence::RevisionReport;
+use crate::desired_state::models::legacy_alias_allowlist;
 use crate::desired_state::{
     AccessDenial, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
     LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
@@ -677,6 +678,8 @@ impl AdminService {
             return Err(error);
         }
 
+        let legacy_aliases = legacy_alias_allowlist(current_state, &candidate_state);
+
         // 5 and 6. Validate the whole candidate, then diff two complete states.
         let mutation = MutationId::new(self.ids.next());
         let submitted_at = SystemTime::now();
@@ -684,6 +687,7 @@ impl AdminService {
         let candidate = RevisionCandidate {
             expected,
             state: candidate_state,
+            legacy_aliases,
             mutation: Mutation {
                 id: mutation,
                 actor: identity.actor(),
@@ -709,7 +713,7 @@ impl AdminService {
         // on, which is "re-read and retry", so staleness outranks invalidity
         // here. A lost-response retry is unaffected: its candidate was valid
         // when it was first built, and is rebuilt from the same base.
-        let checksum = match candidate.validated_checksum() {
+        let checksum = match candidate.validated_checksum_for_publication() {
             Ok(checksum) => checksum,
             Err(error) if !expected.matches(head) => {
                 debug!(

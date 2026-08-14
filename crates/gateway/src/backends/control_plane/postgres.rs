@@ -883,7 +883,7 @@ impl ControlPlaneStore for PostgresControlPlane {
         // Validation is domain work, and it happens before the store commits to
         // anything: a rejected candidate leaves no transaction, no row, and no
         // audit event.
-        let checksum = candidate.validated_checksum()?;
+        let checksum = candidate.validated_checksum_for_publication()?;
         let caller_scope = rows::caller_scope(&candidate.mutation.actor)
             .map_err(|error| ControlPlaneError::Invalid(error.into()))?;
         let retention = self.settings.idempotency_retention;
