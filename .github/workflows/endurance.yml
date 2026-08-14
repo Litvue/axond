@@ -10,6 +10,12 @@ name: Endurance
 # upstream socket outliving its caller, exactly one usage record per dispatched
 # request, and resident memory that does not trend upwards. Throughput and
 # latency are recorded and never asserted.
+#
+# The second job is the stateful tier of the same question (issue #221): the
+# mixed workload offered to a fleet of replicas backed by a real database while
+# the catalogue, the credential pool, tenant policy, the provider, the database,
+# and the processes themselves all change underneath it. Both jobs take the
+# dispatched duration, and both run every scheduled month.
 on:
   workflow_dispatch:
     inputs:
@@ -81,4 +87,55 @@ jobs:
           path: |
             target/endurance/**/*.json
             target/endurance/**/*.samples.jsonl
+          if-no-files-found: error
+
+  stateful-endurance:
+    name: Stateful mixed-workload endurance
+    runs-on: ubuntu-latest
+    # The same six-hour ceiling, and the same answer: the dispatched default
+    # offers five hours, and the manifest's twelve-hour tier is run off CI on a
+    # host without the limit (`just stateful-endurance`).
+    timeout-minutes: 350
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_PASSWORD: axond-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
+      # The stateful soak by name, for the reason the stateless job gives: the
+      # smoke tier and the deterministic checks share this binary and run in
+      # `CI`, and offering their load again here would only contend with the
+      # dispatched hours.
+      - name: Soak the mixed stateful workload
+        run: |
+          cargo test --locked --all-features --test stateful_endurance -- \
+            the_stateful_endurance_soak_tier_qualifies_and_publishes_its_evidence \
+            --exact --nocapture --test-threads=1
+        env:
+          AXOND_STATEFUL_ENDURANCE: '1'
+          AXOND_STATEFUL_ENDURANCE_DURATION_MS: ${{ inputs.duration_ms || '18000000' }}
+          AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
+          AXOND_TEST_REQUIRE_SERVICES: '1'
+      - name: Publish the result artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stateful-endurance-results
+          path: |
+            target/stateful-endurance/**/*.json
+            target/stateful-endurance/**/*.samples.jsonl
           if-no-files-found: error

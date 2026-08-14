@@ -226,6 +226,14 @@ capacity:
 endurance duration_ms="":
     AXOND_ENDURANCE=1 AXOND_ENDURANCE_DURATION_MS={{ duration_ms }} cargo test --locked --all-features --test endurance -- the_endurance_soak_tier_qualifies_and_publishes_its_evidence --exact --nocapture --test-threads=1
 
+# The twelve-hour stateful endurance soak (issue #221), writing its result and
+# time series to target/stateful-endurance/soak. Needs AXOND_TEST_POSTGRES_DSN:
+# the durable usage sink, the revisions, and the database outage are the point,
+# and a run without a database is not a shorter one. The smoke tier of the same
+# driver runs in `just test` wherever that DSN is set.
+stateful-endurance duration_ms="":
+    AXOND_STATEFUL_ENDURANCE=1 AXOND_STATEFUL_ENDURANCE_DURATION_MS={{ duration_ms }} cargo test --locked --all-features --test stateful_endurance -- the_stateful_endurance_soak_tier_qualifies_and_publishes_its_evidence --exact --nocapture --test-threads=1
+
 # The heavy rollout scenarios, writing result artifacts to target/rollout/heavy.
 # The reduced tier of the same driver runs in `just test` (ADR 0038).
 # Set AXOND_TEST_POSTGRES_DSN to also evaluate the forward-only rollback fence;

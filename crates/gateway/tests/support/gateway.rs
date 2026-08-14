@@ -5,7 +5,7 @@
 //! router assembled in-process, so a regression in boot or wiring fails here
 //! too.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::upstream::target;
 
@@ -91,6 +91,67 @@ const BOOT_ATTEMPTS: u32 = 4;
 /// run would make the harness the leak it is looking for.
 const RETAINED_LINES: usize = 4096;
 
+/// Normalise one of the process's dropped-accounting reports, whichever of the
+/// four it wrote, into a single report carrying how many records *this* report
+/// lost.
+///
+/// The reports are told apart from the rest of the log by carrying both a
+/// `sink` and a drop `reason`; matching on those rather than on the message
+/// text keeps a rephrased log line from silently turning reported backpressure
+/// into an unexplained missing row.
+///
+/// `records` is a rejected batch and `abandoned` an abandoned buffer: both are
+/// what that report lost. `dropped` is the sink's *running total* — the same
+/// counter the batch and buffer reports add to — so what it adds is whatever it
+/// has over the reports already attributed to that sink, which `attributed`
+/// carries between calls.
+///
+/// The one report that is not a loss of its own is the shutdown flush's: a
+/// rejected flush is the batch failure the sink has already reported, restated
+/// with the same count, so counting it again would let the run excuse a row it
+/// never actually lost twice over.
+pub fn normalise_drop_report(
+    fields: &Value,
+    attributed: &mut BTreeMap<String, u64>,
+) -> Option<Value> {
+    let (sink, reason) = (
+        fields.get("sink").and_then(Value::as_str)?,
+        fields.get("reason").and_then(Value::as_str)?,
+    );
+    let message = fields
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if message.contains("rejected its buffered records on shutdown") {
+        return None;
+    }
+    let counted = attributed.entry(sink.to_owned()).or_default();
+    let records = match (
+        fields.get("records").and_then(Value::as_u64),
+        fields.get("abandoned").and_then(Value::as_u64),
+        fields.get("dropped").and_then(Value::as_u64),
+    ) {
+        (Some(records), _, _) | (_, Some(records), _) => {
+            *counted += records;
+            records
+        }
+        (_, _, Some(total)) => {
+            let increment = total.saturating_sub(*counted);
+            *counted = (*counted).max(total);
+            increment
+        }
+        _ => return None,
+    };
+    (records > 0).then(|| {
+        json!({
+            "sink": sink,
+            "reason": reason,
+            "records": records,
+            "message": fields.get("message").cloned().unwrap_or(Value::Null),
+        })
+    })
+}
+
 /// What the process has said, kept so a failing test can print it and a
 /// harness can read what each request was charged.
 #[derive(Default)]
@@ -107,20 +168,43 @@ struct Output {
     /// asserts over all of them — and drained by the endurance harness, which
     /// reconciles each batch as it lands.
     usage: Vec<Value>,
+    /// The process's own reports of usage records it dropped, kept apart from
+    /// the bounded scrollback. A harness reconciling durable rows against
+    /// emitted records needs every one of these to say *why* a row is missing,
+    /// and losing one to the line bound would turn documented backpressure into
+    /// an unexplained loss.
+    ///
+    /// Every report is normalised to an increment in `records`, whatever the
+    /// field the process wrote it as.
+    usage_drops: Vec<Value>,
+    /// How many dropped records have been attributed to each sink so far. The
+    /// buffer-full report carries the sink's running total rather than what
+    /// this report lost, and that total also counts the batches and buffers
+    /// reported separately, so an increment is the total minus what has
+    /// already been counted.
+    attributed: BTreeMap<String, u64>,
 }
 
 impl Output {
     fn ingest(&mut self, line: String) {
-        if let Ok(value) = serde_json::from_str::<Value>(&line)
-            && value.get("schema_version").is_some()
-        {
-            self.usage.push(value);
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            if value.get("schema_version").is_some() {
+                self.usage.push(value);
+            } else if let Some(fields) = value.get("fields") {
+                self.ingest_drop(fields);
+            }
         }
         if self.lines.len() == RETAINED_LINES {
             self.lines.pop_front();
             self.dropped += 1;
         }
         self.lines.push_back(line);
+    }
+
+    fn ingest_drop(&mut self, fields: &Value) {
+        if let Some(report) = normalise_drop_report(fields, &mut self.attributed) {
+            self.usage_drops.push(report);
+        }
     }
 
     fn rendered(&self) -> String {
@@ -175,6 +259,9 @@ pub struct Axond {
     /// exactly what it qualified.
     pub config: String,
     child: Child,
+    /// The file the process reads its config from, kept so a suite can publish
+    /// a new revision to the running replica.
+    config_path: PathBuf,
     /// This boot's own config directory, removed with the process that read it.
     config_dir: PathBuf,
     output: Arc<Mutex<Output>>,
@@ -329,6 +416,7 @@ impl Axond {
             boot_key,
             config,
             child,
+            config_path: path,
             config_dir: dir,
             output,
             readers,
@@ -417,6 +505,29 @@ impl Axond {
         format!("{}{path}", self.base_url)
     }
 
+    /// The address this process is bound to, for a caller rendering the next
+    /// revision of the config it is already serving.
+    pub fn bind(&self) -> &str {
+        self.base_url
+            .strip_prefix("http://")
+            .expect("a loopback base URL")
+    }
+
+    /// Publish a new revision of the config to the running process and signal
+    /// it to load it (ADR 0011). Reject-and-keep, so a refused revision leaves
+    /// the process serving the one it had — which is a property a suite may be
+    /// asking about.
+    pub fn publish(&mut self, config: &str) {
+        std::fs::write(&self.config_path, config).expect("the revision is written");
+        self.config = config.to_owned();
+        let status = Command::new("kill")
+            .arg("-HUP")
+            .arg(self.pid().to_string())
+            .status()
+            .expect("kill(1) runs");
+        assert!(status.success(), "SIGHUP was delivered");
+    }
+
     /// What the process has written to stdout/stderr, for failure output and
     /// for assertions over the raw text: its most recent lines.
     pub fn output(&self) -> String {
@@ -456,6 +567,13 @@ impl Axond {
     /// than holding every record until the end.
     pub fn drain_usage_records(&self) -> Vec<Value> {
         std::mem::take(&mut self.output.lock().expect("output lock").usage)
+    }
+
+    /// Take the process's reports of dropped usage batches since the last
+    /// drain: one entry per report, carrying the sink, the reason, and how many
+    /// records went with it.
+    pub fn drain_usage_drops(&self) -> Vec<Value> {
+        std::mem::take(&mut self.output.lock().expect("output lock").usage_drops)
     }
 
     /// Wait until at least `count` usage records have been written. Settlement

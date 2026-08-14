@@ -83,6 +83,9 @@ and operate it.
 - [Endurance qualification](./operations/endurance.md) — the twelve-hour mixed
   workload, what a long run leaves behind, and the leak and accounting
   properties it gates on.
+- [Stateful endurance qualification](./operations/stateful-endurance.md) — the
+  same mixed workload offered to a fleet with a durable usage sink while its
+  catalogue, credentials, policy, provider, database, and processes change.
 - [Rollout qualification](./operations/rollout.md) — the rolling upgrade executed
   against a real fleet: drain, readiness removal, replacement, mixed-version
   windows, rollback limits, and the evidence a run leaves behind.
