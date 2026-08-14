@@ -69,10 +69,8 @@ use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::secrets::SecretStore;
 use crate::config::Mode;
-<<<<<<< HEAD
 use crate::convergence::{ChangeSignal, RevisionReport};
 use crate::desired_state::models::legacy_alias_allowlist;
->>>>>>> 5116c504 (Complete stateful serving convergence assurance)
 use crate::desired_state::{
     AccessDenial, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
     LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
