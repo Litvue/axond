@@ -292,6 +292,29 @@ fn durable_inventory_owns_the_secret_catalogue_and_pricing_dependencies() {
             "cold-boot-invalid-cache/readiness",
         ])
     );
+    let backup_inventory = manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == "backup-restore")
+        .and_then(|scenario| {
+            scenario
+                .stages
+                .iter()
+                .find(|stage| stage.id == "durable-inventory")
+        })
+        .expect("backup restore owns durable inventory evidence");
+    assert_eq!(backup_inventory.evidence, vec![Evidence::DurableInventory]);
+    let pitr_recovery = manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == "point-in-time-recovery")
+        .and_then(|scenario| scenario.stages.iter().find(|stage| stage.id == "recovery"))
+        .expect("PITR recovery owns durable inventory evidence");
+    assert!(pitr_recovery.evidence.contains(&Evidence::DurableInventory));
+    assert!(
+        !pitr_recovery.evidence.contains(&Evidence::DataLossBoundary),
+        "PITR durable inventory must not steal data_loss_boundary from usage-boundary"
+    );
 }
 
 /// A slice may leave the dependency map, but only by saying what became of it.
@@ -610,6 +633,59 @@ fn restore_drill_uses_the_catalog_request_raw_digest_spelling() {
     assert!(
         !drill.contains("\"digest\":\"${catalog_content_id}\""),
         "content_id is a pointer assertion, not the catalogue resource raw digest"
+    );
+}
+
+/// Missing catalogue rows must become typed sentinels before the recorder sees
+/// them, so a failed restore closes an evidence artifact instead of aborting on
+/// `int("")` under the drill's `set -e` shell.
+#[test]
+fn restore_drill_normalizes_empty_catalogue_reads_before_observing_them() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    for expected in [
+        "catalog_restore_content_id=\"${catalog_restore_content_id:-missing}\"",
+        "catalog_restore_raw_digest=\"${catalog_restore_raw_digest:-missing}\"",
+        "catalog_restore_raw_bytes=\"${catalog_restore_raw_bytes:-0}\"",
+        "catalog_restore_payload_bytes=\"${catalog_restore_payload_bytes:-0}\"",
+        "catalog_restore_rows=\"${catalog_restore_rows:-0}\"",
+        "pitr_catalog_content_id=\"${pitr_catalog_content_id:-missing}\"",
+        "pitr_catalog_raw_digest=\"${pitr_catalog_raw_digest:-missing}\"",
+        "pitr_catalog_raw_bytes=\"${pitr_catalog_raw_bytes:-0}\"",
+        "pitr_catalog_payload_bytes=\"${pitr_catalog_payload_bytes:-0}\"",
+        "pitr_catalog_rows=\"${pitr_catalog_rows:-0}\"",
+    ] {
+        assert!(
+            source.contains(expected),
+            "missing recovery sentinel: {expected}"
+        );
+    }
+}
+
+/// The drill compares the serialized per-version owner, whose spelling is the
+/// `SecretOwner` display contract, rather than assuming an undocumented JSON
+/// shape or a project decoration.
+#[test]
+fn restore_drill_uses_the_serialized_secret_version_owner_contract() {
+    let root = recovery::workspace_root();
+    let drill = std::fs::read_to_string(root.join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let admin_secrets = std::fs::read_to_string(root.join("crates/gateway/src/admin/secrets.rs"))
+        .expect("the admin secret view is readable");
+    let owners = std::fs::read_to_string(root.join("crates/gateway/src/desired_state/secrets.rs"))
+        .expect("the secret owner type is readable");
+    assert!(
+        admin_secrets.contains("owner: descriptor.owner.to_string()"),
+        "SecretVersionView must serialize its typed owner through Display"
+    );
+    assert!(
+        owners.contains("None => write!(f, \"{}\", self.tenant)"),
+        "a tenant-scoped SecretOwner must serialize as its tenant id"
+    );
+    assert!(
+        drill.contains("jq -r '.versions[0].owner // \"missing\"'")
+            && drill.contains("the serialized secret-version owner remains the drill tenant"),
+        "the drill must assert the stable serialized per-version owner"
     );
 }
 

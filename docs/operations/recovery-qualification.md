@@ -8,8 +8,8 @@ behaviour being qualified is
 [revision convergence](./revision-convergence.md#during-a-control-plane-outage)
 and the [control-plane journal](./control-plane-journal.md#during-a-postgres-outage).
 
-This page is a **contract, and a partial report.** Nine stages run today against
-a real PostgreSQL — five in-process against a severable journal, four against a
+This page is a **contract, and a partial report.** Ten stages run today against
+a real PostgreSQL — five in-process against a severable journal, five against a
 backed-up and point-in-time-recovered database driven through `axond admin` —
 and each writes evidence to `target/recovery/`; the rest are declared and
 blocked — see [the stages](#the-stages-and-what-runs-today) and
@@ -86,10 +86,10 @@ never be upgraded by editing the manifest alone.
 | `secret-rotation/serving` | blocked | Requests authenticated with the rotated material. |
 | `backup-restore/restore` | runs | A deployment published through `axond admin` is dumped, restored into a database no replica ever wrote, and read back by a replica booted on it: same head, same checksum, whole revision chain, whole resource set, a publication against the restored head accepted, and `/readyz` plus inference refuse closed until a serving snapshot exists. |
 | `backup-restore/administration` | runs | The audit trail read back through the authenticated surface of that replica, refused there without a credential, and checked to name a credential's reference rather than any material. |
-| `backup-restore/durable-inventory` | runs | A throwaway encrypted secret's metadata/lifecycle and the Postgres-backed catalogue active pointer, content identity, and payload survive logical restore. |
+| `backup-restore/durable-inventory` | runs | A throwaway encrypted secret's serialized owner, metadata/lifecycle, and the Postgres-backed catalogue active pointer, content identity, raw bytes, payload, and history survive logical restore. |
 | `backup-restore/pricing-history` | blocked | Approved, effective-dated price-book history survives with its catalogue identity and version. Origin/main has no operator publication path for this resource, so this lane records an explicit no-op rather than manufacturing SQL-only evidence. |
 | `backup-restore/reconvergence` | blocked | Replicas converging onto the restored journal. |
-| `point-in-time-recovery/recovery` | runs | A base backup plus archived WAL recovered to a target taken between two publications: everything before the target is present, the revision after it is absent, and a replica booted on the promoted cluster reads the pre-target head and accepts a publication against it. |
+| `point-in-time-recovery/recovery` | runs | A base backup plus archived WAL recovered to a target taken between two publications: everything before the target is present, the revision after it is absent, the pre-target secret owner/lifecycle and catalogue pointer/raw payload survive, and a replica booted on the promoted cluster reads the pre-target head and accepts a publication against it. |
 | `point-in-time-recovery/administration` | runs | The audit trail on the safe side of the target read back through the authenticated surface; the trail of the revision after it is gone with the revision. |
 | `point-in-time-recovery/usage-boundary` | blocked | The same boundary measured over usage records. |
 | `point-in-time-recovery/reconvergence` | blocked | Serving across the recovery and converging onto the recovered head. |
@@ -176,7 +176,7 @@ evidence fails the build instead of uploading nothing.
 
 ## What a run retains
 
-Eleven evidence classes, and the committed scenarios have to cover all of them:
+Twelve evidence classes, and the committed scenarios have to cover all of them:
 
 | Class | Holds |
 | --- | --- |
@@ -187,6 +187,7 @@ Eleven evidence classes, and the committed scenarios have to cover all of them:
 | `cold_start` | What a replica booting *into* the window did: restored from cache, refused readiness, or served. |
 | `restore_duration` | Wall-clock restore time. Recorded, never asserted. |
 | `data_loss_boundary` | What durable state did not survive, named rather than counted. |
+| `durable_inventory` | Secret metadata/ownership and catalogue pointer, raw payload, and history that a recovered revision references. |
 | `revision_loss_boundary` | Which revisions a recovery kept and which it left behind, which is what `max_data_loss_revisions` counts. |
 | `fail_open_closed` | Which dependency failed open and which failed closed, per scenario. |
 | `audit_auth` | Administrative authentication and audit outcomes across the window. |

@@ -474,18 +474,23 @@ observe restore_duration_seconds "$restore_seconds" seconds
 # recovered replica. The recovered config below is also non-repopulating, but
 # this ordering makes the evidence independent of both boot and refresh code.
 catalog_restore_content_id="$(psql logical_restore 5432 -c \
-  'SELECT content_id FROM axond_catalog_active WHERE singleton' 2>/dev/null || printf 'missing')"
+  'SELECT content_id FROM axond_catalog_active WHERE singleton' 2>/dev/null || true)"
+catalog_restore_content_id="${catalog_restore_content_id:-missing}"
 catalog_restore_raw_digest="$(psql logical_restore 5432 -c \
   "SELECT raw_digest FROM axond_catalog_snapshot WHERE content_id = '${catalog_restore_content_id}'" \
-  2>/dev/null || printf 'missing')"
+  2>/dev/null || true)"
+catalog_restore_raw_digest="${catalog_restore_raw_digest:-missing}"
 catalog_restore_raw_bytes="$(psql logical_restore 5432 -c \
   "SELECT raw_bytes FROM axond_catalog_snapshot WHERE content_id = '${catalog_restore_content_id}'" \
-  2>/dev/null || printf '0')"
+  2>/dev/null || true)"
+catalog_restore_raw_bytes="${catalog_restore_raw_bytes:-0}"
 catalog_restore_payload_bytes="$(psql logical_restore 5432 -c \
   "SELECT octet_length(payload) FROM axond_catalog_snapshot WHERE content_id = '${catalog_restore_content_id}'" \
-  2>/dev/null || printf '0')"
+  2>/dev/null || true)"
+catalog_restore_payload_bytes="${catalog_restore_payload_bytes:-0}"
 catalog_restore_rows="$(psql logical_restore 5432 -c \
-  'SELECT count(*) FROM axond_catalog_snapshot' 2>/dev/null || printf '0')"
+  'SELECT count(*) FROM axond_catalog_snapshot' 2>/dev/null || true)"
+catalog_restore_rows="${catalog_restore_rows:-0}"
 mark "catalogue-preboot-read" "the restored catalogue pointer and payload metadata were read before any recovered replica booted"
 observe catalogue_preboot_content_id "$catalog_restore_content_id"
 observe catalogue_preboot_raw_digest "$catalog_restore_raw_digest"
@@ -589,15 +594,17 @@ secret_versions="$(admin secret versions --secret "$secret_id" --tenant "$tenant
   2>/dev/null || printf '{"versions":[]}')"
 mark "secret-metadata-read" "the staged secret's metadata read through the restored admin surface"
 observe secret_versions "$(printf '%s' "$secret_versions" | jq '.versions | length')" count
-observe secret_owner "$(printf '%s' "$secret_versions" | jq -r '.owner // "missing"')"
+secret_owner="$(printf '%s' "$secret_versions" |
+  jq -r '.versions[0].owner // "missing"')"
+observe secret_owner "$secret_owner"
 observe secret_lifecycle "$(printf '%s' "$secret_versions" | jq -r '.versions[0].lifecycle // "missing"')"
 observe secret_resolvable "$(printf '%s' "$secret_versions" | jq -r '.versions[0].resolvable // false')"
 require "the_secret_metadata_survives_the_restore" 1 \
   "$(printf '%s' "$secret_versions" | jq '.versions | length')" \
   "the restored database retains the secret's opaque version metadata"
 require "the_secret_owner_is_the_drill_tenant" "$tenant" \
-  "$(printf '%s' "$secret_versions" | jq -r '.owner // "missing"')" \
-  "secret metadata remains scoped to its owning tenant"
+  "$secret_owner" \
+  "the serialized secret-version owner remains the drill tenant"
 require "the_secret_lifecycle_survives_the_restore" active \
   "$(printf '%s' "$secret_versions" | jq -r '.versions[0].lifecycle // "missing"')" \
   "the restored lifecycle is the state the credential was activated into"
@@ -748,18 +755,23 @@ observe restore_duration_seconds "$restore_seconds" seconds
 # recovered replica. Missing tables become sentinel values and are judged by
 # this stage's checks instead of aborting before its artifact can close.
 pitr_catalog_content_id="$(psql live 5433 -c \
-  'SELECT content_id FROM axond_catalog_active WHERE singleton' 2>/dev/null || printf 'missing')"
+  'SELECT content_id FROM axond_catalog_active WHERE singleton' 2>/dev/null || true)"
+pitr_catalog_content_id="${pitr_catalog_content_id:-missing}"
 pitr_catalog_raw_digest="$(psql live 5433 -c \
   "SELECT raw_digest FROM axond_catalog_snapshot WHERE content_id = '${pitr_catalog_content_id}'" \
-  2>/dev/null || printf 'missing')"
+  2>/dev/null || true)"
+pitr_catalog_raw_digest="${pitr_catalog_raw_digest:-missing}"
 pitr_catalog_raw_bytes="$(psql live 5433 -c \
   "SELECT raw_bytes FROM axond_catalog_snapshot WHERE content_id = '${pitr_catalog_content_id}'" \
-  2>/dev/null || printf '0')"
+  2>/dev/null || true)"
+pitr_catalog_raw_bytes="${pitr_catalog_raw_bytes:-0}"
 pitr_catalog_payload_bytes="$(psql live 5433 -c \
   "SELECT octet_length(payload) FROM axond_catalog_snapshot WHERE content_id = '${pitr_catalog_content_id}'" \
-  2>/dev/null || printf '0')"
+  2>/dev/null || true)"
+pitr_catalog_payload_bytes="${pitr_catalog_payload_bytes:-0}"
 pitr_catalog_rows="$(psql live 5433 -c \
-  'SELECT count(*) FROM axond_catalog_snapshot' 2>/dev/null || printf '0')"
+  'SELECT count(*) FROM axond_catalog_snapshot' 2>/dev/null || true)"
+pitr_catalog_rows="${pitr_catalog_rows:-0}"
 mark "catalogue-preboot-read" "the PITR catalogue pointer and payload metadata were read before any recovered replica booted"
 observe pitr_catalogue_preboot_content_id "$pitr_catalog_content_id"
 observe pitr_catalogue_preboot_raw_digest "$pitr_catalog_raw_digest"
@@ -783,8 +795,11 @@ mark "replica-booted" "a replica booted on the promoted cluster and opened /admi
 # captured above, before the recovered replica could boot.
 pitr_secret_versions="$(admin secret versions --secret "$secret_id" --tenant "$tenant" \
   2>/dev/null || printf '{"versions":[]}')"
+pitr_secret_owner="$(printf '%s' "$pitr_secret_versions" |
+  jq -r '.versions[0].owner // "missing"')"
 mark "durable-inventory-read" "PITR metadata reads for the tenant's secret and pre-boot catalogue snapshot"
 observe pitr_secret_versions "$(printf '%s' "$pitr_secret_versions" | jq '.versions | length')" count
+observe pitr_secret_owner "$pitr_secret_owner"
 observe pitr_secret_lifecycle "$(printf '%s' "$pitr_secret_versions" | jq -r '.versions[0].lifecycle // "missing"')"
 observe pitr_catalogue_content_id "$pitr_catalog_content_id"
 observe pitr_catalogue_raw_digest "$pitr_catalog_raw_digest"
@@ -794,6 +809,9 @@ observe pitr_catalogue_snapshot_rows "$pitr_catalog_rows" count
 require "the_pitr_secret_metadata_survives_the_target" 1 \
   "$(printf '%s' "$pitr_secret_versions" | jq '.versions | length')" \
   "the target preserves the secret version metadata referenced by the pre-target deployment"
+require "the_pitr_secret_owner_survives_the_target" "$tenant" \
+  "$pitr_secret_owner" \
+  "the target preserves the serialized owner of the pre-target secret version"
 require "the_pitr_secret_lifecycle_survives_the_target" active \
   "$(printf '%s' "$pitr_secret_versions" | jq -r '.versions[0].lifecycle // "missing"')" \
   "the target preserves the lifecycle needed by the pre-target credential"

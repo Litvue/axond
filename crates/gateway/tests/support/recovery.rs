@@ -239,6 +239,9 @@ pub enum Evidence {
     RestoreDuration,
     /// What durable state did not survive, named rather than counted.
     DataLossBoundary,
+    /// Secret metadata and catalogue state a restore must retain for the
+    /// resources that a recovered revision references.
+    DurableInventory,
     /// Which revisions a recovery kept and which it left behind: the journal's
     /// own loss boundary, which is what `max_data_loss_revisions` counts.
     RevisionLossBoundary,
@@ -252,7 +255,7 @@ pub enum Evidence {
 }
 
 impl Evidence {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::OutageTimeline,
         Self::ServingBehavior,
         Self::Revisions,
@@ -260,6 +263,7 @@ impl Evidence {
         Self::ColdStart,
         Self::RestoreDuration,
         Self::DataLossBoundary,
+        Self::DurableInventory,
         Self::RevisionLossBoundary,
         Self::FailOpenClosed,
         Self::AuditAuth,
@@ -275,6 +279,7 @@ impl Evidence {
             Self::ColdStart => "cold_start",
             Self::RestoreDuration => "restore_duration",
             Self::DataLossBoundary => "data_loss_boundary",
+            Self::DurableInventory => "durable_inventory",
             Self::RevisionLossBoundary => "revision_loss_boundary",
             Self::FailOpenClosed => "fail_open_closed",
             Self::AuditAuth => "audit_auth",
