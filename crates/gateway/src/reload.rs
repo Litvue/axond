@@ -283,6 +283,11 @@ impl Reloader {
         // running until the operator restarts the process.
         config.catalog = self.boot.catalog.clone();
         carry_policy_forward(&mut config, &current.config);
+        // Stateful convergence owns the projected inbound identities. A file
+        // reload cannot recreate them, so carry the immutable set forward just
+        // as it carries published policy and pricing; the next revision
+        // publication replaces it atomically.
+        config.projected_principals = current.config.projected_principals.clone();
         Ok(ReloadCandidate {
             snapshot: ConfigSnapshot::build_with(
                 config,

@@ -89,6 +89,14 @@ pub struct Config {
     /// fails closed, so there is no keyless mode (ADR 0013).
     #[serde(default)]
     pub gateway_key: Vec<GatewayKey>,
+    /// Inbound workload principals projected from a durable revision.
+    ///
+    /// This is deliberately not deserializable: stateful bootstrap TOML cannot
+    /// declare inference identities, and the key material never enters the
+    /// process. A revision contributes only the namespace, stable subject, and
+    /// one-way digest needed by the snapshot's in-memory verifier.
+    #[serde(skip)]
+    pub(crate) projected_principals: Vec<ProjectedPrincipal>,
     /// Token verification authority. Verifiers are additive to static gateway
     /// keys and require a deployment audience when any are configured.
     #[serde(default)]
@@ -2057,6 +2065,20 @@ pub struct GatewayKey {
     pub can_mint: bool,
 }
 
+/// A recoverable inbound workload principal carried by a compiled stateful
+/// revision.
+///
+/// The presented `axw1.` key is never stored here. Its digest is sufficient for
+/// verification and is the only credential material the durable identity model
+/// exposes. `namespace` is already resolved by the projection because request
+/// authentication has no later namespace-selection step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectedPrincipal {
+    pub(crate) namespace: String,
+    pub(crate) subject: String,
+    pub(crate) digest: crate::desired_state::Checksum,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyMaterialSource<'a> {
     Env(&'a str),
@@ -2408,6 +2430,20 @@ impl Config {
         // the first row that matches and a second row for the same pair would be
         // unreachable configuration.
         let mut owned: HashSet<(Option<&str>, &str)> = HashSet::new();
+
+        for principal in &self.projected_principals {
+            if principal.subject.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "a projected inbound principal must have a non-empty subject".into(),
+                ));
+            }
+            if !namespaces.contains_key(principal.namespace.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "projected inbound principal `{}` references undefined namespace `{}`",
+                    principal.subject, principal.namespace
+                )));
+            }
+        }
         for model in &self.model {
             if model.targets.is_empty() {
                 return Err(ConfigError::Invalid(format!(

@@ -35,13 +35,14 @@ use crate::convergence::SystemClock;
 use crate::convergence::secrets::ResolvedSecrets;
 use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
+use crate::desired_state::WorkloadKey;
 use crate::desired_state::pricing::PricingSnapshot;
 use crate::key_material::{self, KeyMaterialError};
 use crate::policy::PolicyRuntime;
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
-    PrincipalShapeError, PrincipalStoreChain, TokenVerifier, TokenVerifierBuildError,
-    configured_token_epochs, resolve_token_epoch,
+    PrincipalShapeError, PrincipalStoreChain, ProjectedPrincipals, TokenVerifier,
+    TokenVerifierBuildError, configured_token_epochs, resolve_token_epoch,
 };
 #[cfg(test)]
 use crate::rate_limit::NoLimit;
@@ -341,6 +342,13 @@ pub enum SnapshotError {
     EmptyGatewayKeyFile { namespace: String, path: String },
     #[error("gateway_key for namespace `{namespace}` file `{path}` is not valid UTF-8")]
     InvalidGatewayKeyFileUtf8 { namespace: String, path: String },
+    #[error(
+        "gateway_key for namespace `{namespace}` uses the reserved `{shape}` workload-key shape"
+    )]
+    ReservedGatewayKeyShape {
+        namespace: String,
+        shape: &'static str,
+    },
     #[error("gateway_key for namespace `{namespace}` must declare exactly one non-empty source")]
     InvalidGatewayKeySource { namespace: String },
     #[error(
@@ -429,6 +437,21 @@ impl ConfigSnapshot {
         Self::build_with_mode(config, env, generation, secrets, false)
     }
 
+    /// Build a snapshot for a hydrated durable revision.
+    ///
+    /// The initial stateful bootstrap is allowed to be keyless while inference
+    /// is refused and the administrative surface comes up. A compiled candidate
+    /// is different: it may publish only when the revision supplied at least one
+    /// request-addressable inbound principal.
+    pub fn build_compiled_with(
+        config: Config,
+        env: &HashMap<String, String>,
+        generation: u64,
+        secrets: ResolvedSecrets,
+    ) -> Result<Self, SnapshotError> {
+        Self::build_with_mode(config, env, generation, secrets, false)
+    }
+
     fn build_with_mode(
         config: Config,
         env: &HashMap<String, String>,
@@ -480,6 +503,12 @@ impl ConfigSnapshot {
                     }
                 }
             })?;
+            if secret.starts_with(WorkloadKey::PREFIX) {
+                return Err(SnapshotError::ReservedGatewayKeyShape {
+                    namespace: k.namespace.clone(),
+                    shape: WorkloadKey::PREFIX,
+                });
+            }
             // Two keys resolving to one secret is ambiguous authority — one
             // namespace would silently win — so reject it. Compared here on the
             // operator-supplied values at boot, never at request time.
@@ -513,11 +542,21 @@ impl ConfigSnapshot {
             gateway_key_fingerprints
                 .insert(label.to_owned(), key_material::fingerprint(label, &secret));
         }
-        // Inbound authentication fails closed: no serving snapshot may be
-        // keyless. The sole exception is the stateful bootstrap object held
-        // before the reconciler has projected a revision; that object is
-        // rejected by the serving gate and can never authenticate a request.
+        // Inbound authentication fails closed: there is no keyless deployment
+        // that serves inference. A stateful replica cannot declare
+        // `[[gateway_key]]` at all — the section is rejected by
+        // `Config::validate_stateful` — because its inbound principals arrive
+        // with a compiled revision instead of the file, and until that compiler
+        // exists the runtime answers every inference request with
+        // `ops::inference_refusal` instead of the snapshot. A keyless snapshot
+        // is therefore admissible exactly while that refusal stands, and the
+        // condition is asked of the refusal itself rather than of the mode: when
+        // the projection lands and `inference_refusal` returns `None`, this
+        // rejects the keyless snapshot again with no edit here, which is the
+        // only ordering that cannot serve inference from an empty snapshot.
+        let projected_principals = ProjectedPrincipals::new(config.projected_principals.clone());
         if inbound_keys.is_empty()
+            && projected_principals.count() == 0
             && !(allow_keyless_bootstrap && config.mode == crate::config::Mode::Stateful)
         {
             return Err(SnapshotError::NoInboundKeys);
@@ -614,10 +653,13 @@ impl ConfigSnapshot {
         } else {
             None
         };
-        let stores = verifier
-            .into_iter()
-            .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>)
-            .collect();
+        let mut stores: Vec<Box<dyn crate::principals::PrincipalStore>> =
+            vec![Box::new(projected_principals)];
+        stores.extend(
+            verifier
+                .into_iter()
+                .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>),
+        );
         let principals = PrincipalStoreChain::new(stores, config_principals)?;
         let gateway_minting_fingerprint = config
             .gateway_minting
@@ -757,7 +799,7 @@ impl ConfigSnapshot {
     /// How many inbound gateway keys are enforced. For the boot log and reload
     /// metrics — the count is safe to surface, the secrets are not.
     pub fn inbound_key_count(&self) -> usize {
-        self.principals.config_count()
+        self.principals.config_count() + self.config.projected_principals.len()
     }
 
     pub fn token_verifier_count(&self) -> usize {
@@ -1505,6 +1547,41 @@ namespace = "platform"
         );
     }
 
+    #[tokio::test]
+    async fn a_projected_workload_key_resolves_from_its_durable_digest() {
+        let key = crate::desired_state::fixtures::workload_key(0xd0);
+        let mut config = config_with(PLATFORM_KEY);
+        config.projected_principals = vec![crate::config::ProjectedPrincipal {
+            namespace: "platform".to_owned(),
+            subject: crate::desired_state::fixtures::principal_id(33).to_string(),
+            digest: crate::desired_state::Checksum::of(key.as_bytes()),
+        }];
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
+        let snapshot = ConfigSnapshot::build(config, &env, 0)
+            .expect("a digest-backed principal does not need secret material");
+        let principal = snapshot
+            .resolve_principal(&Presented { credential: &key })
+            .await
+            .expect("principal resolution succeeds")
+            .expect("the projected workload key resolves");
+        assert_eq!(principal.namespace, "platform");
+        assert_eq!(
+            principal.subject,
+            crate::desired_state::fixtures::principal_id(33).to_string()
+        );
+        assert_eq!(principal.authority, PrincipalAuthority::WorkloadKey);
+        assert_eq!(snapshot.inbound_key_count(), 2);
+        assert!(
+            snapshot
+                .resolve_principal(&Presented {
+                    credential: "axw1.not-a-key",
+                })
+                .await
+                .expect("malformed workload keys fail closed")
+                .is_none()
+        );
+    }
+
     /// Issuance epochs belong only to minted tokens; the static breakglass key
     /// remains resolvable when a namespace-wide epoch is configured.
     #[tokio::test]
@@ -1552,8 +1629,56 @@ env = "GW_ADMIN_BREAKGLASS"
         assert_eq!(snapshot.inbound_key_count(), 0);
     }
 
-    /// A normal candidate build never permits a keyless stateful snapshot. The
-    /// explicit bootstrap constructor is the only keyless path.
+    #[test]
+    fn a_compiled_revision_without_a_request_addressable_principal_is_refused() {
+        let env = HashMap::new();
+        let stateful = Config::from_toml_str(
+            r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+"#,
+        )
+        .expect("a valid stateful bootstrap");
+        let error = match ConfigSnapshot::build_compiled_with(
+            stateful,
+            &env,
+            1,
+            ResolvedSecrets::default(),
+        ) {
+            Ok(_) => panic!("a candidate without an inbound principal cannot serve"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SnapshotError::NoInboundKeys));
+    }
+
+    #[test]
+    fn a_static_key_cannot_shadow_the_projected_workload_shape() {
+        let config = config_with(PLATFORM_KEY);
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "axw1.shadowed".to_owned())]);
+        let error = match ConfigSnapshot::build(config, &env, 0) {
+            Ok(_) => panic!("the reserved workload shape must remain unambiguous"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SnapshotError::ReservedGatewayKeyShape { .. }
+        ));
+    }
+
+    /// The keyless snapshot above is admissible only because the runtime answers
+    /// inference with [`crate::ops::inference_refusal`] instead of that snapshot.
+    /// This is the coupling, asserted rather than described: a mode that would
+    /// serve inference from a snapshot has to have an inbound key, so a future
+    /// change that stops refusing stateful inference fails here instead of
+    /// authenticating callers against an empty key set.
     #[test]
     fn stateful_candidates_require_projected_inbound_keys() {
         // A mode that serves inference has no keyless form to begin with:

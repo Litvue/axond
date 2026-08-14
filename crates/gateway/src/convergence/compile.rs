@@ -476,12 +476,11 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
         // version is in hand" is what separates a credential a tenant holds from
         // one it can use, and it is a set of references, never material.
         let readiness = CredentialReadiness::of(&secrets);
-        let snapshot = ConfigSnapshot::build_with(config, &self.env, generation, secrets).map_err(
-            |source| CompileError::Snapshot {
+        let snapshot = ConfigSnapshot::build_compiled_with(config, &self.env, generation, secrets)
+            .map_err(|source| CompileError::Snapshot {
                 revision: id,
                 source,
-            },
-        )?;
+            })?;
         let snapshot = match pricing {
             None => snapshot,
             Some(pricing) => snapshot.with_pricing(pricing),

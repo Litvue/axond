@@ -94,6 +94,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use super::compile::{ProjectionError, RevisionProjection};
+use super::principals::PrincipalProjection;
 use super::tenancy::TenancyProjection;
 use crate::config::{Config, Credential, ProjectIdentity, ProviderWire};
 use crate::desired_state::credentials::{Credentials, ProviderCredential};
@@ -109,13 +110,8 @@ use crate::desired_state::{DesiredState, RevisionId, SecretLifecycle, SecretOwne
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CredentialProjection;
 
-/// The production projection: tenancy, then the credentials that authenticate its
-/// namespaces.
-///
-/// This projection intentionally does not project inbound gateway principals.
-/// Stateful compilation reports that as a typed `unsupported` refusal instead
-/// of constructing a keyless serving snapshot. Adding a principal source here
-/// is the narrow point at which stateful serving can become Ready.
+/// The production projection: tenancy, credentials, and inbound principals for
+/// the namespaces they authenticate.
 ///
 /// One type rather than a generic chain because the order is not a configuration
 /// choice — a credential's namespace has to exist before the credential can name
@@ -128,6 +124,10 @@ impl RevisionProjection for RuntimeProjection {
         "runtime"
     }
 
+    fn projects_inbound_principals(&self) -> bool {
+        true
+    }
+
     fn project(
         &self,
         bootstrap: &Config,
@@ -135,7 +135,8 @@ impl RevisionProjection for RuntimeProjection {
         source: RevisionId,
     ) -> Result<Config, ProjectionError> {
         let namespaces = TenancyProjection.project(bootstrap, state, source)?;
-        CredentialProjection.project(&namespaces, state, source)
+        let credentials = CredentialProjection.project(&namespaces, state, source)?;
+        PrincipalProjection.project(&credentials, state, source)
     }
 }
 

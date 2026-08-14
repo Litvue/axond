@@ -13,7 +13,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::aliases::AliasScope;
-use crate::config::{Config, GatewayVerifierAlgorithm};
+use crate::config::{Config, GatewayVerifierAlgorithm, ProjectedPrincipal};
+use crate::desired_state::WorkloadKey;
 use crate::key_material::{self, KeyMaterialError};
 
 macro_rules! define_capabilities {
@@ -104,6 +105,10 @@ pub enum PrincipalAuthority {
     /// A verified `axt1.` token. Its authority is delegated and bounded by what
     /// minting and the verifier allow.
     MintedToken,
+    /// A workload key whose digest was projected from the active durable
+    /// revision. It is an inference credential, but it is not the operator's
+    /// bootstrap authority and cannot mint tokens or widen its namespace.
+    WorkloadKey,
 }
 
 #[derive(Clone)]
@@ -721,6 +726,14 @@ impl PrincipalStore for TokenVerifier {
 pub trait PrincipalStore: Send + Sync {
     fn name(&self) -> &'static str;
     fn shapes(&self) -> &'static [&'static str];
+    /// Whether resolution is guaranteed not to await a backend.
+    ///
+    /// Shape-owning stores are treated as backend-capable by default; a store
+    /// that only verifies an immutable snapshot can opt into the cheaper
+    /// diagnostic admission bucket.
+    fn is_in_memory(&self) -> bool {
+        false
+    }
     async fn resolve(
         &self,
         presented: &Presented<'_>,
@@ -729,6 +742,83 @@ pub trait PrincipalStore: Send + Sync {
 
 pub struct ConfigPrincipals {
     inbound_keys: Arc<[GatewayKeyEntry]>,
+}
+
+/// In-memory verifier for workload keys projected from a durable revision.
+///
+/// Durable state stores only each key's digest. The verifier therefore keeps no
+/// recoverable secret and can be rebuilt on every revision publication. It is a
+/// separate shape-owning store so a malformed `axw1.` credential cannot fall
+/// through to a different authority, just as minted `axt1.` tokens cannot.
+pub struct ProjectedPrincipals {
+    entries: Arc<[ProjectedPrincipalEntry]>,
+}
+
+struct ProjectedPrincipalEntry {
+    digest: crate::desired_state::Checksum,
+    caller: InboundKey,
+}
+
+impl ProjectedPrincipals {
+    pub(crate) fn new(projected: Vec<ProjectedPrincipal>) -> Self {
+        let entries = projected
+            .into_iter()
+            .map(|principal| ProjectedPrincipalEntry {
+                digest: principal.digest,
+                caller: InboundKey {
+                    namespace: principal.namespace,
+                    subject: principal.subject,
+                    authority: PrincipalAuthority::WorkloadKey,
+                    signer_kid: None,
+                    // A durable workload key is an explicit inference
+                    // credential for its projected namespace. Capabilities are
+                    // not an administrative role: the key is namespace-bound
+                    // and does not acquire token minting authority.
+                    scope: None,
+                    alias_scope: None,
+                    max_request_microdollars: None,
+                    can_mint: false,
+                    jti: None,
+                },
+            })
+            .collect::<Vec<_>>()
+            .into();
+        Self { entries }
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[async_trait]
+impl PrincipalStore for ProjectedPrincipals {
+    fn name(&self) -> &'static str {
+        "revision"
+    }
+
+    fn shapes(&self) -> &'static [&'static str] {
+        &[WorkloadKey::PREFIX]
+    }
+
+    fn is_in_memory(&self) -> bool {
+        true
+    }
+
+    async fn resolve(
+        &self,
+        presented: &Presented<'_>,
+    ) -> Result<Option<InboundKey>, PrincipalStoreError> {
+        let Ok(key) = WorkloadKey::parse(presented.credential) else {
+            return Ok(None);
+        };
+        let digest = key.digest();
+        Ok(self
+            .entries
+            .iter()
+            .find(|entry| constant_time_eq(entry.digest.as_bytes(), digest.as_bytes()))
+            .map(|entry| entry.caller.clone()))
+    }
 }
 
 impl ConfigPrincipals {
@@ -832,10 +922,11 @@ impl PrincipalStoreChain {
     /// classified by the same declaration that routes it.
     pub(crate) fn resolves_in_memory(&self, presented: &Presented<'_>) -> bool {
         !self.stores.iter().any(|store| {
-            store
-                .shapes()
-                .iter()
-                .any(|shape| presented.credential.starts_with(shape))
+            !store.is_in_memory()
+                && store
+                    .shapes()
+                    .iter()
+                    .any(|shape| presented.credential.starts_with(shape))
         })
     }
 
