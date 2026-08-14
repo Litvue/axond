@@ -1623,11 +1623,12 @@ async fn a_cold_boot_against_an_empty_control_plane_refuses_to_start() {
     assert!(matches!(error, BootstrapError::Empty), "{error}");
 }
 
-/// A revision that cannot be compiled is fatal at boot, and specifically *not*
-/// answered from the cache: booting an older cached revision would silently serve
-/// state an operator already replaced.
+/// A revision that cannot be compiled is rejected by the bootstrap attempt and
+/// specifically *not* answered from the cache: booting an older cached revision
+/// would silently serve state an operator already replaced. The post-listener
+/// caller may retry, but this candidate never publishes.
 #[tokio::test]
-async fn a_boot_revision_that_does_not_compile_is_fatal_even_with_a_cache() {
+async fn a_boot_revision_that_does_not_compile_is_rejected_even_with_a_cache() {
     let store = control_plane();
     publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
     let path = cache_path("boot-rejected");
@@ -1886,7 +1887,8 @@ async fn a_cold_boot_whose_material_does_not_resolve_refuses_to_start() {
     assert!(path.exists(), "converging exported the cache");
 
     // The next replica boots with a healthy control plane and a store that is
-    // down. Unlike a control-plane outage, this is fatal.
+    // down. Unlike a control-plane outage, the cache cannot answer this
+    // candidate; the post-listener loop will retry the dependency instead.
     let cold = Replica::with_cache_and_unresolvable_secrets(
         &store,
         LastKnownGood::new(&path, KEY).expect("a long enough key"),

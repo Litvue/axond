@@ -798,7 +798,10 @@ async fn serve() -> anyhow::Result<()> {
                 _ = async {
                     match reconciler.bootstrap().await {
                         Ok(revision) => tracing::info!(%revision, "stateful serving snapshot ready"),
-                        Err(error) => tracing::warn!(error = %error, "stateful serving is waiting for convergence"),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "stateful bootstrap did not publish a snapshot; the bounded convergence loop will retry"
+                        ),
                     }
                     reconciler.run(signal, shutdown.closed()).await;
                 } => {}

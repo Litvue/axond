@@ -73,6 +73,15 @@ pub trait RevisionProjection: Send + Sync {
     /// refused a revision.
     fn name(&self) -> &'static str;
 
+    /// Whether this projection supplies the inbound caller principals required
+    /// by a stateful serving snapshot. The current desired-state projection
+    /// owns tenancy, credentials, and policy, but it does not yet own gateway
+    /// principals. Stateful compilation must therefore refuse explicitly until
+    /// a projection can provide them; an empty key set is never an auth bypass.
+    fn projects_inbound_principals(&self) -> bool {
+        false
+    }
+
     /// Project desired state onto the bootstrap config.
     ///
     /// `source` is the revision the state came from. A projection that derives
@@ -124,6 +133,15 @@ pub enum ProjectionError {
 /// is usually secret material that is missing or wrong.
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
+    /// The projection is structurally valid but this build does not yet have
+    /// the durable inbound-principal source needed to serve it statefully.
+    /// Keeping this distinct from a malformed snapshot makes the readiness and
+    /// operator status honest without weakening authentication.
+    #[error("revision {revision} is unsupported for stateful serving: {detail}")]
+    Unsupported {
+        revision: RevisionId,
+        detail: &'static str,
+    },
     #[error("revision {revision} does not project onto a servable configuration: {source}")]
     Projection {
         revision: RevisionId,
@@ -221,7 +239,8 @@ impl CompileError {
     /// The revision that was refused.
     pub const fn revision(&self) -> RevisionId {
         match self {
-            Self::Projection { revision, .. }
+            Self::Unsupported { revision, .. }
+            | Self::Projection { revision, .. }
             | Self::Validation { revision, .. }
             | Self::Pricing { revision, .. }
             | Self::Clock { revision, .. }
@@ -238,6 +257,7 @@ impl CompileError {
     /// distinction an on-call engineer needs first.
     pub const fn reason(&self) -> &'static str {
         match self {
+            Self::Unsupported { .. } => "unsupported",
             Self::Projection {
                 source: ProjectionError::Secret { .. },
                 ..
@@ -422,6 +442,14 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
                 revision: id,
                 source,
             })?;
+        if self.bootstrap.mode == crate::config::Mode::Stateful
+            && !self.projection.projects_inbound_principals()
+        {
+            return Err(CompileError::Unsupported {
+                revision: id,
+                detail: "the active projection does not provide inbound caller principals",
+            });
+        }
         config
             .validate_compiled()
             .map_err(|source| CompileError::Validation {
@@ -588,6 +616,27 @@ namespace = "platform"
         .expect("a valid bootstrap config")
     }
 
+    /// The stateful bootstrap deliberately has no inbound key. It is useful
+    /// here to prove that a projection which cannot add caller principals is
+    /// rejected before it reaches validation or secret materialization.
+    pub(crate) fn stateful_bootstrap() -> Config {
+        Config::from_toml_str(
+            r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+"#,
+        )
+        .expect("a valid stateful bootstrap config")
+    }
+
     pub(crate) fn env() -> HashMap<String, String> {
         HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())])
     }
@@ -622,6 +671,7 @@ mod tests {
 
     use super::testing::{
         AliasProjection, RefusingProjection, bootstrap, env, revision, revision_with,
+        stateful_bootstrap,
     };
     use super::*;
     use crate::backends::catalog::ProviderId;
@@ -650,6 +700,25 @@ mod tests {
                 .model
                 .iter()
                 .any(|model| model.name == "fast")
+        );
+    }
+
+    #[tokio::test]
+    async fn stateful_projection_without_inbound_principals_is_typed_unsupported() {
+        let compiler = RevisionCompiler::new(
+            stateful_bootstrap(),
+            HashMap::new(),
+            AliasProjection { provider: "openai" },
+        );
+        let error = match compiler.compile(&revision(), 1).await {
+            Ok(_) => panic!("keyless stateful projection must remain fail-closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.reason(), "unsupported");
+        assert_eq!(error.revision(), fixtures::revision_id(9));
+        assert!(
+            error.to_string().contains("inbound caller principals"),
+            "{error}"
         );
     }
 

@@ -102,16 +102,25 @@ def render(directory: Path, components: tuple[Path, ...] = ()) -> list[Document]
     if not components:
         return kustomize(str(directory), None)
     with tempfile.TemporaryDirectory(prefix="axond-kustomize-") as holder:
+        # On macOS, the repository may be addressed as `/private/tmp` while
+        # tempfile returns its `/var/folders` symlink spelling. Compute both
+        # sides from resolved paths or the relative resource becomes
+        # `/private/private/...` inside kubectl's cwd.
+        holder_path = Path(holder).resolve()
         lines = [
             "apiVersion: kustomize.config.k8s.io/v1beta1",
             "kind: Kustomization",
             "resources:",
-            f"  - {os.path.relpath(directory, holder)}",
+            f"  - {os.path.relpath(directory.resolve(), holder_path)}",
             "components:",
         ]
-        lines.extend(f"  - {os.path.relpath(component, holder)}" for component in components)
-        Path(holder, "kustomization.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return kustomize(".", Path(holder))
+        lines.extend(
+            f"  - {os.path.relpath(component.resolve(), holder_path)}" for component in components
+        )
+        (holder_path / "kustomization.yaml").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+        return kustomize(".", holder_path)
 
 
 def kustomize(target: str, cwd: Path | None) -> list[Document]:
@@ -798,6 +807,34 @@ def check_stateful(documents: list[Document]) -> list[str]:
     if strategy.get("rollingUpdate") is not None:
         failures.append(f"{label}: the Deployment keeps rollingUpdate settings beside Recreate")
 
+    pod_spec = deployment["spec"]["template"]["spec"]
+    cache_volumes = {
+        volume["name"]
+        for volume in pod_spec.get("volumes", [])
+        if "name" in volume
+    }
+    axond = next(
+        (container for container in pod_spec.get("containers", []) if container.get("name") == "axond"),
+        None,
+    )
+    cache_mount = next(
+        (
+            mount
+            for mount in (axond or {}).get("volumeMounts", [])
+            if mount.get("name") == "last-known-good"
+        ),
+        None,
+    )
+    if "last-known-good" not in cache_volumes:
+        failures.append(
+            f"{label}: the read-only-root stateful Pod has no writable last-known-good volume"
+        )
+    if cache_mount is None or cache_mount.get("mountPath") != "/var/lib/axond" or cache_mount.get("readOnly"):
+        failures.append(
+            f"{label}: the stateful container does not mount last-known-good read-write at "
+            "/var/lib/axond"
+        )
+
     budget = one(documents, "PodDisruptionBudget")
     if budget["spec"].get("unhealthyPodEvictionPolicy") != "AlwaysAllow":
         failures.append(
@@ -1183,6 +1220,15 @@ def self_test() -> int:
         if service["metadata"]["name"] == "axond":
             service["spec"]["publishNotReadyAddresses"] = True
     expect_failure("callers routed to a refusing replica", check_stateful(routed))
+
+    without_cache_volume = copy.deepcopy(stateful)
+    without_cache_pod = one(without_cache_volume, "Deployment")["spec"]["template"]["spec"]
+    without_cache_pod["volumes"] = []
+    without_cache_pod["containers"][0]["volumeMounts"] = []
+    expect_failure(
+        "a read-only stateful Pod without a cache volume",
+        check_stateful(without_cache_volume),
+    )
 
     self_migrating = copy.deepcopy(stateful)
     config = one(self_migrating, "ConfigMap")

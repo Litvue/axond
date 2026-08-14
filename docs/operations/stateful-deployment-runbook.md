@@ -23,9 +23,11 @@ port-forward as the acceptance checks instead.
   named axond-secrets.
 - A verified multi-architecture image-index digest. The committed all-zero
   digest is intentionally not pullable.
-- Three Secret values for this bootstrap: GW_CONTROL_PLANE_DSN,
-  GW_SECRET_STORE_KEK, and GW_ADMIN_BREAKGLASS. The KEK must be the deployment's
-  existing key material; changing it makes stored ciphertext unrecoverable.
+- Four Secret values for this bootstrap: GW_CONTROL_PLANE_DSN,
+  GW_SECRET_STORE_KEK, GW_ADMIN_BREAKGLASS, and GW_LAST_KNOWN_GOOD_KEY. The KEK
+  must be the deployment's existing key material; changing it makes stored
+  ciphertext unrecoverable. Provision the last-known-good key before the
+  ConfigMap that names it.
 
 Resolve and verify the image before applying the overlay. Set
 `RELEASE_VERSION` to the verified release; the resolver updates both production
@@ -57,11 +59,20 @@ kubectl -n "$namespace" create secret generic axond-secrets \
   --from-literal=GW_CONTROL_PLANE_DSN='postgres://<user>:<password>@<host>:5432/<db>' \
   --from-literal=GW_SECRET_STORE_KEK='<base64-encoded-key-material>' \
   --from-literal=GW_ADMIN_BREAKGLASS='<breakglass-value>' \
+  --from-literal=GW_LAST_KNOWN_GOOD_KEY='<deployment-cache-signing-key>' \
   --dry-run=client -o yaml | kubectl apply -f -
 
 ops/pin-image-digest.sh --check overlays/production-stateful
 kubectl apply -k "$overlay"
 ~~~
+
+The Secret step is deliberately first. For an existing fleet, update or create
+`axond-secrets` with `GW_LAST_KNOWN_GOOD_KEY` and verify it is present before
+applying a release whose `axond.toml` contains `[convergence]`. Applying that
+ConfigMap first makes the new cache configuration a boot dependency while the
+key is absent, so replicas can crash-loop instead of reaching the administrative
+surface. The key is a deployment-wide reference used to authenticate the cache;
+it is not written into the ConfigMap or logs.
 
 The Job and Deployment are created by the same apply and are not ordered by
 Kubernetes. A Pod may briefly restart against a schema that is not present yet;
