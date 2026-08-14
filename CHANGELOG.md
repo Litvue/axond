@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.3.39](https://github.com/Litvue/axond/compare/v0.3.38...v0.3.39) (2026-08-14)
+
+
+### Features
+
+* **recovery:** qualify durable secret and catalogue restore state ([6cb8dff](https://github.com/Litvue/axond/commit/6cb8dff813b6d70454990ebbd2764bad2897866f))
+* **stateful:** wire fail-closed convergence posture ([55c0b01](https://github.com/Litvue/axond/commit/55c0b0190b4c30c9c71126d8ad9a8ea0114d6995))
+* **stateful:** wire outage recovery serving spine ([e3b80e2](https://github.com/Litvue/axond/commit/e3b80e2d1406b2aa0a70e2997fd245385d8ee9dd))
+
+
+### Bug Fixes
+
+* **config:** include convergence in override keys ([90aca6c](https://github.com/Litvue/axond/commit/90aca6cdd487f6c510b718e2c76d91745d0d4b1d))
+* **deploy:** preserve stateful pod template ([b697026](https://github.com/Litvue/axond/commit/b697026ea77a29daa0dccced8daa9fe958ad9346))
+* **models:** bound legacy alias publication context ([dbbf4b7](https://github.com/Litvue/axond/commit/dbbf4b7ea8da5ace416ef71414647f5bc9c66d69))
+* **models:** clarify legacy alias repair failures ([0ee373d](https://github.com/Litvue/axond/commit/0ee373df1f0250b09c496d3345e9017f35d2fe0e))
+* **models:** complete legacy lifecycle edge cases ([8695dc1](https://github.com/Litvue/axond/commit/8695dc133d06cee6a36f8b664b71489856e7e5db))
+* **models:** enforce alias lifecycle safety ([6654fd0](https://github.com/Litvue/axond/commit/6654fd03256739ef1154bae859b0c53e9bac1073))
+* **models:** preserve legacy alias lifecycle compatibility ([5f65ac3](https://github.com/Litvue/axond/commit/5f65ac340c79aa4f16608096f3879d5252503a5f))
+* **models:** retire aliases with disabled targets ([80895ad](https://github.com/Litvue/axond/commit/80895ad8d9000442a10b88a8dd3f202a31456c3e))
+* **qualification:** retire catalogue recovery dependency ([5edd69a](https://github.com/Litvue/axond/commit/5edd69a68e9ab799dfe84b17f1d54a9170b3ccd2))
+* **recovery:** align evidence and qualification docs ([39299a3](https://github.com/Litvue/axond/commit/39299a39a2882c3838a81979c24756ef786e6f23))
+* **recovery:** expect unready inference refusal ([2d80335](https://github.com/Litvue/axond/commit/2d803352107e4af08e15cb7a156349e308abbc8d))
+* **recovery:** keep provider key out of child environment ([8d0fcaf](https://github.com/Litvue/axond/commit/8d0fcaf3ab99ce2b87ac8de7b539f8355bfc5b10))
+* **recovery:** make restore evidence non-repopulating ([813b5ee](https://github.com/Litvue/axond/commit/813b5ee6915cbafe26e4ae5e20c2f5ceef49b108))
+* **recovery:** scope provider key to evidence check ([f2587b7](https://github.com/Litvue/axond/commit/f2587b7a46d8d5c5209f5c9e24304da4fd8710cc))
+* **recovery:** stream drill secret material ([01e8c50](https://github.com/Litvue/axond/commit/01e8c50feb3129ea80fedef1d6aca77fa8d71620))
+* **recovery:** stream secret schema into postgres ([d0e1389](https://github.com/Litvue/axond/commit/d0e1389cc689670b0f324cb183f2c9a074c39be9))
+* **recovery:** wait for catalogue import ([5b7e614](https://github.com/Litvue/axond/commit/5b7e614ea2f24a5f45d39be71c34ba7c44798a61))
+* **stateful:** remove rebase conflict markers ([de4b4fe](https://github.com/Litvue/axond/commit/de4b4fe71e89af7610fab1b8f8038b310397f5e1))
+* **stateful:** validate preflight cache posture ([9118b8c](https://github.com/Litvue/axond/commit/9118b8c03c4f016cc5308f4f7e84a9c154851078))
+
+
+### Documentation
+
+* **stateful:** clarify fail-closed rollout contract ([146cf80](https://github.com/Litvue/axond/commit/146cf80179ae67d8924262da51c68b9392ab3ea3))
+* **stateful:** preserve outage section anchor ([55fa76e](https://github.com/Litvue/axond/commit/55fa76e97af8210bef27ebddb1f7dbf70e28ee34))
+* **stateful:** scope convergence to fail-closed wiring ([0441f51](https://github.com/Litvue/axond/commit/0441f51a58d34b8733a63fd33748005697eb0c49))
+
+
+### Tests
+
+* **recovery:** align restore contracts with runtime ordering ([f8fc066](https://github.com/Litvue/axond/commit/f8fc06685a6cb07445b385001da5d1db6d115f6f))
+* **recovery:** assert auth-first stateful refusal ([1e59740](https://github.com/Litvue/axond/commit/1e59740fbbccc4c8fec5a1a81690485c4d72635c))
+* **recovery:** qualify durable restore state ([c143559](https://github.com/Litvue/axond/commit/c14355926a2b6fe7b39faa66f69115574cc85965))
+
 ## [0.3.38](https://github.com/Litvue/axond/compare/v0.3.37...v0.3.38) (2026-08-14)
 
 
