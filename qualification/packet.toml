@@ -99,14 +99,14 @@ heavy_lane = ".github/workflows/ci.yml"
 heavy_tier = "serving"
 retained = []
 outstanding = """
-Nine stages run against a real Postgres and retain evidence — the outage, the \
-three cold boots, journal convergence, a logical restore, and a point-in-time \
-recovery — but every scenario still has a blocked stage, because a stateful \
-replica cannot serve a projected revision, so nothing that needs an offered \
-request is measured."""
+Ten stages run against a real Postgres and retain evidence — the outage, the \
+three cold boots, journal convergence, a logical restore with durable secret and \
+catalogue inventory, and a point-in-time recovery — but every scenario still has \
+a blocked stage, because a stateful replica cannot serve a projected revision, \
+so nothing that needs an offered request is measured."""
 # Mirrors the union of the recovery manifest's own dependency map, and is
 # checked against it.
-blocked_on = [144, 145, 146, 147, 148, 149, 150, 155, 158]
+blocked_on = [144, 145, 147, 148, 149, 150, 155, 158]
 
 # The fault slice: what a failing dependency does to a request.
 [[slice]]
