@@ -45,6 +45,11 @@ pub struct Config {
     /// Required by `mode = "stateful"`, rejected in stateless mode.
     #[serde(default)]
     pub control_plane: Option<ControlPlane>,
+    /// Stateful convergence and its authenticated local last-known-good cache.
+    /// The cache contains desired-state references only; the secret store still
+    /// has to be available before a restored revision can be published.
+    #[serde(default)]
+    pub convergence: ConvergenceConfig,
     /// Stateful bootstrap: which `SecretStore` unwraps tenant secret material,
     /// and the key-encryption key it unwraps with — both by reference.
     #[serde(default)]
@@ -273,6 +278,20 @@ pub struct ControlPlane {
     /// inference-path standards: nothing here runs with a request in flight.
     #[serde(default = "default_control_plane_operation_timeout_ms")]
     pub operation_timeout_ms: u64,
+}
+
+/// The small process-local surface needed to make a stateful replica recoverable
+/// during a control-plane outage. Omitting both fields disables the local cache,
+/// which deliberately leaves cold boot fail-closed when the journal is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ConvergenceConfig {
+    /// Durable path shared with replacement replicas on the local volume.
+    #[serde(default)]
+    pub cache_path: Option<String>,
+    /// Environment variable containing the deployment-wide HMAC key reference.
+    /// The key itself never enters configuration or diagnostics.
+    #[serde(default)]
+    pub cache_key_env: Option<String>,
 }
 
 fn default_control_plane_connect_timeout_ms() -> u64 {

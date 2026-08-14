@@ -375,6 +375,21 @@ impl Reconciler {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let status = Arc::new(RevisionStatus::new(Box::new(ArcClock(Arc::clone(&clock)))));
+        Self::with_status(store, compiler, sink, settings, cache, clock, status)
+    }
+
+    /// Construct a reconciler using a status handle already installed in the
+    /// serving state. This prevents the admin/status surfaces and the loop from
+    /// telling two different convergence stories.
+    pub fn with_status(
+        store: Arc<dyn ControlPlaneStore>,
+        compiler: Arc<dyn CandidateCompiler>,
+        sink: Arc<dyn SnapshotSink>,
+        settings: ConvergenceSettings,
+        cache: Option<LastKnownGood>,
+        clock: Arc<dyn Clock>,
+        status: Arc<RevisionStatus>,
+    ) -> Self {
         Self {
             store,
             compiler,
