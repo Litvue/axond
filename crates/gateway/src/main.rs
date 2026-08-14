@@ -99,7 +99,11 @@ use std::time::Instant;
 
 use budget::BudgetStore;
 use clap::{Arg, ArgAction, Command};
-use config::Config;
+use config::{Config, Mode};
+use convergence::{
+    ConvergenceSettings, LastKnownGood, MaterialLedger, PolicyProjection, Reconciler,
+    RevisionCompiler, RevisionStatus, RuntimeProjection, SystemClock,
+};
 use rate_limit::RateLimiter;
 use revocation::RevocationStore;
 use state::{AppState, ReplicaObservability};
@@ -514,11 +518,8 @@ async fn serve() -> anyhow::Result<()> {
     let config = Config::load(&config_path)
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
 
-    // The same refusal `axond check preflight` reports, read from the same place,
-    // so the command cannot describe a surface this function would not serve.
-    let inference_refusal = ops::inference_refusal(&config);
-
     let env: HashMap<String, String> = std::env::vars().collect();
+    let bootstrap_config = config.clone();
 
     // No-datastore defaults: usage to stdout, budget always-allow. Durable
     // usage sinks and shared (Redis / Postgres) budget backends are opt-in via
@@ -644,6 +645,12 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
     let (observability, status_refresher) = ReplicaObservability::observing(plan);
+    let revision_status = (config.mode == Mode::Stateful)
+        .then(|| Arc::new(RevisionStatus::new(Box::new(SystemClock))));
+    let observability = match revision_status.as_ref() {
+        Some(status) => observability.with_revision(Arc::clone(status)),
+        None => observability,
+    };
 
     // The catalogue report is added to whatever posture this replica already
     // observes: importing metadata is orthogonal to administering a control
@@ -656,7 +663,7 @@ async fn serve() -> anyhow::Result<()> {
     let bind = config.server.bind;
     let watching = config.reload.watch;
     let state = AppState::new_with_policy(
-        config,
+        config.clone(),
         &env,
         usage,
         budget,
@@ -683,22 +690,60 @@ async fn serve() -> anyhow::Result<()> {
     // Kept past the router so the sinks can be flushed after the last request:
     // shutdown is the one point where durability outranks the request path.
     let resources = state.clone();
+    // Assemble the stateful convergence loop only after its immutable serving
+    // state exists. Bootstrap failures intentionally leave the process alive
+    // with authenticated administration and a fail-closed inference/readiness
+    // surface; the loop can then recover when Postgres or a valid cache returns.
+    let reconciler = if config.mode == Mode::Stateful {
+        let store = admin
+            .control_plane
+            .as_ref()
+            .map(|observed| Arc::clone(&observed.store))
+            .ok_or_else(|| anyhow::anyhow!("stateful boot opened no control-plane store"))?;
+        let resolver = admin
+            .secret_resolver
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("stateful boot opened no secret resolver"))?;
+        let compiler = Arc::new(RevisionCompiler::with_secrets(
+            bootstrap_config,
+            env.clone(),
+            PolicyProjection::over(RuntimeProjection),
+            Arc::new(crate::convergence::SecretMaterialization::new(
+                resolver,
+                MaterialLedger::new(),
+            )),
+        ));
+        let cache = configured_cache(&config, &env)?;
+        let reconciler = Arc::new(Reconciler::with_status(
+            store,
+            compiler,
+            Arc::new(state.clone()),
+            ConvergenceSettings::default(),
+            cache,
+            Arc::new(SystemClock),
+            revision_status
+                .clone()
+                .expect("stateful mode has a convergence status"),
+        ));
+        match reconciler.bootstrap().await {
+            Ok(revision) => tracing::info!(%revision, "stateful serving snapshot ready"),
+            Err(error) => {
+                tracing::warn!(error = %error, "stateful serving is waiting for convergence")
+            }
+        }
+        Some(reconciler)
+    } else {
+        None
+    };
+
     // Routed after the inference state exists, because an availability read is
     // answered from the snapshot this replica is serving (#148), while the store
     // behind administration was opened before it so the diagnostic paces against
     // the connection administrative requests take.
-    let administration = admin.router(Some(Arc::new(state.clone())));
-    // A replica that cannot compile a revision into a snapshot still administers
-    // one: the administrative surface is mounted either way, and only inference
-    // is replaced by its refusal. The replica diagnostic is mounted either way
-    // too — an unconverged replica is precisely the one an operator asks about.
-    let inference = match inference_refusal {
-        None => routes::router(state),
-        Some(reason) => {
-            tracing::warn!(reason, "inference is refused on this replica");
-            routes::unconverged_router(reason).merge(routes::diagnostic_router(state))
-        }
-    };
+    let administration =
+        admin.router_with_convergence(Some(Arc::new(state.clone())), revision_status.clone());
+    let inference = routes::router(state.clone());
     let app = inference
         .merge(administration)
         .layer(telemetry::TelemetryLayer);
@@ -740,6 +785,13 @@ async fn serve() -> anyhow::Result<()> {
                 .await;
         })
     });
+    let converging = reconciler.map(|reconciler| {
+        let shutdown = Arc::clone(&lifecycle);
+        let signal = Arc::new(convergence::ChangeSignal::new());
+        tokio::spawn(async move {
+            reconciler.run(signal, shutdown.closed()).await;
+        })
+    });
     let served = axum::serve(listener, app).with_graceful_shutdown(drain);
     // Only used if the server ends without ever being signalled.
     let boot = shutdown::Plan::from(&resources.config().config.shutdown);
@@ -752,6 +804,9 @@ async fn serve() -> anyhow::Result<()> {
     drop(stop_refreshing);
     if let Some(refreshing) = refreshing {
         let _ = refreshing.await;
+    }
+    if let Some(converging) = converging {
+        let _ = converging.await;
     }
 
     // Nothing below waits on the import: its work is metadata, and the budget
@@ -832,9 +887,76 @@ async fn serve() -> anyhow::Result<()> {
     }
 }
 
+/// Resolve the cache's path and signing key from references only. A partially
+/// configured cache is a boot configuration error; silently disabling it would
+/// turn a deployment mistake into an outage-only capacity failure.
+fn configured_cache(
+    config: &Config,
+    env: &HashMap<String, String>,
+) -> anyhow::Result<Option<LastKnownGood>> {
+    let path = config
+        .convergence
+        .cache_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let key_name = config
+        .convergence
+        .cache_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    match (path, key_name) {
+        (None, None) => Ok(None),
+        (Some(path), Some(name)) => {
+            let key = env
+                .get(name)
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("last-known-good key env `{name}` is unset"))?;
+            LastKnownGood::new(path, key.as_bytes())
+                .map(Some)
+                .map_err(|error| {
+                    anyhow::anyhow!("last-known-good cache configuration failed: {error}")
+                })
+        }
+        _ => anyhow::bail!("last-known-good cache requires both `cache_path` and `cache_key_env`"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_last_known_good_configuration_is_rejected() {
+        let mut config = Config::from_toml_str(
+            "[[namespace]]\nid = \"platform\"\ndefault = true\n\
+             [[provider]]\nid = \"openai\"\nkind = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n\
+             [[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n",
+        )
+        .expect("a minimal stateless config");
+        config.convergence.cache_path = Some("/tmp/axond-lkg".to_owned());
+        let error = configured_cache(&config, &HashMap::new())
+            .expect_err("a cache without a key reference is not fail-closed configuration");
+        assert!(error.to_string().contains("requires both"), "{error}");
+    }
+
+    #[test]
+    fn a_short_last_known_good_key_is_rejected_without_rendering_it() {
+        let mut config = Config::from_toml_str(
+            "[[namespace]]\nid = \"platform\"\ndefault = true\n\
+             [[provider]]\nid = \"openai\"\nkind = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n\
+             [[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n",
+        )
+        .expect("a minimal stateless config");
+        config.convergence.cache_path = Some("/tmp/axond-lkg".to_owned());
+        config.convergence.cache_key_env = Some("GW_LKG_KEY".to_owned());
+        let env = HashMap::from([(String::from("GW_LKG_KEY"), String::from("too-short"))]);
+        let error = configured_cache(&config, &env)
+            .expect_err("the cache MAC key must meet the authenticated format bound");
+        assert!(error.to_string().contains("at least"), "{error}");
+        assert!(!error.to_string().contains("too-short"), "{error}");
+    }
 
     /// The grammar itself, pinned: `axond <command> <action> --config PATH`, with
     /// the flag in one place. Operators write these into runbooks and Helm hooks,

@@ -81,6 +81,7 @@ pub fn router(state: AppState) -> Router {
 /// — it is refusing inference and its convergence is the reason — so the
 /// diagnostic is mounted beside [`unconverged_router`] rather than being lost
 /// with the inference surface it happens to be declared next to.
+#[allow(dead_code)]
 pub fn diagnostic_router(state: AppState) -> Router {
     let specs = route_specs(state.config().gateway_minting.is_some())
         .into_iter()
@@ -114,6 +115,16 @@ fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
                     (state.clone(), spec.capability),
                     authenticate_middleware,
                 ))
+            } else {
+                route
+            };
+            // Stateful inference is live-gated by the reconciler's active
+            // revision. The gate is read per request, so a cold replica can
+            // start with a refusal and begin serving immediately after a cache
+            // restore or control-plane publication, without rebuilding the
+            // router. Authentication remains outside this gate.
+            let route = if spec.auth == AuthPosture::Authenticated && state.0.revision.is_some() {
+                route.layer(from_fn_with_state(state.clone(), convergence_middleware))
             } else {
                 route
             };
@@ -172,6 +183,7 @@ fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
 /// envelope. Nothing here holds an [`AppState`]: there is no configuration to
 /// hold, which is the whole point. The replica diagnostic does hold one, so it
 /// is mounted alongside by [`diagnostic_router`] rather than from here.
+#[allow(dead_code)]
 pub fn unconverged_router(reason: &'static str) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -623,10 +635,39 @@ async fn healthz() -> &'static str {
 /// balancer can stop routing while the replica is still able to serve. Real
 /// dependency readiness (config loaded, credentials present) is a follow-up.
 async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
+    if state
+        .revision_report()
+        .is_some_and(|report| report.active.is_none())
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "unconverged");
+    }
     match state.lifecycle().phase() {
         Phase::Serving => (StatusCode::OK, "ready"),
         Phase::Draining | Phase::Closing => (StatusCode::SERVICE_UNAVAILABLE, "draining"),
     }
+}
+
+async fn convergence_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state
+        .revision_report()
+        .is_some_and(|report| report.active.is_none())
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": {
+                    "type": "inference_unavailable",
+                    "message": "the replica has no active projected revision",
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// This replica's own dependency status, projected into what the caller is

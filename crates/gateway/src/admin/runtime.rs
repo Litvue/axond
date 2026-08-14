@@ -31,7 +31,7 @@ use super::service::AdminService;
 use crate::availability::AvailabilityReader;
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
-use crate::backends::secrets::SecretError;
+use crate::backends::secrets::{SecretError, SecretResolver};
 use crate::config::{AdminBreakglass, Config, KeyMaterialSource, Mode};
 use crate::desired_state::ResourceScope;
 use crate::key_material::{self, KeyMaterialError};
@@ -97,6 +97,7 @@ pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<S
             api: None,
             mode: "stateless",
             control_plane: None,
+            secret_resolver: None,
         });
     }
     let (Some(control_plane), Some(breakglass)) = (
@@ -133,6 +134,7 @@ pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<S
         .as_ref()
         .ok_or(BootError::MissingSecretStore)?;
     let secrets = crate::backends::secrets::build(secret_store, control_plane, env).await?;
+    let resolver: Arc<dyn SecretResolver> = secrets.clone();
     let api = AdminApi::new(
         Arc::new(AdminService::stateful(Arc::clone(&store)).with_secrets(secrets)),
         Arc::new(authenticator),
@@ -142,6 +144,7 @@ pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<S
         api: Some(api),
         mode: "stateful",
         control_plane: Some(ObservedControlPlane { store, pacing }),
+        secret_resolver: Some(resolver),
     })
 }
 
@@ -155,6 +158,9 @@ pub struct Surface {
     /// The store administration was built on, or `None` in stateless mode where
     /// no store is opened at all.
     pub control_plane: Option<ObservedControlPlane>,
+    /// The read-only resolver used by candidate compilation. It is the same
+    /// store administration owns, so outages and ownership checks agree.
+    pub secret_resolver: Option<Arc<dyn SecretResolver>>,
 }
 
 impl Surface {
@@ -167,12 +173,24 @@ impl Surface {
     /// order satisfy both, with a single connection pool behind administration,
     /// the diagnostic, and an availability read.
     pub fn router(self, availability: Option<Arc<dyn AvailabilityReader>>) -> Router {
+        self.router_with_convergence(availability, None)
+    }
+
+    pub fn router_with_convergence(
+        self,
+        availability: Option<Arc<dyn AvailabilityReader>>,
+        convergence: Option<Arc<crate::convergence::RevisionStatus>>,
+    ) -> Router {
         let Some(api) = self.api else {
             return router::refusing_router();
         };
         let api = match availability {
             None => api,
             Some(reader) => api.with_availability(reader),
+        };
+        let api = match convergence {
+            None => api,
+            Some(status) => api.with_convergence(status),
         };
         router::router(Arc::new(api))
     }

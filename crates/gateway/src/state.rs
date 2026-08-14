@@ -161,6 +161,13 @@ impl ReplicaObservability {
         )
     }
 
+    /// Attach the one convergence report the reconciler writes.
+    #[must_use]
+    pub fn with_revision(mut self, revision: Arc<RevisionStatus>) -> Self {
+        self.revision = Some(revision);
+        self
+    }
+
     /// The plan a deployment's own stores imply: one probe per dependency that
     /// exposes a reachability handle, and nothing for the backends that have none.
     ///
