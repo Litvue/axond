@@ -251,7 +251,9 @@ fn the_dependency_map_is_complete_in_both_directions() {
 }
 
 /// Durable inventory is the only recovery stage that can claim restoration of
-/// the state introduced by the catalogue, pricing, and SecretStore slices.
+/// the state introduced by the catalogue and SecretStore slices. Pricing has a
+/// separate explicit blocker because origin/main has no operator publication
+/// path for an approved price book.
 /// Keep those edges exact: attaching one to serving or reconvergence would
 /// either make the wrong stage appear unblocked or overstate what the restore
 /// drill proves.
@@ -280,21 +282,38 @@ fn durable_inventory_owns_the_secret_catalogue_and_pricing_dependencies() {
             .collect::<BTreeSet<_>>()
     };
 
-    assert_eq!(
-        owners(145),
-        expected(&[
-            "backup-restore/durable-inventory",
-            "secret-rotation/rotation",
-        ])
-    );
-    assert_eq!(owners(146), expected(&["backup-restore/durable-inventory"]));
-    assert_eq!(owners(147), expected(&["backup-restore/durable-inventory"]));
+    assert_eq!(owners(145), expected(&["secret-rotation/rotation"]));
+    assert_eq!(owners(146), BTreeSet::new());
+    assert_eq!(owners(147), expected(&["backup-restore/pricing-history"]));
     assert_eq!(
         owners(158),
         expected(&[
             "cold-boot-no-cache/readiness",
             "cold-boot-invalid-cache/readiness",
         ])
+    );
+    let backup_inventory = manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == "backup-restore")
+        .and_then(|scenario| {
+            scenario
+                .stages
+                .iter()
+                .find(|stage| stage.id == "durable-inventory")
+        })
+        .expect("backup restore owns durable inventory evidence");
+    assert_eq!(backup_inventory.evidence, vec![Evidence::DurableInventory]);
+    let pitr_recovery = manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == "point-in-time-recovery")
+        .and_then(|scenario| scenario.stages.iter().find(|stage| stage.id == "recovery"))
+        .expect("PITR recovery owns durable inventory evidence");
+    assert!(pitr_recovery.evidence.contains(&Evidence::DurableInventory));
+    assert!(
+        !pitr_recovery.evidence.contains(&Evidence::DataLossBoundary),
+        "PITR durable inventory must not steal data_loss_boundary from usage-boundary"
     );
 }
 
@@ -422,6 +441,317 @@ fn every_executable_stage_names_the_lane_that_runs_it() {
             runner.as_str()
         );
     }
+}
+
+/// The shell lane owns the stages that need a promoted or restored database;
+/// the in-process driver must neither run them nor let a recovered catalogue
+/// bootstrap itself before its evidence is read.
+#[test]
+fn restore_drill_owns_restore_stages_and_reads_catalogue_before_recovered_boot() {
+    let manifest = recovery::load();
+    let durable = manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == "backup-restore")
+        .and_then(|scenario| {
+            scenario
+                .stages
+                .iter()
+                .find(|stage| stage.id == "durable-inventory")
+        })
+        .expect("backup-restore/durable-inventory is committed");
+    assert_eq!(durable.runner, Some(Runner::RestoreDrill));
+
+    let root = recovery::workspace_root();
+    let drill = std::fs::read_to_string(root.join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let stateful_driver =
+        std::fs::read_to_string(root.join("crates/gateway/src/qualification/recovery.rs"))
+            .expect("the stateful recovery driver is readable");
+    assert!(
+        !stateful_driver.contains("backup-restore/durable-inventory"),
+        "the in-process driver must not claim the restore-drill stage"
+    );
+
+    let logical_read = drill
+        .find("catalog_restore_content_id=\"$(psql logical_restore")
+        .expect("logical restore reads catalogue metadata");
+    let logical_boot = drill
+        .find("serve logical_restore")
+        .expect("logical restore boots a replica");
+    assert!(
+        logical_read < logical_boot,
+        "logical catalogue evidence must be read before a recovered replica boots"
+    );
+    let pitr_read = drill
+        .find("pitr_catalog_content_id=\"$(psql live 5433")
+        .expect("PITR reads catalogue metadata");
+    let pitr_boot = drill
+        .find("serve recovered")
+        .expect("PITR boots a recovered replica");
+    assert!(
+        pitr_read < pitr_boot,
+        "PITR catalogue evidence must be read before a recovered replica boots"
+    );
+    let live_boot = drill
+        .find("serve live \"$live_http\"")
+        .expect("the live replica boots before catalogue discovery");
+    let catalogue_poll = drill
+        .find("for _ in $(seq 60); do\n  catalog_content_id=\"$(psql live 5432")
+        .expect("the live catalogue pointer is polled after boot");
+    let initial_catalogue_read = drill
+        .find("catalog_raw_digest=\"$(psql live 5432")
+        .expect("the initial catalogue metadata read is present");
+    assert!(
+        live_boot < catalogue_poll && catalogue_poll < initial_catalogue_read,
+        "the initial catalogue metadata reads must wait for asynchronous import"
+    );
+    assert!(
+        drill.contains(
+            "fail \"catalogue import did not publish an active pointer within 60 seconds\""
+        ),
+        "catalogue discovery must fail clearly when its bounded wait expires"
+    );
+    assert!(
+        drill.contains(
+            "config logical_restore \"$live_port\" logical.toml \"$logical_http\" none empty false"
+        ),
+        "logical restore must use a non-repopulating catalogue config"
+    );
+    assert!(
+        drill.contains(
+            "config live \"$restored_port\" restored.toml \"$recovered_http\" none empty false"
+        ),
+        "PITR must use a non-repopulating catalogue config"
+    );
+    let checker = std::fs::read_to_string(root.join("ops/check-recovery-evidence.py"))
+        .expect("the evidence checker is readable");
+    assert!(
+        checker.contains("stage.get(\"runner\") == runner"),
+        "the evidence checker must select executable stages by their declared runner"
+    );
+    let tenant_publish = drill
+        .find("publish tenants \"${workdir}/tenant.json\"")
+        .expect("the tenant is published before secret staging");
+    let secret_stage = drill
+        .find("secret_stage_output=\"")
+        .expect("the secret is staged through the admin surface");
+    let remaining_publications = drill
+        .find("for pair in projects:project")
+        .expect("the remaining resources are published after secret staging");
+    assert!(
+        tenant_publish < secret_stage && secret_stage < remaining_publications,
+        "secret staging must occur after tenant ownership exists and before dependent resources publish"
+    );
+    assert!(
+        drill.contains(
+            "require \"the_restored_replica_fails_readiness_closed\" 503 \"$readiness_status\""
+        ),
+        "a restored replica that has not converged must keep readiness closed"
+    );
+    assert!(
+        drill.contains(
+            "require \"the_restored_replica_fails_inference_closed\" 503 \"$inference_status\""
+        ),
+        "an unready restored replica must fail the inference route closed"
+    );
+    assert!(
+        drill.contains(
+            "require \"the_restored_replica_names_inference_refusal\" inference_unavailable \"$inference_error\""
+        ),
+        "the unready inference refusal must retain its typed error"
+    );
+    assert!(
+        drill.contains("successes=\"$(unauthenticated_successes \"$logical_endpoint\")\"")
+            && drill.contains("gate max_unauthenticated_admin_successes \"$successes\""),
+        "the separate administrative authentication gate must remain enforced"
+    );
+}
+
+/// A durable-inventory artifact states every gate field, even though this
+/// inventory-only stage defers all six rather than pretending to measure them.
+#[test]
+fn durable_inventory_records_all_gate_fields_and_setup_failures() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let setup_failure = source
+        .find("record_durable_setup_failure()")
+        .expect("durable setup failure handling is present");
+    let start = source
+        .rfind("\nstage backup-restore/durable-inventory logical_restore")
+        .map(|offset| offset + 1)
+        .expect("the real durable-inventory stage is driven");
+    assert!(
+        start > setup_failure,
+        "gate assertions must anchor on the real durable-inventory stage, not its setup-failure helper"
+    );
+    let end = source[start..]
+        .find("stage backup-restore/administration")
+        .map(|offset| start + offset)
+        .expect("the durable-inventory stage has a bounded body");
+    let stage = &source[start..end];
+    for gate in [
+        "readiness",
+        "max_serving_error_fraction",
+        "max_convergence_lag_seconds",
+        "max_data_loss_revisions",
+        "admin_writes",
+        "max_unauthenticated_admin_successes",
+    ] {
+        assert!(
+            stage.contains(&format!("defer {gate}")),
+            "durable-inventory must record or defer {gate}"
+        );
+    }
+    assert!(
+        source.contains("record_durable_setup_failure"),
+        "setup failures must retain an evidence artifact before stopping the drill"
+    );
+}
+
+/// Catalogue resources carry the raw blob checksum, and CatalogRequest::plan
+/// accepts only the canonical `sha256:<64 lowercase hex>` spelling. The
+/// content id remains a separate pointer assertion in the restore stages.
+#[test]
+fn restore_drill_uses_the_catalog_request_raw_digest_spelling() {
+    let root = recovery::workspace_root();
+    let drill = std::fs::read_to_string(root.join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let checksum =
+        std::fs::read_to_string(root.join("crates/gateway/src/desired_state/canonical.rs"))
+            .expect("the checksum parser is readable");
+    assert!(
+        checksum.contains(".strip_prefix(CHECKSUM_ALGORITHM)")
+            && checksum.contains(".and_then(|rest| rest.strip_prefix(':'))"),
+        "the contract must track CatalogRequest's canonical sha256: parser"
+    );
+    assert!(
+        drill.contains("\"$catalog_raw_digest\" == sha256:*")
+            && drill.contains("\"digest\":\"${catalog_raw_digest}\""),
+        "the drill must validate and publish raw_digest in the accepted sha256: form"
+    );
+    assert!(
+        !drill.contains("\"digest\":\"${catalog_content_id}\""),
+        "content_id is a pointer assertion, not the catalogue resource raw digest"
+    );
+}
+
+/// Missing catalogue rows must become typed sentinels before the recorder sees
+/// them, so a failed restore closes an evidence artifact instead of aborting on
+/// `int("")` under the drill's `set -e` shell.
+#[test]
+fn restore_drill_normalizes_empty_catalogue_reads_before_observing_them() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    for expected in [
+        "catalog_restore_content_id=\"${catalog_restore_content_id:-missing}\"",
+        "catalog_restore_raw_digest=\"${catalog_restore_raw_digest:-missing}\"",
+        "catalog_restore_raw_bytes=\"${catalog_restore_raw_bytes:-0}\"",
+        "catalog_restore_payload_bytes=\"${catalog_restore_payload_bytes:-0}\"",
+        "catalog_restore_rows=\"${catalog_restore_rows:-0}\"",
+        "pitr_catalog_content_id=\"${pitr_catalog_content_id:-missing}\"",
+        "pitr_catalog_raw_digest=\"${pitr_catalog_raw_digest:-missing}\"",
+        "pitr_catalog_raw_bytes=\"${pitr_catalog_raw_bytes:-0}\"",
+        "pitr_catalog_payload_bytes=\"${pitr_catalog_payload_bytes:-0}\"",
+        "pitr_catalog_rows=\"${pitr_catalog_rows:-0}\"",
+    ] {
+        assert!(
+            source.contains(expected),
+            "missing recovery sentinel: {expected}"
+        );
+    }
+    for observation in [
+        "observe catalogue_preboot_content_id \"$catalog_restore_content_id\"",
+        "observe catalogue_preboot_raw_digest \"$catalog_restore_raw_digest\"",
+        "observe catalogue_preboot_raw_bytes \"$catalog_restore_raw_bytes\" count",
+        "observe catalogue_preboot_payload_bytes \"$catalog_restore_payload_bytes\" count",
+        "observe catalogue_preboot_snapshot_rows \"$catalog_restore_rows\" count",
+        "observe pitr_catalogue_preboot_content_id \"$pitr_catalog_content_id\"",
+        "observe pitr_catalogue_preboot_raw_digest \"$pitr_catalog_raw_digest\"",
+        "observe pitr_catalogue_preboot_raw_bytes \"$pitr_catalog_raw_bytes\" count",
+        "observe pitr_catalogue_preboot_payload_bytes \"$pitr_catalog_payload_bytes\" count",
+        "observe pitr_catalogue_preboot_snapshot_rows \"$pitr_catalog_rows\" count",
+    ] {
+        assert!(
+            source.contains(observation),
+            "normalized recovery value is not observed: {observation}"
+        );
+    }
+}
+
+/// Secret material is piped directly to the CLI, so the redaction contract does
+/// not depend on a temporary provider-key file surviving cleanup or appearing
+/// in an artifact directory.
+#[test]
+fn restore_drill_streams_provider_material_without_a_temp_file() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    assert!(
+        source.contains("secret_stage_output=\"$(printf '%s' \"$GW_DRILL_PROVIDER_KEY\" |")
+            && source.contains("admin secret stage --tenant \"$tenant\" --material-file -"),
+        "provider material must reach secret staging over stdin"
+    );
+    assert!(
+        source.contains("export GW_DRILL_KEK GW_DRILL_BREAKGLASS")
+            && !source.contains("export GW_DRILL_KEK GW_DRILL_BREAKGLASS GW_DRILL_PROVIDER_KEY")
+            && source.contains(
+                "GW_DRILL_PROVIDER_KEY=\"$GW_DRILL_PROVIDER_KEY\" \"$python_bin\" \"${root}/ops/check-recovery-evidence.py\"",
+            )
+            && source.contains("--forbid-env GW_DRILL_PROVIDER_KEY"),
+        "the provider key must stay shell-local while the evidence checker still forbids leakage"
+    );
+    assert!(
+        !source.contains("provider-key"),
+        "the provider material must not be written to a temporary file"
+    );
+}
+
+/// The drill compares the serialized per-version owner, whose spelling is the
+/// `SecretOwner` display contract, rather than assuming an undocumented JSON
+/// shape or a project decoration.
+#[test]
+fn restore_drill_uses_the_serialized_secret_version_owner_contract() {
+    let root = recovery::workspace_root();
+    let drill = std::fs::read_to_string(root.join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let admin_secrets = std::fs::read_to_string(root.join("crates/gateway/src/admin/secrets.rs"))
+        .expect("the admin secret view is readable");
+    let owners = std::fs::read_to_string(root.join("crates/gateway/src/desired_state/secrets.rs"))
+        .expect("the secret owner type is readable");
+    assert!(
+        admin_secrets.contains("owner: descriptor.owner.to_string()"),
+        "SecretVersionView must serialize its typed owner through Display"
+    );
+    assert!(
+        owners.contains("None => write!(f, \"{}\", self.tenant)"),
+        "a tenant-scoped SecretOwner must serialize as its tenant id"
+    );
+    assert!(
+        drill.contains("jq -r '.versions[0].owner // \"missing\"'")
+            && drill.contains("the serialized secret-version owner remains the drill tenant"),
+        "the drill must assert the stable serialized per-version owner"
+    );
+}
+
+/// `psql` runs in the database container, so host paths must be streamed over
+/// stdin rather than passed as container-local `-f` arguments.
+#[test]
+fn restore_drill_streams_the_secret_store_schema_into_the_container() {
+    let root = recovery::workspace_root();
+    let source = std::fs::read_to_string(root.join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    assert!(
+        root.join("ops/postgres/secret_store_v1.sql").is_file(),
+        "the drill's shipped secret-store schema must have an ops/postgres path"
+    );
+    assert!(
+        source.contains("psql live 5432 -f - <\"${root}/ops/postgres/secret_store_v1.sql\""),
+        "the secret-store schema must be streamed to psql over stdin"
+    );
+    assert!(
+        !source.contains("psql live 5432 -f \"${root}/crates/gateway/sql/secret_store_v1.sql\""),
+        "the drill must not pass a host-only schema path to container psql"
+    );
 }
 
 /// The prose contract and the manifest describe one harness. An operator reads

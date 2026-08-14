@@ -11,7 +11,7 @@ decomposes into five slices. They landed, and will land, at different depths:
 | --- | --- | --- | --- |
 | `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `evidenced` | Driver, eight committed profiles — including multi-tenant isolation, admission shedding, and a bounded stalling backend — reduced tier on every change, heavy tier on demand, and two retained runs. |
 | `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Two drivers and committed mixes — one stateless, one against a fleet with a durable usage sink — whose smoke tiers run in CI. Neither 12–24 hour tier has been dispatched. |
-| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver, committed scenarios, and nine stages running against a real Postgres in two lanes — the outage, the cold boots, convergence, a logical restore, and a point-in-time recovery. Every scenario still has a blocked stage: stateful serving is not assembled yet. |
+| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver, committed scenarios, and ten stages running against a real Postgres in two lanes — the outage, the cold boots, convergence, a logical restore, and a point-in-time recovery. Every scenario still has a blocked stage: stateful serving is not assembled yet. |
 | `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `unbuilt` | Nothing. The fake upstream already injects the provider faults a matrix would drive. |
 | `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver, committed scenarios, and a reduced tier in CI. The heavy tier has never been dispatched, and mixed-version serving waits on a stateful replica. |
 

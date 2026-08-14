@@ -343,9 +343,11 @@ id = "backup-restore"
 capability = "backup_restore"
 description = """
 The control-plane database is lost and restored from a backup taken while the \
-fleet was serving. Revisions, tenancy, secret metadata, pricing, and audit rows \
-all come back together; the restored journal hydrates its head revision; and the \
-replicas that kept serving converge onto it rather than fighting it."""
+fleet was serving. Revisions, tenancy, secret metadata, catalogue state, and \
+audit rows come back together; approved price-book history is not claimed because \
+its publication path remains blocked; the restored journal hydrates its head \
+revision; and the replicas that kept serving converge onto it rather than \
+fighting it."""
 
 [scenario.gate]
 max_serving_error_fraction = 0.0
@@ -382,26 +384,29 @@ evidence = ["audit_auth"]
 
 [[scenario.stage]]
 id = "durable-inventory"
-status = "blocked"
+status = "executable"
+runner = "restore-drill"
 covers = """
 The durable state a restore has to bring back beyond the journal and its \
-tenancy: wrapped secret material and its lifecycle, imported catalogue \
-snapshots, and effective-dated price books. Named per class rather than \
-counted, because a restore that brought back the revisions and lost the \
-material they reference is a restore that reads as complete."""
-evidence = ["data_loss_boundary"]
+tenancy: wrapped secret metadata and lifecycle, and the retained imported \
+catalogue snapshot selected by its active content pointer. Named per class rather \
+than counted, because a restore that brought back revisions and lost the material \
+or catalogue content they reference is a restore that reads as complete."""
+evidence = ["durable_inventory"]
 
-[[scenario.stage.blocked_on]]
-issue = 145
-needs = "the staging and rotation path for wrapped material, so a restore can be checked to bring secret metadata and its lifecycle back with the credentials that reference it"
-
-[[scenario.stage.blocked_on]]
-issue = 146
-needs = "an operator path that imports a catalogue snapshot, so a restored revision's blob references point at content that has to survive with it"
+[[scenario.stage]]
+id = "pricing-history"
+status = "blocked"
+covers = """
+Approved, effective-dated price-book history: the exact approved book, its \
+catalogue content identity and version, and the rules a restore must retain \
+alongside the revision journal. This stage remains explicit rather than claiming \
+pricing evidence from a database fixture the operator cannot publish."""
+evidence = ["pricing_history"]
 
 [[scenario.stage.blocked_on]]
 issue = 147
-needs = "effective-dated price books, so the restore covers pricing state and not only routing and tenancy state"
+needs = "origin/main has the pricing domain and request-path consumers, but no existing operator/admin publication path for an approved effective-dated price-book resource; adding one is outside this bounded recovery/evidence slice and must not be faked with direct SQL"
 
 [[scenario.stage]]
 id = "reconvergence"
@@ -446,8 +451,11 @@ publications, and the boundary measured in both directions: every revision \
 committed before the target is present in the promoted cluster, the revision \
 published after it is absent, the head is the pre-target revision, and a \
 replica booted on the recovered database reads that head and accepts a \
-publication against it."""
-evidence = ["outage_timeline", "revisions", "restore_duration", "revision_loss_boundary"]
+publication against it. The same pre-boot reads retain the tenant secret's \
+serialized owner and lifecycle, and the catalogue pointer, raw digest, byte \
+count, payload, and history-row count; those durable inventory facts must survive \
+the target as well."""
+evidence = ["outage_timeline", "revisions", "restore_duration", "durable_inventory", "revision_loss_boundary"]
 
 [[scenario.stage]]
 id = "administration"
@@ -489,6 +497,15 @@ needs = "a projection and the reconciler that publishes it in `serve`, so servin
 # of the slice and where it stays tracked. `RETIRED_BLOCKERS` in
 # `crates/gateway/tests/support/recovery.rs` repeats this list, and the contract
 # tests hold the two together.
+
+[[retired_blocker]]
+issue = 146
+became = """
+The durable catalogue state is now covered by `backup-restore/durable-inventory`: \
+the restore drill configures the existing Postgres catalogue store with the \
+offline seed and checks its active pointer, retained content id, and non-empty \
+payload after logical restore. The remaining #146 source/import behavior stays \
+tracked on #146 and is not reintroduced as a recovery blocker."""
 
 [[retired_blocker]]
 issue = 159

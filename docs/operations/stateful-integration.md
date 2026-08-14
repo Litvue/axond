@@ -192,7 +192,7 @@ IG-11 is furthest out, and the [qualification
 packet](./qualification.md) says why in the terms it owns: capacity is
 `evidenced`, endurance, rollout and recovery are `harnessed` with no heavy run
 behind them, and fault is `unbuilt`. Recovery gained its driver with #219 —
-nine stages against a real Postgres — but every one of its scenarios still has a
+ten stages against a real Postgres — but every one of its scenarios still has a
 blocked stage, for the reason above: stateful serving is not assembled.
 Everything measured so far is one stateless process. Nothing in this page's
 status column, and nothing merged so far, should be read as evidence that
