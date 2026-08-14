@@ -184,7 +184,7 @@ plaintext secret material. Set both fields or neither.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `cache_path` | path | unset | Per-replica file containing the signed last-known-good projected snapshot. |
-| `cache_key_env` | string | unset | Environment-variable name containing the cache signing key. The value is resolved at boot and is never logged. |
+| `cache_key_env` | string | unset | Environment-variable name containing canonical padded base64 for exactly 32 CSPRNG bytes. Leading/trailing whitespace and raw passphrases are refused; the value is never logged. |
 
 A valid cache permits cold boot during a control-plane outage. Missing, invalid,
 tampered, or keyless projected state remains fail-closed; the cache is not a
@@ -194,6 +194,11 @@ The current desired-state projection does not yet supply inbound caller
 principals, so stateful candidates report a typed `unsupported` refusal and the
 replica remains not Ready until that projection lands. Configuring the cache
 does not weaken that gate or create a keyless serving path.
+
+Generate `GW_LAST_KNOWN_GOOD_KEY` as one canonical padded base64 value from 32
+random bytes (for example, `openssl rand -base64 32` with its trailing newline
+removed). Do not use a human passphrase, add whitespace, or trim a value
+differently between replicas: the exact Secret bytes are the HMAC contract.
 
 #### `[[admin_breakglass]]`
 

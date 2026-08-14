@@ -319,7 +319,9 @@ the `axond-secrets` Secret first — including
 `GW_LAST_KNOWN_GOOD_KEY` — then apply the ConfigMap/overlay. Existing fleets
 must follow that order during rollout or the new cache reference can make Pods
 crash-loop before the signing key is present. The key authenticates the cache
-and is never put in the ConfigMap or diagnostics.
+and must be canonical padded base64 for the same 32 CSPRNG bytes on every
+replica; it is never put in the ConfigMap or diagnostics. Do not include
+leading/trailing whitespace or use a human passphrase.
 and see [Stateful backends](./stateful-backends.md) for choosing the stores and
 [backup and recovery](../operations/backup-and-recovery.md) for what has to be
 recoverable before the fleet holds anything.

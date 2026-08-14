@@ -435,13 +435,6 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
         generation: u64,
     ) -> Result<ConfigSnapshot, CompileError> {
         let id = revision.id();
-        let config = self
-            .projection
-            .project(&self.bootstrap, revision.state(), id)
-            .map_err(|source| CompileError::Projection {
-                revision: id,
-                source,
-            })?;
         if self.bootstrap.mode == crate::config::Mode::Stateful
             && !self.projection.projects_inbound_principals()
         {
@@ -450,6 +443,13 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
                 detail: "the active projection does not provide inbound caller principals",
             });
         }
+        let config = self
+            .projection
+            .project(&self.bootstrap, revision.state(), id)
+            .map_err(|source| CompileError::Projection {
+                revision: id,
+                source,
+            })?;
         config
             .validate_compiled()
             .map_err(|source| CompileError::Validation {
@@ -720,6 +720,24 @@ mod tests {
             error.to_string().contains("inbound caller principals"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn production_stateful_projection_cannot_claim_readiness_without_principals() {
+        let projection =
+            crate::convergence::PolicyProjection::over(crate::convergence::RuntimeProjection);
+        assert!(
+            !projection.projects_inbound_principals(),
+            "the current desired-state model has no inbound-principal projection"
+        );
+
+        let compiler = RevisionCompiler::new(stateful_bootstrap(), HashMap::new(), projection);
+        let error = match compiler.compile(&revision(), 1).await {
+            Ok(_) => panic!("the production stateful projection must remain fail-closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CompileError::Unsupported { .. }), "{error}");
+        assert!(!error.to_string().contains("gateway_key"), "{error}");
     }
 
     /// The reason the boot gate is *reused* rather than reimplemented: a

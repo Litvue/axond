@@ -24,10 +24,12 @@ port-forward as the acceptance checks instead.
 - A verified multi-architecture image-index digest. The committed all-zero
   digest is intentionally not pullable.
 - Four Secret values for this bootstrap: GW_CONTROL_PLANE_DSN,
-  GW_SECRET_STORE_KEK, GW_ADMIN_BREAKGLASS, and GW_LAST_KNOWN_GOOD_KEY. The KEK
-  must be the deployment's existing key material; changing it makes stored
-  ciphertext unrecoverable. Provision the last-known-good key before the
-  ConfigMap that names it.
+  GW_SECRET_STORE_KEK, GW_ADMIN_BREAKGLASS, and GW_LAST_KNOWN_GOOD_KEY. The
+  last-known-good value must be one canonical padded base64 string encoding 32
+  CSPRNG bytes, with no surrounding whitespace; use the same exact value on
+  every replica. The KEK must be the deployment's existing key material;
+  changing it makes stored ciphertext unrecoverable. Provision the
+  last-known-good key before the ConfigMap that names it.
 
 Resolve and verify the image before applying the overlay. Set
 `RELEASE_VERSION` to the verified release; the resolver updates both production
@@ -59,7 +61,7 @@ kubectl -n "$namespace" create secret generic axond-secrets \
   --from-literal=GW_CONTROL_PLANE_DSN='postgres://<user>:<password>@<host>:5432/<db>' \
   --from-literal=GW_SECRET_STORE_KEK='<base64-encoded-key-material>' \
   --from-literal=GW_ADMIN_BREAKGLASS='<breakglass-value>' \
-  --from-literal=GW_LAST_KNOWN_GOOD_KEY='<deployment-cache-signing-key>' \
+  --from-literal=GW_LAST_KNOWN_GOOD_KEY='<44-character-padded-base64-32-byte-key>' \
   --dry-run=client -o yaml | kubectl apply -f -
 
 ops/pin-image-digest.sh --check overlays/production-stateful

@@ -59,13 +59,14 @@
 //!   stateful bootstrap declares its own default, and a refusal that says so is
 //!   worth more than a config that fails the boot gate one step later.
 //!
-//! # Still not wired to `serve`
+//! # Serving boundary
 //!
-//! Nothing constructs this in `serve`, and this slice does not change that: a
-//! deployment whose aliases, providers, and credentials are all still file-owned
-//! gains nothing from projecting tenants, and the sections that would make it
-//! gain something are the later slices'. What exists here is the seam, exercised
-//! end to end through [`RevisionCompiler`](super::compile::RevisionCompiler).
+//! `serve` now constructs this projection as part of the stateful convergence
+//! chain. It remains deliberately incomplete for serving: the current desired
+//! state has no inbound-principal resource, so the compiler reports a typed
+//! unsupported refusal before publishing a keyless snapshot. This seam is
+//! exercised end to end through [`RevisionCompiler`](super::compile::RevisionCompiler)
+//! and becomes Ready only when that principal projection is added.
 //!
 //! Two things the runtime slice owns, recorded here because this module is what
 //! creates the need for them:
@@ -494,8 +495,10 @@ env = "GW_ADMIN_BREAKGLASS"
             "the refusal says default selection is still gated: {detail}"
         );
 
-        // Compiled, it is a `projection` refusal naming the missing default,
-        // rather than a `validation` one from the graph gate after the fact.
+        // The production stateful compiler rejects this projection chain at
+        // its serving capability boundary before compiling any keyless
+        // snapshot. The direct projection assertion above keeps the more
+        // specific missing-default diagnostic covered independently.
         let Err(error) = RevisionCompiler::with_secrets(
             bootstrap,
             env(),
@@ -507,8 +510,11 @@ env = "GW_ADMIN_BREAKGLASS"
         else {
             panic!("an incomplete bootstrap does not compile");
         };
-        assert_eq!(error.reason(), "projection");
-        assert!(error.to_string().contains("default namespace"), "{error}");
+        assert_eq!(error.reason(), "unsupported");
+        assert!(
+            error.to_string().contains("inbound caller principals"),
+            "{error}"
+        );
     }
 
     #[test]

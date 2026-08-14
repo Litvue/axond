@@ -20,7 +20,8 @@ bind = "0.0.0.0:8080"
 
 [convergence]
 # The mounted volume stores only authenticated projected state; the signing key
-# is supplied through axond-secrets as GW_LAST_KNOWN_GOOD_KEY.
+# is supplied through axond-secrets as GW_LAST_KNOWN_GOOD_KEY. That value is
+# canonical padded base64 for 32 CSPRNG bytes, with no surrounding whitespace.
 cache_path = "/var/lib/axond/last-known-good.snapshot"
 cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"
 

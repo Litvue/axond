@@ -290,7 +290,8 @@ pub struct ConvergenceConfig {
     #[serde(default)]
     pub cache_path: Option<String>,
     /// Environment variable containing the deployment-wide HMAC key reference.
-    /// The key itself never enters configuration or diagnostics.
+    /// Its value must be canonical padded base64 encoding of exactly 32 CSPRNG
+    /// bytes; the key itself never enters configuration or diagnostics.
     #[serde(default)]
     pub cache_key_env: Option<String>,
 }

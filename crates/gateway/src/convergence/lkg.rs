@@ -35,12 +35,21 @@
 //! canonical values; every credential is a *reference* that is resolved through
 //! the secret store during compilation, so a stolen cache file discloses topology
 //! an operator could read from the admin API, not keys.
+//!
+//! The deployment-facing signing key is standard padded base64 encoding of
+//! exactly 32 bytes (256 bits), generated from a CSPRNG. The parser rejects raw
+//! passphrases, non-canonical encodings, and leading or trailing whitespace, so
+//! every replica derives the same HMAC key from the same Secret bytes. The
+//! format enforces the 256-bit material size; only the operator's CSPRNG can
+//! supply its entropy.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use ring::hmac;
 
 use crate::desired_state::canonical::CanonicalDecodeError;
@@ -63,6 +72,11 @@ const RECORD_VERSION: u8 = 1;
 /// The shortest key accepted, in bytes. Shorter material would make the MAC a
 /// formality.
 const MIN_KEY_BYTES: usize = 32;
+/// The environment contract is a standard padded base64 encoding of one
+/// 256-bit deployment key. The encoding is fixed so every replica interprets
+/// the same Secret bytes identically; surrounding whitespace is not silently
+/// normalized into a different key.
+const ENCODED_KEY_BYTES: usize = 32;
 
 /// Why the last-known-good cache could not be written or read.
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +89,16 @@ pub enum LastKnownGoodError {
     },
     #[error("last-known-good signing material must be at least {MIN_KEY_BYTES} bytes, not {bytes}")]
     KeyTooShort { bytes: usize },
+    #[error(
+        "last-known-good signing material must be standard padded base64 encoding of exactly +         {ENCODED_KEY_BYTES} bytes"
+    )]
+    KeyEncoding,
+    #[error("last-known-good signing material must not have leading or trailing whitespace")]
+    KeyWhitespace,
+    #[error(
+        "last-known-good signing material must decode to exactly {ENCODED_KEY_BYTES} bytes, +         not {bytes}"
+    )]
+    KeyWrongLength { bytes: usize },
     /// The MAC did not verify: the file was edited, truncated, or written with a
     /// different key. Never repaired, never partially read.
     #[error(
@@ -118,6 +142,31 @@ impl std::fmt::Debug for LastKnownGood {
 }
 
 impl LastKnownGood {
+    /// Construct a cache from the deployment-facing key contract: canonical
+    /// padded standard base64, exactly 32 decoded bytes, and no surrounding
+    /// whitespace. The value is decoded only in memory and never enters an
+    /// error or diagnostic.
+    pub fn from_base64(
+        path: impl Into<PathBuf>,
+        encoded: &str,
+    ) -> Result<Self, LastKnownGoodError> {
+        if encoded.trim() != encoded {
+            return Err(LastKnownGoodError::KeyWhitespace);
+        }
+        let decoded = STANDARD
+            .decode(encoded)
+            .map_err(|_| LastKnownGoodError::KeyEncoding)?;
+        if decoded.len() != ENCODED_KEY_BYTES {
+            return Err(LastKnownGoodError::KeyWrongLength {
+                bytes: decoded.len(),
+            });
+        }
+        if STANDARD.encode(&decoded) != encoded {
+            return Err(LastKnownGoodError::KeyEncoding);
+        }
+        Self::new(path, &decoded)
+    }
+
     /// A cache at `path`, authenticated with `key`.
     ///
     /// The key is deployment-wide material an operator provisions like any other
@@ -880,5 +929,37 @@ mod tests {
             matches!(error, LastKnownGoodError::KeyTooShort { bytes } if bytes == 9),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_deployment_key_is_canonical_base64_of_exactly_256_bits() {
+        let encoded = STANDARD.encode([7u8; ENCODED_KEY_BYTES]);
+        let cache = LastKnownGood::from_base64(cache_path("encoded"), &encoded)
+            .expect("a canonical 256-bit key is accepted");
+        assert!(cache.path().to_string_lossy().contains("encoded"));
+
+        let short = STANDARD.encode([7u8; ENCODED_KEY_BYTES / 2]);
+        assert!(matches!(
+            LastKnownGood::from_base64(cache_path("short-encoded"), &short),
+            Err(LastKnownGoodError::KeyWrongLength { bytes }) if bytes == ENCODED_KEY_BYTES / 2
+        ));
+    }
+
+    #[test]
+    fn the_deployment_key_rejects_whitespace_and_noncanonical_encoding() {
+        let encoded = STANDARD.encode([9u8; ENCODED_KEY_BYTES]);
+        assert!(matches!(
+            LastKnownGood::from_base64(cache_path("leading-space"), &format!(" {encoded}")),
+            Err(LastKnownGoodError::KeyWhitespace)
+        ));
+        assert!(matches!(
+            LastKnownGood::from_base64(cache_path("trailing-newline"), &format!("{encoded}\n")),
+            Err(LastKnownGoodError::KeyWhitespace)
+        ));
+        let unpadded = encoded.trim_end_matches('=');
+        assert!(matches!(
+            LastKnownGood::from_base64(cache_path("unpadded"), unpadded),
+            Err(LastKnownGoodError::KeyEncoding)
+        ));
     }
 }

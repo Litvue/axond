@@ -329,6 +329,12 @@ fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, 
             None => {}
         }
     }
+    if let Some(name) = non_empty(config.convergence.cache_key_env.as_deref()) {
+        references.push((
+            "[convergence] cache_key_env".to_owned(),
+            Reference::Env(name.to_owned()),
+        ));
+    }
     for (index, breakglass) in config.admin_breakglass.iter().enumerate() {
         let key = format!("[[admin_breakglass]] #{}", index + 1);
         if let Some(name) = non_empty(breakglass.env.as_deref()) {
@@ -796,6 +802,54 @@ mod tests {
         assert!(
             !report.checks.iter().any(|check| check.name == "serving"),
             "stateless mode has no such refusal to report: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cache_key_is_preflighted_by_name_without_rendering_its_value() {
+        let toml = format!(
+            "{}\n[convergence]\ncache_path = \"/tmp/axond-lkg\"\ncache_key_env = \"GW_LAST_KNOWN_GOOD_KEY\"\n",
+            stateful_toml()
+        );
+        let path = write("axond-cache.toml", &toml);
+        let config = Config::from_toml_str(&toml).expect("valid stateful cache config");
+        let mut env = HashMap::from([
+            (
+                "GW_CONTROL_PLANE_DSN".to_owned(),
+                "postgres://axond@127.0.0.1:1/axond?connect_timeout=1".to_owned(),
+            ),
+            ("GW_KEK".to_owned(), "kek-material".to_owned()),
+            ("GW_BREAKGLASS".to_owned(), "breakglass-material".to_owned()),
+            (
+                "GW_LAST_KNOWN_GOOD_KEY".to_owned(),
+                "cache-signing-material-that-must-not-render".to_owned(),
+            ),
+        ]);
+        let report = run(&config, &path, &env).await;
+        let references = report
+            .checks
+            .iter()
+            .find(|check| check.name == "bootstrap references")
+            .expect("references are checked");
+        assert!(
+            matches!(references.outcome, Outcome::Passed(_)),
+            "{references}"
+        );
+        let rendered = report.to_string();
+        assert!(rendered.contains("bootstrap references"), "{rendered}");
+        assert!(
+            !rendered.contains("cache-signing-material-that-must-not-render"),
+            "preflight names references, never their values: {rendered}"
+        );
+
+        env.remove("GW_LAST_KNOWN_GOOD_KEY");
+        let report = run(&config, &path, &env).await;
+        let rendered = report.to_string();
+        assert!(!report.is_ok(), "an unset cache key must fail preflight");
+        assert!(rendered.contains("GW_LAST_KNOWN_GOOD_KEY"), "{rendered}");
+        assert!(
+            !rendered.contains("cache-signing-material-that-must-not-render"),
+            "the missing-reference diagnostic still cannot contain material: {rendered}"
         );
     }
 

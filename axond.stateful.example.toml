@@ -34,6 +34,9 @@ bind = "0.0.0.0:8080"
 # The cache is authenticated and contains projected state, never plaintext
 # secrets. A valid cache permits cold boot during a control-plane outage;
 # missing, invalid, or tampered cache state remains fail-closed.
+# GW_LAST_KNOWN_GOOD_KEY must be canonical padded base64 encoding of exactly 32
+# CSPRNG bytes, with no leading or trailing whitespace. Use the same value on
+# every replica; a human passphrase is not a cache key.
 
 [convergence]
 cache_path = "/var/lib/axond/last-known-good.snapshot"
