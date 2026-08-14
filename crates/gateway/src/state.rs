@@ -402,6 +402,18 @@ impl ConfigSnapshot {
         Self::build_with(config, env, generation, ResolvedSecrets::default())
     }
 
+    /// Build the keyless stateful bootstrap snapshot. It is intentionally not
+    /// a serving snapshot: the reconciler must replace it with a projected
+    /// snapshot containing inbound principals before authenticated traffic can
+    /// pass the convergence gate.
+    pub(crate) fn build_bootstrap(
+        config: Config,
+        env: &HashMap<String, String>,
+        generation: u64,
+    ) -> Result<Self, SnapshotError> {
+        Self::build_with_mode(config, env, generation, ResolvedSecrets::default(), true)
+    }
+
     /// [`ConfigSnapshot::build`], taking ownership of durable material a
     /// candidate's compilation already unwrapped.
     ///
@@ -413,6 +425,16 @@ impl ConfigSnapshot {
         env: &HashMap<String, String>,
         generation: u64,
         secrets: ResolvedSecrets,
+    ) -> Result<Self, SnapshotError> {
+        Self::build_with_mode(config, env, generation, secrets, false)
+    }
+
+    fn build_with_mode(
+        config: Config,
+        env: &HashMap<String, String>,
+        generation: u64,
+        secrets: ResolvedSecrets,
+        allow_keyless_bootstrap: bool,
     ) -> Result<Self, SnapshotError> {
         let gateway_token_epochs = configured_token_epochs(&config);
         // The one place both kinds of provider credential become one pool: env
@@ -491,19 +513,13 @@ impl ConfigSnapshot {
             gateway_key_fingerprints
                 .insert(label.to_owned(), key_material::fingerprint(label, &secret));
         }
-        // Inbound authentication fails closed: there is no keyless deployment
-        // that serves inference. A stateful replica cannot declare
-        // `[[gateway_key]]` at all — the section is rejected by
-        // `Config::validate_stateful` — because its inbound principals arrive
-        // with a compiled revision instead of the file, and until that compiler
-        // exists the runtime answers every inference request with
-        // `ops::inference_refusal` instead of the snapshot. A keyless snapshot
-        // is therefore admissible exactly while that refusal stands, and the
-        // condition is asked of the refusal itself rather than of the mode: when
-        // the projection lands and `inference_refusal` returns `None`, this
-        // rejects the keyless snapshot again with no edit here, which is the
-        // only ordering that cannot serve inference from an empty snapshot.
-        if inbound_keys.is_empty() && crate::ops::inference_refusal(&config).is_none() {
+        // Inbound authentication fails closed: no serving snapshot may be
+        // keyless. The sole exception is the stateful bootstrap object held
+        // before the reconciler has projected a revision; that object is
+        // rejected by the serving gate and can never authenticate a request.
+        if inbound_keys.is_empty()
+            && !(allow_keyless_bootstrap && config.mode == crate::config::Mode::Stateful)
+        {
             return Err(SnapshotError::NoInboundKeys);
         }
         let inbound_keys: Arc<[GatewayKeyEntry]> = inbound_keys.into();
@@ -870,7 +886,11 @@ impl AppState {
         // restart rather than swapping the pool under in-flight requests.
         let limits = config.transport.limits();
         let admission = AdmissionControl::from_config(&config.admission);
-        let snapshot = ConfigSnapshot::build(config, env, 0)?;
+        let snapshot = if config.mode == crate::config::Mode::Stateful {
+            ConfigSnapshot::build_bootstrap(config, env, 0)?
+        } else {
+            ConfigSnapshot::build(config, env, 0)?
+        };
         Ok(AppState(Arc::new(Inner {
             dispatcher: HttpDispatcher::with_limits(
                 build_client(&limits).expect("the upstream HTTP client builds"),
@@ -1507,12 +1527,10 @@ namespace = "platform"
         );
     }
 
-    /// A stateful deployment may not declare `[[gateway_key]]` at all — its
-    /// inbound principals arrive with a compiled revision — so it must compile
-    /// a keyless snapshot rather than hit the fail-closed refusal stateless
-    /// mode answers with; otherwise the administrative surface never binds.
+    /// A stateful deployment starts with a keyless bootstrap object, but that
+    /// object is not admissible as a serving snapshot.
     #[test]
-    fn a_stateful_deployment_compiles_without_an_inbound_key() {
+    fn a_stateful_bootstrap_compiles_without_an_inbound_key() {
         let env = HashMap::new();
         let stateful = Config::from_toml_str(
             r#"
@@ -1529,18 +1547,15 @@ env = "GW_ADMIN_BREAKGLASS"
 "#,
         )
         .expect("valid stateful bootstrap");
-        let snapshot = ConfigSnapshot::build(stateful, &env, 0).expect("compiles keyless");
+        let snapshot =
+            ConfigSnapshot::build_bootstrap(stateful, &env, 0).expect("compiles keyless bootstrap");
         assert_eq!(snapshot.inbound_key_count(), 0);
     }
 
-    /// The keyless snapshot above is admissible only because the runtime answers
-    /// inference with [`crate::ops::inference_refusal`] instead of that snapshot.
-    /// This is the coupling, asserted rather than described: a mode that would
-    /// serve inference from a snapshot has to have an inbound key, so a future
-    /// change that stops refusing stateful inference fails here instead of
-    /// authenticating callers against an empty key set.
+    /// A normal candidate build never permits a keyless stateful snapshot. The
+    /// explicit bootstrap constructor is the only keyless path.
     #[test]
-    fn only_a_mode_whose_inference_is_refused_may_compile_without_an_inbound_key() {
+    fn stateful_candidates_require_projected_inbound_keys() {
         // A mode that serves inference has no keyless form to begin with:
         // configuration refuses it before a snapshot is ever built.
         let error = Config::from_toml_str(
@@ -1568,13 +1583,10 @@ env = "GW_ADMIN_BREAKGLASS"
 "#,
         )
         .expect("a valid stateful bootstrap");
-        assert!(
-            crate::ops::inference_refusal(&stateful).is_some(),
-            "a keyless stateful snapshot is admissible only while inference is refused; \
-             when the revision projection lands, `ConfigSnapshot::build` must require a key \
-             again rather than authenticate callers against an empty key set"
-        );
-        assert!(ConfigSnapshot::build(stateful, &HashMap::new(), 0).is_ok());
+        assert!(matches!(
+            ConfigSnapshot::build(stateful, &HashMap::new(), 0),
+            Err(SnapshotError::NoInboundKeys)
+        ));
     }
 
     /// The secret is held as `SecretString`, so debugging or logging an entry

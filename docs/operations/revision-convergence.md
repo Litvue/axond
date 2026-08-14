@@ -5,16 +5,12 @@ In stateful mode, a change is *published* to the control plane and then
 half: how fast it is, what a replica reports about itself, what happens when it
 cannot converge, and how a replica boots while PostgreSQL is unavailable.
 
-Stateful mode is still being assembled: this is the convergence layer
-([#142](https://github.com/Litvue/axond/issues/142)), built on the revision
-journal ([#165](https://github.com/Litvue/axond/issues/165)). The loop, its
-telemetry, and the signed cache are complete and tested, but `serve` does not yet
-construct them. Tenants and projects have durable schemas and a projection
-([#191](https://github.com/Litvue/axond/issues/191)); the remaining resource
-*bodies* (providers, credentials, catalogue models, prices, policies) belong to
-the slices that own those schemas. Read
-[ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) for the mode as
-a whole.
+Stateful serving uses the convergence layer
+([#142](https://github.com/Litvue/axond/issues/142)) over the revision journal
+([#165](https://github.com/Litvue/axond/issues/165)). The runtime binds its
+listener before the first bounded bootstrap attempt, then publishes only
+complete projected snapshots. Read [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md)
+for the mode as a whole.
 
 ## How a change reaches a replica
 

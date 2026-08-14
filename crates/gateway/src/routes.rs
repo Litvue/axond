@@ -110,21 +110,23 @@ fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
             } else {
                 route
             };
+            // Stateful inference is live-gated by the reconciler's active
+            // revision. The gate is read per request, so a cold replica can
+            // start with a refusal and begin serving immediately after a cache
+            // restore or control-plane publication, without rebuilding the
+            // router. Apply it before authentication so authentication remains
+            // the first externally visible refusal: an anonymous caller gets
+            // `401`, never a convergence-state `503`.
+            let route = if spec.auth == AuthPosture::Authenticated && state.0.revision.is_some() {
+                route.layer(from_fn_with_state(state.clone(), convergence_middleware))
+            } else {
+                route
+            };
             let route = if spec.auth.requires_a_credential() {
                 route.layer(from_fn_with_state(
                     (state.clone(), spec.capability),
                     authenticate_middleware,
                 ))
-            } else {
-                route
-            };
-            // Stateful inference is live-gated by the reconciler's active
-            // revision. The gate is read per request, so a cold replica can
-            // start with a refusal and begin serving immediately after a cache
-            // restore or control-plane publication, without rebuilding the
-            // router. Authentication remains outside this gate.
-            let route = if spec.auth == AuthPosture::Authenticated && state.0.revision.is_some() {
-                route.layer(from_fn_with_state(state.clone(), convergence_middleware))
             } else {
                 route
             };
@@ -5056,23 +5058,11 @@ min_iat = {}
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// A stateful replica is administrable before it is servable. Its inference
-    /// surface must say so per request rather than answer an empty configuration:
-    /// an unknown-model `404` or an unauthorized `401` would read, to a caller,
-    /// as a deployment that is configured and simply lacks what was asked for.
+    /// The legacy unconverged surface remains useful for a process that has no
+    /// runtime snapshot at all; its response is a coarse serving refusal.
     #[tokio::test]
     async fn an_unconverged_replica_refuses_inference_without_pretending_to_be_ready() {
-        let reason = crate::ops::inference_refusal(
-            &crate::config::Config::from_toml_str(
-                "mode = \"stateful\"\n\
-                 [control_plane]\ndsn_env = \"GW_CONTROL_PLANE_DSN\"\n\
-                 [secret_store]\nkek_env = \"GW_KEK\"\n\
-                 [[admin_breakglass]]\nenv = \"GW_BREAKGLASS\"\n",
-            )
-            .expect("a valid stateful config"),
-        )
-        .expect("stateful inference is refused");
-        let app = unconverged_router(reason);
+        let app = unconverged_router("no projected serving snapshot");
 
         let live = app
             .clone()
@@ -5106,10 +5096,45 @@ min_iat = {}
             assert!(
                 body["error"]["message"]
                     .as_str()
-                    .is_some_and(|message| message.contains("stateful")),
-                "the refusal names the mode that caused it: {body}"
+                    .is_some_and(|message| message.contains("projected")),
+                "the refusal names the missing serving posture: {body}"
             );
         }
+    }
+
+    /// Convergence is an authenticated serving condition, not an anonymous
+    /// disclosure channel. A stateful bootstrap has a revision gate but no
+    /// inbound keys, so an anonymous caller must see the auth refusal first.
+    #[tokio::test]
+    async fn an_unconverged_stateful_route_authenticates_before_reporting_convergence() {
+        let config = Config::from_toml_str(
+            "mode = \"stateful\"\n\
+             [control_plane]\ndsn_env = \"GW_CONTROL_PLANE_DSN\"\n\
+             [secret_store]\nkek_env = \"GW_KEK\"\n\
+             [[admin_breakglass]]\nenv = \"GW_BREAKGLASS\"\n",
+        )
+        .expect("valid stateful config");
+        let state = AppState::new_with_observability(
+            config,
+            &HashMap::new(),
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            ReplicaObservability {
+                status: observed_registry(),
+                revision: Some(Arc::new(crate::convergence::RevisionStatus::new(Box::new(
+                    crate::convergence::SystemClock,
+                )))),
+                catalogue: None,
+            },
+        )
+        .expect("bootstrap state");
+        let response = router(state)
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// Draining is what a rolling deployment observes, and it must not take the

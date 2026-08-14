@@ -92,6 +92,16 @@ pub enum BootError {
 /// what makes an inference key powerless here — a second port would only make
 /// them separated by firewall rules.
 pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<Surface, BootError> {
+    surface_with_change_signal(config, env, None).await
+}
+
+/// Build the administrative surface and optionally wake the serving
+/// reconciler after a durable publication or secret lifecycle change.
+pub async fn surface_with_change_signal(
+    config: &Config,
+    env: &HashMap<String, String>,
+    change_signal: Option<Arc<crate::convergence::ChangeSignal>>,
+) -> Result<Surface, BootError> {
     if config.mode == Mode::Stateless {
         return Ok(Surface {
             api: None,
@@ -135,8 +145,11 @@ pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<S
         .ok_or(BootError::MissingSecretStore)?;
     let secrets = crate::backends::secrets::build(secret_store, control_plane, env).await?;
     let resolver: Arc<dyn SecretResolver> = secrets.clone();
+    let service = AdminService::stateful(Arc::clone(&store))
+        .with_secrets(secrets)
+        .with_change_signal(change_signal);
     let api = AdminApi::new(
-        Arc::new(AdminService::stateful(Arc::clone(&store)).with_secrets(secrets)),
+        Arc::new(service),
         Arc::new(authenticator),
         Arc::new(BreakglassAuthorizer),
     );

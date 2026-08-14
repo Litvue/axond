@@ -577,9 +577,15 @@ async fn serve() -> anyhow::Result<()> {
     // the listener exists: a stateful replica whose administrative surface cannot
     // come up must fail at boot rather than serve a deployment nobody can
     // administer. In stateless mode this opens nothing at all.
-    let admin = admin::runtime::surface(&config, &env).await.map_err(|e| {
-        anyhow::anyhow!("a stateful deployment could not bring up its administrative surface: {e}")
-    })?;
+    let change_signal =
+        (config.mode == Mode::Stateful).then(|| Arc::new(convergence::ChangeSignal::new()));
+    let admin = admin::runtime::surface_with_change_signal(&config, &env, change_signal.clone())
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "a stateful deployment could not bring up its administrative surface: {e}"
+            )
+        })?;
     tracing::info!(
         mode = admin.mode,
         prefix = admin::ADMIN_PREFIX,
@@ -691,9 +697,8 @@ async fn serve() -> anyhow::Result<()> {
     // shutdown is the one point where durability outranks the request path.
     let resources = state.clone();
     // Assemble the stateful convergence loop only after its immutable serving
-    // state exists. Bootstrap failures intentionally leave the process alive
-    // with authenticated administration and a fail-closed inference/readiness
-    // surface; the loop can then recover when Postgres or a valid cache returns.
+    // state exists. The first bootstrap attempt is started after the listener
+    // binds, so a slow control plane cannot delay liveness registration.
     let reconciler = if config.mode == Mode::Stateful {
         let store = admin
             .control_plane
@@ -726,12 +731,6 @@ async fn serve() -> anyhow::Result<()> {
                 .clone()
                 .expect("stateful mode has a convergence status"),
         ));
-        match reconciler.bootstrap().await {
-            Ok(revision) => tracing::info!(%revision, "stateful serving snapshot ready"),
-            Err(error) => {
-                tracing::warn!(error = %error, "stateful serving is waiting for convergence")
-            }
-        }
         Some(reconciler)
     } else {
         None
@@ -785,11 +784,25 @@ async fn serve() -> anyhow::Result<()> {
                 .await;
         })
     });
+    let (stop_converging, stop_converging_rx) = tokio::sync::oneshot::channel::<()>();
     let converging = reconciler.map(|reconciler| {
         let shutdown = Arc::clone(&lifecycle);
-        let signal = Arc::new(convergence::ChangeSignal::new());
+        let signal = change_signal
+            .clone()
+            .expect("stateful mode has a convergence change signal");
         tokio::spawn(async move {
-            reconciler.run(signal, shutdown.closed()).await;
+            tokio::select! {
+                _ = stop_converging_rx => {
+                    tracing::debug!("stateful convergence stopped by serve shutdown");
+                }
+                _ = async {
+                    match reconciler.bootstrap().await {
+                        Ok(revision) => tracing::info!(%revision, "stateful serving snapshot ready"),
+                        Err(error) => tracing::warn!(error = %error, "stateful serving is waiting for convergence"),
+                    }
+                    reconciler.run(signal, shutdown.closed()).await;
+                } => {}
+            }
         })
     });
     let served = axum::serve(listener, app).with_graceful_shutdown(drain);
@@ -805,6 +818,7 @@ async fn serve() -> anyhow::Result<()> {
     if let Some(refreshing) = refreshing {
         let _ = refreshing.await;
     }
+    let _ = stop_converging.send(());
     if let Some(converging) = converging {
         let _ = converging.await;
     }

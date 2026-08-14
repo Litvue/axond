@@ -69,8 +69,10 @@ use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::secrets::SecretStore;
 use crate::config::Mode;
-use crate::convergence::RevisionReport;
+<<<<<<< HEAD
+use crate::convergence::{ChangeSignal, RevisionReport};
 use crate::desired_state::models::legacy_alias_allowlist;
+>>>>>>> 5116c504 (Complete stateful serving convergence assurance)
 use crate::desired_state::{
     AccessDenial, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
     LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
@@ -211,6 +213,10 @@ pub struct AdminService {
     /// constructed only by the administrative runtime, and [`crate::routes`]
     /// holds no [`AdminApi`](super::router::AdminApi).
     pub(super) secrets: Option<Arc<dyn SecretStore>>,
+    /// Coalescing wake-up for the serving reconciler. Durable publications and
+    /// secret lifecycle changes are control-plane events, not request-path
+    /// work, so the service only nudges the existing compiler loop.
+    pub(super) change_signal: Option<Arc<ChangeSignal>>,
     ids: Uuid7Generator,
 }
 
@@ -221,6 +227,7 @@ impl AdminService {
         Self {
             store: None,
             secrets: None,
+            change_signal: None,
             ids: Uuid7Generator::new(),
         }
     }
@@ -229,6 +236,7 @@ impl AdminService {
         Self {
             store: Some(store),
             secrets: None,
+            change_signal: None,
             ids: Uuid7Generator::new(),
         }
     }
@@ -238,6 +246,13 @@ impl AdminService {
     #[must_use]
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
         self.secrets = Some(secrets);
+        self
+    }
+
+    /// Attach the replica-local convergence wake-up.
+    #[must_use]
+    pub fn with_change_signal(mut self, signal: Option<Arc<ChangeSignal>>) -> Self {
+        self.change_signal = signal;
         self
     }
 
@@ -749,6 +764,9 @@ impl AdminService {
             });
         }
         let manifest = store.publish_revision(candidate).await.map_err(log_store)?;
+        if let Some(signal) = &self.change_signal {
+            signal.notify();
+        }
         // The store replays a repeated key carrying identical state by returning
         // the revision the *first* call published, whose mutation is therefore not
         // this one's. That is the only difference between publishing and

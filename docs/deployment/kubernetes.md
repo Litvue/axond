@@ -187,11 +187,10 @@ Autoscaling on CPU does not make `[admission]` ceilings fleet-wide — read
 `deploy/kubernetes/overlays/production-stateful` is the production overlay plus
 the `deploy/kubernetes/components/stateful` component, and it deploys a fleet
 with a different lifecycle: a stateful replica boots, serves `/admin/v1` against
-the control plane, and refuses inference with a typed
-`503 inference_unavailable` until a published revision compiles into a runtime
-snapshot ([revision convergence](../operations/revision-convergence.md)). Until
-that ships, **no replica ever reports Ready**, and three defaults of a serving
-fleet become wrong at once. The component answers each:
+the control plane, and remains fail-closed until a published revision or valid
+last-known-good cache compiles into a runtime snapshot ([revision convergence](../operations/revision-convergence.md)).
+Until that snapshot is active, **no replica reports Ready**, and three defaults
+of a serving fleet become wrong at once. The component answers each:
 
 - **The upgrade.** `Recreate`, replacing the base's rolling update: a rolling
   update with `maxUnavailable: 0` waits for an availability that never arrives,
@@ -304,8 +303,8 @@ kubectl apply -k deploy/kubernetes/overlays/production-stateful
 ```
 
 `axond migrate status` — the same binary, read-only — is what tells a
-crash-looping replica apart from one refusing inference: the first reports a
-schema behind the binary, the second reports it current.
+crash-looping replica apart from one waiting for a projected serving snapshot:
+the first reports a schema behind the binary, the second reports it current.
 
 The overlay pins its own images, because the production overlay's transformer
 never sees the Job: `ops/pin-image-digest.sh` resolves the sentinel in
@@ -315,7 +314,8 @@ and its `--check` refuses either while unresolved. The mounted
 KEK, and a break-glass principal, and declares no providers, models, aliases, or
 tenants: in this mode the control plane owns them, and a bootstrap that also
 declares them fails to boot. Supply `GW_CONTROL_PLANE_DSN`,
-`GW_SECRET_STORE_KEK`, and `GW_ADMIN_BREAKGLASS` in the `axond-secrets` Secret,
+`GW_SECRET_STORE_KEK`, `GW_ADMIN_BREAKGLASS`, and `GW_LAST_KNOWN_GOOD_KEY` in the
+`axond-secrets` Secret,
 and see [Stateful backends](./stateful-backends.md) for choosing the stores and
 [backup and recovery](../operations/backup-and-recovery.md) for what has to be
 recoverable before the fleet holds anything.

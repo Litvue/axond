@@ -76,14 +76,13 @@ exclusive: there is no per-resource migration state, and therefore no merge
 policy between a file and a database. It is a bootstrap property, so a reload
 cannot switch a serving process between modes — that needs a restart.
 
-**A stateful replica administers today and serves inference later.** It boots,
-opens the control plane, and serves `/admin/v1` — see
-[administering a stateful deployment](./operations/admin-api.md) — but a
-published revision cannot be compiled into a runtime snapshot yet, so `/readyz`
-stays `503` and every `/v1` route answers `503 inference_unavailable` rather than
-an empty configuration. Serve inference from `mode = "stateless"` until
-[revision convergence](./operations/revision-convergence.md) ships, and read the
-ADR's ownership and failure matrices before planning a deployment.
+**A stateful replica administers and serves only projected state.** It opens the
+control plane and serves `/admin/v1` — see [administering a stateful deployment]
+(./operations/admin-api.md) — while inference remains fail-closed until a
+projected snapshot or valid signed last-known-good cache is active. Once active,
+the immutable snapshot keeps serving through a control-plane outage. See
+[revision convergence](./operations/revision-convergence.md) for recovery and
+read the ADR's ownership and failure matrices before planning a deployment.
 
 ### Stateful bootstrap
 
@@ -174,6 +173,22 @@ restaged under the new one. Timeouts are inherited from `[control_plane]`, since
 encrypted Postgres is normally the same database and two independent sets of
 bounds for one server is a knob with no decision behind it. See
 [ADR 0039](./adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md).
+
+#### `[convergence]`
+
+Optional in stateful mode. It controls the authenticated local
+last-known-good snapshot used only when a replica cold-boots while the control
+plane is unreachable. The cache contains projected state and references, never
+plaintext secret material. Set both fields or neither.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `cache_path` | path | unset | Per-replica file containing the signed last-known-good projected snapshot. |
+| `cache_key_env` | string | unset | Environment-variable name containing the cache signing key. The value is resolved at boot and is never logged. |
+
+A valid cache permits cold boot during a control-plane outage. Missing, invalid,
+tampered, or keyless projected state remains fail-closed; the cache is not a
+fallback for a candidate that fails validation or secret resolution.
 
 #### `[[admin_breakglass]]`
 

@@ -5,15 +5,21 @@
 # the repository documents every field, including the optional enforcement
 # backends this manifest leaves off.
 #
-# The three references below are supplied by the `axond-secrets` Secret the
-# container takes with `envFrom`: GW_CONTROL_PLANE_DSN, GW_SECRET_STORE_KEK, and
-# GW_ADMIN_BREAKGLASS. The base's published placeholder Secret carries none of
+# The four references below are supplied by the `axond-secrets` Secret the
+# container takes with `envFrom`: GW_CONTROL_PLANE_DSN, GW_SECRET_STORE_KEK,
+# GW_ADMIN_BREAKGLASS, and GW_LAST_KNOWN_GOOD_KEY. The base's published placeholder Secret carries none of
 # them, which is deliberate — a stateful deployment supplies its own.
 
 mode = "stateful"
 
 [server]
 bind = "0.0.0.0:8080"
+
+[convergence]
+# The mounted volume stores only authenticated projected state; the signing key
+# is supplied through axond-secrets as GW_LAST_KNOWN_GOOD_KEY.
+cache_path = "/var/lib/axond/last-known-good.snapshot"
+cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"
 
 [control_plane]
 dsn_env = "GW_CONTROL_PLANE_DSN"
