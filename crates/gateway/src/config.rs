@@ -460,9 +460,9 @@ pub struct Namespace {
     /// Never read from TOML: a file has no tenants or projects to name, and an id
     /// shaped like one would be a claim about durable state the file cannot make.
     ///
-    /// Consumed by the later runtime slice, which keys per-namespace durable state
-    /// on it rather than on the renameable [`Namespace::id`]; nothing in this build
-    /// serves a projected namespace yet.
+    /// Consumed by the runtime, which keys per-namespace durable state on it
+    /// rather than on the renameable [`Namespace::id`]. A projected namespace
+    /// is served only after a complete stateful candidate has been published.
     #[serde(skip)]
     #[allow(dead_code)]
     pub project: Option<ProjectIdentity>,
@@ -2576,7 +2576,14 @@ impl Config {
                 )));
             }
         }
-        self.validate_gateway_keys(&namespaces)?;
+        // A stateful candidate may replace file-owned gateway keys with
+        // digest-backed principals projected from durable workload identities.
+        // The empty-key refusal still applies to every candidate: this branch
+        // is reachable only when at least one projected principal has already
+        // passed the namespace and subject checks above.
+        if self.mode != Mode::Stateful || self.projected_principals.is_empty() {
+            self.validate_gateway_keys(&namespaces)?;
+        }
         self.validate_gateway_verifiers(&namespaces)?;
         self.validate_gateway_minting(&namespaces)?;
         self.validate_gateway_token_epochs(&namespaces)?;

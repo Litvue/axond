@@ -9,6 +9,14 @@ therefore **Running and not Ready**: /healthz returns 200, /readyz returns
 production overlay for inference traffic until revision convergence is wired
 into serve.
 
+For durable per-replica last-known-good storage, use the separate
+`deploy/kubernetes/overlays/production-stateful-persistent` option documented in
+the [Kubernetes deployment guide](../deployment/kubernetes.md#durable-statefulset-option).
+The procedure below intentionally remains the Recreate/emptyDir path; it is the
+safe default while the serving path is still fail-closed. The persistent option
+uses the same Secret and migration ordering, but creates retained PVCs and
+requires explicit Pod replacement because its StatefulSet uses `OnDelete`.
+
 This distinction is important during an incident: Kubernetes availability and
 inference availability are not claims this overlay makes today. The procedure
 below treats the migration Job, Pod state, and the direct administrative

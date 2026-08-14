@@ -1,0 +1,22 @@
+# Durable stateful option for replicas that need to retain their signed
+# last-known-good snapshot across Pod replacement. The existing
+# `production-stateful` overlay remains the fail-closed Recreate/emptyDir
+# deployment; this overlay is opt-in and replaces only its workload shape.
+#
+# The parent carries the stateful ConfigMap, migration Job, policies, and
+# administrative boundary. The delete patch removes the parent's Deployment,
+# while the StatefulSet below supplies stable per-replica PVC identities.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../production-stateful
+  - statefulset.yaml
+  - headless-service.yaml
+patches:
+  - path: delete-deployment.yaml
+images:
+  - name: ghcr.io/litvue/axond
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: axond

@@ -74,10 +74,10 @@ pub trait RevisionProjection: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Whether this projection supplies the inbound caller principals required
-    /// by a stateful serving snapshot. The current desired-state projection
-    /// owns tenancy, credentials, and policy, but it does not yet own gateway
-    /// principals. Stateful compilation must therefore refuse explicitly until
-    /// a projection can provide them; an empty key set is never an auth bypass.
+    /// by a stateful serving snapshot. A projection may expose this capability
+    /// before a particular revision contains any usable workload identity; the
+    /// snapshot builder still rejects an empty key set, so this is never an auth
+    /// bypass.
     fn projects_inbound_principals(&self) -> bool {
         false
     }
@@ -133,10 +133,10 @@ pub enum ProjectionError {
 /// is usually secret material that is missing or wrong.
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
-    /// The projection is structurally valid but this build does not yet have
-    /// the durable inbound-principal source needed to serve it statefully.
-    /// Keeping this distinct from a malformed snapshot makes the readiness and
-    /// operator status honest without weakening authentication.
+    /// The projection is structurally valid but this build does not have the
+    /// durable capability needed to serve it statefully. Keeping this distinct
+    /// from a malformed snapshot makes readiness and operator status honest
+    /// without weakening authentication.
     #[error("revision {revision} is unsupported for stateful serving: {detail}")]
     Unsupported {
         revision: RevisionId,
@@ -615,9 +615,9 @@ namespace = "platform"
         .expect("a valid bootstrap config")
     }
 
-    /// The stateful bootstrap deliberately has no inbound key. It is useful
-    /// here to prove that a projection which cannot add caller principals is
-    /// rejected before it reaches validation or secret materialization.
+    /// The stateful bootstrap deliberately has no static inbound key. It is
+    /// useful here to prove that a projection must supply one from durable
+    /// state before a serving snapshot can be built.
     pub(crate) fn stateful_bootstrap() -> Config {
         Config::from_toml_str(
             r#"
@@ -722,21 +722,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_stateful_projection_cannot_claim_readiness_without_principals() {
+    async fn production_stateful_projection_compiles_a_projected_workload_principal() {
         let projection =
             crate::convergence::PolicyProjection::over(crate::convergence::RuntimeProjection);
         assert!(
-            !projection.projects_inbound_principals(),
-            "the current desired-state model has no inbound-principal projection"
+            projection.projects_inbound_principals(),
+            "the production projection must expose its durable principal capability"
         );
 
-        let compiler = RevisionCompiler::new(stateful_bootstrap(), HashMap::new(), projection);
-        let error = match compiler.compile(&revision(), 1).await {
-            Ok(_) => panic!("the production stateful projection must remain fail-closed"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, CompileError::Unsupported { .. }), "{error}");
-        assert!(!error.to_string().contains("gateway_key"), "{error}");
+        // A stateful file still cannot declare this namespace; the compiled
+        // candidate used by this focused test supplies the bootstrap-owned
+        // default that the tenancy slice currently requires. The separate
+        // tenancy test keeps the no-default refusal explicit.
+        let mut bootstrap = stateful_bootstrap();
+        bootstrap.namespace.push(crate::config::Namespace {
+            id: "platform".to_owned(),
+            default: true,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+        });
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap,
+            HashMap::new(),
+            projection,
+            crate::convergence::secrets::testing::permissive(),
+        );
+        let key = fixtures::workload_key(0xd0);
+        let mut state = fixtures::state();
+        state
+            .insert(fixtures::workload(
+                33,
+                "deployer",
+                crate::desired_state::ResourceScope::Project {
+                    tenant: fixtures::tenant_id(1),
+                    project: fixtures::project_id(2),
+                },
+                &[crate::desired_state::Role::Developer],
+                Some(&key),
+            ))
+            .expect("a project workload is valid desired state");
+
+        let snapshot = compiler
+            .compile(&revision_with(state), 1)
+            .await
+            .expect("the projected workload principal makes stateful serving possible");
+        assert_eq!(snapshot.inbound_key_count(), 1);
+        assert!(snapshot.config.projected_principals.len() == 1);
     }
 
     /// The reason the boot gate is *reused* rather than reimplemented: a

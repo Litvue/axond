@@ -242,6 +242,8 @@ there is no “last value wins” interpretation for a catalogue filter.
       "scope": { "kind": "project", "tenant": "...", "project": "..." },
       "wire_family": "openai-chat",
       "state": "enabled",
+      "routable": true,
+      "unavailable": [],
       "targets": [
         { "enablement": "res_...", "version": 1 }
       ]
@@ -287,7 +289,11 @@ on each offering entry. It preserves the durable alias id and version, its
 project scope and wire family, and the ordered enablement targets. The target
 references are not provider-local model ids: resolving those requires the pinned
 catalogue snapshot, and remains named in `pending` until that metadata reader is
-attached.
+attached. `routable` and `unavailable` are derived from desired state: an enabled
+alias is routable when any exact target is enabled and billable. Project override
+precedence does not rewrite an alias's explicit tenant-default target. The reasons
+are `disabled`, `no-targets`, `disabled-target`, and `unpriced-target`; an
+unusable fallback does not make the alias unavailable if a later target is usable.
 
 ## Conditional reads
 

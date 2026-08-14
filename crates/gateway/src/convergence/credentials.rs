@@ -86,10 +86,11 @@
 //! withdrawn tenant's leftover key serves nothing, and letting it refuse the
 //! candidate would turn one dormant tenant into a fleet that stops converging.
 //!
-//! A stateful file may not declare `[[provider]]` at all, so that requirement is
-//! the same standing gate [`TenancyProjection`] has on the default namespace: it
-//! is met once the slice projecting provider connections from desired state lands,
-//! and until then nothing in `serve` constructs this projection.
+//! A stateful file may not declare `[[provider]]` at all. The production
+//! convergence chain therefore constructs this projection, but a credential
+//! that names a provider connection not yet projected from durable state is
+//! refused before publication. Provider-connection projection remains a
+//! prerequisite for a complete inference snapshot.
 
 use std::collections::{BTreeMap, HashSet};
 

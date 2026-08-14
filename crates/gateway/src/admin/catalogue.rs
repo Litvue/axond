@@ -50,13 +50,15 @@
 //! the scope rule, the reason vocabulary, and the response shape are independent
 //! of where offering metadata comes from.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use super::diff::ScopeView;
 use super::error::AdminError;
 use crate::desired_state::{
     LoadedRevision, ModelAlias, ModelEnablement, ModelError, ModelLifecycle, ModelOwner, Models,
-    OfferingId, ProjectId, ResourceScope, TenantId, WireFamily,
+    OfferingId, ProjectId, ResourceId, ResourceScope, TenantId, WireFamily,
 };
 
 /// What a catalogue read asks for: one scope, and filters over it.
@@ -264,6 +266,11 @@ pub struct CatalogueAlias {
     pub scope: ScopeView,
     pub wire_family: &'static str,
     pub state: &'static str,
+    /// Whether at least one exact ordered target is enabled and backed by an
+    /// approved price.
+    pub routable: bool,
+    /// Why this alias cannot currently route. Empty when `routable` is true.
+    pub unavailable: Vec<AliasUnavailableReason>,
     /// Ordered enablement references. The order is the failover priority and is
     /// therefore part of the response contract rather than a set.
     pub targets: Vec<CatalogueAliasTarget>,
@@ -274,6 +281,56 @@ pub struct CatalogueAlias {
 pub struct CatalogueAliasTarget {
     pub enablement: String,
     pub version: u64,
+}
+
+/// Why an enabled-looking alias cannot currently reach a usable target.
+///
+/// These reasons are derived from the same desired-state model used to validate
+/// publication. A disabled fallback may remain in the ordered target list, so a
+/// single unusable target does not make the alias unavailable when a later target
+/// is still effective, enabled, and billable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AliasUnavailableReason {
+    /// The alias itself is withdrawn.
+    Disabled,
+    /// An enabled alias has no target entries. This is defensive because desired
+    /// state validation rejects this shape, but keeping the response vocabulary
+    /// total makes damaged or legacy projections explicit.
+    NoTargets,
+    /// A target exists but its enablement is withdrawn.
+    DisabledTarget,
+    /// A target is enabled but has no approved price, so it cannot be billed.
+    UnpricedTarget,
+}
+
+impl AliasUnavailableReason {
+    pub const ALL: &'static [Self] = &[
+        Self::Disabled,
+        Self::NoTargets,
+        Self::DisabledTarget,
+        Self::UnpricedTarget,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NoTargets => "no-targets",
+            Self::DisabledTarget => "disabled-target",
+            Self::UnpricedTarget => "unpriced-target",
+        }
+    }
+}
+
+impl Serialize for AliasUnavailableReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AliasStatus {
+    routable: bool,
+    unavailable: Vec<AliasUnavailableReason>,
 }
 
 /// One tenant's management catalogue.
@@ -306,6 +363,10 @@ impl CatalogueView {
         // read these bodies its own way could report a catalogue the runtime would
         // never serve.
         let models = Models::of(revision.state()).map_err(|error| unreadable(revision, &error))?;
+        let alias_statuses: BTreeMap<ResourceId, AliasStatus> = models
+            .aliases()
+            .map(|alias| (alias.reference.id, alias_status(&models, alias)))
+            .collect();
         let mut entries = Vec::new();
         for enablement in models.enablements() {
             let owner = enablement.body.owner();
@@ -351,22 +412,33 @@ impl CatalogueView {
         let aliases = models
             .aliases()
             .filter(|alias| in_scope(request, alias))
-            .map(|alias| CatalogueAlias {
-                alias: alias.reference.id.to_string(),
-                version: alias.reference.version.get(),
-                slug: alias.slug.as_str().to_owned(),
-                scope: ScopeView::of(&alias.body.scope()),
-                wire_family: alias.body.wire_family().as_str(),
-                state: alias.body.state().as_str(),
-                targets: alias
-                    .body
-                    .targets()
-                    .iter()
-                    .map(|target| CatalogueAliasTarget {
-                        enablement: target.enablement.to_string(),
-                        version: target.version.get(),
-                    })
-                    .collect(),
+            .map(|alias| {
+                // `in_scope` has already established that this alias belongs
+                // to the requested tenant/project. Status uses the alias's
+                // exact target references; scope does not rewrite those
+                // references through project override precedence.
+                let status = alias_statuses
+                    .get(&alias.reference.id)
+                    .expect("every alias has a derived status");
+                CatalogueAlias {
+                    alias: alias.reference.id.to_string(),
+                    version: alias.reference.version.get(),
+                    slug: alias.slug.as_str().to_owned(),
+                    scope: ScopeView::of(&alias.body.scope()),
+                    wire_family: alias.body.wire_family().as_str(),
+                    state: alias.body.state().as_str(),
+                    routable: status.routable,
+                    unavailable: status.unavailable.clone(),
+                    targets: alias
+                        .body
+                        .targets()
+                        .iter()
+                        .map(|target| CatalogueAliasTarget {
+                            enablement: target.enablement.to_string(),
+                            version: target.version.get(),
+                        })
+                        .collect(),
+                }
             })
             .collect();
         Ok(Self {
@@ -417,6 +489,55 @@ fn aliases_naming(
     names
 }
 
+/// Derive whether one alias has any usable target in its owning project.
+///
+/// The alias target is an exact enablement reference. A project override does not
+/// rewrite an alias that explicitly targets a tenant default; the alias contract
+/// permits either target and keeps the ordered references intact. Effective
+/// enablement precedence belongs to unaliased model resolution, not to alias
+/// target interpretation.
+fn alias_status(models: &Models, alias: &ModelAlias) -> AliasStatus {
+    if !alias.body.is_enabled() {
+        return AliasStatus {
+            routable: false,
+            unavailable: vec![AliasUnavailableReason::Disabled],
+        };
+    }
+
+    let mut unavailable = Vec::new();
+    let mut routable = false;
+    if alias.body.targets().is_empty() {
+        unavailable.push(AliasUnavailableReason::NoTargets);
+    }
+
+    for target in alias.body.targets() {
+        let Some(enablement) = models.enablement(target.enablement) else {
+            unavailable.push(AliasUnavailableReason::NoTargets);
+            continue;
+        };
+        if !enablement.body.is_enabled() {
+            unavailable.push(AliasUnavailableReason::DisabledTarget);
+            continue;
+        }
+        if enablement.body.billable_price().is_none() {
+            unavailable.push(AliasUnavailableReason::UnpricedTarget);
+            continue;
+        }
+        routable = true;
+        break;
+    }
+
+    if routable {
+        unavailable.clear();
+    }
+    unavailable.sort_unstable();
+    unavailable.dedup();
+    AliasStatus {
+        routable,
+        unavailable,
+    }
+}
+
 /// Whether an alias belongs to the scope being read. Aliases are project-scoped,
 /// so a tenant-wide read reports every project's aliases for a default it owns,
 /// and a project read reports only that project's.
@@ -441,9 +562,9 @@ fn unreadable(revision: &LoadedRevision, error: &ModelError) -> AdminError {
 mod tests {
     use super::*;
     use crate::desired_state::fixtures::{
-        approved_price, blob_backed_catalog, candidate, catalog_reference, enablement_body,
-        offering_id, price, project, project_enablement, project_id, revision_id, tenant,
-        tenant_id, typed_alias,
+        alias_body, approved_price, blob_backed_catalog, candidate, catalog_reference,
+        enablement_body, offering_id, price, project, project_enablement, project_id, reference,
+        revision_id, tenant, tenant_id, typed_alias,
     };
     use crate::desired_state::{
         DesiredState, ExpectedRevision, ProjectId, RevisionManifest, Slug, TenantId,
@@ -710,12 +831,90 @@ mod tests {
         );
         assert_eq!(alias.wire_family, WireFamily::OpenaiChat.as_str());
         assert_eq!(alias.state, ModelLifecycle::Enabled.as_str());
+        assert!(alias.routable);
+        assert!(alias.unavailable.is_empty());
         assert_eq!(
             alias.targets,
             vec![CatalogueAliasTarget {
                 enablement: crate::desired_state::fixtures::resource_id(30).to_string(),
                 version: 1,
             }]
+        );
+    }
+
+    #[test]
+    fn an_alias_explains_when_every_target_is_unusable() {
+        let revision = published();
+        let models = Models::of(revision.state()).expect("the fixture models are valid");
+        let acme = tenant_id(1);
+        let core = project_id(2);
+
+        let exact_default = models.aliases().next().expect("the fixture alias");
+        assert_eq!(
+            alias_status(&models, exact_default),
+            AliasStatus {
+                routable: true,
+                unavailable: Vec::new(),
+            },
+            "an alias keeps its exact tenant-default target even when the project has an override"
+        );
+
+        let unpriced = ModelAlias {
+            reference: reference(crate::desired_state::ResourceKind::Alias, 37),
+            slug: slug("unpriced"),
+            body: alias_body(
+                &acme,
+                &core,
+                37,
+                &[reference(
+                    crate::desired_state::ResourceKind::ModelEnablement,
+                    31,
+                )],
+            ),
+        };
+        assert_eq!(
+            alias_status(&models, &unpriced).unavailable,
+            vec![AliasUnavailableReason::UnpricedTarget]
+        );
+
+        let withdrawn = ModelAlias {
+            reference: reference(crate::desired_state::ResourceKind::Alias, 38),
+            slug: slug("withdrawn"),
+            body: alias_body(
+                &acme,
+                &core,
+                38,
+                &[reference(
+                    crate::desired_state::ResourceKind::ModelEnablement,
+                    32,
+                )],
+            ),
+        };
+        assert_eq!(
+            alias_status(&models, &withdrawn).unavailable,
+            vec![AliasUnavailableReason::DisabledTarget]
+        );
+
+        let fallback = ModelAlias {
+            reference: reference(crate::desired_state::ResourceKind::Alias, 39),
+            slug: slug("fallback"),
+            body: alias_body(
+                &acme,
+                &core,
+                39,
+                &[
+                    reference(crate::desired_state::ResourceKind::ModelEnablement, 31),
+                    reference(crate::desired_state::ResourceKind::ModelEnablement, 30),
+                ],
+            ),
+        };
+        assert_eq!(
+            alias_status(&models, &fallback),
+            AliasStatus {
+                routable: true,
+                unavailable: Vec::new(),
+            },
+            "an unusable fallback does not make an alias unavailable when a later target works"
         );
     }
 
@@ -781,6 +980,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PendingFact::ALL).expect("serializable"),
             serde_json::json!(["offering-metadata", "availability"])
+        );
+        assert_eq!(
+            serde_json::to_value(AliasUnavailableReason::ALL).expect("serializable"),
+            serde_json::json!([
+                "disabled",
+                "no-targets",
+                "disabled-target",
+                "unpriced-target"
+            ])
         );
     }
 }

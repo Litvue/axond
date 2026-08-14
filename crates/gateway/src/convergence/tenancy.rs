@@ -1,12 +1,10 @@
 //! Projecting a revision's tenancy onto a servable configuration (#191).
 //!
-//! This is the first real [`RevisionProjection`]: it reads the one body schema
-//! the domain knows ([`crate::desired_state::tenancy`]) and fills the one config
-//! section that boundary owns — `[[namespace]]`. Every other section a stateful
-//! deployment will eventually own (providers, credentials, models, prices,
-//! policies) is left exactly as the bootstrap config had it, because those bodies
-//! belong to later slices and a projection that guessed at them would have to be
-//! unshipped.
+//! This is the tenancy stage of [`RevisionProjection`]: it reads the one body
+//! schema the domain knows ([`crate::desired_state::tenancy`]) and fills the one
+//! config section that boundary owns — `[[namespace]]`. Provider connections,
+//! models, prices, and the remaining serving policy still belong to later slices;
+//! a projection that guessed at those bodies would have to be unshipped.
 //!
 //! # A project *is* a namespace, and it is named beyond its tenant
 //!
@@ -61,12 +59,12 @@
 //!
 //! # Serving boundary
 //!
-//! `serve` now constructs this projection as part of the stateful convergence
-//! chain. It remains deliberately incomplete for serving: the current desired
-//! state has no inbound-principal resource, so the compiler reports a typed
-//! unsupported refusal before publishing a keyless snapshot. This seam is
-//! exercised end to end through [`RevisionCompiler`](super::compile::RevisionCompiler)
-//! and becomes Ready only when that principal projection is added.
+//! `serve` constructs this projection as part of the stateful convergence chain.
+//! The runtime chain now adds recoverable workload principals after tenancy, but
+//! a bootstrap without a default namespace and a revision without routable
+//! provider/model metadata remain deliberate refusals. This seam is exercised
+//! through [`RevisionCompiler`](super::compile::RevisionCompiler), and readiness
+//! still requires a complete serving snapshot rather than a key alone.
 //!
 //! Two things the runtime slice owns, recorded here because this module is what
 //! creates the need for them:

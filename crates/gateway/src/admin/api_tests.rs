@@ -1415,6 +1415,8 @@ async fn the_management_catalogue_reports_what_a_tenant_published() {
     assert_eq!(aliases.len(), 1, "{view}");
     assert_eq!(aliases[0]["slug"], "default");
     assert_eq!(aliases[0]["scope"]["kind"], "project");
+    assert_eq!(aliases[0]["routable"], json!(false));
+    assert_eq!(aliases[0]["unavailable"], json!(["unpriced-target"]));
     assert_eq!(aliases[0]["targets"].as_array().unwrap().len(), 1);
     // Enabled and named, and still not routable: nobody approved a price. The
     // read says which of the two acts is missing rather than reporting a bare
