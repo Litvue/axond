@@ -29,7 +29,7 @@ use super::access::Directory;
 use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, SerializerVersion};
 use super::credentials::{CredentialError, Credentials};
 use super::ids::{AuditEventId, MutationId, ResourceId, RevisionId, Slug};
-use super::models::{ModelEnablementBody, ModelError, Models};
+use super::models::{ModelEnablementBody, ModelError, ModelValidationMode, Models};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::policy::{PolicyError, PolicySet};
 use super::pricing::{PriceBooks, PricingError};
@@ -237,6 +237,21 @@ impl DesiredState {
     /// accepted, and #166 re-runs this on what it hydrated, so a constraint lives
     /// in one place instead of being half-expressed in DDL.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        self.validate_with_model_mode(ModelValidationMode::Strict)
+    }
+
+    /// Validate a retained revision while preserving the one legacy model shape
+    /// this build intentionally still reads: an enabled alias targeting a
+    /// disabled enablement. This is for hydration and rollback only; authored
+    /// candidates use [`DesiredState::validate`].
+    pub(crate) fn validate_legacy_read(&self) -> Result<(), ValidationError> {
+        self.validate_with_model_mode(ModelValidationMode::LegacyRead)
+    }
+
+    fn validate_with_model_mode(
+        &self,
+        model_validation: ModelValidationMode,
+    ) -> Result<(), ValidationError> {
         if self.resources.is_empty() {
             return Err(ValidationError::Empty);
         }
@@ -368,7 +383,7 @@ impl DesiredState {
         // reaches its own project's enablements and its tenant's defaults — which
         // is only meaningful once tenancy has agreed the project belongs to the
         // tenant (#205).
-        Models::of(self)?;
+        Models::of_with_mode(self, model_validation)?;
 
         Ok(())
     }
@@ -471,6 +486,20 @@ impl RevisionCandidate {
     /// the same reason a dangling resource reference is, and before #165 stores it
     /// as a foreign key.
     pub fn validated_checksum(&self) -> Result<Checksum, ValidationError> {
+        self.validated_checksum_with(ModelValidationMode::Strict)
+    }
+
+    /// Validate a rollback candidate against the retained-revision compatibility
+    /// rules. A rollback republishes an existing immutable state; it is not a
+    /// newly authored model/alias candidate.
+    pub(crate) fn validated_checksum_legacy_read(&self) -> Result<Checksum, ValidationError> {
+        self.validated_checksum_with(ModelValidationMode::LegacyRead)
+    }
+
+    fn validated_checksum_with(
+        &self,
+        model_validation: ModelValidationMode,
+    ) -> Result<Checksum, ValidationError> {
         if self.audit.mutation != self.mutation.id {
             return Err(ValidationError::AuditMutationMismatch {
                 audit: self.audit.id,
@@ -478,7 +507,7 @@ impl RevisionCandidate {
                 mutation: self.mutation.id,
             });
         }
-        self.state.validate()?;
+        self.state.validate_with_model_mode(model_validation)?;
         Ok(self.state.checksum()?)
     }
 }
@@ -795,7 +824,9 @@ impl LoadedRevision {
                 current,
             });
         }
-        state.validate().map_err(IntegrityError::classify)?;
+        state
+            .validate_legacy_read()
+            .map_err(IntegrityError::classify)?;
 
         for entry in &manifest.entries {
             let Some(resource) = state.get(&entry.reference) else {
@@ -886,9 +917,11 @@ impl LoadedRevision {
 mod tests {
     use super::super::fixtures::{
         DESIRED_STATE_RESOURCES, alias, blob_backed_catalog, catalog_payload, credential, project,
-        reference, resource_id, revision_id, state, tenant, tenant_body, tenant_id,
+        reference, resource_id, revision_id, state, state_with_models, tenant, tenant_body,
+        tenant_id,
     };
     use super::super::ids::Uuid7;
+    use super::super::models::{AliasTarget, ModelAliasBody, ModelEnablementBody, ModelLifecycle};
     use super::super::resource::{
         BlobKind, ResourceBody, ResourceKind, ResourceVersion, ResourceVersionNumber,
     };
@@ -1354,6 +1387,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rebuilt, manifest);
+    }
+
+    #[test]
+    fn a_legacy_enabled_alias_targeting_a_disabled_enablement_hydrates() {
+        let mut state = state_with_models();
+        let target = state
+            .version_of(ResourceKind::ModelEnablement, resource_id(31))
+            .cloned()
+            .expect("the project enablement");
+        let disabled = ModelEnablementBody::read(&target)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled)
+            .version_at(
+                target.slug.clone(),
+                target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        state
+            .supersede(disabled.clone())
+            .expect("disable the target");
+
+        let alias = state
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the project alias");
+        let legacy_alias = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([AliasTarget::new(
+                disabled.reference.id,
+                disabled.reference.version,
+            )])
+            .version_at(alias.slug.clone(), alias.reference.version.next());
+        state
+            .supersede(legacy_alias)
+            .expect("write the historical alias shape");
+
+        assert!(
+            state.validate().is_err(),
+            "new candidates reject the legacy enabled-alias/disabled-target shape"
+        );
+        assert!(
+            candidate(state.clone()).validated_checksum().is_err(),
+            "ordinary publication remains strict"
+        );
+        assert!(
+            candidate(state.clone())
+                .validated_checksum_legacy_read()
+                .is_ok(),
+            "rollback may republish the retained legacy state"
+        );
+
+        // A published old revision already has its own checksum and manifest;
+        // assemble that stored representation directly so this test exercises
+        // hydration rather than the strict publication constructor.
+        let candidate = candidate(state.clone());
+        let mut entries = state
+            .resources()
+            .map(ManifestEntry::of)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("manifest entries");
+        entries.sort_by_key(|entry| entry.reference);
+        let mut blobs: Vec<_> = state.blobs().copied().collect();
+        blobs.sort_by_key(|blob| blob.digest);
+        let manifest = RevisionManifest {
+            id: revision_id(42),
+            parent: None,
+            created_at: SystemTime::UNIX_EPOCH,
+            serializer: SerializerVersion::default(),
+            mutation: candidate.mutation.id,
+            entries,
+            blobs,
+            checksum: state.checksum().expect("state checksum"),
+        };
+        let loaded = LoadedRevision::assemble(manifest, state.clone())
+            .expect("legacy published revisions remain readable");
+        assert_eq!(loaded.state(), &state);
+        let resolved = Models::of(loaded.state()).expect("legacy model read");
+        assert_eq!(resolved.aliases().count(), 1);
+        assert_eq!(resolved.enablements().count(), 2);
     }
 
     #[test]

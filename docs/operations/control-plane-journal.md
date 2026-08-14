@@ -601,6 +601,15 @@ outcomes need different responses:
   the documented exception: it is skipped rather than reported, so neither outcome
   names it — see
   [resource body schemas](./revision-convergence.md#resource-body-schemas).
+  A legacy typed alias that is enabled while naming a disabled enablement is a
+  separate compatibility accommodation: hydration, catalogue reads, and
+  rollback preserve that historical state, while a newly authored candidate
+  refuses it. It is not corruption and does not make the retained revision
+  incompatible. Repair it by retiring or retargeting the alias before the next
+  entitlement publication. When restack removes the final target, the disabled
+  alias version is stored in the same complete revision and appears in its
+  resource diff; the single mutation audit event records the publication intent,
+  and the revision/diff records the incidental alias retirement explicitly.
   A body that *declares* a schema this build reads and then is not one —
   a field gone, a field whose type changed — is not this outcome; that is
   unreadable, above, because no version skew produces it. Neither is a tenancy body

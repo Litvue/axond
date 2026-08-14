@@ -412,6 +412,17 @@ same name may exist in another project or tenant. Both bodies move only between
 identifier this build does not know is `incompatible`, so a newer release may add
 one without older replicas reporting damage.
 
+There is one lifecycle compatibility exception for typed model bodies. Older
+writers could leave an enabled alias pointing at a disabled enablement. The
+reader tolerates that exact legacy shape during hydration, catalogue projection,
+and rollback so retained revisions remain readable; `DesiredState` candidate
+validation rejects it for newly authored publication. A repair publishes a
+disabled/cleared alias or retargets it to an enabled target. Restack strips a
+target only on an actual enabled-to-disabled transition, and when that removes
+the last target the alias's disabled resource version is carried in the same
+revision and semantic diff, which is the resource-level audit record for the
+incidental retirement.
+
 ### How a project becomes a namespace
 
 The runtime's tenancy boundary is the namespace: keys bind to one, credential

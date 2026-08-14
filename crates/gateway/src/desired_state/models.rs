@@ -1704,12 +1704,23 @@ pub struct ModelAlias {
     pub body: ModelAliasBody,
 }
 
+/// Whether model resolution is being used to read history or to admit a new
+/// candidate. The old writer could publish an enabled alias whose target was
+/// already disabled; that shape remains readable for history and rollback, but
+/// it is not accepted in a newly authored revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelValidationMode {
+    Strict,
+    LegacyRead,
+}
+
 /// The model contracts of one revision, resolved once.
 ///
 /// Built by [`Models::of`], which is the single place these bodies are
-/// interpreted: publication, hydration, and every later projection reach the same
-/// conclusions because they all call it. Ordering is by id throughout, so two
-/// replicas iterate the same enablements and aliases in the same order.
+/// interpreted: hydration and every later projection reach the same conclusions
+/// because they all call it. Candidate validation uses [`Models::of_strict`].
+/// Ordering is by id throughout, so two replicas iterate the same enablements
+/// and aliases in the same order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Models {
     enablements: BTreeMap<ResourceId, ModelEnablement>,
@@ -1727,7 +1738,23 @@ impl Models {
     /// An *alias* row whose body declares no `schema` is skipped rather than
     /// refused, because such rows predate this slice; an untyped *enablement* is
     /// refused, because none was ever published. See the module documentation.
+    ///
+    /// This is the history/projection reader. It tolerates the legacy published
+    /// shape where an enabled alias names a disabled enablement; a new candidate
+    /// must use [`Self::of_strict`] through [`DesiredState::validate`].
     pub fn of(state: &DesiredState) -> Result<Self, ModelError> {
+        Self::of_with_mode(state, ModelValidationMode::LegacyRead)
+    }
+
+    /// Resolve model contracts for a newly authored candidate.
+    pub(crate) fn of_strict(state: &DesiredState) -> Result<Self, ModelError> {
+        Self::of_with_mode(state, ModelValidationMode::Strict)
+    }
+
+    pub(crate) fn of_with_mode(
+        state: &DesiredState,
+        mode: ModelValidationMode,
+    ) -> Result<Self, ModelError> {
         let mut models = Self::default();
         for resource in state.resources() {
             match resource.reference.kind {
@@ -1794,7 +1821,7 @@ impl Models {
             let resource = state
                 .get(&alias.reference)
                 .expect("the alias was read from this state");
-            models.check_targets(state, resource, &alias.body)?;
+            models.check_targets(state, resource, &alias.body, mode)?;
         }
         Ok(models)
     }
@@ -1806,6 +1833,7 @@ impl Models {
         state: &DesiredState,
         resource: &ResourceVersion,
         body: &ModelAliasBody,
+        mode: ModelValidationMode,
     ) -> Result<(), ModelError> {
         if body.is_enabled() && body.targets().is_empty() {
             return Err(ModelError::NoTargets {
@@ -1826,7 +1854,10 @@ impl Models {
             // reachable enablement; its wire family is checked when the body is
             // one this build reads.
             if let Some(enabled) = self.enablements.get(&target.enablement) {
-                if body.is_enabled() && !enabled.body.is_enabled() {
+                if mode == ModelValidationMode::Strict
+                    && body.is_enabled()
+                    && !enabled.body.is_enabled()
+                {
                     return Err(ModelError::DisabledTarget {
                         reference: resource.reference,
                         target: target.reference(),
