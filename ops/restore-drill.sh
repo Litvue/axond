@@ -357,7 +357,7 @@ for sql in usage_v2 budget_v1 budget_v2 revocation_v1; do
 done
 
 step "Applying the encrypted secret-store schema"
-psql live 5432 -f "${root}/crates/gateway/sql/secret_store_v1.sql" >/dev/null
+psql live 5432 -f - <"${root}/ops/postgres/secret_store_v1.sql" >/dev/null
 
 step "Building the deployment a recovery has to bring back, through axond admin"
 serve live "$live_http"

@@ -523,6 +523,27 @@ fn durable_inventory_records_all_gate_fields_and_setup_failures() {
     );
 }
 
+/// `psql` runs in the database container, so host paths must be streamed over
+/// stdin rather than passed as container-local `-f` arguments.
+#[test]
+fn restore_drill_streams_the_secret_store_schema_into_the_container() {
+    let root = recovery::workspace_root();
+    let source = std::fs::read_to_string(root.join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    assert!(
+        root.join("ops/postgres/secret_store_v1.sql").is_file(),
+        "the drill's shipped secret-store schema must have an ops/postgres path"
+    );
+    assert!(
+        source.contains("psql live 5432 -f - <\"${root}/ops/postgres/secret_store_v1.sql\""),
+        "the secret-store schema must be streamed to psql over stdin"
+    );
+    assert!(
+        !source.contains("psql live 5432 -f \"${root}/crates/gateway/sql/secret_store_v1.sql\""),
+        "the drill must not pass a host-only schema path to container psql"
+    );
+}
+
 /// The prose contract and the manifest describe one harness. An operator reads
 /// the first; the driver reads the second; a scenario, a stage, or a blocker
 /// that exists in only one of them is how the two come to disagree.
