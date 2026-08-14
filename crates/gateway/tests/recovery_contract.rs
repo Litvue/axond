@@ -470,6 +470,25 @@ fn restore_drill_owns_restore_stages_and_reads_catalogue_before_recovered_boot()
         pitr_read < pitr_boot,
         "PITR catalogue evidence must be read before a recovered replica boots"
     );
+    let live_boot = drill
+        .find("serve live \"$live_http\"")
+        .expect("the live replica boots before catalogue discovery");
+    let catalogue_poll = drill
+        .find("for _ in $(seq 60); do\n  catalog_content_id=\"$(psql live 5432")
+        .expect("the live catalogue pointer is polled after boot");
+    let initial_catalogue_read = drill
+        .find("catalog_raw_digest=\"$(psql live 5432")
+        .expect("the initial catalogue metadata read is present");
+    assert!(
+        live_boot < catalogue_poll && catalogue_poll < initial_catalogue_read,
+        "the initial catalogue metadata reads must wait for asynchronous import"
+    );
+    assert!(
+        drill.contains(
+            "fail \"catalogue import did not publish an active pointer within 60 seconds\""
+        ),
+        "catalogue discovery must fail clearly when its bounded wait expires"
+    );
     assert!(
         drill.contains(
             "config logical_restore \"$live_port\" logical.toml \"$logical_http\" none empty false"

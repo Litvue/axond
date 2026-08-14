@@ -363,12 +363,23 @@ step "Building the deployment a recovery has to bring back, through axond admin"
 serve live "$live_http"
 live_endpoint="$endpoint"
 
+# Catalogue import starts asynchronously after healthz is reachable. Wait for
+# its active pointer before reading the pointer or its snapshot metadata; a
+# health check alone does not mean the seeded catalogue has been published.
+catalog_content_id=""
+for _ in $(seq 60); do
+  catalog_content_id="$(psql live 5432 -c \
+    'SELECT content_id FROM axond_catalog_active WHERE singleton' 2>/dev/null || true)"
+  [[ -n "$catalog_content_id" ]] && break
+  sleep 1
+done
+[[ "$catalog_content_id" == sha256:* ]] ||
+  fail "catalogue import did not publish an active pointer within 60 seconds"
+
 # Seeded catalogue content is retained by the same Postgres database as the
 # journal. Record its identity before the catalogue resource is published: the
 # resource pins the exact content, while the durable-inventory stage checks the
 # pointer and payload independently after restore.
-catalog_content_id="$(psql live 5432 -c \
-  'SELECT content_id FROM axond_catalog_active WHERE singleton')"
 catalog_raw_digest="$(psql live 5432 -c \
   "SELECT raw_digest FROM axond_catalog_snapshot WHERE content_id = '${catalog_content_id}'")"
 catalog_raw_bytes="$(psql live 5432 -c \
