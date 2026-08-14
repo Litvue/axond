@@ -697,7 +697,10 @@ from every replica at once.
 
 Backoff clears on the first success.
 
-## During a control-plane outage (future serving contract)
+## During a control-plane outage
+
+The serving behavior described below is the future serving contract; the current
+build remains fail-closed until inbound-principal projection lands.
 
 The current build remains admin-only and fail-closed because the principal-
 projection dependency above prevents any stateful snapshot from becoming
