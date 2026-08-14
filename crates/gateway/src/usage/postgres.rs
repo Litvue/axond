@@ -712,13 +712,19 @@ mod tests {
             .missing_columns(&client)
             .await
             .expect("inspect the table resolved through search_path");
-        let resolved: Option<String> = client
-            .query_one("SELECT to_regclass($1)::text", &[&table])
+        let qualified = format!("{schema}.{table}");
+        let resolves_to_expected_relation: bool = client
+            .query_one(
+                "SELECT to_regclass($1) = to_regclass($2)",
+                &[&table, &qualified],
+            )
             .await
             .expect("resolve the same relation as INSERT")
             .get(0);
-        let expected = format!("{schema}.{table}");
-        assert_eq!(resolved.as_deref(), Some(expected.as_str()));
+        assert!(
+            resolves_to_expected_relation,
+            "the unqualified relation must resolve to {qualified} through search_path"
+        );
         assert!(missing.iter().any(|column| column == "price_book"));
         assert!(missing.iter().any(|column| column == "signer_kid"));
         let gap = migration_gap(&missing).expect("an unmigrated table is a boot gap");

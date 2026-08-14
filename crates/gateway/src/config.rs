@@ -22,10 +22,10 @@ use serde::{Deserialize, Deserializer};
 
 use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
+use crate::backends::catalog::{InvalidCatalogId, ProviderId};
 use crate::backends::catalog_refresh::{Bootstrap, RefreshSchedule};
 use crate::backends::catalog_store::postgres::CatalogStoreSettings;
 use crate::convergence::backoff::BackoffPolicy;
-use crate::backends::catalog::{InvalidCatalogId, ProviderId};
 use crate::desired_state::policy::{PolicyBody, PolicyGeneration};
 use crate::desired_state::{ProjectId, SecretRef, TenantId};
 use crate::principals::Capability;
