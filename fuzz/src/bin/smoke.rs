@@ -34,7 +34,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arbitrary::{Arbitrary, Unstructured};
-use axond_fuzz::{ProviderStreamInput, SseInput, StreamShape, TokenInput};
+use axond_fuzz::{
+    CapabilityField, CatalogEdit, CatalogInput, CostField, LifecycleValue, MetaField,
+    ProviderStreamInput, SseInput, StreamShape, TokenInput,
+};
 
 /// Live heap the whole replay may hold at once. The parsers under test are
 /// bounded by their input, which is why this is generous in absolute terms and
@@ -56,6 +59,10 @@ const MINIMUM_MINTED_CLASSES: usize = 8;
 
 /// How many outcome classes the re-signed token seeds must reach.
 const MINIMUM_RESIGNED_CLASSES: usize = 10;
+
+/// How many outcome classes the catalogue edit scenarios must reach.
+/// [`EXPECTED_CATALOG_CLASSES`] pins which ones.
+const MINIMUM_CATALOG_EDIT_CLASSES: usize = 6;
 
 #[global_allocator]
 static ALLOCATOR: Capped = Capped;
@@ -139,6 +146,11 @@ const TARGETS: &[Target] = &[
         name: "provider_error",
         run: replay_provider_error,
         minimum_classes: 5,
+    },
+    Target {
+        name: "catalog_import",
+        run: replay_catalog_import,
+        minimum_classes: 6,
     },
 ];
 
@@ -261,6 +273,169 @@ fn replay_token_verify(data: &[u8]) -> Vec<&'static str> {
     }
     classes
 }
+
+/// The catalogue target takes a structured input, so a seed file is replayed
+/// twice: decoded through `Arbitrary`, the way libFuzzer replays it, and as a
+/// payload, so a seed file stays a readable catalogue document rather than an
+/// encoding of one.
+fn replay_catalog_import(data: &[u8]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    if let Ok(input) = CatalogInput::arbitrary_take_rest(Unstructured::new(data)) {
+        classes.push(axond_fuzz::catalog_import(&input));
+    }
+    classes.push(axond_fuzz::catalog_import(&CatalogInput::Payload {
+        bytes: data,
+        etag: None,
+    }));
+    classes
+}
+
+/// Edits of the bundled seed, applied at replay time.
+///
+/// The committed corpus is documents, which reaches decoding, the schema, and
+/// normalization; it cannot reach the *semantic* classification, because that
+/// needs two catalogues that differ in one stated way. These are that second
+/// catalogue: one edit each, pinned below to the class it must be understood as.
+fn catalog_scenarios() -> Vec<(&'static str, CatalogInput<'static>)> {
+    let edited = |edit| CatalogInput::Edited {
+        edit,
+        // A rotation and pretty-printing on every scenario, so each semantic
+        // assertion is also an assertion that key order and whitespace did not
+        // reach the content identity.
+        rotate: 3,
+        pretty: true,
+    };
+    vec![
+        ("reordered-and-reprinted", edited(CatalogEdit::None)),
+        // These are acceptance-critical refusal paths, so pin them as named
+        // scenarios rather than relying only on corpus discovery. Each still
+        // runs through the in-memory fetch, strict parse, and last-known-good
+        // admission checks in `catalog_import`.
+        (
+            "empty-catalogue",
+            CatalogInput::Payload {
+                bytes: include_bytes!("../../seeds/catalog_import/drift-empty.json"),
+                etag: None,
+            },
+        ),
+        (
+            "provider-less-catalogue",
+            CatalogInput::Payload {
+                bytes: include_bytes!("../../seeds/catalog_import/drift-missing-providers.json"),
+                etag: None,
+            },
+        ),
+        (
+            "empty-provider-section",
+            CatalogInput::Payload {
+                bytes: include_bytes!("../../seeds/catalog_import/drift-providers-empty.json"),
+                etag: None,
+            },
+        ),
+        (
+            "malformed-catalogue",
+            CatalogInput::Payload {
+                bytes: include_bytes!("../../seeds/catalog_import/drift-not-json.json"),
+                etag: None,
+            },
+        ),
+        (
+            "unknown-field",
+            edited(CatalogEdit::Unknown {
+                provider: 0,
+                model: 0,
+                key: "speculative",
+                value: "a field the schema does not define",
+            }),
+        ),
+        (
+            "price-only",
+            edited(CatalogEdit::Cost {
+                provider: 0,
+                model: 0,
+                field: CostField::Input,
+                value: 4.25,
+            }),
+        ),
+        (
+            "metadata-only",
+            edited(CatalogEdit::Metadata {
+                provider: 0,
+                model: 0,
+                field: MetaField::Name,
+                value: "Renamed by the smoke",
+            }),
+        ),
+        (
+            "capability-only",
+            edited(CatalogEdit::Capability {
+                provider: 0,
+                model: 0,
+                field: CapabilityField::ToolCall,
+                value: false,
+            }),
+        ),
+        (
+            "lifecycle-only",
+            edited(CatalogEdit::Lifecycle {
+                provider: 0,
+                model: 0,
+                status: LifecycleValue::Deprecated,
+            }),
+        ),
+        (
+            "lifecycle-unknown-status",
+            edited(CatalogEdit::Lifecycle {
+                provider: 0,
+                model: 0,
+                status: LifecycleValue::Unknown(7),
+            }),
+        ),
+        (
+            "neutral-record-only",
+            edited(CatalogEdit::Neutral {
+                model: 0,
+                field: MetaField::Family,
+                value: "regenerated-family",
+            }),
+        ),
+        (
+            "spliced-garbage",
+            edited(CatalogEdit::Splice {
+                at: 0,
+                bytes: b"\x00not json",
+            }),
+        ),
+    ]
+}
+
+/// The class each catalogue scenario exists to land in.
+///
+/// These are the acceptance criteria of issue #222 written as pins: a price
+/// change understood as metadata, or a metadata change understood as a price,
+/// would still satisfy a class count and is exactly the confusion a spend
+/// decision cannot survive.
+const EXPECTED_CATALOG_CLASSES: &[(&str, &str)] = &[
+    // Key order and whitespace are not content: the same catalogue, re-rendered,
+    // is not an update.
+    ("reordered-and-reprinted", "rendered"),
+    // Empty and provider-less documents are not usable catalogues, and malformed
+    // bytes must preserve the last-known-good snapshot through the offline path.
+    ("empty-catalogue", "content"),
+    ("provider-less-catalogue", "schema"),
+    ("empty-provider-section", "content"),
+    ("malformed-catalogue", "not_json"),
+    // Additive drift is tolerated rather than refused, and adds nothing.
+    ("unknown-field", "unknown_field_ignored"),
+    ("price-only", "price_changed"),
+    ("metadata-only", "metadata_changed"),
+    ("capability-only", "capability_changed"),
+    ("lifecycle-only", "lifecycle_changed"),
+    // Drift in the *meaning* of a field is refused, not folded onto a default.
+    ("lifecycle-unknown-status", "unknown_status"),
+    ("neutral-record-only", "neutral_changed"),
+    ("spliced-garbage", "not_json"),
+];
 
 /// Claim scenarios minted at replay time, with the seam's own HS256 material.
 ///
@@ -747,6 +922,53 @@ fn main() {
         minted_classes.values().sum::<usize>(),
         minted_classes.len(),
         minted_classes
+            .iter()
+            .map(|(class, count)| format!("{class}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    let mut catalog_classes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut catalog_scenarios_asserted = 0_usize;
+    for (label, input) in catalog_scenarios() {
+        let input_started = Instant::now();
+        let class = axond_fuzz::catalog_import(&input);
+        if let Some((_, expected)) = EXPECTED_CATALOG_CLASSES
+            .iter()
+            .find(|(scenario, _)| *scenario == label)
+        {
+            catalog_scenarios_asserted += 1;
+            assert_eq!(
+                class, *expected,
+                "catalogue scenario {label} was understood as {class} rather than {expected}"
+            );
+        }
+        *catalog_classes.entry(class).or_default() += 1;
+        let elapsed = input_started.elapsed();
+        assert!(
+            elapsed < PER_INPUT_BUDGET,
+            "catalogue scenario {label} took {elapsed:?}, over the {PER_INPUT_BUDGET:?} budget"
+        );
+        inputs += 1;
+    }
+    assert_eq!(
+        catalog_scenarios_asserted,
+        EXPECTED_CATALOG_CLASSES.len(),
+        "only {catalog_scenarios_asserted} of the {} pinned catalogue scenarios were asserted; a \
+         pinned label no longer appears in `catalog_scenarios`",
+        EXPECTED_CATALOG_CLASSES.len()
+    );
+    assert!(
+        catalog_classes.len() >= MINIMUM_CATALOG_EDIT_CLASSES,
+        "catalogue scenarios reached {} outcome classes, fewer than the \
+         {MINIMUM_CATALOG_EDIT_CLASSES} required",
+        catalog_classes.len()
+    );
+    println!(
+        "catalog_import (seed edited at replay time): {} scenarios, {} outcome classes: {}",
+        catalog_classes.values().sum::<usize>(),
+        catalog_classes.len(),
+        catalog_classes
             .iter()
             .map(|(class, count)| format!("{class}={count}"))
             .collect::<Vec<_>>()

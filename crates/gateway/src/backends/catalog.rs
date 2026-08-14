@@ -596,19 +596,92 @@ pub trait CatalogSource: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CatalogId(String);
 
+/// Upstream text as a refusal may repeat it: itself when it is short, and a
+/// bounded head plus its true length when it is not.
+///
+/// Every string a catalogue refusal quotes came off the wire, where the only
+/// bound is the payload ceiling — a map key may be megabytes long. A refusal is
+/// written to be read by an operator and is retried on a schedule, so quoting
+/// one whole would let an upstream choose how many megabytes of its own text
+/// this gateway writes to its logs, on a timer. The excerpt keeps the value
+/// recognizable; the JSON Pointer every refusal carries is what locates it
+/// exactly.
+pub fn excerpt(value: &str) -> String {
+    const MAX_BYTES: usize = 96;
+    if value.len() <= MAX_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes)", &value[..end], value.len())
+}
+
+/// Bounded like [`excerpt`], but keeping the tail as well as the head.
+///
+/// For the two refusals that carry no [`JsonPointer`] — a payload that is not
+/// JSON, and one whose shape the schema rejects — the deserializer's message is
+/// the only locator there is, and it states the position last (`… at line 112
+/// column 33`). Cutting only the head would drop precisely the part worth
+/// reading, and the hostile case is the one that needs it: a type error quotes
+/// the offending value, so an upstream that files a megabyte of text where a
+/// number belongs produces exactly the long message whose location is lost.
+pub fn excerpt_located(value: &str) -> String {
+    const HEAD_BYTES: usize = 96;
+    const TAIL_BYTES: usize = 32;
+    if value.len() <= HEAD_BYTES + TAIL_BYTES {
+        return value.to_owned();
+    }
+    let mut head = HEAD_BYTES;
+    while !value.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = value.len() - TAIL_BYTES;
+    while !value.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!(
+        "{}… ({} bytes) …{}",
+        &value[..head],
+        value.len(),
+        &value[tail..]
+    )
+}
+
+/// A list of upstream-derived values as a refusal may repeat it.
+///
+/// Each element is already an accepted identifier and so is bounded, but their
+/// number is not: a document may file thousands of models under one ambiguous
+/// key. The same reasoning as [`excerpt`] applies to the list itself.
+pub fn excerpt_list(values: &[String]) -> String {
+    const MAX_ITEMS: usize = 8;
+    let shown = values.len().min(MAX_ITEMS);
+    let mut listed = values[..shown]
+        .iter()
+        .map(|value| format!("`{}`", excerpt(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if values.len() > shown {
+        listed.push_str(&format!(" and {} more", values.len() - shown));
+    }
+    listed
+}
+
 /// Why an identifier was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidCatalogId {
     #[error("a catalogue identifier may not be empty")]
     Empty,
-    #[error("catalogue identifier `{value}` is longer than {max} bytes")]
+    #[error("catalogue identifier `{}` is longer than {max} bytes", excerpt(value))]
     TooLong { value: String, max: usize },
     #[error(
-        "catalogue identifier `{value}` contains `{character}`; \
-         only ASCII alphanumerics and `-._:/+@~` are accepted"
+        "catalogue identifier `{}` contains `{character}`; \
+         only ASCII alphanumerics and `-._:/+@~` are accepted",
+        excerpt(value)
     )]
     Character { value: String, character: char },
-    #[error("catalogue identifier `{value}` has an empty path segment")]
+    #[error("catalogue identifier `{}` has an empty path segment", excerpt(value))]
     Segment { value: String },
 }
 
@@ -1062,7 +1135,19 @@ impl JsonPointer {
     }
 
     /// A child pointer, escaping `~` and `/` as RFC 6901 requires.
+    ///
+    /// A token longer than an identifier may ever be is excerpted: such a token
+    /// is a map key no catalogue this gateway accepts can carry, so the pointer
+    /// built from it only ever appears inside a refusal, and a refusal an
+    /// upstream can size is a way to write megabytes into these logs on a timer.
     pub fn child(&self, token: &str) -> Self {
+        let bounded;
+        let token = if token.len() > CatalogId::MAX_BYTES {
+            bounded = excerpt(token);
+            bounded.as_str()
+        } else {
+            token
+        };
         let escaped = token.replace('~', "~0").replace('/', "~1");
         Self(format!("{}/{escaped}", self.0))
     }
@@ -1502,6 +1587,15 @@ pub enum CatalogContentError {
     },
     #[error("the payload describes no models")]
     Empty,
+    /// Models, but nothing offering them: no provider, or no offering under any
+    /// provider.
+    ///
+    /// Separate from [`CatalogContentError::Empty`] because it is a different
+    /// upstream accident — a document that kept its model records and lost its
+    /// providers section — and the same danger: a catalogue nothing can be
+    /// routed or priced from must not be admitted over one that can.
+    #[error("the payload describes {models} model(s) that no provider offers")]
+    Unoffered { models: usize },
     /// Text a canonical form cannot hold, so the content has no identity.
     ///
     /// A rejection rather than a panic: upstream free text is upstream's to
@@ -1519,6 +1613,16 @@ pub enum CatalogContentError {
         #[source]
         source: CanonicalError,
     },
+}
+
+/// Every arm is content that is not internally consistent, which is one label:
+/// the arm names *which* inconsistency in the message, and the pointer a source
+/// adapter would have carried is not available here, since this check runs over
+/// assembled content rather than over the payload it came from.
+impl Refusable for CatalogContentError {
+    fn refusal(&self) -> Refusal {
+        Refusal::new(RefusalReason::Content)
+    }
 }
 
 /// A normalized catalogue: providers, and models with their offerings.
@@ -1593,6 +1697,13 @@ impl CatalogContent {
                     });
                 }
             }
+        }
+        // Checked after the references, so a document whose offerings name
+        // providers it never described is still told which provider is missing.
+        if models.iter().all(|model| model.offerings.is_empty()) {
+            return Err(CatalogContentError::Unoffered {
+                models: models.len(),
+            });
         }
         let content_id = CatalogContentId(
             canonical_content(&providers, &models)
@@ -2633,9 +2744,17 @@ mod tests {
     fn facts() -> ModelFacts {
         ModelFacts {
             display_name: Some("GPT-4o".to_owned()),
-            capabilities: [ModelCapability::ToolCall].into_iter().collect(),
-            input_modalities: [Modality::Text].into_iter().collect(),
-            output_modalities: [Modality::Text].into_iter().collect(),
+            capabilities: [
+                ModelCapability::ToolCall,
+                ModelCapability::Reasoning,
+                ModelCapability::Attachment,
+            ]
+            .into_iter()
+            .collect(),
+            input_modalities: [Modality::Text, Modality::Image, Modality::Pdf]
+                .into_iter()
+                .collect(),
+            output_modalities: [Modality::Text, Modality::Audio].into_iter().collect(),
             limits: ModelLimits {
                 context_tokens: Some(128_000),
                 output_tokens: Some(16_384),
@@ -3066,7 +3185,7 @@ mod tests {
         changed
             .facts
             .capabilities
-            .insert(ModelCapability::Reasoning);
+            .insert(ModelCapability::StructuredOutput);
         changed.facts.limits.context_tokens = Some(200_000);
         let after = content(vec![changed]);
 
@@ -3238,6 +3357,46 @@ mod tests {
         );
     }
 
+    /// A document that kept its model records and lost its providers section is
+    /// a catalogue nothing can be routed or priced from. It must be refused, so
+    /// that admission cannot hand it the place a working catalogue holds.
+    #[test]
+    fn a_catalogue_no_provider_offers_is_refused() {
+        let neutral = CatalogModelEntry {
+            id: ModelId::parse("gpt-4o").expect("id"),
+            neutral: None,
+            offerings: Vec::new(),
+        };
+        assert_eq!(
+            CatalogContent::new(Vec::new(), vec![neutral.clone()]),
+            Err(CatalogContentError::Unoffered { models: 1 })
+        );
+        assert_eq!(
+            CatalogContent::new(vec![provider("openai")], vec![neutral.clone()]),
+            Err(CatalogContentError::Unoffered { models: 1 })
+        );
+
+        let held = CatalogContent::new(
+            vec![provider("openai")],
+            vec![CatalogModelEntry {
+                offerings: vec![offering("openai", "gpt-4o", None)],
+                ..neutral.clone()
+            }],
+        )
+        .expect("an offered catalogue");
+        let mut active = LastKnownGoodCatalog::default();
+        active.admit(snapshot(held.clone(), SourceValidators::etag("\"one\"")));
+        let refused: Result<CatalogSnapshot, CatalogContentError> =
+            CatalogContent::new(Vec::new(), vec![neutral])
+                .map(|content| snapshot(content, SourceValidators::etag("\"two\"")));
+        assert!(active.admit_result(refused).is_err());
+        assert_eq!(
+            active.active().map(|active| active.content.content_id()),
+            Some(held.content_id()),
+            "a catalogue no provider offers replaced the last known good one"
+        );
+    }
+
     #[test]
     fn an_offering_filed_under_the_wrong_model_is_refused() {
         let entry = CatalogModelEntry {
@@ -3293,6 +3452,92 @@ mod tests {
             ModelId::parse(&"m".repeat(129)),
             Err(InvalidCatalogId::TooLong { max: 128, .. })
         ));
+    }
+
+    #[test]
+    fn a_refusal_quotes_a_hostile_identifier_only_in_excerpt() {
+        let hostile = "m".repeat(4 * 1024 * 1024);
+        let refusal = ModelId::parse(&hostile)
+            .expect_err("an over-long id")
+            .to_string();
+
+        assert!(
+            refusal.len() < 256,
+            "a refusal an upstream can size is a log amplifier: {} bytes",
+            refusal.len()
+        );
+        assert!(
+            refusal.contains("mmmm") && refusal.contains(&hostile.len().to_string()),
+            "the excerpt has to stay recognizable and state the true length: {refusal}"
+        );
+
+        let multibyte = format!("{}€", "é".repeat(200));
+        let refusal = ModelId::parse(&multibyte)
+            .expect_err("an over-long id")
+            .to_string();
+        assert!(
+            refusal.len() < 256 && refusal.contains('é'),
+            "an excerpt cuts on a character boundary: {refusal}"
+        );
+
+        assert_eq!(
+            excerpt("openai/gpt-4o"),
+            "openai/gpt-4o",
+            "an identifier of a plausible length is quoted whole"
+        );
+
+        // A list of accepted identifiers is bounded in its length as well as in
+        // each element: how many of them there are is the payload's choice.
+        let many: Vec<String> = (0..100_000).map(|index| format!("a{index}/x")).collect();
+        let listed = excerpt_list(&many);
+        assert!(
+            listed.len() < 256 && listed.ends_with("and 99992 more"),
+            "a candidate list an upstream can size is the same amplifier: {} bytes",
+            listed.len()
+        );
+        assert_eq!(
+            excerpt_list(&["alpha/m-1".to_owned(), "beta/m-1".to_owned()]),
+            "`alpha/m-1`, `beta/m-1`",
+            "a list an operator can read is quoted whole"
+        );
+    }
+
+    /// A bound that eats the location is a bound that eats the diagnosis.
+    #[test]
+    fn a_bounded_message_keeps_the_position_it_ends_with() {
+        let located = format!(
+            "invalid type: string \"{}\", expected u64 at line 1234 column 12",
+            "x".repeat(4 * 1024 * 1024)
+        );
+        let bounded = excerpt_located(&located);
+
+        assert!(
+            bounded.len() < 256,
+            "an upstream still cannot size the line: {} bytes",
+            bounded.len()
+        );
+        assert!(
+            bounded.starts_with("invalid type: string")
+                && bounded.contains(&located.len().to_string()),
+            "the head and the true length survive: {bounded}"
+        );
+        assert!(
+            bounded.ends_with("at line 1234 column 12"),
+            "the only locator these two refusals carry survives: {bounded}"
+        );
+
+        let multibyte = format!("{}€ at line 1 column 9", "é".repeat(400));
+        let bounded = excerpt_located(&multibyte);
+        assert!(
+            bounded.len() < 256 && bounded.ends_with("at line 1 column 9"),
+            "both cuts land on a character boundary: {bounded}"
+        );
+
+        assert_eq!(
+            excerpt_located("expected value at line 1 column 1"),
+            "expected value at line 1 column 1",
+            "a message an operator can read is quoted whole"
+        );
     }
 
     #[test]

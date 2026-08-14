@@ -1,10 +1,11 @@
 # Fuzzing
 
-Axond parses input it does not control on three paths: an operator's
+Axond parses input it does not control on four paths: an operator's
 configuration file at boot and on every reload, a caller's credential and query
-string on every request, and everything a *provider* sends back — the SSE stream
-relayed to a tenant byte for byte, and the failure body an error response is
-classified from. All three are fuzzed continuously — a scheduled
+string on every request, everything a *provider* sends back — the SSE stream
+relayed to a tenant byte for byte and the failure body an error response is
+classified from — and the models.dev catalogue a background refresh imports
+unattended. All four are fuzzed continuously — a scheduled
 coverage-guided run for exploration, and a bounded deterministic replay on every
 pull request so the result is required CI evidence rather than a dashboard
 nobody reads.
@@ -26,6 +27,7 @@ feature, and what that costs.
 | `sse_decode` | `SseDecoder`: event framing, `data:`/`event:` fields, LF and CRLF delimiters, the buffer limit | Every streamed response, on whatever chunk boundaries the network produced |
 | `provider_stream` | The provider stream decoders: OpenAI chat and Responses, Azure AI Foundry, Anthropic translated into OpenAI chunks, and a native Anthropic relay | Every streamed response, once framed |
 | `provider_error` | `ProviderError::from_upstream` and `ProviderError::transport`, and the classification, retry, and health judgements built on them | Every non-2xx or failed upstream call |
+| `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission over the last-known-good catalogue | The scheduled catalogue refresh, unattended |
 
 Every target asserts the same three properties, because they are what the
 gateway relies on.
@@ -67,17 +69,86 @@ The wire targets add the properties a relay depends on:
    an upstream URL as canaries that it passes to nothing, so either of them
    appearing in a rendered error, a `Debug`, or a diagnostic is a finding.
 
+The catalogue target adds the properties that make an unattended import safe to
+run against a document a third party publishes:
+
+- **A refused payload cannot replace a good one.** Every fuzzed import runs over
+  a last-known-good catalogue that already holds a valid snapshot; whatever the
+  payload is, the active content afterwards is either that payload's content or
+  exactly what was active before.
+- **Identity is content, not spelling.** Object key order, whitespace, the fetch
+  time, and the validators are provenance: they are recorded and they never reach
+  the content id, so a regenerated upstream document is not an update.
+- **Additive drift is tolerated; changed meaning is refused.** A field the schema
+  does not define is ignored and changes nothing stored. A field whose meaning
+  drifted — an unknown status or modality, a malformed or negative price, a
+  duplicated tier, an id that contradicts its key — is a typed refusal naming the
+  JSON Pointer an operator can act on, never a value folded onto a default.
+- **A price change is classified as a price change.** An edit to a published rate
+  classifies as price-only, and an edit to a description, a capability flag, a
+  lifecycle status, or a provider-neutral record classifies as metadata-only.
+  Confusing the two would mean a spend decision made from a stale rate or a
+  cosmetic edit alerting as a price move.
+- **Provider overrides stay honest and local.** The overrides an offering
+  records are compared with the complete set of differences recomputed against
+  the neutral record, so an override the import invented and a provider value it
+  quietly dropped both fail, and each pointer must point inside the offering
+  that states it. The comparison is calibrated once per run by removing a
+  recorded override and requiring it to be noticed.
+- **Importing is not publishing.** The routing table a request would be served
+  from is read off a real `AppState` — the same snapshot load a request performs,
+  on the pointer `AppState::publish` stores into — before and after every import,
+  and must be unchanged: a catalogue import records metadata, and nothing in this
+  path activates runtime state. The observation is calibrated once per run
+  against a separate state that is deliberately published into: if publishing
+  stopped moving the table, the check has gone blind and the run fails rather
+  than reporting a vacuous pass.
+- **A catalogue nothing offers is refused.** An accepted import holds at least
+  one model, one provider, and one offering; a document that kept its models and
+  lost its providers is a typed `Unoffered` refusal and leaves the held
+  catalogue active. The guarantee is that an accepted catalogue is routable
+  somewhere, not that every model in it is offered — a single record no provider
+  serves is an ordinary upstream state, and refusing the whole document over it
+  would let one upstream edit freeze every other model.
+- **A refusal is not sized by the payload.** A refusal quotes upstream text only
+  in a bounded excerpt — the JSON Pointer beside it is what locates the value
+  exactly — so a 64 MiB map key cannot make a refused refresh write 64 MiB into
+  the log pipeline on every scheduled retry. The bound is on the count as well
+  as on each value: a refusal that lists the models an ambiguous key could mean
+  names a few of them and says how many there were. Both the message and the
+  pointer are asserted to stay under a fixed ceiling. A payload that is not JSON
+  and one whose shape the schema rejects carry no pointer at all, so their bound
+  keeps the tail as well as the head: `serde_json` states the position last, and
+  a type error repeats the value it rejected, so an upstream that files a
+  megabyte where a number belongs is exactly the case whose location an
+  unqualified head-only cut would drop.
+- **An absent wrapper states nothing rather than something.** A record that
+  omits `modalities` or `limit` imports with neither stated — no ceiling, no
+  modality, nothing a caller can mistake for an observed answer. A *stated*
+  wrapper of the wrong shape is still a refusal, and the fuzz corpus carries
+  both shapes so a future default cannot appear unnoticed.
+
 Runs are hermetic: the seam the targets call builds its verifiers from a
 configuration compiled into the binary with synthetic key material, so a fuzz run
-makes no network call, reads no file, and holds no real secret. The corpora are
-public for the same reason.
+makes no network call, reads no file, and holds no real secret. The catalogue
+target runs the *real* source — conditional fetch, strict parse, admission —
+against an in-memory fetcher that serves bytes already in hand and records what
+it was asked for, and then asserts that the only thing the import path reached
+for was the configured `/catalog.json` URL. No socket, and evidence of it rather
+than an assurance. The corpora are public for the same reason.
 
 ## The two lanes
 
 **Pull requests — `Fuzz smoke`, required.** Replays every committed seed plus
 fixed derivations of it (truncations, single-byte flips, one oversized
-repetition) and a set of tokens minted at replay time, on the pinned stable
-toolchain. A committed token seed has expired by the time it is replayed, so the
+repetition), a set of tokens minted at replay time, and a set of catalogue edits
+applied at replay time, on the pinned stable toolchain. The catalogue corpus is
+documents, which reaches decoding, the schema, and normalization; the semantic
+classification needs two catalogues that differ in one stated way, so the smoke
+edits the bundled seed at replay time — one edit each, every one of them pinned
+by name to the class it must be understood as, and every one of them re-rendered
+with its keys rotated so each semantic assertion is a reordering assertion too.
+A committed token seed has expired by the time it is replayed, so the
 checks *behind* `exp` — audience, lifetime, namespace, signer authority, subject,
 `jti`, aliases, scope, issuance epoch — are reached two other ways, both of which
 assert the outcome each case exists for by name rather than counting classes:
@@ -115,9 +186,10 @@ regression-test rule a security fix already follows.
 
 ## Scope, and what it is not
 
-Fuzzing covers the parsers above. Catalogue imports are named in the umbrella
-program (issue #159) and are not covered yet; they need the same treatment
-through the same seam. Fuzzing is also
+Fuzzing covers the parsers above. On the catalogue path, what is fuzzed is
+the import: the transport that retrieves the document is covered by the ordinary
+suite, not here, because the fuzz seam deliberately replaces it with an in-memory
+fetcher. Fuzzing is also
 not a substitute for the typed-error and tenant-isolation tests in the ordinary
 suite: it explores inputs those tests do not enumerate, and it asserts *fewer*
 things about each one.

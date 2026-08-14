@@ -12,13 +12,16 @@ use gateway_core::CircuitState;
 
 use super::projection::testing;
 use super::*;
-use crate::backends::catalog::{CatalogContent, CatalogModelEntry, ModelId};
+use crate::backends::catalog::{
+    CatalogContent, CatalogModelEntry, CatalogProvider, JsonPointer, ModelId, ProviderEndpoint,
+    ProviderId, ProviderOffering,
+};
 use crate::desired_state::credentials::ProviderCredentialBody;
 use crate::desired_state::fixtures;
 use crate::desired_state::models::{ModelLifecycle, ModelOwner, WireFamily};
 use crate::desired_state::providers::ProviderBody;
 use crate::desired_state::secrets::{SecretLifecycle, SecretOwner};
-use crate::desired_state::{DesiredState, ProjectId, ResourceVersion, Slug, TenantId};
+use crate::desired_state::{Checksum, DesiredState, ProjectId, ResourceVersion, Slug, TenantId};
 
 const MODEL: &str = "gpt-4o";
 const PROVIDER: &str = "openai";
@@ -40,22 +43,46 @@ fn catalogue() -> Catalogue {
     Catalogue::active(listing())
 }
 
+/// A valid later catalogue that does not publish the deployment's target.
+///
+/// `CatalogContent` refuses a model-less offering set, so withdrawal fixtures
+/// retain one unrelated provider/model pair rather than constructing an invalid
+/// empty snapshot.
+fn catalogue_without_target(snapshot: Checksum) -> Catalogue {
+    let provider = ProviderId::parse("anthropic").expect("a well-formed provider id");
+    let model = ModelId::parse("claude-3").expect("a well-formed model id");
+    let content = CatalogContent::new(
+        vec![CatalogProvider {
+            id: provider.clone(),
+            display_name: None,
+            doc_url: None,
+            endpoint: ProviderEndpoint::default(),
+            env_vars: Vec::new(),
+            pointer: JsonPointer::new("").child("providers").child("anthropic"),
+        }],
+        vec![CatalogModelEntry {
+            id: model.clone(),
+            neutral: None,
+            offerings: vec![ProviderOffering {
+                provider,
+                model,
+                published_model_id: "claude-3".to_owned(),
+                facts: Default::default(),
+                overrides: Vec::new(),
+                price: None,
+                endpoint: ProviderEndpoint::default(),
+                pointer: JsonPointer::new("").child("models").child("claude-3"),
+            }],
+        }],
+    )
+    .expect("a catalogue with an unrelated offering");
+    Catalogue::active(CatalogueListing::of(snapshot, &content))
+}
+
 /// A catalogue that no longer carries the offering, but remembers the snapshot
 /// the enablement pinned: the withdrawal shape.
 fn withdrawn_catalogue() -> Catalogue {
-    let empty = CatalogueListing::of(
-        crate::desired_state::Checksum::of(b"a later catalogue import"),
-        &CatalogContent::new(
-            Vec::new(),
-            vec![CatalogModelEntry {
-                id: ModelId::parse("claude-3").expect("a well-formed model id"),
-                neutral: None,
-                offerings: Vec::new(),
-            }],
-        )
-        .expect("a catalogue with one model"),
-    );
-    Catalogue::active(empty).with_superseded(listing())
+    catalogue_without_target(Checksum::of(b"a later catalogue import")).with_superseded(listing())
 }
 
 /// A provider connection the tenant owns, named as the catalogue names the
@@ -313,18 +340,7 @@ fn an_offering_the_active_catalogue_dropped_is_withdrawn() {
 #[test]
 fn an_unnameable_enablement_is_counted_and_files_no_record() {
     let deployment = Deployment::new().entitled().governed();
-    let empty = Catalogue::active(CatalogueListing::of(
-        fixtures::catalog_snapshot(),
-        &CatalogContent::new(
-            Vec::new(),
-            vec![CatalogModelEntry {
-                id: ModelId::parse("claude-3").expect("a well-formed model id"),
-                neutral: None,
-                offerings: Vec::new(),
-            }],
-        )
-        .expect("a catalogue with one model"),
-    ));
+    let empty = catalogue_without_target(fixtures::catalog_snapshot());
 
     let projected = project(&deployment, &empty, &resolved(40), None);
 
@@ -663,18 +679,7 @@ fn a_target_the_revision_stopped_describing_stops_being_permitted() {
     // The catalogue snapshot the enablement pinned is no longer in hand, so this
     // projection can name nothing: the same shape a rollback that dropped the
     // enablement produces.
-    let unnameable = Catalogue::active(CatalogueListing::of(
-        crate::desired_state::Checksum::of(b"a catalogue naming nothing"),
-        &CatalogContent::new(
-            Vec::new(),
-            vec![CatalogModelEntry {
-                id: ModelId::parse("claude-3").expect("a well-formed model id"),
-                neutral: None,
-                offerings: Vec::new(),
-            }],
-        )
-        .expect("a catalogue with one model"),
-    ));
+    let unnameable = catalogue_without_target(Checksum::of(b"a catalogue naming nothing"));
     let again = AvailabilityProjection::new(&unnameable, &resolved(40))
         .project(&deployment.state, &first, None)
         .expect("the revision projects again");

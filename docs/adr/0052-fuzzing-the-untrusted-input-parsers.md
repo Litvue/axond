@@ -59,7 +59,17 @@ nothing at the repository root:
 pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection>
 pub fn credentials_query_namespaces(q: Option<&str>) -> Result<Option<String>, Rejection>
 pub fn verify_token(credential: &str) -> Result<Option<VerifiedToken>, Rejection>
+pub fn catalog_import_over_seed(payload: &[u8], etag: Option<&str>) -> CatalogAdmission
 ```
+
+The catalogue entry point is the shape the rest follow as coverage grows: the
+seam runs the *real* import — the source's conditional fetch, the strict parse,
+admission over a last-known-good catalogue — with the only untrusted-side
+dependency replaced by an in-memory `CatalogFetch` that records what it was
+asked for. Replacing the transport rather than the parser is what makes a
+hermetic run evidence: the target can assert that the import reached for nothing
+but the configured URL, and that the routing table a request is served from did
+not move, instead of asserting that it stayed inside a mock.
 
 A Cargo feature was the obvious alternative and is worse in the way that matters:
 a feature is switchable by any dependant and is compiled by `--all-features`, so
