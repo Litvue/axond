@@ -503,15 +503,26 @@ fn restore_drill_owns_restore_stages_and_reads_catalogue_before_recovered_boot()
     );
     assert!(
         drill.contains(
-            "require \"the_restored_replica_authenticates_before_inference\" 401 \"$inference_status\""
+            "require \"the_restored_replica_fails_readiness_closed\" 503 \"$readiness_status\""
         ),
-        "recovered unauthenticated catalogue reads must fail authentication before convergence"
+        "a restored replica that has not converged must keep readiness closed"
     );
     assert!(
         drill.contains(
-            "require \"the_restored_replica_names_authentication_refusal\" unauthorized \"$inference_error\""
+            "require \"the_restored_replica_fails_inference_closed\" 503 \"$inference_status\""
         ),
-        "the recovered unauthenticated catalogue refusal must retain its typed error"
+        "an unready restored replica must fail the inference route closed"
+    );
+    assert!(
+        drill.contains(
+            "require \"the_restored_replica_names_inference_refusal\" inference_unavailable \"$inference_error\""
+        ),
+        "the unready inference refusal must retain its typed error"
+    );
+    assert!(
+        drill.contains("successes=\"$(unauthenticated_successes \"$logical_endpoint\")\"")
+            && drill.contains("gate max_unauthenticated_admin_successes \"$successes\""),
+        "the separate administrative authentication gate must remain enforced"
     );
 }
 

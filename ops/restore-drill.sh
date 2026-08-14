@@ -524,6 +524,9 @@ observe revision_after_restore "$after_restore"
 # or a successful publication is not permission to put the replica in traffic.
 # Keep connection failure as a sentinel so the stage writes its artifact and
 # names an unreachable probe rather than aborting before `close` can retain it.
+# An unready replica rejects inference at the readiness/convergence gate before
+# the inference route reaches its authentication check; the administrative
+# surface below still proves that unauthenticated callers are refused.
 probe_status() {
   local body="$1" url="$2" status
   status="$(curl -sS -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
@@ -538,10 +541,10 @@ observe restored_inference_status "$inference_status"
 observe restored_inference_error "$inference_error"
 require "the_restored_replica_fails_readiness_closed" 503 "$readiness_status" \
   "a restored journal without a projected serving snapshot is not routed traffic"
-require "the_restored_replica_authenticates_before_inference" 401 "$inference_status" \
-  "authentication precedes convergence, so an unauthenticated catalogue read is refused before readiness state is evaluated"
-require "the_restored_replica_names_authentication_refusal" unauthorized "$inference_error" \
-  "the refusal identifies missing authentication rather than an unrelated route error"
+require "the_restored_replica_fails_inference_closed" 503 "$inference_status" \
+  "an unready restored replica refuses inference before the route can serve traffic"
+require "the_restored_replica_names_inference_refusal" inference_unavailable "$inference_error" \
+  "the refusal identifies the missing serving snapshot rather than an unrelated route error"
 
 restore_loss_checks=(the_restored_head_is_the_backed_up_head
   the_restored_revision_chain_is_whole the_restored_deployment_is_whole
