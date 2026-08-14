@@ -998,7 +998,7 @@ pub(crate) fn candidate(
     RevisionCandidate {
         expected,
         state,
-        base: None,
+        legacy_aliases: Default::default(),
         mutation: Mutation {
             id: mutation,
             actor: actor(),

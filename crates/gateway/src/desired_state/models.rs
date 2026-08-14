@@ -121,7 +121,7 @@
 //! with the schema table and the untyped-alias exception in
 //! `docs/operations/revision-convergence.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::canonical::{
@@ -1754,7 +1754,7 @@ impl Models {
     pub(crate) fn of_with_mode(
         state: &DesiredState,
         mode: ModelValidationMode,
-        legacy_base: Option<&DesiredState>,
+        legacy_aliases: Option<&BTreeSet<ResourceRef>>,
     ) -> Result<Self, ModelError> {
         let mut models = Self::default();
         for resource in state.resources() {
@@ -1822,9 +1822,9 @@ impl Models {
             let resource = state
                 .get(&alias.reference)
                 .expect("the alias was read from this state");
-            let unchanged_legacy_alias =
-                legacy_base.is_some_and(|base| base.get(&alias.reference) == Some(resource));
-            models.check_targets(state, resource, &alias.body, mode, unchanged_legacy_alias)?;
+            let legacy_alias_allowed =
+                legacy_aliases.is_some_and(|aliases| aliases.contains(&alias.reference));
+            models.check_targets(state, resource, &alias.body, mode, legacy_alias_allowed)?;
         }
         Ok(models)
     }
@@ -1837,7 +1837,7 @@ impl Models {
         resource: &ResourceVersion,
         body: &ModelAliasBody,
         mode: ModelValidationMode,
-        unchanged_legacy_alias: bool,
+        legacy_alias_allowed: bool,
     ) -> Result<(), ModelError> {
         if body.is_enabled() && body.targets().is_empty() {
             return Err(ModelError::NoTargets {
@@ -1861,7 +1861,7 @@ impl Models {
                 if mode == ModelValidationMode::Strict
                     && body.is_enabled()
                     && !enabled.body.is_enabled()
-                    && !unchanged_legacy_alias
+                    && !legacy_alias_allowed
                 {
                     return Err(ModelError::DisabledTarget {
                         reference: resource.reference,
@@ -1943,6 +1943,94 @@ impl Models {
             enablement.body.owner() == owner && enablement.body.offering().offering == offering
         })
     }
+}
+
+/// Return the candidate alias references that may carry a legacy disabled-target
+/// shape through strict publication validation.
+///
+/// The allowance is deliberately bounded to references, rather than carrying a
+/// complete base [`DesiredState`] through the store. An unchanged legacy alias
+/// is allowed for a one-resource repair. A restacked alias is allowed only when
+/// its identity, owner, wire family, lifecycle, target order, and target ids are
+/// unchanged, with target versions advanced exactly to the candidate's current
+/// enablement versions. An authored target or body change therefore remains
+/// strict.
+pub(crate) fn legacy_alias_allowlist(
+    base: &DesiredState,
+    candidate: &DesiredState,
+) -> BTreeSet<ResourceRef> {
+    let mut allowed = BTreeSet::new();
+    for resource in candidate
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::Alias)
+    {
+        let Ok(candidate_body) = ModelAliasBody::read(resource) else {
+            continue;
+        };
+        let Some(base_resource) = base.version_of(ResourceKind::Alias, candidate_body.alias())
+        else {
+            continue;
+        };
+        let Ok(base_body) = ModelAliasBody::read(base_resource) else {
+            continue;
+        };
+        if !base_body.is_enabled()
+            || !base_body.targets().iter().any(|target| {
+                base.version_of(ResourceKind::ModelEnablement, target.enablement)
+                    .filter(|enablement| enablement.reference == target.reference())
+                    .and_then(|enablement| ModelEnablementBody::read(enablement).ok())
+                    .is_some_and(|body| !body.is_enabled())
+            })
+        {
+            continue;
+        }
+
+        if resource.reference == base_resource.reference {
+            if resource == base_resource {
+                allowed.insert(resource.reference);
+            }
+            continue;
+        }
+        if resource.reference.version <= base_resource.reference.version
+            || candidate_body.alias() != base_body.alias()
+            || candidate_body.tenant() != base_body.tenant()
+            || candidate_body.project() != base_body.project()
+            || candidate_body.wire_family() != base_body.wire_family()
+            || candidate_body.state() != base_body.state()
+            || candidate_body.targets().len() != base_body.targets().len()
+        {
+            continue;
+        }
+
+        let mut advanced_target = false;
+        let carry_forward = base_body
+            .targets()
+            .iter()
+            .zip(candidate_body.targets())
+            .all(|(base_target, candidate_target)| {
+                if base_target.enablement != candidate_target.enablement {
+                    return false;
+                }
+                if base_target.version == candidate_target.version {
+                    return true;
+                }
+                let base_current = base
+                    .version_of(ResourceKind::ModelEnablement, base_target.enablement)
+                    .map(|enablement| enablement.reference);
+                let candidate_current = candidate
+                    .version_of(ResourceKind::ModelEnablement, candidate_target.enablement)
+                    .map(|enablement| enablement.reference);
+                let advanced = base_current == Some(base_target.reference())
+                    && candidate_current == Some(candidate_target.reference())
+                    && candidate_target.version > base_target.version;
+                advanced_target |= advanced;
+                advanced
+            });
+        if carry_forward && advanced_target {
+            allowed.insert(resource.reference);
+        }
+    }
+    allowed
 }
 
 /// Whether an alias body declares a schema at all, and is therefore a body this
