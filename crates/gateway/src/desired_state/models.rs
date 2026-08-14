@@ -175,11 +175,16 @@ const TARGET_ENABLEMENT_ID_PATH: &str = "targets.enablement_id";
 const TARGET_VERSION_PATH: &str = "targets.version";
 
 /// Why an offering identity could not be parsed.
+///
+/// The refused name is carried but never rendered, for the same reason
+/// [`InvalidId`] does not render it: a refusal reaches a
+/// response body, a log line and an audit trail, and a caller who pastes
+/// material into an identifier field must not have it read back.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidOfferingId {
-    #[error("offering id `{name}` is not prefixed `{}`", OfferingId::PREFIX)]
+    #[error("is not prefixed `{}`", OfferingId::PREFIX)]
     Prefix { name: String },
-    #[error("offering id `{name}` is not 64 lowercase hex digits")]
+    #[error("does not carry 64 lowercase hex digits")]
     Digits { name: String },
 }
 
@@ -707,21 +712,21 @@ pub enum ModelError {
         reference: ResourceRef,
         field: &'static str,
     },
-    #[error("{reference} field `{field}` is not an id: {source}")]
+    #[error("{reference} field `{field}` {source}")]
     MalformedId {
         reference: ResourceRef,
         field: &'static str,
         #[source]
         source: InvalidId,
     },
-    #[error("{reference} field `{field}` is not an offering id: {source}")]
+    #[error("{reference} field `{field}` is not an offering id: it {source}")]
     MalformedOffering {
         reference: ResourceRef,
         field: &'static str,
         #[source]
         source: InvalidOfferingId,
     },
-    #[error("{reference} field `{field}` is not a checksum: {source}")]
+    #[error("{reference} field `{field}` is not a checksum: it {source}")]
     MalformedChecksum {
         reference: ResourceRef,
         field: &'static str,

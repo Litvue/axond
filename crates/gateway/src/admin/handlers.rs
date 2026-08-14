@@ -32,12 +32,12 @@ use super::reads::{
     AuditPage, AvailabilityResult, ConvergenceResult, HistoryLimit, HistoryRequest, RevisionPage,
     StateView,
 };
-use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest};
+use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest, uuid_detail};
 use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi};
 use super::service::{AvailabilityAuthority, MutationOutcome};
 use crate::desired_state::{
-    ModelLifecycle, MutationKind, OfferingId, ProjectId, ResourceScope, RevisionId, Surface,
-    TenantId, WireFamily,
+    InvalidId, ModelLifecycle, MutationKind, OfferingId, ProjectId, ResourceScope, RevisionId,
+    Surface, TenantId, WireFamily,
 };
 
 /// The route table's mutating rows, as method routers.
@@ -169,7 +169,7 @@ async fn rollback(
     let target =
         RevisionId::parse(&request.revision).map_err(|error| AdminError::RequestInvalid {
             schema: "rollback",
-            detail: format!("`revision`: {error}"),
+            detail: format!("`revision`: {}", id_detail(RevisionId::PREFIX, &error)),
         })?;
     let scope = scope_of(
         "rollback",
@@ -395,7 +395,7 @@ async fn history(
             Some(
                 RevisionId::parse(text).map_err(|error| AdminError::RequestInvalid {
                     schema: "history",
-                    detail: format!("`start`: {error}"),
+                    detail: format!("`start`: {}", id_detail(RevisionId::PREFIX, &error)),
                 })?,
             )
         }
@@ -423,7 +423,7 @@ async fn audit(
         .await?;
     let revision = RevisionId::parse(&revision).map_err(|error| AdminError::RequestInvalid {
         schema: "audit",
-        detail: format!("`revision`: {error}"),
+        detail: format!("`revision`: {}", id_detail(RevisionId::PREFIX, &error)),
     })?;
     Ok(Conditional::new(
         &headers,
@@ -542,17 +542,73 @@ fn scope_of(
             "a project scope must name the tenant that owns it".to_owned(),
         )),
         (Some(tenant), project) => {
-            let tenant =
-                TenantId::parse(tenant).map_err(|error| invalid("tenant", error.to_string()))?;
+            // A scope names ids, and a refusal is rendered into a response and a
+            // log line, so it says what form was expected rather than repeating
+            // the text a caller sent — the same boundary the document path holds.
+            let tenant = TenantId::parse(tenant)
+                .map_err(|error| invalid("tenant", id_detail(TenantId::PREFIX, &error)))?;
             match project {
                 None => Ok(ResourceScope::Tenant(tenant)),
                 Some(project) => {
-                    let project = ProjectId::parse(project)
-                        .map_err(|error| invalid("project", error.to_string()))?;
+                    let project = ProjectId::parse(project).map_err(|error| {
+                        invalid("project", id_detail(ProjectId::PREFIX, &error))
+                    })?;
                     Ok(ResourceScope::Project { tenant, project })
                 }
             }
         }
+    }
+}
+
+/// Why an id a request named was refused, without echoing the text that
+/// arrived: a refusal reaches a response body, a log line and an audit trail,
+/// and material mispasted where an id belongs must not reach any of them.
+fn id_detail(prefix: &'static str, error: &InvalidId) -> String {
+    match error {
+        InvalidId::Prefix { .. } => format!("is not a `{prefix}`-prefixed id"),
+        InvalidId::Uuid(uuid) => format!("has a uuid that {}", uuid_detail(uuid)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PASTED_MATERIAL: &str = "sk-axond-admin-sentinel-51H9xNEVERLOGME";
+
+    fn detail(error: AdminError) -> String {
+        error
+            .operator_detail()
+            .expect("a request refusal has operator detail")
+            .to_owned()
+    }
+
+    /// A scope the caller spelled wrongly is refused for the reason it failed,
+    /// and the text it sent is never rendered back: a refusal reaches a response
+    /// body, a log line and a transcript of the session.
+    #[test]
+    fn a_malformed_scope_id_is_refused_without_echoing_what_arrived() {
+        let refusal = detail(
+            scope_of("rollback", Some(PASTED_MATERIAL), None).expect_err("a wrong-prefix tenant"),
+        );
+        assert_eq!(refusal, "`tenant`: is not a `ten_`-prefixed id");
+
+        let malformed = format!("{}not-a-uuid", TenantId::PREFIX);
+        let refusal =
+            detail(scope_of("rollback", Some(&malformed), None).expect_err("a malformed uuid"));
+        assert_eq!(
+            refusal,
+            "`tenant`: has a uuid that is not a hyphenated 8-4-4-4-12 uuid"
+        );
+        assert!(!refusal.contains(&malformed));
+
+        let tenant = format!("{}0189f8c1-2a3b-7c4d-8e5f-6a7b8c9d0e1f", TenantId::PREFIX);
+        let refusal = detail(
+            scope_of("rollback", Some(&tenant), Some(PASTED_MATERIAL))
+                .expect_err("a wrong-prefix project"),
+        );
+        assert_eq!(refusal, "`project`: is not a `prj_`-prefixed id");
+        assert!(!refusal.contains(PASTED_MATERIAL));
     }
 }
 

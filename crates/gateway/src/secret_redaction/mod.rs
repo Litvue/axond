@@ -26,6 +26,10 @@
 //!   logs, spans, usage records, status.
 //! * [`journal`] sweeps everything a published revision durably leaves behind,
 //!   against a real PostgreSQL journal.
+//! * [`admin_surface`] sweeps everything the `/admin/v1` route table renders
+//!   back to an operator about a credential — diffs, publish responses,
+//!   idempotent replays, refusals, state, history, audit and convergence —
+//!   with the credential naming material that is genuinely live in the store.
 //! * [`stateful`] drives the zero-redeploy sequence — stage, activate, serve,
 //!   rotate, roll back, revoke — against the *production* secret store, so the
 //!   lifecycle is asserted over envelope-encrypted rows and owner-checked reads
@@ -45,6 +49,7 @@
 pub(crate) mod harness;
 pub(crate) mod sweep;
 
+mod admin_surface;
 mod journal;
 mod lifecycle;
 mod request_path;

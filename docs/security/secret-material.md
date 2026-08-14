@@ -37,6 +37,30 @@ unchanged by it. This page is the evidence for them under stateful mode.
 - **Material is not reachable from an operational surface.** Response bodies and
   headers, logs at every level, spans, usage records, and status responses are
   swept for it.
+- **An administrative surface renders references, not material.** Diffs, publish
+  responses, idempotent replays, refusals, state, history, audit trails, and
+  convergence all describe the credential by reference. A document that pastes
+  material where a `sct_…` reference belongs is refused by naming the form
+  expected, rather than by echoing what arrived. The refusal distinguishes a
+  value of the wrong kind from a right-prefixed identifier whose UUID is
+  malformed, so an operator can tell a mispaste from a typo, and it says so from
+  the parse failure rather than from the text: no identifier refusal anywhere —
+  request field, record field, log line, or audit trail — renders the string it
+  refused.
+- **The same boundary holds for every field material can be pasted into.** A
+  digest, a catalogue content address, an offering identity, and a name are all
+  refused by the form expected — wrong prefix, or a body that is not 64 lowercase
+  hex digits — and never by repeating what arrived. A closed-set field
+  (`wire_family`, a lifecycle, a state) is refused with the set *this build*
+  accepts, which is the actionable context and is composed entirely of the
+  build's own constants. Provider endpoint validation follows the same rule:
+  the refusal names the required absolute-origin form without copying the
+  configured endpoint into an operator log.
+- **The convergence read is swept against a real projection.** The
+  administrative fixture attaches a replica convergence status and records the
+  revision it published, so `/convergence` answers with revision identity,
+  generation, and source rather than with the empty report of a replica that has
+  no reconciler attached.
 
 ## How it is tested
 
@@ -50,6 +74,7 @@ reconciler, the real publication seam, the real router, and — for durable stat
 | `harness` | Sentinel material, a fake provider that records the `Authorization` header it was presented with, and a compiler that resolves desired-state credential references through a `SecretStore`. |
 | `lifecycle` | One-time disclosure, rotation overlapping an in-flight request, last-known-good retention on a failed resolution, destruction of retired material, and that the stateless environment-variable path still serves and still redacts. |
 | `request_path` | One served request's response, logs, spans, and usage record; a transport failure's error surfaces; a rejected caller's refusal; and the status projection of an unresolved secret. |
+| `admin_surface` | Every `/admin/v1` response about a credential that names material genuinely staged and activated in the production store: dry-run diff, publish, idempotent replay, reused-key conflict, a document with material pasted into `secret`, and the `state`, `history`, `audit` and `convergence` reads. |
 | `journal` | Every row of every table in the control-plane schema, rendered as text, plus manifests, hydrated revisions, audit trails, and idempotency replays and conflicts. |
 | `stateful` | The zero-redeploy sequence against the *production* secret store: stage, activate, serve, rotate, roll back to the previous version, and a revoked version refusing a candidate while the last known good keeps serving — plus a sweep of every stored row and a cross-owner read that never reaches a pool. |
 
@@ -99,7 +124,6 @@ inbound key binds to, because binding a caller to a projected namespace is
 declare, so the suite rebinds its bootstrap key to it rather than inventing an
 identity model. Stateful `serve` is still not wired for the same reason.
 
-The authenticated `/admin/v1` boundary is likewise not on this branch; the
-administrative reads that page is responsible for are asserted at the store
-level (`load_manifest`, `load_revision`, `audit_trail`, idempotency replay),
-which is where their payloads are built.
+The `/admin/v1` boundary is swept over its real route table and the real Postgres
+journal, with authentication and authorization faked — an administrator's
+identity is #252's, and no administrative response is shaped by who asked for it.

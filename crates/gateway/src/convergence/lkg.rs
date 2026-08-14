@@ -47,9 +47,9 @@ use crate::desired_state::canonical::CanonicalDecodeError;
 use crate::desired_state::revision::{ManifestEntry, RevisionManifest};
 use crate::desired_state::{
     BlobKind, BlobRef, CanonicalError, CanonicalValue, Checksum, DesiredState, IntegrityError,
-    LoadedRevision, MutationId, ProjectId, ResourceBody, ResourceId, ResourceKind, ResourceRef,
-    ResourceScope, ResourceVersion, ResourceVersionNumber, RevisionId, SerializerVersion, Slug,
-    TenantId,
+    InvalidId, LoadedRevision, MutationId, ProjectId, ResourceBody, ResourceId, ResourceKind,
+    ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, RevisionId,
+    SerializerVersion, Slug, TenantId,
 };
 
 /// The domain separator for cache files, so cached-state bytes cannot be
@@ -464,8 +464,7 @@ fn decode_manifest(value: &CanonicalValue) -> Result<RevisionManifest, String> {
                 "manifest.created_at_nanos",
             )?),
         serializer,
-        mutation: MutationId::parse(&string(field(fields, "mutation")?, "manifest.mutation")?)
-            .map_err(|error| format!("manifest.mutation is not an id: {error}"))?,
+        mutation: mutation_id(field(fields, "mutation")?, "manifest.mutation")?,
         entries: list(field(fields, "entries")?, "manifest.entries")?
             .iter()
             .map(decode_entry)
@@ -520,7 +519,7 @@ fn decode_reference(value: &CanonicalValue) -> Result<ResourceRef, String> {
     Ok(ResourceRef::new(
         kind,
         ResourceId::parse(&string(field(fields, "id")?, "reference.id")?)
-            .map_err(|error| format!("reference.id is not an id: {error}"))?,
+            .map_err(|error| invalid_id("reference.id", error))?,
         ResourceVersionNumber::new(version)
             .ok_or_else(|| "reference.version 0 names no content".to_owned())?,
     ))
@@ -530,7 +529,7 @@ fn decode_scope(value: &CanonicalValue) -> Result<ResourceScope, String> {
     let fields = map(value, "scope")?;
     let tenant = |fields: &[(String, CanonicalValue)]| -> Result<TenantId, String> {
         TenantId::parse(&string(field(fields, "tenant")?, "scope.tenant")?)
-            .map_err(|error| format!("scope.tenant is not an id: {error}"))
+            .map_err(|error| invalid_id("scope.tenant", error))
     };
     match string(field(fields, "kind")?, "scope.kind")?.as_str() {
         "deployment" => Ok(ResourceScope::Deployment),
@@ -538,7 +537,7 @@ fn decode_scope(value: &CanonicalValue) -> Result<ResourceScope, String> {
         "project" => Ok(ResourceScope::Project {
             tenant: tenant(fields)?,
             project: ProjectId::parse(&string(field(fields, "project")?, "scope.project")?)
-                .map_err(|error| format!("scope.project is not an id: {error}"))?,
+                .map_err(|error| invalid_id("scope.project", error))?,
         }),
         kind => Err(format!("scope.kind `{kind}` is not a scope")),
     }
@@ -562,8 +561,20 @@ fn decode_slug(value: &CanonicalValue) -> Result<Slug, String> {
     Slug::parse(&string(value, "slug")?).map_err(|error| format!("slug is not valid: {error}"))
 }
 
+/// Describe an ID in the authenticated cache without copying the stored text
+/// into a malformed-cache diagnostic. The field path and parser reason remain
+/// bounded and actionable; the parser's retained input is for structured
+/// inspection only, never for this operator-facing string.
+fn invalid_id(at: &str, error: InvalidId) -> String {
+    format!("{at} is not a valid id: {error}")
+}
+
+fn mutation_id(value: &CanonicalValue, at: &str) -> Result<MutationId, String> {
+    MutationId::parse(&string(value, at)?).map_err(|error| invalid_id(at, error))
+}
+
 fn revision_id(value: &CanonicalValue, at: &str) -> Result<RevisionId, String> {
-    RevisionId::parse(&string(value, at)?).map_err(|error| format!("{at} is not an id: {error}"))
+    RevisionId::parse(&string(value, at)?).map_err(|error| invalid_id(at, error))
 }
 
 fn map<'a>(value: &'a CanonicalValue, at: &str) -> Result<&'a [(String, CanonicalValue)], String> {
@@ -700,6 +711,58 @@ mod tests {
             "a body this build cannot read is a version skew, not damage: {integrity}"
         );
         let _ = fs::remove_file(cache.path());
+    }
+
+    #[test]
+    fn cached_id_refusals_keep_field_context_without_echoing_material() {
+        const MATERIAL: &str = "sk-live-provider-material";
+        let bad = CanonicalValue::string(MATERIAL);
+        let valid_tenant = fixtures::tenant_id(1).to_string();
+        let valid_project = fixtures::project_id(2).to_string();
+
+        let reference = CanonicalValue::map([
+            (
+                "kind",
+                CanonicalValue::string(ResourceKind::Tenant.as_str()),
+            ),
+            ("id", bad.clone()),
+            ("version", CanonicalValue::Integer(1)),
+        ]);
+        let tenant_scope = CanonicalValue::map([
+            ("kind", CanonicalValue::string("tenant")),
+            ("tenant", bad.clone()),
+        ]);
+        let project_scope_with_bad_tenant = CanonicalValue::map([
+            ("kind", CanonicalValue::string("project")),
+            ("tenant", bad.clone()),
+            ("project", CanonicalValue::string(&valid_project)),
+        ]);
+        let project_scope_with_bad_project = CanonicalValue::map([
+            ("kind", CanonicalValue::string("project")),
+            ("tenant", CanonicalValue::string(&valid_tenant)),
+            ("project", bad.clone()),
+        ]);
+
+        let errors = [
+            revision_id(&bad, "manifest.id").expect_err("the cache is corrupt"),
+            mutation_id(&bad, "manifest.mutation").expect_err("the cache is corrupt"),
+            decode_reference(&reference).expect_err("the cache is corrupt"),
+            decode_scope(&tenant_scope).expect_err("the cache is corrupt"),
+            decode_scope(&project_scope_with_bad_tenant).expect_err("the cache is corrupt"),
+            decode_scope(&project_scope_with_bad_project).expect_err("the cache is corrupt"),
+        ];
+        for error in &errors {
+            assert!(
+                !error.contains(MATERIAL),
+                "the cache refusal echoed material: {error}"
+            );
+        }
+        assert!(errors[0].contains("manifest.id"));
+        assert!(errors[1].contains("manifest.mutation"));
+        assert!(errors[2].contains("reference.id"));
+        assert!(errors[3].contains("scope.tenant"));
+        assert!(errors[4].contains("scope.tenant"));
+        assert!(errors[5].contains("scope.project"));
     }
 
     #[test]

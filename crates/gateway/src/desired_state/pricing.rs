@@ -1309,7 +1309,7 @@ pub enum PricingError {
         schema: &'static str,
         field: &'static str,
     },
-    #[error("{reference} field `{field}` is not a checksum: {source}")]
+    #[error("{reference} field `{field}` is not a checksum: it {source}")]
     MalformedChecksum {
         reference: ResourceRef,
         field: &'static str,

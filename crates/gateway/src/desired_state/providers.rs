@@ -91,7 +91,7 @@ pub enum ProviderError {
         reference: ResourceRef,
         field: &'static str,
     },
-    #[error("{reference} field `{field}` is not an id: {source}")]
+    #[error("{reference} field `{field}` {source}")]
     MalformedId {
         reference: ResourceRef,
         field: &'static str,
@@ -122,7 +122,7 @@ pub enum ProviderError {
     },
     /// An endpoint that is not an absolute `http`/`https` origin. Refused at
     /// publication rather than at the first request that cannot be sent.
-    #[error("{reference} declares endpoint `{found}`, which is not an absolute http(s) origin")]
+    #[error("{reference} declares an endpoint that is not an absolute http(s) origin")]
     MalformedEndpoint {
         reference: ResourceRef,
         found: String,
@@ -587,6 +587,10 @@ mod tests {
             assert!(
                 matches!(error, ProviderError::MalformedEndpoint { .. }),
                 "{endpoint}: {error}"
+            );
+            assert!(
+                !error.to_string().contains(endpoint),
+                "the malformed endpoint must not be copied into the refusal: {endpoint}"
             );
             assert!(!error.is_incompatible(), "{endpoint}");
         }

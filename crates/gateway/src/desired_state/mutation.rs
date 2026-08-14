@@ -111,7 +111,7 @@ pub enum InvalidActor {
     },
     #[error("an actor of kind `{kind}` does not have a `{field}` field in this build")]
     UnknownField { kind: &'static str, field: String },
-    #[error("an actor of kind `{kind}` records a `{field}` that is not an id: {source}")]
+    #[error("an actor of kind `{kind}` records a `{field}` that {source}")]
     Id {
         kind: &'static str,
         field: &'static str,

@@ -51,11 +51,16 @@ impl fmt::Debug for Uuid7 {
 }
 
 /// Why a UUIDv7 could not be accepted.
+///
+/// The refused text is carried but never rendered: a refusal reaches a response
+/// body, a log line and an audit trail, and provider material mispasted where an
+/// id belongs must not reach any of them. The field naming the id says where the
+/// mistake is; the message says what is wrong with it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidUuid7 {
-    #[error("`{0}` is not a hyphenated 8-4-4-4-12 UUID")]
+    #[error("is not a hyphenated 8-4-4-4-12 UUID")]
     Shape(String),
-    #[error("`{0}` contains a character that is not a lowercase hex digit")]
+    #[error("contains a character that is not a lowercase hex digit")]
     Digit(String),
     #[error("UUID version is {version}, but only version 7 is accepted")]
     Version { version: u8 },
@@ -306,7 +311,9 @@ macro_rules! typed_id {
 /// Why a typed id could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidId {
-    #[error("`{found}` is not prefixed `{expected}`, so it identifies something else")]
+    /// The refused text is carried but never rendered, for the reason
+    /// [`InvalidUuid7`] gives.
+    #[error("is not prefixed `{expected}`, so it identifies something else")]
     Prefix {
         expected: &'static str,
         found: String,
@@ -385,23 +392,28 @@ typed_id!(
 pub struct Slug(String);
 
 /// Why a slug was refused.
+///
+/// The refused text is carried but never rendered, for the reason [`InvalidId`]
+/// gives: a name field is one of the places material gets mispasted, and a
+/// refusal reaches a response body, a log line and an audit trail. What is wrong
+/// with the name is renderable; the name is not.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidSlug {
     #[error("a slug must not be empty")]
     Empty,
-    #[error("slug `{slug}` is {length} characters, over the {max}-character limit")]
+    #[error("a slug of {length} characters is over the {max}-character limit")]
     TooLong {
         slug: String,
         length: usize,
         max: usize,
     },
     #[error(
-        "slug `{slug}` contains `{character}`; only ASCII letters, digits, `-`, and `_` are allowed"
+        "a slug may not contain `{character}`; only ASCII letters, digits, `-`, and `_` are allowed"
     )]
     Character { slug: String, character: char },
-    #[error("slug `{slug}` must start and end with a letter or digit")]
+    #[error("a slug must start and end with a letter or digit")]
     Boundary { slug: String },
-    #[error("slug `{slug}` looks like an id; ids are not names")]
+    #[error("a slug may not look like an id; ids are not names")]
     IdLike { slug: String },
 }
 
@@ -596,6 +608,65 @@ mod tests {
         // A structure printed with `Debug` carries searchable ids, not bytes.
         assert_eq!(format!("{tenant:?}"), tenant.to_string());
         assert_eq!(format!("{uuid:?}"), uuid.to_string());
+    }
+
+    /// A slug is a name field, and a name field takes pasted text: the reason a
+    /// name was refused is renderable, the name itself is not.
+    #[test]
+    fn a_slug_refusal_never_repeats_the_text_it_refused() {
+        const MATERIAL: &str = "sk-live-0123456789abcdefghij";
+
+        for input in [
+            format!("{MATERIAL}!"),
+            format!("{MATERIAL}-"),
+            format!("{}{MATERIAL}", TenantId::PREFIX),
+            "a".repeat(Slug::MAX_LEN + 1),
+        ] {
+            let refusal = Slug::parse(&input).expect_err("the slug is refused");
+            assert!(
+                !refusal.to_string().contains(&input),
+                "the refusal echoed the name: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_refusal_never_repeats_the_text_it_refused() {
+        const MATERIAL: &str = "sk-live-0123456789abcdefghij";
+
+        let wrong_kind = TenantId::parse(MATERIAL).expect_err("material is not a tenant id");
+        assert_eq!(
+            wrong_kind.to_string(),
+            "is not prefixed `ten_`, so it identifies something else"
+        );
+        assert!(!wrong_kind.to_string().contains(MATERIAL));
+        // The text is still carried, for a caller that needs it deliberately.
+        assert!(matches!(wrong_kind, InvalidId::Prefix { found, .. } if found == MATERIAL));
+
+        let pasted_after_prefix = format!("{}{MATERIAL}", TenantId::PREFIX);
+        let malformed =
+            TenantId::parse(&pasted_after_prefix).expect_err("material is not a uuid either");
+        assert_eq!(
+            malformed.to_string(),
+            "is not a hyphenated 8-4-4-4-12 UUID",
+            "a right prefix must not be blamed for a malformed uuid"
+        );
+        assert!(!malformed.to_string().contains(MATERIAL));
+
+        let uppercase = format!(
+            "{}{}",
+            TenantId::PREFIX,
+            Uuid7::from_parts(42, 0, 7)
+                .unwrap()
+                .to_string()
+                .to_uppercase()
+        );
+        let digit = TenantId::parse(&uppercase).expect_err("uppercase hex is refused");
+        assert_eq!(
+            digit.to_string(),
+            "contains a character that is not a lowercase hex digit"
+        );
+        assert!(!digit.to_string().contains(&uppercase));
     }
 
     #[test]

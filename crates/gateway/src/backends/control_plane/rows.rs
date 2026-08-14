@@ -17,9 +17,9 @@
 //!   column is a typed error rather than sixteen bytes that fit.
 
 use crate::desired_state::{
-    Actor, BlobKind, BlobRef, Canonical, CanonicalError, Checksum, IntegrityError, MutationKind,
-    ProjectId, ResourceBody, ResourceKind, ResourceScope, ResourceVersionNumber, SerializerVersion,
-    Slug, TenantId,
+    Actor, BlobKind, BlobRef, Canonical, CanonicalError, Checksum, IntegrityError, InvalidId,
+    MutationKind, ProjectId, ResourceBody, ResourceKind, ResourceScope, ResourceVersionNumber,
+    SerializerVersion, Slug, TenantId,
 };
 
 /// The serializer versions a stored row may name.
@@ -41,11 +41,11 @@ pub(super) fn encoding(error: CanonicalError) -> IntegrityError {
 }
 
 pub(super) fn checksum(text: &str) -> Result<Checksum, IntegrityError> {
-    Checksum::parse(text).map_err(|error| unreadable(error.to_string()))
+    Checksum::parse(text).map_err(|error| unreadable(format!("a stored checksum {error}")))
 }
 
 pub(super) fn slug(text: &str) -> Result<Slug, IntegrityError> {
-    Slug::parse(text).map_err(|error| unreadable(error.to_string()))
+    Slug::parse(text).map_err(|error| unreadable(format!("a stored slug is refused: {error}")))
 }
 
 pub(super) fn version_number(value: i64) -> Result<ResourceVersionNumber, IntegrityError> {
@@ -99,11 +99,19 @@ pub(super) fn serializer(text: &str) -> Result<SerializerVersion, IntegrityError
         })
 }
 
+/// Add the stored column to an id parse failure without rendering the value
+/// that storage returned. `InvalidId` retains that value for structured callers,
+/// but its display is deliberately limited to the expected form and parse
+/// reason, so this is safe for operator-facing integrity diagnostics.
+fn invalid_stored_id(column: &str, error: InvalidId) -> IntegrityError {
+    unreadable(format!("stored `{column}` id is invalid: {error}"))
+}
+
 /// Parse a typed id from its prefixed text form.
 macro_rules! id_column {
     ($name:ident, $type:ty) => {
         pub(super) fn $name(text: &str) -> Result<$type, IntegrityError> {
-            <$type>::parse(text).map_err(|error| unreadable(error.to_string()))
+            <$type>::parse(text).map_err(|error| invalid_stored_id(stringify!($name), error))
         }
     };
 }
@@ -148,10 +156,12 @@ pub(super) fn scope(
     project: Option<&str>,
 ) -> Result<ResourceScope, IntegrityError> {
     let tenant = tenant
-        .map(|text| TenantId::parse(text).map_err(|error| unreadable(error.to_string())))
+        .map(|text| TenantId::parse(text).map_err(|error| invalid_stored_id("scope tenant", error)))
         .transpose()?;
     let project = project
-        .map(|text| ProjectId::parse(text).map_err(|error| unreadable(error.to_string())))
+        .map(|text| {
+            ProjectId::parse(text).map_err(|error| invalid_stored_id("scope project", error))
+        })
         .transpose()?;
     match (kind, tenant, project) {
         ("deployment", None, None) => Ok(ResourceScope::Deployment),
@@ -569,6 +579,66 @@ mod tests {
         );
         assert!(revision_id(&RevisionId::new(uuid(5)).to_string()).is_ok());
         assert!(resource_id("res_not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn stored_id_refusals_keep_column_context_without_echoing_the_value() {
+        const MATERIAL: &str = "sk-live-provider-material";
+
+        let errors = [
+            (
+                "resource_id",
+                resource_id(MATERIAL).expect_err("the row is corrupt"),
+            ),
+            (
+                "revision_id",
+                revision_id(MATERIAL).expect_err("the row is corrupt"),
+            ),
+            (
+                "mutation_id",
+                mutation_id(MATERIAL).expect_err("the row is corrupt"),
+            ),
+            (
+                "audit_event_id",
+                audit_event_id(MATERIAL).expect_err("the row is corrupt"),
+            ),
+            (
+                "tenant_id",
+                tenant_id(MATERIAL).expect_err("the row is corrupt"),
+            ),
+            (
+                "principal_id",
+                principal_id(MATERIAL).expect_err("the row is corrupt"),
+            ),
+        ];
+        for (column, error) in errors {
+            let text = error.to_string();
+            assert!(
+                text.contains(&format!("stored `{column}` id is invalid")),
+                "the refusal lost its stored-column context: {text}"
+            );
+            assert!(
+                !text.contains(MATERIAL),
+                "the refusal echoed stored material: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_scope_id_refusals_keep_field_context_without_echoing_the_value() {
+        const MATERIAL: &str = "sk-live-provider-material";
+
+        let tenant = scope("tenant", Some(MATERIAL), None).expect_err("the row is corrupt");
+        let text = tenant.to_string();
+        assert!(text.contains("stored `scope tenant` id is invalid"));
+        assert!(!text.contains(MATERIAL));
+
+        let tenant_id = TenantId::new(uuid(7)).to_string();
+        let project =
+            scope("project", Some(&tenant_id), Some(MATERIAL)).expect_err("the row is corrupt");
+        let text = project.to_string();
+        assert!(text.contains("stored `scope project` id is invalid"));
+        assert!(!text.contains(MATERIAL));
     }
 
     #[test]
