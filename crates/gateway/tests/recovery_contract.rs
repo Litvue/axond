@@ -694,6 +694,9 @@ fn restore_drill_streams_provider_material_without_a_temp_file() {
     assert!(
         source.contains("export GW_DRILL_KEK GW_DRILL_BREAKGLASS")
             && !source.contains("export GW_DRILL_KEK GW_DRILL_BREAKGLASS GW_DRILL_PROVIDER_KEY")
+            && source.contains(
+                "GW_DRILL_PROVIDER_KEY=\"$GW_DRILL_PROVIDER_KEY\" \"$python_bin\" \"${root}/ops/check-recovery-evidence.py\"",
+            )
             && source.contains("--forbid-env GW_DRILL_PROVIDER_KEY"),
         "the provider key must stay shell-local while the evidence checker still forbids leakage"
     );

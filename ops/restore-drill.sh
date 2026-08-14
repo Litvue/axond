@@ -926,7 +926,7 @@ close
 # ---------------------------------------------------------------------------
 step "Checking the lane retained evidence for every stage it owes"
 check_evidence() {
-  "$python_bin" "${root}/ops/check-recovery-evidence.py" --runner restore-drill \
+  GW_DRILL_PROVIDER_KEY="$GW_DRILL_PROVIDER_KEY" "$python_bin" "${root}/ops/check-recovery-evidence.py" --runner restore-drill \
     --since-unix-ms "$drill_started_ms" \
     --forbid-env GW_DRILL_BREAKGLASS --forbid-env GW_DRILL_KEK \
     --forbid-env GW_DRILL_PROVIDER_KEY
