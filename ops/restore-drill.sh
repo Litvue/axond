@@ -273,7 +273,7 @@ EOF
 GW_DRILL_KEK="$(openssl rand -base64 32)"
 GW_DRILL_BREAKGLASS="$(openssl rand -hex 24)"
 GW_DRILL_PROVIDER_KEY="$(openssl rand -hex 24)"
-export GW_DRILL_KEK GW_DRILL_BREAKGLASS GW_DRILL_PROVIDER_KEY
+export GW_DRILL_KEK GW_DRILL_BREAKGLASS
 # `axond admin` reads its credential from the environment rather than from a flag,
 # which keeps it out of the process listing and out of this script's own output.
 export AXOND_ADMIN_TOKEN="$GW_DRILL_BREAKGLASS"
