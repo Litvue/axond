@@ -248,16 +248,6 @@ impl DesiredState {
         self.validate_with_model_mode(ModelValidationMode::LegacyRead, None)
     }
 
-    /// Validate a newly authored candidate. The bounded allow-list contains only
-    /// legacy aliases that the service proved were unchanged or restack-produced
-    /// carry-forwards; authored or otherwise modified aliases stay strict.
-    pub(crate) fn validate_for_publication(
-        &self,
-        legacy_aliases: &BTreeSet<ResourceRef>,
-    ) -> Result<(), ValidationError> {
-        self.validate_with_model_mode(ModelValidationMode::Strict, Some(legacy_aliases))
-    }
-
     fn validate_with_model_mode(
         &self,
         model_validation: ModelValidationMode,
@@ -1710,6 +1700,101 @@ mod tests {
                 .is_err(),
             "an authored change to the offending alias remains refused"
         );
+    }
+
+    #[test]
+    fn a_legacy_alias_with_another_disabled_target_explains_the_required_repair() {
+        let mut base = state_with_models();
+        let legacy_target = base
+            .version_of(ResourceKind::ModelEnablement, resource_id(31))
+            .cloned()
+            .expect("the project enablement");
+        let legacy_disabled = ModelEnablementBody::read(&legacy_target)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled)
+            .version_at(
+                legacy_target.slug.clone(),
+                legacy_target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        base.supersede(legacy_disabled.clone())
+            .expect("write the pre-existing disabled target");
+
+        let alias = base
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the project alias");
+        let default_target = base
+            .version_of(ResourceKind::ModelEnablement, resource_id(30))
+            .cloned()
+            .expect("the tenant default");
+        let legacy_alias = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([
+                AliasTarget::new(
+                    legacy_disabled.reference.id,
+                    legacy_disabled.reference.version,
+                ),
+                AliasTarget::new(
+                    default_target.reference.id,
+                    default_target.reference.version,
+                ),
+            ])
+            .version_at(alias.slug.clone(), alias.reference.version.next());
+        base.supersede(legacy_alias)
+            .expect("write the pre-existing legacy alias");
+
+        let mut candidate_state = base.clone();
+        let default_target = candidate_state
+            .version_of(ResourceKind::ModelEnablement, resource_id(30))
+            .cloned()
+            .expect("the enabled target being disabled");
+        let disabled_default = ModelEnablementBody::read(&default_target)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled)
+            .version_at(
+                default_target.slug.clone(),
+                default_target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        candidate_state
+            .supersede(disabled_default)
+            .expect("disable the requested target");
+        let alias = candidate_state
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the legacy alias");
+        let restacked_alias = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([AliasTarget::new(
+                legacy_disabled.reference.id,
+                legacy_disabled.reference.version,
+            )])
+            .version_at(alias.slug, alias.reference.version.next());
+        candidate_state
+            .supersede(restacked_alias)
+            .expect("restack the alias after removing one target");
+
+        let mut candidate = candidate(candidate_state.clone());
+        candidate.legacy_aliases = legacy_alias_allowlist(&base, &candidate_state);
+        assert!(
+            candidate.legacy_aliases.is_empty(),
+            "a changed target count cannot be treated as a carry-forward"
+        );
+        let error = candidate
+            .validated_checksum_for_publication()
+            .expect_err("the remaining disabled target must keep this unsafe change refused");
+        assert!(
+            error
+                .to_string()
+                .contains("repair or retire this alias before publishing"),
+            "the refusal should tell the operator how to unblock the requested change: {error}"
+        );
+        assert!(matches!(
+            error,
+            ValidationError::Model(ref model)
+                if matches!(**model, super::super::models::ModelError::DisabledTarget { .. })
+        ));
     }
 
     #[test]

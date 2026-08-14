@@ -818,7 +818,9 @@ pub enum ModelError {
     /// An enabled alias points at an enablement that is no longer active. The
     /// alias must be retargeted or retired in the same candidate so a published
     /// name never advertises a graph with no valid route.
-    #[error("{reference} names disabled target {target}")]
+    #[error(
+        "{reference} names disabled target {target}; repair or retire this alias before publishing"
+    )]
     DisabledTarget {
         reference: ResourceRef,
         target: ResourceRef,
@@ -1718,7 +1720,8 @@ pub(crate) enum ModelValidationMode {
 ///
 /// Built by [`Models::of`], which is the single place these bodies are
 /// interpreted: hydration and every later projection reach the same conclusions
-/// because they all call it. Candidate validation uses [`Models::of_strict`].
+/// because they all call it. Candidate validation uses [`DesiredState::validate`]
+/// with the strict model rules.
 /// Ordering is by id throughout, so two replicas iterate the same enablements
 /// and aliases in the same order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1741,14 +1744,9 @@ impl Models {
     ///
     /// This is the history/projection reader. It tolerates the legacy published
     /// shape where an enabled alias names a disabled enablement; a new candidate
-    /// must use [`Self::of_strict`] through [`DesiredState::validate`].
+    /// must use [`DesiredState::validate`].
     pub fn of(state: &DesiredState) -> Result<Self, ModelError> {
         Self::of_with_mode(state, ModelValidationMode::LegacyRead, None)
-    }
-
-    /// Resolve model contracts for a newly authored candidate.
-    pub(crate) fn of_strict(state: &DesiredState) -> Result<Self, ModelError> {
-        Self::of_with_mode(state, ModelValidationMode::Strict, None)
     }
 
     pub(crate) fn of_with_mode(
