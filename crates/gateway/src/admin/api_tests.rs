@@ -723,12 +723,6 @@ async fn advancing_a_resource_other_resources_pin_carries_those_resources_forwar
         .await
         .expect("the published revision hydrates");
     let state = loaded.state();
-    let enablement = state
-        .version_of(
-            crate::desired_state::ResourceKind::ModelEnablement,
-            fixtures::resource_id(14),
-        )
-        .expect("the enablement is desired");
     let alias = state
         .version_of(
             crate::desired_state::ResourceKind::Alias,
@@ -737,15 +731,16 @@ async fn advancing_a_resource_other_resources_pin_carries_those_resources_forwar
         .expect("the alias is desired");
     let alias_body = crate::desired_state::ModelAliasBody::read(alias).expect("an alias body");
     assert_eq!(
-        alias_body.primary().expect("a target").version,
-        enablement.reference.version,
-        "the alias follows the enablement it names"
+        (alias_body.is_enabled(), alias_body.targets().len()),
+        (false, 0),
+        "retiring the last target retires the alias in the same revision"
     );
-    // Re-posting an alias document that omits its target version resolves
-    // against the enablement the state holds rather than against version 1.
-    deployment
-        .publish("/aliases", "key-alias-2", &head, &alias_document())
+    // A stale alias write cannot reactivate a name against the retired model.
+    let (status, error) = deployment
+        .post("/aliases", "key-alias-2", &head, &alias_document())
         .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"]["type"], "validation_failed", "{error}");
 }
 
 #[tokio::test]

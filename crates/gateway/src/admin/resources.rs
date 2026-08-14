@@ -839,16 +839,33 @@ fn restack(
             // An alias names its targets in its *body*, so re-pinning it is a
             // retarget rather than an edge rewrite: the edges follow the body.
             let body = ModelAliasBody::read(&dependent)?;
-            let targets = body.targets().iter().map(|target| {
-                if target.enablement == superseded.id && target.version == superseded.version {
-                    AliasTarget::new(target.enablement, current.version)
-                } else {
-                    *target
-                }
-            });
-            body.clone()
-                .retargeted(targets.collect::<Vec<_>>())
-                .version_at(dependent.slug.clone(), version)
+            let disabling = current.kind == ResourceKind::ModelEnablement
+                && state
+                    .get(&current)
+                    .and_then(|resource| ModelEnablementBody::read(resource).ok())
+                    .is_some_and(|body| !body.is_enabled());
+            let targets = body
+                .targets()
+                .iter()
+                .filter_map(|target| {
+                    if target.enablement == superseded.id && target.version == superseded.version {
+                        if disabling {
+                            None
+                        } else {
+                            Some(AliasTarget::new(target.enablement, current.version))
+                        }
+                    } else {
+                        Some(*target)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let body = body.retargeted(targets);
+            let body = if disabling && body.is_enabled() && body.targets().is_empty() {
+                body.transitioned(ModelLifecycle::Disabled)
+            } else {
+                body
+            };
+            body.version_at(dependent.slug.clone(), version)
         } else {
             // Everything else pins by edge alone — an enablement's catalogue
             // pin is the version of the row, while the snapshot digest it read

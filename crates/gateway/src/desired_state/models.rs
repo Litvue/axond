@@ -815,6 +815,14 @@ pub enum ModelError {
         reference: ResourceRef,
         target: ResourceRef,
     },
+    /// An enabled alias points at an enablement that is no longer active. The
+    /// alias must be retargeted or retired in the same candidate so a published
+    /// name never advertises a graph with no valid route.
+    #[error("{reference} names disabled target {target}")]
+    DisabledTarget {
+        reference: ResourceRef,
+        target: ResourceRef,
+    },
     /// A target speaking a different wire contract than the name promises.
     #[error("{reference} speaks {alias}, but {target} speaks {found}")]
     WireFamilyMismatch {
@@ -867,6 +875,7 @@ impl ModelError {
             | Self::ForeignTarget { .. }
             | Self::NoTargets { .. }
             | Self::DuplicateTarget { .. }
+            | Self::DisabledTarget { .. }
             | Self::WireFamilyMismatch { .. } => false,
         }
     }
@@ -899,6 +908,7 @@ impl ModelError {
             | Self::ForeignTarget { reference, .. }
             | Self::NoTargets { reference }
             | Self::DuplicateTarget { reference, .. }
+            | Self::DisabledTarget { reference, .. }
             | Self::WireFamilyMismatch { reference, .. } => *reference,
         }
     }
@@ -1815,15 +1825,21 @@ impl Models {
             // A target this build cannot read a body for is still a declared,
             // reachable enablement; its wire family is checked when the body is
             // one this build reads.
-            if let Some(enabled) = self.enablements.get(&target.enablement)
-                && enabled.body.wire_family() != body.wire_family()
-            {
-                return Err(ModelError::WireFamilyMismatch {
-                    reference: resource.reference,
-                    target: target.reference(),
-                    alias: body.wire_family(),
-                    found: enabled.body.wire_family(),
-                });
+            if let Some(enabled) = self.enablements.get(&target.enablement) {
+                if body.is_enabled() && !enabled.body.is_enabled() {
+                    return Err(ModelError::DisabledTarget {
+                        reference: resource.reference,
+                        target: target.reference(),
+                    });
+                }
+                if enabled.body.wire_family() != body.wire_family() {
+                    return Err(ModelError::WireFamilyMismatch {
+                        reference: resource.reference,
+                        target: target.reference(),
+                        alias: body.wire_family(),
+                        found: enabled.body.wire_family(),
+                    });
+                }
             }
         }
         Ok(())
@@ -2224,7 +2240,20 @@ mod tests {
                 ResourceVersionNumber::FIRST,
                 catalog_reference(),
             );
-        let state = state_replacing(withdrawn);
+        let mut state = state_replacing(withdrawn);
+        let alias = state
+            .version_of(ResourceKind::Alias, resource_id(32))
+            .cloned()
+            .expect("the fixture alias");
+        let alias_body = ModelAliasBody::read(&alias).expect("an alias body");
+        state
+            .supersede(
+                alias_body
+                    .transitioned(ModelLifecycle::Disabled)
+                    .retargeted([])
+                    .version_at(alias.slug, alias.reference.version.next()),
+            )
+            .expect("retiring the alias with its disabled override");
         state
             .validate()
             .expect("a disabled enablement is valid desired state");
@@ -2290,12 +2319,12 @@ mod tests {
             retired.reference.version.next(),
             catalog_reference(),
         );
-        let disabled_reference = disabled.reference;
         state
             .supersede(disabled)
             .expect("disabling advances the enablement");
-        // Every alias that named the enablement follows it to the version that
-        // disabled it, exactly as an administrative edit carries dependents.
+        // Every alias that named the enablement is retired or has the disabled
+        // target removed in the same candidate; an active alias cannot carry a
+        // dead route forward.
         let dependents: Vec<ResourceVersion> = state
             .resources()
             .filter(|resource| resource.depends_on.contains(&retired.reference))
@@ -2306,19 +2335,21 @@ mod tests {
             let targets: Vec<AliasTarget> = alias
                 .targets()
                 .iter()
-                .map(|target| {
-                    if target.enablement == disabled_reference.id {
-                        AliasTarget::new(target.enablement, disabled_reference.version)
-                    } else {
-                        *target
-                    }
+                .filter(|target| {
+                    target.enablement != retired.reference.id
+                        || target.version != retired.reference.version
                 })
+                .copied()
                 .collect();
+            let alias = alias.retargeted(targets);
+            let alias = if alias.is_enabled() && alias.targets().is_empty() {
+                alias.transitioned(ModelLifecycle::Disabled)
+            } else {
+                alias
+            };
             state
                 .supersede(
-                    alias
-                        .retargeted(targets)
-                        .version_at(dependent.slug.clone(), dependent.reference.version.next()),
+                    alias.version_at(dependent.slug.clone(), dependent.reference.version.next()),
                 )
                 .expect("the alias follows its target");
         }
@@ -2326,6 +2357,34 @@ mod tests {
         state
             .validate()
             .expect("only what resolves can be ambiguous");
+        let models = Models::of(&state).expect("the retired target was removed safely");
+        let alias = models.alias(resource_id(32)).expect("the fixture alias");
+        assert!(alias.body.is_enabled());
+        assert_eq!(
+            alias.body.targets().len(),
+            1,
+            "the fallback remains routable"
+        );
+    }
+
+    #[test]
+    fn an_enabled_alias_cannot_target_a_disabled_enablement() {
+        let tenant = tenant_id(1);
+        let project = project_id(2);
+        let disabled = enablement_body(36, owner_tenant(), "gpt-4o")
+            .transitioned(ModelLifecycle::Disabled)
+            .version(Slug::parse("retired-gpt-4o").unwrap(), catalog_reference());
+        let alias = typed_alias(&tenant, &project, 32, "fast", &[disabled.reference]);
+        let mut state = state_replacing(alias);
+        state.insert(disabled).expect("a disabled target");
+
+        let error = state
+            .validate()
+            .expect_err("an active alias cannot advertise a disabled route");
+        assert!(
+            matches!(model_error(&error), Some(ModelError::DisabledTarget { .. })),
+            "{error}"
+        );
     }
 
     #[test]
