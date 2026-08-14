@@ -5805,7 +5805,9 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     /// The shipped stateful example is the operator-facing copy of the approved
-    /// bootstrap set; it must keep validating as the parser evolves.
+    /// bootstrap set; it must keep validating as the parser evolves. The
+    /// Recreate deployment deliberately leaves the optional cache disabled until
+    /// a durable StatefulSet/PVC mount exists.
     #[test]
     fn the_shipped_stateful_example_validates() {
         let config = Config::from_toml_str(&repository_file("axond.stateful.example.toml"))
@@ -5815,14 +5817,7 @@ dsn_env = "AXOND_REDIS_URL"
             config.namespace.is_empty(),
             "the control plane owns tenants"
         );
-        assert_eq!(
-            config.convergence.cache_path.as_deref(),
-            Some("/var/lib/axond/last-known-good.snapshot")
-        );
-        assert_eq!(
-            config.convergence.cache_key_env.as_deref(),
-            Some("GW_LAST_KNOWN_GOOD_KEY")
-        );
+        assert_eq!(config.convergence, ConvergenceConfig::default());
     }
 
     /// Documentation drift gate: every key the shipped stateful example uses is

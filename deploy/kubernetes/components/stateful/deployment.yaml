@@ -20,18 +20,3 @@ spec:
     $patch: replace
     type: Recreate
   template:
-    spec:
-      containers:
-        - name: axond
-          volumeMounts:
-            - name: last-known-good
-              mountPath: /var/lib/axond
-              readOnly: false
-      # The stateful component is a Deployment with Recreate semantics, so an
-      # emptyDir is the writable per-Pod cache volume that matches its current
-      # lifecycle. A Pod replacement starts without a cache and remains
-      # fail-closed until it re-converges; durable cross-Pod recovery belongs to
-      # a future StatefulSet/PVC rollout.
-      volumes:
-        - name: last-known-good
-          emptyDir: {}

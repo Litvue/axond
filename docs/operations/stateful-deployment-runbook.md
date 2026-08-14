@@ -3,11 +3,13 @@
 This is the operator procedure for
 [deploy/kubernetes/overlays/production-stateful](../../deploy/kubernetes/overlays/production-stateful).
 The current stateful process serves authenticated /admin/v1, but it does not
-compile a published revision into an inference snapshot. A healthy Pod is
+compile a published revision into an inference snapshot because the production
+projection has no inbound caller-principal source yet. A healthy Pod is
 therefore **Running and not Ready**: /healthz returns 200, /readyz returns
-503, and inference returns typed 503 inference_unavailable. Use the stateless
-production overlay for inference traffic until revision convergence is wired
-into serve.
+503, anonymous inference returns 401 unauthorized, and an authenticated
+inference request reaches typed 503 inference_unavailable. Use the stateless
+production overlay for inference traffic until the principal-projection slice
+lands and the convergence dependency is wired into serving.
 
 This distinction is important during an incident: Kubernetes availability and
 inference availability are not claims this overlay makes today. The procedure
@@ -19,17 +21,18 @@ port-forward as the acceptance checks instead.
 - Kubernetes 1.32 or newer. The production overlay uses the GA sleep
   lifecycle action and matchLabelKeys for topology spread.
 - A Postgres primary reachable from the axond namespace. The deployment's
-  GW_CONTROL_PLANE_DSN and GW_SECRET_STORE_KEK are supplied through the Secret
-  named axond-secrets.
+  GW_CONTROL_PLANE_DSN, GW_SECRET_STORE_KEK, and GW_ADMIN_BREAKGLASS are
+  supplied through the Secret named axond-secrets.
 - A verified multi-architecture image-index digest. The committed all-zero
   digest is intentionally not pullable.
-- Four Secret values for this bootstrap: GW_CONTROL_PLANE_DSN,
-  GW_SECRET_STORE_KEK, GW_ADMIN_BREAKGLASS, and GW_LAST_KNOWN_GOOD_KEY. The
-  last-known-good value must be one canonical padded base64 string encoding 32
-  CSPRNG bytes, with no surrounding whitespace; use the same exact value on
-  every replica. The KEK must be the deployment's existing key material;
-  changing it makes stored ciphertext unrecoverable. Provision the
-  last-known-good key before the ConfigMap that names it.
+- Three Secret values for this bootstrap: GW_CONTROL_PLANE_DSN,
+  GW_SECRET_STORE_KEK, and GW_ADMIN_BREAKGLASS. The KEK must be the
+  deployment's existing key material; changing it makes stored ciphertext
+  unrecoverable. The shipped Recreate Deployment deliberately has no
+  `[convergence]` cache or writable volume: a Pod replacement would discard an
+  `emptyDir` cache and make cold-boot outage recovery an untrue promise. A
+  future StatefulSet/PVC deployment must provision its cache key before the
+  ConfigMap that names it.
 
 Resolve and verify the image before applying the overlay. Set
 `RELEASE_VERSION` to the verified release; the resolver updates both production
@@ -61,20 +64,18 @@ kubectl -n "$namespace" create secret generic axond-secrets \
   --from-literal=GW_CONTROL_PLANE_DSN='postgres://<user>:<password>@<host>:5432/<db>' \
   --from-literal=GW_SECRET_STORE_KEK='<base64-encoded-key-material>' \
   --from-literal=GW_ADMIN_BREAKGLASS='<breakglass-value>' \
-  --from-literal=GW_LAST_KNOWN_GOOD_KEY='<44-character-padded-base64-32-byte-key>' \
   --dry-run=client -o yaml | kubectl apply -f -
 
 ops/pin-image-digest.sh --check overlays/production-stateful
 kubectl apply -k "$overlay"
 ~~~
 
-The Secret step is deliberately first. For an existing fleet, update or create
-`axond-secrets` with `GW_LAST_KNOWN_GOOD_KEY` and verify it is present before
-applying a release whose `axond.toml` contains `[convergence]`. Applying that
-ConfigMap first makes the new cache configuration a boot dependency while the
-key is absent, so replicas can crash-loop instead of reaching the administrative
-surface. The key is a deployment-wide reference used to authenticate the cache;
-it is not written into the ConfigMap or logs.
+The Secret step is deliberately first because the control-plane, KEK, and
+breakglass references are boot dependencies. Existing fleets do not need a
+cache-key migration for this overlay: its shipped `axond.toml` intentionally
+omits `[convergence]` until a durable StatefulSet/PVC storage design exists.
+Do not add the cache section to this Deployment as a workaround; it would make
+Pod replacement erase the only recovery copy.
 
 The Job and Deployment are created by the same apply and are not ordered by
 Kubernetes. A Pod may briefly restart against a schema that is not present yet;
@@ -148,7 +149,14 @@ test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/readyz)" 
 
 inference_body="$(curl -sS -X POST -H 'content-type: application/json' \
   -d '{}' http://127.0.0.1:18080/v1/chat/completions)"
-grep -q '"inference_unavailable"' <<<"$inference_body"
+test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  -H 'content-type: application/json' -d '{}' \
+  http://127.0.0.1:18080/v1/chat/completions)" = 401
+grep -q '"unauthorized"' <<<"$inference_body"
+
+# A valid caller reaches the convergence boundary and receives its typed 503.
+# The current stateful bootstrap has no gateway key, so this authenticated
+# contract is held by the route regression test until principal projection lands.
 
 # The value, not the variable name, is the breakglass token.
 test -n "$GW_ADMIN_BREAKGLASS"

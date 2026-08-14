@@ -76,13 +76,17 @@ exclusive: there is no per-resource migration state, and therefore no merge
 policy between a file and a database. It is a bootstrap property, so a reload
 cannot switch a serving process between modes — that needs a restart.
 
-**A stateful replica administers and serves only projected state.** It opens the
-control plane and serves `/admin/v1` — see [administering a stateful deployment]
-(./operations/admin-api.md) — while inference remains fail-closed until a
-projected snapshot or valid signed last-known-good cache is active. Once active,
-the immutable snapshot keeps serving through a control-plane outage. See
-[revision convergence](./operations/revision-convergence.md) for recovery and
-read the ADR's ownership and failure matrices before planning a deployment.
+**A stateful replica administers and is fail-closed until projected state is
+available.** It opens the control plane and serves `/admin/v1` — see
+[administering a stateful deployment](./operations/admin-api.md) — while
+inference remains refused until a projected snapshot with inbound caller
+principals is active. The current desired-state model does not yet provide that
+principal projection, so this build does not claim stateful inference or outage
+serving. The signed last-known-good cache remains an optional runtime contract,
+but the shipped Recreate Deployment intentionally does not enable it because it
+has no durable per-replica volume. See [revision convergence]
+(./operations/revision-convergence.md) for the dependency boundary and read the
+ADR's ownership and failure matrices before planning a deployment.
 
 ### Stateful bootstrap
 
@@ -186,9 +190,14 @@ plaintext secret material. Set both fields or neither.
 | `cache_path` | path | unset | Per-replica file containing the signed last-known-good projected snapshot. |
 | `cache_key_env` | string | unset | Environment-variable name containing canonical padded base64 for exactly 32 CSPRNG bytes. Leading/trailing whitespace and raw passphrases are refused; the value is never logged. |
 
-A valid cache permits cold boot during a control-plane outage. Missing, invalid,
-tampered, or keyless projected state remains fail-closed; the cache is not a
-fallback for a candidate that fails validation or secret resolution.
+A valid cache can permit cold boot during a control-plane outage only when it is
+stored on durable per-replica storage and the inbound-principal projection is
+available. Missing, invalid, tampered, or keyless projected state remains
+fail-closed; the cache is not a fallback for a candidate that fails validation or
+secret resolution. The shipped `production-stateful` Recreate Deployment omits
+this section, because its Pod replacement would discard an `emptyDir` cache and
+make the recovery promise false. Enable it only in a StatefulSet/PVC-compatible
+deployment, provisioning the signing-key Secret before the ConfigMap.
 
 The current desired-state projection does not yet supply inbound caller
 principals, so stateful candidates report a typed `unsupported` refusal and the

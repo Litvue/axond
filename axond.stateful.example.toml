@@ -16,10 +16,13 @@
 # and diagnostics name the reference rather than the value.
 #
 # Status: a replica boots against this file and serves `/admin/v1` against the
-# control plane. It serves only an immutable projected snapshot (or a valid
-# signed last-known-good cache) and remains fail-closed until one is active;
-# `/readyz` reports that posture while `/healthz` stays live, so an orchestrator
-# leaves the administrative surface reachable during convergence;
+# control plane. It remains fail-closed until an immutable projected snapshot
+# is active; `/readyz` reports that posture while `/healthz` stays live, so an
+# orchestrator leaves the administrative surface reachable during convergence.
+# This example deliberately omits `[convergence]`: the shipped Recreate
+# Deployment has no durable per-replica volume, so it cannot promise cold-boot
+# outage recovery after a Pod replacement. A future StatefulSet/PVC deployment
+# may opt into the authenticated cache once that storage exists;
 # docs/deployment/kubernetes.md#stateful-mode has the deployment shape that
 # follows from it, and `axond check preflight` reports that refusal on its
 # `serving` line.
@@ -29,25 +32,13 @@ mode = "stateful"
 [server]
 bind = "0.0.0.0:8080"
 
-# ── Stateful serving snapshot cache ─────────────────────────────────────────
-# Both references are required together when a last-known-good cache is used.
-# The cache is authenticated and contains projected state, never plaintext
-# secrets. A valid cache permits cold boot during a control-plane outage;
-# missing, invalid, or tampered cache state remains fail-closed.
-# GW_LAST_KNOWN_GOOD_KEY must be canonical padded base64 encoding of exactly 32
-# CSPRNG bytes, with no leading or trailing whitespace. Use the same value on
-# every replica; a human passphrase is not a cache key.
-
-[convergence]
-cache_path = "/var/lib/axond/last-known-good.snapshot"
-cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"
-
 # ── Control plane ────────────────────────────────────────────────────────────
 # Durable desired state: revisions, immutable manifests, resource versions, and
 # audit events. Initial cold boot requires it: a stateful replica with no
-# snapshot fails readiness rather than serving partial state. Once a replica
-# holds a snapshot, a control-plane outage stalls change and convergence but
-# does not degrade inference.
+# snapshot fails readiness rather than serving partial state. This build's
+# production projection cannot create the required inbound-principal snapshot
+# yet, so the replica remains fail-closed; outage serving is a future contract,
+# not a promise of this bootstrap example.
 #
 # The schema is applied by the operator, before replicas start, and the commands
 # that do it read this same file:

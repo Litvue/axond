@@ -649,6 +649,19 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
     }
 }
 
+fn convergence_refusal() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "type": "inference_unavailable",
+                "message": "the replica has no active projected revision",
+            }
+        })),
+    )
+        .into_response()
+}
+
 async fn convergence_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -658,16 +671,7 @@ async fn convergence_middleware(
         .revision_report()
         .is_some_and(|report| report.active.is_none())
     {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": {
-                    "type": "inference_unavailable",
-                    "message": "the replica has no active projected revision",
-                }
-            })),
-        )
-            .into_response();
+        return convergence_refusal();
     }
     next.run(request).await
 }
@@ -937,8 +941,9 @@ async fn authenticate(
 
 /// Authenticate once per request, before handler extractors, and carry the
 /// resolved snapshot and caller into the handler. A reload landing mid-request
-/// therefore cannot change what this request resolved; failures return `401`
-/// before any typed handler error.
+/// therefore cannot change what this request resolved. Invalid callers return
+/// `401` first; a valid caller on a replica with no active projected revision
+/// gets the typed `503` convergence refusal before the handler runs.
 async fn authenticate_middleware(
     State((state, capability)): State<(AppState, Option<Capability>)>,
     headers: HeaderMap,
@@ -980,6 +985,21 @@ async fn authenticate_middleware(
             "token scope denied route"
         );
         return Err(GatewayError::ScopeInsufficient(capability));
+    }
+    // Keep the serving boundary here as well as in the route layer. The route
+    // table currently adds `convergence_middleware` to every authenticated
+    // inference route, but putting the invariant after successful
+    // authentication means a future authenticated route cannot accidentally
+    // serve the keyless stateful bootstrap by omitting that layer. Diagnostic
+    // status is intentionally exempt: it is the operator's view of why the
+    // replica is not ready, not inference traffic.
+    if !matches!(capability, Some(Capability::Status))
+        && state
+            .revision_report()
+            .is_some_and(|report| report.active.is_none())
+    {
+        request.extensions_mut().remove::<AuthenticatingPermit>();
+        return Ok(convergence_refusal());
     }
     // Authentication is over, whatever it cost, so the permit that bounded it
     // goes back before the handler runs rather than after.
@@ -5135,6 +5155,38 @@ min_iat = {}
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The defense-in-depth gate is still typed after a valid caller has
+    /// authenticated. This uses the production route table with a configured
+    /// key store and no active revision, so a future route that forgets to add
+    /// the separate convergence layer cannot serve around the boundary.
+    #[tokio::test]
+    async fn an_authenticated_unconverged_route_reports_convergence_after_authentication() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: Some(Arc::new(crate::convergence::RevisionStatus::new(Box::new(
+                crate::convergence::SystemClock,
+            )))),
+            catalogue: None,
+        });
+        let response = router(state)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_KEY}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .expect("typed convergence refusal");
+        assert_eq!(body["error"]["type"], "inference_unavailable", "{body}");
     }
 
     /// Draining is what a rolling deployment observes, and it must not take the
