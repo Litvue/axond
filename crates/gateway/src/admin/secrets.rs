@@ -280,6 +280,9 @@ impl AdminService {
         Self::permits_material(grant, AdminAction::WriteSecrets, owner)?;
         let store = self.secret_store()?;
         let descriptor = store.stage(owner, material).await.map_err(log_secret)?;
+        if let Some(signal) = &self.change_signal {
+            signal.force_refresh();
+        }
         log_secret_operation(
             "stage",
             grant,
@@ -306,6 +309,9 @@ impl AdminService {
             .rotate(owner, &reference, material)
             .await
             .map_err(log_secret)?;
+        if let Some(signal) = &self.change_signal {
+            signal.force_refresh();
+        }
         log_secret_operation(
             "rotate",
             grant,
@@ -348,6 +354,9 @@ impl AdminService {
             .transition(owner, &reference, next)
             .await
             .map_err(log_secret)?;
+        if let Some(signal) = &self.change_signal {
+            signal.force_refresh();
+        }
         log_secret_operation(
             "lifecycle",
             grant,

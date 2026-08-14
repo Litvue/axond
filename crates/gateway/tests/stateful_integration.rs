@@ -560,8 +560,9 @@ async fn stateful_boot_serves_administration_and_refuses_inference() {
          router's:\n{envelope}"
     );
 
-    // 3. Inference refuses, per request, naming itself — not by failing to boot,
-    //    and not by pretending an empty configuration is a catalogue.
+    // 3. Inference remains fail-closed per request. Authentication runs before
+    //    the convergence gate, so an unauthenticated probe receives 401 rather
+    //    than learning that the replica has no active projected snapshot.
     let readyz = client()
         .get(replica.url("/readyz"))
         .send()
@@ -580,14 +581,14 @@ async fn stateful_boot_serves_administration_and_refuses_inference() {
         .expect("a response");
     assert_eq!(
         models.status(),
-        503,
-        "an unconverged replica must refuse inference rather than serve an empty snapshot:\n{}",
+        401,
+        "an unconverged replica must authenticate before reporting convergence:\n{}",
         replica.output()
     );
     let refusal: serde_json::Value = models.json().await.expect("an error envelope");
     assert_eq!(
-        refusal["error"]["type"], "inference_unavailable",
-        "the refusal must name itself, so a caller can tell it from an outage:\n{refusal}"
+        refusal["error"]["type"], "unauthorized",
+        "an unauthenticated caller must not learn convergence state:\n{refusal}"
     );
 }
 
@@ -785,9 +786,9 @@ async fn migrate_prepares_a_control_plane_before_replicas_start() {
         reapply.context()
     );
 
-    // 4. Preflight now describes a prepared database. It still fails overall,
-    //    because `serve` still refuses stateful mode (IG-01), and reporting that
-    //    honestly is what keeps a rollout from gating green on a crash loop.
+    // 4. Preflight now describes a valid stateful serving posture. It passes
+    //    the serving check; the database/reference checks remain the source of
+    //    truth for this prepared control plane.
     let preflight = control_plane.run(&["check", "preflight"]);
     let reported = preflight.reported();
     assert!(
@@ -796,8 +797,8 @@ async fn migrate_prepares_a_control_plane_before_replicas_start() {
         preflight.context()
     );
     assert!(
-        !preflight.succeeded() && reported.contains("serving"),
-        "preflight must keep reporting the serving refusal until IG-01 is wired:\n{}",
+        preflight.succeeded() && reported.contains("serving"),
+        "preflight must accept the serving posture while retaining its DSN/reference checks:\n{}",
         preflight.context()
     );
 

@@ -37,6 +37,7 @@ use crate::backends::control_plane::schema::{self, SchemaStatus};
 use crate::config::{
     BudgetBackend, Config, Mode, RateLimitBackend, RevocationBackend, UsageSinkKind,
 };
+use crate::convergence::LastKnownGood;
 
 /// One check's outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,29 +155,51 @@ pub async fn run(config: &Config, config_path: &Path, env: &HashMap<String, Stri
             }
         ),
     );
-    // Read from `serve`'s own refusal rather than restated here, so this command
-    // cannot promise a surface `serve` would decline: today that is inference in
-    // `mode = "stateful"`, and when the projection lands this line disappears
-    // with it instead of failing every stateful deployment forever. Failed rather
-    // than skipped, because the honest answer to this command's question is no: a
-    // rollout gating on a zero exit would pass here and then answer every caller
-    // `503`. The replica does start, and its `/admin/v1` surface is checked
-    // below, as are the database checks — and `axond migrate status`/`apply` are
-    // separate commands with their own exit codes.
-    if let Some(refusal) = super::inference_refusal(config) {
-        report.failed(
-            "serving",
-            format!(
-                "a replica starts against this config and serves `/admin/v1`, but it refuses \
-                 inference: {refusal} The checks below still describe the database, and `axond \
-                 migrate status` reports it without this failure"
-            ),
-        );
-    }
+    check_serving_posture(&mut report, config);
     check_file_ownership(&mut report, config_path);
     check_references(&mut report, config, env);
     check_control_plane(&mut report, config, env).await;
     report
+}
+
+/// Check the configuration posture required to become a stateful serving
+/// replica. This is deliberately not a readiness check: readiness depends on
+/// an active projected snapshot and is reported by the running process. The
+/// snapshot builder is the fail-closed boundary that refuses an empty projected
+/// key set, while this command catches an incomplete bootstrap before rollout.
+fn check_serving_posture(report: &mut Report, config: &Config) {
+    if config.mode == Mode::Stateless {
+        return;
+    }
+    let complete_cache = matches!(
+        (
+            config.convergence.cache_path.as_deref(),
+            config.convergence.cache_key_env.as_deref()
+        ),
+        (Some(path), Some(key_env)) if !path.trim().is_empty() && !key_env.trim().is_empty()
+    );
+    let partial_cache = [
+        config.convergence.cache_path.as_deref(),
+        config.convergence.cache_key_env.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty());
+    if partial_cache && !complete_cache {
+        report.failed(
+            "serving",
+            "stateful serving requires both `convergence.cache_path` and `convergence.cache_key_env` when a last-known-good cache is configured",
+        );
+        return;
+    }
+    report.passed(
+        "serving",
+        if complete_cache {
+            "stateful bootstrap posture is complete; serving still requires a valid projected snapshot (or the configured last-known-good cache)"
+        } else {
+            "stateful bootstrap posture is complete; serving waits for a valid projected snapshot"
+        },
+    );
 }
 
 /// The config file names every secret the process will read. A file another
@@ -311,6 +334,12 @@ fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, 
             )),
             None => {}
         }
+    }
+    if let Some(name) = non_empty(config.convergence.cache_key_env.as_deref()) {
+        references.push((
+            "[convergence] cache_key_env".to_owned(),
+            Reference::CacheKey(name.to_owned()),
+        ));
     }
     for (index, breakglass) in config.admin_breakglass.iter().enumerate() {
         let key = format!("[[admin_breakglass]] #{}", index + 1);
@@ -468,6 +497,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// A secret's location: the name of an environment variable, or a path.
 enum Reference {
     Env(String),
+    CacheKey(String),
     File(String),
 }
 
@@ -486,6 +516,15 @@ impl Reference {
                     None => Some(format!("`{name}` is unset")),
                 }
             }
+            Self::CacheKey(name) => match env.get(name) {
+                Some(value) if !value.trim().is_empty() => {
+                    LastKnownGood::from_base64("preflight", value)
+                        .err()
+                        .map(|error| format!("`{name}` is invalid: {error}"))
+                }
+                Some(_) => Some(format!("`{name}` is set but empty")),
+                None => Some(format!("`{name}` is unset")),
+            },
             Self::File(path) => match std::fs::metadata(path) {
                 Ok(metadata) if metadata.is_file() => None,
                 Ok(_) => Some(format!("`{path}` is not a file")),
@@ -566,6 +605,7 @@ mod tests {
     use super::*;
     use crate::desired_state::Checksum;
     use crate::ops::tests::{stateful_toml, stateless_toml};
+    use base64::Engine;
 
     /// Fixtures use the temp directory directly, the way the rest of this crate's
     /// file-backed tests do: no dev-dependency is added for a config file.
@@ -740,13 +780,11 @@ mod tests {
         );
     }
 
-    /// `serve` still refuses *inference* in `mode = "stateful"`. An operator
-    /// gating a rollout on preflight has to learn that here rather than from a
-    /// deployment that answers every caller `503`, so the refusal is a reported
-    /// *failure*: a green exit would promise traffic this replica will not serve.
-    /// The other checks still run, so the report is still useful.
+    /// Stateful preflight validates the bootstrap posture. It does not claim
+    /// readiness before a projected snapshot is active; the running replica's
+    /// readiness endpoint and snapshot builder enforce that boundary.
     #[tokio::test]
-    async fn a_stateful_preflight_names_the_serving_refusal_it_cannot_rehearse() {
+    async fn a_stateful_preflight_accepts_a_complete_serving_posture() {
         let path = write("axond.toml", stateful_toml());
         let config = Config::from_toml_str(stateful_toml()).expect("valid stateful config");
         let report = run(&config, &path, &HashMap::new()).await;
@@ -754,14 +792,14 @@ mod tests {
             .checks
             .iter()
             .find(|check| check.name == "serving")
-            .expect("a stateful preflight must name the refusal");
+            .expect("a stateful preflight must name the serving posture");
         assert!(
-            matches!(refusal.outcome, Outcome::Failed(_)),
-            "a config whose inference is refused must not exit zero: {refusal}"
+            matches!(refusal.outcome, Outcome::Passed(_)),
+            "a complete bootstrap posture is valid even before convergence: {refusal}"
         );
         assert!(
             !report.is_ok(),
-            "the exit code has to carry the refusal too: {report}"
+            "unresolved bootstrap references must still fail the overall preflight: {report}"
         );
         assert!(
             report
@@ -782,9 +820,69 @@ mod tests {
             !report.checks.iter().any(|check| check.name == "serving"),
             "stateless mode has no such refusal to report: {report}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_cache_key_is_preflighted_by_name_without_rendering_its_value() {
+        let toml = format!(
+            "{}\n[convergence]\ncache_path = \"/tmp/axond-lkg\"\ncache_key_env = \"GW_LAST_KNOWN_GOOD_KEY\"\n",
+            stateful_toml()
+        );
+        let path = write("axond-cache.toml", &toml);
+        let config = Config::from_toml_str(&toml).expect("valid stateful cache config");
+        let mut env = HashMap::from([
+            (
+                "GW_CONTROL_PLANE_DSN".to_owned(),
+                "postgres://axond@127.0.0.1:1/axond?connect_timeout=1".to_owned(),
+            ),
+            ("GW_KEK".to_owned(), "kek-material".to_owned()),
+            ("GW_BREAKGLASS".to_owned(), "breakglass-material".to_owned()),
+            (
+                "GW_LAST_KNOWN_GOOD_KEY".to_owned(),
+                "cache-signing-material-that-must-not-render".to_owned(),
+            ),
+        ]);
+        let report = run(&config, &path, &env).await;
+        let references = report
+            .checks
+            .iter()
+            .find(|check| check.name == "bootstrap references")
+            .expect("references are checked");
         assert!(
-            super::super::inference_refusal(&stateless).is_none(),
-            "and the reported refusal is `serve`'s own, not a second opinion"
+            matches!(references.outcome, Outcome::Failed(_)),
+            "{references}"
+        );
+        let rendered = report.to_string();
+        assert!(rendered.contains("bootstrap references"), "{rendered}");
+        assert!(rendered.contains("GW_LAST_KNOWN_GOOD_KEY"), "{rendered}");
+        assert!(
+            !rendered.contains("cache-signing-material-that-must-not-render"),
+            "preflight names references, never their values: {rendered}"
+        );
+
+        env.insert(
+            "GW_LAST_KNOWN_GOOD_KEY".to_owned(),
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        );
+        let report = run(&config, &path, &env).await;
+        let references = report
+            .checks
+            .iter()
+            .find(|check| check.name == "bootstrap references")
+            .expect("references are checked");
+        assert!(
+            matches!(references.outcome, Outcome::Passed(_)),
+            "{references}"
+        );
+
+        env.remove("GW_LAST_KNOWN_GOOD_KEY");
+        let report = run(&config, &path, &env).await;
+        let rendered = report.to_string();
+        assert!(!report.is_ok(), "an unset cache key must fail preflight");
+        assert!(rendered.contains("GW_LAST_KNOWN_GOOD_KEY"), "{rendered}");
+        assert!(
+            !rendered.contains("cache-signing-material-that-must-not-render"),
+            "the missing-reference diagnostic still cannot contain material: {rendered}"
         );
     }
 

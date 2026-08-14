@@ -16,16 +16,20 @@ an inference request.
 | `/admin/v1` | Served, authenticated, backed by the control plane. |
 | `/healthz` | `200` — the process is alive and administrable. |
 | `/readyz` | `503` — never route inference traffic to it. |
-| `/v1/...` | `503 inference_unavailable`. |
+| anonymous `/v1/...` | `401 unauthorized` — authentication comes before convergence state. |
+| authenticated `/v1/...` | `503 inference_unavailable` while no projected revision is active. |
 
-A published revision cannot be compiled into a runtime snapshot yet (the
-projection is [revision convergence](./revision-convergence.md) work), so
-inference is refused per request rather than answered from an empty
+A published revision cannot be compiled into a runtime snapshot yet: the
+production projection is still missing inbound caller principals, which is the
+explicit dependency in [revision convergence](./revision-convergence.md).
+Inference is refused per request rather than answered from an empty
 configuration — an empty configuration would look, to a caller, like a
-deployment that is configured and simply lacks what was asked for. `axond check
-preflight` reports the same refusal, from the same function, before a rollout
-gates on it. **Serve inference from `mode = "stateless"` until convergence
-ships**; use stateful mode to build and review desired state.
+deployment that is configured and simply lacks what was asked for. Anonymous
+callers see only `401 unauthorized`; a valid caller reaches the typed
+`503 inference_unavailable` convergence refusal. `axond check preflight` reports
+the bootstrap/reference posture before a rollout gates on it. **Serve inference
+from `mode = "stateless"` until the principal-projection slice lands**; use
+stateful mode to build and review desired state.
 
 A stateless deployment answers every `/admin/v1` path with
 `501 stateful_mode_required`, before authentication and without opening any

@@ -71,6 +71,9 @@ use crate::usage::identity::EventIdentity;
 use crate::usage::{Status, UsageRecord};
 
 pub fn router(state: AppState) -> Router {
+    if state.config().config.mode == crate::config::Mode::Stateful && state.0.revision.is_none() {
+        return unconverged_router("no projected serving snapshot").merge(diagnostic_router(state));
+    }
     let minting_enabled = state.config().gateway_minting.is_some();
     mount(route_specs(minting_enabled), state)
 }
@@ -81,6 +84,7 @@ pub fn router(state: AppState) -> Router {
 /// — it is refusing inference and its convergence is the reason — so the
 /// diagnostic is mounted beside [`unconverged_router`] rather than being lost
 /// with the inference surface it happens to be declared next to.
+#[allow(dead_code)]
 pub fn diagnostic_router(state: AppState) -> Router {
     let specs = route_specs(state.config().gateway_minting.is_some())
         .into_iter()
@@ -106,6 +110,18 @@ fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
             // against the operators it is for.
             let route = if spec.auth.takes_a_diagnostic_slot() {
                 route.layer(from_fn_with_state(state.clone(), diagnostic_middleware))
+            } else {
+                route
+            };
+            // Stateful inference is live-gated by the reconciler's active
+            // revision. The gate is read per request, so a cold replica can
+            // start with a refusal and begin serving immediately after a cache
+            // restore or control-plane publication, without rebuilding the
+            // router. Apply it before authentication so authentication remains
+            // the first externally visible refusal: an anonymous caller gets
+            // `401`, never a convergence-state `503`.
+            let route = if spec.auth == AuthPosture::Authenticated && state.0.revision.is_some() {
+                route.layer(from_fn_with_state(state.clone(), convergence_middleware))
             } else {
                 route
             };
@@ -172,6 +188,7 @@ fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
 /// envelope. Nothing here holds an [`AppState`]: there is no configuration to
 /// hold, which is the whole point. The replica diagnostic does hold one, so it
 /// is mounted alongside by [`diagnostic_router`] rather than from here.
+#[allow(dead_code)]
 pub fn unconverged_router(reason: &'static str) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -623,10 +640,43 @@ async fn healthz() -> &'static str {
 /// balancer can stop routing while the replica is still able to serve. Real
 /// dependency readiness (config loaded, credentials present) is a follow-up.
 async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
+    if state
+        .revision_report()
+        .is_some_and(|report| report.active.is_none())
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "unconverged");
+    }
     match state.lifecycle().phase() {
         Phase::Serving => (StatusCode::OK, "ready"),
         Phase::Draining | Phase::Closing => (StatusCode::SERVICE_UNAVAILABLE, "draining"),
     }
+}
+
+fn convergence_refusal() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "type": "inference_unavailable",
+                "message": "the replica has no active projected revision",
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn convergence_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state
+        .revision_report()
+        .is_some_and(|report| report.active.is_none())
+    {
+        return convergence_refusal();
+    }
+    next.run(request).await
 }
 
 /// This replica's own dependency status, projected into what the caller is
@@ -894,8 +944,9 @@ async fn authenticate(
 
 /// Authenticate once per request, before handler extractors, and carry the
 /// resolved snapshot and caller into the handler. A reload landing mid-request
-/// therefore cannot change what this request resolved; failures return `401`
-/// before any typed handler error.
+/// therefore cannot change what this request resolved. Invalid callers return
+/// `401` first; a valid caller on a replica with no active projected revision
+/// gets the typed `503` convergence refusal before the handler runs.
 async fn authenticate_middleware(
     State((state, capability)): State<(AppState, Option<Capability>)>,
     headers: HeaderMap,
@@ -937,6 +988,21 @@ async fn authenticate_middleware(
             "token scope denied route"
         );
         return Err(GatewayError::ScopeInsufficient(capability));
+    }
+    // Keep the serving boundary here as well as in the route layer. The route
+    // table currently adds `convergence_middleware` to every authenticated
+    // inference route, but putting the invariant after successful
+    // authentication means a future authenticated route cannot accidentally
+    // serve the keyless stateful bootstrap by omitting that layer. Diagnostic
+    // status is intentionally exempt: it is the operator's view of why the
+    // replica is not ready, not inference traffic.
+    if !matches!(capability, Some(Capability::Status))
+        && state
+            .revision_report()
+            .is_some_and(|report| report.active.is_none())
+    {
+        request.extensions_mut().remove::<AuthenticatingPermit>();
+        return Ok(convergence_refusal());
     }
     // Authentication is over, whatever it cost, so the permit that bounded it
     // goes back before the handler runs rather than after.
@@ -5015,23 +5081,11 @@ min_iat = {}
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// A stateful replica is administrable before it is servable. Its inference
-    /// surface must say so per request rather than answer an empty configuration:
-    /// an unknown-model `404` or an unauthorized `401` would read, to a caller,
-    /// as a deployment that is configured and simply lacks what was asked for.
+    /// The legacy unconverged surface remains useful for a process that has no
+    /// runtime snapshot at all; its response is a coarse serving refusal.
     #[tokio::test]
     async fn an_unconverged_replica_refuses_inference_without_pretending_to_be_ready() {
-        let reason = crate::ops::inference_refusal(
-            &crate::config::Config::from_toml_str(
-                "mode = \"stateful\"\n\
-                 [control_plane]\ndsn_env = \"GW_CONTROL_PLANE_DSN\"\n\
-                 [secret_store]\nkek_env = \"GW_KEK\"\n\
-                 [[admin_breakglass]]\nenv = \"GW_BREAKGLASS\"\n",
-            )
-            .expect("a valid stateful config"),
-        )
-        .expect("stateful inference is refused");
-        let app = unconverged_router(reason);
+        let app = unconverged_router("no projected serving snapshot");
 
         let live = app
             .clone()
@@ -5065,10 +5119,77 @@ min_iat = {}
             assert!(
                 body["error"]["message"]
                     .as_str()
-                    .is_some_and(|message| message.contains("stateful")),
-                "the refusal names the mode that caused it: {body}"
+                    .is_some_and(|message| message.contains("projected")),
+                "the refusal names the missing serving posture: {body}"
             );
         }
+    }
+
+    /// Convergence is an authenticated serving condition, not an anonymous
+    /// disclosure channel. A stateful bootstrap has a revision gate but no
+    /// inbound keys, so an anonymous caller must see the auth refusal first.
+    #[tokio::test]
+    async fn an_unconverged_stateful_route_authenticates_before_reporting_convergence() {
+        let config = Config::from_toml_str(
+            "mode = \"stateful\"\n\
+             [control_plane]\ndsn_env = \"GW_CONTROL_PLANE_DSN\"\n\
+             [secret_store]\nkek_env = \"GW_KEK\"\n\
+             [[admin_breakglass]]\nenv = \"GW_BREAKGLASS\"\n",
+        )
+        .expect("valid stateful config");
+        let state = AppState::new_with_observability(
+            config,
+            &HashMap::new(),
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            ReplicaObservability {
+                status: observed_registry(),
+                revision: Some(Arc::new(crate::convergence::RevisionStatus::new(Box::new(
+                    crate::convergence::SystemClock,
+                )))),
+                catalogue: None,
+            },
+        )
+        .expect("bootstrap state");
+        let response = router(state)
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The defense-in-depth gate is still typed after a valid caller has
+    /// authenticated. This uses the production route table with a configured
+    /// key store and no active revision, so a future route that forgets to add
+    /// the separate convergence layer cannot serve around the boundary.
+    #[tokio::test]
+    async fn an_authenticated_unconverged_route_reports_convergence_after_authentication() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: Some(Arc::new(crate::convergence::RevisionStatus::new(Box::new(
+                crate::convergence::SystemClock,
+            )))),
+            catalogue: None,
+        });
+        let response = router(state)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_KEY}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .expect("typed convergence refusal");
+        assert_eq!(body["error"]["type"], "inference_unavailable", "{body}");
     }
 
     /// Draining is what a rolling deployment observes, and it must not take the

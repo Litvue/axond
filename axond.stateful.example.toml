@@ -16,11 +16,13 @@
 # and diagnostics name the reference rather than the value.
 #
 # Status: a replica boots against this file and serves `/admin/v1` against the
-# control plane, but it refuses inference until a published revision compiles
-# into a runtime snapshot, rather than serving an empty one (axond #142). It
-# fails `/readyz` and answers inference `503 inference_unavailable` until then,
-# while `/healthz` stays live, so an orchestrator leaves the administrative
-# surface reachable on a fleet that is deliberately unready;
+# control plane. It remains fail-closed until an immutable projected snapshot
+# is active; `/readyz` reports that posture while `/healthz` stays live, so an
+# orchestrator leaves the administrative surface reachable during convergence.
+# This example deliberately omits `[convergence]`: the shipped Recreate
+# Deployment has no durable per-replica volume, so it cannot promise cold-boot
+# outage recovery after a Pod replacement. A future StatefulSet/PVC deployment
+# may opt into the authenticated cache once that storage exists;
 # docs/deployment/kubernetes.md#stateful-mode has the deployment shape that
 # follows from it, and `axond check preflight` reports that refusal on its
 # `serving` line.
@@ -33,9 +35,10 @@ bind = "0.0.0.0:8080"
 # ── Control plane ────────────────────────────────────────────────────────────
 # Durable desired state: revisions, immutable manifests, resource versions, and
 # audit events. Initial cold boot requires it: a stateful replica with no
-# snapshot fails readiness rather than serving partial state. Once a replica
-# holds a snapshot, a control-plane outage stalls change and convergence but
-# does not degrade inference.
+# snapshot fails readiness rather than serving partial state. This build's
+# production projection cannot create the required inbound-principal snapshot
+# yet, so the replica remains fail-closed; outage serving is a future contract,
+# not a promise of this bootstrap example.
 #
 # The schema is applied by the operator, before replicas start, and the commands
 # that do it read this same file:

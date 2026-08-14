@@ -6,9 +6,15 @@
 # backends this manifest leaves off.
 #
 # The three references below are supplied by the `axond-secrets` Secret the
-# container takes with `envFrom`: GW_CONTROL_PLANE_DSN, GW_SECRET_STORE_KEK, and
-# GW_ADMIN_BREAKGLASS. The base's published placeholder Secret carries none of
-# them, which is deliberate — a stateful deployment supplies its own.
+# container takes with `envFrom`: GW_CONTROL_PLANE_DSN, GW_SECRET_STORE_KEK,
+# and GW_ADMIN_BREAKGLASS. The base's published placeholder Secret carries none
+# of them, which is deliberate — a stateful deployment supplies its own.
+#
+# This Deployment uses Recreate semantics but has no durable per-replica volume.
+# It therefore does not ship `[convergence]`: enabling the local
+# last-known-good cache here would promise cold-boot outage recovery that a Pod
+# replacement cannot retain. A future StatefulSet/PVC overlay may opt in after
+# it provisions durable storage and the signing-key Secret first.
 
 mode = "stateful"
 

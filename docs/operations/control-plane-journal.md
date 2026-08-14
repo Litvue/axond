@@ -199,17 +199,14 @@ In stateless mode there is no control plane, so `preflight` reports the database
 checks as skipped and `migrate` has nothing to do. Neither command requires
 PostgreSQL to exist.
 
-Until revision convergence is wired up, a stateful `preflight` **fails** on a
-`serving` line and exits non-zero: a replica does boot against that config and
-does serve `/admin/v1`, but it refuses inference, because a published revision
-cannot yet be compiled into a runtime snapshot — and a rollout gating on a zero
-exit would pass here and then answer every caller `503`. Every other check still
-runs and is still printed, so the report is the same description of the database it
-would otherwise be — and `axond migrate status` / `axond migrate apply` are
-separate commands with their own exit codes, so preparing the database is not
-blocked by the serving refusal. The line is printed from the refusal `serve`
-itself raises, not from a second copy of the rule, so it disappears when that
-refusal does rather than outliving it.
+Stateful `preflight` validates the **serving posture** rather than transient
+readiness: it passes the bootstrap line when the control-plane, secret-store,
+breakglass, and optional cache references are structurally complete. A running
+replica still stays unready until a valid projected snapshot or signed
+last-known-good cache is active, and the snapshot builder rejects empty
+projected keys. Every database check still runs and is printed, while `axond
+migrate status` / `axond migrate apply` retain their own exit codes. The serving
+line describes configuration readiness; `/readyz` describes runtime readiness.
 
 Only the control-plane journal is migrated by these commands. It is the only store
 with a ledger — recorded version, file name, checksum — so it is the only one where
@@ -234,9 +231,13 @@ axond check preflight --config /etc/axond/axond.toml # then verify a replica wou
 Then start replicas. Run `apply` once from one place; it is safe if that
 accidentally becomes twice, or two places at once.
 
-While stateful serving is unwired, that `preflight` exits non-zero on its
-`serving` line even when the database is ready; read the rest of the
-report, and gate the rollout on `axond migrate status` until the refusal is gone.
+The `serving` line is a bootstrap-configuration gate, not a promise that the
+runtime has a projected serving snapshot. It can pass while `/readyz` remains
+503: this build still refuses stateful inference until inbound caller-principal
+projection exists, and the stateful deployment is intentionally fail-closed.
+Gate the rollout on the migration status and then on `/readyz`; treat a passing
+preflight as evidence that the replica can boot its administrative surface and
+wait safely for convergence, not as evidence that inference is available.
 
 ### Upgrade
 

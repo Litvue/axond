@@ -310,15 +310,19 @@ pub enum BootstrapError {
         #[source]
         source: ControlPlaneError,
     },
-    /// The desired revision exists but does not compile. Fatal at boot on
-    /// purpose: there is no previous revision to keep serving.
+    /// The desired revision exists but does not compile. The bootstrap attempt
+    /// returns this typed refusal, while the post-listener convergence task
+    /// keeps the process alive and retries it with the normal bounded backoff;
+    /// readiness remains failed until a candidate is accepted.
     #[error("the desired revision cannot be served: {source}")]
     Rejected {
         #[source]
         source: Box<CompileError>,
     },
     /// The cache was consulted and refused itself: unauthentic, corrupt, or
-    /// unreadable. Never downgraded to "boot empty".
+    /// unreadable. Never downgraded to "boot empty". The post-listener task
+    /// keeps retrying control-plane recovery, but does not turn invalid cache
+    /// bytes into a serving snapshot.
     #[error("the last-known-good snapshot could not be restored: {source}")]
     Cache {
         #[source]
@@ -375,6 +379,21 @@ impl Reconciler {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let status = Arc::new(RevisionStatus::new(Box::new(ArcClock(Arc::clone(&clock)))));
+        Self::with_status(store, compiler, sink, settings, cache, clock, status)
+    }
+
+    /// Construct a reconciler using a status handle already installed in the
+    /// serving state. This prevents the admin/status surfaces and the loop from
+    /// telling two different convergence stories.
+    pub fn with_status(
+        store: Arc<dyn ControlPlaneStore>,
+        compiler: Arc<dyn CandidateCompiler>,
+        sink: Arc<dyn SnapshotSink>,
+        settings: ConvergenceSettings,
+        cache: Option<LastKnownGood>,
+        clock: Arc<dyn Clock>,
+        status: Arc<RevisionStatus>,
+    ) -> Self {
         Self {
             store,
             compiler,
@@ -425,16 +444,20 @@ impl Reconciler {
         &self.status
     }
 
-    /// Reach a first servable snapshot, or explain why the replica must not
-    /// start.
+    /// Attempt to reach a first servable snapshot, or explain why this attempt
+    /// could not. `serve` performs this after binding the listener so health and
+    /// administration remain observable during an outage; its convergence task
+    /// then continues with the bounded retry loop for every returned error.
     ///
     /// The cache is consulted for the two failures where cached state is the
     /// better answer: the control plane being unreachable, and a desired revision
     /// this build cannot read (a newer schema during a rollout). Both leave
     /// storage intact and neither is repaired by refusing to start. Corruption, a
     /// revision past this build's bounds, and a revision that does not compile are
-    /// all fatal here: booting from an older cached revision would silently serve
-    /// state an operator already replaced, or hide damage.
+    /// all remain fail-closed here: booting from an older cached revision would
+    /// silently serve state an operator already replaced, or hide damage. The
+    /// caller may retry the control plane, but never falls back to an empty or
+    /// partially compiled snapshot.
     pub async fn bootstrap(&self) -> Result<RevisionId, BootstrapError> {
         let span = telemetry::revision_convergence_span(telemetry::CONVERGENCE_BOOT);
         let result = self.bootstrap_inner().await;

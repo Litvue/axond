@@ -5,16 +5,25 @@ In stateful mode, a change is *published* to the control plane and then
 half: how fast it is, what a replica reports about itself, what happens when it
 cannot converge, and how a replica boots while PostgreSQL is unavailable.
 
-Stateful mode is still being assembled: this is the convergence layer
-([#142](https://github.com/Litvue/axond/issues/142)), built on the revision
-journal ([#165](https://github.com/Litvue/axond/issues/165)). The loop, its
-telemetry, and the signed cache are complete and tested, but `serve` does not yet
-construct them. Tenants and projects have durable schemas and a projection
-([#191](https://github.com/Litvue/axond/issues/191)); the remaining resource
-*bodies* (providers, credentials, catalogue models, prices, policies) belong to
-the slices that own those schemas. Read
-[ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) for the mode as
-a whole.
+Stateful serving uses the convergence layer
+([#142](https://github.com/Litvue/axond/issues/142)) over the revision journal
+([#165](https://github.com/Litvue/axond/issues/165)). The runtime binds its
+listener before the first bounded bootstrap attempt, then publishes only
+complete projected snapshots. Read [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md)
+for the mode as a whole.
+
+## Current implementation boundary
+
+This PR is the fail-closed convergence wiring slice, not an outage-serving
+release. The production projection currently reads tenancy, credentials, and
+policy, but the desired-state model has no recoverable inbound caller-principal
+secret: workload identities retain only a key digest, while the one-time key is
+deliberately unrecoverable. Stateful compilation therefore returns the typed
+`unsupported` refusal before publishing a candidate, and no stateful replica in
+this build becomes Ready or exports/restores a serving cache. The principal-
+projection slice must land before the serving and outage-recovery contract below
+can become active. The shipped Recreate Deployment also omits `[convergence]`
+because it has no durable per-replica cache volume.
 
 ## How a change reaches a replica
 
@@ -24,10 +33,12 @@ a whole.
 3. A replica that sees a head it is not serving hydrates the **whole** revision,
    projects it onto its configuration, runs the same whole-graph validation boot
    runs, and resolves every secret the result needs.
-4. If all of that succeeds, the replica swaps in the new snapshot atomically and
-   the next request is served from it.
-5. If any of it fails, the replica keeps serving what it already had and reports
-   why.
+4. Once the principal-projection dependency exists, if all of that succeeds, the
+   replica swaps in the new snapshot atomically and the next request is served
+   from it.
+5. Once an active snapshot exists, if any later candidate fails, the replica
+   keeps serving what it already had and reports why. In this PR's current build
+   every stateful candidate stops at the typed `unsupported` boundary above.
 
 When the published snapshot carries effective-dated pricing, the reconciler also
 arms a timer for `PricingSnapshot::effective().ends()`. At that boundary it
@@ -58,7 +69,7 @@ Two consequences worth internalising:
 | Notification delivered | Compile time (milliseconds), no poll wait |
 | Notification lost or disabled | Up to one poll interval, plus compile time |
 | Effective-dated pricing boundary | At the boundary, plus compile time; the scheduler is off the request path |
-| Control plane unreachable | Not until it returns; the previous revision keeps serving |
+| Control plane unreachable after an active snapshot | Not until it returns; the previous revision keeps serving |
 | Revision refused | Never, until the revision is fixed or replaced |
 
 Polling is the mechanism that makes convergence *correct*; notifications only
@@ -475,9 +486,10 @@ an unrelated publication silently redirect unnamed traffic. A bootstrap that
 declares no default namespace is therefore refused with reason `projection`, and
 the message says so. Since `[[namespace]]` is a control-plane-owned section that a
 stateful file may not declare, that is the shape a stateful bootstrap has today:
-**stateful serving stays gated until the runtime slice that selects a default from
-desired state lands.** Nothing in `serve` constructs this projection yet, so the
-refusal is a design boundary rather than an outage.
+**stateful serving stays gated until the runtime slice that projects inbound
+caller principals from desired state lands.** Nothing in `serve` constructs that
+principal projection yet, so the typed `unsupported` refusal is a design
+boundary rather than an authentication fallback or an outage.
 
 A stateless deployment is unaffected by all of this. Tenants and projects are
 published, never declared in `axond.toml`, and a stateless config's namespace ids
@@ -687,21 +699,27 @@ Backoff clears on the first success.
 
 ## During a control-plane outage
 
-A **running** replica is unaffected in the only way that matters: it keeps
-serving inference from its active snapshot. It cannot learn about new revisions,
-so its lag grows and its rejection reason reads `unavailable`, and it converges
-without intervention once PostgreSQL returns.
+The serving behavior described below is the future serving contract; the current
+build remains fail-closed until inbound-principal projection lands.
 
-A **new** replica has nothing to serve, and this is where the signed
-last-known-good cache matters.
+The current build remains admin-only and fail-closed because the principal-
+projection dependency above prevents any stateful snapshot from becoming
+active. Once that slice lands, a **running** replica will be unaffected in the
+serving sense: it will keep inference on its active immutable snapshot, report
+growing lag, and reconverge when PostgreSQL returns.
+
+A **new** replica will be able to use a signed last-known-good cache only in a
+deployment with durable per-replica storage. The shipped Recreate overlay does
+not provide that storage or enable the cache, so Pod replacement during an
+outage remains fail-closed rather than pretending to recover.
 
 ### The signed last-known-good cache
 
-Every replica writes the revision it just published to a local file, and a
-replica that boots while the control plane is unreachable may restore that file
-instead of failing to start. This is what keeps a database incident from also
-freezing fleet size — otherwise an outage during a traffic spike means no
-scale-out and no replacement of failed replicas.
+When enabled by a durable StatefulSet/PVC deployment after principal projection
+lands, every replica writes the revision it just published to a local file, and
+a replica that boots while the control plane is unreachable may restore that
+file instead of failing to start. The current Recreate overlay intentionally
+does not enable this path.
 
 What to know about it operationally:
 
@@ -724,9 +742,12 @@ What to know about it operationally:
   the mixed-version case above). Both leave storage intact and neither is repaired
   by a replica refusing to start — a replica added mid-rollout that would not boot
   withdraws capacity exactly when a rollback needs it added. Corruption, a revision
-  past this build's bounds, and a revision that exists but does not compile are all
-  fatal at boot: booting an older cached revision instead would hide damage, or
-  silently serve state an operator already replaced.
+  past this build's bounds, and a revision that exists but does not compile remain
+  rejected rather than being restored from cache: booting an older cached revision
+  instead would hide damage, or silently serve state an operator already replaced.
+  The initial bootstrap attempt returns a typed refusal, while the post-listener
+  convergence task remains alive and retries the control plane with bounded
+  backoff; it never turns the invalid candidate into a cache or empty snapshot.
 
   A replica that boots this way reports `source = last-known-good` and keeps
   reporting `incompatible` for the revision it will not read, so the mixed-version

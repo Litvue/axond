@@ -45,6 +45,11 @@ pub struct Config {
     /// Required by `mode = "stateful"`, rejected in stateless mode.
     #[serde(default)]
     pub control_plane: Option<ControlPlane>,
+    /// Stateful convergence and its authenticated local last-known-good cache.
+    /// The cache contains desired-state references only; the secret store still
+    /// has to be available before a restored revision can be published.
+    #[serde(default)]
+    pub convergence: ConvergenceConfig,
     /// Stateful bootstrap: which `SecretStore` unwraps tenant secret material,
     /// and the key-encryption key it unwraps with — both by reference.
     #[serde(default)]
@@ -162,10 +167,11 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 26] = [
+const OVERRIDE_KEYS: [&str; 27] = [
     "mode",
     "server",
     "control_plane",
+    "convergence",
     "secret_store",
     "admin_breakglass",
     "namespace",
@@ -273,6 +279,21 @@ pub struct ControlPlane {
     /// inference-path standards: nothing here runs with a request in flight.
     #[serde(default = "default_control_plane_operation_timeout_ms")]
     pub operation_timeout_ms: u64,
+}
+
+/// The small process-local surface needed to make a stateful replica recoverable
+/// during a control-plane outage. Omitting both fields disables the local cache,
+/// which deliberately leaves cold boot fail-closed when the journal is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ConvergenceConfig {
+    /// Durable path shared with replacement replicas on the local volume.
+    #[serde(default)]
+    pub cache_path: Option<String>,
+    /// Environment variable containing the deployment-wide HMAC key reference.
+    /// Its value must be canonical padded base64 encoding of exactly 32 CSPRNG
+    /// bytes; the key itself never enters configuration or diagnostics.
+    #[serde(default)]
+    pub cache_key_env: Option<String>,
 }
 
 fn default_control_plane_connect_timeout_ms() -> u64 {
@@ -2538,6 +2559,7 @@ impl Config {
     /// with #163 and #141.
     fn validate_stateful(&self) -> Result<(), ConfigError> {
         self.reject_stateful_owned_sections()?;
+        self.validate_convergence()?;
         self.validate_control_plane()?;
         self.validate_secret_store()?;
         self.validate_admin_breakglass()?;
@@ -2547,6 +2569,38 @@ impl Config {
         self.validate_budget_layout()?;
         self.validate_revocation()?;
         Ok(())
+    }
+
+    /// The last-known-good cache is an all-or-nothing bootstrap dependency.
+    /// A path without its signing-key reference would look configured while
+    /// remaining unusable, and a reference without a path would leave an
+    /// operator believing cold-boot recovery was enabled when it is not.
+    /// References also pass through the same override-collision guard as every
+    /// other secret-bearing environment name.
+    fn validate_convergence(&self) -> Result<(), ConfigError> {
+        let cache_path = self
+            .convergence
+            .cache_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let cache_key_env = self
+            .convergence
+            .cache_key_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match (cache_path, cache_key_env) {
+            (None, None) => Ok(()),
+            (Some(_), Some(name)) => {
+                reject_env_override_collision("[convergence] cache_key_env", name)
+            }
+            _ => Err(ConfigError::Invalid(
+                "`[convergence]` requires both `cache_path` and `cache_key_env` when a \
+                 last-known-good cache is configured"
+                    .into(),
+            )),
+        }
     }
 
     /// Bounds the process applies to itself, in both modes: per-phase upstream
@@ -2620,6 +2674,9 @@ impl Config {
         }
         if !self.admin_breakglass.is_empty() {
             sections.push("`[[admin_breakglass]]`");
+        }
+        if self.convergence != ConvergenceConfig::default() {
+            sections.push("`[convergence]`");
         }
         if sections.is_empty() {
             return Ok(());
@@ -5657,6 +5714,10 @@ dsn_env = "AXOND_REDIS_URL"
                 "[secret_store] kek_env",
                 "mode = \"stateful\"\n[control_plane]\ndsn_env = \"GW_DSN\"\n[secret_store]\nkek_env = \"AXOND_SECRET_STORE\"\n[[admin_breakglass]]\nenv = \"GW_BG\"",
             ),
+            (
+                "[convergence] cache_key_env",
+                "mode = \"stateful\"\n[convergence]\ncache_path = \"/tmp/lkg\"\ncache_key_env = \"AXOND_CONVERGENCE\"\n[control_plane]\ndsn_env = \"GW_DSN\"\n[secret_store]\nkek_env = \"GW_KEK\"\n[[admin_breakglass]]\nenv = \"GW_BG\"",
+            ),
         ] {
             let error = Config::from_toml_str(toml)
                 .expect_err("the override layer would claim this variable");
@@ -5667,6 +5728,23 @@ dsn_env = "AXOND_REDIS_URL"
             assert!(
                 message.contains("`AXOND_` override layer"),
                 "{key}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partial_last_known_good_cache_is_rejected_before_boot() {
+        for snippet in [
+            "[convergence]\ncache_path = \"/tmp/lkg\"",
+            "[convergence]\ncache_key_env = \"GW_LAST_KNOWN_GOOD_KEY\"",
+        ] {
+            let error = Config::from_toml_str(&format!("{STATEFUL}\n{snippet}"))
+                .expect_err("a cache path and key reference must be configured together");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires both `cache_path` and `cache_key_env`"),
+                "{error}"
             );
         }
     }
@@ -5714,7 +5792,7 @@ dsn_env = "AXOND_REDIS_URL"
                 let Some((key, value)) = line.split_once(" = ") else {
                     continue;
                 };
-                if !matches!(key, "env" | "dsn_env" | "kek_env") {
+                if !matches!(key, "env" | "dsn_env" | "kek_env" | "cache_key_env") {
                     continue;
                 }
                 let reference = value.trim().trim_matches('"');
@@ -5727,7 +5805,9 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     /// The shipped stateful example is the operator-facing copy of the approved
-    /// bootstrap set; it must keep validating as the parser evolves.
+    /// bootstrap set; it must keep validating as the parser evolves. The
+    /// Recreate deployment deliberately leaves the optional cache disabled until
+    /// a durable StatefulSet/PVC mount exists.
     #[test]
     fn the_shipped_stateful_example_validates() {
         let config = Config::from_toml_str(&repository_file("axond.stateful.example.toml"))
@@ -5737,6 +5817,7 @@ dsn_env = "AXOND_REDIS_URL"
             config.namespace.is_empty(),
             "the control plane owns tenants"
         );
+        assert_eq!(config.convergence, ConvergenceConfig::default());
     }
 
     /// Documentation drift gate: every key the shipped stateful example uses is

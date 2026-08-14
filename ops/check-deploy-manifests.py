@@ -102,16 +102,25 @@ def render(directory: Path, components: tuple[Path, ...] = ()) -> list[Document]
     if not components:
         return kustomize(str(directory), None)
     with tempfile.TemporaryDirectory(prefix="axond-kustomize-") as holder:
+        # On macOS, the repository may be addressed as `/private/tmp` while
+        # tempfile returns its `/var/folders` symlink spelling. Compute both
+        # sides from resolved paths or the relative resource becomes
+        # `/private/private/...` inside kubectl's cwd.
+        holder_path = Path(holder).resolve()
         lines = [
             "apiVersion: kustomize.config.k8s.io/v1beta1",
             "kind: Kustomization",
             "resources:",
-            f"  - {os.path.relpath(directory, holder)}",
+            f"  - {os.path.relpath(directory.resolve(), holder_path)}",
             "components:",
         ]
-        lines.extend(f"  - {os.path.relpath(component, holder)}" for component in components)
-        Path(holder, "kustomization.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return kustomize(".", Path(holder))
+        lines.extend(
+            f"  - {os.path.relpath(component.resolve(), holder_path)}" for component in components
+        )
+        (holder_path / "kustomization.yaml").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+        return kustomize(".", holder_path)
 
 
 def kustomize(target: str, cwd: Path | None) -> list[Document]:
@@ -798,6 +807,18 @@ def check_stateful(documents: list[Document]) -> list[str]:
     if strategy.get("rollingUpdate") is not None:
         failures.append(f"{label}: the Deployment keeps rollingUpdate settings beside Recreate")
 
+    template = deployment["spec"].get("template")
+    if not isinstance(template, dict) or not isinstance(template.get("spec"), dict):
+        failures.append(
+            f"{label}: the Deployment is missing spec.template.spec, so Kubernetes cannot create a Pod"
+        )
+        return failures
+    # This is a Deployment with Recreate semantics, not a StatefulSet. There is
+    # no durable per-replica volume, so the shipped config must not enable the
+    # local last-known-good cache and promise recovery across Pod replacement.
+    # A future StatefulSet/PVC overlay gets its own manifest gate when it opts
+    # into `[convergence]`.
+
     budget = one(documents, "PodDisruptionBudget")
     if budget["spec"].get("unhealthyPodEvictionPolicy") != "AlwaysAllow":
         failures.append(
@@ -896,6 +917,11 @@ def check_stateful(documents: list[Document]) -> list[str]:
     config = gateway_config(documents)
     if config.get("mode") != "stateful":
         failures.append(f"{label}: the mounted config is not `mode = \"stateful\"`")
+    if "convergence" in config:
+        failures.append(
+            f"{label}: the Recreate Deployment ships [convergence] without durable per-replica "
+            "storage; use a StatefulSet/PVC overlay before enabling the cache"
+        )
     owned_by_the_control_plane = sorted(
         key
         for key in ("namespace", "provider", "credential", "model", "gateway_key", "alias")
@@ -954,6 +980,22 @@ def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> lis
                 f"ops/stateful-deploy-drill.sh: the {counterfactual!r} counterfactual is gone; "
                 f"{lost}"
             )
+    for contract, lost in (
+        (
+            "401 unauthorized",
+            "an anonymous inference probe would no longer prove auth-first refusal",
+        ),
+        (
+            "503 inference_unavailable",
+            "the drill would no longer document the authenticated convergence contract",
+        ),
+        (
+            "principal projection lands",
+            "the drill would claim active serving before its production dependency exists",
+        ),
+    ):
+        if contract not in drill:
+            failures.append(f"ops/stateful-deploy-drill.sh: {lost}")
     return failures
 
 
@@ -1134,6 +1176,10 @@ def self_test() -> int:
     one(blocked, "PodDisruptionBudget")["spec"].pop("unhealthyPodEvictionPolicy")
     expect_failure("a budget that blocks every drain", check_stateful(blocked))
 
+    missing_template = copy.deepcopy(stateful)
+    one(missing_template, "Deployment")["spec"].pop("template")
+    expect_failure("a stateful Deployment without a Pod template", check_stateful(missing_template))
+
     published_admin = copy.deepcopy(stateful)
     published_admin.append(
         {
@@ -1183,6 +1229,18 @@ def self_test() -> int:
         if service["metadata"]["name"] == "axond":
             service["spec"]["publishNotReadyAddresses"] = True
     expect_failure("callers routed to a refusing replica", check_stateful(routed))
+
+    cache_enabled_without_durable_storage = copy.deepcopy(stateful)
+    cache_config = one(cache_enabled_without_durable_storage, "ConfigMap")
+    cache_config["data"]["axond.toml"] += (
+        "\n[convergence]\n"
+        "cache_path = \"/var/lib/axond/last-known-good.snapshot\"\n"
+        "cache_key_env = \"GW_LAST_KNOWN_GOOD_KEY\"\n"
+    )
+    expect_failure(
+        "a Recreate stateful Deployment that enables a non-durable cache",
+        check_stateful(cache_enabled_without_durable_storage),
+    )
 
     self_migrating = copy.deepcopy(stateful)
     config = one(self_migrating, "ConfigMap")

@@ -3,17 +3,26 @@
 Stateful mode
 ([#160](https://github.com/Litvue/axond/issues/160)) is being built as a set of
 *contract* slices — durable schemas, typed documents, protocol boundaries — each
-landing on its own. None of them makes a replica *serve inference* statefully:
-a stateful replica boots and serves `/admin/v1`, and refuses inference until a
-published revision compiles into a runtime snapshot. That last step
-is **integration**: the wiring that connects a bootstrap file to a control plane,
-a control plane to a compiled snapshot, and a snapshot to the request path, plus
-the evidence that each of #160's release gates actually holds on the assembled
-system.
+landing on its own. The integration seam connects a bootstrap file to a control
+plane, a control plane to a compiled immutable snapshot, and that snapshot to
+the request path, plus the evidence that each of #160's release gates holds on
+the assembled system. A cold or unconverged replica remains fail-closed. A
+valid projected snapshot or signed last-known-good cache is the intended future
+serving posture, but this build's production projection has no inbound
+caller-principal source, so no stateful serving or cache-recovery claim is
+active yet.
 
 This page is the integration plan and its acceptance matrix. It exists so that
 "is stateful mode ready?" has a single answer with a reference behind each line,
 rather than a set of merged pull requests nobody has run together.
+
+The current #345 slice is intentionally **fail-closed convergence wiring**. Its
+production projection has no inbound caller-principal source, so stateful
+compilation returns typed `unsupported`, no revision becomes active, and no
+outage-serving or cache-recovery claim is active in this build. The principal-
+projection slice is the explicit dependency that moves IG-03, IG-06, IG-07, and
+the later serving gates from blocked to executable. The shipped Recreate
+Deployment also omits `[convergence]` until durable per-replica storage exists.
 
 - [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) — the two
   operating modes and what each one owns.
@@ -92,8 +101,8 @@ integration owns, what it depends on, and the harness scenario that proves it.
 - `partial` — a running process proves the path that exists, and the `Depends on`
   cell names the part a contract slice still owns. Never a status a gate can hold
   without a service-backed scenario.
-- `blocked` — the scenario asserts that the system still refuses inference rather
-  than pretending otherwise, and names what it waits for.
+- `blocked` — the scenario asserts that the system remains fail-closed without a
+  valid projected serving snapshot, and names what it waits for.
 
 `Depends on` lists only what is still outstanding — an unlanded contract slice,
 or an earlier gate that has to serve first. A dependency that lands moves to
@@ -105,7 +114,7 @@ here without a scenario, or a scenario without a row, fails the suite.
 
 | Gate | #160 release gate | Integration wiring | Depends on | Evidence | Status |
 | --- | --- | --- | --- | --- | --- |
-| IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap either reaches its control plane and serves `/admin/v1` — refusing inference while no revision is compiled — or fails loudly on the reference it could not resolve | | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_serves_administration_and_refuses_inference`, `stateful_boot_refuses_an_unresolved_reference` | wired |
+| IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap reaches its control plane and serves `/admin/v1`; anonymous inference is refused by auth first and authenticated inference remains behind the typed convergence refusal until principal projection exists | | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_serves_administration_and_refuses_inference`, `stateful_boot_refuses_an_unresolved_reference` | wired |
 | IG-02 | Postgres-first control plane | Operator preflight, forward-only migration, and the connect a replica performs before it serves | | `preflight_describes_a_stateless_install`, `migrate_prepares_a_control_plane_before_replicas_start` | wired |
 | IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | | `hydrate_compile_publish_is_one_atomic_step` | blocked |
 | IG-04 | Provider secrets rotate without redeployment | Resolve every credential a candidate snapshot needs through the SecretStore during compilation, never on the request path | IG-03 | `secrets_resolve_during_compilation_only` | blocked |
@@ -120,15 +129,15 @@ here without a scenario, or a scenario without a row, fails the suite.
 ## The next gate that can become executable
 
 IG-01 is wired: a replica boots against a migrated control plane, serves
-`/admin/v1`, and refuses inference and readiness until a revision compiles — so
-the scenarios above now assert a running stateful process, and the loud-failure
-half asserts the *reference* a boot could not resolve rather than any nonzero
-exit.
+`/admin/v1`, and remains fail-closed and unready until a valid projected
+snapshot or cache is active — so the scenarios above assert a running stateful
+process, and the loud-failure half asserts the *reference* a boot could not
+resolve rather than any nonzero exit.
 
 IG-03 is next, and it is what the remaining blocked gates wait behind: until a
 published revision compiles into a runtime snapshot, IG-04 and IG-06 through
 IG-11 have no served revision to assert against, which is why their scenarios
-assert today's inference refusal instead. Much of its foundation is on main — the
+assert today's fail-closed posture instead. Much of its foundation is on main — the
 policy document type (#253), the derived availability contracts (#250), the
 `/admin/v1` boundary and its served runtime (#254, #143), the models.dev
 catalogue import (#207), the envelope-encrypted SecretStore (#275), and now
@@ -141,15 +150,15 @@ on integration alone. Two gates still name a slice of their own: IG-05 the admin
 OIDC authenticator, which is not downstream of compilation, and IG-11 the
 qualification epic (#156), which is — it waits on IG-03 … IG-08 as well.
 
-What it waits on is not a contract but a seam. The reconciler, the compiler, the
-last-known-good cache and the status registry are all on main and all unreachable
-from `serve` — `crates/gateway/src/main.rs` still declares `convergence` and
-`status` `#[allow(dead_code)]` and `qualification` `#[cfg(test)]`, because nothing
-constructs them at boot — that much this tree proves. Wiring it is a single edit
-to `main.rs` and `state.rs`, the files the in-flight slices above were last seen
-touching. If they still touch them when they land, IG-03 written first resolves
-the same conflict once per slice, in the file where a bad resolution silently
-changes what a replica serves.
+What it waits on is the principal-projection seam. The reconciler and compiler
+are now constructed by `serve`, but the production chain returns typed
+`unsupported` before it can publish a keyless candidate. The desired-state
+identity model retains only workload-key digests, not recoverable caller
+secrets, so this PR does not invent a projection from unrelated material. The
+principal-projection slice must provide that source and its isolation rules
+before IG-03 can become executable; the cache-storage slice must provide durable
+per-replica storage before cold-boot recovery is enabled in the Recreate
+deployment.
 
 So the next integration pull request is IG-03, opened once that seam settles —
 not against those branches, and not duplicating the compilation a contract slice

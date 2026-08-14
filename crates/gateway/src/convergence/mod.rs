@@ -57,18 +57,14 @@
 //! with its own reason, and the replica keeps both the configuration and the
 //! policy it already had.
 //!
-//! # Not wired to `serve` yet
+//! # Serving boundary
 //!
-//! A stateful replica boots and serves `/admin/v1`, but it refuses *inference*
-//! ([`crate::ops::inference_refusal`]), and deliberately. Three of the
-//! projections a snapshot needs exist — [`tenancy`], which makes a project a
-//! namespace, [`credentials`], which makes an active provider credential the
-//! pool a call leases from, and [`policy`], which says which published document
-//! governs each projected namespace — but a servable snapshot also needs the
-//! catalogue and pricing a revision carries, so no production
-//! [`compile::RevisionProjection`] composes a whole servable config yet. Those
-//! are the seams left open; wiring `serve` is the remaining projections landing,
-//! not a second convergence design.
+//! `serve` owns the bootstrap snapshot and the reconciler owns every projected
+//! replacement. A stateful bootstrap is intentionally keyless and therefore
+//! cannot authenticate traffic; only a candidate with a complete projected
+//! inbound-key set may become active. A control-plane outage leaves the active
+//! immutable snapshot in place, while a cold boot without a valid projection or
+//! signed last-known-good cache remains fail-closed until recovery.
 
 pub mod backoff;
 pub mod compile;

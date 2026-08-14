@@ -59,6 +59,10 @@ impl<P: RevisionProjection> RevisionProjection for PolicyProjection<P> {
         "policy"
     }
 
+    fn projects_inbound_principals(&self) -> bool {
+        self.inner.projects_inbound_principals()
+    }
+
     fn project(
         &self,
         bootstrap: &Config,

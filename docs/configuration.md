@@ -76,23 +76,33 @@ exclusive: there is no per-resource migration state, and therefore no merge
 policy between a file and a database. It is a bootstrap property, so a reload
 cannot switch a serving process between modes — that needs a restart.
 
-**A stateful replica administers today and serves inference later.** It boots,
-opens the control plane, and serves `/admin/v1` — see
-[administering a stateful deployment](./operations/admin-api.md) — but a
-published revision cannot be compiled into a runtime snapshot yet, so `/readyz`
-stays `503` and every `/v1` route answers `503 inference_unavailable` rather than
-an empty configuration. Serve inference from `mode = "stateless"` until
-[revision convergence](./operations/revision-convergence.md) ships, and read the
+**A stateful replica administers and is fail-closed until projected state is
+available.** It opens the control plane and serves `/admin/v1` — see
+[administering a stateful deployment](./operations/admin-api.md) — while
+inference remains refused until a projected snapshot with inbound caller
+principals is active. The current desired-state model does not yet provide that
+principal projection, so this build does not claim stateful inference or outage
+serving. The signed last-known-good cache remains an optional runtime contract,
+but the shipped Recreate Deployment intentionally does not enable it because it
+has no durable per-replica volume. See [revision convergence]
+(./operations/revision-convergence.md) for the dependency boundary and read the
 ADR's ownership and failure matrices before planning a deployment.
 
 ### Stateful bootstrap
 
 The whole file a stateful replica reads is `mode`, `[server]`, `[transport]`,
-`[admission]`, `[reload]`, telemetry (`[[usage_sink]]`, plus the environment-only
-OTLP settings), the three sections below, and *backend selection with DSN references*
+`[admission]`, telemetry (`[[usage_sink]]`, plus the environment-only OTLP
+settings), the three sections below, and *backend selection with DSN references*
 for the opt-in `[budget]`, `[rate_limit]`, and `[revocation]` backends.
 [`axond.stateful.example.toml`](../axond.stateful.example.toml) is that file with
 prose.
+
+`[reload]` remains a recognized bootstrap section for schema compatibility, but
+it is not a live configuration channel in stateful mode: SIGHUP and file-watch
+reloads are refused because they cannot compile a control-plane revision. The
+stateful example omits it deliberately. Change process-local settings such as
+the listener or admission bounds with a restart, and change durable resources
+through `/admin/v1`.
 
 Two symmetrical rejections happen before the socket is bound, and again on every
 reload:
@@ -174,6 +184,37 @@ restaged under the new one. Timeouts are inherited from `[control_plane]`, since
 encrypted Postgres is normally the same database and two independent sets of
 bounds for one server is a knob with no decision behind it. See
 [ADR 0039](./adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md).
+
+#### `[convergence]`
+
+Optional in stateful mode. It controls the authenticated local
+last-known-good snapshot used only when a replica cold-boots while the control
+plane is unreachable. The cache contains projected state and references, never
+plaintext secret material. Set both fields or neither.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `cache_path` | path | unset | Per-replica file containing the signed last-known-good projected snapshot. |
+| `cache_key_env` | string | unset | Environment-variable name containing canonical padded base64 for exactly 32 CSPRNG bytes. Leading/trailing whitespace and raw passphrases are refused; the value is never logged. |
+
+A valid cache can permit cold boot during a control-plane outage only when it is
+stored on durable per-replica storage and the inbound-principal projection is
+available. Missing, invalid, tampered, or keyless projected state remains
+fail-closed; the cache is not a fallback for a candidate that fails validation or
+secret resolution. The shipped `production-stateful` Recreate Deployment omits
+this section, because its Pod replacement would discard an `emptyDir` cache and
+make the recovery promise false. Enable it only in a StatefulSet/PVC-compatible
+deployment, provisioning the signing-key Secret before the ConfigMap.
+
+The current desired-state projection does not yet supply inbound caller
+principals, so stateful candidates report a typed `unsupported` refusal and the
+replica remains not Ready until that projection lands. Configuring the cache
+does not weaken that gate or create a keyless serving path.
+
+Generate `GW_LAST_KNOWN_GOOD_KEY` as one canonical padded base64 value from 32
+random bytes (for example, `openssl rand -base64 32` with its trailing newline
+removed). Do not use a human passphrase, add whitespace, or trim a value
+differently between replicas: the exact Secret bytes are the HMAC contract.
 
 #### `[[admin_breakglass]]`
 
@@ -698,6 +739,12 @@ old one. Restart after changing `[catalog]`; the applied reload log includes
 The same log entry sets `restart_required = true` for catalogue and other
 boot-owned changes; `changed` only reports live serving state applied by the
 reload.
+
+Stateful mode is the exception to this file-reload contract. Because a file
+reload has no control-plane projection compiler, SIGHUP and file-watch reloads
+are refused rather than replacing the active or pending revision with the
+keyless bootstrap configuration. Restart for process-local bootstrap changes;
+publish durable resource changes through `/admin/v1`.
 
 ## `[[usage_sink]]` — Tier 0 by default; Tier 2 for `postgres`
 

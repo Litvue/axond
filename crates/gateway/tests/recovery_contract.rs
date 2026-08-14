@@ -551,15 +551,15 @@ fn restore_drill_owns_restore_stages_and_reads_catalogue_before_recovered_boot()
     );
     assert!(
         drill.contains(
-            "require \"the_restored_replica_fails_inference_closed\" 503 \"$inference_status\""
+            "require \"the_restored_replica_authenticates_before_convergence\" 401 \"$inference_status\""
         ),
-        "an unready restored replica must fail the inference route closed"
+        "an unauthenticated restored replica must authenticate before exposing convergence state"
     );
     assert!(
         drill.contains(
-            "require \"the_restored_replica_names_inference_refusal\" inference_unavailable \"$inference_error\""
+            "require \"the_restored_replica_uses_the_unauthorized_envelope\" unauthorized \"$inference_error\""
         ),
-        "the unready inference refusal must retain its typed error"
+        "the anonymous inference refusal must retain its typed unauthorized error"
     );
     assert!(
         drill.contains("successes=\"$(unauthenticated_successes \"$logical_endpoint\")\"")
