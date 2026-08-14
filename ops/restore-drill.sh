@@ -556,10 +556,10 @@ observe restored_inference_status "$inference_status"
 observe restored_inference_error "$inference_error"
 require "the_restored_replica_fails_readiness_closed" 503 "$readiness_status" \
   "a restored journal without a projected serving snapshot is not routed traffic"
-require "the_restored_replica_fails_inference_closed" 503 "$inference_status" \
-  "an unready restored replica refuses inference before the route can serve traffic"
-require "the_restored_replica_names_inference_refusal" inference_unavailable "$inference_error" \
-  "the refusal identifies the missing serving snapshot rather than an unrelated route error"
+require "the_restored_replica_authenticates_before_convergence" 401 "$inference_status" \
+  "an unauthenticated restored-replica probe is refused before convergence state is disclosed"
+require "the_restored_replica_uses_the_unauthorized_envelope" unauthorized "$inference_error" \
+  "the auth-first refusal hides the missing serving snapshot from anonymous callers"
 
 restore_loss_checks=(the_restored_head_is_the_backed_up_head
   the_restored_revision_chain_is_whole the_restored_deployment_is_whole
@@ -573,7 +573,7 @@ gate admin_writes \
   "$(verdict a_publication_against_the_restored_head_is_accepted)" \
   "a publication against the restored head was accepted by a replica booted on it"
 defer readiness \
-  "the blocked \`reconvergence\` stage owns what a restored replica serves; this replica answers /admin/v1 and refuses inference, which the readiness_probe observation records"
+  "the blocked \`reconvergence\` stage owns what a restored replica serves; this replica answers /admin/v1, keeps readiness 503, and auth-first refuses anonymous inference probes"
 defer max_serving_error_fraction \
   "this stage offers no inference traffic, so the ceiling is vacuous by contract"
 defer max_convergence_lag_seconds \
