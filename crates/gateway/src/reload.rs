@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::config::{
-    AdmissionConfig, BudgetConfig, Config, ConfigError, Mode, RateLimitConfig, Reload,
-    RevocationConfig, Transport, UsageJournalConfig, UsageSinkConfig,
+    AdmissionConfig, BudgetConfig, CatalogConfig, Config, ConfigError, Mode, RateLimitConfig,
+    Reload, RevocationConfig, Transport, UsageJournalConfig, UsageSinkConfig,
 };
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
@@ -59,6 +59,17 @@ struct Boot {
     revocation: RevocationConfig,
     transport: Transport,
     admission: AdmissionConfig,
+    catalog: CatalogConfig,
+}
+
+/// A validated reload candidate plus the boot-owned settings the file tried to
+/// change. The catalogue importer owns a source, store, and refresh task that
+/// are built before the listener, so its settings stay at their boot values
+/// until a restart. Keeping that fact alongside the candidate prevents the
+/// published serving snapshot from claiming that a new importer is running.
+struct ReloadCandidate {
+    snapshot: ConfigSnapshot,
+    catalog_changed: bool,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -88,6 +99,7 @@ impl Reloader {
                 revocation: booted.config.revocation.clone(),
                 transport: booted.config.transport.clone(),
                 admission: booted.config.admission.clone(),
+                catalog: booted.config.catalog.clone(),
             },
             path,
             state,
@@ -156,6 +168,7 @@ impl Reloader {
 
         match self.candidate(env, &current, current.generation + 1) {
             Ok(candidate) => {
+                let catalog_changed = candidate.catalog_changed;
                 // A file reload replaces what the file describes and nothing
                 // else. Approved pricing is not in the file — it came from a
                 // desired revision this replica converged on — so it is carried
@@ -164,9 +177,9 @@ impl Reloader {
                 // `SIGHUP`, which is the one way pricing could disappear without
                 // a revision saying so. Which pricing convergence *replaces* is
                 // its own business (#142); this only refuses to lose it.
-                let candidate = match current.pricing() {
-                    None => candidate,
-                    Some(pricing) => candidate.with_pricing(pricing.clone()),
+                let candidate_snapshot = match current.pricing() {
+                    None => candidate.snapshot,
+                    Some(pricing) => candidate.snapshot.with_pricing(pricing.clone()),
                 };
                 // The derived availability view is carried the same way and for
                 // the same reason. Nothing it rests on is in the file: its four
@@ -179,13 +192,14 @@ impl Reloader {
                 // or blanking the view would make a `SIGHUP` the way an operator
                 // loses the answer to "which models can this tenant reach",
                 // indefinitely, during the incident that prompted the reload.
-                let candidate = match current.availability_handle() {
-                    None => candidate,
-                    Some(availability) => candidate.with_availability(availability),
+                let candidate_snapshot = match current.availability_handle() {
+                    None => candidate_snapshot,
+                    Some(availability) => candidate_snapshot.with_availability(availability),
                 };
-                let summary = ReloadSummary::between(&self.boot, &current, &candidate);
-                let generation = candidate.generation;
-                self.state.publish(candidate);
+                let mut summary = ReloadSummary::between(&self.boot, &current, &candidate_snapshot);
+                summary.catalog_changed = catalog_changed;
+                let generation = candidate_snapshot.generation;
+                self.state.publish(candidate_snapshot);
                 telemetry::finish_config_reload(
                     &span,
                     trigger,
@@ -229,7 +243,7 @@ impl Reloader {
         env: &HashMap<String, String>,
         current: &ConfigSnapshot,
         generation: u64,
-    ) -> Result<ConfigSnapshot, ReloadError> {
+    ) -> Result<ReloadCandidate, ReloadError> {
         let mut config = Config::load(&self.path)?;
         if config.mode != self.boot.mode {
             return Err(ReloadError::Config(ConfigError::Invalid(format!(
@@ -239,13 +253,23 @@ impl Reloader {
                 config.mode.as_str()
             ))));
         }
+        let catalog_changed = self.boot.catalog != config.catalog;
+        // `[catalog]` selects the importer built before the listener binds. A
+        // reload validates the edited values and reports the difference, but it
+        // cannot safely replace that task, its client, or its retained store.
+        // Keep the serving snapshot aligned with the importer that is actually
+        // running until the operator restarts the process.
+        config.catalog = self.boot.catalog.clone();
         carry_policy_forward(&mut config, &current.config);
-        Ok(ConfigSnapshot::build_with(
-            config,
-            env,
-            generation,
-            current.secrets().clone(),
-        )?)
+        Ok(ReloadCandidate {
+            snapshot: ConfigSnapshot::build_with(
+                config,
+                env,
+                generation,
+                current.secrets().clone(),
+            )?,
+            catalog_changed,
+        })
     }
 
     fn watch_settings(&self) -> Reload {
@@ -343,6 +367,8 @@ pub struct ReloadSummary {
     /// `[admission]` differs from the ceilings admission control was built with.
     /// Validated on reload, applied on restart.
     pub admission_changed: bool,
+    /// `[catalog]` differs from the catalogue importer built at boot.
+    pub catalog_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -539,6 +565,7 @@ impl ReloadSummary {
             revocation_changed: boot.revocation != after_config.revocation,
             transport_changed: boot.transport != after_config.transport,
             admission_changed: boot.admission != after_config.admission,
+            catalog_changed: boot.catalog != after_config.catalog,
         }
     }
 
@@ -553,6 +580,23 @@ impl ReloadSummary {
             && self.gateway_minting.is_empty()
             && self.gateway_token_epochs.is_empty()
             && self.gateway_token_audience.is_empty()
+    }
+
+    /// Whether the candidate contains a valid change that this process can
+    /// report but only apply after a restart. Kept separate from [`Self::is_empty`]
+    /// because that method answers the narrower question of whether a reload
+    /// changed any live serving state.
+    pub fn restart_required(&self) -> bool {
+        self.bind_changed
+            || self.usage_sinks_changed
+            || self.usage_journal_changed
+            || self.budget_changed
+            || self.rate_limit_changed
+            || self.revocation_changed
+            || self.transport_changed
+            || self.admission_changed
+            || self.catalog_changed
+            || self.gateway_minting_route_added()
     }
 
     fn log_applied(&self, trigger: &'static str, path: &str) {
@@ -574,6 +618,8 @@ impl ReloadSummary {
             budget_changed = self.budget_changed,
             rate_limit_changed = self.rate_limit_changed,
             revocation_changed = self.revocation_changed,
+            catalog_changed = self.catalog_changed,
+            restart_required = self.restart_required(),
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -637,6 +683,11 @@ impl ReloadSummary {
         if self.admission_changed {
             tracing::warn!(
                 "`[admission]` changed, but the admission ceilings are already serving requests; restart to apply them"
+            );
+        }
+        if self.catalog_changed {
+            tracing::warn!(
+                "`[catalog]` changed, but the catalogue importer is built at boot; restart to apply it"
             );
         }
     }
@@ -1261,6 +1312,7 @@ env = "GW_ADMIN_BREAKGLASS"
             revocation: before.config.revocation.clone(),
             transport: before.config.transport.clone(),
             admission: before.config.admission.clone(),
+            catalog: before.config.catalog.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1294,6 +1346,7 @@ env = "GW_ADMIN_BREAKGLASS"
             revocation: before.config.revocation.clone(),
             transport: before.config.transport.clone(),
             admission: before.config.admission.clone(),
+            catalog: before.config.catalog.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1334,6 +1387,7 @@ env = "GW_ADMIN_BREAKGLASS"
             revocation: disabled.config.revocation.clone(),
             transport: disabled.config.transport.clone(),
             admission: disabled.config.admission.clone(),
+            catalog: disabled.config.catalog.clone(),
         };
 
         let added = ReloadSummary::between(&boot, &disabled, &enabled);
@@ -1404,6 +1458,7 @@ env = "GW_ADMIN_BREAKGLASS"
             revocation: before.config.revocation.clone(),
             transport: before.config.transport.clone(),
             admission: before.config.admission.clone(),
+            catalog: before.config.catalog.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(summary.gateway_minting.changed, vec!["enabled".to_owned()]);
@@ -2171,6 +2226,35 @@ targets = [
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("budget removal is valid");
         assert!(!summary.budget_changed);
+    }
+
+    #[tokio::test]
+    async fn catalogue_changes_are_reported_as_restart_required() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[catalog]\nsource = \"seed\"\nstore = \"in-memory\"\nbootstrap = \"seed\"\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("catalogue candidate is valid");
+        assert!(summary.catalog_changed);
+        assert!(summary.restart_required());
+        assert!(summary.is_empty(), "catalogue importer is boot-owned");
+        assert_eq!(
+            reloader.state.config().config.catalog,
+            CatalogConfig::default(),
+            "the serving snapshot must not claim a reload-created importer"
+        );
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("catalogue removal is valid");
+        assert!(!summary.catalog_changed);
+        assert!(!summary.restart_required());
     }
 
     /// Turning billing-grade usage recording on or off is a restart, because the

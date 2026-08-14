@@ -624,3 +624,24 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # aliases = ["gpt-*"]
 # max_request_microdollars = 1000
 # Add can_mint = true to an explicitly authorized static key.
+
+# ── Imported model metadata (opt-in; disabled in this example) ───────────────
+# Enabled, a background task imports the models.dev catalogue, retains every
+# accepted snapshot with its provenance, and keeps a last-known-good active.
+# Nothing on the inference path reads the source or the store, and an import
+# activates no model, changes no enablement, and settles no price.
+# `store = "in-memory"` is a development store: it loses every snapshot and its
+# provenance on restart, and a stateful deployment must retain in Postgres.
+# [catalog]
+# source = "models-dev" # none (default) | models-dev | seed
+# source_url = "https://models.dev/catalog.json"
+# store = "in-memory" # in-memory (default) | postgres
+# dsn_env = "AXOND_CATALOG_DSN" # postgres: otherwise inherit [control_plane]
+# schema = "public"
+# create_table = true
+# refresh_interval_seconds = 21_600
+# refresh_timeout_seconds = 60
+# retry_initial_seconds = 60 # doubles per consecutive refusal, up to retry_max
+# retry_max_seconds = 3_600
+# bootstrap = "empty" # empty (default) | seed (offline, before a first fetch)
+# max_payload_bytes = 67_108_864

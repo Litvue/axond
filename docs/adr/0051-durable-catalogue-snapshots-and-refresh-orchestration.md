@@ -143,9 +143,10 @@ already-alerting state. That is the intended reading: `PERSISTENT_REFUSAL_THRESH
 is about the catalogue, not about the process, and #241's metrics and status
 surface project from the same `CatalogReport` either way.
 
-Two behaviours are deliberately still absent. The refresher is not wired into
-`serve`: nothing spawns it and no configuration section selects a store, so this
-slice changes no running deployment. And `RefreshImpact` is a report with no
-consumer yet — the surface an operator reads it on is the enablement work of
+Two behaviours are deliberately still absent here. The refresher is not wired
+into `serve`: nothing spawns it and no configuration section selects a store, so
+this slice changes no running deployment — [ADR 0055](./0055-catalogue-imports-in-a-running-deployment.md)
+adds the `[catalog]` section, the production fetch, and the task that owns the
+loop. And `RefreshImpact` is a report with no consumer yet — the surface an operator reads it on is the enablement work of
 #146's remaining slices, which is also where a decision to act on a withdrawn
 offering belongs.

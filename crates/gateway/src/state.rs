@@ -25,6 +25,8 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::admission::{AdmissionControl, DiagnosticCredential};
 use crate::aliases::AliasScope;
 use crate::availability::{AvailabilityIndex, AvailabilityReader, RuntimeObservations};
+use crate::backends::catalog::CatalogReport;
+use crate::backends::catalog_runtime::CatalogStatus;
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::health::BackendHealth;
 use crate::budget::BudgetStore;
@@ -47,7 +49,7 @@ use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
 use crate::shutdown::Lifecycle;
 use crate::status::Component;
-use crate::status::probes::{BackendProbe, ControlPlaneProbe};
+use crate::status::probes::{BackendProbe, CatalogProbe, ControlPlaneProbe};
 use crate::status::registry::{
     CachedStatusRegistry, ObservationPlan, StatusRefresher, StatusSettings,
 };
@@ -92,6 +94,11 @@ pub struct Inner {
     /// [`AdminApi::with_convergence`](crate::admin::router::AdminApi::with_convergence):
     /// two instances would let one replica tell two convergence stories.
     pub revision: Option<Arc<RevisionStatus>>,
+    /// What the background catalogue import last reported, when this deployment
+    /// imports one at all. A read of a mutex over a bounded report: the request
+    /// path never reaches the source or the store, and holding this handle is
+    /// what makes that structural rather than a rule (ADR 0043).
+    pub catalogue: Option<Arc<CatalogStatus>>,
     config: ArcSwap<ConfigSnapshot>,
 }
 
@@ -105,6 +112,7 @@ pub struct Inner {
 pub struct ReplicaObservability {
     pub status: Arc<CachedStatusRegistry>,
     pub revision: Option<Arc<RevisionStatus>>,
+    pub catalogue: Option<Arc<CatalogStatus>>,
 }
 
 impl ReplicaObservability {
@@ -114,6 +122,7 @@ impl ReplicaObservability {
         Self {
             status: Arc::new(CachedStatusRegistry::stateless()),
             revision: None,
+            catalogue: None,
         }
     }
 
@@ -146,6 +155,7 @@ impl ReplicaObservability {
                 // no convergence state to report and an empty report would be a
                 // false all-clear (#142).
                 revision: None,
+                catalogue: None,
             },
             Some(refresher),
         )
@@ -181,6 +191,55 @@ impl ReplicaObservability {
             plan.observe(Arc::new(BackendProbe::new(component, health)), pacing);
         }
         plan
+    }
+
+    /// Extend the deployment-derived observation plan with the bounded
+    /// process-local catalogue report, when one is running.
+    pub fn plan_with_catalogue(
+        control_plane: Option<(Arc<dyn ControlPlaneStore>, StatusSettings)>,
+        budget: &dyn BudgetStore,
+        rate_limiter: &dyn RateLimiter,
+        revocation: &dyn RevocationStore,
+        catalogue: Option<Arc<CatalogStatus>>,
+    ) -> ObservationPlan {
+        let mut plan = Self::plan(control_plane, budget, rate_limiter, revocation);
+        if let Some(catalogue) = catalogue {
+            let mut pacing = StatusSettings::default();
+            pacing.enabled.push(Component::Catalogue);
+            plan.observe(Arc::new(CatalogProbe::new(catalogue)), pacing);
+        }
+        plan
+    }
+
+    /// Report on the catalogue the background import is keeping current.
+    ///
+    /// Separate from the constructors because catalogue imports are orthogonal to
+    /// the mode: a stateless deployment may import metadata into a development
+    /// store, and a stateful one may import none at all.
+    #[must_use]
+    pub fn with_catalogue(mut self, catalogue: Arc<CatalogStatus>) -> Self {
+        self.catalogue = Some(catalogue);
+        self
+    }
+
+    /// The stateless posture with a process-local catalogue import.
+    #[cfg(test)]
+    pub fn stateless_with_catalogue(catalogue: Arc<CatalogStatus>) -> (Self, StatusRefresher) {
+        let mut settings = StatusSettings::default();
+        settings.enabled.push(Component::Catalogue);
+        let status = Arc::new(CachedStatusRegistry::new(settings, Arc::new(SystemClock)));
+        let refresher = StatusRefresher::new(
+            Arc::clone(&status),
+            vec![Arc::new(CatalogProbe::new(Arc::clone(&catalogue)))],
+        );
+        (
+            Self {
+                status,
+                revision: None,
+                catalogue: Some(catalogue),
+            },
+            refresher,
+        )
     }
 }
 
@@ -819,6 +878,7 @@ impl AppState {
             lifecycle: Arc::new(Lifecycle::new()),
             status: observability.status,
             revision: observability.revision,
+            catalogue: observability.catalogue,
             config: ArcSwap::from_pointee(snapshot),
         })))
     }
@@ -836,6 +896,18 @@ impl AppState {
     /// This replica's convergence report, when it converges at all.
     pub fn revision_report(&self) -> Option<RevisionReport> {
         self.0.revision.as_ref().map(|status| status.report())
+    }
+
+    /// What the catalogue import last reported, when this deployment imports.
+    ///
+    /// `None` covers both "imports nothing" and "has not finished its first
+    /// attempt", which are the same thing to a caller: there is nothing to say
+    /// about a catalogue yet.
+    pub fn catalogue_report(&self) -> Option<CatalogReport> {
+        self.0
+            .catalogue
+            .as_ref()
+            .and_then(|catalogue| catalogue.report())
     }
 
     /// The config snapshot a request runs against. Taken once per request and
@@ -938,6 +1010,37 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 env = "AXOND_KEY"
 namespace = "platform"
 "#;
+
+    /// The production observation plan, not only the status route's projection,
+    /// must mark an enabled importer as configured. Otherwise the component
+    /// would remain `disabled` forever even though the background task is
+    /// running and the catalogue report is available to operators.
+    #[test]
+    fn catalogue_imports_enable_the_catalogue_status_component() {
+        let plan = ReplicaObservability::plan_with_catalogue(
+            None,
+            &crate::budget::NoBudget,
+            &crate::rate_limit::NoLimit,
+            &crate::revocation::NoDenylist,
+            Some(Arc::new(CatalogStatus::new())),
+        );
+
+        assert_eq!(plan.components(), &[Component::Catalogue]);
+        let (observability, refresher) = ReplicaObservability::observing(plan);
+        assert!(refresher.is_some());
+        let catalogue = observability
+            .status
+            .view()
+            .components
+            .into_iter()
+            .find(|observed| observed.component == Component::Catalogue)
+            .expect("the catalogue component is in every status view");
+        assert_eq!(
+            catalogue.state,
+            crate::status::ComponentState::Unavailable,
+            "enabled-but-not-yet-observed is not disabled"
+        );
+    }
 
     /// Availability is projected onto a snapshot, not compiled into it: a built
     /// snapshot knows nothing, and attaching an index leaves every config section

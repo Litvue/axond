@@ -265,6 +265,12 @@ Ingestion must stay inert:
 `the_source_is_background_only_and_declares_incremental_refresh`, and
 `an_unreachable_source_is_retryable_and_never_a_boot_failure` — upstream
 catalogue data must never become an entitlement or an admission dependency. The
+source a deployment reads must also be the source it approved:
+`a_catalogue_source_url_must_be_https`,
+`a_catalogue_source_url_must_have_a_host_without_credentials`, and
+`a_redirected_source_is_refused_rather_than_followed` — metadata an operator
+prices and enables against may not arrive over a transport that can be
+substituted, nor from wherever an answer redirected the import. The
 durable side of the same rule: `an_observed_catalogue_rate_is_not_an_approved_price`,
 `an_enablement_is_pinned_to_a_snapshot_the_revision_declares`,
 `an_alias_resolves_in_order_within_its_own_reach_and_one_wire_family`,

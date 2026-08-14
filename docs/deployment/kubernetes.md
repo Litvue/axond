@@ -348,9 +348,11 @@ projected-volume symlink swap to be observed without a process restart. A bad
 candidate is rejected while the previous snapshot keeps serving.
 
 Not every setting is live-reloadable. Changes to `[server]`, `[[usage_sink]]`,
-or `[budget]` require a rollout restart. Environment-backed secrets also require
-replacement Pods because a running process cannot acquire new environment
-values:
+`[budget]`, or `[catalog]` require a rollout restart. Catalogue edits are
+validated and reported, but the existing importer remains on its boot-time
+source, store, and schedule until the Pod is replaced. Environment-backed
+secrets also require replacement Pods because a running process cannot acquire
+new environment values:
 
 ```bash
 kubectl -n axond rollout restart deployment/axond

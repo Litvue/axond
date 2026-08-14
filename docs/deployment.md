@@ -165,9 +165,11 @@ new snapshot. Invalid candidates leave the old snapshot serving. File-backed
 key material can be replaced and re-read; new process environment variables
 require a replacement process/container.
 
-`[server]`, `[[usage_sink]]`, and `[budget]` changes require restart. Follow the
-[minted-token guide](./minted-token-guide.md) for signer and revocation
-operations.
+`[server]`, `[[usage_sink]]`, `[budget]`, and `[catalog]` changes require
+restart. A catalogue edit is validated on reload and called out in the applied
+reload log, but the running importer and the serving snapshot retain their
+boot-time settings until restart. Follow the [minted-token
+guide](./minted-token-guide.md) for signer and revocation operations.
 
 ## Sizing and stateful opt-ins
 

@@ -1966,7 +1966,7 @@ impl CatalogChange {
 }
 
 /// How many changes of each class a diff holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct CatalogDiffCounts {
     pub providers_added: usize,
     pub providers_removed: usize,
@@ -2353,6 +2353,10 @@ pub struct LastKnownGoodCatalog {
     active: Option<CatalogSnapshot>,
     consecutive_refusals: u32,
     last_refusal: Option<Refusal>,
+    /// Counts from the most recent content-changing import. Kept separately
+    /// from the active snapshot because a refusal does not erase the last
+    /// successful import's classification.
+    last_diff: Option<CatalogDiffCounts>,
 }
 
 impl LastKnownGoodCatalog {
@@ -2361,6 +2365,7 @@ impl LastKnownGoodCatalog {
             active: None,
             consecutive_refusals: 0,
             last_refusal: None,
+            last_diff: None,
         }
     }
 
@@ -2387,6 +2392,7 @@ impl LastKnownGoodCatalog {
             active,
             consecutive_refusals,
             last_refusal,
+            last_diff: None,
         }
     }
 
@@ -2465,6 +2471,9 @@ impl LastKnownGoodCatalog {
                 diff: snapshot.content.diff(&active.content),
             },
         };
+        if let Admission::Updated { diff, .. } = &admission {
+            self.last_diff = Some(diff.counts());
+        }
         self.active = Some(snapshot);
         self.consecutive_refusals = 0;
         self.last_refusal = None;
@@ -2648,6 +2657,7 @@ impl LastKnownGoodCatalog {
             }),
             consecutive_refusals: self.consecutive_refusals,
             last_refusal: self.last_refusal.as_ref().map(Refusal::reason),
+            last_diff: self.last_diff,
         }
     }
 }
@@ -2686,6 +2696,10 @@ pub struct CatalogReport {
     pub active: Option<ActiveCatalog>,
     pub consecutive_refusals: u32,
     pub last_refusal: Option<RefusalReason>,
+    /// The bounded semantic counts from the most recent content-changing
+    /// import. A refusal leaves this intact because the last-known-good
+    /// catalogue and its last successful classification remain active.
+    pub last_diff: Option<CatalogDiffCounts>,
 }
 
 impl CatalogReport {
@@ -3090,6 +3104,23 @@ mod tests {
         };
         assert_eq!(id, content_id);
         assert!(diff.has_price_changes());
+        assert_eq!(
+            catalogue
+                .report(SystemTime::UNIX_EPOCH)
+                .last_diff
+                .expect("the report keeps bounded diff counts")
+                .prices_changed,
+            1
+        );
+        catalogue.record_refusal(Refusal::new(RefusalReason::Unreachable));
+        assert_eq!(
+            catalogue
+                .report(SystemTime::UNIX_EPOCH)
+                .last_diff
+                .expect("a refusal keeps the last successful classification")
+                .prices_changed,
+            1
+        );
         assert_eq!(
             catalogue.content().map(CatalogContent::content_id),
             Some(content_id),

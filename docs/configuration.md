@@ -672,9 +672,17 @@ restart. `[[namespace]]` changes are reloadable and appear in the reported
 namespace delta, but the namespace count used for in-memory budget retention
 floors is captured at boot and does not resize until restart. `[server] bind`,
 `[transport]`, `[admission]`, `[[usage_sink]]`, `[usage_journal]`, `[budget]`,
-`[rate_limit]`, and
-`[revocation]` changes warn and are ignored until restart; this includes
-`limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
+`[rate_limit]`, `[revocation]`, and `[catalog]` changes warn and are ignored
+until restart;
+this includes `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
+The catalogue candidate is still fully validated, but the running snapshot
+keeps the boot-time `[catalog]` settings so it cannot claim that a new source,
+store, or refresh schedule is active when the importer task is still using the
+old one. Restart after changing `[catalog]`; the applied reload log includes
+`catalog_changed = true` and a restart warning.
+The same log entry sets `restart_required = true` for catalogue and other
+boot-owned changes; `changed` only reports live serving state applied by the
+reload.
 
 ## `[[usage_sink]]` — Tier 0 by default; Tier 2 for `postgres`
 
@@ -944,6 +952,60 @@ With `allow`, that same window admits all revoked JTIs. Invoke-cap exhaustion
 also applies the policy store-wide.
 The separate request-wait and liveness budgets keep ordinary slowness from
 triggering that generation-wide recovery path.
+
+## `[catalog]` — imported model metadata (opt-in, Tier 2 when retained)
+
+Omit this section for the default: nothing is imported, no HTTP client is built,
+and no connection is opened. Enabled, a background task imports the
+[models.dev](https://models.dev) catalogue, retains each accepted snapshot with
+its provenance, and keeps a last-known-good active
+([ADR 0043](./adr/0043-catalogue-source-imports.md),
+[ADR 0051](./adr/0051-durable-catalogue-snapshots-and-refresh-orchestration.md)).
+
+Imports are observational metadata only: they never activate a model, change a
+tenant's enablements, or settle a price. Nothing on the inference path reads the
+source or the store — a request cannot cause a fetch, and a fetch cannot delay a
+request.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `source` | `none` \| `models-dev` \| `seed` | `none` | Selects no import, models.dev over HTTPS, or the bundled offline excerpt. |
+| `source_url` | string | `https://models.dev/catalog.json` | The document a `models-dev` import fetches; must be a hosted `https://` URL without embedded credentials, is validated at boot against the adapter, and is rejected for other sources. |
+| `store` | `in-memory` \| `postgres` | `in-memory` | Where accepted snapshots are retained. `in-memory` is a development store and is refused in stateful mode, which loses every snapshot and its provenance on restart. |
+| `dsn_env` | string | — | Name of the env var holding the Postgres connection string. Inherits `[control_plane] dsn_env` when omitted. The value never appears in config or in a log line. |
+| `schema` | string | — | Schema qualifying the catalogue tables, validated as an identifier. |
+| `create_table` | bool | `true` | Apply the shipped versioned catalogue DDL at boot. |
+| `refresh_interval_seconds` | integer | `21600` | Scheduled cadence. Must be nonzero. |
+| `refresh_timeout_seconds` | integer | `60` | One bound covering the fetch and the retention of a single import. Must be nonzero. |
+| `retry_initial_seconds` | integer | `60` | First delay after a refused import; doubles per consecutive refusal. Must be nonzero. |
+| `retry_max_seconds` | integer | `3600` | Backoff ceiling. Must be nonzero and at least `retry_initial_seconds`. |
+| `bootstrap` | `empty` \| `seed` | `empty` | What an empty store starts from. `seed` admits the bundled excerpt so an offline deployment has a catalogue before its first successful fetch. |
+| `max_payload_bytes` | integer | `67108864` | Maximum upstream document accepted; a larger body is refused without being read whole. Must be nonzero. |
+| `connect_timeout_ms` | integer | `10000` | Bounded Postgres connection setup. Must be nonzero. |
+| `operation_timeout_ms` | integer | `30000` | Bounded Postgres statement timeout. Must be nonzero. |
+
+An HTTPS mirror is a supported `source_url`; a plaintext, hostless, or credential-
+carrying one is refused at boot. Hosts are deliberately not allowlisted: an
+operator-controlled HTTPS mirror may be deployment-local or air-gapped. The URL
+must still name the exact supported `/catalog.json` document.
+Imported metadata is what an operator later reads to approve a price or enable a
+model, so a document anyone on the path could substitute is not a source this
+gateway will trust. Redirects are not followed either: the configured URL is the
+provenance every snapshot records, so a `3xx` is a bounded refusal naming its
+status rather than an import of whatever the answer pointed at.
+
+Refreshes are conditional: the stored ETag and `Last-Modified` are sent back, and
+a `304` confirms the active snapshot's freshness without producing new content.
+Identical normalized content is idempotent — reformatted or reordered upstream
+bytes admit as unchanged rather than as a new revision.
+
+A malformed, oversized, schema-drifting, or unreachable import is *refused*: the
+active snapshot keeps serving, the refusal is counted, and the next attempt is
+delayed by the backoff. Freshness, the active content digest, and the bounded
+refusal reason are readable by an operator on
+[`/status`](./observability.md); the response carries no URL, payload, upstream
+error text, or tenant-specific data, and a tenant-scoped caller sees no
+catalogue at all.
 
 ## Telemetry
 

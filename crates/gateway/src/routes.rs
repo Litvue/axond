@@ -653,7 +653,16 @@ async fn replica_status(
     ));
     let view = state.status().view();
     let revision = state.revision_report();
-    Json(view.project(scope, state.lifecycle().phase(), revision.as_ref()))
+    // Deployment scope only, and a memory read either way: the catalogue summary
+    // is what the background import last published, never a fetch or a query
+    // performed for this request.
+    let catalogue = state.catalogue_report();
+    Json(view.project_with_catalogue(
+        scope,
+        state.lifecycle().phase(),
+        revision.as_ref(),
+        catalogue.as_ref(),
+    ))
 }
 
 /// Replica-local Tier 0 credential status. Presence is expressed by each
@@ -7338,6 +7347,7 @@ max_ttl = "15m"
             status_state(ReplicaObservability {
                 status: observed_registry(),
                 revision: None,
+                catalogue: None,
             }),
             None,
         )
@@ -7353,6 +7363,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let token = scoped_token_for("test-audience", Some(vec!["chat", "models"]));
         let (status, body) = status_response(state, Some(&token)).await;
@@ -7369,6 +7380,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let (status, body) = status_response(state, Some(OPERATOR_KEY)).await;
         assert_eq!(status, StatusCode::OK);
@@ -7390,6 +7402,70 @@ max_ttl = "15m"
         );
     }
 
+    /// Catalogue freshness is observable where an operator already looks, from
+    /// what the background import last published: the read is a memory read, no
+    /// upstream is contacted for it, and a tenant-scoped caller learns nothing
+    /// about the deployment's metadata source (#146).
+    #[tokio::test]
+    async fn status_reports_catalogue_freshness_to_the_operator_only() {
+        let handle = crate::backends::catalog_runtime::start(
+            &crate::config::CatalogConfig {
+                source: crate::config::CatalogSourceBackend::Seed,
+                store: crate::config::CatalogStoreBackend::InMemory,
+                bootstrap: crate::config::CatalogBootstrap::Seed,
+                ..crate::config::CatalogConfig::default()
+            },
+            None,
+            &HashMap::new(),
+            std::future::pending(),
+        )
+        .await
+        .expect("an offline catalogue starts")
+        .expect("an enabled catalogue yields a handle");
+        let (observability, refresher) =
+            ReplicaObservability::stateless_with_catalogue(Arc::clone(handle.status()));
+        refresher.refresh_once().await;
+        let state = status_state(observability);
+
+        let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        let catalogue = &body["catalogue"];
+        assert!(
+            catalogue.is_object(),
+            "the operator sees the catalogue: {body}"
+        );
+        assert_eq!(catalogue["consecutive_refusals"], 0);
+        assert_eq!(catalogue["persistent_refusal"], false);
+        assert!(
+            catalogue["active_age_ms"].is_number(),
+            "freshness is what an operator acts on: {body}"
+        );
+        assert!(
+            catalogue["content_id"].is_string(),
+            "the operator learns which content is active: {body}"
+        );
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("models.dev"),
+            "the summary names no upstream URL: {rendered}"
+        );
+        let catalogue_component = body["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .find(|entry| entry["component"] == "catalogue")
+            .expect("catalogue component");
+        assert_eq!(catalogue_component["state"], "ok", "{body}");
+
+        let (status, body) = status_response(state, Some(TENANT_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope"], "namespace");
+        assert!(
+            body.get("catalogue").is_none_or(Value::is_null),
+            "a tenant learns nothing about the deployment's catalogue: {body}"
+        );
+    }
+
     /// A tenant sees its own request path, with the operator's internals removed
     /// and the reasons behind them coarsened: it learns *that* a dependency is
     /// impaired, not that the operator's control-plane credential was rejected.
@@ -7398,6 +7474,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let (status, body) = status_response(state, Some(TENANT_KEY)).await;
         assert_eq!(status, StatusCode::OK);
@@ -7427,6 +7504,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let token = scoped_token_for("test-audience", Some(vec!["status"]));
         let (status, body) = status_response(state, Some(&token)).await;
@@ -7448,6 +7526,7 @@ max_ttl = "15m"
                 ReplicaObservability {
                     status: observed_registry(),
                     revision: None,
+                    catalogue: None,
                 },
                 Box::new(FakeRevocation {
                     mode: FakeRevocationMode::Unavailable,
@@ -7475,6 +7554,7 @@ max_ttl = "15m"
             let state = status_state(ReplicaObservability {
                 status: observed_registry(),
                 revision: Some(lagging_replica().1),
+                catalogue: None,
             });
             let (status, body) = status_response(state, Some(credential)).await;
             assert_eq!(status, StatusCode::OK);
@@ -7508,6 +7588,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let (_, body) = status_response(state, Some(OPERATOR_KEY)).await;
         let states: Vec<&str> = ComponentState::ALL
@@ -7645,6 +7726,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let lifecycle = Arc::clone(state.lifecycle());
         lifecycle.close();
@@ -7679,6 +7761,7 @@ max_ttl = "15m"
         let state = saturable_status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let admission = &state.0.admission;
 
@@ -7727,6 +7810,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let held: Vec<_> = (0..crate::admission::MAX_IN_FLIGHT_DIAGNOSTICS)
             .map(|_| {
@@ -7766,6 +7850,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let mut held = Vec::new();
         for (credential, capacity) in [
@@ -7838,6 +7923,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let flood: Vec<_> = (0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS)
             .map(|_| {
@@ -7915,6 +8001,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         // One request per permit in the in-memory share, answered in sequence:
         // if the permit outlived authentication these would exhaust it, since
@@ -7948,6 +8035,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let app = router(state).merge(crate::admin::router::refusing_router());
         let answer = |path: String| {
@@ -7999,6 +8087,7 @@ max_ttl = "15m"
             let state = status_state(ReplicaObservability {
                 status: observed_registry(),
                 revision: None,
+                catalogue: None,
             });
             let app = router(state).merge(surface);
             // With a credential and without one alike: a wrong method is a
@@ -8058,6 +8147,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: None,
+            catalogue: None,
         });
         let app = unconverged_router("no snapshot yet").merge(diagnostic_router(state));
         let answer = |path: &'static str| {
@@ -8101,6 +8191,7 @@ max_ttl = "15m"
             .merge(diagnostic_router(status_state(ReplicaObservability {
                 status: observed_registry(),
                 revision: None,
+                catalogue: None,
             })))
             .merge(stateful_admin_surface());
         let response = stateful
@@ -8126,6 +8217,7 @@ max_ttl = "15m"
             .merge(diagnostic_router(status_state(ReplicaObservability {
                 status: observed_registry(),
                 revision: None,
+                catalogue: None,
             })))
             .oneshot(
                 Request::get("/admin/v1/status")
@@ -8149,6 +8241,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: Arc::clone(&registry),
             revision: None,
+            catalogue: None,
         });
         for _ in 0..5 {
             let (status, _) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
@@ -8245,11 +8338,13 @@ max_ttl = "15m"
         let converged = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: Some(converged_replica()),
+            catalogue: None,
         });
         let (_clock, lagging_status) = lagging_replica();
         let lagging = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: Some(lagging_status),
+            catalogue: None,
         });
 
         let (status, healthy) = status_response(converged, Some(OPERATOR_KEY)).await;
@@ -8282,6 +8377,7 @@ max_ttl = "15m"
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
             revision: Some(lagging_status),
+            catalogue: None,
         });
         let (status, body) = status_response(state, Some(TENANT_KEY)).await;
         assert_eq!(status, StatusCode::OK);

@@ -52,6 +52,7 @@ pub mod catalog;
 pub mod catalog_pins;
 pub mod catalog_projection;
 pub mod catalog_refresh;
+pub mod catalog_runtime;
 pub mod catalog_store;
 pub mod control_plane;
 pub mod health;
