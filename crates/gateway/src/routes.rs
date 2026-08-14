@@ -71,6 +71,9 @@ use crate::usage::identity::EventIdentity;
 use crate::usage::{Status, UsageRecord};
 
 pub fn router(state: AppState) -> Router {
+    if state.config().config.mode == crate::config::Mode::Stateful && state.0.revision.is_none() {
+        return unconverged_router("no projected serving snapshot").merge(diagnostic_router(state));
+    }
     let minting_enabled = state.config().gateway_minting.is_some();
     mount(route_specs(minting_enabled), state)
 }

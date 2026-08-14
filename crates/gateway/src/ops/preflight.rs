@@ -37,6 +37,7 @@ use crate::backends::control_plane::schema::{self, SchemaStatus};
 use crate::config::{
     BudgetBackend, Config, Mode, RateLimitBackend, RevocationBackend, UsageSinkKind,
 };
+use crate::convergence::LastKnownGood;
 
 /// One check's outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,8 +178,13 @@ fn check_serving_posture(report: &mut Report, config: &Config) {
         ),
         (Some(path), Some(key_env)) if !path.trim().is_empty() && !key_env.trim().is_empty()
     );
-    let partial_cache =
-        config.convergence.cache_path.is_some() || config.convergence.cache_key_env.is_some();
+    let partial_cache = [
+        config.convergence.cache_path.as_deref(),
+        config.convergence.cache_key_env.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty());
     if partial_cache && !complete_cache {
         report.failed(
             "serving",
@@ -332,7 +338,7 @@ fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, 
     if let Some(name) = non_empty(config.convergence.cache_key_env.as_deref()) {
         references.push((
             "[convergence] cache_key_env".to_owned(),
-            Reference::Env(name.to_owned()),
+            Reference::CacheKey(name.to_owned()),
         ));
     }
     for (index, breakglass) in config.admin_breakglass.iter().enumerate() {
@@ -491,6 +497,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// A secret's location: the name of an environment variable, or a path.
 enum Reference {
     Env(String),
+    CacheKey(String),
     File(String),
 }
 
@@ -509,6 +516,15 @@ impl Reference {
                     None => Some(format!("`{name}` is unset")),
                 }
             }
+            Self::CacheKey(name) => match env.get(name) {
+                Some(value) if !value.trim().is_empty() => {
+                    LastKnownGood::from_base64("preflight", value)
+                        .err()
+                        .map(|error| format!("`{name}` is invalid: {error}"))
+                }
+                Some(_) => Some(format!("`{name}` is set but empty")),
+                None => Some(format!("`{name}` is unset")),
+            },
             Self::File(path) => match std::fs::metadata(path) {
                 Ok(metadata) if metadata.is_file() => None,
                 Ok(_) => Some(format!("`{path}` is not a file")),
@@ -589,6 +605,7 @@ mod tests {
     use super::*;
     use crate::desired_state::Checksum;
     use crate::ops::tests::{stateful_toml, stateless_toml};
+    use base64::Engine;
 
     /// Fixtures use the temp directory directly, the way the rest of this crate's
     /// file-backed tests do: no dev-dependency is added for a config file.
@@ -832,14 +849,30 @@ mod tests {
             .find(|check| check.name == "bootstrap references")
             .expect("references are checked");
         assert!(
-            matches!(references.outcome, Outcome::Passed(_)),
+            matches!(references.outcome, Outcome::Failed(_)),
             "{references}"
         );
         let rendered = report.to_string();
         assert!(rendered.contains("bootstrap references"), "{rendered}");
+        assert!(rendered.contains("GW_LAST_KNOWN_GOOD_KEY"), "{rendered}");
         assert!(
             !rendered.contains("cache-signing-material-that-must-not-render"),
             "preflight names references, never their values: {rendered}"
+        );
+
+        env.insert(
+            "GW_LAST_KNOWN_GOOD_KEY".to_owned(),
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        );
+        let report = run(&config, &path, &env).await;
+        let references = report
+            .checks
+            .iter()
+            .find(|check| check.name == "bootstrap references")
+            .expect("references are checked");
+        assert!(
+            matches!(references.outcome, Outcome::Passed(_)),
+            "{references}"
         );
 
         env.remove("GW_LAST_KNOWN_GOOD_KEY");
