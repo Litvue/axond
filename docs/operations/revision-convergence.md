@@ -458,9 +458,10 @@ an unrelated publication silently redirect unnamed traffic. A bootstrap that
 declares no default namespace is therefore refused with reason `projection`, and
 the message says so. Since `[[namespace]]` is a control-plane-owned section that a
 stateful file may not declare, that is the shape a stateful bootstrap has today:
-**stateful serving stays gated until the runtime slice that selects a default from
-desired state lands.** Nothing in `serve` constructs this projection yet, so the
-refusal is a design boundary rather than an outage.
+**stateful serving stays gated until the runtime slice that projects inbound
+caller principals from desired state lands.** Nothing in `serve` constructs that
+principal projection yet, so the typed `unsupported` refusal is a design
+boundary rather than an authentication fallback or an outage.
 
 A stateless deployment is unaffected by all of this. Tenants and projects are
 published, never declared in `axond.toml`, and a stateless config's namespace ids
@@ -707,9 +708,12 @@ What to know about it operationally:
   the mixed-version case above). Both leave storage intact and neither is repaired
   by a replica refusing to start — a replica added mid-rollout that would not boot
   withdraws capacity exactly when a rollback needs it added. Corruption, a revision
-  past this build's bounds, and a revision that exists but does not compile are all
-  fatal at boot: booting an older cached revision instead would hide damage, or
-  silently serve state an operator already replaced.
+  past this build's bounds, and a revision that exists but does not compile remain
+  rejected rather than being restored from cache: booting an older cached revision
+  instead would hide damage, or silently serve state an operator already replaced.
+  The initial bootstrap attempt returns a typed refusal, while the post-listener
+  convergence task remains alive and retries the control plane with bounded
+  backoff; it never turns the invalid candidate into a cache or empty snapshot.
 
   A replica that boots this way reports `source = last-known-good` and keeps
   reporting `incompatible` for the revision it will not read, so the mixed-version

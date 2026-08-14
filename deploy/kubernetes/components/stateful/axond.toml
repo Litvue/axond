@@ -7,8 +7,11 @@
 #
 # The four references below are supplied by the `axond-secrets` Secret the
 # container takes with `envFrom`: GW_CONTROL_PLANE_DSN, GW_SECRET_STORE_KEK,
-# GW_ADMIN_BREAKGLASS, and GW_LAST_KNOWN_GOOD_KEY. The base's published placeholder Secret carries none of
-# them, which is deliberate — a stateful deployment supplies its own.
+# GW_ADMIN_BREAKGLASS, and GW_LAST_KNOWN_GOOD_KEY. Provision that Secret before
+# applying this ConfigMap, especially on an existing fleet: the cache key is a
+# boot dependency once `[convergence]` is shipped. The base's published
+# placeholder Secret carries none of them, which is deliberate — a stateful
+# deployment supplies its own.
 
 mode = "stateful"
 

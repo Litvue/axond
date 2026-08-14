@@ -311,11 +311,15 @@ never sees the Job: `ops/pin-image-digest.sh` resolves the sentinel in
 `overlays/production-stateful/kustomization.yaml` alongside the production one,
 and its `--check` refuses either while unresolved. The mounted
 `axond.toml` declares `mode = "stateful"`, the control-plane DSN, the SecretStore
-KEK, and a break-glass principal, and declares no providers, models, aliases, or
-tenants: in this mode the control plane owns them, and a bootstrap that also
-declares them fails to boot. Supply `GW_CONTROL_PLANE_DSN`,
-`GW_SECRET_STORE_KEK`, `GW_ADMIN_BREAKGLASS`, and `GW_LAST_KNOWN_GOOD_KEY` in the
-`axond-secrets` Secret,
+KEK, a break-glass principal, and the last-known-good cache references, and
+declares no providers, models, aliases, or tenants: in this mode the control
+plane owns them, and a bootstrap that also declares them fails to boot. Apply
+the `axond-secrets` Secret first — including
+`GW_CONTROL_PLANE_DSN`, `GW_SECRET_STORE_KEK`, `GW_ADMIN_BREAKGLASS`, and
+`GW_LAST_KNOWN_GOOD_KEY` — then apply the ConfigMap/overlay. Existing fleets
+must follow that order during rollout or the new cache reference can make Pods
+crash-loop before the signing key is present. The key authenticates the cache
+and is never put in the ConfigMap or diagnostics.
 and see [Stateful backends](./stateful-backends.md) for choosing the stores and
 [backup and recovery](../operations/backup-and-recovery.md) for what has to be
 recoverable before the fleet holds anything.

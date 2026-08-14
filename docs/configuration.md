@@ -190,6 +190,11 @@ A valid cache permits cold boot during a control-plane outage. Missing, invalid,
 tampered, or keyless projected state remains fail-closed; the cache is not a
 fallback for a candidate that fails validation or secret resolution.
 
+The current desired-state projection does not yet supply inbound caller
+principals, so stateful candidates report a typed `unsupported` refusal and the
+replica remains not Ready until that projection lands. Configuring the cache
+does not weaken that gate or create a keyless serving path.
+
 #### `[[admin_breakglass]]`
 
 Exactly one is required in stateful mode. Human `/admin/v1` identity is OIDC;
