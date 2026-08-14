@@ -603,10 +603,12 @@ outcomes need different responses:
   [resource body schemas](./revision-convergence.md#resource-body-schemas).
   A legacy typed alias that is enabled while naming a disabled enablement is a
   separate compatibility accommodation: hydration, catalogue reads, and
-  rollback preserve that historical state, while a newly authored candidate
-  refuses it. It is not corruption and does not make the retained revision
-  incompatible. Repair it by retiring or retargeting the alias before the next
-  entitlement publication. When restack removes the final target, the disabled
+  rollback preserve that historical state. A newly authored or modified alias
+  refuses it, while a one-resource repair may carry other unchanged legacy
+  aliases from its base; store-side publication applies the same base-aware
+  validation. It is not corruption and does not make the retained revision
+  incompatible. Repair it by retiring or retargeting the alias being changed
+  before the next entitlement publication. When restack removes the final target, the disabled
   alias version is stored in the same complete revision and appears in its
   resource diff; the single mutation audit event records the publication intent,
   and the revision/diff records the incidental alias retirement explicitly.

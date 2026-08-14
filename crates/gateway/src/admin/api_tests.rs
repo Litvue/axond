@@ -843,6 +843,57 @@ async fn republishing_an_already_disabled_enablement_preserves_a_disabled_alias_
 }
 
 #[tokio::test]
+async fn disabling_an_enablement_preserves_targets_of_a_disabled_alias() {
+    let deployment = Deployment::new();
+    let mut head = build(&deployment).await;
+
+    let mut disabled_alias = alias_document();
+    disabled_alias["mutation"] = json!("update");
+    disabled_alias["resource"]["state"] = json!("disabled");
+    head = deployment
+        .publish(
+            "/aliases",
+            "key-alias-disabled-history",
+            &head,
+            &disabled_alias,
+        )
+        .await;
+
+    let mut disable_model = model_document();
+    disable_model["mutation"] = json!("update");
+    disable_model["resource"]["state"] = json!("disabled");
+    head = deployment
+        .publish(
+            "/models",
+            "key-model-disable-history",
+            &head,
+            &disable_model,
+        )
+        .await;
+
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(&head).expect("a revision"))
+        .await
+        .expect("the retirement revision hydrates");
+    let alias = loaded
+        .state()
+        .version_of(
+            crate::desired_state::ResourceKind::Alias,
+            fixtures::resource_id(15),
+        )
+        .expect("the disabled alias is retained");
+    let body = crate::desired_state::ModelAliasBody::read(alias).expect("an alias body");
+    assert!(!body.is_enabled());
+    assert_eq!(
+        body.targets().len(),
+        1,
+        "disabled alias history is retained"
+    );
+    assert_eq!(body.targets()[0].version.get(), 2);
+}
+
+#[tokio::test]
 async fn disabling_an_alias_can_clear_targets_in_one_revision() {
     let deployment = Deployment::new();
     let mut head = build(&deployment).await;

@@ -860,7 +860,7 @@ fn restack(
                 .iter()
                 .filter_map(|target| {
                     if target.enablement == superseded.id && target.version == superseded.version {
-                        if disabling_enablement {
+                        if disabling_enablement && body.is_enabled() {
                             None
                         } else {
                             Some(AliasTarget::new(target.enablement, current.version))

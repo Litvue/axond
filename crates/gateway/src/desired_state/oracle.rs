@@ -206,7 +206,7 @@ impl ControlPlaneStore for InMemoryControlPlane {
         }
         // Validation is domain work and happens before the store commits to
         // anything, so a rejected candidate leaves no trace.
-        let checksum = candidate.validated_checksum()?;
+        let checksum = candidate.validated_checksum_for_publication()?;
 
         let mut storage = self.locked();
 
@@ -333,9 +333,10 @@ mod tests {
     use super::super::canonical::CanonicalValue;
     use super::super::fixtures::{
         DESIRED_STATE_RESOURCES, alias, candidate, legacy_tenant, principal_id, reference,
-        revision_id, state, state_with_renamed_alias, tenant_id,
+        revision_id, state, state_with_models, state_with_renamed_alias, tenant_id,
     };
-    use super::super::mutation::{Actor, ExpectedRevision};
+    use super::super::models::{AliasTarget, ModelAliasBody, ModelEnablementBody, ModelLifecycle};
+    use super::super::mutation::{Actor, ExpectedRevision, MutationKind};
     use super::super::resource::{ResourceBody, ResourceKind};
     use super::super::revision::{BodySkew, ValidationError};
     use super::super::tenancy::TenancyError;
@@ -488,6 +489,55 @@ mod tests {
         let loaded = store.load_revision(first.id).await.unwrap();
         assert_eq!(loaded.manifest(), &first);
         assert_eq!(loaded.state().len(), DESIRED_STATE_RESOURCES);
+    }
+
+    #[tokio::test]
+    async fn store_publication_allows_a_legacy_rollback_shape() {
+        let store = InMemoryControlPlane::new();
+        let mut state = state_with_models();
+        let target = state
+            .version_of(
+                ResourceKind::ModelEnablement,
+                super::super::fixtures::resource_id(31),
+            )
+            .cloned()
+            .expect("the project enablement");
+        let disabled = ModelEnablementBody::read(&target)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled)
+            .version_at(
+                target.slug.clone(),
+                target.reference.version.next(),
+                reference(ResourceKind::CatalogModel, 5),
+            );
+        state
+            .supersede(disabled.clone())
+            .expect("disable the target");
+        let alias = state
+            .version_of(ResourceKind::Alias, super::super::fixtures::resource_id(32))
+            .cloned()
+            .expect("the project alias");
+        let legacy = ModelAliasBody::read(&alias)
+            .expect("an alias body")
+            .retargeted([AliasTarget::new(
+                disabled.reference.id,
+                disabled.reference.version,
+            )])
+            .version_at(alias.slug, alias.reference.version.next());
+        state.supersede(legacy).expect("write the legacy shape");
+
+        let mut rollback = candidate(ExpectedRevision::Empty, "legacy-rollback", state.clone());
+        rollback.mutation.kind = MutationKind::Rollback;
+        rollback.audit.kind = MutationKind::Rollback;
+        let manifest = store
+            .publish_revision(rollback)
+            .await
+            .expect("store-side rollback validation permits legacy history");
+        let loaded = store
+            .load_revision(manifest.id)
+            .await
+            .expect("the rollback revision hydrates");
+        assert_eq!(loaded.state(), &state);
     }
 
     #[tokio::test]

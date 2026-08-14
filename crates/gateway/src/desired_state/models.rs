@@ -1743,17 +1743,18 @@ impl Models {
     /// shape where an enabled alias names a disabled enablement; a new candidate
     /// must use [`Self::of_strict`] through [`DesiredState::validate`].
     pub fn of(state: &DesiredState) -> Result<Self, ModelError> {
-        Self::of_with_mode(state, ModelValidationMode::LegacyRead)
+        Self::of_with_mode(state, ModelValidationMode::LegacyRead, None)
     }
 
     /// Resolve model contracts for a newly authored candidate.
     pub(crate) fn of_strict(state: &DesiredState) -> Result<Self, ModelError> {
-        Self::of_with_mode(state, ModelValidationMode::Strict)
+        Self::of_with_mode(state, ModelValidationMode::Strict, None)
     }
 
     pub(crate) fn of_with_mode(
         state: &DesiredState,
         mode: ModelValidationMode,
+        legacy_base: Option<&DesiredState>,
     ) -> Result<Self, ModelError> {
         let mut models = Self::default();
         for resource in state.resources() {
@@ -1821,7 +1822,9 @@ impl Models {
             let resource = state
                 .get(&alias.reference)
                 .expect("the alias was read from this state");
-            models.check_targets(state, resource, &alias.body, mode)?;
+            let unchanged_legacy_alias =
+                legacy_base.is_some_and(|base| base.get(&alias.reference) == Some(resource));
+            models.check_targets(state, resource, &alias.body, mode, unchanged_legacy_alias)?;
         }
         Ok(models)
     }
@@ -1834,6 +1837,7 @@ impl Models {
         resource: &ResourceVersion,
         body: &ModelAliasBody,
         mode: ModelValidationMode,
+        unchanged_legacy_alias: bool,
     ) -> Result<(), ModelError> {
         if body.is_enabled() && body.targets().is_empty() {
             return Err(ModelError::NoTargets {
@@ -1857,6 +1861,7 @@ impl Models {
                 if mode == ModelValidationMode::Strict
                     && body.is_enabled()
                     && !enabled.body.is_enabled()
+                    && !unchanged_legacy_alias
                 {
                     return Err(ModelError::DisabledTarget {
                         reference: resource.reference,

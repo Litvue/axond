@@ -166,13 +166,16 @@ PR #344 closes the lifecycle gap without making retained history unreadable. A
 legacy published revision may contain an enabled alias targeting an enablement
 that is already disabled; hydration, catalogue reads, and rollback tolerate
 that exact shape so the revision remains readable and reversible. The strict
-candidate/publication path rejects it for newly authored state, and the normal
-repair is to retarget or retire the alias before publishing further entitlement
-changes. Restack removes a target only for a genuine enabled-to-disabled
-transition, not when an already-disabled enablement is republished. When the
-last target disappears during that transition, the alias's disabled version is
-part of the same complete revision and semantic diff, so its retirement remains
-auditable without creating a second mutation event.
+candidate/publication path rejects it for newly authored or modified aliases,
+while a one-resource repair may carry untouched legacy aliases from its base;
+the normal repair is to retarget or retire the alias being changed before
+publishing further entitlement changes. Store-side revalidation carries that
+same base context, and rollback branches on its mutation kind. Restack removes
+a target only for a genuine enabled-to-disabled transition, not when an
+already-disabled enablement is republished. When the last target disappears
+during that transition, the alias's disabled version is part of the same
+complete revision and semantic diff, so its retirement remains auditable without
+creating a second mutation event.
 
 Nothing in this slice is reachable from a request. Routing, `/v1/models`, admin
 handlers, catalogue polling, and persistence continue to work as they did; they

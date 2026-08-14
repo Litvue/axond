@@ -72,8 +72,8 @@ use crate::config::Mode;
 use crate::convergence::RevisionReport;
 use crate::desired_state::{
     AccessDenial, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
-    LoadedRevision, Mutation, MutationId, MutationKind, ResourceScope, RevisionCandidate,
-    RevisionId, Surface, Uuid7Generator, ValidationError,
+    LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
+    Uuid7Generator, ValidationError,
 };
 use crate::status::StatusScope;
 
@@ -684,6 +684,7 @@ impl AdminService {
         let candidate = RevisionCandidate {
             expected,
             state: candidate_state,
+            base: current.as_ref().map(|revision| revision.state().clone()),
             mutation: Mutation {
                 id: mutation,
                 actor: identity.actor(),
@@ -709,11 +710,7 @@ impl AdminService {
         // on, which is "re-read and retry", so staleness outranks invalidity
         // here. A lost-response retry is unaffected: its candidate was valid
         // when it was first built, and is rebuilt from the same base.
-        let checksum = match if request.kind == MutationKind::Rollback {
-            candidate.validated_checksum_legacy_read()
-        } else {
-            candidate.validated_checksum()
-        } {
+        let checksum = match candidate.validated_checksum_for_publication() {
             Ok(checksum) => checksum,
             Err(error) if !expected.matches(head) => {
                 debug!(

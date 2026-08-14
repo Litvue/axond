@@ -415,8 +415,10 @@ one without older replicas reporting damage.
 There is one lifecycle compatibility exception for typed model bodies. Older
 writers could leave an enabled alias pointing at a disabled enablement. The
 reader tolerates that exact legacy shape during hydration, catalogue projection,
-and rollback so retained revisions remain readable; `DesiredState` candidate
-validation rejects it for newly authored publication. A repair publishes a
+and rollback so retained revisions remain readable. `DesiredState` candidate
+validation rejects it for a newly authored or modified alias, while a
+one-resource repair can carry other unchanged legacy aliases from its base;
+store-side publication reuses that base context. A repair publishes a
 disabled/cleared alias or retargets it to an enabled target. Restack strips a
 target only on an actual enabled-to-disabled transition, and when that removes
 the last target the alias's disabled resource version is carried in the same

@@ -998,6 +998,7 @@ pub(crate) fn candidate(
     RevisionCandidate {
         expected,
         state,
+        base: None,
         mutation: Mutation {
             id: mutation,
             actor: actor(),
