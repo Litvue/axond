@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.38](https://github.com/Litvue/axond/compare/v0.3.37...v0.3.38) (2026-08-14)
+
+
+### Features
+
+* **catalog:** import and version models.dev catalogues in a running deployment ([#311](https://github.com/Litvue/axond/issues/311)) ([061ecf9](https://github.com/Litvue/axond/commit/061ecf941066d1f61a1b187655d5bab784c84d90))
+* **pricing:** charge requests at the approved price book ([#318](https://github.com/Litvue/axond/issues/318)) ([b7dd7a7](https://github.com/Litvue/axond/commit/b7dd7a7e519dd77ed6df85ba841e5d1e0bf97eb8))
+* **secrets:** administer the credential lifecycle without a redeploy ([#312](https://github.com/Litvue/axond/issues/312)) ([a90ba37](https://github.com/Litvue/axond/commit/a90ba377573ff511c32330163f336cacfbd07c84))
+
+
+### Documentation
+
+* **integration:** correct the wave-1 roster and contract-dependency scope ([#323](https://github.com/Litvue/axond/issues/323)) ([32844a9](https://github.com/Litvue/axond/commit/32844a9a83837f044da1aa30e403258d9b3a7cd9))
+
+
+### Tests
+
+* **qualification:** soak the mixed workload against a stateful fleet ([#303](https://github.com/Litvue/axond/issues/303)) ([fc1e66d](https://github.com/Litvue/axond/commit/fc1e66d453d958910918e359541f2ae9fde2cccb))
+* **security:** fuzz the models.dev catalogue import and normalization ([#222](https://github.com/Litvue/axond/issues/222)) ([#266](https://github.com/Litvue/axond/issues/266)) ([aacb003](https://github.com/Litvue/axond/commit/aacb003c0939f6b484c7f37998593350da228051))
+* **security:** sweep the /admin/v1 surface for secret material ([#223](https://github.com/Litvue/axond/issues/223)) ([#314](https://github.com/Litvue/axond/issues/314)) ([3e3a13b](https://github.com/Litvue/axond/commit/3e3a13b8068f28953167f3145d38b5376e809eb9))
+
 ## [0.3.37](https://github.com/Litvue/axond/compare/v0.3.36...v0.3.37) (2026-08-13)
 
 
