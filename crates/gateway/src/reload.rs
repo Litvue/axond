@@ -42,6 +42,8 @@ pub enum ReloadError {
     Config(#[from] ConfigError),
     #[error("config resolution failed: {0}")]
     Snapshot(#[from] SnapshotError),
+    #[error("stateful config reload is refused; publish a new revision or restart the replica")]
+    StatefulUnsupported,
 }
 
 /// What the process committed to at startup and cannot redo while serving, so a
@@ -165,6 +167,26 @@ impl Reloader {
         let span = telemetry::config_reload_span(trigger);
         let _entered = span.enter();
         let current = self.state.config();
+
+        // A file reload has no reconciler compiler and therefore cannot turn
+        // stateful bootstrap TOML into the projected snapshot that is serving.
+        // Refusing the operation is safer than publishing a keyless bootstrap
+        // candidate over a valid last-known-good revision.
+        if self.boot.mode == Mode::Stateful {
+            telemetry::finish_config_reload(
+                &span,
+                trigger,
+                telemetry::RELOAD_REJECTED,
+                current.generation,
+            );
+            tracing::warn!(
+                trigger,
+                path = %self.path,
+                generation = current.generation,
+                "stateful config reload refused; the reconciler owns serving snapshots"
+            );
+            return Err(ReloadError::StatefulUnsupported);
+        }
 
         match self.candidate(env, &current, current.generation + 1) {
             Ok(candidate) => {
@@ -2016,6 +2038,54 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
             after.gateway_token_epoch("acme-web", "someone"),
             Some(1_700_000_000),
             "a reload un-revoked tokens the published floor was revoking"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stateful_file_reload_cannot_replace_a_projected_snapshot() {
+        let file = ConfigFile::new(
+            r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+"#,
+        );
+        let state = state_from(&file);
+        let before = state.config();
+        let reloader = Reloader::new(file.path(), state.clone());
+
+        file.rewrite(
+            r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+
+[convergence]
+cache_path = "/tmp/edited-keyless-bootstrap"
+cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"
+"#,
+        );
+        let error = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &HashMap::new())
+            .expect_err("stateful file reload is not reconciler-aware");
+        assert!(matches!(error, ReloadError::StatefulUnsupported));
+        assert!(
+            Arc::ptr_eq(&before, &state.config()),
+            "a SIGHUP cannot replace the reconciler-owned snapshot"
         );
     }
 

@@ -5757,6 +5757,14 @@ dsn_env = "AXOND_REDIS_URL"
             config.namespace.is_empty(),
             "the control plane owns tenants"
         );
+        assert_eq!(
+            config.convergence.cache_path.as_deref(),
+            Some("/var/lib/axond/last-known-good.snapshot")
+        );
+        assert_eq!(
+            config.convergence.cache_key_env.as_deref(),
+            Some("GW_LAST_KNOWN_GOOD_KEY")
+        );
     }
 
     /// Documentation drift gate: every key the shipped stateful example uses is

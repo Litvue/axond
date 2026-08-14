@@ -3,13 +3,12 @@
 Stateful mode
 ([#160](https://github.com/Litvue/axond/issues/160)) is being built as a set of
 *contract* slices — durable schemas, typed documents, protocol boundaries — each
-landing on its own. None of them makes a replica *serve inference* statefully:
-a stateful replica boots and serves `/admin/v1`, and refuses inference until a
-published revision compiles into a runtime snapshot. That last step
-is **integration**: the wiring that connects a bootstrap file to a control plane,
-a control plane to a compiled snapshot, and a snapshot to the request path, plus
-the evidence that each of #160's release gates actually holds on the assembled
-system.
+landing on its own. The integration seam connects a bootstrap file to a control
+plane, a control plane to a compiled immutable snapshot, and that snapshot to
+the request path, plus the evidence that each of #160's release gates holds on
+the assembled system. A cold or unconverged replica remains fail-closed; a
+valid projected snapshot or signed last-known-good cache is the only serving
+posture.
 
 This page is the integration plan and its acceptance matrix. It exists so that
 "is stateful mode ready?" has a single answer with a reference behind each line,
@@ -92,8 +91,8 @@ integration owns, what it depends on, and the harness scenario that proves it.
 - `partial` — a running process proves the path that exists, and the `Depends on`
   cell names the part a contract slice still owns. Never a status a gate can hold
   without a service-backed scenario.
-- `blocked` — the scenario asserts that the system still refuses inference rather
-  than pretending otherwise, and names what it waits for.
+- `blocked` — the scenario asserts that the system remains fail-closed without a
+  valid projected serving snapshot, and names what it waits for.
 
 `Depends on` lists only what is still outstanding — an unlanded contract slice,
 or an earlier gate that has to serve first. A dependency that lands moves to
@@ -120,15 +119,15 @@ here without a scenario, or a scenario without a row, fails the suite.
 ## The next gate that can become executable
 
 IG-01 is wired: a replica boots against a migrated control plane, serves
-`/admin/v1`, and refuses inference and readiness until a revision compiles — so
-the scenarios above now assert a running stateful process, and the loud-failure
-half asserts the *reference* a boot could not resolve rather than any nonzero
-exit.
+`/admin/v1`, and remains fail-closed and unready until a valid projected
+snapshot or cache is active — so the scenarios above assert a running stateful
+process, and the loud-failure half asserts the *reference* a boot could not
+resolve rather than any nonzero exit.
 
 IG-03 is next, and it is what the remaining blocked gates wait behind: until a
 published revision compiles into a runtime snapshot, IG-04 and IG-06 through
 IG-11 have no served revision to assert against, which is why their scenarios
-assert today's inference refusal instead. Much of its foundation is on main — the
+assert today's fail-closed posture instead. Much of its foundation is on main — the
 policy document type (#253), the derived availability contracts (#250), the
 `/admin/v1` boundary and its served runtime (#254, #143), the models.dev
 catalogue import (#207), the envelope-encrypted SecretStore (#275), and now
