@@ -149,6 +149,25 @@ close() {
   "$python_bin" "$evidence" finish --log "$log" || failed_stages+=("$(basename "$log" .log)")
 }
 failed_stages=()
+
+# Setup failures happen before the normal restore stage starts. Retain a
+# durable-inventory artifact for them rather than letting `set -e` turn a
+# missing store table or refused lifecycle transition into an unexplained
+# missing artifact.
+record_durable_setup_failure() {
+  local detail="$1"
+  stage backup-restore/durable-inventory logical_restore "$schema_identity"
+  mark "setup-failed" "$detail"
+  require "the_secret_store_setup_succeeds" true false "$detail"
+  defer readiness "setup failed before this stage could inspect a recovered replica"
+  defer max_serving_error_fraction "setup failed before this stage could offer inference traffic"
+  defer max_convergence_lag_seconds "setup failed before this stage could observe convergence"
+  defer max_data_loss_revisions "the restore stage owns the revision loss boundary"
+  defer admin_writes "setup failed before this stage could attempt an administrative write"
+  defer max_unauthenticated_admin_successes "the administration stage owns restored-surface authentication"
+  close
+  fail "$detail"
+}
 # When this run began, so the checker can reject an artifact a previous run left
 # behind: a stale file is indistinguishable from a stage that ran.
 drill_started_ms=$(($(date +%s%N) / 1000000))
@@ -216,6 +235,8 @@ psql postgres 5432 -c 'CREATE DATABASE logical_restore' >/dev/null
 # subshell that made it.
 config() {
   local database="$1" port="$2" http="${4:-0}"
+  local catalog_source="${5:-none}" catalog_bootstrap="${6:-empty}"
+  local catalog_create_table="${7:-false}"
   drill_config="${workdir}/${3}"
   cat >"$drill_config" <<EOF
 mode = "stateful"
@@ -230,9 +251,10 @@ dsn_env = "GW_DRILL_DSN"
 kek_env = "GW_DRILL_KEK"
 
 [catalog]
-source = "seed"
+source = "${catalog_source}"
 store = "postgres"
-bootstrap = "seed"
+bootstrap = "${catalog_bootstrap}"
+create_table = ${catalog_create_table}
 
 [[admin_breakglass]]
 env = "GW_DRILL_BREAKGLASS"
@@ -322,7 +344,7 @@ unauthenticated_successes() {
 }
 
 step "Installing the control-plane schema with axond migrate apply"
-config live "$live_port" live.toml "$live_http"
+config live "$live_port" live.toml "$live_http" seed seed true
 live_config="$drill_config"
 "$axond_bin" migrate apply --config "$live_config"
 schema_identity="$("$axond_bin" migrate status --config "$live_config")" ||
@@ -334,6 +356,9 @@ for sql in usage_v2 budget_v1 budget_v2 revocation_v1; do
   psql live 5432 -f - <"${root}/ops/postgres/${sql}.sql" >/dev/null
 done
 
+step "Applying the encrypted secret-store schema"
+psql live 5432 -f "${root}/crates/gateway/sql/secret_store_v1.sql" >/dev/null
+
 step "Building the deployment a recovery has to bring back, through axond admin"
 serve live "$live_http"
 live_endpoint="$endpoint"
@@ -344,9 +369,12 @@ live_endpoint="$endpoint"
 # pointer and payload independently after restore.
 catalog_content_id="$(psql live 5432 -c \
   'SELECT content_id FROM axond_catalog_active WHERE singleton')"
-catalog_payload_bytes="$(psql live 5432 -c \
-  "SELECT octet_length(payload) FROM axond_catalog_snapshot WHERE content_id = '${catalog_content_id}'")"
-[[ "$catalog_content_id" == sha256:* && "$catalog_payload_bytes" -gt 0 ]] ||
+catalog_raw_digest="$(psql live 5432 -c \
+  "SELECT raw_digest FROM axond_catalog_snapshot WHERE content_id = '${catalog_content_id}'")"
+catalog_raw_bytes="$(psql live 5432 -c \
+  "SELECT raw_bytes FROM axond_catalog_snapshot WHERE content_id = '${catalog_content_id}'")"
+[[ "$catalog_content_id" == sha256:* && "$catalog_raw_digest" == sha256:* &&
+  "$catalog_raw_bytes" -gt 0 ]] ||
   fail "the seeded catalogue was not retained before the restore drill"
 
 tenant=ten_01900000-0000-7000-8000-000000000001
@@ -368,11 +396,17 @@ EOF
 # A credential is a *reference* to staged material, never the material: what a
 # restore has to bring back here is the reference and its lifecycle.
 printf '%s' "$GW_DRILL_PROVIDER_KEY" >"${workdir}/provider-key"
-secret_ref="$(admin secret stage --tenant "$tenant" --material-file "${workdir}/provider-key" |
-  jq -r .reference)"
+secret_stage_output="$(admin secret stage --tenant "$tenant" \
+  --material-file "${workdir}/provider-key" 2>/dev/null || true)"
+secret_ref="$(printf '%s' "$secret_stage_output" |
+  jq -r '.reference // "missing"' 2>/dev/null || printf 'missing')"
 secret_id="${secret_ref%@*}"
-[[ "$secret_ref" == sct_*@v1 ]] || fail "secret staging returned an invalid reference"
-admin secret lifecycle --tenant "$tenant" --reference "$secret_ref" --state active >/dev/null
+[[ "$secret_ref" == sct_*@v1 ]] ||
+  record_durable_setup_failure "secret staging did not return a valid reference"
+if ! admin secret lifecycle --tenant "$tenant" --reference "$secret_ref" \
+  --state active >/dev/null 2>&1; then
+  record_durable_setup_failure "secret lifecycle activation was refused"
+fi
 cat >"${workdir}/credential.json" <<EOF
 {"summary":"stage the drill openai key","mutation":"create","resource":{
   "credential":"res_01900000-0000-7000-8000-000000000011","tenant":"${tenant}",
@@ -382,7 +416,7 @@ EOF
 cat >"${workdir}/catalog.json" <<EOF
 {"summary":"retain the drill catalogue","mutation":"create","resource":{
   "catalog":"res_01900000-0000-7000-8000-000000000013","slug":"seed-models",
-  "digest":"${catalog_content_id}","size_bytes":${catalog_payload_bytes}}}
+  "digest":"${catalog_raw_digest}","size_bytes":${catalog_raw_bytes}}}
 EOF
 cat >"${workdir}/policy.json" <<EOF
 {"summary":"cap the drill tenant","resource":{
@@ -421,7 +455,30 @@ restore_seconds="$(awk -v end="$(date +%s.%N)" -v start="$started" 'BEGIN { prin
 mark "restored" "pg_restore into a database no replica ever wrote"
 observe restore_duration_seconds "$restore_seconds" seconds
 
-config logical_restore "$live_port" logical.toml "$logical_http"
+# Read the catalogue directly from the restored database before creating any
+# recovered replica. The recovered config below is also non-repopulating, but
+# this ordering makes the evidence independent of both boot and refresh code.
+catalog_restore_content_id="$(psql logical_restore 5432 -c \
+  'SELECT content_id FROM axond_catalog_active WHERE singleton' 2>/dev/null || printf 'missing')"
+catalog_restore_raw_digest="$(psql logical_restore 5432 -c \
+  "SELECT raw_digest FROM axond_catalog_snapshot WHERE content_id = '${catalog_restore_content_id}'" \
+  2>/dev/null || printf 'missing')"
+catalog_restore_raw_bytes="$(psql logical_restore 5432 -c \
+  "SELECT raw_bytes FROM axond_catalog_snapshot WHERE content_id = '${catalog_restore_content_id}'" \
+  2>/dev/null || printf '0')"
+catalog_restore_payload_bytes="$(psql logical_restore 5432 -c \
+  "SELECT octet_length(payload) FROM axond_catalog_snapshot WHERE content_id = '${catalog_restore_content_id}'" \
+  2>/dev/null || printf '0')"
+catalog_restore_rows="$(psql logical_restore 5432 -c \
+  'SELECT count(*) FROM axond_catalog_snapshot' 2>/dev/null || printf '0')"
+mark "catalogue-preboot-read" "the restored catalogue pointer and payload metadata were read before any recovered replica booted"
+observe catalogue_preboot_content_id "$catalog_restore_content_id"
+observe catalogue_preboot_raw_digest "$catalog_restore_raw_digest"
+observe catalogue_preboot_raw_bytes "$catalog_restore_raw_bytes" count
+observe catalogue_preboot_payload_bytes "$catalog_restore_payload_bytes" count
+observe catalogue_preboot_snapshot_rows "$catalog_restore_rows" count
+
+config logical_restore "$live_port" logical.toml "$logical_http" none empty false
 restored_schema="$("$axond_bin" migrate status --config "$drill_config" 2>&1 | tr '\n' ' ')" &&
   restored_current=current || restored_current=stale
 require "the_restored_schema_is_current" current "$restored_current" \
@@ -530,21 +587,23 @@ require "the_secret_version_is_resolvable_after_restore" true \
   "$(printf '%s' "$secret_versions" | jq -r '.versions[0].resolvable // false')" \
   "the restored encrypted material still has a usable lifecycle without returning material"
 
-catalog_restore_content_id="$(psql logical_restore 5432 -c \
-  'SELECT content_id FROM axond_catalog_active WHERE singleton')"
-catalog_restore_bytes="$(psql logical_restore 5432 -c \
-  "SELECT octet_length(payload) FROM axond_catalog_snapshot WHERE content_id = '${catalog_restore_content_id}'")"
-catalog_restore_rows="$(psql logical_restore 5432 -c \
-  'SELECT count(*) FROM axond_catalog_snapshot')"
-mark "catalogue-metadata-read" "the restored active catalogue pointer and retained payload read from Postgres"
+mark "catalogue-metadata-read" "the restored catalogue metadata captured before boot was checked in the durable-inventory stage"
 observe catalogue_snapshot_rows "$catalog_restore_rows" count
 observe catalogue_content_id "$catalog_restore_content_id"
-observe catalogue_payload_bytes "$catalog_restore_bytes" count
+observe catalogue_raw_digest "$catalog_restore_raw_digest"
+observe catalogue_raw_bytes "$catalog_restore_raw_bytes" count
+observe catalogue_payload_bytes "$catalog_restore_payload_bytes" count
 require "the_catalogue_snapshot_survives_the_restore" "$catalog_content_id" \
   "$catalog_restore_content_id" \
   "the restored active pointer names the same content-addressed catalogue"
+require "the_catalogue_raw_digest_survives_the_restore" "$catalog_raw_digest" \
+  "$catalog_restore_raw_digest" \
+  "the restored catalogue blob still addresses the retained raw payload"
+require "the_catalogue_raw_bytes_survive_the_restore" "$catalog_raw_bytes" \
+  "$catalog_restore_raw_bytes" \
+  "the restored catalogue blob retains the recorded raw byte count"
 require "the_catalogue_payload_survives_the_restore" true \
-  "$([[ "$catalog_restore_bytes" -gt 0 ]] && echo true || echo false)" \
+  "$([[ "$catalog_restore_payload_bytes" -gt 0 ]] && echo true || echo false)" \
   "the restored catalogue keeps non-empty accepted payload bytes"
 require "the_catalogue_history_is_nonempty_after_restore" true \
   "$([[ "$catalog_restore_rows" -gt 0 ]] && echo true || echo false)" \
@@ -554,6 +613,7 @@ defer max_serving_error_fraction "this stage offers no inference traffic, so the
 defer max_convergence_lag_seconds "the blocked \`reconvergence\` stage measures replicas converging onto restored durable inventory"
 defer max_unauthenticated_admin_successes "the \`administration\` stage measures the administrative surface's authentication"
 defer max_data_loss_revisions "the \`restore\` stage measures the revision loss boundary"
+defer admin_writes "this stage only reads restored durable inventory; the \`restore\` stage measures whether the restored journal accepts a publication"
 close
 
 # ---------------------------------------------------------------------------
@@ -666,7 +726,30 @@ require "the_recovered_cluster_promotes" f "$in_recovery" \
 mark "promoted" "the recovered cluster was promoted at the target"
 observe restore_duration_seconds "$restore_seconds" seconds
 
-config live "$restored_port" restored.toml "$recovered_http"
+# As with logical restore, read the PITR catalogue directly before creating a
+# recovered replica. Missing tables become sentinel values and are judged by
+# this stage's checks instead of aborting before its artifact can close.
+pitr_catalog_content_id="$(psql live 5433 -c \
+  'SELECT content_id FROM axond_catalog_active WHERE singleton' 2>/dev/null || printf 'missing')"
+pitr_catalog_raw_digest="$(psql live 5433 -c \
+  "SELECT raw_digest FROM axond_catalog_snapshot WHERE content_id = '${pitr_catalog_content_id}'" \
+  2>/dev/null || printf 'missing')"
+pitr_catalog_raw_bytes="$(psql live 5433 -c \
+  "SELECT raw_bytes FROM axond_catalog_snapshot WHERE content_id = '${pitr_catalog_content_id}'" \
+  2>/dev/null || printf '0')"
+pitr_catalog_payload_bytes="$(psql live 5433 -c \
+  "SELECT octet_length(payload) FROM axond_catalog_snapshot WHERE content_id = '${pitr_catalog_content_id}'" \
+  2>/dev/null || printf '0')"
+pitr_catalog_rows="$(psql live 5433 -c \
+  'SELECT count(*) FROM axond_catalog_snapshot' 2>/dev/null || printf '0')"
+mark "catalogue-preboot-read" "the PITR catalogue pointer and payload metadata were read before any recovered replica booted"
+observe pitr_catalogue_preboot_content_id "$pitr_catalog_content_id"
+observe pitr_catalogue_preboot_raw_digest "$pitr_catalog_raw_digest"
+observe pitr_catalogue_preboot_raw_bytes "$pitr_catalog_raw_bytes" count
+observe pitr_catalogue_preboot_payload_bytes "$pitr_catalog_payload_bytes" count
+observe pitr_catalogue_preboot_snapshot_rows "$pitr_catalog_rows" count
+
+config live "$restored_port" restored.toml "$recovered_http" none empty false
 recovered_schema="$("$axond_bin" migrate status --config "$drill_config" 2>&1 | tr '\n' ' ')" &&
   recovered_current=current || recovered_current=stale
 require "the_recovered_schema_is_current" current "$recovered_current" \
@@ -678,18 +761,18 @@ mark "replica-booted" "a replica booted on the promoted cluster and opened /admi
 
 # PITR must restore the durable dependencies of the revision, not only the
 # revision row itself. Read secret and catalogue metadata without material and
-# without treating a post-target fixture as evidence.
+# without treating a post-target fixture as evidence. Catalogue values were
+# captured above, before the recovered replica could boot.
 pitr_secret_versions="$(admin secret versions --secret "$secret_id" --tenant "$tenant" \
   2>/dev/null || printf '{"versions":[]}')"
-pitr_catalog_content_id="$(psql live 5433 -c \
-  'SELECT content_id FROM axond_catalog_active WHERE singleton')"
-pitr_catalog_bytes="$(psql live 5433 -c \
-  "SELECT octet_length(payload) FROM axond_catalog_snapshot WHERE content_id = '${pitr_catalog_content_id}'")"
-mark "durable-inventory-read" "PITR metadata reads for the tenant's secret and active catalogue snapshot"
+mark "durable-inventory-read" "PITR metadata reads for the tenant's secret and pre-boot catalogue snapshot"
 observe pitr_secret_versions "$(printf '%s' "$pitr_secret_versions" | jq '.versions | length')" count
 observe pitr_secret_lifecycle "$(printf '%s' "$pitr_secret_versions" | jq -r '.versions[0].lifecycle // "missing"')"
 observe pitr_catalogue_content_id "$pitr_catalog_content_id"
-observe pitr_catalogue_payload_bytes "$pitr_catalog_bytes" count
+observe pitr_catalogue_raw_digest "$pitr_catalog_raw_digest"
+observe pitr_catalogue_raw_bytes "$pitr_catalog_raw_bytes" count
+observe pitr_catalogue_payload_bytes "$pitr_catalog_payload_bytes" count
+observe pitr_catalogue_snapshot_rows "$pitr_catalog_rows" count
 require "the_pitr_secret_metadata_survives_the_target" 1 \
   "$(printf '%s' "$pitr_secret_versions" | jq '.versions | length')" \
   "the target preserves the secret version metadata referenced by the pre-target deployment"
@@ -699,8 +782,14 @@ require "the_pitr_secret_lifecycle_survives_the_target" active \
 require "the_pitr_catalogue_snapshot_survives_the_target" "$catalog_content_id" \
   "$pitr_catalog_content_id" \
   "the target preserves the active catalogue identity used by the pre-target state"
+require "the_pitr_catalogue_raw_digest_survives_the_target" "$catalog_raw_digest" \
+  "$pitr_catalog_raw_digest" \
+  "the target preserves the raw catalogue blob identity"
+require "the_pitr_catalogue_raw_bytes_survive_the_target" "$catalog_raw_bytes" \
+  "$pitr_catalog_raw_bytes" \
+  "the target preserves the raw catalogue byte count"
 require "the_pitr_catalogue_payload_survives_the_target" true \
-  "$([[ "$pitr_catalog_bytes" -gt 0 ]] && echo true || echo false)" \
+  "$([[ "$pitr_catalog_payload_bytes" -gt 0 ]] && echo true || echo false)" \
   "the target preserves accepted catalogue payload bytes"
 
 # Sentinels rather than bare reads: a recovered head the replica cannot answer

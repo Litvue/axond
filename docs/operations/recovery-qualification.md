@@ -254,7 +254,6 @@ records are the blocked `usage-boundary` stage.
 | --- | --- |
 | #144 | Durable tenants, projects, principals, RBAC, and audit boundaries — the tenancy and audit state a restore is checked against. |
 | #145 | The `SecretStore` and the zero-redeploy credential lifecycle that `secret-rotation` is the evidence for; the restore lane now exercises the existing secret metadata/lifecycle surface without claiming rotation evidence. |
-| #146 | Retired for recovery qualification: the restore lane exercises the existing Postgres-backed catalogue store and checks its retained active snapshot. The remaining import/source behavior stays on #146. |
 | #147 | Effective-dated price books. This remains a blocker because origin/main has no operator/admin publication path for an approved book; adding one is outside this bounded evidence slice. |
 | #148 | A revision projection a replica can serve — without it, serving behaviour is asserted about an empty snapshot. |
 | #149 | Tenant model enablement and aliases, so requests offered during an outage resolve to a target. |
@@ -269,6 +268,7 @@ which scenarios it unblocks.
 
 | Slice | Why no stage waits on it, and where the rest of it lives |
 | --- | --- |
+| #146 | Retired for recovery qualification: the restore lane exercises the existing Postgres-backed catalogue store and checks its retained active snapshot. The remaining import/source behavior stays on #146. |
 | #159 | The part a recovery scenario needed — a database running with WAL archiving, and the evidence published as an artifact — is here: `ops/restore-drill.sh` runs that lane, and `ops/check-recovery-evidence.py` fails it when an executable stage leaves no artifact. The rest of #159 — disclosure, fuzzing, SDK compatibility — blocks no recovery stage, so it stays tracked on #159 itself rather than on a stage invented to wait on it. |
 
 The manifest carries the same list in `[[retired_blocker]]`, and

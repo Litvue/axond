@@ -406,15 +406,6 @@ evidence = ["pricing_history"]
 issue = 147
 needs = "origin/main has the pricing domain and request-path consumers, but no existing operator/admin publication path for an approved effective-dated price-book resource; adding one is outside this bounded recovery/evidence slice and must not be faked with direct SQL"
 
-[[retired_blocker]]
-issue = 146
-became = """
-The durable catalogue state is now covered by `backup-restore/durable-inventory`: \
-the restore drill configures the existing Postgres catalogue store with the \
-offline seed and checks its active pointer, retained content id, and non-empty \
-payload after logical restore. The remaining #146 source/import behavior stays \
-tracked on #146 and is not reintroduced as a recovery blocker."""
-
 [[scenario.stage]]
 id = "reconvergence"
 status = "blocked"
@@ -501,6 +492,15 @@ needs = "a projection and the reconciler that publishes it in `serve`, so servin
 # of the slice and where it stays tracked. `RETIRED_BLOCKERS` in
 # `crates/gateway/tests/support/recovery.rs` repeats this list, and the contract
 # tests hold the two together.
+
+[[retired_blocker]]
+issue = 146
+became = """
+The durable catalogue state is now covered by `backup-restore/durable-inventory`: \
+the restore drill configures the existing Postgres catalogue store with the \
+offline seed and checks its active pointer, retained content id, and non-empty \
+payload after logical restore. The remaining #146 source/import behavior stays \
+tracked on #146 and is not reintroduced as a recovery blocker."""
 
 [[retired_blocker]]
 issue = 159

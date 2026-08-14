@@ -420,6 +420,109 @@ fn every_executable_stage_names_the_lane_that_runs_it() {
     }
 }
 
+/// The shell lane owns the stages that need a promoted or restored database;
+/// the in-process driver must neither run them nor let a recovered catalogue
+/// bootstrap itself before its evidence is read.
+#[test]
+fn restore_drill_owns_restore_stages_and_reads_catalogue_before_recovered_boot() {
+    let manifest = recovery::load();
+    let durable = manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == "backup-restore")
+        .and_then(|scenario| {
+            scenario
+                .stages
+                .iter()
+                .find(|stage| stage.id == "durable-inventory")
+        })
+        .expect("backup-restore/durable-inventory is committed");
+    assert_eq!(durable.runner, Some(Runner::RestoreDrill));
+
+    let root = recovery::workspace_root();
+    let drill = std::fs::read_to_string(root.join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let stateful_driver =
+        std::fs::read_to_string(root.join("crates/gateway/src/qualification/recovery.rs"))
+            .expect("the stateful recovery driver is readable");
+    assert!(
+        !stateful_driver.contains("backup-restore/durable-inventory"),
+        "the in-process driver must not claim the restore-drill stage"
+    );
+
+    let logical_read = drill
+        .find("catalog_restore_content_id=\"$(psql logical_restore")
+        .expect("logical restore reads catalogue metadata");
+    let logical_boot = drill
+        .find("serve logical_restore")
+        .expect("logical restore boots a replica");
+    assert!(
+        logical_read < logical_boot,
+        "logical catalogue evidence must be read before a recovered replica boots"
+    );
+    let pitr_read = drill
+        .find("pitr_catalog_content_id=\"$(psql live 5433")
+        .expect("PITR reads catalogue metadata");
+    let pitr_boot = drill
+        .find("serve recovered")
+        .expect("PITR boots a recovered replica");
+    assert!(
+        pitr_read < pitr_boot,
+        "PITR catalogue evidence must be read before a recovered replica boots"
+    );
+    assert!(
+        drill.contains(
+            "config logical_restore \"$live_port\" logical.toml \"$logical_http\" none empty false"
+        ),
+        "logical restore must use a non-repopulating catalogue config"
+    );
+    assert!(
+        drill.contains(
+            "config live \"$restored_port\" restored.toml \"$recovered_http\" none empty false"
+        ),
+        "PITR must use a non-repopulating catalogue config"
+    );
+    let checker = std::fs::read_to_string(root.join("ops/check-recovery-evidence.py"))
+        .expect("the evidence checker is readable");
+    assert!(
+        checker.contains("stage.get(\"runner\") == runner"),
+        "the evidence checker must select executable stages by their declared runner"
+    );
+}
+
+/// A durable-inventory artifact states every gate field, even though this
+/// inventory-only stage defers all six rather than pretending to measure them.
+#[test]
+fn durable_inventory_records_all_gate_fields_and_setup_failures() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let start = source
+        .find("stage backup-restore/durable-inventory")
+        .expect("the durable-inventory stage is driven");
+    let end = source[start..]
+        .find("stage backup-restore/administration")
+        .map(|offset| start + offset)
+        .expect("the durable-inventory stage has a bounded body");
+    let stage = &source[start..end];
+    for gate in [
+        "readiness",
+        "max_serving_error_fraction",
+        "max_convergence_lag_seconds",
+        "max_data_loss_revisions",
+        "admin_writes",
+        "max_unauthenticated_admin_successes",
+    ] {
+        assert!(
+            stage.contains(&format!("defer {gate}")),
+            "durable-inventory must record or defer {gate}"
+        );
+    }
+    assert!(
+        source.contains("record_durable_setup_failure"),
+        "setup failures must retain an evidence artifact before stopping the drill"
+    );
+}
+
 /// The prose contract and the manifest describe one harness. An operator reads
 /// the first; the driver reads the second; a scenario, a stage, or a blocker
 /// that exists in only one of them is how the two come to disagree.
