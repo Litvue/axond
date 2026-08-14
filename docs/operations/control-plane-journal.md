@@ -231,9 +231,13 @@ axond check preflight --config /etc/axond/axond.toml # then verify a replica wou
 Then start replicas. Run `apply` once from one place; it is safe if that
 accidentally becomes twice, or two places at once.
 
-While stateful serving is unwired, that `preflight` exits non-zero on its
-`serving` line even when the database is ready; read the rest of the
-report, and gate the rollout on `axond migrate status` until the refusal is gone.
+The `serving` line is a bootstrap-configuration gate, not a promise that the
+runtime has a projected serving snapshot. It can pass while `/readyz` remains
+503: this build still refuses stateful inference until inbound caller-principal
+projection exists, and the stateful deployment is intentionally fail-closed.
+Gate the rollout on the migration status and then on `/readyz`; treat a passing
+preflight as evidence that the replica can boot its administrative surface and
+wait safely for convergence, not as evidence that inference is available.
 
 ### Upgrade
 

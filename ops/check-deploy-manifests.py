@@ -807,7 +807,12 @@ def check_stateful(documents: list[Document]) -> list[str]:
     if strategy.get("rollingUpdate") is not None:
         failures.append(f"{label}: the Deployment keeps rollingUpdate settings beside Recreate")
 
-    pod_spec = deployment["spec"]["template"]["spec"]
+    template = deployment["spec"].get("template")
+    if not isinstance(template, dict) or not isinstance(template.get("spec"), dict):
+        failures.append(
+            f"{label}: the Deployment is missing spec.template.spec, so Kubernetes cannot create a Pod"
+        )
+        return failures
     # This is a Deployment with Recreate semantics, not a StatefulSet. There is
     # no durable per-replica volume, so the shipped config must not enable the
     # local last-known-good cache and promise recovery across Pod replacement.
@@ -1170,6 +1175,10 @@ def self_test() -> int:
     blocked = copy.deepcopy(stateful)
     one(blocked, "PodDisruptionBudget")["spec"].pop("unhealthyPodEvictionPolicy")
     expect_failure("a budget that blocks every drain", check_stateful(blocked))
+
+    missing_template = copy.deepcopy(stateful)
+    one(missing_template, "Deployment")["spec"].pop("template")
+    expect_failure("a stateful Deployment without a Pod template", check_stateful(missing_template))
 
     published_admin = copy.deepcopy(stateful)
     published_admin.append(
