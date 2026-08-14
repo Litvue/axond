@@ -32,7 +32,7 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
-use super::ids::{ProjectId, SecretId, TenantId};
+use super::ids::{InvalidId, ProjectId, SecretId, TenantId};
 use super::resource::ResourceScope;
 
 /// Which version of a secret's material a reference names.
@@ -102,6 +102,37 @@ impl SecretRef {
     pub fn is_same_secret(self, other: Self) -> bool {
         self.secret == other.secret
     }
+
+    /// Read back the text form [`fmt::Display`] writes: `sct_…@v2`.
+    ///
+    /// Exact, and only exact. There is no way to spell "the newest version of
+    /// this secret" here, because an administrative call that meant one version
+    /// and reached another is precisely the mistake exact references exist to
+    /// make impossible.
+    pub fn parse(text: &str) -> Result<Self, InvalidSecretRef> {
+        let (secret, version) = text.split_once('@').ok_or(InvalidSecretRef::Unversioned)?;
+        let secret = SecretId::parse(secret)?;
+        let version = version
+            .strip_prefix('v')
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .and_then(SecretVersion::new)
+            .ok_or(InvalidSecretRef::Version)?;
+        Ok(Self::new(secret, version))
+    }
+}
+
+/// Why a text reference is not one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidSecretRef {
+    #[error(
+        "a secret reference names an exact version, as `{}…@v1`",
+        SecretId::PREFIX
+    )]
+    Unversioned,
+    #[error(transparent)]
+    Secret(#[from] InvalidId),
+    #[error("a secret version is `v` and a number from 1 upwards")]
+    Version,
 }
 
 /// `sct_…@v2`: the id and the version, never anything derived from the material.
@@ -376,6 +407,35 @@ mod tests {
         assert_eq!(SecretVersion::new(0), None);
         assert_eq!(SecretVersion::new(1), Some(SecretVersion::FIRST));
         assert_eq!(SecretVersion::new(7).map(SecretVersion::get), Some(7));
+    }
+
+    #[test]
+    fn a_parsed_reference_is_the_one_that_was_printed() {
+        let reference = SecretRef::first(secret_id(3)).rotated();
+        assert_eq!(SecretRef::parse(&reference.to_string()), Ok(reference));
+
+        // An administrator names a version or names nothing: a bare id would
+        // have to mean "whichever is current", which is the ambiguity the
+        // exact reference exists to remove.
+        let bare = reference.secret.to_string();
+        assert_eq!(SecretRef::parse(&bare), Err(InvalidSecretRef::Unversioned));
+        for text in [
+            format!("{bare}@v0"),
+            format!("{bare}@2"),
+            format!("{bare}@vlatest"),
+            format!("{bare}@v-1"),
+            format!("{bare}@v"),
+        ] {
+            assert_eq!(
+                SecretRef::parse(&text),
+                Err(InvalidSecretRef::Version),
+                "{text} is not an exact version"
+            );
+        }
+        assert!(matches!(
+            SecretRef::parse("not-a-secret@v1"),
+            Err(InvalidSecretRef::Secret(_))
+        ));
     }
 
     #[test]

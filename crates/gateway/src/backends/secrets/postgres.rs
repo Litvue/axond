@@ -45,7 +45,9 @@ use super::{
     ENVELOPE_CAPABILITIES, KekRef, SecretDescriptor, SecretError, SecretMaterial, SecretResolver,
     SecretStore,
 };
-use crate::desired_state::secrets::{LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef};
+use crate::desired_state::secrets::{
+    LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef, SecretVersion,
+};
 use crate::desired_state::{SecretId, Uuid7Generator};
 
 const BACKEND: &str = "encrypted-postgres";
@@ -360,10 +362,10 @@ impl PostgresSecrets {
         // A state a newer release wrote is not a state this build may guess at:
         // treating an unknown lifecycle as resolvable would put material in
         // service that an administrator withdrew.
-        let lifecycle = SecretLifecycle::parse(&stored).ok_or_else(|| {
-            SecretError::Invalid(format!(
+        let lifecycle = SecretLifecycle::parse(&stored).ok_or_else(|| SecretError::Corrupt {
+            detail: format!(
                 "secret {reference} is stored in state `{stored}`, which this build does not read"
-            ))
+            ),
         })?;
         Ok(SecretDescriptor {
             reference: *reference,
@@ -476,7 +478,7 @@ impl SecretStore for PostgresSecrets {
                 if inserted != 1 {
                     // A time-ordered UUIDv7 collision. Reported rather than
                     // overwritten: the row that exists is somebody's material.
-                    return Err(SecretError::Invalid(format!("{reference} already exists")));
+                    return Err(SecretError::VersionExists { reference });
                 }
                 transaction
                     .commit()
@@ -532,7 +534,7 @@ impl SecretStore for PostgresSecrets {
                     // reference is a stale request rather than a second rotation:
                     // overwriting would change what a credential body already
                     // pinning `rotated` resolves to.
-                    return Err(SecretError::Invalid(format!("{rotated} already exists")));
+                    return Err(SecretError::VersionExists { reference: rotated });
                 }
                 transaction
                     .commit()
@@ -624,6 +626,47 @@ impl SecretStore for PostgresSecrets {
         })
         .await
     }
+
+    async fn versions(
+        &self,
+        owner: SecretOwner,
+        secret: SecretId,
+    ) -> Result<Vec<SecretDescriptor>, SecretError> {
+        self.run(|client| {
+            Box::pin(async move {
+                let rows = client
+                    .query(
+                        "SELECT version, tenant_id, project_id, lifecycle FROM axond_secret \
+                         WHERE secret_id = $1 ORDER BY version",
+                        &[&secret.to_string()],
+                    )
+                    .await
+                    .map_err(|error| unavailable("list secret versions", &error))?;
+                let mut descriptors = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let stored: i64 = row.get("version");
+                    let version = u64::try_from(stored)
+                        .ok()
+                        .and_then(SecretVersion::new)
+                        .ok_or_else(|| SecretError::Corrupt {
+                            detail: format!(
+                                "secret {secret} holds version `{stored}`, which is not a version"
+                            ),
+                        })?;
+                    let reference = SecretRef::new(secret, version);
+                    match Self::descriptor_of(row, owner, &reference) {
+                        Ok(descriptor) => descriptors.push(descriptor),
+                        // Another owner's rows answer as absent ones do, so a
+                        // listing cannot be used to enumerate foreign material.
+                        Err(SecretError::Ownership { .. }) => return Ok(Vec::new()),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(descriptors)
+            })
+        })
+        .await
+    }
 }
 
 /// A version as the column type. `bigint` is signed, and a version past
@@ -666,9 +709,11 @@ fn sealed_of(row: &Row, reference: &SecretRef) -> Result<SealedSecret, SecretErr
 /// material belong to" — and none of them is retryable.
 fn unwrap_error(error: EnvelopeError, reference: &SecretRef, kek: KekRef) -> SecretError {
     match error {
-        EnvelopeError::UnknownScheme { found } => SecretError::Invalid(format!(
-            "secret {reference} is sealed with scheme `{found}`, which this build does not read"
-        )),
+        EnvelopeError::UnknownScheme { found } => SecretError::Corrupt {
+            detail: format!(
+                "secret {reference} is sealed with scheme `{found}`, which this build does not read"
+            ),
+        },
         EnvelopeError::Random | EnvelopeError::Unopenable | EnvelopeError::Malformed { .. } => {
             SecretError::Unwrap {
                 reference: *reference,
@@ -1293,12 +1338,15 @@ mod tests {
         );
         // Rotating again from the stale base reference does not overwrite the
         // version somebody may already have published against.
-        assert!(matches!(
+        assert_eq!(
             store
                 .rotate(owner(), &first, SecretMaterial::new("sk-live-3".to_owned()))
-                .await,
-            Err(SecretError::Invalid(_))
-        ));
+                .await
+                .err(),
+            Some(SecretError::VersionExists {
+                reference: second.reference
+            })
+        );
         assert_eq!(
             store
                 .resolve(owner(), &second.reference)
@@ -1352,7 +1400,7 @@ mod tests {
             store
                 .rotate(owner(), &first, SecretMaterial::new("x".to_owned()))
                 .await,
-            Err(SecretError::Invalid(_) | SecretError::Lifecycle { .. })
+            Err(SecretError::VersionExists { .. } | SecretError::Lifecycle { .. })
         ));
         store
             .transition(owner(), &first, SecretLifecycle::Tombstoned)

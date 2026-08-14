@@ -20,6 +20,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+use super::auth::AdminAction;
 use super::auth::INFERENCE_KEY_HEADER;
 use super::fakes::{CountingStore, FakeAdminAuthenticator, FakeAdminAuthorizer};
 use super::protocol::{
@@ -34,6 +35,7 @@ use crate::availability::{
     Entitlement, PolicyDecision, RuntimeObservations, ScopeRef, TargetRef,
 };
 use crate::backends::control_plane::ControlPlaneStore;
+use crate::backends::fakes::InMemorySecrets;
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{DenialPage, ResourceScope, fixtures};
 
@@ -46,6 +48,7 @@ const SUBJECT: &str = "operator@example";
 struct Deployment {
     api: Arc<AdminApi>,
     store: Arc<InMemoryControlPlane>,
+    secrets: Arc<InMemorySecrets>,
 }
 
 impl Deployment {
@@ -55,12 +58,45 @@ impl Deployment {
 
     fn with_authorizer(authorizer: FakeAdminAuthorizer) -> Self {
         let store = Arc::new(InMemoryControlPlane::new());
+        let secrets = Arc::new(InMemorySecrets::new());
         let api = Arc::new(AdminApi::new(
-            Arc::new(AdminService::stateful(store.clone())),
+            Arc::new(AdminService::stateful(store.clone()).with_secrets(secrets.clone())),
             Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
             Arc::new(authorizer),
         ));
-        Self { api, store }
+        Self {
+            api,
+            store,
+            secrets,
+        }
+    }
+
+    /// A call that carries material: no idempotency key and no expected
+    /// revision, because storing material publishes no revision.
+    async fn post_material(&self, path: &str, body: &Value) -> (StatusCode, Value) {
+        self.send(
+            Request::post(format!("{ADMIN_PREFIX}{path}"))
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::from(body.to_string()))
+                .expect("a request"),
+        )
+        .await
+    }
+
+    /// Store material, asserting it was stored, and answer with the reference it
+    /// was stored under.
+    async fn stage(&self, tenant: &str, material: &str) -> String {
+        let (status, body) = self
+            .post_material(
+                "/secrets",
+                &json!({ "tenant": tenant, "material": material }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "staging refused: {body}");
+        body["reference"]
+            .as_str()
+            .expect("a stored reference")
+            .to_owned()
     }
 
     /// A deployment that derives availability: the index a snapshot would carry,
@@ -82,7 +118,11 @@ impl Deployment {
                 runtime,
             })),
         );
-        Self { api, store }
+        Self {
+            api,
+            store,
+            secrets: Arc::new(InMemorySecrets::new()),
+        }
     }
 
     /// A deployment whose availability reader is attached and derives nothing:
@@ -101,7 +141,11 @@ impl Deployment {
                 runtime: RuntimeObservations::none(),
             })),
         );
-        Self { api, store }
+        Self {
+            api,
+            store,
+            secrets: Arc::new(InMemorySecrets::new()),
+        }
     }
 
     /// The same control plane, read through a narrower grant: what a tenant
@@ -115,6 +159,7 @@ impl Deployment {
                 Arc::new(FakeAdminAuthorizer::permissive().within(scopes)),
             )),
             store: self.store.clone(),
+            secrets: self.secrets.clone(),
         }
     }
 
@@ -172,6 +217,34 @@ impl Deployment {
             .expect("a body")
             .to_bytes();
         (status, etag, body.to_vec())
+    }
+
+    /// A read, with the headers the conditional contract puts on it: the
+    /// validator, and the directives that keep a per-caller projection out of a
+    /// shared cache.
+    async fn get_with_headers(
+        &self,
+        path: &str,
+        if_none_match: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut request = Request::get(format!("{ADMIN_PREFIX}{path}"))
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        if let Some(validator) = if_none_match {
+            request = request.header(axum::http::header::IF_NONE_MATCH, validator);
+        }
+        let response = router(self.api.clone())
+            .oneshot(request.body(Body::empty()).expect("a request"))
+            .await
+            .expect("a response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes();
+        (status, headers, body.to_vec())
     }
 
     /// Publish a document, with the preconditions a mutation must carry.
@@ -1040,7 +1113,11 @@ async fn a_document_that_is_not_its_schema_is_refused_before_the_control_plane()
         Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
         Arc::new(FakeAdminAuthorizer::permissive()),
     ));
-    let deployment = Deployment { api, store };
+    let deployment = Deployment {
+        api,
+        store,
+        secrets: Arc::new(InMemorySecrets::new()),
+    };
 
     let cases = [
         // An unknown field is a typo the caller must see, not an omission to
@@ -1186,7 +1263,11 @@ async fn an_oversized_document_is_refused_in_the_administrative_envelope() {
         Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
         Arc::new(FakeAdminAuthorizer::permissive()),
     ));
-    let deployment = Deployment { api, store };
+    let deployment = Deployment {
+        api,
+        store,
+        secrets: Arc::new(InMemorySecrets::new()),
+    };
     let mut document = tenant_document();
     document["summary"] = json!("x".repeat(ADMIN_MAX_REQUEST_BYTES + 1));
 
@@ -1223,8 +1304,8 @@ async fn an_unknown_administrative_path_answers_in_the_administrative_envelope()
 async fn no_route_answers_without_an_administrative_credential() {
     let deployment = Deployment::new();
     for spec in super::admin_route_specs() {
-        let path = format!("{ADMIN_PREFIX}{}", spec.path.replace("{revision}", "rev"));
-        let builder = if spec.action.mutates() {
+        let path = format!("{ADMIN_PREFIX}{}", super::router::concrete_path(&spec));
+        let builder = if spec.action.writes() {
             Request::post(&path)
                 .header(IDEMPOTENCY_KEY_HEADER, "key-1")
                 .header(EXPECTED_REVISION_HEADER, EXPECTED_REVISION_EMPTY)
@@ -1679,8 +1760,8 @@ async fn a_rollback_to_a_revision_that_does_not_exist_is_refused() {
 #[tokio::test]
 async fn a_stateless_deployment_refuses_every_administrative_route_by_mode() {
     for spec in super::admin_route_specs() {
-        let path = format!("{ADMIN_PREFIX}{}", spec.path.replace("{revision}", "rev"));
-        let builder = if spec.action.mutates() {
+        let path = format!("{ADMIN_PREFIX}{}", super::router::concrete_path(&spec));
+        let builder = if spec.action.writes() {
             Request::post(&path)
         } else {
             Request::get(&path)
@@ -1817,7 +1898,11 @@ async fn an_availability_read_reaches_no_control_plane() {
             runtime: RuntimeObservations::none(),
         })),
     );
-    let deployment = Deployment { api, store };
+    let deployment = Deployment {
+        api,
+        store,
+        secrets: Arc::new(InMemorySecrets::new()),
+    };
 
     let (status, body) = deployment
         .get(&format!("/availability?tenant={}", mine.tenant))
@@ -2035,4 +2120,590 @@ async fn an_availability_read_a_caller_already_holds_answers_not_modified() {
     assert_eq!(status, StatusCode::NOT_MODIFIED);
     assert_eq!(repeat.as_deref(), Some(validator.as_str()));
     assert!(body_again.is_empty(), "a 304 carries no body");
+}
+
+// ---------------------------------------------------------------------------
+// The credential lifecycle: `/admin/v1/secrets`
+// ---------------------------------------------------------------------------
+
+const MATERIAL: &str = "sk-live-do-not-log-this";
+const ROTATED: &str = "sk-live-the-replacement";
+
+/// The tenant every material case below owns its secrets as.
+fn owning_tenant() -> String {
+    fixtures::tenant_id(1).to_string()
+}
+
+/// Nothing a material call answers with may carry what was presented — not the
+/// stored value, not a prefix of it, not a fingerprint derived from it.
+fn carries_no_material(body: &Value) {
+    let rendered = body.to_string();
+    for material in [MATERIAL, ROTATED] {
+        assert!(
+            !rendered.contains(material),
+            "material reached a caller: {rendered}"
+        );
+        // A prefix long enough to identify a key is a leak too.
+        assert!(
+            !rendered.contains(&material[..12]),
+            "a prefix of material reached a caller: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn material_is_stored_under_a_reference_and_never_answered_back() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    let (status, staged) = deployment
+        .post_material(
+            "/secrets",
+            &json!({ "tenant": tenant, "material": MATERIAL }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+    carries_no_material(&staged);
+    // Staged, not active: storing material makes nothing servable.
+    assert_eq!(staged["lifecycle"], "staged");
+    assert_eq!(staged["version"], 1);
+    assert_eq!(staged["owner"], tenant);
+    let reference = staged["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned();
+    assert!(reference.ends_with("@v1"), "{reference}");
+
+    // And there is no route that gives it back: the versions read is the widest
+    // thing a caller may ask for.
+    let secret = staged["secret"].as_str().expect("a secret id");
+    let (status, versions) = deployment
+        .get(&format!("/secrets/{secret}?tenant={tenant}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{versions}");
+    carries_no_material(&versions);
+    assert_eq!(versions["versions"].as_array().expect("versions").len(), 1);
+    assert_eq!(versions["versions"][0]["reference"], reference);
+    assert_eq!(deployment.store.published_revisions(), 0);
+}
+
+#[tokio::test]
+async fn a_rotation_stages_the_next_version_beside_the_one_in_service() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    let first = deployment.stage(&tenant, MATERIAL).await;
+    let (status, activated) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({ "tenant": tenant, "reference": first, "lifecycle": "active" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    assert_eq!(activated["changed"], true);
+
+    let (status, rotated) = deployment
+        .post_material(
+            "/secrets/rotate",
+            &json!({ "tenant": tenant, "reference": first, "material": ROTATED }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{rotated}");
+    carries_no_material(&rotated);
+    assert_eq!(rotated["version"], 2);
+    assert_eq!(rotated["lifecycle"], "staged");
+
+    // Both versions exist at once, which is what makes a cutover reversible: the
+    // old one is still resolvable while the new one is provable.
+    let secret = rotated["secret"].as_str().expect("a secret id");
+    let (_, versions) = deployment
+        .get(&format!("/secrets/{secret}?tenant={tenant}"))
+        .await;
+    let versions = versions["versions"].as_array().expect("versions").clone();
+    assert_eq!(versions.len(), 2, "{versions:?}");
+    assert_eq!(versions[0]["lifecycle"], "active");
+    assert_eq!(versions[0]["resolvable"], true);
+    assert_eq!(versions[1]["lifecycle"], "staged");
+    assert_eq!(versions[1]["resolvable"], true);
+
+    // Withdrawing the superseded version is the end of the rotation, and it is
+    // visible as rotation status rather than inferred.
+    let (status, disabled) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({ "tenant": tenant, "reference": first, "lifecycle": "disabled" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{disabled}");
+    let (_, versions) = deployment
+        .get(&format!("/secrets/{secret}?tenant={tenant}"))
+        .await;
+    assert_eq!(versions["versions"][0]["lifecycle"], "disabled");
+    assert_eq!(versions["versions"][0]["resolvable"], false);
+    assert_eq!(
+        deployment.store.published_revisions(),
+        0,
+        "secret material lifecycle calls do not publish a revision or AuditEvent"
+    );
+}
+
+/// The rotation an operator repeats — a retried request, or a second
+/// administrator doing what the first already did — must not be reported as a
+/// bad key: the material was never examined, and an operator told their key was
+/// refused re-issues a credential that was never at fault.
+#[tokio::test]
+async fn a_repeated_rotation_is_a_conflict_rather_than_a_refusal_of_the_material() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    let first = deployment.stage(&tenant, MATERIAL).await;
+    let body = json!({ "tenant": tenant, "reference": first, "material": ROTATED });
+    let (status, rotated) = deployment.post_material("/secrets/rotate", &body).await;
+    assert_eq!(status, StatusCode::OK, "{rotated}");
+    let next = rotated["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned();
+
+    let (status, again) = deployment.post_material("/secrets/rotate", &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{again}");
+    assert_eq!(again["error"]["type"], "secret_version_exists");
+    assert_ne!(
+        again["error"]["type"], "secret_material_refused",
+        "the presented material was never examined, so it cannot be what was refused"
+    );
+    // Not retryable: the version this would mint exists, and replaying cannot
+    // change that — the caller re-reads the versions and rotates from the current
+    // one.
+    assert_eq!(again["error"]["retryable"], false);
+    // The refusal names the version that already exists, which is what tells the
+    // caller the rotation it wanted has happened.
+    assert_eq!(again["error"]["resource"], next);
+    carries_no_material(&again);
+
+    // And the stored version is the first rotation's, untouched: a version is
+    // immutable, so the second call could not have overwritten what a credential
+    // pinning it already resolves to.
+    let secret = rotated["secret"].as_str().expect("a secret id");
+    let (_, versions) = deployment
+        .get(&format!("/secrets/{secret}?tenant={tenant}"))
+        .await;
+    let listed = versions["versions"].as_array().expect("versions").clone();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert_eq!(listed[1]["reference"], next);
+    assert_eq!(listed[1]["lifecycle"], "staged");
+}
+
+/// The versions read is polled — by an operator watching a staged version reach
+/// `active` — so it answers the same conditional contract as every other
+/// administrative projection, rather than a bare body.
+#[tokio::test]
+async fn the_versions_read_answers_the_conditional_contract() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    let reference = deployment.stage(&tenant, MATERIAL).await;
+    let secret = reference.split('@').next().expect("a secret id").to_owned();
+    let path = format!("/secrets/{secret}?tenant={tenant}");
+
+    let (status, headers, body) = deployment.get_with_headers(&path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let validator = headers
+        .get(axum::http::header::ETAG)
+        .expect("a validator")
+        .to_str()
+        .expect("a readable validator")
+        .to_owned();
+    // Strong: this projection is validated by the bytes it answers with.
+    assert!(validator.starts_with('"'), "{validator}");
+    // Per-caller — a project-scoped grant reads a narrower projection of the same
+    // secret — so no shared cache may reuse it for another administrator.
+    assert_eq!(
+        headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-cache"),
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::VARY)
+            .and_then(|value| value.to_str().ok()),
+        Some("authorization"),
+    );
+    assert!(!body.is_empty());
+
+    let (status, headers, body) = deployment.get_with_headers(&path, Some(&validator)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        headers
+            .get(axum::http::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(validator.as_str()),
+    );
+    assert!(body.is_empty(), "a 304 carries no body");
+
+    // A lifecycle move is a new representation, so the validator the caller holds
+    // stops matching and the next poll is answered in full.
+    let (status, moved) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({ "tenant": tenant, "reference": reference, "lifecycle": "active" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    let (status, headers, body) = deployment.get_with_headers(&path, Some(&validator)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        headers
+            .get(axum::http::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(validator.as_str()),
+    );
+    let versions: Value = serde_json::from_slice(&body).expect("a projection");
+    assert_eq!(versions["versions"][0]["lifecycle"], "active");
+    carries_no_material(&versions);
+}
+
+/// Version listing is an operational rotation projection, not a control-plane
+/// or provider calibration endpoint: it returns only store metadata for the
+/// tenant the caller named and does not load desired state or unwrap material.
+#[tokio::test]
+async fn the_versions_read_is_tenant_scoped_metadata_only() {
+    let control_plane = Arc::new(InMemoryControlPlane::new());
+    let counting = Arc::new(CountingStore::new(control_plane));
+    let secrets = Arc::new(InMemorySecrets::new());
+    let tenant = fixtures::tenant_id(1);
+    let reference = fixtures::secret_ref(1);
+    secrets.seed(
+        crate::desired_state::secrets::SecretOwner::tenant(tenant),
+        reference,
+        MATERIAL,
+        crate::desired_state::SecretLifecycle::Active,
+    );
+    let api = Arc::new(AdminApi::new(
+        Arc::new(AdminService::stateful(counting.clone()).with_secrets(secrets)),
+        Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+        Arc::new(FakeAdminAuthorizer::permissive()),
+    ));
+
+    let response = router(api)
+        .oneshot(
+            Request::get(format!(
+                "{ADMIN_PREFIX}/secrets/{}?tenant={tenant}",
+                reference.secret
+            ))
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .expect("a request"),
+        )
+        .await
+        .expect("a response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&body).expect("a projection");
+
+    assert_eq!(body["secret"], reference.secret.to_string());
+    assert_eq!(body["owner"], tenant.to_string());
+    assert_eq!(body["versions"][0]["reference"], reference.to_string());
+    assert_eq!(body["versions"][0]["lifecycle"], "active");
+    assert_eq!(body["versions"][0]["resolvable"], true);
+    carries_no_material(&body);
+    assert_eq!(
+        counting.calls(),
+        0,
+        "version listing consulted the control plane"
+    );
+}
+
+#[tokio::test]
+async fn moving_a_version_to_the_state_it_already_holds_is_not_a_second_change() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    let reference = deployment.stage(&tenant, MATERIAL).await;
+    let body = json!({ "tenant": tenant, "reference": reference, "lifecycle": "revoked" });
+    let (status, first) = deployment.post_material("/secrets/lifecycle", &body).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["changed"], true);
+    // The retry a client makes after a lost response: same state, no second
+    // change, which is what stands in for an idempotency key here.
+    let (status, again) = deployment.post_material("/secrets/lifecycle", &body).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["changed"], false);
+    assert_eq!(again["lifecycle"], "revoked");
+}
+
+#[tokio::test]
+async fn destroying_material_the_desired_state_still_pins_is_refused() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    let reference = deployment.stage(&tenant, MATERIAL).await;
+    let secret = reference.split('@').next().expect("a secret id").to_owned();
+
+    // A credential that pins exactly this version, published the ordinary way.
+    let head = deployment
+        .publish(
+            "/tenants",
+            "key-1",
+            EXPECTED_REVISION_EMPTY,
+            &tenant_document(),
+        )
+        .await;
+    let head = deployment
+        .publish("/providers", "key-2", &head, &provider_document())
+        .await;
+    let mut credential = credential_document();
+    credential["resource"]["secret"] = json!(secret);
+    credential["resource"]["secret_version"] = json!(1);
+    let head = deployment
+        .publish("/credentials", "key-3", &head, &credential)
+        .await;
+
+    let tombstone = json!({ "tenant": tenant, "reference": reference, "lifecycle": "tombstoned" });
+    let (status, refusal) = deployment
+        .post_material("/secrets/lifecycle", &tombstone)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "secret_in_use");
+
+    // Revocation is not gated the same way: a leaked key is withdrawable at
+    // once, and withdrawing it is what fails the *next* candidate rather than
+    // the snapshot serving now.
+    let (status, revoked) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({ "tenant": tenant, "reference": reference, "lifecycle": "revoked" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+
+    // Unpinned, and then destroyable: the credential is retired first, which is
+    // what stops a candidate revision from resolving the version at all.
+    let mut retire = credential_document();
+    retire["mutation"] = json!("update");
+    retire["resource"]["secret"] = json!(secret);
+    retire["resource"]["secret_version"] = json!(1);
+    retire["resource"]["lifecycle"] = json!("revoked");
+    deployment
+        .publish("/credentials", "key-4", &head, &retire)
+        .await;
+    let (status, destroyed) = deployment
+        .post_material("/secrets/lifecycle", &tombstone)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{destroyed}");
+    assert_eq!(destroyed["lifecycle"], "tombstoned");
+}
+
+#[tokio::test]
+async fn one_tenants_administrator_cannot_reach_another_tenants_material() {
+    let deployment = Deployment::with_authorizer(
+        FakeAdminAuthorizer::permissive().within(&[ResourceScope::Tenant(fixtures::tenant_id(1))]),
+    );
+    let ours = owning_tenant();
+    let theirs = fixtures::tenant_id(2).to_string();
+    let reference = deployment.stage(&ours, MATERIAL).await;
+    let secret = reference.split('@').next().expect("a secret id").to_owned();
+
+    let (status, refusal) = deployment
+        .post_material(
+            "/secrets",
+            &json!({ "tenant": theirs, "material": MATERIAL }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+    carries_no_material(&refusal);
+
+    // A grant that *is* held, aimed at material another tenant owns: the store
+    // answers as it does for a reference that was never stored, so this route is
+    // not a way to learn that one exists.
+    let deployment = Deployment::new();
+    deployment.secrets.seed(
+        crate::desired_state::secrets::SecretOwner::tenant(fixtures::tenant_id(2)),
+        crate::desired_state::secrets::SecretRef::parse(&reference).expect("a reference"),
+        MATERIAL,
+        crate::desired_state::secrets::SecretLifecycle::Active,
+    );
+    let (status, versions) = deployment
+        .get(&format!("/secrets/{secret}?tenant={ours}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{versions}");
+    assert_eq!(
+        versions,
+        json!({
+            "secret": secret,
+            "owner": ours,
+            "versions": [],
+        })
+    );
+    let (status, refusal) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({ "tenant": ours, "reference": reference, "lifecycle": "revoked" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "secret_not_found");
+}
+
+#[tokio::test]
+async fn tombstoning_a_foreign_pinned_version_is_not_an_existence_probe() {
+    let deployment = Deployment::new();
+    let ours = fixtures::tenant_id(1).to_string();
+    let theirs = fixtures::tenant_id(2).to_string();
+    let foreign_owner = crate::desired_state::secrets::SecretOwner::tenant(fixtures::tenant_id(2));
+    let foreign_reference = fixtures::secret_ref(12);
+
+    deployment.secrets.seed(
+        foreign_owner,
+        foreign_reference,
+        MATERIAL,
+        crate::desired_state::SecretLifecycle::Active,
+    );
+
+    // The desired state pins the foreign version as resolvable. A caller that
+    // owns tenant 1 must still receive the same not-found answer as for an
+    // unreferenced foreign version: ownership is established before this
+    // deployment-wide reference-use check.
+    let mut tenant = tenant_document();
+    tenant["resource"]["tenant"] = json!(theirs);
+    tenant["resource"]["slug"] = json!("globex");
+    let mut provider = provider_document();
+    provider["resource"]["tenant"] = json!(theirs);
+    let mut credential = credential_document();
+    credential["resource"]["tenant"] = json!(theirs);
+    credential["resource"]["secret"] = json!(foreign_reference.secret.to_string());
+
+    let mut head = deployment
+        .publish(
+            "/tenants",
+            "key-foreign-1",
+            EXPECTED_REVISION_EMPTY,
+            &tenant,
+        )
+        .await;
+    head = deployment
+        .publish("/providers", "key-foreign-2", &head, &provider)
+        .await;
+    deployment
+        .publish("/credentials", "key-foreign-3", &head, &credential)
+        .await;
+
+    let (status, pinned_refusal) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({
+                "tenant": ours,
+                "reference": foreign_reference.to_string(),
+                "lifecycle": "tombstoned",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{pinned_refusal}");
+    assert_eq!(pinned_refusal["error"]["type"], "secret_not_found");
+
+    let (status, absent_refusal) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({
+                "tenant": ours,
+                "reference": fixtures::secret_ref(99).to_string(),
+                "lifecycle": "tombstoned",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{absent_refusal}");
+    assert_eq!(absent_refusal["error"]["type"], "secret_not_found");
+}
+
+#[tokio::test]
+async fn a_body_that_carries_material_is_refused_without_echoing_it() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    // Valid JSON, wrong shape: serde renders the offending input into some of
+    // its messages, and the offending input here is a provider key.
+    let (status, refusal) = deployment
+        .post_material(
+            "/secrets",
+            &json!({ "tenant": tenant, "material": { "value": MATERIAL } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "admin_request_invalid");
+    carries_no_material(&refusal);
+
+    // Empty material is refused before it is stored, rather than becoming a
+    // version that can never authenticate anything.
+    let (status, refusal) = deployment
+        .post_material("/secrets", &json!({ "tenant": tenant, "material": "" }))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "secret_material_refused");
+
+    // A lifecycle value is not material by type, but it is still caller input
+    // and must not be copied into either the response or operator detail.
+    let lifecycle_value = "sk-lifecycle-value-must-not-echo";
+    let (status, refusal) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({
+                "tenant": tenant,
+                "reference": fixtures::secret_ref(12).to_string(),
+                "lifecycle": lifecycle_value,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "admin_request_invalid");
+    assert!(
+        !refusal.to_string().contains(lifecycle_value),
+        "caller input reached the response: {refusal}"
+    );
+
+    // A reference that names no version is refused: every operation here is
+    // aimed at an exact version.
+    let (status, refusal) = deployment
+        .post_material(
+            "/secrets/rotate",
+            &json!({
+                "tenant": tenant,
+                "reference": fixtures::secret_id(7).to_string(),
+                "material": ROTATED,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    carries_no_material(&refusal);
+}
+
+#[tokio::test]
+async fn a_secret_store_outage_refuses_the_call_and_names_no_backend_detail() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    deployment.secrets.set_unavailable(true);
+    let (status, refusal) = deployment
+        .post_material(
+            "/secrets",
+            &json!({ "tenant": tenant, "material": MATERIAL }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "secret_store_unavailable");
+    assert_eq!(refusal["error"]["retryable"], true);
+    carries_no_material(&refusal);
+}
+
+#[tokio::test]
+async fn material_calls_need_the_material_authority_and_not_the_publishing_one() {
+    let deployment =
+        Deployment::with_authorizer(FakeAdminAuthorizer::permitting(&[AdminAction::Publish]));
+    let tenant = owning_tenant();
+    let (status, refusal) = deployment
+        .post_material(
+            "/secrets",
+            &json!({ "tenant": tenant, "material": MATERIAL }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "admin_forbidden");
+    carries_no_material(&refusal);
 }

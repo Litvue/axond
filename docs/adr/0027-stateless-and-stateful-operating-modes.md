@@ -235,8 +235,11 @@ routes, and never share a credential type with them.
   [ADR 0016](./0016-minted-inbound-identity-and-principal-stores.md)) grant no
   administrative authority, and administrative identity grants no inference
   authority.
-- Every mutation is written transactionally with its audit event and accepts an
-  idempotency key, so retries are safe.
+- Every desired-state mutation is written transactionally with its audit event
+  and accepts an idempotency key, so retries are safe. SecretStore material
+  lifecycle calls are a separate boundary: they publish no desired-state
+  revision and therefore have no `AuditEvent`; their success record is the
+  material-free operational log described in ADR 0039.
 - **Administrative authority is a role at a scope.** A principal — an OIDC human
   or an Axond-owned workload of one tenant — holds roles, and a role permits an
   action on an administrative surface only within the scope it was granted at.

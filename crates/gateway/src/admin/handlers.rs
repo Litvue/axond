@@ -34,6 +34,10 @@ use super::reads::{
 };
 use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest, uuid_detail};
 use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi};
+use super::secrets::{
+    self, RotateSecretRequest, SecretLifecycleRequest, SecretTransitionView, SecretVersionView,
+    SecretVersionsView, StageSecretRequest,
+};
 use super::service::{AvailabilityAuthority, MutationOutcome};
 use crate::desired_state::{
     InvalidId, ModelLifecycle, MutationKind, OfferingId, ProjectId, ResourceScope, RevisionId,
@@ -71,6 +75,22 @@ pub(super) fn convergence_route() -> MethodRouter<Arc<AdminApi>> {
 
 pub(super) fn availability_route() -> MethodRouter<Arc<AdminApi>> {
     get(availability)
+}
+
+pub(super) fn stage_secret_route() -> MethodRouter<Arc<AdminApi>> {
+    post(stage_secret)
+}
+
+pub(super) fn rotate_secret_route() -> MethodRouter<Arc<AdminApi>> {
+    post(rotate_secret)
+}
+
+pub(super) fn secret_lifecycle_route() -> MethodRouter<Arc<AdminApi>> {
+    post(secret_lifecycle)
+}
+
+pub(super) fn secret_versions_route() -> MethodRouter<Arc<AdminApi>> {
+    get(secret_versions)
 }
 
 /// The buffered request body, or the administrative refusal for one that never
@@ -465,6 +485,102 @@ struct AvailabilityQuery {
     project: Option<String>,
 }
 
+/// Store material as a new secret's first version.
+///
+/// The one request body on this surface that carries material. It is parsed
+/// into [`secrets::PresentedMaterial`], which does not render and is moved into a
+/// zeroizing [`SecretMaterial`](crate::backends::secrets::SecretMaterial)
+/// before anything else sees it — including the refusal for a body that failed
+/// to parse, which reports serde's message about the *shape*.
+async fn stage_secret(
+    State(api): State<Arc<AdminApi>>,
+    identity: AdminIdentity,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<SecretVersionView>, AdminError> {
+    const SCHEMA: &str = "secret";
+    let body = document(SCHEMA, body)?;
+    let request: StageSecretRequest = secret_document(SCHEMA, &body)?;
+    let owner = secrets::owner_of(SCHEMA, &request.tenant, request.project.as_deref())?;
+    let material = secrets::material_of(SCHEMA, request.material)?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::WriteSecrets,
+            Surface::Credential,
+            &owner.scope(),
+        )
+        .await?;
+    Ok(Json(
+        api.service.stage_secret(&grant, owner, material).await?,
+    ))
+}
+
+/// Store material as the next version of an existing secret.
+async fn rotate_secret(
+    State(api): State<Arc<AdminApi>>,
+    identity: AdminIdentity,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<SecretVersionView>, AdminError> {
+    const SCHEMA: &str = "secret_rotation";
+    let body = document(SCHEMA, body)?;
+    let request: RotateSecretRequest = secret_document(SCHEMA, &body)?;
+    let owner = secrets::owner_of(SCHEMA, &request.tenant, request.project.as_deref())?;
+    let reference = secrets::reference_of(SCHEMA, &request.reference)?;
+    let material = secrets::material_of(SCHEMA, request.material)?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::WriteSecrets,
+            Surface::Credential,
+            &owner.scope(),
+        )
+        .await?;
+    Ok(Json(
+        api.service
+            .rotate_secret(&grant, owner, reference, material)
+            .await?,
+    ))
+}
+
+/// Activate, disable, revoke, or destroy one version's material.
+async fn secret_lifecycle(
+    State(api): State<Arc<AdminApi>>,
+    identity: AdminIdentity,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<SecretTransitionView>, AdminError> {
+    const SCHEMA: &str = "secret_lifecycle";
+    let body = document(SCHEMA, body)?;
+    // This body carries no material, but an operator who posts the wrong one to
+    // it has: parsed like the routes that do, so the mistake is refused without
+    // the mistake being quoted back.
+    let request: SecretLifecycleRequest = secret_document(SCHEMA, &body)?;
+    let owner = secrets::owner_of(SCHEMA, &request.tenant, request.project.as_deref())?;
+    let reference = secrets::reference_of(SCHEMA, &request.reference)?;
+    let next = secrets::lifecycle_of(SCHEMA, &request.lifecycle)?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::WriteSecrets,
+            Surface::Credential,
+            &owner.scope(),
+        )
+        .await?;
+    Ok(Json(
+        api.service
+            .move_secret(&grant, owner, reference, next)
+            .await?,
+    ))
+}
+
+/// What a versions read names: whose material, and which secret.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretVersionsQuery {
+    tenant: String,
+    #[serde(default)]
+    project: Option<String>,
+}
+
 /// What this replica derives about one scope's models — answered from the
 /// snapshot it is serving and its own circuits, so it survives the control-plane
 /// or provider outage that prompted the question.
@@ -525,8 +641,67 @@ async fn availability(
     Ok(Conditional::new(&headers, result))
 }
 
+/// Every version of one secret, with the state each is in — and no material,
+/// because the store has no method that would return any.
+///
+/// Conditional like the rest of the administrative read surface: an operator
+/// watching a staged version reach `active` polls this, and the validator turns
+/// the reads between two lifecycle moves into a header comparison. The digest is
+/// over a projection of references and states, so it discloses nothing the
+/// caller was not already authorized to read.
+async fn secret_versions(
+    State(api): State<Arc<AdminApi>>,
+    identity: AdminIdentity,
+    headers: HeaderMap,
+    Path(secret): Path<String>,
+    query: Result<Query<SecretVersionsQuery>, QueryRejection>,
+) -> Result<Conditional<SecretVersionsView>, AdminError> {
+    const SCHEMA: &str = "secret_versions";
+    let Query(query) = query.map_err(|rejection| AdminError::RequestInvalid {
+        schema: SCHEMA,
+        detail: rejection.body_text(),
+    })?;
+    let owner = secrets::owner_of(SCHEMA, &query.tenant, query.project.as_deref())?;
+    let secret = secrets::secret_of(SCHEMA, &secret)?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::ReadSecrets,
+            Surface::Credential,
+            &owner.scope(),
+        )
+        .await?;
+    Ok(Conditional::new(
+        &headers,
+        api.service.secret_versions(&grant, owner, secret).await?,
+    ))
+}
+
+/// Parse a body that carries material.
+///
+/// Separate from the other documents' inline `from_slice` for one reason: serde
+/// renders the offending *input* into some of its messages, and this is the only
+/// input on the surface that may be a credential. The refusal therefore says
+/// which schema rejected it and nothing about what was in it — an administrator
+/// debugging a malformed body has the request they sent, and the alternative is
+/// a provider key in a log line.
+fn secret_document<T: serde::de::DeserializeOwned>(
+    schema: &'static str,
+    body: &Bytes,
+) -> Result<T, AdminError> {
+    serde_json::from_slice(body).map_err(|error| AdminError::RequestInvalid {
+        schema,
+        detail: format!(
+            "the document is not a valid `{schema}` request (line {}, column {}); its text is not \
+             reported, because it carries material",
+            error.line(),
+            error.column()
+        ),
+    })
+}
+
 /// The scope a request names, from an optional tenant and project.
-fn scope_of(
+pub(super) fn scope_of(
     schema: &'static str,
     tenant: Option<&str>,
     project: Option<&str>,

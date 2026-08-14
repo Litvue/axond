@@ -34,6 +34,8 @@ use serde::Serialize;
 
 use super::auth::AdminAuthError;
 use crate::backends::control_plane::ControlPlaneError;
+use crate::backends::secrets::SecretError;
+use crate::desired_state::secrets::SecretRef;
 use crate::desired_state::{
     CanonicalError, ExpectedRevision, IdempotencyKey, InvalidIdempotencyKey, ResourceRef,
     RevisionId, ValidationError,
@@ -163,6 +165,56 @@ pub enum AdminError {
     RouteNotFound,
     #[error("that method is not allowed on this /admin/v1 route")]
     MethodNotAllowed,
+    /// The secret store is unreachable. Administration of material is degraded;
+    /// inference is not, and neither is any revision already compiled — a
+    /// snapshot holds the material it was published against.
+    #[error("the secret store is unavailable")]
+    SecretStoreUnavailable { detail: String },
+    /// No such secret version *for this owner*. Material another owner holds is
+    /// reported identically, which is the whole point: an administrator must not
+    /// be able to probe this route to learn that another tenant's reference
+    /// exists.
+    #[error("{reference} is not stored")]
+    SecretNotFound { reference: SecretRef },
+    /// The version exists and its lifecycle state does not permit what was
+    /// asked — rotating from a tombstoned version, resolving a revoked one, or a
+    /// move the lifecycle matrix does not define. A move to the state a version
+    /// is already in is not this: it succeeds, unchanged.
+    #[error("{reference} cannot do that in its current state: {detail}")]
+    SecretLifecycleRefused {
+        reference: SecretRef,
+        detail: String,
+    },
+    /// Destroying material the current desired state still pins. The caller's
+    /// fix is to publish a credential that no longer references this version and
+    /// then tombstone it, which is why the refusal is a conflict rather than a
+    /// forbidden lifecycle move.
+    #[error(
+        "{reference} is still referenced by the current revision; publish a credential that \
+             no longer pins it before destroying its material"
+    )]
+    SecretInUse { reference: SecretRef },
+    /// The version a rotation would mint is already stored, so the rotation this
+    /// request asks for has already happened — by an earlier attempt of the same
+    /// request, or by another administrator. The caller's fix is to re-read the
+    /// versions of the secret and rotate from its current one; replaying this
+    /// request cannot succeed, and the material it presented was never examined.
+    #[error(
+        "{reference} already exists, so this rotation has already been performed; re-read the \
+             secret's versions and rotate from the current one"
+    )]
+    SecretVersionExists { reference: SecretRef },
+    /// The material presented is not storable — empty, or otherwise refused by
+    /// the store before anything was sealed. The detail is retained only for
+    /// internal classification; secret-operation logging deliberately drops it.
+    #[error("the presented secret material was refused")]
+    SecretMaterialRefused { detail: String },
+    /// Stored material this replica cannot unwrap, or a store that refused the
+    /// operation outright: a rotated or wrong deployment KEK, a damaged record,
+    /// a schema this build does not read. An operator acts; a retry does not
+    /// help.
+    #[error("the secret store could not complete the operation")]
+    SecretStoreUnusable { detail: String },
 }
 
 impl AdminError {
@@ -196,6 +248,13 @@ impl AdminError {
         "admin_request_too_large",
         "admin_route_not_found",
         "admin_method_not_allowed",
+        "secret_store_unavailable",
+        "secret_not_found",
+        "secret_lifecycle_refused",
+        "secret_in_use",
+        "secret_version_exists",
+        "secret_material_refused",
+        "secret_store_unusable",
     ];
 
     pub const fn code(&self) -> &'static str {
@@ -226,6 +285,13 @@ impl AdminError {
             Self::RequestTooLarge { .. } => "admin_request_too_large",
             Self::RouteNotFound => "admin_route_not_found",
             Self::MethodNotAllowed => "admin_method_not_allowed",
+            Self::SecretStoreUnavailable { .. } => "secret_store_unavailable",
+            Self::SecretNotFound { .. } => "secret_not_found",
+            Self::SecretLifecycleRefused { .. } => "secret_lifecycle_refused",
+            Self::SecretInUse { .. } => "secret_in_use",
+            Self::SecretVersionExists { .. } => "secret_version_exists",
+            Self::SecretMaterialRefused { .. } => "secret_material_refused",
+            Self::SecretStoreUnusable { .. } => "secret_store_unusable",
         }
     }
 
@@ -244,28 +310,35 @@ impl AdminError {
             | Self::AuditSummaryInvalid
             | Self::DryRunInvalid
             | Self::HistoryLimitInvalid { .. }
-            | Self::RequestInvalid { .. } => StatusCode::BAD_REQUEST,
+            | Self::RequestInvalid { .. }
+            | Self::SecretMaterialRefused { .. } => StatusCode::BAD_REQUEST,
             Self::RevisionConflict { .. }
             | Self::IdempotencyKeyReused { .. }
             | Self::NameTaken { .. }
-            | Self::ImmutableResourceVersion { .. } => StatusCode::CONFLICT,
+            | Self::ImmutableResourceVersion { .. }
+            | Self::SecretLifecycleRefused { .. }
+            | Self::SecretInUse { .. }
+            | Self::SecretVersionExists { .. } => StatusCode::CONFLICT,
             Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::RevisionNotFound(_) | Self::RouteNotFound => StatusCode::NOT_FOUND,
+            Self::RevisionNotFound(_) | Self::RouteNotFound | Self::SecretNotFound { .. } => {
+                StatusCode::NOT_FOUND
+            }
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             // Stateless mode is not a failure and not a misconfiguration: the
             // surface is unimplemented *for this deployment*, which is what
             // `501` means.
             Self::StatefulModeRequired => StatusCode::NOT_IMPLEMENTED,
-            Self::ControlPlaneUnavailable { .. } | Self::IdentityProviderUnavailable => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::ControlPlaneUnavailable { .. }
+            | Self::IdentityProviderUnavailable
+            | Self::SecretStoreUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             // Unreadable, incompatible, oversized, and refused storage are all
             // "this replica cannot serve the request, and retrying will not
             // change that": an operator acts, the caller does not.
             Self::RevisionUnreadable { .. }
             | Self::RevisionIncompatible { .. }
             | Self::RevisionTooLarge { .. }
-            | Self::ControlPlaneDenied { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::ControlPlaneDenied { .. }
+            | Self::SecretStoreUnusable { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -278,7 +351,9 @@ impl AdminError {
     pub const fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::ControlPlaneUnavailable { .. } | Self::IdentityProviderUnavailable
+            Self::ControlPlaneUnavailable { .. }
+                | Self::IdentityProviderUnavailable
+                | Self::SecretStoreUnavailable { .. }
         )
     }
 
@@ -294,8 +369,65 @@ impl AdminError {
             | Self::ControlPlaneUnavailable { detail }
             | Self::ControlPlaneDenied { detail }
             | Self::NameTaken { detail, .. }
-            | Self::RequestInvalid { detail, .. } => Some(detail),
+            | Self::RequestInvalid { detail, .. }
+            | Self::SecretStoreUnavailable { detail }
+            | Self::SecretLifecycleRefused { detail, .. }
+            | Self::SecretMaterialRefused { detail }
+            | Self::SecretStoreUnusable { detail } => Some(detail),
             _ => None,
+        }
+    }
+
+    /// The secret version this refusal is about, if it is about one.
+    ///
+    /// A reference, never material: that is the whole of what a secret refusal
+    /// is allowed to carry, and [`SecretError`] has nothing else to give it.
+    pub const fn secret(&self) -> Option<SecretRef> {
+        match self {
+            Self::SecretNotFound { reference }
+            | Self::SecretLifecycleRefused { reference, .. }
+            | Self::SecretInUse { reference }
+            | Self::SecretVersionExists { reference } => Some(*reference),
+            _ => None,
+        }
+    }
+
+    /// Translate a secret-store failure into the administrative vocabulary.
+    ///
+    /// Exhaustive, like [`Self::from_control_plane`], and lossy in exactly one
+    /// direction: [`SecretError::Ownership`] becomes the same
+    /// [`Self::SecretNotFound`] an absent reference does, so this surface cannot
+    /// be used to discover that another owner's version exists. The distinction
+    /// survives in the log line the caller never sees.
+    pub fn from_secret(error: SecretError) -> Self {
+        match error {
+            SecretError::Unavailable { backend, message } => Self::SecretStoreUnavailable {
+                detail: format!("{backend}: {message}"),
+            },
+            SecretError::NotFound(reference) | SecretError::Ownership { reference, .. } => {
+                Self::SecretNotFound { reference }
+            }
+            SecretError::Lifecycle { reference, state } => Self::SecretLifecycleRefused {
+                reference,
+                detail: format!("the material is {state}"),
+            },
+            SecretError::Transition { reference, source } => Self::SecretLifecycleRefused {
+                reference,
+                detail: source.to_string(),
+            },
+            // Not a material refusal: nothing was examined about the material,
+            // and reporting a good key as bad is how an operator comes to
+            // re-issue one that was never at fault.
+            SecretError::VersionExists { reference } => Self::SecretVersionExists { reference },
+            SecretError::Corrupt { detail } => Self::SecretStoreUnusable { detail },
+            SecretError::Invalid(detail) => Self::SecretMaterialRefused { detail },
+            SecretError::Unwrap { reference, kek } => Self::SecretStoreUnusable {
+                // The KEK *reference* is a configured name, not key material.
+                detail: format!("{reference} could not be unwrapped under `{kek}`"),
+            },
+            SecretError::Denied { backend, message } => Self::SecretStoreUnusable {
+                detail: format!("{backend}: {message}"),
+            },
         }
     }
 
@@ -340,7 +472,13 @@ impl AdminError {
                 message: self.to_string(),
                 retryable: self.retryable(),
                 rule: self.rule(),
-                resource: self.reference().map(|reference| reference.to_string()),
+                resource: self
+                    .reference()
+                    .map(|reference| reference.to_string())
+                    // A secret refusal names the version it is about in the same
+                    // field a resource refusal names its resource: both are
+                    // opaque identifiers the caller already had.
+                    .or_else(|| self.secret().map(|reference| reference.to_string())),
                 revision: self.revision().map(|revision| revision.to_string()),
             },
         }

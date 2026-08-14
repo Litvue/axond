@@ -67,6 +67,7 @@ use super::reads::{
 };
 use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
+use crate::backends::secrets::SecretStore;
 use crate::config::Mode;
 use crate::convergence::RevisionReport;
 use crate::desired_state::{
@@ -200,6 +201,15 @@ pub struct AdminService {
     /// `None` in stateless mode — and there is no other way to hold `None`, so a
     /// stateless service cannot reach a backend it does not have.
     store: Option<Arc<dyn ControlPlaneStore>>,
+    /// The secret store the material routes administer, `None` when this
+    /// deployment has none. Held beside the control plane rather than inside it
+    /// because they are two stores with two failure modes: the control plane
+    /// being unreachable does not make material unreadable, and the reverse.
+    ///
+    /// Nothing on the request path can reach it from here — [`AdminService`] is
+    /// constructed only by the administrative runtime, and [`crate::routes`]
+    /// holds no [`AdminApi`](super::router::AdminApi).
+    pub(super) secrets: Option<Arc<dyn SecretStore>>,
     ids: Uuid7Generator,
 }
 
@@ -209,6 +219,7 @@ impl AdminService {
     pub fn stateless() -> Self {
         Self {
             store: None,
+            secrets: None,
             ids: Uuid7Generator::new(),
         }
     }
@@ -216,8 +227,17 @@ impl AdminService {
     pub fn stateful(store: Arc<dyn ControlPlaneStore>) -> Self {
         Self {
             store: Some(store),
+            secrets: None,
             ids: Uuid7Generator::new(),
         }
+    }
+
+    /// The service a stateful deployment runs: a control plane, and the secret
+    /// store whose material its credential references name.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
+        self.secrets = Some(secrets);
+        self
     }
 
     /// The service for a validated configuration: a store is present exactly when
@@ -238,7 +258,7 @@ impl AdminService {
     }
 
     /// The store, or the typed refusal a stateless deployment owes.
-    fn store(&self) -> Result<&Arc<dyn ControlPlaneStore>, AdminError> {
+    pub(super) fn store(&self) -> Result<&Arc<dyn ControlPlaneStore>, AdminError> {
         self.store.as_ref().ok_or(AdminError::StatefulModeRequired)
     }
 
@@ -760,7 +780,26 @@ impl AdminService {
 /// The operator detail — which may name a host, a DSN, or a driver internal — is
 /// logged here and dropped from the response, so the caller learns the category
 /// and the operator learns the cause.
-fn log_store(error: ControlPlaneError) -> AdminError {
+pub(super) fn log_secret(error: crate::backends::secrets::SecretError) -> AdminError {
+    let error = AdminError::from_secret(error);
+    // Material refusals are deliberately not operational diagnostics: their
+    // backend detail is caller-adjacent input and must never become a log field.
+    // Secret lifecycle logs below carry only references and ownership metadata;
+    // audit attribution remains a separate durable control-plane concern.
+    if !matches!(error, AdminError::SecretMaterialRefused { .. })
+        && let Some(detail) = error.operator_detail()
+    {
+        warn!(code = error.code(), detail, "secret-store operation failed");
+    }
+    error
+}
+
+/// Translate a control-plane failure and log the part that does not travel.
+///
+/// The operator detail — which may name a host, a DSN, or a driver internal — is
+/// logged here and dropped from the response, so the caller learns the category
+/// and the operator learns the cause.
+pub(super) fn log_store(error: ControlPlaneError) -> AdminError {
     let error = AdminError::from_control_plane(error);
     if let Some(detail) = error.operator_detail() {
         warn!(

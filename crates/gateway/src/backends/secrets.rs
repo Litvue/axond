@@ -53,6 +53,7 @@ use secrecy::zeroize::Zeroize;
 use secrecy::{ExposeSecret, SecretString};
 
 use super::{BackendFailure, BackendKind, Capabilities, Capability, FailureCategory};
+use crate::desired_state::ids::SecretId;
 use crate::desired_state::secrets::{
     ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,
 };
@@ -216,6 +217,19 @@ pub enum SecretError {
         #[source]
         source: ForbiddenTransition,
     },
+    /// The version a rotation would mint is already stored.
+    ///
+    /// A version is immutable, so this is the outcome of rotating twice from one
+    /// base reference — the second call's work was already done, by the first or
+    /// by another administrator. Distinct from [`Self::Invalid`] because the
+    /// material presented with it was never examined: reporting it as a bad key
+    /// is how an operator comes to re-issue a good one.
+    #[error("secret {reference} is already stored, so it cannot be minted again")]
+    VersionExists { reference: SecretRef },
+    /// Stored metadata cannot be interpreted. This is a store problem, not a
+    /// refusal of material presented by the caller.
+    #[error("secret store metadata is corrupt: {detail}")]
+    Corrupt { detail: String },
     #[error("invalid secret request: {0}")]
     Invalid(String),
     #[error("secret store `{backend}` refused the operation: {message}")]
@@ -233,6 +247,10 @@ impl BackendFailure for SecretError {
             // holder, from one that was never stored.
             Self::NotFound(_) | Self::Ownership { .. } => FailureCategory::NotFound,
             Self::Unwrap { .. } => FailureCategory::Corrupt,
+            // The caller's request lost to a rotation that already happened,
+            // which is what a conflict is: replaying it cannot win.
+            Self::VersionExists { .. } => FailureCategory::Conflict,
+            Self::Corrupt { .. } => FailureCategory::Corrupt,
             Self::Invalid(_) => FailureCategory::Invalid,
             Self::Lifecycle { .. } | Self::Transition { .. } | Self::Denied { .. } => {
                 FailureCategory::Denied
@@ -351,6 +369,23 @@ pub trait SecretStore: SecretResolver {
         owner: SecretOwner,
         reference: &SecretRef,
     ) -> Result<SecretDescriptor, SecretError>;
+
+    /// Every version of one secret this owner holds, oldest version first.
+    ///
+    /// The overlap a rotation creates is only administrable if it is visible: an
+    /// operator activating a staged version, and then withdrawing the one it
+    /// supersedes, is acting on two versions that exist at once. This is the read
+    /// that shows both, and — like [`SecretStore::describe`] — it unwraps
+    /// nothing.
+    ///
+    /// A secret another owner holds answers with no versions, exactly as one that
+    /// was never stored does, so listing is not a way to learn that a foreign
+    /// secret exists.
+    async fn versions(
+        &self,
+        owner: SecretOwner,
+        secret: SecretId,
+    ) -> Result<Vec<SecretDescriptor>, SecretError>;
 }
 
 /// Build the configured store, resolving its DSN and its KEK from the
@@ -597,7 +632,15 @@ mod tests {
             .rotate(owner(), &first, SecretMaterial::new("sk-live-3".to_owned()))
             .await
             .expect_err("a version is immutable once it is stored");
-        assert_eq!(error.category(), FailureCategory::Invalid);
+        // A conflict, not an invalid request: the presented material was never
+        // examined, so the answer must not accuse it of anything.
+        assert_eq!(
+            error,
+            SecretError::VersionExists {
+                reference: second.reference
+            }
+        );
+        assert_eq!(error.category(), FailureCategory::Conflict);
         assert_eq!(
             store
                 .resolve(owner(), &second.reference)

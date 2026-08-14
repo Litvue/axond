@@ -299,12 +299,53 @@ pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
             action: AdminAction::Publish,
             router: handlers::publish_route::<PolicyRequest>,
         },
+        // Material, not documents: the four rows that make a credential
+        // rotatable without a redeploy. None of them publishes a revision, so
+        // none of them carries the mutation preconditions — see
+        // [`super::secrets`].
+        AdminRouteSpec {
+            path: "/secrets",
+            action: AdminAction::WriteSecrets,
+            router: handlers::stage_secret_route,
+        },
+        AdminRouteSpec {
+            path: "/secrets/rotate",
+            action: AdminAction::WriteSecrets,
+            router: handlers::rotate_secret_route,
+        },
+        AdminRouteSpec {
+            path: "/secrets/lifecycle",
+            action: AdminAction::WriteSecrets,
+            router: handlers::secret_lifecycle_route,
+        },
+        AdminRouteSpec {
+            path: "/secrets/{secret}",
+            action: AdminAction::ReadSecrets,
+            router: handlers::secret_versions_route,
+        },
         AdminRouteSpec {
             path: "/rollback",
             action: AdminAction::Rollback,
             router: handlers::rollback_route,
         },
     ]
+}
+
+/// A request path for `spec`, with every path parameter filled by a value of the
+/// shape that parameter accepts.
+///
+/// The loops that assert something about *every* shipped route build a URI from
+/// [`AdminRouteSpec::path`], and a parameter left as a literal `{name}` would
+/// make them assert against a path the caller could never send: substitution
+/// therefore lives beside the table, so a spec that introduces a parameter is
+/// filled in one place rather than in each loop that forgot.
+#[cfg(test)]
+pub(super) fn concrete_path(spec: &AdminRouteSpec) -> String {
+    use crate::desired_state::fixtures;
+
+    spec.path
+        .replace("{revision}", &fixtures::revision_id(1).to_string())
+        .replace("{secret}", &fixtures::secret_id(1).to_string())
 }
 
 /// The inbound bound on an administrative document, declared rather than

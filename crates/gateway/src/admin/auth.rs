@@ -265,6 +265,21 @@ pub enum AdminAction {
     Publish,
     /// Republish an earlier revision's desired state.
     Rollback,
+    /// Read what secret material exists: references, owners, and lifecycle
+    /// states. Never material — there is no action that reads material, because
+    /// there is no route that returns it.
+    ReadSecrets,
+    /// Store, rotate, or move the lifecycle of secret material.
+    ///
+    /// Separate from [`Self::Publish`] rather than folded into it, even though
+    /// both are administrative writes, because they write to different stores
+    /// with different consequences. Publishing changes which *references* a
+    /// revision pins and is reversible by rollback; this puts material into the
+    /// secret store and takes it back out, and revocation is not reversible at
+    /// all. An operator trusted to publish a credential document naming an
+    /// already-staged version is not thereby trusted to destroy the material it
+    /// names, and a single verb would make those one grant.
+    WriteSecrets,
 }
 
 impl AdminAction {
@@ -276,6 +291,8 @@ impl AdminAction {
         Self::ReadAvailability,
         Self::Publish,
         Self::Rollback,
+        Self::ReadSecrets,
+        Self::WriteSecrets,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -287,13 +304,35 @@ impl AdminAction {
             Self::ReadAvailability => "read_availability",
             Self::Publish => "publish",
             Self::Rollback => "rollback",
+            Self::ReadSecrets => "read_secrets",
+            Self::WriteSecrets => "write_secrets",
         }
     }
 
     /// Whether this action publishes a revision, and therefore requires an
     /// idempotency key and an expected revision.
+    ///
+    /// [`Self::WriteSecrets`] is a write and is still not one of them: it
+    /// changes the secret store, not desired state, so there is no revision for
+    /// a caller to have expected and none for its change to conflict with. What
+    /// stands in for the preconditions is the shape of the operations
+    /// themselves — staging mints a fresh version rather than overwriting one,
+    /// and a lifecycle move to the state a version already holds is
+    /// [`LifecycleTransition::Unchanged`], so a retried call is not a second
+    /// change.
+    ///
+    /// [`LifecycleTransition::Unchanged`]: crate::desired_state::secrets::LifecycleTransition::Unchanged
     pub const fn mutates(self) -> bool {
         matches!(self, Self::Publish | Self::Rollback)
+    }
+
+    /// Whether the route this action guards changes something, and is therefore
+    /// reached with `POST` rather than `GET`.
+    ///
+    /// Wider than [`Self::mutates`] by exactly [`Self::WriteSecrets`]: what
+    /// separates the two is the revision preconditions, not the verb.
+    pub const fn writes(self) -> bool {
+        self.mutates() || matches!(self, Self::WriteSecrets)
     }
 
     /// The action that publishing `kind` requires authority for.
@@ -314,10 +353,13 @@ impl AdminAction {
 
     /// The [`Action`] a denial of this verb is recorded as.
     ///
-    /// [`Action::Rotate`] is never produced here: a credential rotation arrives
-    /// as [`Self::Publish`] of a credential document, and the denial trail
-    /// records what the caller was refused — reaching the surface at all —
-    /// rather than which field of a document it would have changed.
+    /// [`Action::Rotate`] is produced for exactly one verb, and it is not
+    /// publication: a credential *document* changes which version is pinned and
+    /// records as an update, while [`Self::WriteSecrets`] is the verb that puts
+    /// material in place and takes it out — which is what an investigator means
+    /// by a rotation. Neither records which field a document would have changed;
+    /// the trail records what the caller was refused, which is reaching the
+    /// surface at all.
     pub const fn recorded_action(self) -> Action {
         match self {
             Self::ReadState
@@ -325,7 +367,9 @@ impl AdminAction {
             | Self::ReadAudit
             | Self::ReadConvergence
             | Self::ReadAvailability => Action::Read,
+            Self::ReadSecrets => Action::Read,
             Self::Publish | Self::Rollback => Action::Update,
+            Self::WriteSecrets => Action::Rotate,
         }
     }
 }

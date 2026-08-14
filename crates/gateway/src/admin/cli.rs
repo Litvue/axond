@@ -64,6 +64,91 @@ const RESOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+/// `axond admin secret`: the credential lifecycle, without a redeploy.
+///
+/// Material is read from a file or standard input, never from a flag: a flag is
+/// in the shell history and in every `ps` listing on the host, which is the same
+/// reason the administrative credential is an environment variable. A single
+/// trailing newline is stripped, because `echo` and every editor add one and a
+/// provider key does not end in one.
+fn secret_command() -> Command {
+    let tenant = || {
+        Arg::new("tenant")
+            .long("tenant")
+            .required(true)
+            .help("Tenant that owns the material")
+    };
+    let project = || {
+        Arg::new("project")
+            .long("project")
+            .help("Project that owns the material; requires --tenant")
+    };
+    let material = || {
+        Arg::new("material-file")
+            .long("material-file")
+            .short('f')
+            .help("File holding the material; `-` (the default) reads standard input")
+    };
+    let reference = |help: &'static str| {
+        Arg::new("reference")
+            .long("reference")
+            .required(true)
+            .help(help)
+    };
+    Command::new("secret")
+        .about("Store, rotate, and withdraw credential material")
+        .long_about(
+            "Store, rotate, and withdraw credential material.\n\nNothing here publishes a \
+             revision: a credential document pinning a new version is `axond admin apply \
+             --resource credentials`, with its own idempotency key and expected revision. And \
+             nothing here reads material back \u{2014} there is no route that returns it.",
+        )
+        .subcommand_required(true)
+        .subcommand(
+            Command::new("stage")
+                .about("Store material as a new secret's first version, staged")
+                .arg(tenant())
+                .arg(project())
+                .arg(material()),
+        )
+        .subcommand(
+            Command::new("rotate")
+                .about("Store material as the next version of an existing secret, staged")
+                .arg(tenant())
+                .arg(project())
+                .arg(reference(
+                    "The exact version being rotated from, as `sct_\u{2026}@v1`",
+                ))
+                .arg(material()),
+        )
+        .subcommand(
+            Command::new("lifecycle")
+                .about("Activate, disable, revoke, or destroy one version's material")
+                .arg(tenant())
+                .arg(project())
+                .arg(reference("The exact version to move, as `sct_\u{2026}@v2`"))
+                .arg(
+                    Arg::new("state")
+                        .long("state")
+                        .required(true)
+                        .value_parser(["staged", "active", "disabled", "revoked", "tombstoned"])
+                        .help("The state to move the version to"),
+                ),
+        )
+        .subcommand(
+            Command::new("versions")
+                .about("Every version of one secret and the state each is in")
+                .arg(
+                    Arg::new("secret")
+                        .long("secret")
+                        .required(true)
+                        .help("The secret to list, as `sct_\u{2026}`"),
+                )
+                .arg(tenant())
+                .arg(project()),
+        )
+}
+
 pub fn command() -> Command {
     let endpoint = Arg::new("endpoint")
         .long("endpoint")
@@ -173,6 +258,7 @@ pub fn command() -> Command {
                         .help("Validate and diff the candidate without publishing anything"),
                 ),
         )
+        .subcommand(secret_command())
         .subcommand(
             Command::new("rollback")
                 .about("Republish an earlier revision's complete state as a new revision")
@@ -302,6 +388,7 @@ fn plan(name: &str, args: &ArgMatches, env: &HashMap<String, String>) -> anyhow:
                 body: Some(body.to_string()),
             }
         }
+        "secret" => secret_call(args)?,
         other => unreachable!("clap validates subcommands: {other}"),
     };
     // Read only to fail early on a missing credential, before a connection is
@@ -310,6 +397,99 @@ fn plan(name: &str, args: &ArgMatches, env: &HashMap<String, String>) -> anyhow:
         anyhow::bail!("${TOKEN_ENV} is not set: `axond admin` needs an administrative credential");
     }
     Ok(call)
+}
+
+/// One `axond admin secret` call.
+fn secret_call(args: &ArgMatches) -> anyhow::Result<Call> {
+    let (name, args) = args
+        .subcommand()
+        .expect("clap requires an `axond admin secret` subcommand");
+    let mut body = serde_json::Map::new();
+    if name != "versions" {
+        body.insert(
+            "tenant".to_owned(),
+            serde_json::Value::String(required(args, "tenant").to_owned()),
+        );
+        if let Some(project) = args.get_one::<String>("project") {
+            body.insert(
+                "project".to_owned(),
+                serde_json::Value::String(project.clone()),
+            );
+        }
+    }
+    let call = match name {
+        "stage" => {
+            body.insert("material".to_owned(), material(args)?);
+            Call {
+                method: Method::POST,
+                path: "secrets".to_owned(),
+                query: Vec::new(),
+                body: Some(serde_json::Value::Object(body).to_string()),
+            }
+        }
+        "rotate" => {
+            body.insert(
+                "reference".to_owned(),
+                serde_json::Value::String(required(args, "reference").to_owned()),
+            );
+            body.insert("material".to_owned(), material(args)?);
+            Call {
+                method: Method::POST,
+                path: "secrets/rotate".to_owned(),
+                query: Vec::new(),
+                body: Some(serde_json::Value::Object(body).to_string()),
+            }
+        }
+        "lifecycle" => {
+            body.insert(
+                "reference".to_owned(),
+                serde_json::Value::String(required(args, "reference").to_owned()),
+            );
+            body.insert(
+                "lifecycle".to_owned(),
+                serde_json::Value::String(required(args, "state").to_owned()),
+            );
+            Call {
+                method: Method::POST,
+                path: "secrets/lifecycle".to_owned(),
+                query: Vec::new(),
+                body: Some(serde_json::Value::Object(body).to_string()),
+            }
+        }
+        "versions" => {
+            let mut query = vec![("tenant".to_owned(), required(args, "tenant").to_owned())];
+            if let Some(project) = args.get_one::<String>("project") {
+                query.push(("project".to_owned(), project.clone()));
+            }
+            Call {
+                method: Method::GET,
+                path: format!("secrets/{}", required(args, "secret")),
+                query,
+                body: None,
+            }
+        }
+        other => unreachable!("clap validates subcommands: {other}"),
+    };
+    Ok(call)
+}
+
+/// The material a secret command sends, from a file or standard input.
+///
+/// One trailing newline is stripped and nothing else is: material is bytes an
+/// operator pasted, and trimming it further would silently store something other
+/// than the key they hold.
+fn material(args: &ArgMatches) -> anyhow::Result<serde_json::Value> {
+    let mut material = document(args.get_one::<String>("material-file").map(String::as_str))?;
+    if material.ends_with('\n') {
+        material.pop();
+        if material.ends_with('\r') {
+            material.pop();
+        }
+    }
+    if material.is_empty() {
+        anyhow::bail!("no material was read: pass --material-file, or pipe it on standard input");
+    }
+    Ok(serde_json::Value::String(material))
 }
 
 /// The mutation document, from a file or standard input.

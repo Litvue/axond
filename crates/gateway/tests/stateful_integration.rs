@@ -224,6 +224,17 @@ fn every_gate_has_a_scenario_that_exists() {
     }
 }
 
+#[test]
+fn integration_kek_fixture_is_base64_encoded_32_bytes() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let encoded = stateful::integration_kek();
+    let decoded = STANDARD
+        .decode(encoded.as_bytes())
+        .expect("the stateful fixture KEK is valid base64");
+    assert_eq!(decoded.len(), 32, "the stateful fixture KEK is 32 bytes");
+}
+
 /// A `Wired` gate's evidence has to *run* somewhere a merge cannot skip.
 ///
 /// The datastore scenarios skip without `AXOND_TEST_POSTGRES_DSN`, the way the
@@ -289,10 +300,7 @@ fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>, SocketAddr)
             stateful::DSN_ENV,
             "postgres://axond@127.0.0.1:1/axond".to_owned(),
         ),
-        (
-            stateful::KEK_ENV,
-            "integration-test-kek-0123456789abcdef".to_owned(),
-        ),
+        (stateful::KEK_ENV, stateful::integration_kek()),
         (
             stateful::BREAKGLASS_ENV,
             "integration-test-breakglass".to_owned(),
@@ -379,7 +387,156 @@ async fn stateful_boot_serves_administration_and_refuses_inference() {
     );
     let replica = control_plane.serve().await;
 
-    // 1. The administrative surface is served and authenticated. An unauthorized
+    // 0. Boot opened the SecretStore in this scenario's own schema. A store left
+    //    on the search path's default would hold every concurrent scenario's
+    //    material in one table, and the fixture's `DROP SCHEMA` would leave it
+    //    behind.
+    assert!(
+        control_plane.table_exists("axond_secret").await,
+        "the replica's SecretStore must be the scenario's, not `public`'s:\n{}",
+        replica.output()
+    );
+
+    // 1. Drive the zero-redeploy lifecycle through the running administrative
+    //    surface and the production PostgreSQL-backed store, rather than only
+    //    through the in-memory route fixture or the store's direct unit tests.
+    let http = client();
+    let tenant = "ten_019ff9e0-0000-7000-8000-000000000001";
+    let first_material = "sk-integration-secret-v1";
+    let second_material = "sk-integration-secret-v2";
+    let staged = replica
+        .breakglass(
+            http.post(replica.admin_url("/secrets"))
+                .json(&serde_json::json!({
+                    "tenant": tenant,
+                    "material": first_material,
+                })),
+            "integration secret stage",
+        )
+        .send()
+        .await
+        .expect("a staged secret response");
+    assert_eq!(staged.status(), 200, "{}", replica.output());
+    let staged: serde_json::Value = staged.json().await.expect("a staged secret body");
+    assert_eq!(staged["lifecycle"], "staged");
+    assert!(!staged.to_string().contains(first_material), "{staged}");
+    let first_reference = staged["reference"]
+        .as_str()
+        .expect("a staged reference")
+        .to_owned();
+    let secret = first_reference
+        .split_once('@')
+        .expect("a versioned reference")
+        .0;
+
+    let activated = replica
+        .breakglass(
+            http.post(replica.admin_url("/secrets/lifecycle"))
+                .json(&serde_json::json!({
+                    "tenant": tenant,
+                    "reference": first_reference,
+                    "lifecycle": "active",
+                })),
+            "integration secret activate",
+        )
+        .send()
+        .await
+        .expect("an activation response");
+    assert_eq!(activated.status(), 200, "{}", replica.output());
+    assert_eq!(
+        activated
+            .json::<serde_json::Value>()
+            .await
+            .expect("an activation body")["changed"],
+        true
+    );
+
+    let rotated = replica
+        .breakglass(
+            http.post(replica.admin_url("/secrets/rotate"))
+                .json(&serde_json::json!({
+                    "tenant": tenant,
+                    "reference": first_reference,
+                    "material": second_material,
+                })),
+            "integration secret rotate",
+        )
+        .send()
+        .await
+        .expect("a rotation response");
+    assert_eq!(rotated.status(), 200, "{}", replica.output());
+    let rotated: serde_json::Value = rotated.json().await.expect("a rotated secret body");
+    assert_eq!(rotated["version"], 2);
+    assert_eq!(rotated["lifecycle"], "staged");
+    assert!(!rotated.to_string().contains(second_material), "{rotated}");
+    let second_reference = rotated["reference"]
+        .as_str()
+        .expect("a rotated reference")
+        .to_owned();
+
+    for (reference, lifecycle, reason) in [
+        (
+            &second_reference,
+            "active",
+            "integration secret activate rotation",
+        ),
+        (&first_reference, "revoked", "integration secret revoke"),
+        (
+            &first_reference,
+            "tombstoned",
+            "integration secret tombstone",
+        ),
+    ] {
+        let moved = replica
+            .breakglass(
+                http.post(replica.admin_url("/secrets/lifecycle"))
+                    .json(&serde_json::json!({
+                        "tenant": tenant,
+                        "reference": reference,
+                        "lifecycle": lifecycle,
+                    })),
+                reason,
+            )
+            .send()
+            .await
+            .expect("a lifecycle response");
+        assert_eq!(moved.status(), 200, "{}", replica.output());
+        let moved: serde_json::Value = moved.json().await.expect("a lifecycle body");
+        assert_eq!(moved["lifecycle"], lifecycle);
+        assert!(!moved.to_string().contains(first_material), "{moved}");
+        assert!(!moved.to_string().contains(second_material), "{moved}");
+    }
+
+    let versions = replica
+        .breakglass(
+            http.get(replica.admin_url(&format!("/secrets/{secret}?tenant={tenant}"))),
+            "integration secret versions",
+        )
+        .send()
+        .await
+        .expect("a versions response");
+    assert_eq!(versions.status(), 200, "{}", replica.output());
+    let versions: serde_json::Value = versions.json().await.expect("a versions body");
+    assert_eq!(versions["versions"][0]["lifecycle"], "tombstoned");
+    assert_eq!(versions["versions"][0]["resolvable"], false);
+    assert_eq!(versions["versions"][1]["lifecycle"], "active");
+    assert_eq!(versions["versions"][1]["resolvable"], true);
+    assert!(!versions.to_string().contains(first_material), "{versions}");
+    assert!(
+        !versions.to_string().contains(second_material),
+        "{versions}"
+    );
+    let output = replica.output();
+    assert!(
+        !output.contains(first_material),
+        "secret material reached the log: {output}"
+    );
+    assert!(
+        !output.contains(second_material),
+        "secret material reached the log: {output}"
+    );
+
+    // 2. The administrative surface is served and authenticated. An unauthorized
     //    read is the strongest evidence a scenario without an OIDC provider can
     //    state without holding a credential: `401` in the administrative error
     //    envelope means the surface is mounted, reached, and gated — where a
@@ -403,7 +560,7 @@ async fn stateful_boot_serves_administration_and_refuses_inference() {
          router's:\n{envelope}"
     );
 
-    // 2. Inference refuses, per request, naming itself — not by failing to boot,
+    // 3. Inference refuses, per request, naming itself — not by failing to boot,
     //    and not by pretending an empty configuration is a catalogue.
     let readyz = client()
         .get(replica.url("/readyz"))

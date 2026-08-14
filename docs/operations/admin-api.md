@@ -139,6 +139,31 @@ record, or a state read.
 | `/admin/v1/aliases` | `POST` | A routing alias and its ordered targets. |
 | `/admin/v1/policies` | `POST` | Budgets, concurrency limits, and token epoch for a scope. |
 | `/admin/v1/rollback` | `POST` | Republish an earlier revision's complete state as a *new* revision. |
+| `/admin/v1/secrets` | `POST` | Store credential material as a new secret's first version, staged. |
+| `/admin/v1/secrets/rotate` | `POST` | Store material as the *next* version of an existing secret, staged. |
+| `/admin/v1/secrets/lifecycle` | `POST` | Move one version: `active`, `disabled`, `revoked`, `tombstoned`. |
+| `/admin/v1/secrets/{secret}` | `GET` | Every version of one secret, with its state and whether it still resolves. |
+
+The four `secrets` rows are the only place material crosses this boundary, and
+it crosses one way: they take material and answer with a reference, an owner,
+and a lifecycle state. No route — and no method on the store behind them —
+returns material that was stored earlier, so an administrator who can rotate a
+provider key cannot read the one in service.
+
+They are also the only writes that carry no idempotency key and no expected
+revision, because they publish no revision: storing material changes nothing a
+request can observe until a credential document pins it. What stands in for the
+preconditions is the shape of the operations — staging mints a fresh version
+rather than overwriting one, and a lifecycle move to the state a version already
+holds answers `"changed": false`, so a retry is not a second change.
+
+The versions read is intentionally bounded to the caller-named tenant (and
+project, when present) and secret. It returns store metadata only — opaque
+references, version numbers, lifecycle, and lifecycle-only `resolvable` status;
+it does not unwrap material, consult desired state, or report provider
+reachability. An absent or foreign secret returns the same empty version list,
+so this rotation-status view is not a cross-tenant existence or control-plane
+calibration endpoint.
 
 An availability read names which authority refused — the catalogue, the
 enablement, the tenant's entitlement, policy, discovery, or this replica's own
@@ -151,6 +176,21 @@ query always names a tenant, so it is the caller's authority that decides this,
 not the scope asked about. Asking about a project answers with what the project
 inherits from its tenant as well as what it overrides, because a project's
 enablements are overrides rather than a catalogue of its own.
+
+Because they publish no revision, they also write no `AuditEvent`: a successful
+stage, rotation, activation, revocation, or destruction is recorded only as an
+operational event on the `axond.admin.secrets` log target rather than in the
+control plane. That is a process-log record, not a durable audit trail: its
+delivery and retention depend on the deployment's logging pipeline, and if it is
+dropped or expires there is no SecretStore audit history or backfill for
+`/admin/v1/audit/{revision}` to recover. The event contains only actor, owner,
+operation, opaque references, and lifecycle metadata. Refusals of authority are
+the exception and still record durably as access denials; a storage or lifecycle
+failure is not converted into an audit event either.
+
+Refusals from these routes describe the shape a field wants and never quote what
+was presented — a provider key pasted into `reference`, `secret`, `tenant`, or
+`project` must not come back out in the response or an operator log line.
 
 Budgets and limits are policy fields rather than a route of their own: they are
 published as a `policies` document, and history is therefore one chain rather
@@ -264,15 +304,16 @@ it, and do not parse it. An `If-None-Match` this surface cannot read is treated
 as absent and answered in full, because a `304` against a validator nobody
 issued would hand an operator a stale answer mid-incident.
 
-`/state`, `/history` and `/audit/{revision}` are validated strongly, by their own
-bytes. `/convergence` is the exception: it reports how long this replica has been
-behind, so while it is behind its bytes differ on every read and a digest of them
-would never match — for exactly the caller that wants it to. That read is
-validated over the convergence *state* — everything but the growing `lag_ms`:
-the desired, loaded and active revisions, the snapshot source, the generation, the
-last convergence duration, the failure count and the rejection reason — and
-answers a weak validator, `W/"…"`. A `304` there may therefore withhold a body
-whose `lag_ms` has moved on; when a `200` arrives, the lag it reports is current.
+`/state`, `/history`, `/audit/{revision}` and `/secrets/{secret}` are validated
+strongly, by their own bytes. `/convergence` is the exception: it reports how
+long this replica has been behind, so while it is behind its bytes differ on
+every read and a digest of them would never match — for exactly the caller that
+wants it to. That read is validated over the convergence *state* — everything
+but the growing `lag_ms`: the desired, loaded and active revisions, the snapshot
+source, the generation, the last convergence duration, the failure count and the
+rejection reason — and answers a weak validator, `W/"…"`.
+A `304` there may therefore withhold a body whose `lag_ms` has moved on; when a
+`200` arrives, the lag it reports is current.
 `If-None-Match` is compared weakly, so a caller sends back whatever validator it
 was given and needs no special handling.
 
@@ -338,6 +379,57 @@ resolving, and `UNIQUE (tenant_id, slug)` on that row is unconditional. There is
 therefore no way to hand a retired project's name to a new one — publish the new
 project under a different slug, or rename the retired project by publishing it
 with the slug you want it to keep.
+
+### Rotating a provider credential without a redeploy
+
+Material and the document that points at it are separate changes on purpose: the
+new version is stored and provable while the old one keeps serving, and the
+cutover is one ordinary publication whose rollback is another.
+
+```console
+$ printf %s "$NEW_KEY" | axond admin secret rotate --tenant ten_01J... \
+    --reference sct_01J...@v1                       # stages sct_01J...@v2
+$ axond admin secret lifecycle --tenant ten_01J... --reference sct_01J...@v2 --state active
+$ axond admin apply --resource credentials --file credential-v2.json \
+    --idempotency-key rotate-openai-1 --expected-revision rev_01J...
+$ axond admin secret lifecycle --tenant ten_01J... --reference sct_01J...@v1 --state disabled
+$ axond admin secret versions --secret sct_01J... --tenant ten_01J...
+```
+
+Material is read from a file or standard input, never from a flag, for the same
+reason `AXOND_ADMIN_TOKEN` is an environment variable.
+
+The credential document names `secret` and `secret_version`; publishing it is
+what makes the new version servable, because material is resolved while a
+candidate snapshot is compiled and never on a request. A version that cannot be
+resolved — disabled, revoked, destroyed, or unreachable — therefore **fails the
+candidate** and leaves the last-known-good snapshot serving. Cutting over to a
+version that was never activated is a failed publication, not an outage.
+
+Rotating twice from the same base reference is refused with
+`secret_version_exists` and `409`, naming the version that already holds
+material: a version is immutable, so the second call's rotation had already
+happened — by a retry of the same request, or by another administrator — and
+overwriting it would change what a credential already pinning it resolves to.
+The material presented with that call is never examined, so the refusal does not
+report it as bad; re-read `axond admin secret versions` and rotate from the
+current version.
+
+Rolling a rotation back is publishing the previous credential document again, or
+`axond admin rollback`: the old version is still there, still resolvable, until
+it is withdrawn.
+
+Withdrawal has two strengths:
+
+- **`revoked` and `disabled`** stop the *next* candidate from resolving the
+  version and are never gated: a leaked key must be withdrawable immediately.
+  The snapshot serving requests at that moment holds its own resolved copy and
+  keeps serving until a candidate replaces it — the same last-known-good
+  behaviour every other convergence failure has.
+- **`tombstoned`** destroys the material. It is refused with `secret_in_use`
+  while the current revision still pins the version, so the order is: publish a
+  credential that no longer resolves it, then destroy. The plaintext a running
+  replica already resolved is zeroized once no active snapshot holds it.
 
 ### Refreshing a model catalogue
 
@@ -426,6 +518,19 @@ $ axond admin rollback --revision rev_01J... --summary "undo the bad alias" \
 
 A refusal is printed as the gateway sent it, typed `code` included, and exits
 non-zero.
+
+`axond admin secret` is the credential lifecycle, and reads material from
+`--material-file` or standard input:
+
+```console
+$ axond admin secret stage     --tenant ten_01J... --material-file ./key.txt
+$ axond admin secret rotate    --tenant ten_01J... --reference sct_01J...@v1 -f -
+$ axond admin secret lifecycle --tenant ten_01J... --reference sct_01J...@v2 --state active
+$ axond admin secret versions  --secret sct_01J... --tenant ten_01J...
+```
+
+One trailing newline is stripped and nothing else is, so `printf %s` and a file
+written by an editor both store the key the operator holds.
 
 ## Related
 

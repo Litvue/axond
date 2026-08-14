@@ -259,7 +259,7 @@ impl SecretStore for InMemorySecrets {
         // stale request rather than a second rotation: overwriting would change
         // what a credential body already pinning `rotated` resolves to.
         if entries.contains_key(&rotated) {
-            return Err(SecretError::Invalid(format!("{rotated} already exists")));
+            return Err(SecretError::VersionExists { reference: rotated });
         }
         let kek = self.kek.lock().expect("not poisoned").clone();
         entries.insert(
@@ -315,6 +315,31 @@ impl SecretStore for InMemorySecrets {
         }
         let entries = self.entries.lock().expect("not poisoned");
         Self::describe_locked(&entries, owner, reference)
+    }
+
+    async fn versions(
+        &self,
+        owner: SecretOwner,
+        secret: SecretId,
+    ) -> Result<Vec<SecretDescriptor>, SecretError> {
+        if let Some(error) = self.outage() {
+            return Err(error);
+        }
+        let entries = self.entries.lock().expect("not poisoned");
+        let mut held: Vec<&SecretRef> = entries
+            .keys()
+            .filter(|reference| reference.secret == secret)
+            .collect();
+        held.sort_unstable();
+        let mut descriptors = Vec::with_capacity(held.len());
+        for reference in held {
+            match Self::describe_locked(&entries, owner, reference) {
+                Ok(descriptor) => descriptors.push(descriptor),
+                Err(SecretError::Ownership { .. }) => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(descriptors)
     }
 }
 
