@@ -100,11 +100,22 @@ Apply the committed DDL under explicit schema ownership:
 psql "$AXOND_USAGE_POSTGRES_DSN" -f ops/postgres/usage_v1.sql
 psql "$AXOND_USAGE_POSTGRES_DSN" -f ops/postgres/usage_v1_001_add_signer_kid.sql
 psql "$AXOND_USAGE_POSTGRES_DSN" -f ops/postgres/usage_v2.sql
+psql "$AXOND_USAGE_POSTGRES_DSN" -f ops/postgres/usage_v2_001_add_price_identity.sql
 ```
 
-Apply additive usage migrations in filename order before deploying a binary
-that writes the new shape. A missing column does not stop requests; the
-off-path sink drops rejected batches and increments the dropped-record metric.
+Apply additive usage migrations in filename order **before** deploying a binary
+that writes the new shape. The sink compares every column it binds against the
+existing table while it connects, so a binary deployed ahead of any migration
+(including an older `usage_v1_001` migration) refuses to boot and names the
+ordered files to apply rather than dropping batches at insert time. This is an
+intentional fail-closed contract: migrate the table in place and preserve its
+history; do not recreate it merely because the refusal mentions the base DDL.
+The check resolves an unqualified table through the connection's `search_path`,
+just like the `INSERT`, so a DSN selecting `billing` is checked in `billing`,
+not hard-coded `public`. A table that does not exist yet is not checked: with
+`create_table = false` its creation is yours to sequence, and until it exists
+the off-path sink drops rejected batches and increments the dropped-record
+metric.
 
 Shared budgets start with `ops/postgres/budget_v1.sql`. Enabling an exact
 namespace cap requires `ops/postgres/budget_v2.sql` while the fleet is stopped:

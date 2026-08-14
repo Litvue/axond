@@ -30,10 +30,29 @@ use super::{ObservedRecord, SinkFailure, UsageRecord, UsageSink, UsageSinkError}
 // `tests/shipped_ddl.rs` fails if the two copies differ by a byte.
 const SCHEMA_DDL: &str = include_str!("../../sql/usage_v2.sql");
 
-/// Additive migrations for the current schema version. These are applied after
-/// the base DDL for fresh tables; existing installations apply them before
-/// deploying a writer that emits the new column.
-const ADDITIVE_DDL: &str = include_str!("../../sql/usage_v1_001_add_signer_kid.sql");
+/// Additive migrations for the current schema version, in application order.
+/// These are applied after the base DDL for fresh tables; existing
+/// installations apply them before deploying a writer that emits the new
+/// columns. Nullable columns only, so a writer deployed ahead of one of them
+/// still writes rows the earlier shape can read.
+const ADDITIVE_DDL: [&str; 2] = [
+    include_str!("../../sql/usage_v1_001_add_signer_kid.sql"),
+    include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
+];
+
+/// Which migration adds each column the base DDL of the current schema version
+/// does not have, so a writer that would bind a column the table lacks can name
+/// the file to apply instead of failing every batch at insert time.
+///
+/// Ordering is the enforcement: a writer binds all of [`COLUMNS`], so it refuses
+/// to boot against a table an operator has not migrated yet, rather than
+/// discovering it one dropped batch at a time.
+const ADDITIVE_COLUMNS: [(&str, &str); 4] = [
+    ("signer_kid", "usage_v1_001_add_signer_kid.sql"),
+    ("price_book", "usage_v2_001_add_price_identity.sql"),
+    ("price_book_checksum", "usage_v2_001_add_price_identity.sql"),
+    ("price_catalog", "usage_v2_001_add_price_identity.sql"),
+];
 
 /// The table name the shipped DDL uses; substituted when the sink is configured
 /// with another one.
@@ -45,7 +64,7 @@ const INDEX_PREFIX_PLACEHOLDER: &str = "\u{1}index_prefix\u{1}";
 
 /// Columns written per row, in parameter order. `reasoning_tokens` remains
 /// reserved for a future schema version; the cache counters are canonical.
-const COLUMNS: [&str; 22] = [
+const COLUMNS: [&str; 25] = [
     "schema_version",
     "request_id",
     "trace_id",
@@ -64,6 +83,9 @@ const COLUMNS: [&str; 22] = [
     "output_tokens",
     "cost_microdollars",
     "catalog_version",
+    "price_book",
+    "price_book_checksum",
+    "price_catalog",
     "latency_ms",
     "attempts",
     "started_at",
@@ -124,8 +146,49 @@ impl PostgresSink {
         if settings.create_table {
             client.batch_execute(&sink.schema_ddl()).await?;
         }
+        // Migration before writer: every column this sink binds must already
+        // exist, or the boot fails naming the file to apply. An existing
+        // installation that has not run a migration would otherwise accept the
+        // boot and lose every batch at insert time. This is intentionally
+        // fail-closed for every additive migration, including older ones.
+        if let Some(gap) = migration_gap(&sink.missing_columns(&client).await?) {
+            return Err(UsageSinkError::invalid("postgres", gap));
+        }
         *sink.client.lock().await = Some(client);
         Ok(sink)
+    }
+
+    /// The columns this writer binds that the configured table does not have.
+    ///
+    /// An empty answer for an absent table: creating it is the operator's to
+    /// sequence (`create_table` is off by default), and refusing a boot for a
+    /// table that will be created before the first flush would be a new failure
+    /// mode rather than a caught one.
+    ///
+    /// `to_regclass($1)` is deliberate. It resolves the configured relation on
+    /// this connection using its `search_path`, exactly as the unqualified
+    /// INSERT does; reconstructing `public` from the configured string would
+    /// check a different table for DSNs that set `options=-csearch_path=...`.
+    async fn missing_columns(&self, client: &Client) -> Result<Vec<String>, tokio_postgres::Error> {
+        let rows = client
+            .query(
+                "SELECT a.attname \
+                 FROM pg_attribute AS a \
+                 WHERE a.attrelid = to_regclass($1) \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped",
+                &[&self.table],
+            )
+            .await?;
+        let present: Vec<String> = rows.iter().map(|row| row.get::<_, String>(0)).collect();
+        if present.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(COLUMNS
+            .iter()
+            .filter(|column| !present.iter().any(|present| present == *column))
+            .map(|column| (*column).to_owned())
+            .collect())
     }
 
     /// The shipped DDL, retargeted at the configured table.
@@ -141,7 +204,12 @@ impl PostgresSink {
                 .replace(DEFAULT_TABLE, &self.table)
                 .replace(INDEX_PREFIX_PLACEHOLDER, &format!("{index_prefix}_"))
         };
-        format!("{}\n{}", retarget(SCHEMA_DDL), retarget(ADDITIVE_DDL))
+        let mut ddl = retarget(SCHEMA_DDL);
+        for additive in ADDITIVE_DDL {
+            ddl.push('\n');
+            ddl.push_str(&retarget(additive));
+        }
+        ddl
     }
 
     async fn connect_client(&self) -> Result<Client, tokio_postgres::Error> {
@@ -243,6 +311,39 @@ pub fn tls_connector() -> MakeRustlsConnect {
         .clone()
 }
 
+/// Why a boot is refused when the table is behind this writer, naming the
+/// migrations to apply and in which order.
+///
+/// A column with no migration of its own belongs to the base DDL, so the table
+/// is not merely unmigrated: it was created from an older schema version, and
+/// the answer is that version's file rather than a migration.
+fn migration_gap(missing: &[String]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    let mut files: Vec<&str> = Vec::new();
+    for (column, file) in ADDITIVE_COLUMNS {
+        if missing.iter().any(|name| name == column) && !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    let remedy = if files.is_empty() {
+        format!(
+            "recreate it from ops/postgres/usage_v{}.sql",
+            UsageRecord::SCHEMA_VERSION
+        )
+    } else {
+        format!(
+            "apply ops/postgres/{} before deploying this writer",
+            files.join(", then ops/postgres/")
+        )
+    };
+    Some(format!(
+        "usage table is missing column(s) {}: {remedy}",
+        missing.join(", ")
+    ))
+}
+
 /// A multi-row `INSERT` with one parameter set per row.
 ///
 /// `ON CONFLICT DO NOTHING` carries no target, so it is inert on the shipped DDL
@@ -305,6 +406,9 @@ fn row(observed: &ObservedRecord) -> Vec<Box<dyn ToSql + Sync + Send>> {
         Box::new(bigint(record.output_tokens)),
         Box::new(bigint(record.cost_microdollars)),
         Box::new(bigint(record.catalog_version)),
+        Box::new(record.price_book.clone()),
+        Box::new(record.price_book_checksum.clone()),
+        Box::new(record.price_catalog.clone()),
         Box::new(bigint(record.latency_ms)),
         Box::new(record.attempts as i64),
         Box::new(started_at),
@@ -354,12 +458,63 @@ mod tests {
     fn the_row_shape_matches_the_shipped_ddl() {
         for column in COLUMNS {
             assert!(
-                SCHEMA_DDL.contains(column) || ADDITIVE_DDL.contains(column),
+                SCHEMA_DDL.contains(column)
+                    || ADDITIVE_DDL
+                        .iter()
+                        .any(|additive| additive.contains(column)),
                 "column `{column}` is written but not declared in the base or additive DDL"
             );
         }
         assert_eq!(UsageRecord::SCHEMA_VERSION, 2);
         assert!(SCHEMA_DDL.contains("version 2"));
+    }
+
+    /// Migration before writer, on the ordering itself: each additive column is
+    /// attributed to the file that adds it, in the order the files apply, so the
+    /// remedy a refused boot prints is one an operator can run top to bottom.
+    #[test]
+    fn every_additive_column_is_attributed_to_the_migration_that_adds_it() {
+        let files = [
+            (
+                "usage_v1_001_add_signer_kid.sql",
+                include_str!("../../sql/usage_v1_001_add_signer_kid.sql"),
+            ),
+            (
+                "usage_v2_001_add_price_identity.sql",
+                include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
+            ),
+        ];
+        for (column, file) in ADDITIVE_COLUMNS {
+            assert!(COLUMNS.contains(&column), "`{column}` is never bound");
+            let (_, ddl) = files
+                .iter()
+                .find(|(name, _)| *name == file)
+                .expect("an additive column is attributed to a shipped migration");
+            assert!(
+                ddl.contains(column),
+                "`{file}` does not add the `{column}` it is credited with"
+            );
+        }
+        // A boot refused for a v1 and a v2 column names them in apply order.
+        let gap = migration_gap(&["price_book".to_owned(), "signer_kid".to_owned()])
+            .expect("missing columns are a gap");
+        let signer = gap
+            .find("usage_v1_001_add_signer_kid.sql")
+            .expect("the v1 file is named");
+        let price = gap
+            .find("usage_v2_001_add_price_identity.sql")
+            .expect("the v2 file is named");
+        assert!(signer < price, "{gap}");
+        assert!(gap.contains("before deploying this writer"), "{gap}");
+    }
+
+    /// A table that is level with the writer is not a gap, and a table missing a
+    /// base column is a schema-version problem rather than a pending migration.
+    #[test]
+    fn only_a_column_the_writer_binds_and_the_table_lacks_refuses_a_boot() {
+        assert_eq!(migration_gap(&[]), None);
+        let older = migration_gap(&["cache_read_tokens".to_owned()]).expect("a gap");
+        assert!(older.contains("ops/postgres/usage_v2.sql"), "{older}");
     }
 
     #[test]
@@ -509,6 +664,81 @@ mod tests {
         assert_eq!(rows[0].get::<_, &str>(1), "acme");
         assert_eq!(rows[0].get::<_, i64>(2), 640);
         assert_eq!(rows[0].get::<_, i64>(3), 812);
+    }
+
+    /// The writer and its boot gate must resolve an unqualified table through
+    /// the same connection search path. Looking only in `public` would treat
+    /// an unmigrated table in the configured schema as absent and let the
+    /// writer boot before dropping every insert.
+    #[tokio::test]
+    async fn the_schema_gate_follows_the_connection_search_path_and_names_the_gap() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let suffix = std::process::id();
+        let schema = format!("axond_usage_search_path_{suffix}");
+        let table = format!("axond_usage_{suffix}");
+        let setup = PostgresSink {
+            table: table.clone(),
+            config: dsn.parse().expect("static test dsn"),
+            client: tokio::sync::Mutex::new(None),
+        };
+        let setup_client = setup.connect_client().await.expect("connect");
+        setup_client
+            .batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {schema}; \
+                 DROP TABLE IF EXISTS {schema}.{table}; \
+                 CREATE TABLE {schema}.{table} (schema_version integer)"
+            ))
+            .await
+            .expect("create an intentionally unmigrated table on the search path");
+
+        // Use the DSN's startup option rather than a later SET so this covers
+        // the same connection-level search_path an operator configures for
+        // the INSERT path.
+        let mut config: Config = dsn.parse().expect("static test dsn");
+        config.options(format!("-csearch_path={schema}"));
+        let sink = PostgresSink {
+            table: table.clone(),
+            config,
+            client: tokio::sync::Mutex::new(None),
+        };
+        let client = sink
+            .connect_client()
+            .await
+            .expect("connect with search_path");
+
+        let missing = sink
+            .missing_columns(&client)
+            .await
+            .expect("inspect the table resolved through search_path");
+        let qualified = format!("{schema}.{table}");
+        let resolves_to_expected_relation: bool = client
+            .query_one(
+                "SELECT to_regclass($1) = to_regclass($2)",
+                &[&table, &qualified],
+            )
+            .await
+            .expect("resolve the same relation as INSERT")
+            .get(0);
+        assert!(
+            resolves_to_expected_relation,
+            "the unqualified relation must resolve to {qualified} through search_path"
+        );
+        assert!(missing.iter().any(|column| column == "price_book"));
+        assert!(missing.iter().any(|column| column == "signer_kid"));
+        let gap = migration_gap(&missing).expect("an unmigrated table is a boot gap");
+        assert!(gap.contains("usage_v1_001_add_signer_kid.sql"), "{gap}");
+        assert!(gap.contains("usage_v2_001_add_price_identity.sql"), "{gap}");
+        assert!(
+            gap.contains("before deploying this writer"),
+            "the gate is fail-closed with an operator remedy: {gap}"
+        );
+
+        client
+            .batch_execute(&format!("DROP TABLE {schema}.{table}"))
+            .await
+            .expect("drop the test table");
     }
 
     #[tokio::test]

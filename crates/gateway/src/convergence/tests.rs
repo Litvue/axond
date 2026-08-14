@@ -444,6 +444,7 @@ fn boundary_price_book() -> crate::desired_state::pricing::PriceBookBody {
     let target = fixtures::priced_target("openai", "gpt-4o");
     crate::desired_state::pricing::PriceBookBody::new(
         fixtures::catalog_content_id(),
+        fixtures::catalog_version(),
         crate::desired_state::pricing::Approval::Approved {
             by: fixtures::actor(),
             at: EffectiveInstant::EPOCH,

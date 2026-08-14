@@ -399,6 +399,7 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
                 cache_read_microdollars_per_million: None,
                 cache_write_microdollars_per_million: None,
             },
+            catalog: None,
         }],
     });
     let mut env = bootstrap_env();

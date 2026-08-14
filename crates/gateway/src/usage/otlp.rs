@@ -149,6 +149,24 @@ fn attributes(record: &UsageRecord) -> Vec<(&'static str, AnyValue)> {
             AnyValue::String(signer_kid.clone().into()),
         ));
     }
+    // Emitted only when an approved book priced the request, so a deployment
+    // priced by its file adds no attributes at all. Bounded cardinality: one
+    // value per published price-book version, not per request.
+    if let Some(book) = &record.price_book {
+        attributes.push(("axond.price_book", AnyValue::String(book.clone().into())));
+    }
+    if let Some(checksum) = &record.price_book_checksum {
+        attributes.push((
+            "axond.price_book_checksum",
+            AnyValue::String(checksum.clone().into()),
+        ));
+    }
+    if let Some(catalog) = &record.price_catalog {
+        attributes.push((
+            "axond.price_catalog",
+            AnyValue::String(catalog.clone().into()),
+        ));
+    }
     attributes
 }
 

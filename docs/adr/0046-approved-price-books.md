@@ -39,14 +39,24 @@ request held.** Requests are served from an immutable `ConfigSnapshot`; the
 request path reads no database, no models.dev, and nothing mutable. So the
 identity of the price book, the catalogue it was approved against, and the
 interval its rates were in force over have to be *in* the snapshot, not looked
-up later. Numeric `catalog_version` — already replaced by three identities in
-ADR 0043 — is not a place to encode this.
+up later. The numeric `catalog_version` field must identify the actual
+catalogue resource version, rather than being reused for the price-book
+version; the content id alone cannot answer which immutable catalogue resource
+was in force.
 
 ## Decision
 
-Approved pricing is a typed, immutable desired-state body (`axond.price-book.v1`,
+Approved pricing is a typed, immutable desired-state body (`axond.price-book.v2`,
 `ResourceKind::Price`) that is read during compilation and published as part of
 the snapshot it prices.
+
+The body records both the normalized `catalog_content_id` and the positive
+`catalog_version` of the catalogue resource it priced. The two fields are kept
+together because content identity answers "which bytes?" while the resource
+version answers "which published catalogue resource?". A v1 body is still
+readable for rollback and recovery, but has no catalogue-version provenance and
+therefore produces the compatibility value `catalog_version = 0` until it is
+republished as v2.
 
 **Approval activates a rate; an import never does.** A price book records an
 `Approval` — `draft`, or `approved` with the actor, the instant, and an optional

@@ -18,9 +18,11 @@ deployment unit. Read the release's `CHANGELOG.md` entry before every rollout.
 2. Read every breaking-change and migration entry since the deployed version.
 3. Validate the candidate configuration against the new binary in a staging or
    canary environment.
-4. Apply additive Postgres usage migrations before deploying writers, including
-   `ops/postgres/usage_outbox_v1.sql` before any replica that enables
-   `[usage_journal] backend = "postgres"`.
+4. Apply additive Postgres usage migrations in filename order before deploying
+   writers, including `ops/postgres/usage_outbox_v1.sql` before any replica that
+   enables `[usage_journal] backend = "postgres"`. The usage sink checks every
+   bound column at connection time and fails closed with the ordered migration
+   remedy; it does not allow a writer to boot and silently drop rows.
 5. Apply `ops/postgres/catalog_v1.sql` before any replica that sets
    `[catalog] store = "postgres"`. A deployment that configures no `[catalog]`
    section imports nothing and needs none of it; the DDL is additive and
@@ -100,11 +102,26 @@ Exact namespace-wide budgets require a stopped fleet:
 Do not mix cap-aware and cap-unaware replicas. Both backends contain fences so
 an unsafe mix fails loudly rather than undercounting spend.
 
-Usage schema migrations are additive and should be applied before the new
-binary. Missing usage columns cause off-path sink drops rather than request
-failure, which still makes migration ordering operationally important.
+Usage schema migrations are additive and must be applied before the new binary,
+in filename order. This release adds
+`ops/postgres/usage_v2_001_add_price_identity.sql` (nullable `price_book`,
+`price_book_checksum`, `price_catalog`), which follows
+`ops/postgres/usage_v1_001_add_signer_kid.sql`. A Postgres usage sink compares
+every column the writer binds against the existing table while it connects, so a
+replica started before either migration refuses to boot and names the ordered
+files to apply rather than dropping rows. This is intentional fail-closed
+behavior; apply the migrations in place and preserve existing usage history.
+Mixed versions are safe in both directions: the
+columns are nullable, and an older binary neither writes nor reads them. Rolling
+back does not require dropping them.
 
-That last sentence stops being true for a billing-grade deployment: with
+Price-book bodies are now written as `axond.price-book.v2`; the new
+`catalog_version` field is part of the immutable book identity. Retained v1 books
+remain readable for compatibility but have no numeric catalogue version, so new
+requests charged from one record `catalog_version = 0` until the book is
+republished as v2.
+
+The usage *outbox* is stricter still for a billing-grade deployment: with
 `[usage_journal] backend = "postgres"` the outbox is on the request path, so a
 missing or unreadable outbox table is `503 usage_not_durable` per request under
 the default policy, not an off-path drop. Apply outbox DDL before the writers,

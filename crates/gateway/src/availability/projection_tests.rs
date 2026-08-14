@@ -1206,6 +1206,7 @@ fn a_targets_circuit_key_is_the_one_the_request_path_writes() {
             cache_read_microdollars_per_million: None,
             cache_write_microdollars_per_million: None,
         },
+        catalog: None,
     };
     let written = crate::routes::target_key(&routed);
     assert_eq!(written, RuntimeObservations::circuit_key(&target()));

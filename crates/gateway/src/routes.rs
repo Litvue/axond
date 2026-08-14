@@ -39,7 +39,7 @@ use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use gateway_core::{
-    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, ModelPrice, ModelUsage,
+    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, ModelUsage,
     NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
     Surface, Usage,
 };
@@ -59,6 +59,7 @@ use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::error::GatewayError;
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
+use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
@@ -1322,6 +1323,48 @@ async fn serve(
         });
     }
 
+    // What each target is charged at, resolved once from the snapshot this
+    // request is already holding (#147). A price book published while the request
+    // is in flight replaces a later request's snapshot, never this one's, so the
+    // hold, the settlement, and the usage row all name one immutable pricing.
+    //
+    // Resolved here, with the other pure refusals and before admission: an alias
+    // whose every target is unpriced cannot be served at all, so it must not
+    // occupy admission capacity or spend a rate-limit round trip to find out.
+    let prices = AliasPrices::resolve(&snapshot, model);
+    // Responses affinity pins every request to the first target. A later priced
+    // target therefore cannot make an unpriced pin chargeable, and must not be
+    // used to size a budget hold for work this route can never send there.
+    if wire.route.pins_affinity()
+        && let Some((target, refusal)) = model.targets.first().zip(prices.ineligible(0))
+    {
+        tracing::warn!(
+            model = %alias,
+            detail = %refusal.detail(),
+            "pinned target has no approved price"
+        );
+        if wire.route.is_continuation(&body) {
+            return Err(GatewayError::ContinuationAffinityUnavailable {
+                provider: target.provider.clone(),
+                model: target.model.clone(),
+            });
+        }
+        return Err(GatewayError::ModelNotPriced {
+            alias,
+            reason: refusal.reason().to_owned(),
+        });
+    }
+    if let Some(refusal) = prices.refusal() {
+        // The price book, its version, and its approval state answer the
+        // operator's "approve what, where?" and are control-plane facts, so they
+        // are logged rather than returned: the caller gets the stable reason.
+        tracing::warn!(model = %alias, detail = %refusal.detail(), "alias has no approved price");
+        return Err(GatewayError::ModelNotPriced {
+            alias,
+            reason: refusal.reason().to_owned(),
+        });
+    }
+
     // Load shedding before any dependency work: an overloaded replica must not
     // spend a rate-limit round trip or a budget reservation on a request it is
     // about to refuse. It is also strictly after authentication, so unauthenticated
@@ -1367,13 +1410,16 @@ async fn serve(
         })?;
 
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate
-    // from the first target's price before dispatch; settle the hold against the
-    // real cost — priced at whichever target actually served — after.
+    // from the first chargeable target's price before dispatch; settle the hold
+    // against the real cost — priced at whichever target actually served — after.
     let budget_key = BudgetKey {
         namespace: caller.namespace.clone(),
         subject: caller.subject.clone(),
     };
-    let estimated_cost = model.targets[0].price.cost_microdollars(estimate);
+    let estimated_cost = prices
+        .estimate()
+        .expect("an alias with no chargeable target was refused above")
+        .cost_microdollars(estimate);
     if let Some(ceiling) = caller.max_request_microdollars
         && estimated_cost > ceiling
     {
@@ -1404,6 +1450,7 @@ async fn serve(
             StreamRequest {
                 alias,
                 body,
+                prices: &prices,
                 wire: &wire,
                 identity,
                 hold: BudgetHold {
@@ -1419,16 +1466,19 @@ async fn serve(
     }
 
     let reservation = BudgetReservation::new(state.clone(), budget_key, reservation);
-    let outcome =
-        match dispatch_with_failover(&state, &snapshot, &caller, model, &body, &wire).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                // Nothing reached a provider, so nothing was consumed: the whole
-                // estimate goes back rather than lingering until it expires.
-                reservation.release().await;
-                return Err(err);
-            }
-        };
+    let outcome = match dispatch_with_failover(
+        &state, &snapshot, &caller, model, &prices, &body, &wire,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // Nothing reached a provider, so nothing was consumed: the whole
+            // estimate goes back rather than lingering until it expires.
+            reservation.release().await;
+            return Err(err);
+        }
+    };
     let served = &outcome.served;
     match outcome.result {
         Ok(response) => {
@@ -1461,6 +1511,7 @@ async fn serve(
                     cache_write_tokens: response.usage.cache_write_tokens,
                     output_tokens: response.usage.output_tokens,
                     cost_microdollars: cost,
+                    price: served.price,
                     latency_ms: outcome.latency_ms,
                     ttft_ms: outcome.ttft_ms,
                     attempts: outcome.attempts,
@@ -1496,6 +1547,7 @@ async fn serve(
                     cache_write_tokens: 0,
                     output_tokens: 0,
                     cost_microdollars: 0,
+                    price: served.price,
                     latency_ms: outcome.latency_ms,
                     ttft_ms: outcome.ttft_ms,
                     attempts: outcome.attempts,
@@ -1512,7 +1564,7 @@ async fn serve(
 struct ServedTarget {
     provider: String,
     model: String,
-    price: ModelPrice,
+    price: RequestPrice,
     source: CredentialSource,
     credential_id: String,
 }
@@ -1543,6 +1595,7 @@ async fn dispatch_with_failover(
     snapshot: &ConfigSnapshot,
     caller: &InboundKey,
     model: &Model,
+    prices: &AliasPrices,
     body: &Value,
     wire: &Wire,
 ) -> Result<FailoverOutcome, GatewayError> {
@@ -1561,6 +1614,19 @@ async fn dispatch_with_failover(
         if walk.attempts >= max_attempts || Instant::now() >= deadline {
             break;
         }
+        // An ineligible target is skipped exactly like one behind an open
+        // circuit: it is configured and discoverable, but nothing approved says
+        // what it costs, so it cannot be dispatched under a budget hold.
+        let Some(price) = prices.get(index) else {
+            if continuation {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
+            walk.note_unpriced(&model.name, prices.ineligible(index));
+            continue;
+        };
         let Some(provider) = cfg.provider(&target.provider) else {
             if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
@@ -1643,7 +1709,7 @@ async fn dispatch_with_failover(
         let served = ServedTarget {
             provider: target.provider.clone(),
             model: target.model.clone(),
-            price: target.price,
+            price,
             source: plan.source,
             credential_id: attempt.credential_id.clone(),
         };
@@ -1818,6 +1884,7 @@ async fn stream_with_failover(
     let StreamRequest {
         alias,
         body,
+        prices,
         wire,
         identity,
         mut hold,
@@ -1840,6 +1907,17 @@ async fn stream_with_failover(
         if walk.attempts >= max_attempts || Instant::now() >= deadline {
             break;
         }
+        // Ineligible: discoverable, but not dispatchable under a budget hold.
+        let Some(price) = prices.get(index) else {
+            if continuation {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
+            walk.note_unpriced(&model.name, prices.ineligible(index));
+            continue;
+        };
         let Some(provider) = cfg.provider(&target.provider) else {
             if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
@@ -1931,7 +2009,7 @@ async fn stream_with_failover(
                 source: plan.source,
                 credential_id: lease.id.clone(),
                 identity: identity.clone(),
-                price: target.price,
+                price,
                 budget_key: hold.key.clone(),
                 reservation: hold.reservation.clone(),
                 rate_limit_permit: None,
@@ -2019,7 +2097,10 @@ async fn stream_with_failover(
                                     // carries the same event identity rather than
                                     // re-reading a span it no longer runs under.
                                     identity,
-                                    price: target.price,
+                                    // The same immutable pricing the request
+                                    // opened under: a rotation changes the
+                                    // credential, never what the request costs.
+                                    price,
                                     budget_key,
                                     reservation,
                                     rate_limit_permit: None,
@@ -2135,6 +2216,10 @@ async fn stream_with_failover(
 struct StreamRequest<'a> {
     alias: String,
     body: Value,
+    /// What each target is charged at under the snapshot the request started
+    /// with, resolved before admission so the relay's settlement cannot depend on
+    /// a price book published while the stream was open.
+    prices: &'a AliasPrices,
     wire: &'a Wire,
     /// The identity of the usage event this request will settle as, minted at
     /// admission and cloned into every stream context the walk builds — including
@@ -2229,6 +2314,10 @@ struct FailoverWalk {
     attempts: u32,
     skipped_open: Vec<String>,
     no_credential: Option<GatewayError>,
+    /// The refusal for a target skipped because nothing approved prices it,
+    /// carried so a walk pinned to that target reports the pricing refusal
+    /// instead of a generic "nothing to attempt" request error.
+    unpriced: Option<GatewayError>,
     /// The last buffered attempt's error + attribution, carried so a walk that
     /// exhausts its targets still returns a real upstream error.
     last: Option<(TransportError, ServedTarget, u64, Option<u64>)>,
@@ -2245,8 +2334,29 @@ impl FailoverWalk {
             attempts: 0,
             skipped_open: Vec::new(),
             no_credential: None,
+            unpriced: None,
             last: None,
             last_error: None,
+        }
+    }
+
+    /// Remember that a candidate was skipped for want of an approved price. The
+    /// operator-facing identity of the book stays in the log; the walk keeps only
+    /// the stable redacted reason a caller may be told (#147).
+    fn note_unpriced(&mut self, alias: &str, refusal: Option<&Ineligible>) {
+        let Some(refusal) = refusal else {
+            return;
+        };
+        if self.unpriced.is_none() {
+            tracing::warn!(
+                model = %alias,
+                detail = %refusal.detail(),
+                "skipping a target with no approved price"
+            );
+            self.unpriced = Some(GatewayError::ModelNotPriced {
+                alias: alias.to_owned(),
+                reason: refusal.reason().to_owned(),
+            });
         }
     }
 
@@ -2265,6 +2375,7 @@ impl FailoverWalk {
             return ProviderError::AllCircuitsOpen(self.skipped_open).into();
         }
         self.no_credential
+            .or(self.unpriced)
             .unwrap_or_else(|| ProviderError::InvalidRequest("no attemptable target".into()).into())
     }
 }
@@ -2576,6 +2687,9 @@ struct RecordArgs<'a> {
     cache_write_tokens: u64,
     output_tokens: u64,
     cost_microdollars: u64,
+    /// The pricing the cost was computed at, so the row names the immutable
+    /// state it was charged against rather than "whatever is approved now".
+    price: RequestPrice,
     latency_ms: u64,
     /// Time to the first token, when one was produced.
     ttft_ms: Option<u64>,
@@ -2675,7 +2789,10 @@ fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
         cache_write_tokens: args.cache_write_tokens,
         output_tokens: args.output_tokens,
         cost_microdollars: args.cost_microdollars,
-        catalog_version: 0,
+        catalog_version: args.price.catalog_version(),
+        price_book: args.price.identity().map(|id| id.book()),
+        price_book_checksum: args.price.identity().map(|id| id.checksum()),
+        price_catalog: args.price.identity().map(|id| id.catalog()),
         latency_ms: args.latency_ms,
         attempts,
     };
@@ -2686,11 +2803,13 @@ fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
 mod tests {
     use super::*;
     use crate::aliases::AliasScope;
+    use crate::backends::catalog::ProviderId;
     use crate::budget::NoBudget;
     use crate::config::{Config, UndurablePolicy};
     use crate::convergence::status::testing::ManualClock;
     use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
-    use crate::desired_state::fixtures::revision_id;
+    use crate::desired_state::fixtures::{approved_pricing_snapshot, revision_id};
+    use crate::pricing::PriceIdentity;
     use crate::principals::PrincipalAuthority;
     use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
     use crate::state::ReplicaObservability;
@@ -2714,6 +2833,92 @@ mod tests {
     use tokio::sync::oneshot;
     use tower::util::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
+
+    /// A usage row names the pricing it was charged against, so "what did we
+    /// charge in March" is answerable from the row rather than from whatever is
+    /// approved when the question is asked.
+    #[test]
+    fn a_usage_row_names_the_immutable_pricing_its_charge_was_computed_from() {
+        let identity = EventIdentity {
+            request_id: crate::usage::identity::next_request_id(),
+            trace_id: None,
+        };
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "GW_TEST_INBOUND_KEY".to_owned(),
+            authority: PrincipalAuthority::StaticKey,
+            signer_kid: None,
+            scope: None,
+            alias_scope: None,
+            max_request_microdollars: None,
+            can_mint: false,
+            jti: None,
+        };
+        let args = |price| RecordArgs {
+            identity: &identity,
+            caller: &caller,
+            alias: "fast",
+            target_provider: "openai",
+            target_model: "gpt-4o",
+            source: CredentialSource::Platform,
+            credential_id: "openai-primary",
+            status: Status::Ok,
+            input_tokens: 10,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 5,
+            cost_microdollars: 40,
+            price,
+            latency_ms: 12,
+            ttft_ms: None,
+            attempts: 1,
+        };
+
+        let pricing = approved_pricing_snapshot();
+        let approved = RequestPrice::approved(
+            pricing
+                .price(
+                    &ProviderId::parse("openai").expect("a catalogue provider id"),
+                    "gpt-4o",
+                )
+                .expect("the fixture book prices it"),
+            PriceIdentity::of(&pricing),
+        );
+        let (row, _, _) = build_record(args(approved));
+        assert_eq!(
+            row.catalog_version,
+            crate::desired_state::fixtures::catalog_version().get()
+        );
+        assert_ne!(row.catalog_version, pricing.book().version.get());
+        assert_eq!(
+            row.price_book.as_deref(),
+            Some(pricing.book().to_string()).as_deref()
+        );
+        assert_eq!(
+            row.price_book_checksum.as_deref(),
+            Some(pricing.checksum().to_string()).as_deref()
+        );
+        assert_eq!(
+            row.price_catalog.as_deref(),
+            Some(pricing.catalog().to_string()).as_deref()
+        );
+
+        // A deployment priced by its file names no book, and its numeric column
+        // keeps the value it has carried since the first schema.
+        let (row, _, _) = build_record(args(RequestPrice::configured(
+            gateway_core::catalog::ModelPrice {
+                input_microdollars_per_million: 1,
+                output_microdollars_per_million: 1,
+                reasoning_microdollars_per_million: None,
+                cache_read_microdollars_per_million: None,
+                cache_write_microdollars_per_million: None,
+            },
+        )));
+        assert_eq!(row.catalog_version, 0);
+        assert_eq!(row.price_book, None);
+        assert_eq!(row.price_book_checksum, None);
+        assert_eq!(row.price_catalog, None);
+    }
 
     /// An unusable spelling of the output allowance never hides a usable one, so
     /// neither the output ceiling nor the budget hold can be dodged by sending
@@ -2863,6 +3068,325 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
         );
         AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget))
             .expect("credentials resolve")
+    }
+
+    /// A deployment whose `gpt-4o` alias is bound to a catalogue offering the
+    /// approved book does not price. Discovery still lists it; charging it is
+    /// what the gateway refuses.
+    fn state_bound_to_an_unpriced_offering() -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+{GATEWAY_KEY}
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }}, catalog = {{ provider = "openai", model = "o3" }} }}]
+"#
+        ))
+        .expect("a catalogue binding parses");
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        let env = env_with([("AXOND_PLATFORM_OPENAI", "sk-platform-test")]);
+        let state = AppState::new(
+            cfg.clone(),
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("credentials resolve");
+        state.publish(
+            ConfigSnapshot::build(cfg, &env, 1)
+                .expect("minting snapshot")
+                .with_pricing(approved_pricing_snapshot()),
+        );
+        state
+    }
+
+    /// The acceptance criterion for unpriced models: a model the approved book
+    /// does not price stays discoverable, but a request that would have to be
+    /// charged for it is refused as a typed unavailability rather than served
+    /// for free against an unapproved rate.
+    #[tokio::test]
+    async fn a_model_without_an_approved_price_is_discoverable_but_not_chargeable() {
+        let state = state_bound_to_an_unpriced_offering();
+
+        let listed = router(state.clone())
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: Value = serde_json::from_slice(
+            &listed
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("a catalogue document");
+        assert_eq!(listed["data"][0]["id"], "gpt-4o");
+
+        let refused = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "messages": [{ "role": "user", "content": "hi" }]
+                        }))
+                        .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &refused
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("an error document");
+        assert_eq!(body["error"]["type"], "model_not_priced");
+
+        // The refusal is a data-plane answer, so it says the model is not
+        // chargeable and nothing about which book a deployment runs, at which
+        // version, or whether that book is still a draft.
+        let pricing = approved_pricing_snapshot();
+        let message = body["error"]["message"]
+            .as_str()
+            .expect("an error message")
+            .to_owned();
+        assert!(message.contains("gpt-4o"), "{message}");
+        for internal in [
+            pricing.book().to_string(),
+            pricing.book().id.to_string(),
+            pricing.checksum().to_string(),
+            pricing.catalog().to_string(),
+            pricing.approval().state().to_owned(),
+        ] {
+            assert!(
+                !message.contains(&internal),
+                "the refusal `{message}` discloses `{internal}`"
+            );
+        }
+    }
+
+    /// A deployment whose alias leads with an unpriced catalogue-bound target and
+    /// falls back to a file-priced one. Only the *first* target is reachable on
+    /// the pinned Responses route, so the alias as a whole is chargeable while the
+    /// pinned destination is not.
+    fn state_pinned_to_an_unpriced_offering() -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+{GATEWAY_KEY}
+
+[[model]]
+name = "gpt-4o"
+targets = [
+  {{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }}, catalog = {{ provider = "openai", model = "o3" }} }},
+  {{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }},
+]
+"#
+        ))
+        .expect("a catalogue binding parses");
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        let env = env_with([("AXOND_PLATFORM_OPENAI", "sk-platform-test")]);
+        let state = AppState::new(
+            cfg.clone(),
+            &env,
+            UsageFanout::new(sinks),
+            // The only route under test is pinned to the unpriced first target.
+            // A zero budget proves the pricing refusal happens before a hold is
+            // estimated from the later target that this route cannot attempt.
+            Box::new(crate::budget::InMemoryBudget::new(0)),
+        )
+        .expect("credentials resolve");
+        state.publish(
+            ConfigSnapshot::build(cfg, &env, 1)
+                .expect("minting snapshot")
+                .with_pricing(approved_pricing_snapshot()),
+        );
+        state
+    }
+
+    /// A pinned route cannot fail over past the target it is pinned to, so an
+    /// unpriced pin is a refusal in its own right: it must be the documented
+    /// typed `model_not_priced` unavailability, not the generic "nothing to
+    /// attempt" request error a walk that dispatched nothing used to answer with,
+    /// and it must disclose no more about the price book than the alias-wide
+    /// refusal does.
+    #[tokio::test]
+    async fn a_pinned_target_without_an_approved_price_is_a_typed_pricing_refusal() {
+        let state = state_pinned_to_an_unpriced_offering();
+        let refused = router(state.clone())
+            .oneshot(
+                authorized("/v1/responses")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "input": "hi"
+                        }))
+                        .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &refused
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("an error document");
+        assert_eq!(body["error"]["type"], "model_not_priced");
+
+        let pricing = approved_pricing_snapshot();
+        let message = body["error"]["message"]
+            .as_str()
+            .expect("an error message")
+            .to_owned();
+        assert!(message.contains("gpt-4o"), "{message}");
+        for internal in [
+            pricing.book().to_string(),
+            pricing.book().id.to_string(),
+            pricing.checksum().to_string(),
+            pricing.catalog().to_string(),
+            pricing.approval().state().to_owned(),
+        ] {
+            assert!(
+                !message.contains(&internal),
+                "the refusal `{message}` discloses `{internal}`"
+            );
+        }
+
+        // Streaming does not get a different pricing boundary: an initial
+        // request is still pinned to the unpriced first target and must be
+        // refused before the stream is opened or a budget hold is taken.
+        let streaming_initial = router(state.clone())
+            .oneshot(
+                authorized("/v1/responses")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "input": "hi",
+                            "stream": true
+                        }))
+                        .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(streaming_initial.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &streaming_initial
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("an error document");
+        assert_eq!(body["error"]["type"], "model_not_priced");
+
+        let continuation = router(state.clone())
+            .oneshot(
+                authorized("/v1/responses")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "input": "hi",
+                            "previous_response_id": "resp-from-unpriced-target"
+                        }))
+                        .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(continuation.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &continuation
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("an error document");
+        assert_eq!(body["error"]["type"], "continuation_affinity_unavailable");
+
+        let streaming = router(state)
+            .oneshot(
+                authorized("/v1/responses")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "input": "hi",
+                            "stream": true,
+                            "previous_response_id": "resp-from-unpriced-target"
+                        }))
+                        .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(streaming.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &streaming
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("an error document");
+        assert_eq!(body["error"]["type"], "continuation_affinity_unavailable");
     }
 
     fn minting_state() -> AppState {

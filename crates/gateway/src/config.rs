@@ -22,6 +22,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
+use crate::backends::catalog::{InvalidCatalogId, ProviderId};
 use crate::backends::catalog_refresh::{Bootstrap, RefreshSchedule};
 use crate::backends::catalog_store::postgres::CatalogStoreSettings;
 use crate::convergence::backoff::BackoffPolicy;
@@ -555,7 +556,68 @@ pub struct Target {
     /// Per-token pricing for this concrete target, in micro-dollars per million
     /// tokens. Required — a target that can't be priced can't be budget-checked,
     /// so an unpriced target fails config parsing at boot (delta B2).
+    ///
+    /// What a request is *actually* charged at is
+    /// [`RequestPrice`](crate::pricing::RequestPrice): a deployment whose serving
+    /// snapshot carries an approved price book covering this target's [`catalog`]
+    /// binding is billed from the book instead (ADR 0056). These rates stay the
+    /// authority for a file-configured deployment, and for a target the book does
+    /// not claim.
+    ///
+    /// [`catalog`]: Target::catalog
     pub price: ModelPrice,
+    /// The catalogue offering this target calls, when the operator bound it to
+    /// one.
+    ///
+    /// Optional and explicit. An approved price book prices *catalogue
+    /// offerings*, keyed by the upstream's own provider id and the id that
+    /// provider publishes a model under — neither of which the `[[provider]] id`
+    /// and `model` above are: those are operator-chosen routing names that only
+    /// coincide with the catalogue's vocabulary by accident. Inferring the
+    /// binding from them would silently bill one provider's rates for another's
+    /// traffic, so an unbound target is simply not something a book prices.
+    #[serde(default)]
+    pub catalog: Option<CatalogBinding>,
+}
+
+/// The catalogue offering a routed target calls.
+///
+/// The pair an approved price rule is keyed by
+/// ([`PricedTarget`](crate::desired_state::pricing::PricedTarget)): the
+/// catalogue's provider id, and that provider's own published model id. Parsed at
+/// boot, so the request path holds an identifier the pricing domain can be asked
+/// about directly and a malformed binding is a startup refusal rather than a
+/// silently unpriced target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogBinding {
+    pub provider: ProviderId,
+    /// The id the provider publishes the model under — what a request to that
+    /// provider carries, which is what a price rule is keyed by.
+    pub model: String,
+}
+
+impl CatalogBinding {
+    /// A binding from the two ids an operator writes, refusing an id the
+    /// catalogue vocabulary cannot hold.
+    pub fn new(provider: &str, model: &str) -> Result<Self, InvalidCatalogId> {
+        Ok(Self {
+            provider: ProviderId::parse(provider)?,
+            model: model.to_owned(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CatalogBinding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stated {
+            provider: String,
+            model: String,
+        }
+
+        let stated = Stated::deserialize(deserializer)?;
+        Self::new(&stated.provider, &stated.model).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Explicit (namespace, provider) → env-var binding. Declared, never inferred
@@ -3781,6 +3843,32 @@ namespace = "platform"
 name = "gpt-4o"
 targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
 "#;
+
+    /// A catalogue binding is optional, and when written it is parsed into the
+    /// pricing domain's own vocabulary at boot, so a binding no catalogue could
+    /// hold is a startup refusal rather than a request that prices nothing.
+    #[test]
+    fn a_targets_catalogue_binding_is_optional_and_parsed_at_boot() {
+        let unbound = Config::from_toml_str(VALID).expect("a target need not be bound");
+        assert_eq!(unbound.model[0].targets[0].catalog, None);
+
+        let bound = Config::from_toml_str(&VALID.replace(
+            r#"model = "gpt-4o", price"#,
+            r#"model = "gpt-4o", catalog = { provider = "openai", model = "gpt-4o-2024-08-06" }, price"#,
+        ))
+        .expect("a bound target parses");
+        assert_eq!(
+            bound.model[0].targets[0].catalog,
+            Some(CatalogBinding::new("openai", "gpt-4o-2024-08-06").expect("a valid binding"))
+        );
+
+        let err = Config::from_toml_str(&VALID.replace(
+            r#"model = "gpt-4o", price"#,
+            r#"model = "gpt-4o", catalog = { provider = "Open AI", model = "gpt-4o" }, price"#,
+        ))
+        .expect_err("a provider id the catalogue cannot hold must not boot");
+        assert!(matches!(err, ConfigError::Load(_)), "{err:?}");
+    }
 
     /// Inbound auth fails closed (ADR 0013), so a config that would leave the
     /// gateway callable without a credential is refused at boot.

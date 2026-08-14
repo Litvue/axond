@@ -55,6 +55,7 @@ mod ops;
 // What a replica enforces right now, and how a publication replaces it without
 // touching the holds it already granted (#150).
 mod policy;
+mod pricing;
 mod principals;
 // The recovery qualification driver (#219). Tests only: it holds a replica's
 // reconciler, its cache, and a real Postgres journal at once, and takes the

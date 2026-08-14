@@ -89,14 +89,19 @@ use crate::backends::catalog::{
     CatalogContentId, InvalidCatalogId, JsonPointer, ObservedRate, ProviderId,
 };
 
-/// The schema identifier a price-book body declares and this build reads.
+/// The schema identifier a price-book body declares and this build writes.
 ///
 /// As with the tenancy bodies, any change to the field set or a field's meaning
 /// is a *new* identifier: an unknown schema and an unknown field are both
-/// refusals, never partial interpretations (see [`super::tenancy`]).
-pub const PRICE_BOOK_SCHEMA: &str = "axond.price-book.v1";
+/// refusals, never partial interpretations (see [`super::tenancy`]). This build
+/// also reads v1 as a retained legacy shape so rollback/recovery can hydrate an
+/// older revision without inventing a catalogue version.
+pub const PRICE_BOOK_SCHEMA: &str = "axond.price-book.v2";
+const LEGACY_PRICE_BOOK_SCHEMA: &str = "axond.price-book.v1";
+const PRICE_BOOK_SCHEMAS: &[&str] = &[LEGACY_PRICE_BOOK_SCHEMA, PRICE_BOOK_SCHEMA];
 
 const CATALOG_FIELD: &str = "catalog_content_id";
+const CATALOG_VERSION_FIELD: &str = "catalog_version";
 const CURRENCY_FIELD: &str = "currency";
 const UNIT_FIELD: &str = "unit";
 const APPROVAL_FIELD: &str = "approval";
@@ -848,6 +853,10 @@ impl Canonical for PriceRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceBookBody {
     catalog: CatalogContentId,
+    /// The version of the catalogue resource whose content is named by
+    /// `catalog`. Legacy v1 books did not carry this identity and retain the
+    /// compatibility value `None` until they are republished.
+    catalog_version: Option<ResourceVersionNumber>,
     currency: Currency,
     unit: RateUnit,
     approval: Approval,
@@ -860,6 +869,7 @@ impl PriceBookBody {
 
     const KNOWN_FIELDS: &'static [&'static str] = &[
         CATALOG_FIELD,
+        CATALOG_VERSION_FIELD,
         CURRENCY_FIELD,
         UNIT_FIELD,
         APPROVAL_FIELD,
@@ -898,9 +908,14 @@ impl PriceBookBody {
         &[ORIGIN_FIELD, POINTER_FIELD, CITATION_FIELD];
 
     /// An empty book against one catalogue snapshot.
-    pub const fn new(catalog: CatalogContentId, approval: Approval) -> Self {
+    pub const fn new(
+        catalog: CatalogContentId,
+        catalog_version: ResourceVersionNumber,
+        approval: Approval,
+    ) -> Self {
         Self {
             catalog,
+            catalog_version: Some(catalog_version),
             currency: Currency::Usd,
             unit: RateUnit::NanoDollarsPerMillionTokens,
             approval,
@@ -920,6 +935,12 @@ impl PriceBookBody {
     /// The catalogue content this book priced.
     pub const fn catalog(&self) -> CatalogContentId {
         self.catalog
+    }
+
+    /// The catalogue resource version the book was approved against. `None`
+    /// identifies a v1 book retained from before this field existed.
+    pub const fn catalog_version(&self) -> Option<ResourceVersionNumber> {
+        self.catalog_version
     }
 
     pub const fn currency(&self) -> Currency {
@@ -974,10 +995,10 @@ impl PriceBookBody {
     /// this build cannot read is refused rather than partially applied, because
     /// half a price book is a billing error.
     pub fn read(resource: &ResourceVersion) -> Result<Self, PricingError> {
-        let record = Record::<PricingError>::open(
+        let (record, schema) = Record::<PricingError>::open_any(
             resource,
             ResourceKind::Price,
-            Self::SCHEMA,
+            PRICE_BOOK_SCHEMAS,
             Self::KNOWN_FIELDS,
         )?;
         let reference = resource.reference;
@@ -988,6 +1009,26 @@ impl PriceBookBody {
                 field: CATALOG_FIELD,
                 source,
             })?;
+        let catalog_version = if schema == PRICE_BOOK_SCHEMA {
+            Some(
+                ResourceVersionNumber::new(record.integer(CATALOG_VERSION_FIELD)?).ok_or(
+                    PricingError::FieldType {
+                        reference,
+                        schema,
+                        field: CATALOG_VERSION_FIELD,
+                    },
+                )?,
+            )
+        } else {
+            if record.optional_integer(CATALOG_VERSION_FIELD)?.is_some() {
+                return Err(PricingError::UnknownField {
+                    reference,
+                    schema,
+                    field: CATALOG_VERSION_FIELD.to_owned(),
+                });
+            }
+            None
+        };
         let currency = record.string(CURRENCY_FIELD)?;
         let currency = Currency::parse(currency).ok_or_else(|| PricingError::UnknownCurrency {
             reference,
@@ -1015,6 +1056,7 @@ impl PriceBookBody {
 
         let book = Self {
             catalog: CatalogContentId::from_checksum(catalog),
+            catalog_version,
             currency,
             unit,
             approval,
@@ -1216,25 +1258,42 @@ impl PriceBookBody {
 
 impl Canonical for PriceBookBody {
     fn canonical(&self) -> CanonicalValue {
-        CanonicalValue::map([
-            (SCHEMA_FIELD, CanonicalValue::string(Self::SCHEMA)),
+        let mut fields = vec![
             (
-                CATALOG_FIELD,
+                SCHEMA_FIELD.to_owned(),
+                CanonicalValue::string(if self.catalog_version.is_some() {
+                    Self::SCHEMA
+                } else {
+                    LEGACY_PRICE_BOOK_SCHEMA
+                }),
+            ),
+            (
+                CATALOG_FIELD.to_owned(),
                 CanonicalValue::string(self.catalog.checksum().to_string()),
             ),
             (
-                CURRENCY_FIELD,
+                CURRENCY_FIELD.to_owned(),
                 CanonicalValue::string(self.currency.as_str()),
             ),
-            (UNIT_FIELD, CanonicalValue::string(self.unit.as_str())),
-            (APPROVAL_FIELD, self.approval.canonical()),
+            (
+                UNIT_FIELD.to_owned(),
+                CanonicalValue::string(self.unit.as_str()),
+            ),
+            (APPROVAL_FIELD.to_owned(), self.approval.canonical()),
             (
                 // A set: the order rules were authored in carries no meaning, so
                 // it must not change the book's checksum.
-                RULES_FIELD,
+                RULES_FIELD.to_owned(),
                 CanonicalValue::set(self.rules.iter().map(Canonical::canonical)),
             ),
-        ])
+        ];
+        if let Some(version) = self.catalog_version {
+            fields.push((
+                CATALOG_VERSION_FIELD.to_owned(),
+                CanonicalValue::integer(version.get()),
+            ));
+        }
+        CanonicalValue::map(fields)
     }
 }
 
@@ -1522,7 +1581,10 @@ fn declares_a_price_book(resource: &ResourceVersion) -> bool {
         return false;
     };
     fields.iter().any(|(field, value)| {
-        field == SCHEMA_FIELD && *value == CanonicalValue::string(PRICE_BOOK_SCHEMA)
+        field == SCHEMA_FIELD
+            && PRICE_BOOK_SCHEMAS
+                .iter()
+                .any(|schema| *value == CanonicalValue::string(*schema))
     })
 }
 
@@ -1655,6 +1717,7 @@ pub struct PricingSnapshot {
     book: ResourceRef,
     checksum: Checksum,
     catalog: CatalogContentId,
+    catalog_version: Option<ResourceVersionNumber>,
     approval: Approval,
     effective: EffectiveInterval,
     targets: BTreeMap<PricedTarget, ModelPrice>,
@@ -1680,6 +1743,7 @@ impl PricingSnapshot {
             book: book.reference,
             checksum: book.checksum,
             catalog: book.body.catalog(),
+            catalog_version: book.body.catalog_version(),
             approval: book.body.approval.clone(),
             effective: book.body.stable_interval(at),
             targets,
@@ -1702,6 +1766,14 @@ impl PricingSnapshot {
     /// The catalogue content the book was approved against.
     pub const fn catalog(&self) -> CatalogContentId {
         self.catalog
+    }
+
+    /// The catalogue resource version this book priced, if the book carries
+    /// the v2 identity. A legacy v1 book has content identity but no numeric
+    /// catalogue version and is reported as the compatibility value `0` at the
+    /// usage boundary.
+    pub const fn catalog_version(&self) -> Option<ResourceVersionNumber> {
+        self.catalog_version
     }
 
     pub const fn approval(&self) -> &Approval {
@@ -2013,9 +2085,27 @@ mod tests {
             .expect("the fixture body is readable");
         assert_eq!(read, body);
         assert_eq!(read.catalog(), fixtures::catalog_content_id());
+        assert_eq!(read.catalog_version(), Some(fixtures::catalog_version()));
         assert_eq!(read.currency(), Currency::Usd);
         assert_eq!(read.unit(), RateUnit::NanoDollarsPerMillionTokens);
         assert!(read.approval().is_approved());
+    }
+
+    #[test]
+    fn a_legacy_book_round_trips_without_inventing_a_catalogue_version() {
+        let CanonicalValue::Map(mut fields) = fixtures::approved_price_book().canonical() else {
+            panic!("a body is a record");
+        };
+        fields.retain(|(name, _)| name != CATALOG_VERSION_FIELD);
+        if let Some((_, value)) = fields.iter_mut().find(|(name, _)| name == SCHEMA_FIELD) {
+            *value = CanonicalValue::string(LEGACY_PRICE_BOOK_SCHEMA);
+        }
+        let legacy = read_body(CanonicalValue::map(fields)).expect("legacy v1 is readable");
+        assert_eq!(legacy.catalog_version(), None);
+        let CanonicalValue::Map(fields) = legacy.canonical() else {
+            panic!("a body is a record");
+        };
+        assert!(!fields.iter().any(|(name, _)| name == CATALOG_VERSION_FIELD));
     }
 
     /// The order rules were authored in is not part of what a book *is*, so it
@@ -2036,12 +2126,20 @@ mod tests {
             2 * MICRO,
             2 * MICRO,
         );
-        let forwards = PriceBookBody::new(fixtures::catalog_content_id(), approved())
-            .with_rule(first.clone())
-            .with_rule(second.clone());
-        let backwards = PriceBookBody::new(fixtures::catalog_content_id(), approved())
-            .with_rule(second)
-            .with_rule(first);
+        let forwards = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            approved(),
+        )
+        .with_rule(first.clone())
+        .with_rule(second.clone());
+        let backwards = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            approved(),
+        )
+        .with_rule(second)
+        .with_rule(first);
         assert_eq!(
             forwards.canonical().checksum().expect("canonical"),
             backwards.canonical().checksum().expect("canonical")
@@ -2142,21 +2240,25 @@ mod tests {
     /// at the boundary instant.
     #[test]
     fn consecutive_rules_hand_over_at_the_boundary_instant() {
-        let body = PriceBookBody::new(fixtures::catalog_content_id(), approved())
-            .with_rule(fixtures::price_rule(
-                target(),
-                RulePrecedence::Baseline,
-                EffectiveInterval::bounded(EffectiveInstant::EPOCH, at(1_000)).expect("non-empty"),
-                MICRO,
-                MICRO,
-            ))
-            .with_rule(fixtures::price_rule(
-                target(),
-                RulePrecedence::Baseline,
-                EffectiveInterval::from(at(1_000)),
-                2 * MICRO,
-                2 * MICRO,
-            ));
+        let body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            approved(),
+        )
+        .with_rule(fixtures::price_rule(
+            target(),
+            RulePrecedence::Baseline,
+            EffectiveInterval::bounded(EffectiveInstant::EPOCH, at(1_000)).expect("non-empty"),
+            MICRO,
+            MICRO,
+        ))
+        .with_rule(fixtures::price_rule(
+            target(),
+            RulePrecedence::Baseline,
+            EffectiveInterval::from(at(1_000)),
+            2 * MICRO,
+            2 * MICRO,
+        ));
         let book = book_of(&body);
         let provider = target().provider;
         let before = PricingSnapshot::of(&book, at(999));
@@ -2183,21 +2285,25 @@ mod tests {
 
     #[test]
     fn two_rules_of_one_precedence_covering_one_instant_are_refused() {
-        let body = PriceBookBody::new(fixtures::catalog_content_id(), approved())
-            .with_rule(fixtures::price_rule(
-                target(),
-                RulePrecedence::Baseline,
-                EffectiveInterval::bounded(EffectiveInstant::EPOCH, at(1_001)).expect("non-empty"),
-                MICRO,
-                MICRO,
-            ))
-            .with_rule(fixtures::price_rule(
-                target(),
-                RulePrecedence::Baseline,
-                EffectiveInterval::from(at(1_000)),
-                2 * MICRO,
-                2 * MICRO,
-            ));
+        let body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            approved(),
+        )
+        .with_rule(fixtures::price_rule(
+            target(),
+            RulePrecedence::Baseline,
+            EffectiveInterval::bounded(EffectiveInstant::EPOCH, at(1_001)).expect("non-empty"),
+            MICRO,
+            MICRO,
+        ))
+        .with_rule(fixtures::price_rule(
+            target(),
+            RulePrecedence::Baseline,
+            EffectiveInterval::from(at(1_000)),
+            2 * MICRO,
+            2 * MICRO,
+        ));
         let error = PriceBookBody::read(&fixtures::price_book(&body, 7, "baseline"))
             .expect_err("overlapping rules of one precedence are refused");
         assert!(matches!(
@@ -2215,21 +2321,25 @@ mod tests {
     /// stated precedence, and the override's rate is the one billed.
     #[test]
     fn an_override_supersedes_the_baseline_for_the_interval_it_covers() {
-        let body = PriceBookBody::new(fixtures::catalog_content_id(), approved())
-            .with_rule(fixtures::price_rule(
-                target(),
-                RulePrecedence::Baseline,
-                EffectiveInterval::from(EffectiveInstant::EPOCH),
-                10 * MICRO,
-                10 * MICRO,
-            ))
-            .with_rule(fixtures::price_rule(
-                target(),
-                RulePrecedence::Override,
-                EffectiveInterval::bounded(at(500), at(1_500)).expect("non-empty"),
-                4 * MICRO,
-                4 * MICRO,
-            ));
+        let body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            approved(),
+        )
+        .with_rule(fixtures::price_rule(
+            target(),
+            RulePrecedence::Baseline,
+            EffectiveInterval::from(EffectiveInstant::EPOCH),
+            10 * MICRO,
+            10 * MICRO,
+        ))
+        .with_rule(fixtures::price_rule(
+            target(),
+            RulePrecedence::Override,
+            EffectiveInterval::bounded(at(500), at(1_500)).expect("non-empty"),
+            4 * MICRO,
+            4 * MICRO,
+        ));
         let book = book_of(&body);
         let provider = target().provider;
         let priced = |instant| {
@@ -2248,15 +2358,18 @@ mod tests {
     /// unpriced rather than free.
     #[test]
     fn a_draft_book_activates_no_prices() {
-        let body = PriceBookBody::new(fixtures::catalog_content_id(), Approval::Draft).with_rule(
-            fixtures::price_rule(
-                target(),
-                RulePrecedence::Baseline,
-                EffectiveInterval::from(EffectiveInstant::EPOCH),
-                MICRO,
-                MICRO,
-            ),
-        );
+        let body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            Approval::Draft,
+        )
+        .with_rule(fixtures::price_rule(
+            target(),
+            RulePrecedence::Baseline,
+            EffectiveInterval::from(EffectiveInstant::EPOCH),
+            MICRO,
+            MICRO,
+        ));
         let snapshot = PricingSnapshot::of(&book_of(&body), at(5_000));
         assert!(!snapshot.is_approved());
         assert!(snapshot.is_empty());
@@ -2310,6 +2423,10 @@ mod tests {
             body.canonical().checksum().expect("canonical")
         );
         assert_eq!(snapshot.catalog(), fixtures::catalog_content_id());
+        assert_eq!(
+            snapshot.catalog_version(),
+            Some(fixtures::catalog_version())
+        );
         assert_eq!(snapshot.targets().len(), 1);
     }
 
@@ -2543,7 +2660,7 @@ mod tests {
     #[test]
     fn bodies_a_newer_release_could_have_written_are_incompatibilities() {
         let cases: &[(&str, CanonicalValue)] = &[
-            (SCHEMA_FIELD, CanonicalValue::string("axond.price-book.v2")),
+            (SCHEMA_FIELD, CanonicalValue::string("axond.price-book.v3")),
             (CURRENCY_FIELD, CanonicalValue::string("EUR")),
             (UNIT_FIELD, CanonicalValue::string("pico-dollars")),
         ];
@@ -2593,6 +2710,17 @@ mod tests {
         let missing = read_without_field(CURRENCY_FIELD).expect_err("a missing field is refused");
         assert!(matches!(missing, PricingError::MissingField { .. }));
         assert!(!missing.is_incompatible());
+
+        let missing_catalog_version = read_without_field(CATALOG_VERSION_FIELD)
+            .expect_err("a v2 book needs its catalogue version");
+        assert!(matches!(
+            missing_catalog_version,
+            PricingError::MissingField {
+                field: CATALOG_VERSION_FIELD,
+                ..
+            }
+        ));
+        assert!(!missing_catalog_version.is_incompatible());
 
         let mistyped = read_with_field(CURRENCY_FIELD, CanonicalValue::integer(840))
             .expect_err("a mistyped field is refused");
@@ -2969,7 +3097,12 @@ mod tests {
     #[test]
     fn a_resolution_at_the_end_of_the_timeline_has_no_boundary_after_it() {
         let last = EffectiveInstant::from_millis(u64::MAX);
-        let body = PriceBookBody::new(fixtures::catalog_content_id(), approved()).with_rule(
+        let body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            approved(),
+        )
+        .with_rule(
             PriceRule::new(
                 fixtures::priced_target("openai", "gpt-5.5"),
                 RulePrecedence::Baseline,
@@ -3000,6 +3133,7 @@ mod tests {
         };
         let body = PriceBookBody::new(
             fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
             Approval::Approved {
                 by: by.clone(),
                 at: EffectiveInstant::EPOCH,
@@ -3058,7 +3192,11 @@ mod tests {
     /// cannot be published and a retained one is read the same way on hydration.
     #[test]
     fn a_revision_carrying_an_unbillable_book_does_not_validate() {
-        let body = PriceBookBody::new(fixtures::catalog_content_id(), approved());
+        let body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            fixtures::catalog_version(),
+            approved(),
+        );
         let resource = fixtures::price_book(&body, 7, "baseline");
         let mut state = fixtures::state();
         state.insert(resource).expect("a distinct reference");

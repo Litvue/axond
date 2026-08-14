@@ -32,7 +32,10 @@ meaning, and how they are allowed to change. The design rationale is
 | `cache_read_tokens` | `bigint` | Prompt tokens read from the provider cache, disjoint from `input_tokens`. |
 | `cache_write_tokens` | `bigint` | Prompt tokens written to the provider cache. |
 | `cost_microdollars` | `bigint` | Cost in micro-dollars, priced from the target's catalog entry. |
-| `catalog_version` | `bigint` | Version of the pricing catalog the cost was computed against. |
+| `catalog_version` | `bigint` | Resource version of the catalogue the approved price book was computed against, or `0` for configuration-priced rows and retained legacy v1 price books without catalogue-version provenance. |
+| `price_book` | `text` | Exact price-book resource reference and version the rates came from, rendered `price/<resource id>@v<version>` (e.g. `price/res_0190f2c1-6f6a-7c2e-9d3a-6f1c2b4d5e60@v3`); NULL for a file-priced row. |
+| `price_book_checksum` | `text` | Canonical checksum of that book's body — the same rates always produce the same checksum, so a republished (rolled-back) book is recognisable as the one that was audited before. NULL for a file-priced row. |
+| `price_catalog` | `text` | Content identity of the catalogue the book was approved against; NULL for a file-priced row. Pair with `catalog_version` to identify the catalogue resource version. |
 | `latency_ms` | `bigint` | End-to-end gateway latency. |
 | `attempts` | `bigint` | Upstream target attempts across the alias's targets; retry count is `attempts - 1`, and `1` means the first target served. |
 | `started_at` | `timestamptz` | `recorded_at - latency_ms`. |
@@ -48,12 +51,26 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
 - Adding a **nullable** column, or populating a reserved one, is not a version
   bump: no existing reader changes behaviour.
 - Additive nullable columns that were not reserved in the base DDL ship as
-  ordered `usage_v1_<sequence>_<name>.sql` files alongside `usage_v1.sql`.
-  Fresh installations apply `usage_v1.sql` followed by every additive file in
-  filename order; existing installations apply only the new additive file
-  before deploying a writer that emits its column. The writer does not probe
-  for missing columns: deploying it first causes the existing sink error and
-  dropped-record path.
+  ordered `usage_v<N>_<sequence>_<name>.sql` files alongside the base
+  `usage_v<N>.sql`. Fresh installations apply the base DDL followed by every
+  additive file in filename order — currently
+  `usage_v1_001_add_signer_kid.sql` then
+  `usage_v2_001_add_price_identity.sql`; existing installations apply only the
+  new additive file **before** deploying a writer that emits its column.
+  Ordering is enforced rather than trusted: the Postgres sink checks every
+  column the writer binds while it connects and refuses to boot naming the
+  migration file(s) to apply, in order. This includes older additive columns
+  such as `signer_kid`, not only the newest price identity columns. The contract
+  is intentionally fail-closed: migrate the existing table in place before
+  deploying the writer; do not drop a table holding usage history because the
+  refusal names a base schema file. A table the gateway cannot see at all (it is
+  created after boot, and `create_table` is off by default) is not a gap and does
+  not refuse the boot.
+- The gate resolves the configured relation with `to_regclass` on the same
+  connection as the `INSERT`, so an unqualified table follows that connection's
+  PostgreSQL `search_path` (including a DSN `options=-csearch_path=...`). It does
+  not assume `public` or inspect a different relation. A missing table remains
+  the operator's creation step; a present but unmigrated table is a boot error.
 - Removing or renaming a column, making one `NOT NULL`, or changing a unit or a
   vocabulary (e.g. a new `status` value is fine; redefining an existing one is
   not) **is** a bump: a new `ops/postgres/usage_v<N>.sql` plus a bump of
@@ -71,6 +88,16 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
   the contract. Nothing else was strengthened in step: the shipped DDL declares
   no unique index on it (see below), so the promise is about what the writer
   emits, not about what an existing table enforces.
+- Naming the pricing a row was charged against (`price_book`,
+  `price_book_checksum`, `price_catalog`) is **not** a bump: the three columns
+  are nullable, and `catalog_version` keeps its type and its `0` for a row
+  priced by configuration. New v2 price books populate it with the catalogue
+  resource version; a retained v1 book has no such provenance and records `0`.
+  A reader that groups by pricing treats `price_book IS NULL` as "configured
+  rates" ([ADR 0056](./adr/0056-request-path-pricing.md)).
+- A price change is never retroactive. A new publication is a new price-book
+  version written into new rows; settled rows are never rewritten, so what a
+  request was charged stays answerable from the row that recorded it.
 
 This schema versions independently of the gateway's own version; where it sits
 among axond's other published interfaces is the
