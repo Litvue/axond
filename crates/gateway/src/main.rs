@@ -34,9 +34,10 @@ mod availability;
 mod backends;
 mod budget;
 mod config;
-// Stateful revision convergence (#142). Dead code until a projection from
-// resource bodies to a servable config lands with the body-schema slices; the
-// loop, its contract, and its tests are complete without one.
+// Stateful revision convergence (#142). `serve` constructs the production
+// projection after the listener is live; until inbound-principal projection
+// lands, candidates receive the typed unsupported refusal and readiness stays
+// fail-closed.
 #[allow(dead_code)]
 mod convergence;
 mod credentials;
@@ -59,8 +60,8 @@ mod pricing;
 mod principals;
 // The recovery qualification driver (#219). Tests only: it holds a replica's
 // reconciler, its cache, and a real Postgres journal at once, and takes the
-// database away from underneath them, which is not reachable from outside the
-// binary while stateful boot is not wired to `serve`.
+// database away from underneath them. The same serving contract is exercised
+// from outside the binary by the stateful integration suite.
 #[cfg(test)]
 mod qualification;
 mod rate_limit;
@@ -930,7 +931,7 @@ fn configured_cache(
                 .get(name)
                 .filter(|key| !key.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("last-known-good key env `{name}` is unset"))?;
-            LastKnownGood::new(path, key.as_bytes())
+            LastKnownGood::from_base64(path, key)
                 .map(Some)
                 .map_err(|error| {
                     anyhow::anyhow!("last-known-good cache configuration failed: {error}")
@@ -968,11 +969,46 @@ mod tests {
         .expect("a minimal stateless config");
         config.convergence.cache_path = Some("/tmp/axond-lkg".to_owned());
         config.convergence.cache_key_env = Some("GW_LKG_KEY".to_owned());
-        let env = HashMap::from([(String::from("GW_LKG_KEY"), String::from("too-short"))]);
+        let env = HashMap::from([(
+            String::from("GW_LKG_KEY"),
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 16]),
+        )]);
         let error = configured_cache(&config, &env)
             .expect_err("the cache MAC key must meet the authenticated format bound");
-        assert!(error.to_string().contains("at least"), "{error}");
-        assert!(!error.to_string().contains("too-short"), "{error}");
+        assert!(error.to_string().contains("exactly 32 bytes"), "{error}");
+        assert!(!error.to_string().contains("7"), "{error}");
+    }
+
+    #[test]
+    fn a_cache_key_rejects_whitespace_and_raw_passphrases_without_rendering_them() {
+        let mut config = Config::from_toml_str(
+            "[[namespace]]\nid = \"platform\"\ndefault = true\n\
+             [[provider]]\nid = \"openai\"\nkind = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n\
+             [[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n",
+        )
+        .expect("a minimal stateless config");
+        config.convergence.cache_path = Some("/tmp/axond-lkg".to_owned());
+        config.convergence.cache_key_env = Some("GW_LKG_KEY".to_owned());
+        for key in [
+            " cache-signing-material-that-must-not-render ".to_owned(),
+            "cache-signing-material-that-must-not-render\n".to_owned(),
+        ] {
+            let env = HashMap::from([(String::from("GW_LKG_KEY"), key.clone())]);
+            let error = configured_cache(&config, &env).expect_err("whitespace must be refused");
+            assert!(error.to_string().contains("whitespace"), "{error}");
+            assert!(!error.to_string().contains(&key), "{error}");
+        }
+        let env = HashMap::from([(
+            String::from("GW_LKG_KEY"),
+            "cache-signing-material-that-must-not-render".to_owned(),
+        )]);
+        let error = configured_cache(&config, &env).expect_err("raw passphrases must be refused");
+        assert!(error.to_string().contains("base64"), "{error}");
+        assert!(
+            !error
+                .to_string()
+                .contains("cache-signing-material-that-must-not-render")
+        );
     }
 
     /// The grammar itself, pinned: `axond <command> <action> --config PATH`, with
