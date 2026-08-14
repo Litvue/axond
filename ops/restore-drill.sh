@@ -393,8 +393,13 @@ cat >"${workdir}/provider.json" <<EOF
   "provider":"${provider}","tenant":"${tenant}","slug":"openai",
   "display_name":"OpenAI","wire_family":"openai-chat","endpoint":"https://api.openai.com"}}
 EOF
-# A credential is a *reference* to staged material, never the material: what a
-# restore has to bring back here is the reference and its lifecycle.
+head=empty
+head="$(publish tenants "${workdir}/tenant.json" "drill-tenants" "$head")"
+printf '  published %-12s -> %s\n' tenants "$head"
+
+# A credential is a *reference* to staged material, never the material. Publish
+# the tenant first so the secret store's ownership check has a durable control-
+# plane resource to authorize against before staging or activating the secret.
 printf '%s' "$GW_DRILL_PROVIDER_KEY" >"${workdir}/provider-key"
 secret_stage_output="$(admin secret stage --tenant "$tenant" \
   --material-file "${workdir}/provider-key" 2>/dev/null || true)"
@@ -425,8 +430,7 @@ cat >"${workdir}/policy.json" <<EOF
   "reservation_ttl_seconds":300,"max_in_flight_per_subject":8,"lease_ttl_seconds":60}}
 EOF
 
-head=empty
-for pair in tenants:tenant projects:project providers:provider \
+for pair in projects:project providers:provider \
   credentials:credential catalogs:catalog policies:policy; do
   resource="${pair%%:*}"
   head="$(publish "$resource" "${workdir}/${pair##*:}.json" "drill-${resource}" "$head")"
@@ -534,10 +538,10 @@ observe restored_inference_status "$inference_status"
 observe restored_inference_error "$inference_error"
 require "the_restored_replica_fails_readiness_closed" 503 "$readiness_status" \
   "a restored journal without a projected serving snapshot is not routed traffic"
-require "the_restored_replica_refuses_inference_closed" 503 "$inference_status" \
-  "durable state is not presented as an empty or ready inference configuration"
-require "the_restored_replica_names_inference_refusal" inference_unavailable "$inference_error" \
-  "the refusal identifies the missing serving snapshot rather than an unrelated route error"
+require "the_restored_replica_authenticates_before_inference" 401 "$inference_status" \
+  "authentication precedes convergence, so an unauthenticated catalogue read is refused before readiness state is evaluated"
+require "the_restored_replica_names_authentication_refusal" unauthorized "$inference_error" \
+  "the refusal identifies missing authentication rather than an unrelated route error"
 
 restore_loss_checks=(the_restored_head_is_the_backed_up_head
   the_restored_revision_chain_is_whole the_restored_deployment_is_whole

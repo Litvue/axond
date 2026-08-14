@@ -488,6 +488,31 @@ fn restore_drill_owns_restore_stages_and_reads_catalogue_before_recovered_boot()
         checker.contains("stage.get(\"runner\") == runner"),
         "the evidence checker must select executable stages by their declared runner"
     );
+    let tenant_publish = drill
+        .find("publish tenants \"${workdir}/tenant.json\"")
+        .expect("the tenant is published before secret staging");
+    let secret_stage = drill
+        .find("secret_stage_output=\"")
+        .expect("the secret is staged through the admin surface");
+    let remaining_publications = drill
+        .find("for pair in projects:project")
+        .expect("the remaining resources are published after secret staging");
+    assert!(
+        tenant_publish < secret_stage && secret_stage < remaining_publications,
+        "secret staging must occur after tenant ownership exists and before dependent resources publish"
+    );
+    assert!(
+        drill.contains(
+            "require \"the_restored_replica_authenticates_before_inference\" 401 \"$inference_status\""
+        ),
+        "recovered unauthenticated catalogue reads must fail authentication before convergence"
+    );
+    assert!(
+        drill.contains(
+            "require \"the_restored_replica_names_authentication_refusal\" unauthorized \"$inference_error\""
+        ),
+        "the recovered unauthenticated catalogue refusal must retain its typed error"
+    );
 }
 
 /// A durable-inventory artifact states every gate field, even though this
@@ -496,9 +521,17 @@ fn restore_drill_owns_restore_stages_and_reads_catalogue_before_recovered_boot()
 fn durable_inventory_records_all_gate_fields_and_setup_failures() {
     let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
         .expect("the restore drill is readable");
+    let setup_failure = source
+        .find("record_durable_setup_failure()")
+        .expect("durable setup failure handling is present");
     let start = source
-        .find("stage backup-restore/durable-inventory")
-        .expect("the durable-inventory stage is driven");
+        .rfind("\nstage backup-restore/durable-inventory logical_restore")
+        .map(|offset| offset + 1)
+        .expect("the real durable-inventory stage is driven");
+    assert!(
+        start > setup_failure,
+        "gate assertions must anchor on the real durable-inventory stage, not its setup-failure helper"
+    );
     let end = source[start..]
         .find("stage backup-restore/administration")
         .map(|offset| start + offset)
@@ -520,6 +553,33 @@ fn durable_inventory_records_all_gate_fields_and_setup_failures() {
     assert!(
         source.contains("record_durable_setup_failure"),
         "setup failures must retain an evidence artifact before stopping the drill"
+    );
+}
+
+/// Catalogue resources carry the raw blob checksum, and CatalogRequest::plan
+/// accepts only the canonical `sha256:<64 lowercase hex>` spelling. The
+/// content id remains a separate pointer assertion in the restore stages.
+#[test]
+fn restore_drill_uses_the_catalog_request_raw_digest_spelling() {
+    let root = recovery::workspace_root();
+    let drill = std::fs::read_to_string(root.join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let checksum =
+        std::fs::read_to_string(root.join("crates/gateway/src/desired_state/canonical.rs"))
+            .expect("the checksum parser is readable");
+    assert!(
+        checksum.contains(".strip_prefix(CHECKSUM_ALGORITHM)")
+            && checksum.contains(".and_then(|rest| rest.strip_prefix(':'))"),
+        "the contract must track CatalogRequest's canonical sha256: parser"
+    );
+    assert!(
+        drill.contains("\"$catalog_raw_digest\" == sha256:*")
+            && drill.contains("\"digest\":\"${catalog_raw_digest}\""),
+        "the drill must validate and publish raw_digest in the accepted sha256: form"
+    );
+    assert!(
+        !drill.contains("\"digest\":\"${catalog_content_id}\""),
+        "content_id is a pointer assertion, not the catalogue resource raw digest"
     );
 }
 
