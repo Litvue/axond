@@ -436,12 +436,17 @@ pub struct SliceManifest {
     pub profiles: Vec<SliceManifestWorkload>,
     #[serde(rename = "scenario", default)]
     pub scenarios: Vec<SliceManifestWorkload>,
+    #[serde(rename = "row", default)]
+    pub rows: Vec<SliceManifestWorkload>,
 }
 
 impl SliceManifest {
     /// Every workload the manifest declares, whatever it calls them.
     pub fn workloads(&self) -> impl Iterator<Item = &SliceManifestWorkload> {
-        self.profiles.iter().chain(&self.scenarios)
+        self.profiles
+            .iter()
+            .chain(&self.scenarios)
+            .chain(&self.rows)
     }
 }
 

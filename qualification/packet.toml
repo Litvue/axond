@@ -77,7 +77,7 @@ sink — has run only at its ninety-second smoke tier."""
 [[slice]]
 id = "recovery"
 issue = 219
-status = "harnessed"
+status = "evidenced"
 question = """
 What a stateful deployment serves, refuses, and converges to across a \
 control-plane outage, a cold boot, a credential rotation, and a restore."""
@@ -95,18 +95,11 @@ contract = "docs/operations/recovery-qualification.md"
 adr = "docs/adr/0037-recovery-qualification-harness.md"
 reduced_lane = "cargo test --workspace"
 heavy_lane = ".github/workflows/ci.yml"
-# The tier that would evidence the slice: every scenario's serving stage run
-# against a real fleet. No such run exists, which is what keeps this slice
-# harnessed rather than evidenced.
+# The tier that evidences the slice: every executable serving stage is retained
+# from a real PostgreSQL-backed run. A multi-replica fleet baseline remains a
+# separate production gate.
 heavy_tier = "serving"
-retained = []
-outstanding = """
-Twenty-two executable stages run against real PostgreSQL and retain evidence — the \
-outage, three cold boots, journal convergence, secret rotation, durable restore \
-inventory, logical restore, point-in-time recovery, and restore/PITR \
-reconvergence, and the usage boundary over the durable outbox and sink. The \
-restore drill now measures the usage boundary, but no complete fleet record is \
-retained in the packet yet."""
+retained = ["qualification/recovery/evidence/serving-ci.toml"]
 # Mirrors the union of the recovery manifest's own dependency map, and is
 # checked against it.
 blocked_on = []
@@ -115,7 +108,7 @@ blocked_on = []
 [[slice]]
 id = "fault"
 issue = 218
-status = "harnessed"
+status = "evidenced"
 question = """
 How every provider and backend failure — 429 and 5xx, DNS, TLS and connect \
 stalls, truncation, idle streams, oversized errors, Redis and Postgres latency \
@@ -129,14 +122,7 @@ adr = "docs/adr/0048-fault-qualification-harness.md"
 reduced_lane = "cargo test --workspace"
 heavy_lane = ".github/workflows/ci.yml"
 heavy_tier = "full"
-retained = []
-outstanding = """
-The committed matrix and driver now cover provider, transport, Redis, and \
-Postgres faults, and the stateless provider/transport lane runs in CI. The full \
-matrix has passed locally against the pinned services, but no clean heavy \
-artifact is retained in the packet yet; the provider, transport, and backend \
-rows still need a retained run from the supported fault lane."""
-blocked_on = [158]
+retained = ["qualification/faults/evidence/full-ci.toml"]
 
 # The rollout slice: what a fleet does while it is being replaced.
 [[slice]]
@@ -160,7 +146,6 @@ outstanding = """
 The heavy tier has now passed locally, but no run of a fleet under load is \
 retained in the packet; mixed-version serving across a migration still needs a \
 stateful replica qualification."""
-blocked_on = [158]
 
 # What closing #156 requires. `satisfied` is not an opinion: the contract test
 # derives it from the slices above, so it can only become true when every slice

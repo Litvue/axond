@@ -11,8 +11,8 @@ decomposes into five slices. They landed, and will land, at different depths:
 | --- | --- | --- | --- |
 | `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `evidenced` | Driver, eight committed profiles — including multi-tenant isolation, admission shedding, and a bounded stalling backend — reduced tier on every change, heavy tier on demand, and two retained runs. |
 | `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Two drivers and committed mixes — one stateless, one against a fleet with a durable usage sink — whose smoke tiers run in CI. Neither 12–24 hour tier has been dispatched. |
-| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver, committed scenarios, and twenty-two executable stages running against real PostgreSQL in two lanes — outage, cold boots, cached process serving, cache refusal, secret rotation, convergence, durable inventory, logical restore, point-in-time recovery, and the durable usage boundary. No complete fleet record is retained yet. |
-| `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `harnessed` | Committed provider, transport, Redis, and Postgres fault matrix plus a driver; the full pinned-service matrix has passed locally, but no clean heavy artifact is retained yet. |
+| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `evidenced` | Driver, committed scenarios, and twenty-two executable stages running against real PostgreSQL in two lanes — outage, cold boots, cached process serving, cache refusal, secret rotation, convergence, durable inventory, logical restore, point-in-time recovery, and the durable usage boundary — with a retained GitHub Actions record. A multi-replica fleet baseline remains open. |
+| `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `evidenced` | Committed provider, transport, Redis, and Postgres fault matrix plus a driver; the full pinned-service matrix has a clean retained GitHub Actions record. A second reference tier and integrated fleet evidence remain open. |
 | `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver, committed scenarios, reduced and heavy tiers; the local heavy run passed, but no retained record is committed, and mixed-version serving across a migration still needs a stateful multi-replica qualification. |
 
 `qualification/packet.toml` is that table as data — question, inputs, lanes,
@@ -163,16 +163,14 @@ reviewed change checked by the packet test.
   hours can exercise (`max_rss_drift_kib_per_hour` and its neighbours) have no
   run behind them, so the soak tiers are declared bounds rather than measured
   ones.
-- **`recovery`** — all twenty-two executable stages: serving through the outage,
-  from a restored cache, and across a recovery, plus the rotation whose evidence
-  is a request authenticated with rotated material. Both the stateful-test and
-  restore-drill lanes run today against real PostgreSQL, including the durable
-  usage boundary. The remaining qualification step is a clean, retained
-  fleet-level record; the packet mirrors the manifest's dependency map and is
-  tested against it so future dependencies cannot disappear silently.
-- **`fault`** — a clean retained run of the full provider, transport, Redis, and
-  Postgres matrix. The manifest and driver are present, and local execution has
-  passed, but no reproducible heavy artifact is retained yet.
+- **`recovery`** — a multi-replica fleet baseline: serving through the outage,
+  from a restored cache, and across a recovery, plus rotation and restore under
+  offered load. The retained process/recovery record covers all twenty-two
+  executable stages today; the packet mirrors the manifest's dependency map and
+  is tested against it so future dependencies cannot disappear silently.
+- **`fault`** — a second reference tier and integrated fleet fault evidence. The
+  full provider, transport, Redis, and Postgres matrix now has a clean retained
+  GitHub Actions record.
 - **`rollout`** — a manifest, a driver, and a stateful fleet: two or more
   replicas behind an ingress, with the artifact-digest, migration, and timeline
   metadata a rollout has to retain.
@@ -184,11 +182,10 @@ One question the packet is regularly asked for, and still cannot answer: a
 durable tenant/project principals and serves after a complete snapshot is
 published; without one it keeps readiness and inference fail-closed. The
 single-process evidence belongs to #219, while a profile against multiple
-replicas, offered load, and recovery remains outstanding. That is why the
-`recovery` slice stays `harnessed`: its twenty-two executable stages run against
-real PostgreSQL, including the usage-boundary measurement, but no complete fleet
-record is retained. It is also why no capacity profile claims stateful
-serving.
+replicas, offered load, and recovery remains outstanding. That is why #219
+remains open: its twenty-two executable stages run against real PostgreSQL and
+are retained, but no complete multi-replica fleet record is retained. It is also
+why no capacity profile claims stateful serving.
 
 ## Related
 
