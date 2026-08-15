@@ -87,11 +87,18 @@ read the ADR's ownership and failure matrices before planning a deployment.
 ### Stateful bootstrap
 
 The whole file a stateful replica reads is `mode`, `[server]`, `[transport]`,
-`[admission]`, `[reload]`, telemetry (`[[usage_sink]]`, plus the environment-only
-OTLP settings), the three sections below, and *backend selection with DSN references*
+`[admission]`, telemetry (`[[usage_sink]]`, plus the environment-only OTLP
+settings), the three sections below, and *backend selection with DSN references*
 for the opt-in `[budget]`, `[rate_limit]`, and `[revocation]` backends.
 [`axond.stateful.example.toml`](../axond.stateful.example.toml) is that file with
 prose.
+
+`[reload]` remains a recognized bootstrap section for schema compatibility, but
+it is not a live configuration channel in stateful mode: SIGHUP and file-watch
+reloads are refused because they cannot compile a control-plane revision. The
+stateful example omits it deliberately. Change process-local settings such as
+the listener or admission bounds with a restart, and change durable resources
+through `/admin/v1`.
 
 Two symmetrical rejections happen before the socket is bound, and again on every
 reload:
@@ -747,6 +754,12 @@ old one. Restart after changing `[catalog]`; the applied reload log includes
 The same log entry sets `restart_required = true` for catalogue and other
 boot-owned changes; `changed` only reports live serving state applied by the
 reload.
+
+Stateful mode is the exception to this file-reload contract. Because a file
+reload has no control-plane projection compiler, SIGHUP and file-watch reloads
+are refused rather than replacing the active or pending revision with the
+keyless bootstrap configuration. Restart for process-local bootstrap changes;
+publish durable resource changes through `/admin/v1`.
 
 ## `[[usage_sink]]` — Tier 0 by default; Tier 2 for `postgres`
 

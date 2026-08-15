@@ -70,8 +70,8 @@ never be upgraded by editing the manifest alone.
 | `cold-boot-invalid-cache` | The same boot against a cache that fails its authentication: readiness is refused and the cache's own failure reported. | refuses |
 | `recovery-convergence` | Postgres returns holding revisions the fleet never saw; every replica converges without intervention. | serves |
 | `secret-rotation` | A provider credential is rotated in the secret store and published; replicas pick it up by converging, with no restart or redeployment. | serves |
-| `backup-restore` | The database is lost and restored from a backup: revisions, tenancy, secret metadata, pricing, and audit rows return together. | serves |
-| `point-in-time-recovery` | Recovery to a chosen target rather than to a backup, with the data-loss boundary measured instead of assumed. | serves |
+| `backup-restore` | The database is lost and restored from a backup: revisions, tenancy, secret metadata, the retained catalogue snapshot, and audit rows return together; approved price-book history remains an explicit qualification blocker. | serves |
+| `point-in-time-recovery` | Recovery to a chosen target rather than to a backup, with the revision, secret metadata, catalogue pointer/payload, audit, and data-loss boundaries measured instead of assumed. | serves |
 
 ## The stages, and what runs today
 
@@ -191,7 +191,7 @@ evidence fails the build instead of uploading nothing.
 
 ## What a run retains
 
-Nine evidence classes, and the committed scenarios have to cover all of them:
+Twelve evidence classes, and the committed scenarios have to cover all of them:
 
 | Class | Holds |
 | --- | --- |
@@ -203,9 +203,11 @@ Nine evidence classes, and the committed scenarios have to cover all of them:
 | `restore_duration` | Wall-clock restore time. Recorded, never asserted. |
 | `data_loss_boundary` | What durable state did not survive, named rather than counted. |
 | `usage_loss_boundary` | Which usage records and durable outbox events survived the recovery target, keyed by canonical request identity. |
+| `durable_inventory` | Secret metadata/ownership and catalogue pointer, raw payload, and history that a recovered revision references. |
 | `revision_loss_boundary` | Which revisions a recovery kept and which it left behind, which is what `max_data_loss_revisions` counts. |
 | `fail_open_closed` | Which dependency failed open and which failed closed, per scenario. |
 | `audit_auth` | Administrative authentication and audit outcomes across the window. |
+| `pricing_history` | Whether approved, effective-dated price-book history survived with its catalogue identity and version. |
 
 ## What fails, and what is only recorded
 
@@ -274,6 +276,7 @@ which scenarios it unblocks.
 
 | Slice | Why no stage waits on it, and where the rest of it lives |
 | --- | --- |
+| #146 | Retired for recovery qualification: the restore lane exercises the existing Postgres-backed catalogue store and checks its retained active snapshot. The remaining import/source behavior stays on #146. |
 | #159 | The part a recovery scenario needed — a database running with WAL archiving, and the evidence published as an artifact — is here: `ops/restore-drill.sh` runs that lane, and `ops/check-recovery-evidence.py` fails it when an executable stage leaves no artifact. The rest of #159 — disclosure, fuzzing, SDK compatibility — blocks no recovery stage, so it stays tracked on #159 itself rather than on a stage invented to wait on it. |
 
 The manifest carries the same list in `[[retired_blocker]]`, and

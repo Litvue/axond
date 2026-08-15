@@ -19,7 +19,11 @@
 # control plane. It serves only an immutable projected snapshot (or a valid
 # signed last-known-good cache) and remains fail-closed until one is active;
 # `/readyz` reports that posture while `/healthz` stays live, so an orchestrator
-# leaves the administrative surface reachable during convergence;
+# leaves the administrative surface reachable during convergence. This example
+# shows the optional `[convergence]` contract for a deployment with durable
+# per-replica storage; the shipped Recreate Deployment omits it because it has
+# no durable volume. Use the StatefulSet/PVC overlay before enabling the cache;
+#
 # docs/deployment/kubernetes.md#stateful-mode has the deployment shape that
 # follows from it, and `axond check preflight` reports that refusal on its
 # `serving` line.
@@ -45,9 +49,10 @@ cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"
 # ── Control plane ────────────────────────────────────────────────────────────
 # Durable desired state: revisions, immutable manifests, resource versions, and
 # audit events. Initial cold boot requires it: a stateful replica with no
-# snapshot fails readiness rather than serving partial state. Once a replica
-# holds a snapshot, a control-plane outage stalls change and convergence but
-# does not degrade inference.
+# snapshot fails readiness rather than serving partial state. This build's
+# production projection cannot create the required inbound-principal snapshot
+# yet, so the replica remains fail-closed; outage serving is a future contract,
+# not a promise of this bootstrap example.
 #
 # The schema is applied by the operator, before replicas start, and the commands
 # that do it read this same file:

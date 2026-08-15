@@ -8,25 +8,21 @@
 # the repository documents every field, including the optional enforcement
 # backends this manifest leaves off.
 #
-# The four references below are supplied by the `axond-secrets` Secret the
+# The three references below are supplied by the `axond-secrets` Secret the
 # container takes with `envFrom`: GW_CONTROL_PLANE_DSN, GW_SECRET_STORE_KEK,
-# GW_ADMIN_BREAKGLASS, and GW_LAST_KNOWN_GOOD_KEY. Provision that Secret before
-# applying this ConfigMap, especially on an existing fleet: the cache key is a
-# boot dependency once `[convergence]` is shipped. The base's published
-# placeholder Secret carries none of them, which is deliberate — a stateful
-# deployment supplies its own.
+# and GW_ADMIN_BREAKGLASS. The base's published placeholder Secret carries none
+# of them, which is deliberate — a stateful deployment supplies its own.
+#
+# This Deployment uses Recreate semantics but has no durable per-replica volume.
+# It therefore does not ship `[convergence]`: enabling the local
+# last-known-good cache here would promise cold-boot outage recovery that a Pod
+# replacement cannot retain. A future StatefulSet/PVC overlay may opt in after
+# it provisions durable storage and the signing-key Secret first.
 
 mode = "stateful"
 
 [server]
 bind = "0.0.0.0:8080"
-
-[convergence]
-# The mounted volume stores only authenticated projected state; the signing key
-# is supplied through axond-secrets as GW_LAST_KNOWN_GOOD_KEY. That value is
-# canonical padded base64 for 32 CSPRNG bytes, with no surrounding whitespace.
-cache_path = "/var/lib/axond/last-known-good.snapshot"
-cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"
 
 [control_plane]
 dsn_env = "GW_CONTROL_PLANE_DSN"

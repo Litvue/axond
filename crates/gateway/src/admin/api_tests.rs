@@ -706,9 +706,22 @@ async fn advancing_a_resource_other_resources_pin_carries_those_resources_forwar
     let mut disabled = model_document();
     disabled["mutation"] = json!("update");
     disabled["resource"]["state"] = json!("disabled");
-    head = deployment
-        .publish("/models", "key-model-2", &head, &disabled)
+    let (status, outcome) = deployment
+        .post("/models", "key-model-2", &head, &disabled)
         .await;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    let retired_revision = outcome["revision"].as_str().expect("a revision").to_owned();
+    let alias_delta = outcome["diff"]["resources"]
+        .as_array()
+        .expect("resource diff")
+        .iter()
+        .find(|delta| delta["kind"] == "alias")
+        .expect("the implicitly retired alias is in the revision diff");
+    assert_eq!(alias_delta["change"], "updated");
+    let (status, audit) = deployment.get(&format!("/audit/{retired_revision}")).await;
+    assert_eq!(status, StatusCode::OK, "{audit}");
+    assert_eq!(audit["events"].as_array().expect("audit events").len(), 1);
+    head = retired_revision;
 
     let mut reimported = catalog_document();
     reimported["mutation"] = json!("update");
@@ -723,12 +736,6 @@ async fn advancing_a_resource_other_resources_pin_carries_those_resources_forwar
         .await
         .expect("the published revision hydrates");
     let state = loaded.state();
-    let enablement = state
-        .version_of(
-            crate::desired_state::ResourceKind::ModelEnablement,
-            fixtures::resource_id(14),
-        )
-        .expect("the enablement is desired");
     let alias = state
         .version_of(
             crate::desired_state::ResourceKind::Alias,
@@ -737,15 +744,153 @@ async fn advancing_a_resource_other_resources_pin_carries_those_resources_forwar
         .expect("the alias is desired");
     let alias_body = crate::desired_state::ModelAliasBody::read(alias).expect("an alias body");
     assert_eq!(
-        alias_body.primary().expect("a target").version,
-        enablement.reference.version,
-        "the alias follows the enablement it names"
+        (alias_body.is_enabled(), alias_body.targets().len()),
+        (false, 0),
+        "retiring the last target retires the alias in the same revision"
     );
-    // Re-posting an alias document that omits its target version resolves
-    // against the enablement the state holds rather than against version 1.
-    deployment
-        .publish("/aliases", "key-alias-2", &head, &alias_document())
+    // A stale alias write cannot reactivate a name against the retired model.
+    let (status, error) = deployment
+        .post("/aliases", "key-alias-2", &head, &alias_document())
         .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"]["type"], "validation_failed", "{error}");
+}
+
+#[tokio::test]
+async fn republishing_an_already_disabled_enablement_preserves_a_disabled_alias_target() {
+    let deployment = Deployment::new();
+    let mut head = build(&deployment).await;
+
+    let mut disable_model = model_document();
+    disable_model["mutation"] = json!("update");
+    disable_model["resource"]["state"] = json!("disabled");
+    head = deployment
+        .publish("/models", "key-model-disable", &head, &disable_model)
+        .await;
+
+    // An explicitly disabled alias may retain a historical target. This is the
+    // legacy shape restack must preserve when the already-disabled enablement is
+    // republished for metadata or catalogue carry-forward.
+    let mut disabled_alias = alias_document();
+    disabled_alias["mutation"] = json!("update");
+    disabled_alias["resource"]["state"] = json!("disabled");
+    disabled_alias["resource"]["targets"] =
+        json!([{ "enablement": fixtures::resource_id(14).to_string(), "version": 2 }]);
+    head = deployment
+        .publish(
+            "/aliases",
+            "key-alias-legacy-target",
+            &head,
+            &disabled_alias,
+        )
+        .await;
+
+    let mut republish_disabled = model_document();
+    republish_disabled["mutation"] = json!("update");
+    republish_disabled["resource"]["state"] = json!("disabled");
+    republish_disabled["resource"]["observed_input_micros_per_million"] = json!(3_000);
+    republish_disabled["resource"]["observed_output_micros_per_million"] = json!(2_000);
+    let (status, outcome) = deployment
+        .post(
+            "/models",
+            "key-model-republish-disabled",
+            &head,
+            &republish_disabled,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    let next = outcome["revision"].as_str().expect("a revision").to_owned();
+
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(&next).expect("a revision"))
+        .await
+        .expect("the republished revision hydrates");
+    let alias = loaded
+        .state()
+        .version_of(
+            crate::desired_state::ResourceKind::Alias,
+            fixtures::resource_id(15),
+        )
+        .expect("the alias is desired");
+    let body = crate::desired_state::ModelAliasBody::read(alias).expect("an alias body");
+    assert!(!body.is_enabled());
+    assert_eq!(
+        body.targets(),
+        &[crate::desired_state::AliasTarget::new(
+            fixtures::resource_id(14),
+            crate::desired_state::ResourceVersionNumber::new(3).expect("version"),
+        )],
+        "republication is not an enabled -> disabled transition"
+    );
+
+    // The complete revision/diff is the resource-level audit plan: the alias
+    // retirement is visible alongside the mutation-intent audit event.
+    let alias_delta = outcome["diff"]["resources"]
+        .as_array()
+        .expect("resource diff")
+        .iter()
+        .find(|delta| delta["kind"] == "alias")
+        .expect("the carried alias is recorded in the revision diff");
+    assert_eq!(alias_delta["change"], "updated");
+    let (status, audit) = deployment.get(&format!("/audit/{next}")).await;
+    assert_eq!(status, StatusCode::OK, "{audit}");
+    assert_eq!(
+        audit["events"].as_array().expect("audit events").len(),
+        1,
+        "one mutation event owns the revision"
+    );
+}
+
+#[tokio::test]
+async fn disabling_an_enablement_preserves_targets_of_a_disabled_alias() {
+    let deployment = Deployment::new();
+    let mut head = build(&deployment).await;
+
+    let mut disabled_alias = alias_document();
+    disabled_alias["mutation"] = json!("update");
+    disabled_alias["resource"]["state"] = json!("disabled");
+    head = deployment
+        .publish(
+            "/aliases",
+            "key-alias-disabled-history",
+            &head,
+            &disabled_alias,
+        )
+        .await;
+
+    let mut disable_model = model_document();
+    disable_model["mutation"] = json!("update");
+    disable_model["resource"]["state"] = json!("disabled");
+    head = deployment
+        .publish(
+            "/models",
+            "key-model-disable-history",
+            &head,
+            &disable_model,
+        )
+        .await;
+
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(&head).expect("a revision"))
+        .await
+        .expect("the retirement revision hydrates");
+    let alias = loaded
+        .state()
+        .version_of(
+            crate::desired_state::ResourceKind::Alias,
+            fixtures::resource_id(15),
+        )
+        .expect("the disabled alias is retained");
+    let body = crate::desired_state::ModelAliasBody::read(alias).expect("an alias body");
+    assert!(!body.is_enabled());
+    assert_eq!(
+        body.targets().len(),
+        1,
+        "disabled alias history is retained"
+    );
+    assert_eq!(body.targets()[0].version.get(), 2);
 }
 
 #[tokio::test]

@@ -35,17 +35,18 @@ port-forward as the acceptance checks instead.
 - Kubernetes 1.32 or newer. The production overlay uses the GA sleep
   lifecycle action and matchLabelKeys for topology spread.
 - A Postgres primary reachable from the axond namespace. The deployment's
-  GW_CONTROL_PLANE_DSN and GW_SECRET_STORE_KEK are supplied through the Secret
-  named axond-secrets.
+  GW_CONTROL_PLANE_DSN, GW_SECRET_STORE_KEK, and GW_ADMIN_BREAKGLASS are
+  supplied through the Secret named axond-secrets.
 - A verified multi-architecture image-index digest. The committed all-zero
   digest is intentionally not pullable.
-- Four Secret values for this bootstrap: GW_CONTROL_PLANE_DSN,
-  GW_SECRET_STORE_KEK, GW_ADMIN_BREAKGLASS, and GW_LAST_KNOWN_GOOD_KEY. The
-  last-known-good value must be one canonical padded base64 string encoding 32
-  CSPRNG bytes, with no surrounding whitespace; use the same exact value on
-  every replica. The KEK must be the deployment's existing key material;
-  changing it makes stored ciphertext unrecoverable. Provision the
-  last-known-good key before the ConfigMap that names it.
+- Three Secret values for this bootstrap: GW_CONTROL_PLANE_DSN,
+  GW_SECRET_STORE_KEK, and GW_ADMIN_BREAKGLASS. The KEK must be the
+  deployment's existing key material; changing it makes stored ciphertext
+  unrecoverable. The shipped Recreate Deployment deliberately has no
+  `[convergence]` cache or writable volume: a Pod replacement would discard an
+  `emptyDir` cache and make cold-boot outage recovery an untrue promise. A
+  future StatefulSet/PVC deployment must provision its cache key before the
+  ConfigMap that names it.
 
 Resolve and verify the image before applying the overlay. Set
 `RELEASE_VERSION` to the verified release; the resolver updates both production
@@ -84,13 +85,12 @@ ops/pin-image-digest.sh --check overlays/production-stateful
 kubectl apply -k "$overlay"
 ~~~
 
-The Secret step is deliberately first. For an existing fleet, update or create
-`axond-secrets` with `GW_LAST_KNOWN_GOOD_KEY` and verify it is present before
-applying a release whose `axond.toml` contains `[convergence]`. Applying that
-ConfigMap first makes the new cache configuration a boot dependency while the
-key is absent, so replicas can crash-loop instead of reaching the administrative
-surface. The key is a deployment-wide reference used to authenticate the cache;
-it is not written into the ConfigMap or logs.
+The Secret step is deliberately first because the control-plane, KEK, and
+breakglass references are boot dependencies. Existing fleets do not need a
+cache-key migration for this overlay: its shipped `axond.toml` intentionally
+omits `[convergence]` until a durable StatefulSet/PVC storage design exists.
+Do not add the cache section to this Deployment as a workaround; it would make
+Pod replacement erase the only recovery copy.
 
 The Job and Deployment are created by the same apply and are not ordered by
 Kubernetes. A Pod may briefly restart against a schema that is not present yet;

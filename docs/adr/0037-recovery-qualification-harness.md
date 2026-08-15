@@ -205,7 +205,7 @@ Consequences of the amendment:
   printed, and the checker is given both, so an artifact that leaked one fails
   the lane instead of being uploaded.
 - The restore lane qualifies the revision journal, its checksums, the tenancy
-  and access projections, the credential references, and the audit rows. Wrapped
-  secret material, catalogue snapshots, price books, and usage records are named
-  as the blocked `durable-inventory` and `usage-boundary` stages rather than
+  and access projections, the credential references, the restored secret owner
+  and lifecycle, the retained catalogue snapshot, and the audit rows. Approved
+  price books and usage records remain explicitly blocked rather than being
   implied by a restore that "came back".

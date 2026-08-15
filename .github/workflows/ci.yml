@@ -290,6 +290,9 @@ jobs:
       # its own, so it is checked against the manifest rather than inferred from
       # the upload: every stage the manifest gives this lane owes a file here.
       - name: Check the stateful lane retained its evidence
+        env:
+          AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
+          AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: |
           python3 ops/check-recovery-evidence.py --runner stateful-tests \
             --since-unix-ms "$lane_started_ms" \

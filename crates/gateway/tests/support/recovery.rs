@@ -48,15 +48,25 @@ pub const BLOCKING_ISSUES: [u32; 0] = [];
 /// needed it disappears with it, so the claim is written down and checked: a
 /// retired slice may not also be a blocker, no stage may name it, and the
 /// operator contract has to say what became of it.
-pub const RETIRED_BLOCKERS: [(u32, &str); 1] = [(
-    159,
-    "the hardened lane a recovery scenario needs \u{2014} a database running with WAL \
-     archiving, and the evidence published as an artifact \u{2014} exists: \
-     `ops/restore-drill.sh` runs it, and `ops/check-recovery-evidence.py` fails the \
-     lane when an executable stage leaves no artifact. The rest of #159 \u{2014} \
-     disclosure, fuzzing, SDK compatibility \u{2014} blocks no recovery stage here, \
-     and stays tracked on #159 itself rather than on a stage invented to wait on it",
-)];
+pub const RETIRED_BLOCKERS: [(u32, &str); 2] = [
+    (
+        146,
+        "the durable catalogue state is now covered by `backup-restore/durable-inventory`: \
+         the restore drill configures the existing Postgres catalogue store with the \
+         offline seed and checks its active pointer, retained content id, and non-empty \
+         payload after logical restore. The remaining #146 source/import behavior stays \
+         tracked on #146 and is not reintroduced as a recovery blocker",
+    ),
+    (
+        159,
+        "the hardened lane a recovery scenario needs \u{2014} a database running with WAL \
+         archiving, and the evidence published as an artifact \u{2014} exists: \
+         `ops/restore-drill.sh` runs it, and `ops/check-recovery-evidence.py` fails the \
+         lane when an executable stage leaves no artifact. The rest of #159 \u{2014} \
+         disclosure, fuzzing, SDK compatibility \u{2014} blocks no recovery stage here, \
+         and stays tracked on #159 itself rather than on a stage invented to wait on it",
+    ),
+];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +256,9 @@ pub enum Evidence {
     DataLossBoundary,
     /// Which usage records and outbox events survived the recovery target.
     UsageLossBoundary,
+    /// Secret metadata and catalogue state a restore must retain for the
+    /// resources that a recovered revision references.
+    DurableInventory,
     /// Which revisions a recovery kept and which it left behind: the journal's
     /// own loss boundary, which is what `max_data_loss_revisions` counts.
     RevisionLossBoundary,
@@ -253,10 +266,13 @@ pub enum Evidence {
     FailOpenClosed,
     /// Administrative authentication and audit outcomes across the window.
     AuditAuth,
+    /// Whether approved, effective-dated price-book history survived the
+    /// recovery boundary with its catalogue identity and version.
+    PricingHistory,
 }
 
 impl Evidence {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::OutageTimeline,
         Self::ServingBehavior,
         Self::Revisions,
@@ -265,9 +281,11 @@ impl Evidence {
         Self::RestoreDuration,
         Self::DataLossBoundary,
         Self::UsageLossBoundary,
+        Self::DurableInventory,
         Self::RevisionLossBoundary,
         Self::FailOpenClosed,
         Self::AuditAuth,
+        Self::PricingHistory,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -280,9 +298,11 @@ impl Evidence {
             Self::RestoreDuration => "restore_duration",
             Self::DataLossBoundary => "data_loss_boundary",
             Self::UsageLossBoundary => "usage_loss_boundary",
+            Self::DurableInventory => "durable_inventory",
             Self::RevisionLossBoundary => "revision_loss_boundary",
             Self::FailOpenClosed => "fail_open_closed",
             Self::AuditAuth => "audit_auth",
+            Self::PricingHistory => "pricing_history",
         }
     }
 }

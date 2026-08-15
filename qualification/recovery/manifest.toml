@@ -318,9 +318,10 @@ id = "backup-restore"
 capability = "backup_restore"
 description = """
 The control-plane database is lost and restored from a backup taken while the \
-fleet was serving. Revisions, tenancy, secret metadata, pricing, and audit rows \
-all come back together; the restored journal hydrates its head revision; and the \
-survivor that kept serving reconnects, converges onto it, and answers inference traffic."""
+fleet was serving. Revisions, tenancy, secret metadata, catalogue state, and \
+audit rows, approved price-book history, and usage boundaries all come back \
+together; the restored journal hydrates its head revision; and the survivor that \
+kept serving reconnects, converges onto it, and answers inference traffic."""
 
 [scenario.gate]
 max_serving_error_fraction = 0.0
@@ -361,11 +362,12 @@ status = "executable"
 runner = "restore-drill"
 covers = """
 The durable state a restore has to bring back beyond the journal and its \
-tenancy: wrapped secret material and its lifecycle, imported catalogue \
-snapshots, and effective-dated price books. Named per class rather than \
-counted, because a restore that brought back the revisions and lost the \
-material they reference is a restore that reads as complete."""
-evidence = ["usage_loss_boundary"]
+tenancy: wrapped secret metadata and lifecycle, and the retained imported \
+catalogue snapshot selected by its active content pointer, approved effective-dated \
+price-book history, and usage boundary. Named per class rather than counted, \
+because a restore that brought back revisions and lost the material, catalogue \
+content, pricing, or usage state they reference is not complete."""
+evidence = ["usage_loss_boundary", "durable_inventory", "pricing_history"]
 
 [[scenario.stage]]
 id = "reconvergence"
@@ -407,8 +409,11 @@ publications, and the boundary measured in both directions: every revision \
 committed before the target is present in the promoted cluster, the revision \
 published after it is absent, the head is the pre-target revision, and a \
 replica booted on the recovered database reads that head and accepts a \
-publication against it."""
-evidence = ["outage_timeline", "revisions", "restore_duration", "revision_loss_boundary"]
+publication against it. The same pre-boot reads retain the tenant secret's \
+serialized owner and lifecycle, and the catalogue pointer, raw digest, byte \
+count, payload, and history-row count; those durable inventory facts must survive \
+the target as well."""
+evidence = ["outage_timeline", "revisions", "restore_duration", "durable_inventory", "revision_loss_boundary"]
 
 [[scenario.stage]]
 id = "administration"
@@ -447,6 +452,15 @@ evidence = ["serving_behavior", "convergence_lag"]
 # of the slice and where it stays tracked. `RETIRED_BLOCKERS` in
 # `crates/gateway/tests/support/recovery.rs` repeats this list, and the contract
 # tests hold the two together.
+
+[[retired_blocker]]
+issue = 146
+became = """
+The durable catalogue state is now covered by `backup-restore/durable-inventory`: \
+the restore drill configures the existing Postgres catalogue store with the \
+offline seed and checks its active pointer, retained content id, and non-empty \
+payload after logical restore. The remaining #146 source/import behavior stays \
+tracked on #146 and is not reintroduced as a recovery blocker."""
 
 [[retired_blocker]]
 issue = 159

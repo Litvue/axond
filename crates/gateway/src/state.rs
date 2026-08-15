@@ -2278,6 +2278,8 @@ env = "GW_ADMIN_BREAKGLASS"
     /// serve inference from a snapshot has to have an inbound key, so a future
     /// change that stops refusing stateful inference fails here instead of
     /// authenticating callers against an empty key set.
+    /// A normal candidate build never permits a keyless stateful snapshot. The
+    /// explicit bootstrap constructor is the only keyless path.
     #[test]
     fn stateful_candidates_require_projected_inbound_keys() {
         // A mode that serves inference has no keyless form to begin with:

@@ -400,15 +400,18 @@ version 2 transition.
   further usage sinks (Tinybird, ClickHouse) remain post-beta with no committed
   schedule.
 - **The stateful control plane.** `mode = "stateful"` bootstrap configuration
-  parses and validates ([ADR 0027]), and a stateful process now boots, serves
-  authenticated `/admin/v1`, and refuses *inference* per request
-  (`503 inference_unavailable`, `/readyz` `503`) because no compiler from a
-  published revision to a runtime snapshot ships yet. Neither `/admin/v1` nor the
-  stateful bootstrap surface is under the `0.x` config or HTTP promise until
-  convergence exists; a stateless deployment answers every `/admin/v1` resource
-  path with `501 stateful_mode_required`, with `GET /admin/v1/status` the one
-  exception — it is a replica diagnostic rather than a control-plane resource, so
-  it answers in either mode. See
+  parses and validates ([ADR 0027]), and a stateful process boots and serves
+  authenticated `/admin/v1`. The current production projection has no inbound
+  caller-principal source, so the process is not Ready and serves no inference:
+  anonymous inference is `401 unauthorized`, while an authenticated request
+  reaches `503 inference_unavailable` from the convergence gate. This lane is
+  fail-closed convergence wiring, not an outage-serving release; the principal
+  projection and durable cache-storage slices must land before that claim can
+  change. Neither `/admin/v1` nor the stateful bootstrap surface is under the
+  `0.x` config or HTTP promise until convergence exists; a stateless deployment
+  answers every `/admin/v1` resource path with `501 stateful_mode_required`, with
+  `GET /admin/v1/status` the one exception — it is a replica diagnostic rather
+  than a control-plane resource, so it answers in either mode. See
   [administering a stateful deployment](./operations/admin-api.md).
 
 ## Supported releases and who owns each matrix

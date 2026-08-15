@@ -835,33 +835,17 @@ def check_stateful(documents: list[Document]) -> list[str]:
     if strategy.get("rollingUpdate") is not None:
         failures.append(f"{label}: the Deployment keeps rollingUpdate settings beside Recreate")
 
-    pod_spec = deployment["spec"]["template"]["spec"]
-    cache_volumes = {
-        volume["name"]
-        for volume in pod_spec.get("volumes", [])
-        if "name" in volume
-    }
-    axond = next(
-        (container for container in pod_spec.get("containers", []) if container.get("name") == "axond"),
-        None,
-    )
-    cache_mount = next(
-        (
-            mount
-            for mount in (axond or {}).get("volumeMounts", [])
-            if mount.get("name") == "last-known-good"
-        ),
-        None,
-    )
-    if "last-known-good" not in cache_volumes:
+    template = deployment["spec"].get("template")
+    if not isinstance(template, dict) or not isinstance(template.get("spec"), dict):
         failures.append(
-            f"{label}: the read-only-root stateful Pod has no writable last-known-good volume"
+            f"{label}: the Deployment is missing spec.template.spec, so Kubernetes cannot create a Pod"
         )
-    if cache_mount is None or cache_mount.get("mountPath") != "/var/lib/axond" or cache_mount.get("readOnly"):
-        failures.append(
-            f"{label}: the stateful container does not mount last-known-good read-write at "
-            "/var/lib/axond"
-        )
+        return failures
+    # This is a Deployment with Recreate semantics, not a StatefulSet. There is
+    # no durable per-replica volume, so the shipped config must not enable the
+    # local last-known-good cache and promise recovery across Pod replacement.
+    # A future StatefulSet/PVC overlay gets its own manifest gate when it opts
+    # into `[convergence]`.
 
     budget = one(documents, "PodDisruptionBudget")
     if budget["spec"].get("unhealthyPodEvictionPolicy") != "AlwaysAllow":
@@ -961,6 +945,11 @@ def check_stateful(documents: list[Document]) -> list[str]:
     config = gateway_config(documents)
     if config.get("mode") != "stateful":
         failures.append(f"{label}: the mounted config is not `mode = \"stateful\"`")
+    if "convergence" in config:
+        failures.append(
+            f"{label}: the Recreate Deployment ships [convergence] without durable per-replica "
+            "storage; use a StatefulSet/PVC overlay before enabling the cache"
+        )
     owned_by_the_control_plane = sorted(
         key
         for key in ("namespace", "provider", "credential", "model", "gateway_key", "alias")
@@ -1181,6 +1170,22 @@ def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> lis
                 f"ops/stateful-deploy-drill.sh: the {counterfactual!r} counterfactual is gone; "
                 f"{lost}"
             )
+    for contract, lost in (
+        (
+            "401 unauthorized",
+            "an anonymous inference probe would no longer prove auth-first refusal",
+        ),
+        (
+            "503 inference_unavailable",
+            "the drill would no longer document the authenticated convergence contract",
+        ),
+        (
+            "an active serving revision exists",
+            "the drill would claim serving without an active projected revision",
+        ),
+    ):
+        if contract not in drill:
+            failures.append(f"ops/stateful-deploy-drill.sh: {lost}")
     return failures
 
 
@@ -1467,6 +1472,10 @@ def self_test() -> int:
     one(blocked, "PodDisruptionBudget")["spec"].pop("unhealthyPodEvictionPolicy")
     expect_failure("a budget that blocks every drain", check_stateful(blocked))
 
+    missing_template = copy.deepcopy(stateful)
+    one(missing_template, "Deployment")["spec"].pop("template")
+    expect_failure("a stateful Deployment without a Pod template", check_stateful(missing_template))
+
     published_admin = copy.deepcopy(stateful)
     published_admin.append(
         {
@@ -1517,13 +1526,16 @@ def self_test() -> int:
             service["spec"]["publishNotReadyAddresses"] = True
     expect_failure("callers routed to a refusing replica", check_stateful(routed))
 
-    without_cache_volume = copy.deepcopy(stateful)
-    without_cache_pod = one(without_cache_volume, "Deployment")["spec"]["template"]["spec"]
-    without_cache_pod["volumes"] = []
-    without_cache_pod["containers"][0]["volumeMounts"] = []
+    cache_enabled_without_durable_storage = copy.deepcopy(stateful)
+    cache_config = one(cache_enabled_without_durable_storage, "ConfigMap")
+    cache_config["data"]["axond.toml"] += (
+        "\n[convergence]\n"
+        "cache_path = \"/var/lib/axond/last-known-good.snapshot\"\n"
+        "cache_key_env = \"GW_LAST_KNOWN_GOOD_KEY\"\n"
+    )
     expect_failure(
-        "a read-only stateful Pod without a cache volume",
-        check_stateful(without_cache_volume),
+        "a Recreate stateful Deployment that enables a non-durable cache",
+        check_stateful(cache_enabled_without_durable_storage),
     )
 
     self_migrating = copy.deepcopy(stateful)

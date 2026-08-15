@@ -14,6 +14,14 @@ This page is the integration plan and its acceptance matrix. It exists so that
 "is stateful mode ready?" has a single answer with a reference behind each line,
 rather than a set of merged pull requests nobody has run together.
 
+The current #345 slice is intentionally **fail-closed convergence wiring**. Its
+production projection has no inbound caller-principal source, so stateful
+compilation returns typed `unsupported`, no revision becomes active, and no
+outage-serving or cache-recovery claim is active in this build. The principal-
+projection slice is the explicit dependency that moves IG-03, IG-06, IG-07, and
+the later serving gates from blocked to executable. The shipped Recreate
+Deployment also omits `[convergence]` until durable per-replica storage exists.
+
 - [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) — the two
   operating modes and what each one owns.
 - [Control-plane revision journal](./control-plane-journal.md) — the durable
@@ -103,7 +111,7 @@ here without a scenario, or a scenario without a row, fails the suite.
 
 | Gate | #160 release gate | Integration wiring | Depends on | Evidence | Status |
 | --- | --- | --- | --- | --- | --- |
-| IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap either reaches its control plane and serves `/admin/v1` — refusing inference while no revision is compiled — or fails loudly on the reference it could not resolve | | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_serves_administration_and_refuses_inference`, `stateful_boot_refuses_an_unresolved_reference` | wired |
+| IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap reaches its control plane and serves `/admin/v1`; anonymous inference is refused by auth first and authenticated inference remains behind the typed convergence refusal until principal projection exists | | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_serves_administration_and_refuses_inference`, `stateful_boot_refuses_an_unresolved_reference` | wired |
 | IG-02 | Postgres-first control plane | Operator preflight, forward-only migration, and the connect a replica performs before it serves | | `preflight_describes_a_stateless_install`, `migrate_prepares_a_control_plane_before_replicas_start` | wired |
 | IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | | `stateful_revision_compiles_rotates_and_recovers` | wired |
 | IG-04 | Provider secrets rotate without redeployment | Resolve every credential a candidate snapshot needs through the SecretStore during compilation, never on the request path | IG-03 | `stateful_revision_compiles_rotates_and_recovers` | wired |

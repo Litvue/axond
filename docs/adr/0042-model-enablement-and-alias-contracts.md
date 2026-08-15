@@ -93,10 +93,10 @@ axond.model-alias.v1:      schema, alias_id, tenant_id, project_id,
   contract is authored rather than where a request is served. A duplicate,
   dangling, cross-tenant, sibling-project, or wrong-scope target is refused, and
   an active alias must retain a non-empty, reachable target list and all targets
-  must share its wire family; disabled fallback entries may remain in priority
-  order while a later mutation retargets the name. A disabled alias may clear
-  its target list in the same revision that withdraws the name; the retained row
-  is lifecycle history, not an active graph. An alias name is unique within a
+  must share its wire family. A newly authored enabled alias may not target a
+  disabled enablement; a disabled alias may retain historical targets or clear
+  them in the same revision that withdraws the name. The retained row is
+  lifecycle history, not an active graph. An alias name is unique within a
   project while the same name may exist in another project or tenant.
 - **Lifecycle is enabled ↔ disabled, and identity is immutable.** Both
   transitions are permitted and idempotent; a transition to a state a body does
@@ -159,6 +159,23 @@ rather than taste:
   would be an entitlement hole rather than a compatibility allowance: a row
   nothing reads is also a row nothing binds to a scope, pins to a snapshot, or
   holds to one enablement per offering.
+
+### Amendment — legacy disabled targets (2026-08-14)
+
+PR #344 closes the lifecycle gap without making retained history unreadable. A
+legacy published revision may contain an enabled alias targeting an enablement
+that is already disabled; hydration, catalogue reads, and rollback tolerate
+that exact shape so the revision remains readable and reversible. The strict
+candidate/publication path rejects it for newly authored or modified aliases,
+while a one-resource repair may carry untouched legacy aliases from its base;
+the normal repair is to retarget or retire the alias being changed before
+publishing further entitlement changes. Store-side revalidation carries that
+same base context, and rollback branches on its mutation kind. Restack removes
+a target only for a genuine enabled-to-disabled transition, not when an
+already-disabled enablement is republished. When the last target disappears
+during that transition, the alias's disabled version is part of the same
+complete revision and semantic diff, so its retirement remains auditable without
+creating a second mutation event.
 
 Nothing in this slice is reachable from a request. Routing, `/v1/models`, admin
 handlers, catalogue polling, and persistence continue to work as they did; they

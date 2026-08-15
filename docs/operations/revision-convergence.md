@@ -20,10 +20,12 @@ for the mode as a whole.
 3. A replica that sees a head it is not serving hydrates the **whole** revision,
    projects it onto its configuration, runs the same whole-graph validation boot
    runs, and resolves every secret the result needs.
-4. If all of that succeeds, the replica swaps in the new snapshot atomically and
-   the next request is served from it.
-5. If any of it fails, the replica keeps serving what it already had and reports
-   why.
+4. Once the principal-projection dependency exists, if all of that succeeds, the
+   replica swaps in the new snapshot atomically and the next request is served
+   from it.
+5. Once an active snapshot exists, if any later candidate fails, the replica
+   keeps serving what it already had and reports why. In this PR's current build
+   every stateful candidate stops at the typed `unsupported` boundary above.
 
 When the published snapshot carries effective-dated pricing, the reconciler also
 arms a timer for `PricingSnapshot::effective().ends()`. At that boundary it
@@ -54,7 +56,7 @@ Two consequences worth internalising:
 | Notification delivered | Compile time (milliseconds), no poll wait |
 | Notification lost or disabled | Up to one poll interval, plus compile time |
 | Effective-dated pricing boundary | At the boundary, plus compile time; the scheduler is off the request path |
-| Control plane unreachable | Not until it returns; the previous revision keeps serving |
+| Control plane unreachable after an active snapshot | Not until it returns; the previous revision keeps serving |
 | Revision refused | Never, until the revision is fixed or replaced |
 
 Polling is the mechanism that makes convergence *correct*; notifications only
@@ -408,6 +410,19 @@ same name may exist in another project or tenant. Both bodies move only between
 identifier this build does not know is `incompatible`, so a newer release may add
 one without older replicas reporting damage.
 
+There is one lifecycle compatibility exception for typed model bodies. Older
+writers could leave an enabled alias pointing at a disabled enablement. The
+reader tolerates that exact legacy shape during hydration, catalogue projection,
+and rollback so retained revisions remain readable. `DesiredState` candidate
+validation rejects it for a newly authored or modified alias, while a
+one-resource repair can carry other unchanged legacy aliases from its base;
+store-side publication reuses that base context. A repair publishes a
+disabled/cleared alias or retargets it to an enabled target. Restack strips a
+target only on an actual enabled-to-disabled transition, and when that removes
+the last target the alias's disabled resource version is carried in the same
+revision and semantic diff, which is the resource-level audit record for the
+incidental retirement.
+
 ### How a project becomes a namespace
 
 The runtime's tenancy boundary is the namespace: keys bind to one, credential
@@ -677,10 +692,8 @@ Backoff clears on the first success.
 
 ## During a control-plane outage
 
-A **running** replica is unaffected in the only way that matters: it keeps
-serving inference from its active snapshot. It cannot learn about new revisions,
-so its lag grows and its rejection reason reads `unavailable`, and it converges
-without intervention once PostgreSQL returns.
+The serving behavior described below is the future serving contract; the current
+build remains fail-closed until inbound-principal projection lands.
 
 A **new** replica normally compiles the durable head. If the control plane or
 SecretStore is unavailable, the encrypted compiled-serving sibling of the
@@ -690,11 +703,11 @@ references, not usable credential material.
 
 ### The signed last-known-good cache
 
-Every replica writes the revision it just published to a local file, and a
-replica that boots while the control plane is unreachable may restore that file
-instead of failing to start. This is what keeps a database incident from also
-freezing fleet size — otherwise an outage during a traffic spike means no
-scale-out and no replacement of failed replicas.
+When enabled by a durable StatefulSet/PVC deployment after principal projection
+lands, every replica writes the revision it just published to a local file, and
+a replica that boots while the control plane is unreachable may restore that
+file instead of failing to start. The current Recreate overlay intentionally
+does not enable this path.
 
 What to know about it operationally:
 

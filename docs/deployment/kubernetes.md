@@ -90,10 +90,10 @@ kubectl create namespace axond
 kubectl -n axond create secret generic axond-secrets \
   --from-literal=GW_INBOUND_PLATFORM_KEY=... \
   --from-literal=GW_PLATFORM_OPENAI_API_KEY=...
-digest="$(ops/pin-image-digest.sh --print 0.3.38)" # x-release-please-version
+digest="$(ops/pin-image-digest.sh --print 0.3.39)" # x-release-please-version
 SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
   ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
-ops/pin-image-digest.sh 0.3.38 # x-release-please-version
+ops/pin-image-digest.sh 0.3.39 # x-release-please-version
 kubectl apply -k deploy/kubernetes/overlays/production
 kubectl -n axond rollout status deployment/axond
 ```
@@ -125,8 +125,8 @@ the release you verified:
 ```bash
 ops/pin-image-digest.sh --check          # fails while any overlay is unresolved
 ops/pin-image-digest.sh --check overlays/production   # only that overlay
-ops/pin-image-digest.sh --print 0.3.38 # x-release-please-version, prints the digest
-ops/pin-image-digest.sh 0.3.38 # x-release-please-version, rewrites the overlays
+ops/pin-image-digest.sh --print 0.3.39 # x-release-please-version, prints the digest
+ops/pin-image-digest.sh 0.3.39 # x-release-please-version, rewrites the overlays
 ```
 
 Both production overlays are rewritten, and a bare `--check` answers for both:
@@ -311,17 +311,15 @@ never sees the Job: `ops/pin-image-digest.sh` resolves the sentinel in
 `overlays/production-stateful/kustomization.yaml` alongside the production one,
 and its `--check` refuses either while unresolved. The mounted
 `axond.toml` declares `mode = "stateful"`, the control-plane DSN, the SecretStore
-KEK, a break-glass principal, and the last-known-good cache references, and
-declares no providers, models, aliases, or tenants: in this mode the control
-plane owns them, and a bootstrap that also declares them fails to boot. Apply
-the `axond-secrets` Secret first — including
-`GW_CONTROL_PLANE_DSN`, `GW_SECRET_STORE_KEK`, `GW_ADMIN_BREAKGLASS`, and
-`GW_LAST_KNOWN_GOOD_KEY` — then apply the ConfigMap/overlay. Existing fleets
-must follow that order during rollout or the new cache reference can make Pods
-crash-loop before the signing key is present. The key authenticates the cache
-and must be canonical padded base64 for the same 32 CSPRNG bytes on every
-replica; it is never put in the ConfigMap or diagnostics. Do not include
-leading/trailing whitespace or use a human passphrase.
+KEK, and a break-glass principal, and declares no providers, models, aliases,
+tenants, or `[convergence]` cache: in this mode the control plane owns
+resources, and this Recreate Deployment has no durable per-replica volume for a
+cold-boot cache. Apply the `axond-secrets` Secret first — including
+`GW_CONTROL_PLANE_DSN`, `GW_SECRET_STORE_KEK`, and `GW_ADMIN_BREAKGLASS` — then
+apply the ConfigMap/overlay. A future StatefulSet/PVC overlay may add the
+authenticated cache, but must provision its canonical 32-byte signing key
+before the ConfigMap and keep the exact value on every replica; never put the
+key in the ConfigMap or diagnostics.
 and see [Stateful backends](./stateful-backends.md) for choosing the stores and
 [backup and recovery](../operations/backup-and-recovery.md) for what has to be
 recoverable before the fleet holds anything.

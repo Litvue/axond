@@ -5955,7 +5955,9 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     /// The shipped stateful example is the operator-facing copy of the approved
-    /// bootstrap set; it must keep validating as the parser evolves.
+    /// bootstrap set; it must keep validating as the parser evolves. The
+    /// Recreate deployment deliberately leaves the optional cache disabled until
+    /// a durable StatefulSet/PVC mount exists.
     #[test]
     fn the_shipped_stateful_example_validates() {
         let config = Config::from_toml_str(&repository_file("axond.stateful.example.toml"))
