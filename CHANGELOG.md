@@ -7,7 +7,6 @@
 
 * **stateful:** add durable recovery and catalogue contracts ([0aaa258](https://github.com/Litvue/axond/commit/0aaa2589d8cce6a6f62ba18556ebd230f41af3f1))
 * **stateful:** complete wave 2 qualification ([c18b7a5](https://github.com/Litvue/axond/commit/c18b7a50a02941efaa2b6470b9a5f042175bd715))
-* **stateful:** complete wave 2 qualification ([86d9289](https://github.com/Litvue/axond/commit/86d9289b0252d6ea46a5747912ba7d264641fc96))
 * **stateful:** project durable workload principals ([e18e64a](https://github.com/Litvue/axond/commit/e18e64a2ed7e3635284dbed0a0bf612f8d1652a0))
 
 
