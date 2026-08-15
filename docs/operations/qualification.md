@@ -89,15 +89,6 @@ produced it, so re-running a tier — which rebuilds the binary, and so changes
 the digest — without rewriting this table is a test failure rather than a stale
 paragraph.
 
-## Dependency retirements
-
-The fault and rollout slices formerly named #158 in `blocked_on`. That edge is
-retired rather than silently deleted: the stateful deployment, persistent
-volume, and preflight work remains tracked on [#158](https://github.com/Litvue/axond/issues/158),
-while the fault and rollout qualification contracts now own their executable
-evidence. The packet header records the same retirement, and this paragraph is
-checked by the qualification packet test.
-
 Write a record from a run's artifacts:
 
 ```bash
@@ -170,6 +161,15 @@ evidence. Recovery promotion additionally requires all 22 executable stages,
 with the stateful-test and restore-drill lane attribution from the manifest.
 Promotion does not edit the packet; the status and `retained` path remain a
 reviewed change checked by the packet test.
+
+## Dependency retirements
+
+The fault and rollout slices formerly named #158 in `blocked_on`. That edge is
+retired rather than silently deleted: the stateful deployment, persistent
+volume, and preflight work remains tracked on [#158](https://github.com/Litvue/axond/issues/158),
+while the fault and rollout qualification contracts now own their executable
+evidence. The packet header records the same retirement, and this paragraph is
+checked by the qualification packet test.
 
 ## What each slice still owes
 
