@@ -200,11 +200,12 @@ fuzz-lock:
 
 # A bounded coverage-guided run of one target, starting from the committed seeds.
 # Needs a nightly toolchain and cargo-fuzz; the unbounded runs are scheduled in
-# .github/workflows/fuzz.yml.
+# .github/workflows/fuzz.yml. Keep the GNU target explicit: cargo-fuzz's Linux
+# prebuilt installer can otherwise select musl and fail to link AddressSanitizer.
 fuzz target seconds="60":
     mkdir -p fuzz/corpus/{{target}}
     cp -n fuzz/seeds/{{target}}/* fuzz/corpus/{{target}}/ || true
-    cd fuzz && cargo +nightly fuzz run {{target}} corpus/{{target}} -- -max_total_time={{seconds}} -max_len=65536 -rss_limit_mb=2048 -malloc_limit_mb=1024 -timeout=25
+    cd fuzz && cargo +nightly fuzz run --target x86_64-unknown-linux-gnu {{target}} corpus/{{target}} -- -max_total_time={{seconds}} -max_len=65536 -rss_limit_mb=2048 -malloc_limit_mb=1024 -timeout=25
 
 # Every fuzz target in turn, the way the scheduled lane runs them.
 fuzz-all seconds="60":
