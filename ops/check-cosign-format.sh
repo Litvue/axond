@@ -43,6 +43,8 @@ echo "check-cosign-format: cosign ${installed} matches the release pin"
 
 work="$(mktemp -d)"
 registry=""
+registry_port="${COSIGN_REGISTRY_PORT:-5001}"
+registry_host="localhost:${registry_port}"
 # The trap runs under `set -e`, so a failing removal must not take the rest of
 # the cleanup — or the script's exit status — with it.
 cleanup() {
@@ -54,14 +56,14 @@ cleanup() {
 trap cleanup EXIT
 
 registry="cosign-format-check-$$"
-docker run --detach --name "$registry" --publish 5000:5000 \
+docker run --detach --name "$registry" --publish "${registry_port}:5000" \
   registry:3@sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33 \
   >/dev/null
 for _ in $(seq 1 60); do
-  curl --silent --fail http://localhost:5000/v2/ >/dev/null && break
+  curl --silent --fail "http://${registry_host}/v2/" >/dev/null && break
   sleep 1
 done
-curl --silent --fail http://localhost:5000/v2/ >/dev/null
+curl --silent --fail "http://${registry_host}/v2/" >/dev/null
 
 export COSIGN_PASSWORD=""
 cosign generate-key-pair --output-key-prefix "$work/canary" >/dev/null
@@ -77,7 +79,7 @@ printf 'cosign format canary\n' > "$context/canary.txt"
 
 # Any tag the registry rejects would fail the push rather than the assertion, so
 # the reference is fixed and the digest is read back from the registry.
-image=localhost:5000/cosign-format-canary
+image="${registry_host}/cosign-format-canary"
 
 # A signature is stored under a tag derived from the digest it covers; a cosign
 # 3 default-format signature is not reachable there at all.
@@ -87,7 +89,7 @@ assert_signature_tag() {
   if ! curl --silent --fail --output /dev/null \
     --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
     --header 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-    "http://localhost:5000/v2/${repository}/manifests/${tag}"; then
+    "http://${registry_host}/v2/${repository}/manifests/${tag}"; then
     echo "check-cosign-format: cosign ${installed} signed the ${what} but wrote no" \
       "${tag}; the signature is not where a cosign 2.x consumer following" \
       "docs/installation.md looks for it" >&2
@@ -105,7 +107,7 @@ digest_of() {
     --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
     --header 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
     --header 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-    "http://localhost:5000/v2/cosign-format-canary/manifests/$1" |
+    "http://${registry_host}/v2/cosign-format-canary/manifests/$1" |
     tr -d '\r' | awk '/^[Dd]ocker-[Cc]ontent-[Dd]igest:/ {print $2}'
 }
 

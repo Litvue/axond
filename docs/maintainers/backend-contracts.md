@@ -349,14 +349,14 @@ checksum use.
 
 ## What is not here yet
 
-Nothing in `backends` is constructed by `serve`, so the running gateway is the
-stateless gateway it was: no new boot step, no new request-path work, and no
-Postgres on the inference path. A replica serves an immutable snapshot it already
-holds, which is what makes a control-plane outage an administrative failure
-rather than a serving one. The non-Postgres contract tests still run against
-in-memory fakes (`backends::fakes`), which keeps the Tier 0 hermetic gate
-hermetic and is why a fake is test-only — an in-memory control plane is not a
-selectable backend.
+The backend contracts are not all constructed by every mode. Stateful `serve`
+constructs the control-plane, secret, catalogue, and convergence dependencies;
+stateless `serve` opens none of them. Neither mode puts Postgres on the
+inference path: a stateful replica serves an immutable snapshot it already
+holds, which makes a control-plane outage an administrative failure rather than
+a serving one. The non-Postgres contract tests still run against in-memory fakes
+(`backends::fakes`), which keeps the Tier 0 hermetic gate hermetic and is why a
+fake is test-only — an in-memory control plane is not a selectable backend.
 
 Revision convergence and publication to replicas (#142) follow.
 `load_revision` — and `load_desired_revision`, which Postgres answers in a single

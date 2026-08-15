@@ -1,0 +1,115 @@
+# Durable per-replica workload for signed last-known-good recovery.
+#
+# This intentionally repeats the production Pod template because Kubernetes
+# cannot transform a Deployment into a StatefulSet through a strategic merge.
+# Keep the template aligned with overlays/production/deployment.yaml: the
+# manifest gate checks the termination, resource, spread, and cache invariants
+# on the rendered StatefulSet as well as on the existing Deployment.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: axond
+  namespace: axond
+spec:
+  serviceName: axond-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  # The current stateful process deliberately remains unready until serving
+  # convergence is wired into the main path. Operators therefore opt into
+  # each restart explicitly; the PVC identity survives that replacement.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: axond
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: axond
+    spec:
+      # Must exceed shutdown.drain_grace_ms + deadline_ms + flush_timeout_ms
+      # (25s with the shipped defaults). A SIGKILL before the flush finishes
+      # loses buffered usage records; raise both together, never just one.
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: axond
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: axond
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: axond
+          image: ghcr.io/litvue/axond:0.3.39 # x-release-please-version
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AXOND_CONFIG
+              value: /etc/axond/axond.toml
+          envFrom:
+            - secretRef:
+                name: axond-secrets
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/axond
+              readOnly: true
+            - name: last-known-good
+              mountPath: /var/lib/axond
+              readOnly: false
+      volumes:
+        - name: config
+          configMap:
+            name: axond-config
+  volumeClaimTemplates:
+    - metadata:
+        name: last-known-good
+        labels:
+          app.kubernetes.io/name: axond
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

@@ -195,6 +195,21 @@ impl RevisionStatus {
         }
     }
 
+    /// Record that the control plane has confirmed the already-active snapshot.
+    ///
+    /// A last-known-good restore may have the same revision id as the durable
+    /// head. In that case there is no candidate to publish, but the successful
+    /// durable read is still an important state transition: the source is no
+    /// longer merely the cache and any outage counters must clear.
+    pub fn record_control_plane_confirmation(&self, revision: RevisionId) {
+        let mut state = self.locked();
+        if state.active == Some(revision) {
+            state.source = Some(SnapshotSource::ControlPlane);
+            state.consecutive_failures = 0;
+            state.last_rejection = None;
+        }
+    }
+
     /// Record a refusal. The active snapshot is untouched by construction — this
     /// type holds no snapshot — which is the point: reporting a failure cannot
     /// change what is serving.
@@ -375,5 +390,28 @@ mod tests {
         // serving a revision it cannot yet confirm is desired.
         assert_eq!(report.desired, None);
         assert!(!report.converged());
+    }
+
+    #[test]
+    fn durable_confirmation_promotes_a_cached_revision_and_clears_outage_state() {
+        let clock = ManualClock::new();
+        let status = status(&clock);
+        let first = revision_id(1);
+        status.record_published(first, 1, SnapshotSource::LastKnownGood, Duration::ZERO);
+        status.record_rejection(
+            Rejection {
+                revision: Some(first),
+                reason: "unavailable",
+                detail: "control plane unavailable".to_owned(),
+            },
+            4,
+        );
+
+        status.record_control_plane_confirmation(first);
+
+        let report = status.report();
+        assert_eq!(report.source, Some(SnapshotSource::ControlPlane));
+        assert_eq!(report.consecutive_failures, 0);
+        assert_eq!(report.last_rejection, None);
     }
 }

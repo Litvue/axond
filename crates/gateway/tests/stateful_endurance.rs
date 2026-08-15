@@ -119,6 +119,29 @@ fn stateful_smoke_is_explicitly_invoked_by_a_dedicated_ci_lane() {
     }
 }
 
+#[test]
+fn stateful_soak_lane_publishes_a_qualification_record() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/endurance.yml"),
+    )
+    .expect("the Endurance workflow is committed");
+    let (_, stateful) = workflow
+        .split_once("  stateful-endurance:\n")
+        .expect("the workflow has a stateful endurance lane");
+    for required in [
+        "name: Build the stateful endurance qualification record",
+        "--slice stateful-endurance --tier soak",
+        "stateful-endurance-soak.toml",
+        "name: qualification-record-stateful-endurance",
+        "retention-days: 90",
+    ] {
+        assert!(
+            stateful.contains(required),
+            "the stateful endurance lane does not retain a compact qualification record: missing {required:?}"
+        );
+    }
+}
+
 fn assert_qualifies(result: &StatefulEnduranceResult) {
     let failures = result.failures();
     assert!(

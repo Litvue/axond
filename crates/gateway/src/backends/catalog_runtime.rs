@@ -167,6 +167,16 @@ impl CatalogStore for RuntimeStore {
         }
     }
 
+    async fn retained_by_raw_digest(
+        &self,
+        digest: crate::desired_state::Checksum,
+    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
+        match self {
+            Self::Postgres(store) => store.retained_by_raw_digest(digest).await,
+            Self::InMemory(store) => store.retained_by_raw_digest(digest).await,
+        }
+    }
+
     async fn activate(
         &self,
         import: &RetainedCatalog,
@@ -242,6 +252,7 @@ struct ManualRefresh {
 pub struct CatalogHandle {
     status: Arc<CatalogStatus>,
     refresh: mpsc::Sender<ManualRefresh>,
+    store: Arc<RuntimeStore>,
 }
 
 impl std::fmt::Debug for ManualRefresh {
@@ -254,6 +265,12 @@ impl CatalogHandle {
     /// What the status surface reads.
     pub fn status(&self) -> &Arc<CatalogStatus> {
         &self.status
+    }
+
+    /// The durable catalogue reader used by convergence only. It can hydrate
+    /// retained payloads, but it is never placed in request state.
+    pub fn store(&self) -> Arc<dyn CatalogStore> {
+        self.store.clone()
     }
 
     /// Ask for an import now and wait for what it did.
@@ -294,6 +311,7 @@ async fn store(
     config: &CatalogConfig,
     control_plane_dsn_env: Option<&str>,
     env: &std::collections::HashMap<String, String>,
+    allow_unavailable: bool,
 ) -> Result<RuntimeStore, CatalogBootError> {
     match config.store {
         CatalogStoreBackend::InMemory => Ok(RuntimeStore::InMemory(InMemoryCatalogStore::new())),
@@ -315,9 +333,13 @@ async fn store(
                 .ok_or_else(|| CatalogBootError::MissingDsn {
                     name: name.to_owned(),
                 })?;
-            Ok(RuntimeStore::Postgres(Box::new(
-                PostgresCatalogStore::connect(dsn, config.store_settings()).await?,
-            )))
+            let settings = config.store_settings();
+            let store = if allow_unavailable {
+                PostgresCatalogStore::connect_or_defer(dsn, settings).await?
+            } else {
+                PostgresCatalogStore::connect(dsn, settings).await?
+            };
+            Ok(RuntimeStore::Postgres(Box::new(store)))
         }
     }
 }
@@ -340,16 +362,38 @@ pub async fn start(
     env: &std::collections::HashMap<String, String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<Option<CatalogHandle>, CatalogBootError> {
+    start_with_recovery(config, control_plane_dsn_env, env, shutdown, false).await
+}
+
+/// Start catalogue refresh with a permitted initial backend outage. The store
+/// remains retryable and the serving snapshot is supplied by the compiled
+/// cache; a catalogue import never becomes an inference dependency.
+pub async fn start_allow_unavailable(
+    config: &CatalogConfig,
+    control_plane_dsn_env: Option<&str>,
+    env: &std::collections::HashMap<String, String>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<Option<CatalogHandle>, CatalogBootError> {
+    start_with_recovery(config, control_plane_dsn_env, env, shutdown, true).await
+}
+
+async fn start_with_recovery(
+    config: &CatalogConfig,
+    control_plane_dsn_env: Option<&str>,
+    env: &std::collections::HashMap<String, String>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    allow_unavailable: bool,
+) -> Result<Option<CatalogHandle>, CatalogBootError> {
     if !config.enabled() {
         return Ok(None);
     }
     let source = source(config)?;
-    let store = store(config, control_plane_dsn_env, env).await?;
+    let store = Arc::new(store(config, control_plane_dsn_env, env, allow_unavailable).await?);
     let source_name = source.name();
     let store_name = store.name();
     let mut refresher = CatalogRefresher::new(
         source,
-        store,
+        Arc::clone(&store),
         config.schedule(),
         config.bootstrap_mode(),
         SystemTime::now(),
@@ -394,6 +438,7 @@ pub async fn start(
     Ok(Some(CatalogHandle {
         status,
         refresh: sender,
+        store,
     }))
 }
 
@@ -408,7 +453,7 @@ pub async fn start(
 /// fixed interval, so backoff after a refusal and the ordinary cadence are the
 /// same mechanism, and a refresh that took time does not shorten the next wait.
 async fn run(
-    mut refresher: CatalogRefresher<RuntimeSource, RuntimeStore>,
+    mut refresher: CatalogRefresher<RuntimeSource, Arc<RuntimeStore>>,
     status: Arc<CatalogStatus>,
     mut manual: mpsc::Receiver<ManualRefresh>,
     shutdown: impl std::future::Future<Output = ()> + Send,
@@ -456,7 +501,7 @@ async fn run(
 /// updated on success would answer most confidently exactly when it was most
 /// wrong.
 async fn refresh(
-    refresher: &mut CatalogRefresher<RuntimeSource, RuntimeStore>,
+    refresher: &mut CatalogRefresher<RuntimeSource, Arc<RuntimeStore>>,
     status: &CatalogStatus,
     trigger: RefreshTrigger,
 ) -> RefreshOutcome {

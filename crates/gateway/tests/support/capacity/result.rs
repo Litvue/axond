@@ -315,7 +315,8 @@ impl Hardware {
         Self {
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
-            kernel: read_trimmed("/proc/sys/kernel/osrelease"),
+            kernel: read_trimmed("/proc/sys/kernel/osrelease")
+                .or_else(|| command_output("uname", &["-r"])),
             cpus: std::thread::available_parallelism().map_or(0, Into::into),
             cpu_model: cpu_model(),
             total_memory_kib: total_memory_kib(),
@@ -326,21 +327,33 @@ impl Hardware {
 }
 
 fn cpu_model() -> Option<String> {
-    let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-    info.lines()
-        .find_map(|line| line.strip_prefix("model name")?.split_once(':'))
-        .map(|(_, model)| model.trim().to_owned())
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|info| {
+            info.lines()
+                .find_map(|line| line.strip_prefix("model name")?.split_once(':'))
+                .map(|(_, model)| model.trim().to_owned())
+        })
+        .or_else(|| command_output("sysctl", &["-n", "machdep.cpu.brand_string"]))
 }
 
 fn total_memory_kib() -> Option<u64> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    info.lines().find_map(|line| {
-        line.strip_prefix("MemTotal:")?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    })
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|info| {
+            info.lines().find_map(|line| {
+                line.strip_prefix("MemTotal:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+        })
+        .or_else(|| {
+            command_output("sysctl", &["-n", "hw.memsize"])
+                .and_then(|bytes| bytes.parse::<u64>().ok())
+                .map(|bytes| bytes / 1024)
+        })
 }
 
 fn read_trimmed(path: &str) -> Option<String> {

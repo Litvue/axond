@@ -35,9 +35,10 @@ mod backends;
 mod budget;
 mod config;
 // Stateful revision convergence (#142). `serve` constructs the production
-// projection after the listener is live; until inbound-principal projection
-// lands, candidates receive the typed unsupported refusal and readiness stays
-// fail-closed.
+// projection after the listener is live. Candidates without a recoverable
+// project workload principal still receive the typed refusal and readiness
+// stays fail-closed; complete projected revisions can serve authenticated
+// inference.
 #[allow(dead_code)]
 mod convergence;
 mod credentials;
@@ -77,9 +78,9 @@ mod routes;
 mod secret_redaction;
 mod shutdown;
 mod state;
-// The authenticated status contract (#199). Contract only, like `backends` and
-// `convergence`: the dependencies it reports on are not constructed by `serve`
-// yet, and `/healthz` and `/readyz` keep answering from process state alone.
+// The authenticated status contract (#199). Stateful `serve` constructs the
+// dependency and revision observers; `/healthz` remains process liveness while
+// `/readyz` reflects whether a complete serving snapshot is active.
 #[allow(dead_code)]
 mod status;
 mod streaming;
@@ -103,12 +104,37 @@ use clap::{Arg, ArgAction, Command};
 use config::{Config, Mode};
 use convergence::{
     ConvergenceSettings, LastKnownGood, MaterialLedger, PolicyProjection, Reconciler,
-    RevisionCompiler, RevisionStatus, RuntimeProjection, SystemClock,
+    RevisionCompiler, RevisionStatus, RuntimeProjection, SnapshotSink, SystemClock,
 };
 use rate_limit::RateLimiter;
 use revocation::RevocationStore;
 use state::{AppState, ReplicaObservability};
 use usage::UsageRuntime;
+
+/// Publishes the serving snapshot and its administrative directory as one
+/// generation. The directory is updated after the serving swap so a request can
+/// never gain administrative authority for a revision the data plane does not
+/// yet serve.
+struct ServingSnapshotSink {
+    state: AppState,
+    authorization: admin::runtime::AuthorizationState,
+}
+
+impl SnapshotSink for ServingSnapshotSink {
+    fn admit(&self, snapshot: &state::ConfigSnapshot) -> Result<(), policy::ActivationRefusal> {
+        SnapshotSink::admit(&self.state, snapshot)
+    }
+
+    fn publish(&self, snapshot: state::ConfigSnapshot) {
+        let authorization = snapshot.admin_authorization_handle();
+        SnapshotSink::publish(&self.state, snapshot);
+        self.authorization.update(authorization);
+    }
+
+    fn generation(&self) -> u64 {
+        SnapshotSink::generation(&self.state)
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let matches = cli().get_matches();
@@ -521,6 +547,108 @@ async fn serve() -> anyhow::Result<()> {
 
     let env: HashMap<String, String> = std::env::vars().collect();
     let bootstrap_config = config.clone();
+    // Resolve the cache before opening durable dependencies. A valid compiled
+    // serving record is the explicit permit for deferred backend construction;
+    // a missing or unauthenticated record never turns a stateful outage into a
+    // keyless process.
+    let cache = configured_cache(&config, &env)?;
+    // The encrypted serving cache contains the request-path projection. The
+    // signed desired-state sibling contains the administrative directory that
+    // authenticates a human OIDC identity's scope and role. Restore that view
+    // only when its verified revision is exactly the one the serving cache will
+    // restore; a stale or mismatched directory may never authorize against a
+    // different serving snapshot. If the signed sibling is absent or cannot be
+    // read, the data plane may still recover, but non-breakglass admin requests
+    // remain fail-closed until durable convergence returns.
+    let cached_authorization = if config.mode == Mode::Stateful {
+        match cache.as_ref() {
+            Some(cache) if cache.compiled_exists() => match cache.load() {
+                Ok(Some(revision)) => {
+                    match desired_state::AuthorizationSnapshot::of(revision.state()) {
+                        Ok(authorization) => Some((revision.id(), Arc::new(authorization))),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "the signed desired-state cache could not rebuild its administrative directory"
+                            );
+                            None
+                        }
+                    }
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "the signed desired-state cache could not be authenticated for administrative recovery"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let cached_serving = if config.mode == Mode::Stateful {
+        match cache.as_ref() {
+            Some(cache) if cache.compiled_exists() => match cache.load_compiled() {
+                Ok(Some(record)) => match state::ConfigSnapshot::from_cached_serving(
+                    bootstrap_config.clone(),
+                    &env,
+                    record,
+                ) {
+                    Ok((revision, snapshot)) => {
+                        let snapshot = match cached_authorization.as_ref() {
+                            Some((authorization_revision, authorization))
+                                if *authorization_revision == revision =>
+                            {
+                                snapshot.with_admin_authorization(Arc::clone(authorization))
+                            }
+                            Some((authorization_revision, _)) => {
+                                tracing::warn!(
+                                    serving_revision = %revision,
+                                    authorization_revision = %authorization_revision,
+                                    "the signed and encrypted recovery caches name different revisions; cached OIDC administration remains unavailable"
+                                );
+                                snapshot
+                            }
+                            None => snapshot,
+                        };
+                        Some((revision, snapshot))
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "compiled serving cache was refused; the replica remains unready"
+                        );
+                        None
+                    }
+                },
+                Ok(None) => {
+                    tracing::warn!(
+                        "compiled serving cache disappeared during boot; the replica remains unready"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "compiled serving cache could not be authenticated; the replica remains unready"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // Stateful boot is allowed to expose liveness, authenticated administration,
+    // and a 503 readiness result even when neither the control plane nor a valid
+    // compiled cache is available. This is the fail-closed boundary: the
+    // deferred store and convergence loop keep retrying, but no empty snapshot
+    // reaches inference.
+    let allow_recovery = config.mode == Mode::Stateful;
 
     // No-datastore defaults: usage to stdout, budget always-allow. Durable
     // usage sinks and shared (Redis / Postgres) budget backends are opt-in via
@@ -575,18 +703,21 @@ async fn serve() -> anyhow::Result<()> {
     }
 
     // Built before the inference state takes ownership of the config, and before
-    // the listener exists: a stateful replica whose administrative surface cannot
-    // come up must fail at boot rather than serve a deployment nobody can
-    // administer. In stateless mode this opens nothing at all.
+    // the listener exists: stateful boot may defer an unavailable control plane so
+    // the listener can expose authenticated administration and fail-closed
+    // readiness while convergence retries. In stateless mode this opens nothing.
     let change_signal =
         (config.mode == Mode::Stateful).then(|| Arc::new(convergence::ChangeSignal::new()));
-    let admin = admin::runtime::surface_with_change_signal(&config, &env, change_signal.clone())
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "a stateful deployment could not bring up its administrative surface: {e}"
-            )
-        })?;
+    let admin = admin::runtime::surface_with_change_signal_and_recovery(
+        &config,
+        &env,
+        change_signal.clone(),
+        allow_recovery,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!("a stateful deployment could not bring up its administrative surface: {e}")
+    })?;
     tracing::info!(
         mode = admin.mode,
         prefix = admin::ADMIN_PREFIX,
@@ -603,18 +734,33 @@ async fn serve() -> anyhow::Result<()> {
     // later than the drain it cannot outlive, and nothing in the drain waits on
     // it.
     let (stop_catalogue, catalogue_stopped) = tokio::sync::oneshot::channel::<()>();
-    let catalogue = backends::catalog_runtime::start(
-        &config.catalog,
-        config
-            .control_plane
-            .as_ref()
-            .and_then(|plane| plane.dsn_env.as_deref()),
-        &env,
-        async move {
-            let _ = catalogue_stopped.await;
-        },
-    )
-    .await
+    let catalogue = if allow_recovery {
+        backends::catalog_runtime::start_allow_unavailable(
+            &config.catalog,
+            config
+                .control_plane
+                .as_ref()
+                .and_then(|plane| plane.dsn_env.as_deref()),
+            &env,
+            async move {
+                let _ = catalogue_stopped.await;
+            },
+        )
+        .await
+    } else {
+        backends::catalog_runtime::start(
+            &config.catalog,
+            config
+                .control_plane
+                .as_ref()
+                .and_then(|plane| plane.dsn_env.as_deref()),
+            &env,
+            async move {
+                let _ = catalogue_stopped.await;
+            },
+        )
+        .await
+    }
     .map_err(|e| anyhow::anyhow!("catalogue import configuration failed: {e}"))?;
     if catalogue.is_some() {
         tracing::info!(
@@ -624,6 +770,10 @@ async fn serve() -> anyhow::Result<()> {
             "catalogue imports"
         );
     }
+    let admin = match catalogue.as_ref() {
+        Some(handle) => admin.with_catalogue(handle.store()),
+        None => admin,
+    };
 
     // What this replica can say about itself: every dependency it opened is
     // observed, including the bounded catalogue report when imports are enabled.
@@ -711,7 +861,7 @@ async fn serve() -> anyhow::Result<()> {
             .as_ref()
             .map(Arc::clone)
             .ok_or_else(|| anyhow::anyhow!("stateful boot opened no secret resolver"))?;
-        let compiler = Arc::new(RevisionCompiler::with_secrets(
+        let compiler = RevisionCompiler::with_secrets(
             bootstrap_config,
             env.clone(),
             PolicyProjection::over(RuntimeProjection),
@@ -719,12 +869,19 @@ async fn serve() -> anyhow::Result<()> {
                 resolver,
                 MaterialLedger::new(),
             )),
-        ));
-        let cache = configured_cache(&config, &env)?;
+        );
+        let compiler = match catalogue.as_ref() {
+            Some(handle) => compiler.with_catalogue(handle.store()),
+            None => compiler,
+        };
+        let compiler = Arc::new(compiler);
         let reconciler = Arc::new(Reconciler::with_status(
             store,
             compiler,
-            Arc::new(state.clone()),
+            Arc::new(ServingSnapshotSink {
+                state: state.clone(),
+                authorization: admin.authorization.clone(),
+            }),
             ConvergenceSettings::default(),
             cache,
             Arc::new(SystemClock),
@@ -736,6 +893,15 @@ async fn serve() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    if let (Some(reconciler), Some((revision, snapshot))) = (reconciler.as_ref(), cached_serving) {
+        reconciler
+            .restore_cached(revision, snapshot)
+            .map_err(|error| {
+                anyhow::anyhow!("compiled serving cache could not be admitted: {error}")
+            })?;
+        tracing::info!(%revision, "restored compiled serving snapshot from last-known-good cache");
+    }
 
     // Routed after the inference state exists, because an availability read is
     // answered from the snapshot this replica is serving (#148), while the store

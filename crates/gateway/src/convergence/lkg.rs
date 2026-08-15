@@ -31,10 +31,11 @@
 //! domain has no reason to carry — which is why the mapping is written out
 //! explicitly instead of derived.
 //!
-//! The cache holds no secret material. Bodies are resource envelopes and
-//! canonical values; every credential is a *reference* that is resolved through
-//! the secret store during compilation, so a stolen cache file discloses topology
-//! an operator could read from the admin API, not keys.
+//! The signed desired-state cache holds no secret material. The sibling compiled
+//! serving cache does contain the material needed for dependency-independent
+//! cold recovery, but only inside an authenticated AES-GCM envelope under the
+//! deployment cache key; its plaintext copies are explicitly zeroized after
+//! serialization or decryption.
 //!
 //! The deployment-facing signing key is standard padded base64 encoding of
 //! exactly 32 bytes (256 bits), generated from a CSPRNG. The parser rejects raw
@@ -50,7 +51,11 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::digest::SHA256;
 use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
+use secrecy::zeroize::Zeroize;
 
 use crate::desired_state::canonical::CanonicalDecodeError;
 use crate::desired_state::revision::{ManifestEntry, RevisionManifest};
@@ -90,13 +95,15 @@ pub enum LastKnownGoodError {
     #[error("last-known-good signing material must be at least {MIN_KEY_BYTES} bytes, not {bytes}")]
     KeyTooShort { bytes: usize },
     #[error(
-        "last-known-good signing material must be standard padded base64 encoding of exactly +         {ENCODED_KEY_BYTES} bytes"
+        "last-known-good signing material must be standard padded base64 encoding of exactly \
+         {ENCODED_KEY_BYTES} bytes"
     )]
     KeyEncoding,
     #[error("last-known-good signing material must not have leading or trailing whitespace")]
     KeyWhitespace,
     #[error(
-        "last-known-good signing material must decode to exactly {ENCODED_KEY_BYTES} bytes, +         not {bytes}"
+        "last-known-good signing material must decode to exactly {ENCODED_KEY_BYTES} bytes, \
+         not {bytes}"
     )]
     KeyWrongLength { bytes: usize },
     /// The MAC did not verify: the file was edited, truncated, or written with a
@@ -116,6 +123,12 @@ pub enum LastKnownGoodError {
     Encoding(#[from] CanonicalError),
     #[error("last-known-good cache does not decode as canonical bytes: {0}")]
     Decode(#[from] CanonicalDecodeError),
+    #[error("compiled serving cache `{path}` could not be encoded: {detail}")]
+    CompiledEncoding { path: PathBuf, detail: String },
+    #[error("compiled serving cache `{path}` is not authentic or could not be decrypted")]
+    CompiledSignature { path: PathBuf },
+    #[error("compiled serving cache `{path}` is malformed: {detail}")]
+    CompiledMalformed { path: PathBuf, detail: String },
     /// The record was authentic but this build did not accept the revision it
     /// describes: either the rows do not add up, or they describe a revision this
     /// build cannot read. The inner error says which, in the same words hydration
@@ -130,6 +143,7 @@ pub enum LastKnownGoodError {
 pub struct LastKnownGood {
     path: PathBuf,
     key: hmac::Key,
+    aead_key: [u8; 32],
 }
 
 /// Renders the path only: the signing material never reaches a log line.
@@ -179,11 +193,183 @@ impl LastKnownGood {
         Ok(Self {
             path: path.into(),
             key: hmac::Key::new(hmac::HMAC_SHA256, key),
+            aead_key: compiled_key(key),
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The encrypted compiled-serving sibling of the signed desired-state
+    /// cache. Keeping separate files lets old operators retain the original
+    /// revision/audit recovery artifact while the serving cache evolves its
+    /// encryption envelope independently.
+    pub fn compiled_path(&self) -> PathBuf {
+        self.path.with_extension("serving")
+    }
+
+    /// Whether a compiled-serving record exists. This is only a routing hint;
+    /// callers must still authenticate and decrypt it before using it.
+    pub fn compiled_exists(&self) -> bool {
+        self.compiled_path().is_file()
+    }
+
+    /// Encode and encrypt a compiled snapshot before publication. The caller
+    /// writes the returned opaque bytes only after the snapshot is admitted and
+    /// published, so a refused candidate cannot become recoverable state.
+    pub(crate) fn encode_compiled(
+        &self,
+        snapshot: &crate::state::ConfigSnapshot,
+        revision: RevisionId,
+    ) -> Result<Vec<u8>, LastKnownGoodError> {
+        let mut cached = snapshot.cached_serving(revision);
+        let payload =
+            serde_json::to_vec(&cached).map_err(|error| LastKnownGoodError::CompiledEncoding {
+                path: self.compiled_path(),
+                detail: error.to_string(),
+            });
+        cached.zeroize_secrets();
+        let mut payload = payload?;
+        let mut nonce_bytes = [0u8; aead::NONCE_LEN];
+        if SystemRandom::new().fill(&mut nonce_bytes).is_err() {
+            payload.zeroize();
+            return Err(LastKnownGoodError::CompiledEncoding {
+                path: self.compiled_path(),
+                detail: "the operating system could not supply a nonce".to_owned(),
+            });
+        }
+        let unbound = UnboundKey::new(&aead::AES_256_GCM, &self.aead_key);
+        let unbound = match unbound {
+            Ok(unbound) => unbound,
+            Err(_) => {
+                payload.zeroize();
+                return Err(LastKnownGoodError::CompiledEncoding {
+                    path: self.compiled_path(),
+                    detail: "compiled cache encryption key was not accepted".to_owned(),
+                });
+            }
+        };
+        let key = LessSafeKey::new(unbound);
+        let mut ciphertext = payload;
+        if key
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::from(compiled_aad()),
+                &mut ciphertext,
+            )
+            .is_err()
+        {
+            ciphertext.zeroize();
+            return Err(LastKnownGoodError::CompiledEncoding {
+                path: self.compiled_path(),
+                detail: "compiled cache encryption failed".to_owned(),
+            });
+        }
+        let mut signed =
+            Vec::with_capacity(COMPILED_MAGIC.len() + 1 + nonce_bytes.len() + ciphertext.len());
+        signed.extend_from_slice(COMPILED_MAGIC);
+        signed.push(COMPILED_RECORD_VERSION);
+        signed.extend_from_slice(&nonce_bytes);
+        signed.extend_from_slice(&ciphertext);
+        let tag = hmac::sign(&self.key, &signed);
+        let mut file = Vec::with_capacity(signed.len() + tag.as_ref().len());
+        file.extend_from_slice(COMPILED_MAGIC);
+        file.push(COMPILED_RECORD_VERSION);
+        file.extend_from_slice(tag.as_ref());
+        file.extend_from_slice(&nonce_bytes);
+        file.extend_from_slice(&ciphertext);
+        Ok(file)
+    }
+
+    /// Atomically replace the compiled-serving record after publication.
+    pub(crate) fn write_compiled(&self, bytes: &[u8]) -> Result<(), LastKnownGoodError> {
+        self.write_atomically_at(&self.compiled_path(), bytes)
+    }
+
+    /// Load and authenticate the compiled-serving record, or report that this
+    /// replica has never published one. Plaintext is interpreted only after the
+    /// HMAC and AEAD checks succeed.
+    pub(crate) fn load_compiled(
+        &self,
+    ) -> Result<Option<crate::state::CachedServingSnapshot>, LastKnownGoodError> {
+        let path = self.compiled_path();
+        let file = match fs::read(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(LastKnownGoodError::Io { path, source }),
+        };
+        let rest = file.strip_prefix(COMPILED_MAGIC).ok_or_else(|| {
+            LastKnownGoodError::CompiledMalformed {
+                path: path.clone(),
+                detail: "the file does not begin with the compiled cache marker".to_owned(),
+            }
+        })?;
+        let (version, rest) =
+            rest.split_first()
+                .ok_or_else(|| LastKnownGoodError::CompiledMalformed {
+                    path: path.clone(),
+                    detail: "the file ends before its layout version".to_owned(),
+                })?;
+        if *version != COMPILED_RECORD_VERSION {
+            return Err(LastKnownGoodError::CompiledMalformed {
+                path,
+                detail: format!("unsupported layout version {version}"),
+            });
+        }
+        if rest.len() < 32 + aead::NONCE_LEN + aead::AES_256_GCM.tag_len() {
+            return Err(LastKnownGoodError::CompiledMalformed {
+                path,
+                detail: "the file ends before its authentication envelope".to_owned(),
+            });
+        }
+        let (tag, rest) = rest.split_at(32);
+        let (nonce_bytes, ciphertext) = rest.split_at(aead::NONCE_LEN);
+        let mut signed =
+            Vec::with_capacity(COMPILED_MAGIC.len() + 1 + nonce_bytes.len() + ciphertext.len());
+        signed.extend_from_slice(COMPILED_MAGIC);
+        signed.push(*version);
+        signed.extend_from_slice(nonce_bytes);
+        signed.extend_from_slice(ciphertext);
+        hmac::verify(&self.key, &signed, tag).map_err(|_| {
+            LastKnownGoodError::CompiledSignature {
+                path: self.compiled_path(),
+            }
+        })?;
+        let key = LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &self.aead_key).map_err(
+            |_| LastKnownGoodError::CompiledSignature {
+                path: self.compiled_path(),
+            },
+        )?);
+        let mut plaintext = ciphertext.to_vec();
+        let decrypted = key
+            .open_in_place(
+                Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| {
+                    LastKnownGoodError::CompiledSignature {
+                        path: self.compiled_path(),
+                    }
+                })?,
+                Aad::from(compiled_aad()),
+                &mut plaintext,
+            )
+            .map_err(|_| LastKnownGoodError::CompiledSignature {
+                path: self.compiled_path(),
+            });
+        let decrypted = match decrypted {
+            Ok(decrypted) => decrypted,
+            Err(error) => {
+                plaintext.zeroize();
+                return Err(error);
+            }
+        };
+        let decoded = serde_json::from_slice(decrypted)
+            .map(Some)
+            .map_err(|error| LastKnownGoodError::CompiledMalformed {
+                path: self.compiled_path(),
+                detail: error.to_string(),
+            });
+        plaintext.zeroize();
+        decoded
     }
 
     /// Replace the cache with `revision`.
@@ -280,15 +466,23 @@ impl LastKnownGood {
     /// cache or the new one, never a half-written record that would fail its MAC
     /// on the next boot.
     fn write_atomically(&self, bytes: &[u8]) -> Result<(), LastKnownGoodError> {
+        self.write_atomically_at(&self.path, bytes)
+    }
+
+    fn write_atomically_at(&self, path: &Path, bytes: &[u8]) -> Result<(), LastKnownGoodError> {
         use std::io::Write as _;
 
-        let temporary = self.path.with_extension("tmp");
+        let temporary = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("last-known-good")
+        ));
         let io = |path: &Path, source: io::Error| LastKnownGoodError::Io {
             path: path.to_path_buf(),
             source,
         };
-        if let Some(parent) = self
-            .path
+        if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
@@ -306,8 +500,27 @@ impl LastKnownGood {
             .and_then(|()| file.sync_all())
             .map_err(|source| io(&temporary, source))?;
         drop(file);
-        fs::rename(&temporary, &self.path).map_err(|source| io(&self.path, source))
+        fs::rename(&temporary, path).map_err(|source| io(path, source))
     }
+}
+
+const COMPILED_MAGIC: &[u8] = b"axond.compiled-serving\0";
+const COMPILED_RECORD_VERSION: u8 = 1;
+
+fn compiled_key(key: &[u8]) -> [u8; 32] {
+    let mut context = ring::digest::Context::new(&SHA256);
+    context.update(b"axond.compiled-serving-key\0");
+    context.update(key);
+    let mut derived = [0u8; 32];
+    derived.copy_from_slice(context.finish().as_ref());
+    derived
+}
+
+fn compiled_aad() -> Vec<u8> {
+    let mut aad = Vec::with_capacity(COMPILED_MAGIC.len() + 1);
+    aad.extend_from_slice(COMPILED_MAGIC);
+    aad.push(COMPILED_RECORD_VERSION);
+    aad
 }
 
 /// What the MAC covers: the marker, the layout version, and the record.
@@ -703,6 +916,8 @@ mod tests {
     use super::*;
     use crate::desired_state::ExpectedRevision;
     use crate::desired_state::fixtures;
+    use crate::state::ConfigSnapshot;
+    use std::collections::HashMap;
 
     fn revision(seed: u64, state: DesiredState) -> LoadedRevision {
         let candidate = fixtures::candidate(ExpectedRevision::Empty, "cached", state);
@@ -718,6 +933,75 @@ mod tests {
 
     fn cache(name: &str) -> LastKnownGood {
         LastKnownGood::new(cache_path(name), KEY).expect("a long enough key")
+    }
+
+    fn serving_snapshot() -> (
+        ConfigSnapshot,
+        crate::config::Config,
+        HashMap<String, String>,
+    ) {
+        let config = crate::config::Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://provider.invalid/v1"
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+"#,
+        )
+        .expect("serving cache fixture config");
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "fixture-key".to_owned())]);
+        let snapshot = ConfigSnapshot::build(config.clone(), &env, 7).expect("fixture compiles");
+        (snapshot, config, env)
+    }
+
+    #[test]
+    fn compiled_serving_cache_round_trips_opaquely_and_rejects_tampering() {
+        let (snapshot, bootstrap, env) = serving_snapshot();
+        let cache = cache("compiled-serving");
+        let revision = fixtures::revision_id(9);
+        let bytes = cache
+            .encode_compiled(&snapshot, revision)
+            .expect("compiled cache encodes");
+        assert!(
+            !bytes
+                .windows(b"provider.invalid".len())
+                .any(|window| { window == b"provider.invalid" })
+        );
+        cache.write_compiled(&bytes).expect("compiled cache writes");
+
+        let loaded = cache
+            .load_compiled()
+            .expect("compiled cache authenticates")
+            .expect("compiled cache exists");
+        let (restored_revision, restored) =
+            ConfigSnapshot::from_cached_serving(bootstrap, &env, loaded)
+                .expect("compiled cache rebuilds a serving snapshot");
+        assert_eq!(restored_revision, revision);
+        assert_eq!(restored.generation, snapshot.generation);
+        assert_eq!(restored.config.model.len(), 1);
+
+        let mut tampered = bytes;
+        *tampered.last_mut().expect("compiled cache is non-empty") ^= 1;
+        cache
+            .write_compiled(&tampered)
+            .expect("tampered cache writes for the test");
+        assert!(matches!(
+            cache.load_compiled(),
+            Err(LastKnownGoodError::CompiledSignature { .. })
+        ));
+        let _ = fs::remove_file(cache.compiled_path());
     }
 
     /// The property a cold boot depends on: what comes back is the revision that

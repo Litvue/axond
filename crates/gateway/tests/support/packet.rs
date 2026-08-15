@@ -1,8 +1,8 @@
 //! The committed qualification packet: how far axond #156 actually got.
 //!
 //! Its children merge one at a time, and each one leaves the epic in a
-//! different state — a harness with runs behind it, a harness with none, a
-//! contract with no driver, an issue with neither. `qualification/packet.toml`
+//! different state — a harness with runs behind it, and harnesses with none.
+//! `qualification/packet.toml`
 //! is where that state is written down, and these types are what stop it from
 //! being written down optimistically: a [`Status`] is checked against the paths
 //! and the retained records the slice actually names, so a slice cannot say
@@ -78,7 +78,7 @@ pub struct Slice {
     #[serde(default)]
     pub heavy_lane: Option<String>,
     /// What the slice's own manifest calls its heavy tier — `heavy` for
-    /// capacity, `long` for endurance. A record from any other tier is a
+    /// capacity, `soak` for endurance, and `serving` for recovery. A record from any other tier is a
     /// correctness run, so the rung above `harnessed` is defined against this
     /// name rather than against a shared one.
     #[serde(default)]
@@ -250,7 +250,16 @@ pub struct Record {
     pub inputs: RecordInputs,
     pub hardware: RecordHardware,
     #[serde(rename = "profile")]
+    #[serde(default)]
     pub profiles: Vec<RecordProfile>,
+    /// Non-capacity slices retain one observation per manifest workload. The
+    /// raw JSON remains in the workflow artifact; this compact row carries the
+    /// identity and verdict needed to decide whether it is promotable evidence.
+    #[serde(rename = "observation", default)]
+    pub observations: Vec<RecordObservation>,
+    /// Recovery records retain one row for every executable scenario stage.
+    #[serde(rename = "stage", default)]
+    pub stages: Vec<RecordStage>,
 }
 
 /// Where a run happened, which is what bounds who may compare it with what.
@@ -355,6 +364,38 @@ pub struct RecordProfile {
     pub passed: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordObservation {
+    pub id: String,
+    pub artifact_sha256: String,
+    pub elapsed_ms: u64,
+    pub verdicts: u32,
+    pub passed: bool,
+    /// Endurance records carry both the duration offered and the duration the
+    /// committed tier requires. Other slices do not have a duration claim.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub manifest_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub requested_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordStage {
+    /// The fully-qualified `scenario/stage` key from the recovery manifest.
+    pub id: String,
+    pub runner: String,
+    pub artifact_sha256: String,
+    pub elapsed_ms: u64,
+    pub verdicts: u32,
+    pub passed: bool,
+}
+
 /// The workspace root, resolved from this crate rather than from the runner's
 /// working directory.
 pub fn workspace_root() -> PathBuf {
@@ -407,6 +448,23 @@ impl SliceManifest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SliceManifestWorkload {
     pub id: String,
+    #[serde(default)]
+    pub soak: Option<SliceManifestTier>,
+    #[serde(rename = "stage", default)]
+    pub stages: Vec<SliceManifestStage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SliceManifestTier {
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SliceManifestStage {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub runner: Option<String>,
 }
 
 /// Load whichever manifest a slice names, with the digest a run of it records

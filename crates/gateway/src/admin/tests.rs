@@ -341,7 +341,7 @@ fn an_unpermitted_action_or_scope_is_forbidden_rather_than_unauthenticated() {
     let authorizer = FakeAdminAuthorizer::permitting(&[AdminAction::ReadState]).within(&[scope()]);
     let error = AdminError::from(
         authorizer
-            .authorize(&human(), AdminAction::Publish, &scope())
+            .authorize(&human(), AdminAction::Publish, Surface::Tenant, &scope())
             .expect_err("a read-only identity may not publish"),
     );
     assert_eq!(error.code(), "admin_forbidden");
@@ -351,7 +351,12 @@ fn an_unpermitted_action_or_scope_is_forbidden_rather_than_unauthenticated() {
     let error = AdminError::from(
         FakeAdminAuthorizer::permissive()
             .within(&[scope()])
-            .authorize(&human(), AdminAction::ReadState, &elsewhere)
+            .authorize(
+                &human(),
+                AdminAction::ReadState,
+                Surface::Tenant,
+                &elsewhere,
+            )
             .expect_err("that scope is not this identity's"),
     );
     assert_eq!(error.code(), "admin_forbidden");

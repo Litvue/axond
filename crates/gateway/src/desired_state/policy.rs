@@ -3,8 +3,8 @@
 //! [`tenancy`](super::tenancy) gives a tenant and a project a durable identity;
 //! this module gives each of them one durable **policy document**: the budget
 //! cap, the concurrency ceiling, and the token floor a revision wants enforced.
-//! It is the typed contract a later runtime slice activates against, and nothing
-//! more — see *what this module deliberately does not do*, below.
+//! It is the typed contract the convergence/runtime slice activates against,
+//! and nothing more — see *what this module deliberately does not do*, below.
 //!
 //! # A policy document is complete, never merged
 //!

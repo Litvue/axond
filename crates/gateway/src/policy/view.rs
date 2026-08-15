@@ -5,7 +5,7 @@
 //! policy reaches the request path, and a namespace cannot be enforced under
 //! values that no configuration ever described.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::config::{Config, Mode};
@@ -124,6 +124,10 @@ pub struct PolicyView {
     /// in stateful mode nothing, so it cannot be admitted under an absent policy.
     default: ActivePolicy,
     by_namespace: BTreeMap<String, ActivePolicy>,
+    /// Stateful projected namespaces are the only namespaces a durable policy
+    /// document can govern. A synthetic/bootstrap namespace has no project
+    /// identity and remains outside the durable policy set.
+    projected_namespaces: BTreeSet<String>,
     published: BTreeMap<PolicyScope, Published>,
 }
 
@@ -146,6 +150,12 @@ impl PolicyView {
         let stateful = config.mode == Mode::Stateful;
         let bootstrap = ActivePolicy::bootstrap(config);
         let mut by_namespace = BTreeMap::new();
+        let projected_namespaces = config
+            .namespace
+            .iter()
+            .filter(|namespace| namespace.project.is_some())
+            .map(|namespace| namespace.id.clone())
+            .collect();
         let mut published = BTreeMap::new();
         for namespace in &config.namespace {
             let policy = match &namespace.policy {
@@ -173,6 +183,7 @@ impl PolicyView {
                 bootstrap
             },
             by_namespace,
+            projected_namespaces,
             published,
         }
     }
@@ -217,15 +228,20 @@ impl PolicyView {
             .is_some_and(ActivePolicy::unenforceable)
     }
 
-    /// The namespaces this view serves with nothing to enforce for them.
+    /// The projected control-plane namespaces this view serves with nothing to
+    /// enforce for them.
     ///
     /// A stateful replica denies every request to such a namespace, so a
     /// candidate naming one is refused before it is published rather than
-    /// activated into a namespace-wide outage.
+    /// activated into a namespace-wide outage. Bootstrap-owned namespaces are
+    /// deliberately absent: no durable policy can govern them, and the
+    /// synthetic empty `platform` namespace is not a serving project.
     pub(super) fn unenforceable(&self) -> impl Iterator<Item = &str> {
         self.by_namespace
             .iter()
-            .filter(|(_, policy)| policy.unenforceable())
+            .filter(|(namespace, policy)| {
+                policy.unenforceable() && self.projected_namespaces.contains(*namespace)
+            })
             .map(|(namespace, _)| namespace.as_str())
     }
 

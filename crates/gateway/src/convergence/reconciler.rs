@@ -412,6 +412,36 @@ impl Reconciler {
         }
     }
 
+    /// Seed the reconciler from an authenticated compiled-serving cache before
+    /// the first durable poll. The snapshot is re-admitted against this
+    /// process's current policy runtime, then published exactly like a normal
+    /// candidate; the control-plane task can subsequently replace it when
+    /// Postgres recovers.
+    pub fn restore_cached(
+        &self,
+        revision: RevisionId,
+        snapshot: ConfigSnapshot,
+    ) -> Result<(), ActivationRefusal> {
+        self.sink.admit(&snapshot)?;
+        let pricing_boundary = snapshot
+            .pricing()
+            .and_then(|pricing| pricing.effective().ends());
+        let generation = snapshot.generation;
+        self.sink.publish(snapshot);
+        self.pricing_schedule
+            .lock()
+            .expect("not poisoned")
+            .set(pricing_boundary);
+        *self.active.lock().expect("not poisoned") = Some(revision);
+        self.status.record_published(
+            revision,
+            generation,
+            SnapshotSource::LastKnownGood,
+            Duration::ZERO,
+        );
+        Ok(())
+    }
+
     /// Use the same wall-clock source as the compiler in deterministic tests or
     /// a deployment that supplies a clock abstraction. Production defaults to
     /// [`SystemTime::now`].
@@ -685,6 +715,9 @@ impl Reconciler {
         let active = *self.active.lock().expect("not poisoned");
         if desired.is_none() || (!force_refresh && desired == active) {
             self.backoff.lock().expect("not poisoned").succeed();
+            if let Some(revision) = desired.filter(|revision| Some(*revision) == active) {
+                self.status.record_control_plane_confirmation(revision);
+            }
             return Ok(None);
         }
 
@@ -719,6 +752,19 @@ impl Reconciler {
         // fails *here*, before the sink is touched, and the previous snapshot
         // keeps serving.
         let snapshot = self.compiler.compile(&revision, generation).await?;
+        let compiled_cache = self.cache.as_ref().and_then(|cache| {
+            cache
+                .encode_compiled(&snapshot, id)
+                .map(Some)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        revision = %id,
+                        error = %error,
+                        "the compiled serving cache could not be prepared; the snapshot remains eligible"
+                    );
+                    None
+                })
+        });
         // Asked before publishing, so an unsafe policy transition costs a
         // rejected candidate rather than a half-applied one.
         if let Err(source) = self.sink.admit(&snapshot) {
@@ -786,7 +832,7 @@ impl Reconciler {
                 "published approved pricing"
             );
         }
-        self.export(&revision);
+        self.export(&revision, compiled_cache.as_deref());
         Ok(id)
     }
 
@@ -795,11 +841,13 @@ impl Reconciler {
     /// A cache failure is logged and counted, never propagated: the replica is
     /// already serving the revision, and refusing to serve because a *cache* is
     /// unwritable would turn a full disk into an outage.
-    fn export(&self, revision: &LoadedRevision) {
+    fn export(&self, revision: &LoadedRevision, compiled: Option<&[u8]>) {
         let Some(cache) = &self.cache else {
             return;
         };
-        match cache.export(revision) {
+        let desired_result = cache.export(revision);
+        let compiled_result = compiled.map(|bytes| cache.write_compiled(bytes));
+        match desired_result {
             Ok(()) => {
                 if self.export_failing.swap(false, Ordering::Relaxed) {
                     tracing::info!(
@@ -821,6 +869,13 @@ impl Reconciler {
                     );
                 }
             }
+        }
+        if let Some(Err(error)) = compiled_result {
+            tracing::warn!(
+                path = %cache.compiled_path().display(),
+                error = %error,
+                "the compiled serving cache could not be written; cold-start recovery remains unavailable"
+            );
         }
     }
 

@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: axond-config
+  namespace: axond
+data:
+  axond.toml: |
+    # Persistent stateful bootstrap: the parent Recreate overlay intentionally
+    # omits the local cache; this overlay opts in because the StatefulSet mounts
+    # a retained PVC at /var/lib/axond.
+    mode = "stateful"
+
+    [server]
+    bind = "0.0.0.0:8080"
+
+    [convergence]
+    cache_path = "/var/lib/axond/last-known-good.snapshot"
+    cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"
+
+    [control_plane]
+    dsn_env = "GW_CONTROL_PLANE_DSN"
+    connect_timeout_ms = 5000
+    operation_timeout_ms = 30000
+
+    [secret_store]
+    backend = "postgres"
+    kek_env = "GW_SECRET_STORE_KEK"
+
+    [catalog]
+    source = "seed"
+    store = "postgres"
+    bootstrap = "seed"
+
+    [[admin_breakglass]]
+    env = "GW_ADMIN_BREAKGLASS"
+    id = "breakglass"
+
+    [admission]
+    max_request_bytes = 1_048_576
+    max_in_flight = 32
+    max_in_flight_streams = 16
+    max_in_flight_per_tenant = 0
+    max_tenants = 256
+    queue_capacity = 0
+    queue_wait_ms = 0
+    max_stream_duration_ms = 900_000
+    max_stream_bytes = 33_554_432

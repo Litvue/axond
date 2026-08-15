@@ -5,8 +5,10 @@
 //! writes what it observed to `target/recovery/<scenario>.<stage>.json`. The
 //! stages driven today are the control-plane halves: a converged replica losing
 //! the journal, the three cold boots the signed cache defines, and the fleet
-//! converging when the journal comes back. The serving halves are blocked
-//! stages, because a replica cannot yet serve a projected revision.
+//! converging when the journal comes back. The remaining serving halves stay
+//! blocked because this driver does not yet retain live HTTP observations; the
+//! separate stateful integration lane owns the cached-serving and rotation
+//! stages it can prove directly.
 //!
 //! # What makes this a recovery test rather than a mock
 //!
@@ -121,7 +123,20 @@ struct Stage {
     /// `ops/restore-drill.sh`, which needs a cluster it can promote.
     #[serde(default)]
     runner: Option<String>,
+    /// The black-box stateful integration lane shares the CI job but owns a
+    /// separate process-level evidence registry. Older stages default to this
+    /// internal driver so the manifest remains additive.
+    #[serde(default)]
+    driver: Driver,
     evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum Driver {
+    #[default]
+    Qualification,
+    StatefulIntegration,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1161,7 +1176,7 @@ async fn cold_boot_no_cache_cold_boot() {
     recorder.deferred(
         "max_unauthenticated_admin_successes",
         spec.gate.max_unauthenticated_admin_successes.to_string(),
-        "the blocked `readiness` stage owns the probe an operator's tooling calls",
+        "the stateful-integration readiness stage owns the probe an operator's tooling calls",
     );
 
     finish(recorder);
@@ -1338,7 +1353,7 @@ async fn cold_boot_invalid_cache_cold_boot() {
     recorder.deferred(
         "max_unauthenticated_admin_successes",
         spec.gate.max_unauthenticated_admin_successes.to_string(),
-        "the blocked `readiness` stage owns the probe an operator's tooling calls",
+        "the stateful-integration readiness stage owns the probe an operator's tooling calls",
     );
 
     finish(recorder);
@@ -1699,7 +1714,10 @@ fn the_driver_runs_exactly_the_stages_the_manifest_calls_executable() {
     let mut executable: Vec<String> = Vec::new();
     for scenario in &manifest.scenarios {
         for stage in &scenario.stages {
-            if stage.status == "executable" && stage.runner.as_deref() == Some(RUNNER) {
+            if stage.status == "executable"
+                && stage.runner.as_deref() == Some(RUNNER)
+                && stage.driver == Driver::Qualification
+            {
                 executable.push(format!("{}/{}", scenario.id, stage.id));
             }
         }

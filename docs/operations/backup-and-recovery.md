@@ -145,7 +145,9 @@ applies the usage, budget, and revocation DDL, writes control-plane state and an
 audit event, and then performs both recoveries:
 
 - a `pg_dump`/`pg_restore` round trip, asserting the head, the revision
-  checksums, and the audit trail come back;
+  checksums, the encrypted secret lifecycle, the retained catalogue and active
+  pointer, and the approved price-book checksum, catalogue pin, effective-dated
+  rules, rates, approval, and provenance come back with the audit trail;
 - a `pg_basebackup` plus archived WAL recovery to a target between two published
   revisions, asserting the first revision is present, the second is **not**, and
   the usage, budget, and revocation schemas survived.

@@ -5,10 +5,10 @@
 //! that compilation, and it is deliberately three separable steps:
 //!
 //! 1. **Projection.** A [`RevisionProjection`] reads resource *bodies* and fills
-//!    the control-plane-owned sections of the bootstrap config. Body schemas —
-//!    tenancy, providers, catalogue, pricing, policy — are owned by later slices
-//!    (see [`crate::desired_state::resource`]), so #142 takes the projection as a
-//!    seam rather than inventing schemas it would have to unship.
+//!    the control-plane-owned sections of the bootstrap config. The production
+//!    chain projects tenancy, provider connections, credentials, and principals;
+//!    the compiler then hydrates pinned catalogue payloads into concrete model
+//!    targets before the whole-graph gate.
 //! 2. **The boot gate.** The projected config runs
 //!    [`Config::validate_compiled`], which *is* the whole-graph gate boot runs on
 //!    a file. An alias pointing at an undefined provider is refused identically
@@ -50,6 +50,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 
 use crate::availability::{AvailabilityEvidence, AvailabilityProjectionError, CredentialReadiness};
+use crate::backends::catalog_store::CatalogStore;
 use crate::config::{Config, ConfigError};
 use crate::desired_state::pricing::{
     EffectiveInstant, InvalidInstant, PriceBooks, PricingError, PricingSnapshot,
@@ -74,10 +75,10 @@ pub trait RevisionProjection: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Whether this projection supplies the inbound caller principals required
-    /// by a stateful serving snapshot. The current desired-state projection
-    /// owns tenancy, credentials, and policy, but it does not yet own gateway
-    /// principals. Stateful compilation must therefore refuse explicitly until
-    /// a projection can provide them; an empty key set is never an auth bypass.
+    /// by a stateful serving snapshot. A projection may expose this capability
+    /// before a particular revision contains any usable workload identity; the
+    /// snapshot builder still rejects an empty key set, so this is never an auth
+    /// bypass.
     fn projects_inbound_principals(&self) -> bool {
         false
     }
@@ -133,10 +134,10 @@ pub enum ProjectionError {
 /// is usually secret material that is missing or wrong.
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
-    /// The projection is structurally valid but this build does not yet have
-    /// the durable inbound-principal source needed to serve it statefully.
-    /// Keeping this distinct from a malformed snapshot makes the readiness and
-    /// operator status honest without weakening authentication.
+    /// The projection is structurally valid but this build does not have the
+    /// durable capability needed to serve it statefully. Keeping this distinct
+    /// from a malformed snapshot makes readiness and operator status honest
+    /// without weakening authentication.
     #[error("revision {revision} is unsupported for stateful serving: {detail}")]
     Unsupported {
         revision: RevisionId,
@@ -322,6 +323,9 @@ pub struct RevisionCompiler<P> {
     /// thing that holds plaintext is not the thing that can change what a
     /// credential points at.
     secrets: Arc<SecretMaterialization>,
+    /// Retained catalogue payloads, read only while compiling typed model
+    /// contracts. The request path never receives this handle.
+    catalogue: Option<Arc<dyn CatalogStore>>,
     /// This replica's availability state, or `None` when the process derives
     /// none.
     ///
@@ -364,6 +368,7 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
             env,
             projection,
             secrets,
+            catalogue: None,
             availability: None,
             derived: Mutex::new(None),
             clock: Arc::new(SystemTime::now),
@@ -375,6 +380,14 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
     #[must_use]
     pub fn with_availability(mut self, availability: Arc<AvailabilityEvidence>) -> Self {
         self.availability = Some(availability);
+        self
+    }
+
+    /// Attach the durable catalogue reader used to hydrate the exact payloads
+    /// pinned by typed model enablements.
+    #[must_use]
+    pub fn with_catalogue(mut self, catalogue: Arc<dyn CatalogStore>) -> Self {
+        self.catalogue = Some(catalogue);
         self
     }
 
@@ -450,15 +463,32 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
                 revision: id,
                 source,
             })?;
+        // Resolve pricing before the model/catalogue projection. Typed
+        // stateful targets must prove the exact callable id is covered by the
+        // effective approved book; otherwise the request path would interpret
+        // a missing book as file pricing.
+        let pricing = self.pricing(revision)?;
+        let config = if self.bootstrap.mode == crate::config::Mode::Stateful {
+            super::serving::project(
+                config,
+                revision.state(),
+                self.catalogue.as_ref(),
+                pricing.as_ref(),
+            )
+            .await
+            .map_err(|source| CompileError::Projection {
+                revision: id,
+                source,
+            })?
+        } else {
+            config
+        };
         config
             .validate_compiled()
             .map_err(|source| CompileError::Validation {
                 revision: id,
                 source,
             })?;
-        // Before the snapshot build, so a price book this build cannot bill
-        // refuses the candidate without any secret material being resolved.
-        let pricing = self.pricing(revision)?;
         // Material is unwrapped after the boot gate and before the snapshot: a
         // revision that cannot be served at all does not touch the secret store,
         // and material that cannot be unwrapped is a refusal rather than a
@@ -476,15 +506,28 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
         // version is in hand" is what separates a credential a tenant holds from
         // one it can use, and it is a set of references, never material.
         let readiness = CredentialReadiness::of(&secrets);
-        let snapshot = ConfigSnapshot::build_with(config, &self.env, generation, secrets).map_err(
-            |source| CompileError::Snapshot {
+        let snapshot = ConfigSnapshot::build_compiled_with(config, &self.env, generation, secrets)
+            .map_err(|source| CompileError::Snapshot {
                 revision: id,
                 source,
-            },
-        )?;
+            })?;
         let snapshot = match pricing {
             None => snapshot,
             Some(pricing) => snapshot.with_pricing(pricing),
+        };
+        let snapshot = if self.bootstrap.mode == crate::config::Mode::Stateful {
+            let authorization = crate::desired_state::AuthorizationSnapshot::of(revision.state())
+                .map_err(|error| CompileError::Projection {
+                revision: id,
+                source: ProjectionError::Incomplete {
+                    detail: format!(
+                        "the administrative authorization directory could not be projected: {error}"
+                    ),
+                },
+            })?;
+            snapshot.with_admin_authorization(Arc::new(authorization))
+        } else {
+            snapshot
         };
         let Some(evidence) = self.availability.as_ref() else {
             return Ok(snapshot);
@@ -616,9 +659,9 @@ namespace = "platform"
         .expect("a valid bootstrap config")
     }
 
-    /// The stateful bootstrap deliberately has no inbound key. It is useful
-    /// here to prove that a projection which cannot add caller principals is
-    /// rejected before it reaches validation or secret materialization.
+    /// The stateful bootstrap deliberately has no static inbound key. It is
+    /// useful here to prove that a projection must supply one from durable
+    /// state before a serving snapshot can be built.
     pub(crate) fn stateful_bootstrap() -> Config {
         Config::from_toml_str(
             r#"
@@ -723,21 +766,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_stateful_projection_cannot_claim_readiness_without_principals() {
+    async fn production_stateful_projection_compiles_a_projected_workload_principal() {
         let projection =
             crate::convergence::PolicyProjection::over(crate::convergence::RuntimeProjection);
         assert!(
-            !projection.projects_inbound_principals(),
-            "the current desired-state model has no inbound-principal projection"
+            projection.projects_inbound_principals(),
+            "the production projection must expose its durable principal capability"
         );
 
-        let compiler = RevisionCompiler::new(stateful_bootstrap(), HashMap::new(), projection);
-        let error = match compiler.compile(&revision(), 1).await {
-            Ok(_) => panic!("the production stateful projection must remain fail-closed"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, CompileError::Unsupported { .. }), "{error}");
-        assert!(!error.to_string().contains("gateway_key"), "{error}");
+        // A stateful file still cannot declare this namespace; the compiled
+        // candidate used by this focused test supplies the bootstrap-owned
+        // default that the tenancy slice currently requires. The separate
+        // tenancy test keeps the no-default refusal explicit.
+        let mut bootstrap = stateful_bootstrap();
+        bootstrap.namespace.push(crate::config::Namespace {
+            id: "platform".to_owned(),
+            default: true,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+        });
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap,
+            HashMap::new(),
+            projection,
+            crate::convergence::secrets::testing::permissive(),
+        );
+        let key = fixtures::workload_key(0xd0);
+        let mut state = fixtures::state();
+        state
+            .insert(fixtures::workload(
+                33,
+                "deployer",
+                crate::desired_state::ResourceScope::Project {
+                    tenant: fixtures::tenant_id(1),
+                    project: fixtures::project_id(2),
+                },
+                &[crate::desired_state::Role::Developer],
+                Some(&key),
+            ))
+            .expect("a project workload is valid desired state");
+
+        let snapshot = compiler
+            .compile(&revision_with(state), 1)
+            .await
+            .expect("the projected workload principal makes stateful serving possible");
+        assert_eq!(snapshot.inbound_key_count(), 1);
+        assert!(snapshot.config.projected_principals.len() == 1);
     }
 
     /// The reason the boot gate is *reused* rather than reimplemented: a

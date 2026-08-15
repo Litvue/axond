@@ -38,7 +38,7 @@ each assertion is made from outside the process.
 | Property | Test |
 | --- | --- |
 | A tenant's catalogue is what its own credentials can serve, never the deployment's alias list | `a_tenant_sees_only_the_models_its_own_credentials_can_serve` |
-| Naming another tenant's alias is refused, before the provider is reached, and the refusal names nothing of the other tenant's | `a_tenant_cannot_invoke_another_tenants_alias` |
+| Naming another tenant's alias is refused with the same typed 404 as an unknown model, before the provider is reached | `a_tenant_cannot_invoke_another_tenants_alias`, `stateful_revision_compiles_rotates_and_recovers` |
 | Every provider request carries the calling tenant's credential and no other, under interleaved traffic | `a_provider_request_carries_only_the_calling_tenants_credential` |
 | Platform fallback serves only the namespace that opted in, and the usage record attributes the spend to the platform pool | `platform_fallback_is_explicit_and_attributed` |
 | Durable usage rows are partitioned by namespace | `usage_rows_never_cross_a_namespace` |
@@ -82,6 +82,7 @@ that holds because the fixture never created the row is a test that cannot fail.
 | A session pinned to one tenant reads nothing of the other's, swept over every table and every stored resource body | Database (RLS) | `nothing_a_pinned_session_can_read_names_the_other_tenant` |
 | The same session cannot insert rows owned by another tenant, and its updates and deletes against another tenant's rows match nothing | Database (RLS) | `a_pinned_session_cannot_write_another_tenants_rows` |
 | A tenant-scoped administrator cannot publish into another tenant, or publish a candidate that reaches a foreign credential; the refusal is recorded per tenant and nothing durable moves | Service | `a_tenant_scoped_administrator_cannot_publish_into_another_tenant` |
+| A tenant-scoped OIDC human reads only its own catalogue and publishes only within its tenant; the audit event records the issuer-scoped subject | Runtime/service | `an_oidc_principal_is_authorized_against_the_active_directory` |
 | A cross-tenant reference is refused as a validation failure that names the caller's own resource, keeping what it reached for to the operator detail | Domain/service | `a_cross_tenant_reference_names_the_caller_and_not_what_it_reached_for` |
 | Deployment-wide desired state, history, and audit reads require deployment authority, and the refusal names nothing of the deployment | Service | `a_tenant_scoped_administrator_reads_no_deployment_wide_projection` |
 | A rehearsal is authorized like the mutation it rehearses, so a dry run is not a cheaper way across the boundary | Service | `a_rehearsed_cross_tenant_mutation_is_refused_like_a_real_one` |
@@ -111,19 +112,20 @@ resource version and then shows it buys nothing — a version is desired state o
 once a revision carries it, the publication chain admits no pinned session at
 all, and no ownership row appears for the forgery.
 
-## Not covered yet, and why
+## Current boundary
 
-These are the parts of [#225] that cannot be written against the current
-runtime. Each names the change that unblocks it.
+The durable request-path assertion is now covered by
+`stateful_revision_compiles_rotates_and_recovers`: it publishes two tenants'
+projects, principals, providers, credentials, enablements, and aliases, then
+proves tenant-qualified discovery, same-tenant serving, cross-tenant refusal,
+provider non-dispatch, price provenance, alias withdrawal, and scoped
+administration. The required CI lane runs this scenario with PostgreSQL and
+fails rather than skipping it.
 
-| Assertion | Blocked on | Why |
-| --- | --- | --- |
-| A *tenant-scoped human* administrator is refused another tenant's resources over an authenticated `/admin/v1` request | [#143] — tenant-scoped admin authentication on the served surface | The stateful runtime authenticates a deployment-scoped breakglass credential, and the projections `/admin/v1` serves are of the whole deployment by construction. The scenarios above therefore decide authorization at the grant seam a tenant-scoped authenticator will hand the service — which is the same seam the request path will use — rather than fabricating an authenticated HTTP flow that no deployment can currently make |
-| Tenancy isolation holds over *durable* projects and credentials on the request path rather than configured namespaces | The convergence slice that wires desired state into `serve` — tenant-routed catalogue and alias inference is [#148] and [#149] | No revision is loaded on the request path, so a served namespace is one the config declared. The two ends are pinned instead: the projection from durable state is asserted here, and the runtime suite asserts the same *shape* of namespace id it produces, which is what keeps them from drifting before they are joined |
-| A cross-tenant alias is refused indistinguishably from a model that does not exist | A runtime error-contract decision, not a test | Today an alias belonging to another tenant is refused `502 no_credential` while an unknown model is a 404-class `model_not_found`, so status alone is an alias-existence oracle across tenants. No identifier, credential, or key of the other tenant is disclosed and nothing is dispatched upstream; changing which refusal is returned is the security owner's call and is tracked on [#225] |
-
-When each lands, the corresponding row moves into the table above with the test
-that proves it. The suite is structured for that: the harness in
+The remaining qualification work is evidence retention rather than an absent
+isolation mechanism: the heavy recovery, fault, rollout, and endurance records
+must still be retained from clean CI runs before #156/#160 can be promoted.
+The suite is structured for that: the harness in
 [`crates/gateway/tests/support/tenancy.rs`](../../crates/gateway/tests/support/tenancy.rs)
 describes the deployment rather than any one case, and
 [`crates/gateway/src/tenant_isolation/harness.rs`](../../crates/gateway/src/tenant_isolation/harness.rs)

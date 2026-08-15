@@ -48,11 +48,10 @@
 //! bytes differently, boot says so ([`HydrationError::Drift`]) instead of
 //! serving content nobody can reproduce.
 //!
-//! Nothing here is on the request path. The store is
-//! [`BackendPath::Background`](super::BackendPath::Background) like the source
-//! it retains, so an unavailable database costs a refused refresh — the
-//! catalogue that was already active stays active — and never an inference
-//! request.
+//! Nothing here is on the request path. The store is used by the background
+//! refresher and by snapshot compilation, both before a candidate is published.
+//! An unavailable database costs a refused refresh or a refused candidate; the
+//! catalogue and serving snapshot already active remain untouched.
 
 pub mod postgres;
 
@@ -211,6 +210,17 @@ pub trait CatalogStore: Send + Sync {
         content_id: CatalogContentId,
     ) -> Result<Option<RetainedCatalog>, CatalogStoreError>;
 
+    /// A retained snapshot by the raw payload digest an enablement pins.
+    ///
+    /// Desired state carries the digest of the exact document an operator
+    /// approved, while the active catalogue is keyed by normalized content.
+    /// Keeping this lookup here preserves both identities instead of asking
+    /// convergence to guess one from the other.
+    async fn retained_by_raw_digest(
+        &self,
+        digest: crate::desired_state::Checksum,
+    ) -> Result<Option<RetainedCatalog>, CatalogStoreError>;
+
     /// Retain `import` if it is new, and make it the active catalogue as of
     /// `activated_at`.
     ///
@@ -268,6 +278,67 @@ impl<T: CatalogStore + ?Sized> CatalogStore for &T {
         content_id: CatalogContentId,
     ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
         (**self).retained(content_id).await
+    }
+
+    async fn retained_by_raw_digest(
+        &self,
+        digest: crate::desired_state::Checksum,
+    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
+        (**self).retained_by_raw_digest(digest).await
+    }
+
+    async fn activate(
+        &self,
+        import: &RetainedCatalog,
+        activated_at: SystemTime,
+    ) -> Result<Retention, CatalogStoreError> {
+        (**self).activate(import, activated_at).await
+    }
+
+    async fn confirm(
+        &self,
+        content_id: CatalogContentId,
+        validators: &SourceValidators,
+        confirmed_at: SystemTime,
+    ) -> Result<bool, CatalogStoreError> {
+        (**self).confirm(content_id, validators, confirmed_at).await
+    }
+
+    async fn refuse(
+        &self,
+        reason: RefusalReason,
+        refused_at: SystemTime,
+    ) -> Result<(), CatalogStoreError> {
+        (**self).refuse(reason, refused_at).await
+    }
+}
+
+#[async_trait]
+impl<T: CatalogStore + ?Sized> CatalogStore for std::sync::Arc<T> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        (**self).capabilities()
+    }
+
+    async fn load(&self) -> Result<StoredCatalogState, CatalogStoreError> {
+        (**self).load().await
+    }
+
+    async fn retained(
+        &self,
+        content_id: CatalogContentId,
+    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
+        (**self).retained(content_id).await
+    }
+
+    async fn retained_by_raw_digest(
+        &self,
+        digest: crate::desired_state::Checksum,
+    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
+        (**self).retained_by_raw_digest(digest).await
     }
 
     async fn activate(
@@ -472,6 +543,18 @@ impl CatalogStore for InMemoryCatalogStore {
         content_id: CatalogContentId,
     ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
         Ok(self.locked().retained.get(&content_id).cloned())
+    }
+
+    async fn retained_by_raw_digest(
+        &self,
+        digest: crate::desired_state::Checksum,
+    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
+        Ok(self
+            .locked()
+            .retained
+            .values()
+            .find(|retained| retained.source.raw.digest == digest)
+            .cloned())
     }
 
     async fn activate(

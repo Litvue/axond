@@ -99,8 +99,10 @@ CREATE TABLE IF NOT EXISTS axond_catalog_active (
     )
 );
 
--- No index beyond the two primary keys: every statement reads the singleton row
--- or one snapshot by identity, and history is listed by an operator rarely
--- enough that a scan is the right cost.
+-- Convergence resolves the exact raw payload digest pinned by a model
+-- enablement. Keep that lookup bounded as retained history grows; the content
+-- identity remains the primary key for activation and rollback.
+CREATE INDEX IF NOT EXISTS axond_catalog_snapshot_raw_digest_idx
+    ON axond_catalog_snapshot (raw_digest);
 
 COMMIT;

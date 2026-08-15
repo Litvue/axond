@@ -186,6 +186,25 @@ pub struct ResolvedSecrets {
 }
 
 impl ResolvedSecrets {
+    /// Rebuild the retained set from an authenticated compiled-serving cache.
+    ///
+    /// The cache reader is the only caller that has this path: material is
+    /// decrypted in memory, registered with the same ledger as ordinary
+    /// compilation, and then held by the published snapshot with identical
+    /// zeroization semantics.
+    pub(crate) fn from_cached(
+        ledger: Arc<MaterialLedger>,
+        materials: impl IntoIterator<Item = (SecretRef, SecretMaterial)>,
+    ) -> Self {
+        let mut resolved = Self::default();
+        for (reference, material) in materials {
+            resolved
+                .materials
+                .insert(reference, ledger.retain(reference, material));
+        }
+        resolved
+    }
+
     /// The material for an exact version, or `None` if this candidate did not
     /// require it. Not a resolution: nothing here reaches a store.
     pub fn get(&self, reference: SecretRef) -> Option<&RetainedMaterial> {

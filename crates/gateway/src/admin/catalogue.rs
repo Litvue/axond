@@ -20,14 +20,13 @@
 //!   administrative identity against the control plane. No inference route
 //!   consults it, and adding one would be the thing ADR 0002 forbids: the runtime
 //!   reads published snapshots.
-//! - **It reports reasons, not verdicts it cannot reach.** A model is unroutable
-//!   for reasons this revision states ([`UnavailableReason`]) — disabled,
-//!   shadowed by a project override, unpriced, unaliased. Provider health,
-//!   capability and modality metadata, and observed availability come from
-//!   catalogue import (#146), pricing (#147), and the availability index (#148);
-//!   until those land, this read is silent about them rather than guessing, and
-//!   [`CatalogueView::pending`] names the facts it could not consult so a caller
-//!   is not misled by their absence.
+//! - **It reports reasons and provenance.** A model is unroutable for reasons
+//!   this revision states ([`UnavailableReason`]) — disabled, shadowed by a
+//!   project override, unpriced, or unaliased. When the pinned catalogue and
+//!   availability readers are attached, the projection also includes imported
+//!   provider/model metadata, price-book identity, and a scoped availability
+//!   verdict. If either reader is unavailable, [`CatalogueView::pending`] names
+//!   the missing fact so a caller is not misled by its absence.
 //!
 //! # The integration seam
 //!
@@ -45,19 +44,30 @@
 //! ```
 //!
 //! keyed by the same `snapshot` digest an enablement pins. When it exists, the
-//! filters this module refuses today (`provider`, `capability`, `modality`) become
+//! provider, capability, modality, and catalogue-lifecycle filters become
 //! predicates over its result, and `pending` shrinks. Nothing else here changes:
 //! the scope rule, the reason vocabulary, and the response shape are independent
 //! of where offering metadata comes from.
+
+use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 use serde::Serialize;
 
 use super::diff::ScopeView;
 use super::error::AdminError;
+use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef, TargetRef};
+use crate::backends::catalog::{
+    CatalogSnapshot, Modality, ModelCapability, ModelLifecycle as CatalogLifecycle, ProviderId,
+};
+use crate::backends::catalog_pins::{PinnedCatalog, Resolution};
+use crate::backends::catalog_store::{self, CatalogStore};
+use crate::desired_state::pricing::{EffectiveInstant, PriceBooks, PricingSnapshot};
 use crate::desired_state::{
     LoadedRevision, ModelAlias, ModelEnablement, ModelError, ModelLifecycle, ModelOwner, Models,
-    OfferingId, ProjectId, ResourceScope, TenantId, WireFamily,
+    OfferingId, ProjectId, ResourceId, ResourceScope, TenantId, WireFamily,
 };
+use crate::status::StatusScope;
 
 /// What a catalogue read asks for: one scope, and filters over it.
 ///
@@ -75,7 +85,7 @@ pub struct CatalogueRequest {
 
 /// The filters a catalogue read may apply, all of them predicates over state this
 /// revision holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CatalogueFilters {
     /// Enabled or disabled — the operator's decision, not an upstream's.
     pub state: Option<ModelLifecycle>,
@@ -86,6 +96,13 @@ pub struct CatalogueFilters {
     /// `Some(true)` for entries with an approved price, `Some(false)` for those
     /// without.
     pub billable: Option<bool>,
+    /// Provider and model facts from the pinned imported catalogue.
+    pub provider: Option<String>,
+    pub capability: Option<ModelCapability>,
+    pub modality: Option<Modality>,
+    pub catalog_lifecycle: Option<CatalogLifecycle>,
+    /// The derived availability state for this replica and scope.
+    pub availability: Option<crate::availability::AvailabilityState>,
 }
 
 impl CatalogueRequest {
@@ -117,9 +134,14 @@ impl CatalogueRequest {
         }
     }
 
-    fn admits(&self, entry: &ModelEnablement) -> bool {
+    fn admits(
+        &self,
+        entry: &ModelEnablement,
+        metadata: Option<&CatalogueMetadata>,
+        availability: Option<&super::reads::AvailabilityTarget>,
+    ) -> bool {
         let filters = &self.filters;
-        filters
+        let durable = filters
             .state
             .is_none_or(|state| state == entry.body.state())
             && filters
@@ -130,7 +152,37 @@ impl CatalogueRequest {
                 .is_none_or(|offering| offering == entry.body.offering().offering)
             && filters
                 .billable
-                .is_none_or(|billable| billable == entry.body.billable_price().is_some())
+                .is_none_or(|billable| billable == entry.body.billable_price().is_some());
+        durable
+            && filters.provider.as_deref().is_none_or(|provider| {
+                metadata.is_some_and(|metadata| metadata.provider == provider)
+            })
+            && filters.capability.is_none_or(|capability| {
+                metadata.is_some_and(|metadata| {
+                    metadata
+                        .capabilities
+                        .iter()
+                        .any(|candidate| candidate == capability.as_str())
+                })
+            })
+            && filters.modality.is_none_or(|modality| {
+                metadata.is_some_and(|metadata| {
+                    metadata
+                        .input_modalities
+                        .iter()
+                        .any(|candidate| candidate == modality.as_str())
+                        || metadata
+                            .output_modalities
+                            .iter()
+                            .any(|candidate| candidate == modality.as_str())
+                })
+            })
+            && filters.catalog_lifecycle.is_none_or(|lifecycle| {
+                metadata.is_some_and(|metadata| metadata.catalog_lifecycle == lifecycle.as_str())
+            })
+            && filters.availability.is_none_or(|state| {
+                availability.is_some_and(|availability| availability.state == state.as_str())
+            })
     }
 }
 
@@ -213,6 +265,43 @@ impl Serialize for PendingFact {
     }
 }
 
+/// Metadata resolved from the exact catalogue snapshot an enablement pins.
+///
+/// The provider/model strings here are catalogue identities, not operator
+/// connection ids or caller-facing aliases. They are included only after the
+/// pinned snapshot resolves the opaque offering id unambiguously.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogueMetadata {
+    pub provider: String,
+    pub model: String,
+    pub published_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    pub capabilities: Vec<String>,
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+    pub catalog_lifecycle: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+}
+
+/// The durable pricing identity currently covering an offering, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CataloguePrice {
+    pub book: String,
+    pub book_version: u64,
+    pub catalog: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_version: Option<u64>,
+    pub source: &'static str,
+}
+
 /// One enablement, as the management catalogue shows it.
 ///
 /// Identities, scope, lifecycle, and the pinned catalogue coordinates — never a
@@ -243,6 +332,17 @@ pub struct CatalogueEntry {
     pub aliases: Vec<String>,
     /// Why it is not routable, in a stable order. Empty when it is.
     pub unavailable: Vec<UnavailableReason>,
+    /// The exact provider offering resolved from the pinned imported snapshot.
+    /// `None` means the catalogue store was unavailable, the pin was withdrawn,
+    /// or the snapshot published more than one callable id for this opaque id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<CatalogueMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<CataloguePrice>,
+    /// Replica-local entitlement, policy, discovery, and runtime health. This
+    /// is deliberately a verdict rather than raw provider detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability: Option<super::reads::AvailabilityTarget>,
 }
 
 /// A model alias as the management catalogue shows it.
@@ -264,6 +364,11 @@ pub struct CatalogueAlias {
     pub scope: ScopeView,
     pub wire_family: &'static str,
     pub state: &'static str,
+    /// Whether at least one exact ordered target is enabled and backed by an
+    /// approved price.
+    pub routable: bool,
+    /// Why this alias cannot currently route. Empty when `routable` is true.
+    pub unavailable: Vec<AliasUnavailableReason>,
     /// Ordered enablement references. The order is the failover priority and is
     /// therefore part of the response contract rather than a set.
     pub targets: Vec<CatalogueAliasTarget>,
@@ -274,6 +379,56 @@ pub struct CatalogueAlias {
 pub struct CatalogueAliasTarget {
     pub enablement: String,
     pub version: u64,
+}
+
+/// Why an enabled-looking alias cannot currently reach a usable target.
+///
+/// These reasons are derived from the same desired-state model used to validate
+/// publication. A disabled fallback may remain in the ordered target list, so a
+/// single unusable target does not make the alias unavailable when a later target
+/// is still effective, enabled, and billable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AliasUnavailableReason {
+    /// The alias itself is withdrawn.
+    Disabled,
+    /// An enabled alias has no target entries. This is defensive because desired
+    /// state validation rejects this shape, but keeping the response vocabulary
+    /// total makes damaged or legacy projections explicit.
+    NoTargets,
+    /// A target exists but its enablement is withdrawn.
+    DisabledTarget,
+    /// A target is enabled but has no approved price, so it cannot be billed.
+    UnpricedTarget,
+}
+
+impl AliasUnavailableReason {
+    pub const ALL: &'static [Self] = &[
+        Self::Disabled,
+        Self::NoTargets,
+        Self::DisabledTarget,
+        Self::UnpricedTarget,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NoTargets => "no-targets",
+            Self::DisabledTarget => "disabled-target",
+            Self::UnpricedTarget => "unpriced-target",
+        }
+    }
+}
+
+impl Serialize for AliasUnavailableReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AliasStatus {
+    routable: bool,
+    unavailable: Vec<AliasUnavailableReason>,
 }
 
 /// One tenant's management catalogue.
@@ -299,6 +454,77 @@ impl CatalogueView {
         revision: Option<&LoadedRevision>,
         request: &CatalogueRequest,
     ) -> Result<Self, AdminError> {
+        Self::build(revision, request, &BTreeMap::new(), true, true)
+    }
+
+    /// Build the management view with the retained catalogue and replica-local
+    /// availability context attached. Both are read before this synchronous
+    /// projection is built: the request still never reaches a source, a store,
+    /// or an upstream provider while it is being served.
+    pub async fn of_with_context(
+        revision: Option<&LoadedRevision>,
+        request: &CatalogueRequest,
+        catalogue: Option<&dyn CatalogStore>,
+        availability: Option<&dyn AvailabilityReader>,
+        disclosure: StatusScope,
+        now: SystemTime,
+    ) -> Result<Self, AdminError> {
+        let Some(revision) = revision else {
+            return Ok(Self::empty(None, request));
+        };
+        let models = Models::of(revision.state()).map_err(|error| unreadable(revision, &error))?;
+        let snapshots = retained_catalogues(&models, catalogue).await;
+        let pricing = PriceBooks::of(revision.state()).ok().and_then(|books| {
+            EffectiveInstant::of(now)
+                .ok()
+                .and_then(|at| books.snapshot_at(at))
+        });
+        let book = PriceBooks::of(revision.state())
+            .ok()
+            .and_then(|books| books.book().cloned());
+        let availability = availability_context(availability);
+        let mut contexts = BTreeMap::new();
+        for enablement in models.enablements() {
+            let metadata = snapshots
+                .get(&enablement.body.offering().snapshot)
+                .and_then(|snapshot| offering_metadata(snapshot, enablement));
+            let availability = metadata.as_ref().and_then(|metadata| {
+                entry_availability(availability.as_ref(), request, metadata, disclosure, now)
+            });
+            let price = metadata.as_ref().and_then(|metadata| {
+                price_metadata(book.as_ref(), pricing.as_ref(), metadata, now)
+            });
+            contexts.insert(
+                enablement.reference.id,
+                EntryContext {
+                    metadata,
+                    price,
+                    availability,
+                },
+            );
+        }
+        let metadata_pending = models.enablements().any(|enablement| {
+            contexts
+                .get(&enablement.reference.id)
+                .is_none_or(|context| context.metadata.is_none())
+        });
+        let availability_pending = availability.is_none();
+        Self::build(
+            Some(revision),
+            request,
+            &contexts,
+            metadata_pending,
+            availability_pending,
+        )
+    }
+
+    fn build(
+        revision: Option<&LoadedRevision>,
+        request: &CatalogueRequest,
+        contexts: &BTreeMap<ResourceId, EntryContext>,
+        metadata_pending: bool,
+        availability_pending: bool,
+    ) -> Result<Self, AdminError> {
         let Some(revision) = revision else {
             return Ok(Self::empty(None, request));
         };
@@ -306,10 +532,21 @@ impl CatalogueView {
         // read these bodies its own way could report a catalogue the runtime would
         // never serve.
         let models = Models::of(revision.state()).map_err(|error| unreadable(revision, &error))?;
+        let alias_statuses: BTreeMap<ResourceId, AliasStatus> = models
+            .aliases()
+            .map(|alias| (alias.reference.id, alias_status(&models, alias)))
+            .collect();
         let mut entries = Vec::new();
         for enablement in models.enablements() {
             let owner = enablement.body.owner();
-            if !request.covers(owner) || !request.admits(enablement) {
+            let context = contexts.get(&enablement.reference.id);
+            if !request.covers(owner)
+                || !request.admits(
+                    enablement,
+                    context.and_then(|context| context.metadata.as_ref()),
+                    context.and_then(|context| context.availability.as_ref()),
+                )
+            {
                 continue;
             }
             let aliases = aliases_naming(&models, request, enablement);
@@ -346,27 +583,41 @@ impl CatalogueView {
                 billable: enablement.body.billable_price().is_some(),
                 aliases,
                 unavailable,
+                metadata: context.and_then(|context| context.metadata.clone()),
+                price: context.and_then(|context| context.price.clone()),
+                availability: context.and_then(|context| context.availability.clone()),
             });
         }
         let aliases = models
             .aliases()
             .filter(|alias| in_scope(request, alias))
-            .map(|alias| CatalogueAlias {
-                alias: alias.reference.id.to_string(),
-                version: alias.reference.version.get(),
-                slug: alias.slug.as_str().to_owned(),
-                scope: ScopeView::of(&alias.body.scope()),
-                wire_family: alias.body.wire_family().as_str(),
-                state: alias.body.state().as_str(),
-                targets: alias
-                    .body
-                    .targets()
-                    .iter()
-                    .map(|target| CatalogueAliasTarget {
-                        enablement: target.enablement.to_string(),
-                        version: target.version.get(),
-                    })
-                    .collect(),
+            .map(|alias| {
+                // `in_scope` has already established that this alias belongs
+                // to the requested tenant/project. Status uses the alias's
+                // exact target references; scope does not rewrite those
+                // references through project override precedence.
+                let status = alias_statuses
+                    .get(&alias.reference.id)
+                    .expect("every alias has a derived status");
+                CatalogueAlias {
+                    alias: alias.reference.id.to_string(),
+                    version: alias.reference.version.get(),
+                    slug: alias.slug.as_str().to_owned(),
+                    scope: ScopeView::of(&alias.body.scope()),
+                    wire_family: alias.body.wire_family().as_str(),
+                    state: alias.body.state().as_str(),
+                    routable: status.routable,
+                    unavailable: status.unavailable.clone(),
+                    targets: alias
+                        .body
+                        .targets()
+                        .iter()
+                        .map(|target| CatalogueAliasTarget {
+                            enablement: target.enablement.to_string(),
+                            version: target.version.get(),
+                        })
+                        .collect(),
+                }
             })
             .collect();
         Ok(Self {
@@ -374,7 +625,7 @@ impl CatalogueView {
             scope: ScopeView::of(&request.scope()),
             entries,
             aliases,
-            pending: PendingFact::ALL.to_vec(),
+            pending: pending_facts(metadata_pending, availability_pending),
         })
     }
 
@@ -387,6 +638,142 @@ impl CatalogueView {
             pending: PendingFact::ALL.to_vec(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EntryContext {
+    metadata: Option<CatalogueMetadata>,
+    price: Option<CataloguePrice>,
+    availability: Option<super::reads::AvailabilityTarget>,
+}
+
+fn pending_facts(metadata: bool, availability: bool) -> Vec<PendingFact> {
+    PendingFact::ALL
+        .iter()
+        .copied()
+        .filter(|fact| match fact {
+            PendingFact::OfferingMetadata => metadata,
+            PendingFact::Availability => availability,
+        })
+        .collect()
+}
+
+async fn retained_catalogues(
+    models: &Models,
+    catalogue: Option<&dyn CatalogStore>,
+) -> BTreeMap<crate::desired_state::Checksum, CatalogSnapshot> {
+    let Some(catalogue) = catalogue else {
+        return BTreeMap::new();
+    };
+    let mut snapshots = BTreeMap::new();
+    for enablement in models.enablements() {
+        let digest = enablement.body.offering().snapshot;
+        if snapshots.contains_key(&digest) {
+            continue;
+        }
+        let Ok(Some(retained)) = catalogue.retained_by_raw_digest(digest).await else {
+            continue;
+        };
+        let Ok(snapshot) = catalog_store::hydrate(&retained) else {
+            continue;
+        };
+        snapshots.insert(digest, snapshot);
+    }
+    snapshots
+}
+
+fn offering_metadata(
+    snapshot: &CatalogSnapshot,
+    enablement: &ModelEnablement,
+) -> Option<CatalogueMetadata> {
+    let pinned = PinnedCatalog::of_snapshot(snapshot).ok()?;
+    let Resolution::Callable(callable) = pinned.resolve(enablement.body.offering()) else {
+        return None;
+    };
+    let facts = callable.facts();
+    Some(CatalogueMetadata {
+        provider: callable.provider().as_str().to_owned(),
+        model: callable.model().as_str().to_owned(),
+        published_model: callable.published_model_id().to_owned(),
+        display_name: facts.display_name.clone(),
+        family: facts.family.clone(),
+        capabilities: facts
+            .capabilities
+            .iter()
+            .map(|capability| capability.as_str().to_owned())
+            .collect(),
+        input_modalities: facts
+            .input_modalities
+            .iter()
+            .map(|modality| modality.as_str().to_owned())
+            .collect(),
+        output_modalities: facts
+            .output_modalities
+            .iter()
+            .map(|modality| modality.as_str().to_owned())
+            .collect(),
+        catalog_lifecycle: facts.lifecycle.as_str(),
+        context_tokens: facts.limits.context_tokens,
+        input_tokens: facts.limits.input_tokens,
+        output_tokens: facts.limits.output_tokens,
+    })
+}
+
+fn price_metadata(
+    book: Option<&crate::desired_state::pricing::PriceBook>,
+    pricing: Option<&PricingSnapshot>,
+    metadata: &CatalogueMetadata,
+    at: SystemTime,
+) -> Option<CataloguePrice> {
+    let provider = ProviderId::parse(&metadata.provider).ok()?;
+    let pricing = pricing?;
+    pricing.price(&provider, &metadata.published_model)?;
+    let book = book?;
+    let instant = EffectiveInstant::of(at).ok()?;
+    let source = book
+        .body
+        .rules()
+        .iter()
+        .filter(|rule| rule.effective().contains(instant))
+        .filter(|rule| {
+            rule.target().provider == provider
+                && rule.target().published_model_id == metadata.published_model
+        })
+        .max_by_key(|rule| rule.precedence())
+        .map(|rule| rule.provenance().origin.as_str())?;
+    Some(CataloguePrice {
+        book: book.reference.to_string(),
+        book_version: book.reference.version.get(),
+        catalog: pricing.catalog().to_string(),
+        catalog_version: pricing.catalog_version().map(|version| version.get()),
+        source,
+    })
+}
+
+type AvailabilityContext = (
+    std::sync::Arc<crate::availability::AvailabilityIndex>,
+    crate::availability::RuntimeObservations,
+);
+
+fn availability_context(reader: Option<&dyn AvailabilityReader>) -> Option<AvailabilityContext> {
+    reader.and_then(AvailabilityReader::read)
+}
+
+fn entry_availability(
+    context: Option<&AvailabilityContext>,
+    request: &CatalogueRequest,
+    metadata: &CatalogueMetadata,
+    disclosure: StatusScope,
+    now: SystemTime,
+) -> Option<super::reads::AvailabilityTarget> {
+    let (index, runtime) = context?;
+    let scope = ScopeRef::of(&request.scope())?;
+    let target = TargetRef::parse(&metadata.provider, &metadata.published_model).ok()?;
+    let verdict = AvailabilityView::new(index, runtime).evaluate_effective(scope, &target, now);
+    super::reads::AvailabilityResult::of(&request.scope(), disclosure, vec![(target, verdict)])
+        .targets
+        .into_iter()
+        .next()
 }
 
 /// The alias names in the read's scope that resolve to `enablement`, ordered and
@@ -417,6 +804,55 @@ fn aliases_naming(
     names
 }
 
+/// Derive whether one alias has any usable target in its owning project.
+///
+/// The alias target is an exact enablement reference. A project override does not
+/// rewrite an alias that explicitly targets a tenant default; the alias contract
+/// permits either target and keeps the ordered references intact. Effective
+/// enablement precedence belongs to unaliased model resolution, not to alias
+/// target interpretation.
+fn alias_status(models: &Models, alias: &ModelAlias) -> AliasStatus {
+    if !alias.body.is_enabled() {
+        return AliasStatus {
+            routable: false,
+            unavailable: vec![AliasUnavailableReason::Disabled],
+        };
+    }
+
+    let mut unavailable = Vec::new();
+    let mut routable = false;
+    if alias.body.targets().is_empty() {
+        unavailable.push(AliasUnavailableReason::NoTargets);
+    }
+
+    for target in alias.body.targets() {
+        let Some(enablement) = models.enablement(target.enablement) else {
+            unavailable.push(AliasUnavailableReason::NoTargets);
+            continue;
+        };
+        if !enablement.body.is_enabled() {
+            unavailable.push(AliasUnavailableReason::DisabledTarget);
+            continue;
+        }
+        if enablement.body.billable_price().is_none() {
+            unavailable.push(AliasUnavailableReason::UnpricedTarget);
+            continue;
+        }
+        routable = true;
+        break;
+    }
+
+    if routable {
+        unavailable.clear();
+    }
+    unavailable.sort_unstable();
+    unavailable.dedup();
+    AliasStatus {
+        routable,
+        unavailable,
+    }
+}
+
 /// Whether an alias belongs to the scope being read. Aliases are project-scoped,
 /// so a tenant-wide read reports every project's aliases for a default it owns,
 /// and a project read reports only that project's.
@@ -441,9 +877,9 @@ fn unreadable(revision: &LoadedRevision, error: &ModelError) -> AdminError {
 mod tests {
     use super::*;
     use crate::desired_state::fixtures::{
-        approved_price, blob_backed_catalog, candidate, catalog_reference, enablement_body,
-        offering_id, price, project, project_enablement, project_id, revision_id, tenant,
-        tenant_id, typed_alias,
+        alias_body, approved_price, blob_backed_catalog, candidate, catalog_reference,
+        enablement_body, offering_id, price, project, project_enablement, project_id, reference,
+        revision_id, tenant, tenant_id, typed_alias,
     };
     use crate::desired_state::{
         DesiredState, ExpectedRevision, ProjectId, RevisionManifest, Slug, TenantId,
@@ -710,12 +1146,90 @@ mod tests {
         );
         assert_eq!(alias.wire_family, WireFamily::OpenaiChat.as_str());
         assert_eq!(alias.state, ModelLifecycle::Enabled.as_str());
+        assert!(alias.routable);
+        assert!(alias.unavailable.is_empty());
         assert_eq!(
             alias.targets,
             vec![CatalogueAliasTarget {
                 enablement: crate::desired_state::fixtures::resource_id(30).to_string(),
                 version: 1,
             }]
+        );
+    }
+
+    #[test]
+    fn an_alias_explains_when_every_target_is_unusable() {
+        let revision = published();
+        let models = Models::of(revision.state()).expect("the fixture models are valid");
+        let acme = tenant_id(1);
+        let core = project_id(2);
+
+        let exact_default = models.aliases().next().expect("the fixture alias");
+        assert_eq!(
+            alias_status(&models, exact_default),
+            AliasStatus {
+                routable: true,
+                unavailable: Vec::new(),
+            },
+            "an alias keeps its exact tenant-default target even when the project has an override"
+        );
+
+        let unpriced = ModelAlias {
+            reference: reference(crate::desired_state::ResourceKind::Alias, 37),
+            slug: slug("unpriced"),
+            body: alias_body(
+                &acme,
+                &core,
+                37,
+                &[reference(
+                    crate::desired_state::ResourceKind::ModelEnablement,
+                    31,
+                )],
+            ),
+        };
+        assert_eq!(
+            alias_status(&models, &unpriced).unavailable,
+            vec![AliasUnavailableReason::UnpricedTarget]
+        );
+
+        let withdrawn = ModelAlias {
+            reference: reference(crate::desired_state::ResourceKind::Alias, 38),
+            slug: slug("withdrawn"),
+            body: alias_body(
+                &acme,
+                &core,
+                38,
+                &[reference(
+                    crate::desired_state::ResourceKind::ModelEnablement,
+                    32,
+                )],
+            ),
+        };
+        assert_eq!(
+            alias_status(&models, &withdrawn).unavailable,
+            vec![AliasUnavailableReason::DisabledTarget]
+        );
+
+        let fallback = ModelAlias {
+            reference: reference(crate::desired_state::ResourceKind::Alias, 39),
+            slug: slug("fallback"),
+            body: alias_body(
+                &acme,
+                &core,
+                39,
+                &[
+                    reference(crate::desired_state::ResourceKind::ModelEnablement, 31),
+                    reference(crate::desired_state::ResourceKind::ModelEnablement, 30),
+                ],
+            ),
+        };
+        assert_eq!(
+            alias_status(&models, &fallback),
+            AliasStatus {
+                routable: true,
+                unavailable: Vec::new(),
+            },
+            "an unusable fallback does not make an alias unavailable when a later target works"
         );
     }
 
@@ -781,6 +1295,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PendingFact::ALL).expect("serializable"),
             serde_json::json!(["offering-metadata", "availability"])
+        );
+        assert_eq!(
+            serde_json::to_value(AliasUnavailableReason::ALL).expect("serializable"),
+            serde_json::json!([
+                "disabled",
+                "no-targets",
+                "disabled-target",
+                "unpriced-target"
+            ])
         );
     }
 }

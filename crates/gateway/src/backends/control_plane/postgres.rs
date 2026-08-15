@@ -194,6 +194,43 @@ impl std::fmt::Debug for PostgresControlPlane {
 }
 
 impl PostgresControlPlane {
+    /// Build the reconnecting store without opening the first connection.
+    ///
+    /// This is used only when an authenticated compiled-serving cache has
+    /// already proved that inference can start. Administrative calls and
+    /// convergence remain unavailable until `run` reconnects and the normal
+    /// control-plane operation succeeds; no request path uses this store.
+    pub fn deferred(dsn: &str, settings: ControlPlaneSettings) -> Result<Self, ControlPlaneError> {
+        let mut config: Config = dsn.parse().map_err(|error| {
+            denied(format!(
+                "the control-plane DSN could not be parsed: {error}"
+            ))
+        })?;
+        config.connect_timeout(settings.connect_timeout);
+        config.application_name(crate::telemetry::SERVICE_NAME);
+        let search_path = settings
+            .schema
+            .as_deref()
+            .map(|schema| {
+                crate::usage::validate_table_name(schema).map_err(denied)?;
+                if schema.contains('.') {
+                    return Err(denied(format!(
+                        "`{schema}` is not a single unqualified schema name"
+                    )));
+                }
+                Ok(schema.to_owned())
+            })
+            .transpose()?;
+        Ok(Self {
+            config,
+            settings,
+            search_path,
+            ids: Uuid7Generator::new(),
+            client: tokio::sync::Mutex::new(None),
+            pending_operations: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
     /// Connect, check the server and schema, and optionally migrate.
     ///
     /// Boot refuses rather than degrades. An unsupported server, a schema a newer

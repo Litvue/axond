@@ -27,12 +27,13 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Every overlay that carries the sentinel, not just the stateless one: the
-# stateful overlay pins the migration Job as well as its Deployment, and a
-# `--check` blind to it would report a resolved fleet while that overlay still
+# stateful overlays pin the migration Job as well as their workload, and a
+# `--check` blind to one would report a resolved fleet while that overlay still
 # names an image no node can pull.
 overlays=(
   "${repo_root}/deploy/kubernetes/overlays/production/kustomization.yaml"
   "${repo_root}/deploy/kubernetes/overlays/production-stateful/kustomization.yaml"
+  "${repo_root}/deploy/kubernetes/overlays/production-stateful-persistent/kustomization.yaml"
 )
 image="${AXOND_IMAGE:-ghcr.io/litvue/axond}"
 sentinel="sha256:0000000000000000000000000000000000000000000000000000000000000000"

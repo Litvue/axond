@@ -8,10 +8,11 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::oidc::OidcProvider;
 use super::schema::Schema;
 
 /// Distinguishes the fixtures of tests running in the same process.
@@ -148,6 +149,7 @@ pub struct ControlPlane {
     pub dsn: String,
     pub schema: String,
     pub config: PathBuf,
+    pub cache_path: PathBuf,
     pub env: BTreeMap<&'static str, String>,
     /// The breakglass credential this fixture's replica accepts, and no other
     /// fixture's does. See [`ControlPlane::spawn`].
@@ -164,6 +166,7 @@ pub struct ControlPlane {
 pub const DSN_ENV: &str = "GW_INTEGRATION_CONTROL_PLANE_DSN";
 pub const KEK_ENV: &str = "GW_INTEGRATION_KEK";
 pub const BREAKGLASS_ENV: &str = "GW_INTEGRATION_BREAKGLASS";
+pub const CACHE_KEY_ENV: &str = "GW_INTEGRATION_LKG_KEY";
 
 /// A non-secret fixture value for the deployment KEK reference.
 ///
@@ -177,6 +180,88 @@ pub fn integration_kek() -> String {
     STANDARD.encode([7u8; 32])
 }
 
+pub fn integration_cache_key() -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    STANDARD.encode([11u8; 32])
+}
+
+/// Retain process-level recovery evidence in the same small JSON contract as
+/// The artifact deliberately accepts only caller-supplied observations and
+/// bounded status strings; callers cannot pass provider material through this
+/// helper by accident.
+#[allow(clippy::too_many_arguments)]
+pub fn write_recovery_artifact(
+    control_plane: &ControlPlane,
+    scenario: &str,
+    stage: &str,
+    capability: &str,
+    evidence: &[&str],
+    events: &[(&str, &str)],
+    observations: &[(&str, serde_json::Value)],
+    gates: &[(&str, &str, &str, &str)],
+    checks: &[(&str, &str, &str, &str)],
+) {
+    let started_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_millis();
+    let timeline: Vec<serde_json::Value> = events
+        .iter()
+        .enumerate()
+        .map(|(index, (event, detail))| {
+            serde_json::json!({
+                "at_ms": index as u64,
+                "event": event,
+                "detail": detail,
+            })
+        })
+        .collect();
+    let observations = observations
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), value.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let verdicts = |entries: &[(&str, &str, &str, &str)]| {
+        entries
+            .iter()
+            .map(|(gate, bound, observed, detail)| {
+                serde_json::json!({
+                    "gate": gate,
+                    "bound": bound,
+                    "observed": observed,
+                    "outcome": "met",
+                    "detail": detail,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let artifact = serde_json::json!({
+        "schema_version": 2,
+        "scenario": scenario,
+        "stage": stage,
+        "runner": "stateful-tests",
+        "capability": capability,
+        "evidence": evidence,
+        "run": {
+            "started_at_unix_ms": started_at_unix_ms,
+            "elapsed_ms": events.len() as u64,
+            "axond_version": env!("CARGO_PKG_VERSION"),
+            "control_plane": "postgres",
+            "schema": control_plane.schema,
+            "schema_identity": "stateful-integration",
+        },
+        "timeline": timeline,
+        "observations": observations,
+        "gates": verdicts(gates),
+        "checks": verdicts(checks),
+    });
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/recovery");
+    std::fs::create_dir_all(&directory).expect("the recovery evidence directory is writable");
+    let path = directory.join(format!("{scenario}.{stage}.json"));
+    let text = serde_json::to_string_pretty(&artifact).expect("the recovery artifact serializes");
+    std::fs::write(&path, format!("{text}\n")).expect("the recovery artifact is writable");
+}
+
 impl ControlPlane {
     /// `None` when no test database is configured.
     pub async fn create() -> Option<Self> {
@@ -188,6 +273,14 @@ impl ControlPlane {
         );
         let schema = format!("axond_it_{fixture}");
         let breakglass = format!("integration-test-breakglass-{fixture}");
+        let cache_path = std::env::temp_dir().join(format!("axond-stateful-{fixture}.snapshot"));
+        let compiled_cache_path = cache_path.with_extension("serving");
+        // Pids can be reused between test processes. Remove only this fixture's
+        // exact cache paths so a prior process cannot turn a no-cache boot into a
+        // cache-refusal scenario.
+        let _ = std::fs::remove_file(&cache_path);
+        let _ = std::fs::remove_file(compiled_cache_path);
+        let cache_path_text = cache_path.display().to_string();
         // Before the config is rendered and before any later step can fail: the
         // cleanup has to be owned from the moment the schema exists.
         let claim = Schema::create(&dsn, &schema).await;
@@ -206,6 +299,14 @@ impl ControlPlane {
                  backend = \"postgres\"\n\
                  kek_env = \"{KEK_ENV}\"\n\
                  schema = \"{schema}\"\n\
+                 [convergence]\n\
+                 cache_path = \"{cache_path_text}\"\n\
+                 cache_key_env = \"{CACHE_KEY_ENV}\"\n\
+                 [catalog]\n\
+                 source = \"seed\"\n\
+                 store = \"postgres\"\n\
+                 schema = \"{schema}\"\n\
+                 bootstrap = \"seed\"\n\
                  [[admin_breakglass]]\n\
                  env = \"{BREAKGLASS_ENV}\"\n\
                  id = \"breakglass\"\n"
@@ -215,12 +316,14 @@ impl ControlPlane {
             (DSN_ENV, dsn.clone()),
             // Fixture values satisfy reference validation without being logged or inlined.
             (KEK_ENV, integration_kek()),
+            (CACHE_KEY_ENV, integration_cache_key()),
             (BREAKGLASS_ENV, breakglass.clone()),
         ]);
         Some(Self {
             dsn,
             schema,
             config,
+            cache_path,
             env,
             breakglass,
             _schema: claim,
@@ -229,6 +332,19 @@ impl ControlPlane {
 
     pub fn run(&self, args: &[&str]) -> Run {
         run(&self.config, args, &self.env)
+    }
+
+    /// Add the explicit local OIDC verifier boundary to this fixture's
+    /// bootstrap. Breakglass remains configured as the recovery credential.
+    pub fn enable_oidc(&self, provider: &OidcProvider) {
+        let mut config = std::fs::read_to_string(&self.config).expect("read fixture config");
+        config.push_str(&format!(
+            "\n[admin_oidc]\nissuer = \"{}\"\naudience = \"{}\"\njwks_url = \"{}\"\n",
+            provider.issuer(),
+            provider.audience(),
+            provider.jwks_url(),
+        ));
+        std::fs::write(&self.config, config).expect("write OIDC fixture config");
     }
 
     /// Whether the migration ledger exists — observed on a connection of the
@@ -253,6 +369,24 @@ impl ControlPlane {
             .is_some()
     }
 
+    /// The raw payload and normalized content identities imported from the
+    /// bundled seed. Admin revisions pin the former; approved prices pin the
+    /// latter.
+    pub async fn catalogue_identity(&self) -> Option<(String, String, u64)> {
+        client(&self.dsn)
+            .await
+            .query_opt(
+                &format!(
+                    "SELECT raw_digest, content_id, raw_bytes FROM {}.axond_catalog_snapshot ORDER BY imported_at LIMIT 1",
+                    self.schema
+                ),
+                &[],
+            )
+            .await
+            .expect("read the seeded catalogue identity")
+            .map(|row| (row.get(0), row.get(1), row.get::<_, i64>(2) as u64))
+    }
+
     /// A replica of this deployment, running until the fixture is dropped.
     ///
     /// The control plane must already be migrated: a replica opens it at boot,
@@ -265,9 +399,45 @@ impl ControlPlane {
     /// collision costs an attempt instead of failing a scenario for a reason it
     /// does not state.
     pub async fn serve(&self) -> Replica {
+        self.serve_with_dsn_mode(&self.dsn, false).await
+    }
+
+    /// Start a replica through a caller-controlled TCP path to the same control
+    /// plane. The stateful recovery integration uses this to sever live
+    /// Postgres connections while leaving the database and the direct admin
+    /// replica available for the recovery publication.
+    pub async fn serve_with_dsn(&self, dsn: &str) -> Replica {
+        self.serve_with_dsn_mode(dsn, false).await
+    }
+
+    /// Start a replacement replica with the control plane unreachable. This is
+    /// local fault injection: it avoids stopping the shared test Postgres while
+    /// exercising the deferred-store and encrypted-cache recovery path.
+    pub async fn serve_without_control_plane(&self) -> Replica {
+        self.serve_with_dsn_mode("postgres://axond@127.0.0.1:1/axond", true)
+            .await
+    }
+
+    /// Start a replica without a serving cache while the control plane is
+    /// reachable. The administrative surface remains available so the
+    /// black-box readiness stages can distinguish a booted, fail-closed process
+    /// from a process that never started.
+    pub async fn serve_unready(&self) -> Replica {
+        self.serve_with_dsn_mode(&self.dsn, false).await
+    }
+
+    /// Start a cacheless replica while the control plane is unreachable. The
+    /// listener remains alive, but authenticated administrative reads refuse
+    /// with dependency-unavailable and readiness stays closed.
+    pub async fn serve_without_control_plane_unready(&self) -> Replica {
+        self.serve_with_dsn_mode("postgres://axond@127.0.0.1:1/axond", false)
+            .await
+    }
+
+    async fn serve_with_dsn_mode(&self, dsn: &str, recovery: bool) -> Replica {
         let mut reported = String::new();
         for attempt in 0..BOOT_ATTEMPTS {
-            match self.spawn(attempt).await {
+            match self.spawn(attempt, dsn, recovery).await {
                 Ok(replica) => return replica,
                 Err(output) => reported = output,
             }
@@ -280,7 +450,7 @@ impl ControlPlane {
 
     /// One boot attempt on a port of its own: the running replica, or what the
     /// child said instead of serving.
-    async fn spawn(&self, attempt: usize) -> Result<Replica, String> {
+    async fn spawn(&self, attempt: usize, dsn: &str, recovery: bool) -> Result<Replica, String> {
         let bind = free_addr();
         let log = self
             .config
@@ -309,6 +479,7 @@ impl ControlPlane {
         for (key, value) in &self.env {
             command.env(key, value);
         }
+        command.env(DSN_ENV, dsn);
         let child = command.spawn().expect("the axond binary runs");
         let mut replica = Replica {
             child,
@@ -316,7 +487,7 @@ impl ControlPlane {
             log,
             breakglass: self.breakglass.clone(),
         };
-        if replica.serving().await {
+        if replica.serving(recovery).await {
             Ok(replica)
         } else {
             Err(replica.output())
@@ -380,29 +551,43 @@ impl Replica {
     /// administration while reporting itself unready for inference, so readiness
     /// is the very thing a scenario here asserts rather than a precondition it
     /// waits on.
-    async fn serving(&mut self) -> bool {
+    async fn serving(&mut self, recovery: bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(30);
         let client = reqwest::Client::new();
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return false;
             }
+            let path = if recovery { "/convergence" } else { "/state" };
             if let Ok(response) = self
                 .breakglass(
-                    client.get(self.admin_url("/state")),
+                    client.get(self.admin_url(path)),
                     "fixture: identify the replica",
                 )
                 .send()
                 .await
             {
-                match response.status() {
-                    reqwest::StatusCode::OK => return true,
-                    // Another process holds this port. This child will exit on its
-                    // own failed bind; the caller takes a different port.
-                    reqwest::StatusCode::UNAUTHORIZED => return false,
-                    // Still starting: nothing is listening yet, or the admin
-                    // surface is not mounted yet.
-                    _ => {}
+                let status = response.status();
+                if recovery && status == reqwest::StatusCode::OK {
+                    let body = response.json::<serde_json::Value>().await;
+                    if body
+                        .ok()
+                        .and_then(|body| body.get("active").cloned())
+                        .is_some_and(|active| active.is_string())
+                    {
+                        return true;
+                    }
+                } else {
+                    match status {
+                        reqwest::StatusCode::OK => return true,
+                        reqwest::StatusCode::SERVICE_UNAVAILABLE if !recovery => return true,
+                        // Another process holds this port. This child will exit on its
+                        // own failed bind; the caller takes a different port.
+                        reqwest::StatusCode::UNAUTHORIZED => return false,
+                        // Still starting: nothing is listening yet, or the admin
+                        // surface is not mounted yet.
+                        _ => {}
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

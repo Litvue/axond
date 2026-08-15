@@ -187,11 +187,9 @@ Autoscaling on CPU does not make `[admission]` ceilings fleet-wide — read
 `deploy/kubernetes/overlays/production-stateful` is the production overlay plus
 the `deploy/kubernetes/components/stateful` component, and it deploys a fleet
 with a different lifecycle: a stateful replica boots, serves `/admin/v1` against
-the control plane, and remains fail-closed because the current production
-projection has no inbound caller-principal source ([revision convergence](../operations/revision-convergence.md)).
-Until that dependency lands, **no replica reports Ready**: anonymous inference
-is `401 unauthorized`, an authenticated request reaches `503
-inference_unavailable`, and this overlay claims no outage serving. Three defaults
+the control plane, and remains fail-closed until a published revision or valid
+last-known-good cache compiles into a runtime snapshot ([revision convergence](../operations/revision-convergence.md)).
+Until that snapshot is active, **no replica reports Ready**, and three defaults
 of a serving fleet become wrong at once. The component answers each:
 
 - **The upgrade.** `Recreate`, replacing the base's rolling update: a rolling
@@ -230,8 +228,8 @@ of a serving fleet become wrong at once. The component answers each:
   A port-forward is a kubelet-mediated operator action rather than a
   cluster-wide network endpoint, so this remains fail-closed even when the CNI
   does not implement NetworkPolicy. The production overlay's ingress allowance
-  is also replaced by `admin-boundary.yaml`; because inference is refused on
-  this fleet, inheriting that allowance would expose `/admin/v1` to the public
+  is also replaced by `admin-boundary.yaml`; until a complete stateful snapshot
+  is qualified, inheriting that allowance would expose `/admin/v1` to the public
   ingress path.
 
   ```yaml
@@ -333,6 +331,7 @@ proven on a real cluster with its counterfactual:
 ```bash
 just stateful-deploy-drill        # ops/stateful-deploy-drill.sh on a three-worker
                                   # kind cluster, ~5 minutes
+just stateful-persistent-drill    # retained PVC ordinal replacement on kind
 ```
 
 The drill migrates once, asserts three Running and zero Ready replicas, probes
@@ -341,6 +340,68 @@ port-forward, then
 requires a `RollingUpdate` to stall and the default disruption budget to refuse
 the eviction that `AlwaysAllow` permits. Run it when you change the strategy,
 the Services, the budget, or the migration Job.
+
+### Durable StatefulSet option
+
+`deploy/kubernetes/overlays/production-stateful-persistent` is a separate,
+opt-in render for replicas that must retain a signed last-known-good snapshot
+across Pod replacement. It layers on the same stateful ConfigMap, migration Job,
+NetworkPolicies, administrative boundary, and image pinning as the Recreate
+overlay, then replaces only the Deployment with:
+
+- a three-replica `StatefulSet` with `podManagementPolicy: Parallel`, stable
+  ordinal identity, and `updateStrategy: OnDelete`;
+- a headless `axond-headless` governing Service used for StatefulSet identity
+  only; the existing `axond` Service still excludes unready replicas; and
+- one retained `ReadWriteOnce` `1Gi` PVC per ordinal, mounted at
+  `/var/lib/axond`, where `[convergence].cache_path` writes the authenticated
+  `last-known-good.snapshot`.
+
+The PVC template deliberately omits `storageClassName`, so the cluster's
+default StorageClass must be a durable CSI-backed class. Review that class's
+replication, reclaim, encryption, and snapshot policy before applying this
+option; a PVC is per-replica persistence, not a substitute for the database
+backup and PITR procedure. `whenDeleted: Retain` and `whenScaled: Retain` keep a
+replica's cache available for investigation and recovery rather than silently
+deleting it with the workload.
+
+This option does not change the existing
+`deploy/kubernetes/overlays/production-stateful` render. The latter remains the
+Recreate/emptyDir administrative deployment and is the current fail-closed
+path. The persistent option also keeps `OnDelete` until the main serving path
+reports valid snapshots: the current stateful process is intentionally unready,
+so an automatic rolling update would wait on a condition it cannot yet satisfy.
+Use the persistent option only when its storage class and recovery ownership
+are approved:
+
+```bash
+overlay=deploy/kubernetes/overlays/production-stateful-persistent
+ops/pin-image-digest.sh --check overlays/production-stateful-persistent
+kubectl apply -k "$overlay"
+kubectl -n axond wait --for=condition=complete job/axond-migrate --timeout=5m
+kubectl -n axond get statefulset axond
+kubectl -n axond get pvc -l app.kubernetes.io/name=axond
+```
+
+Run the disposable runtime qualification before enabling this option in a
+real cluster:
+
+```bash
+ops/stateful-persistent-drill.sh
+```
+
+That drill verifies the migration Job, three Bound PVCs, the cache mount, and
+ordinal replacement. The stateful integration recovery lane separately writes
+and restores the signed desired-state and encrypted compiled-serving caches;
+the two checks together cover both the cache format and the storage lifecycle.
+
+The four Secret values remain the same as the Recreate path, including the
+deployment-wide `GW_LAST_KNOWN_GOOD_KEY`. Provision that key before applying
+the ConfigMap. To replace one replica, delete its Pod and leave its PVC in
+place; the StatefulSet recreates the same ordinal and the process can read its
+authenticated cache. To update the image or mounted configuration, delete the
+Pods one ordinal at a time after the migration Job is current. Do not delete
+the PVCs as part of that operation.
 
 For the operator sequence around these checks — including the deliberately
 unready probe contract, first-install migration ordering, desired-state rollback,

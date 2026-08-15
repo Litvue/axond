@@ -239,12 +239,10 @@ async fn state(
 /// What a catalogue read may ask for: the scope, and filters over it.
 ///
 /// `tenant` is required, so there is no spelling of this query that asks for
-/// every tenant's enablements. Unknown keys are refused rather than ignored,
-/// because a filter this build does not implement — `provider`, `capability`,
-/// `modality`, `availability`, all of which need metadata the catalogue-import and
-/// availability slices own — must not silently widen the answer: a caller that
-/// asked to narrow and was not narrowed would read the result as authoritative.
-/// [`CatalogueView::pending`] names the same gap in the response.
+/// every tenant's enablements. Unknown keys are refused rather than ignored.
+/// Every accepted filter is parsed into the corresponding catalogue or
+/// availability identity before the read is authorized, so a caller that asked
+/// to narrow the answer cannot accidentally receive an unfiltered projection.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CatalogueQuery {
@@ -259,15 +257,25 @@ struct CatalogueQuery {
     offering: Option<String>,
     #[serde(default)]
     billable: Option<bool>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    modality: Option<String>,
+    #[serde(default)]
+    lifecycle: Option<String>,
+    #[serde(default)]
+    availability: Option<String>,
 }
 
 /// Catalogue queries are deliberately small and finite: the route has one
-/// required scope key and five optional filters. Bounding the raw query before
+/// required scope key and ten optional filters. Bounding the raw query before
 /// deserialization keeps malformed input from turning into an unbounded error
-/// detail and prevents a client from spending parser work on fields this route
-/// could never use.
+/// detail and prevents a client from spending parser work on an unbounded
+/// number of repeated keys.
 pub(super) const CATALOGUE_MAX_QUERY_BYTES: usize = 2 * 1024;
-pub(super) const CATALOGUE_MAX_QUERY_PARAMS: usize = 6;
+pub(super) const CATALOGUE_MAX_QUERY_PARAMS: usize = 11;
 
 fn validate_catalogue_query(uri: &Uri) -> Result<(), AdminError> {
     let query = uri.query().unwrap_or_default();
@@ -346,6 +354,47 @@ async fn catalogue(
             Some(OfferingId::parse(text).map_err(|error| invalid("offering", error.to_string()))?)
         }
     };
+    let provider = query.provider.clone();
+    let capability = match query.capability.as_deref() {
+        None => None,
+        Some(text) => Some(
+            crate::backends::catalog::ModelCapability::parse(text).ok_or_else(|| {
+                invalid(
+                    "capability",
+                    format!("`{text}` is not a catalogue capability"),
+                )
+            })?,
+        ),
+    };
+    let modality =
+        match query.modality.as_deref() {
+            None => None,
+            Some(text) => Some(crate::backends::catalog::Modality::parse(text).ok_or_else(
+                || invalid("modality", format!("`{text}` is not a catalogue modality")),
+            )?),
+        };
+    let catalog_lifecycle = match query.lifecycle.as_deref() {
+        None => None,
+        Some(text) => Some(
+            crate::backends::catalog::ModelLifecycle::parse(text).ok_or_else(|| {
+                invalid(
+                    "lifecycle",
+                    format!("`{text}` is not a catalogue lifecycle"),
+                )
+            })?,
+        ),
+    };
+    let availability = match query.availability.as_deref() {
+        None => None,
+        Some(text) => Some(
+            crate::availability::AvailabilityState::parse(text).ok_or_else(|| {
+                invalid(
+                    "availability",
+                    format!("`{text}` is not an availability state"),
+                )
+            })?,
+        ),
+    };
     let request = CatalogueRequest {
         tenant,
         project,
@@ -354,6 +403,11 @@ async fn catalogue(
             wire_family,
             offering,
             billable: query.billable,
+            provider,
+            capability,
+            modality,
+            catalog_lifecycle,
+            availability,
         },
     };
     let grant = api
@@ -369,7 +423,15 @@ async fn catalogue(
         .await?;
     Ok(Conditional::new(
         &headers,
-        api.service.model_catalogue(&grant, &request).await?,
+        api.service
+            .model_catalogue_with_context(
+                &grant,
+                &request,
+                api.catalogue.as_deref(),
+                api.availability.as_deref(),
+                SystemTime::now(),
+            )
+            .await?,
     ))
 }
 

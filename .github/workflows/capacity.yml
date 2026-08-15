@@ -43,6 +43,19 @@ jobs:
             --nocapture --test-threads=1
         env:
           AXOND_CAPACITY: '1'
+      - name: Build the heavy capacity qualification record
+        if: success()
+        run: |
+          python3 ops/qualification-evidence.py target/capacity/heavy \
+            --runner github-actions \
+            --note "GitHub Actions ubuntu-latest, heavy capacity profiles" \
+            --out target/qualification-records/capacity-heavy.toml
+      - name: Verify the heavy capacity record
+        if: success()
+        run: |
+          python3 ops/promote-qualification.py \
+            target/qualification-records/capacity-heavy.toml \
+            --out target/qualification-records/validated-capacity-heavy.toml
       - name: Publish the result artifacts
         # Uploaded even on failure: a run that missed a threshold is the run whose
         # evidence is worth reading.
@@ -52,3 +65,12 @@ jobs:
           name: capacity-results
           path: target/capacity/**/*.json
           if-no-files-found: error
+          retention-days: 90
+      - name: Publish the heavy capacity qualification record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-record-capacity
+          path: target/qualification-records/capacity-heavy.toml
+          if-no-files-found: warn
+          retention-days: 90

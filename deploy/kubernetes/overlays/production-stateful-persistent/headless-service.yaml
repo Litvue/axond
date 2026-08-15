@@ -1,0 +1,16 @@
+# Governing Service for StatefulSet identity only. The normal `axond` Service
+# remains the caller-facing Service and still excludes unready replicas; this
+# headless Service does not publish not-ready addresses or create an admin path.
+apiVersion: v1
+kind: Service
+metadata:
+  name: axond-headless
+  namespace: axond
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: axond
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

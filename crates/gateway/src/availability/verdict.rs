@@ -83,6 +83,13 @@ impl AvailabilityState {
         }
     }
 
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|state| state.as_str() == value)
+    }
+
     /// Whether this state alone refuses an attempt against the target.
     ///
     /// Not the routability question on its own — use

@@ -2091,8 +2091,16 @@ fn check_reference(
             target,
         });
     };
-    let reachable = ModelOwner::from_scope(&referenced.scope)
-        .is_some_and(|referenced| owner.reaches(referenced));
+    let reachable =
+        if target.kind == ResourceKind::Price && referenced.scope == ResourceScope::Deployment {
+            // The approved deployment price book is shared by every tenant. It is
+            // still an exact declared dependency, but unlike a tenant/project model
+            // target it is intentionally outside the owner's resource scope.
+            true
+        } else {
+            ModelOwner::from_scope(&referenced.scope)
+                .is_some_and(|referenced| owner.reaches(referenced))
+        };
     if reachable {
         Ok(())
     } else {

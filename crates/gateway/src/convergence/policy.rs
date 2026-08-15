@@ -104,6 +104,7 @@ impl<P: RevisionProjection> RevisionProjection for PolicyProjection<P> {
 #[cfg(test)]
 mod tests {
     use super::super::compile::testing::{bootstrap, revision};
+    use super::super::principals::PrincipalProjection;
     use super::super::tenancy::TenancyProjection;
     use super::*;
     use crate::desired_state::fixtures::{project_id, revision_id, state, tenant_id};
@@ -121,6 +122,15 @@ mod tests {
 
     fn projection() -> PolicyProjection<TenancyProjection> {
         PolicyProjection::over(TenancyProjection)
+    }
+
+    #[test]
+    fn policy_wrapper_preserves_inner_inbound_principal_capability() {
+        assert!(
+            PolicyProjection::over(PrincipalProjection).projects_inbound_principals(),
+            "the production policy wrapper must not hide the principal projection"
+        );
+        assert!(!projection().projects_inbound_principals());
     }
 
     fn policy_of<'a>(config: &'a Config, id: &str) -> Option<&'a NamespacePolicy> {

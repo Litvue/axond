@@ -2,14 +2,28 @@
 
 This is the operator procedure for
 [deploy/kubernetes/overlays/production-stateful](../../deploy/kubernetes/overlays/production-stateful).
-The current stateful process serves authenticated /admin/v1, but it does not
-compile a published revision into an inference snapshot because the production
-projection has no inbound caller-principal source yet. A healthy Pod is
-therefore **Running and not Ready**: /healthz returns 200, /readyz returns
-503, anonymous inference returns 401 unauthorized, and an authenticated
-inference request reaches typed 503 inference_unavailable. Use the stateless
-production overlay for inference traffic until the principal-projection slice
-lands and the convergence dependency is wired into serving.
+The stateful process serves authenticated /admin/v1 and can compile a published
+revision into an inference snapshot when the control plane contains a complete
+provider, project workload principal, retained catalogue payload, and effective
+approved price book. A healthy Pod with no such snapshot is still **Running and
+not Ready**: /healthz returns 200, /readyz returns 503, and inference remains
+fail-closed. The compiler and request path are implemented; the remaining
+qualification work is to automate the controlled-upstream outage, restore, and
+long-soak evidence in the integration matrix.
+
+For durable per-replica last-known-good storage, use the separate
+`deploy/kubernetes/overlays/production-stateful-persistent` option documented in
+the [Kubernetes deployment guide](../deployment/kubernetes.md#durable-statefulset-option).
+The procedure below intentionally remains the Recreate/emptyDir path; it is
+appropriate for administrative operation and for a serving snapshot whose
+recovery does not need to survive Pod replacement. The persistent option uses
+the same Secret and migration ordering, but creates retained PVCs and requires
+explicit Pod replacement because its StatefulSet uses `OnDelete`.
+
+The persistent deployment boundary is qualified by
+`ops/stateful-persistent-drill.sh`; the stateful integration recovery scenario
+qualifies the signed desired-state and encrypted compiled-serving cache contents
+that the PVC retains.
 
 This distinction is important during an incident: Kubernetes availability and
 inference availability are not claims this overlay makes today. The procedure
@@ -64,6 +78,7 @@ kubectl -n "$namespace" create secret generic axond-secrets \
   --from-literal=GW_CONTROL_PLANE_DSN='postgres://<user>:<password>@<host>:5432/<db>' \
   --from-literal=GW_SECRET_STORE_KEK='<base64-encoded-key-material>' \
   --from-literal=GW_ADMIN_BREAKGLASS='<breakglass-value>' \
+  --from-literal=GW_LAST_KNOWN_GOOD_KEY='<44-character-padded-base64-32-byte-key>' \
   --dry-run=client -o yaml | kubectl apply -f -
 
 ops/pin-image-digest.sh --check overlays/production-stateful
@@ -125,9 +140,11 @@ kubectl -n axond get endpointslices \
   -l kubernetes.io/service-name=axond
 ~~~
 
-Acceptance is three stable Running Pods, READY false for each, no ready
-inference endpoints, and no continuing restart loop after the migration Job
-completed. A node drain remains permitted because the stateful
+Acceptance for an empty or unconverged deployment is three stable Running Pods,
+READY false for each, no ready inference endpoints, and no continuing restart
+loop after the migration Job completed. Once a complete revision is published,
+repeat the same checks expecting /readyz 200 and a Ready endpoint only after the
+convergence status reports the revision active. A node drain remains permitted because the stateful
 PodDisruptionBudget sets unhealthyPodEvictionPolicy: AlwaysAllow.
 
 Probe one Pod through an operator-controlled port-forward. The administrative
@@ -147,16 +164,15 @@ done
 test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/healthz)" = 200
 test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/readyz)" = 503
 
-inference_body="$(curl -sS -X POST -H 'content-type: application/json' \
+# Before an inbound principal has been projected, the authentication-first
+# boundary returns 401 to an anonymous caller. Once a valid workload principal
+# exists, the same pre-convergence route returns 503 `inference_unavailable`;
+# the stateful integration qualification covers that authenticated case.
+inference_status="$(curl -sS -o /tmp/axond-inference-body \
+  -w '%{http_code}' -X POST -H 'content-type: application/json' \
   -d '{}' http://127.0.0.1:18080/v1/chat/completions)"
-test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
-  -H 'content-type: application/json' -d '{}' \
-  http://127.0.0.1:18080/v1/chat/completions)" = 401
-grep -q '"unauthorized"' <<<"$inference_body"
-
-# A valid caller reaches the convergence boundary and receives its typed 503.
-# The current stateful bootstrap has no gateway key, so this authenticated
-# contract is held by the route regression test until principal projection lands.
+test "$inference_status" = 401
+grep -q '"unauthorized"' /tmp/axond-inference-body
 
 # The value, not the variable name, is the breakglass token.
 test -n "$GW_ADMIN_BREAKGLASS"

@@ -12,19 +12,6 @@ listener before the first bounded bootstrap attempt, then publishes only
 complete projected snapshots. Read [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md)
 for the mode as a whole.
 
-## Current implementation boundary
-
-This PR is the fail-closed convergence wiring slice, not an outage-serving
-release. The production projection currently reads tenancy, credentials, and
-policy, but the desired-state model has no recoverable inbound caller-principal
-secret: workload identities retain only a key digest, while the one-time key is
-deliberately unrecoverable. Stateful compilation therefore returns the typed
-`unsupported` refusal before publishing a candidate, and no stateful replica in
-this build becomes Ready or exports/restores a serving cache. The principal-
-projection slice must land before the serving and outage-recovery contract below
-can become active. The shipped Recreate Deployment also omits `[convergence]`
-because it has no durable per-replica cache volume.
-
 ## How a change reaches a replica
 
 1. An administrator publishes a revision. The journal advances one head pointer.
@@ -372,10 +359,10 @@ successive versions are successive revisions of the same document ([ADR
   negative, or past what these fields count in — is `corrupt`, as is a body that
   contradicts its own identity or scope.
 
-Nothing enforces a document yet: no request path reads one, and no store writes
-one. This is the contract a later activation slice binds to, and the
-classification above states what activating a change would require of a fleet
-rather than performing it.
+The stateful compiler now enforces the projected policy in the same immutable
+snapshot as routing, credentials, and pricing. The control plane still owns the
+document and the request path never reads it directly; a candidate is rejected
+before publication if its policy or any other projection is incomplete.
 
 ### Model enablements pin the catalogue they were approved against
 
@@ -465,31 +452,41 @@ Every compiled configuration's namespace ids are also held to a shape a file's
 never were: one slug, or two joined by `/`, and never repeated. A file may
 legitimately declare the same id twice (it means one namespace), but a *generated*
 id nobody reviewed may not — a duplicate would put two tenants' budgets,
-credentials, and keys on one name. What that gate does not cover is `/` where an
-id is *used* rather than declared: before the runtime slice wires this projection
-into `serve`, metric and trace label values, Redis and Postgres key composition,
-and gateway-key bindings all have to be checked against a separator no
-`axond.toml` could have produced.
+credentials, and keys on one name. The projection is wired into `serve`, so
+every consumer of the qualified id — metric and trace labels, Redis and
+Postgres key composition, and gateway-key bindings — must preserve that identity
+and the separator rules. The compile and integration tests cover those consumers
+against a separator no `axond.toml` could have produced.
 
 What projection does *not* touch is everything the local file owns: listener,
-transport bounds, admission, telemetry, datastore connectivity, and — until their
-own slices land — providers, models, and prices. Provider *credentials* it does
-touch: see [Which pool a credential
-authenticates](#which-pool-a-credential-authenticates). The bootstrap's
-default namespace stays the default, and a projected project starts with no
-platform fallback: it borrows no other namespace's credentials.
+transport bounds, admission, telemetry, and datastore connectivity. Stateful
+projection now also derives durable provider connections, project namespaces,
+active credentials, inbound workload principals, and catalogue-backed aliases.
+The catalogue payload is hydrated from the retained store during compilation;
+requests receive only concrete provider/model strings and an explicit catalogue
+binding. See [Which pool a credential
+authenticates](#which-pool-a-credential-authenticates). The bootstrap's default
+namespace stays the default, and a projected project starts with no platform
+fallback: it borrows no other namespace's credentials.
 
 **No published project is ever made the deployment default.** A request that names
 no namespace is served by whatever the file made default, and publishing a project
 does not move that target — promoting one, even when it is the only one, would let
 an unrelated publication silently redirect unnamed traffic. A bootstrap that
-declares no default namespace is therefore refused with reason `projection`, and
-the message says so. Since `[[namespace]]` is a control-plane-owned section that a
-stateful file may not declare, that is the shape a stateful bootstrap has today:
-**stateful serving stays gated until the runtime slice that projects inbound
-caller principals from desired state lands.** Nothing in `serve` constructs that
-principal projection yet, so the typed `unsupported` refusal is a design
-boundary rather than an authentication fallback or an outage.
+An empty stateful bootstrap receives the deterministic platform default; a file
+that declares namespaces but omits a default is still refused because projection
+cannot guess which file-owned namespace should receive unnamed traffic.
+
+Project-scoped workload keys are projected from their durable digests and bind to
+the qualified project namespace. Tenant-scoped workloads and human identities are
+not treated as inference keys, so a revision with no recoverable project caller
+principal remains fail-closed. A typed model revision also needs its exact
+catalogue payload retained and an effective approved price-book entry for every
+callable target. Missing catalogue, provider, principal, or pricing evidence is
+a projection refusal, not an anonymous or free-serving fallback. The compiler
+path is wired; the stateful integration matrix publishes a complete typed
+revision and proves HTTP inference against a controlled upstream. Fleet-level
+qualification remains a separate evidence gate.
 
 A stateless deployment is unaffected by all of this. Tenants and projects are
 published, never declared in `axond.toml`, and a stateless config's namespace ids
@@ -508,17 +505,13 @@ credentials pin, and each **active** credential becomes one entry in the pool of
   being tried after it. A credential whose owner has no projected namespace (a
   tenant with no projects, a suspended one) is logged by reference and skipped: it
   is not a reason to refuse the revision.
-- **which provider** — the provider resource's slug has to match a `[[provider]]`
-  the file declares, *and* the two must agree on the wire family, because
-  endpoints and wire families are still file-owned. A credential for a provider
-  the deployment cannot dial, or one whose revision speaks Anthropic where the
-  file declares OpenAI, refuses the candidate with reason `projection` rather than
-  publishing a namespace with no key or presenting a key to the wrong account.
-  Like the default namespace above, `[[provider]]` is a control-plane-owned section
-  a stateful file may not declare, so this requirement is a standing gate rather
-  than reachable behaviour today: it is satisfied once the slice that projects
-  provider connections from desired state lands, and until then nothing in `serve`
-  constructs this projection.
+- **which provider** — a durable provider connection is projected from desired
+  state before credentials are pooled. Its runtime id is the readable slug when
+  unique, or a deterministic tenant/project-qualified id when tenants reuse a
+  slug. The provider's endpoint and wire family come from the same durable body;
+  a credential for an absent connection, or one whose wire family disagrees,
+  refuses the candidate with reason `projection` rather than publishing a
+  namespace with no key or presenting a key to the wrong account.
 - **staged is not serving.** Staged material resolves — that is how you prove it
   before traffic reaches it — but only `active` material is pooled. `disabled`,
   `revoked`, and `tombstoned` credentials are absent from the next snapshot's
@@ -702,16 +695,11 @@ Backoff clears on the first success.
 The serving behavior described below is the future serving contract; the current
 build remains fail-closed until inbound-principal projection lands.
 
-The current build remains admin-only and fail-closed because the principal-
-projection dependency above prevents any stateful snapshot from becoming
-active. Once that slice lands, a **running** replica will be unaffected in the
-serving sense: it will keep inference on its active immutable snapshot, report
-growing lag, and reconverge when PostgreSQL returns.
-
-A **new** replica will be able to use a signed last-known-good cache only in a
-deployment with durable per-replica storage. The shipped Recreate overlay does
-not provide that storage or enable the cache, so Pod replacement during an
-outage remains fail-closed rather than pretending to recover.
+A **new** replica normally compiles the durable head. If the control plane or
+SecretStore is unavailable, the encrypted compiled-serving sibling of the
+signed last-known-good cache can restore the last admitted snapshot instead.
+The signed desired-state file alone is intentionally insufficient: it contains
+references, not usable credential material.
 
 ### The signed last-known-good cache
 
@@ -731,8 +719,11 @@ What to know about it operationally:
 - **A restored revision is re-verified.** Checksums, scope rules, and references
   are re-checked after the signature passes, so a cache is not a way to smuggle
   in state the journal would refuse.
-- **It holds no secrets.** Bodies are resource envelopes; every credential is a
-  *reference* resolved through the secret store at compile time.
+- **The signed desired-state file holds no secrets.** Bodies are resource
+  envelopes and credential references. The separate `.serving` sibling is an
+  authenticated AES-GCM envelope containing only the already-admitted material
+  needed for cold recovery; it is not readable without the cache key and is
+  written only after publication.
 - **It may be stale.** A replica reports `source = last-known-good` exactly so
   this is visible. Once the control plane returns, the replica converges to
   desired state normally and stops reporting the cache as its source.

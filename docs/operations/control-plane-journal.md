@@ -231,13 +231,13 @@ axond check preflight --config /etc/axond/axond.toml # then verify a replica wou
 Then start replicas. Run `apply` once from one place; it is safe if that
 accidentally becomes twice, or two places at once.
 
-The `serving` line is a bootstrap-configuration gate, not a promise that the
-runtime has a projected serving snapshot. It can pass while `/readyz` remains
-503: this build still refuses stateful inference until inbound caller-principal
-projection exists, and the stateful deployment is intentionally fail-closed.
-Gate the rollout on the migration status and then on `/readyz`; treat a passing
-preflight as evidence that the replica can boot its administrative surface and
-wait safely for convergence, not as evidence that inference is available.
+The stateful `preflight` serving line is stricter than database readiness: it
+passes only when the projection can produce a complete snapshot or a valid
+signed last-known-good cache. A fresh deployment with no published revision,
+missing provider/model/principal evidence, or missing effective pricing
+therefore remains non-zero even though migration succeeded. Read the rest of
+the report, and gate rollout on both `axond migrate status` and the convergence
+status that explains the refusal.
 
 ### Upgrade
 
@@ -535,8 +535,9 @@ it already holds, so an outage does not touch what it is serving:
   publication that cannot finish writes nothing: the manifest, the resource
   versions, the mutation, the audit event, the idempotency record, and the head
   move in one transaction or not at all.
-- A replica that has not yet loaded a revision cannot start serving. Cold boot
-  needs the control plane.
+- A replica that has not yet loaded a revision can start serving only from a
+  valid signed last-known-good cache; otherwise cold boot needs the control
+  plane and a complete candidate.
 
 So a partially published revision is not a state the journal can be in, and
 "roll back the failed change" is not an operator task.

@@ -62,7 +62,8 @@ read -r -a index_tags <<<"$INDEX_TAGS"
 }
 
 child_refs=()
-declare -A child_digests=()
+amd64_child_digest=""
+arm64_child_digest=""
 for platform in "${PLATFORMS[@]}"; do
   arch="${platform#*/}"
   arch_ref="${IMAGE_NAME}:${RELEASE_VERSION}-${arch}"
@@ -80,10 +81,24 @@ for platform in "${PLATFORMS[@]}"; do
     echo "could not resolve a digest for $arch_ref: ${digest:-none}" >&2
     exit 1
   }
-  child_digests["$platform"]="$digest"
+  case "$platform" in
+    linux/amd64) amd64_child_digest="$digest" ;;
+    linux/arm64) arm64_child_digest="$digest" ;;
+  esac
   child_refs+=("${IMAGE_NAME}@${digest}")
   echo "$platform child: $digest"
 done
+
+child_digest_for_platform() {
+  case "$1" in
+    linux/amd64) printf '%s\n' "$amd64_child_digest" ;;
+    linux/arm64) printf '%s\n' "$arm64_child_digest" ;;
+    *)
+      echo "unsupported release platform: $1" >&2
+      return 1
+      ;;
+  esac
+}
 
 assert_index_contents() {
   # Every descriptor is classified, and anything that is neither an expected
@@ -124,7 +139,7 @@ assert_index_contents() {
       fi
       matched=0
       for platform in "${PLATFORMS[@]}"; do
-        if [[ "${child_digests[$platform]}" == "$referenced" ]]; then
+        if [[ "$(child_digest_for_platform "$platform")" == "$referenced" ]]; then
           matched=1
         fi
       done
@@ -142,7 +157,7 @@ assert_index_contents() {
   local expected
   expected="$(
     for platform in "${PLATFORMS[@]}"; do
-      printf '%s=%s\n' "$platform" "${child_digests[$platform]}"
+      printf '%s=%s\n' "$platform" "$(child_digest_for_platform "$platform")"
     done | sort
   )"
   if [[ "$INDEX_CONTENTS" != "$expected" ]]; then

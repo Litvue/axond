@@ -186,13 +186,12 @@ is what an operator applies by hand and what the deployment docs point at;
 [ADR 0009](./0009-durable-usage-sinks.md), a row-shape change is a new
 `secret_store_v<N>.sql`, never an edit to this one.
 
-**The convergence loop is still not constructed by `serve`.** Compilation
-resolves material through this store wherever a `RevisionCompiler` is built, and
-the compiler already takes the store; what `serve` mounts today is the
-administrative surface, not a running reconciler (#142). Nothing here is
-conditional on that wiring — a rotation is administrable now — but a stateful
-deployment's *automatic* cutover arrives with the loop, and until then the
-boundary is stated rather than papered over with a request-path read.
+**The convergence loop is constructed by `serve`.** Compilation resolves
+material through this store off the request path, and the running reconciler
+publishes a candidate only after the complete revision has passed validation and
+secret resolution. Nothing here turns a rotation into a request-path read: a
+failed refresh leaves the last-known-good snapshot active, while a successful
+refresh makes the successor servable without a restart.
 
 **Security review is triggered and narrow.** This fires threat-model trigger 3
 (`SecretStore`, credential delivery, rotation, redaction). Plaintext exists in two

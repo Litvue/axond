@@ -46,9 +46,10 @@
 //!
 //! # What this module is not
 //!
-//! It is not wired into the request path. The runtime remains stateless: nothing
-//! here is constructed by `serve`, and no snapshot is compiled from a revision
-//! yet. It is also not a complete body model: [`tenancy`], [`access`],
+//! It is not read directly by the request path. Stateful `serve` hydrates and
+//! compiles these bodies off the request path into an immutable snapshot; no
+//! request consults this domain or its stores. It is also not a complete body
+//! model: [`tenancy`], [`access`],
 //! [`policy`], [`models`], [`providers`], and [`pricing`] are the schemas the
 //! domain reads, and catalogue bodies remain owned by their own slice —
 //! [`access::Surface`] names those surfaces so they can be authorized against,
@@ -91,9 +92,9 @@ pub(crate) mod oracle;
 // contract #165, #166, and #142 build against.
 #[allow(unused_imports)]
 pub use access::{
-    AccessDenial, AccessRequest, Action, Authorization, Basis, Caller, Credential, Denial,
-    DenialPage, DenialReason, Directory, IDENTITY_SCHEMA, IdentityBody, IdentityError,
-    IdentityKind, KeyError, Principal, Role, Surface, WorkloadKey,
+    AccessDenial, AccessRequest, Action, Authorization, AuthorizationSnapshot, Basis, Caller,
+    Credential, Denial, DenialPage, DenialReason, Directory, IDENTITY_SCHEMA, IdentityBody,
+    IdentityError, IdentityKind, KeyError, Principal, Role, Surface, WorkloadKey,
 };
 #[allow(unused_imports)]
 pub use canonical::{

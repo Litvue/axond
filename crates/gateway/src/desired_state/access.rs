@@ -1205,6 +1205,39 @@ impl Directory {
     }
 }
 
+/// The immutable administrative authorization view carried by a compiled
+/// revision. It is built off the request path alongside the serving snapshot,
+/// then swapped with it so a human's OIDC identity is authorized against the
+/// same desired state the replica has admitted for serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationSnapshot {
+    tenancy: Tenancy,
+    directory: Directory,
+}
+
+impl AuthorizationSnapshot {
+    pub fn of(state: &DesiredState) -> Result<Self, TenancyError> {
+        let tenancy = Tenancy::of(state)?;
+        let directory = Directory::of(state, &tenancy)?;
+        Ok(Self { tenancy, directory })
+    }
+
+    /// Decide a request for an already authenticated caller.
+    pub fn authorize(
+        &self,
+        caller: &Caller,
+        surface: Surface,
+        action: Action,
+        scope: ResourceScope,
+    ) -> Result<Authorization, Denial> {
+        self.directory.authorize(
+            &self.tenancy,
+            caller,
+            AccessRequest::new(surface, action, scope),
+        )
+    }
+}
+
 /// What the gateway's own background work may do: read anything, and refresh the
 /// two deployment-wide catalogues it owns.
 fn system_permits(request: &AccessRequest) -> bool {

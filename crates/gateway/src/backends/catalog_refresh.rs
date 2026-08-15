@@ -773,6 +773,13 @@ mod tests {
             Ok(None)
         }
 
+        async fn retained_by_raw_digest(
+            &self,
+            _digest: crate::desired_state::Checksum,
+        ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
+            Ok(None)
+        }
+
         async fn activate(
             &self,
             _import: &RetainedCatalog,
@@ -828,6 +835,13 @@ mod tests {
         async fn retained(
             &self,
             _content_id: CatalogContentId,
+        ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
+            Ok(None)
+        }
+
+        async fn retained_by_raw_digest(
+            &self,
+            _digest: crate::desired_state::Checksum,
         ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
             Ok(None)
         }

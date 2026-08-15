@@ -2,11 +2,11 @@
 //!
 //! Scenarios are data for the same reason capacity profiles are (ADR 0033): the
 //! run has to be reproducible from the repository. What is different here is
-//! that a scenario becomes executable in halves — the control-plane half runs
-//! against a real Postgres today, the serving half waits on a projection a
-//! replica can serve — so a scenario is a set of [`Stage`]s, each with its own
-//! status, its own evidence, and its own blockers. This module is what keeps
-//! that map honest rather than aspirational.
+//! that a scenario becomes executable in halves — the control-plane and
+//! process-level outage paths run against a real Postgres today, with the
+//! usage boundary measured by the restore drill — so a scenario is a set of
+//! [`Stage`]s, each with its own status, evidence, and blockers. This
+//! module is what keeps that map honest rather than aspirational.
 //!
 //! The types below are the contract. A scenario the driver has no
 //! [`Capability`] for cannot be written, an evidence field outside [`Evidence`]
@@ -41,7 +41,7 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
 ///
 /// A slice this harness stopped waiting on is recorded in `RETIRED_BLOCKERS`
 /// rather than deleted, so dropping one stays a reviewable statement.
-pub const BLOCKING_ISSUES: [u32; 8] = [144, 145, 147, 148, 149, 150, 155, 158];
+pub const BLOCKING_ISSUES: [u32; 0] = [];
 
 /// Slices #219 once waited on, why it no longer does, and where the rest of
 /// each slice is tracked. Retiring a blocker silently is how a stage that
@@ -137,6 +137,12 @@ pub struct Stage {
     /// could not be checked for the artifact it is supposed to leave.
     #[serde(default)]
     pub runner: Option<Runner>,
+    /// Which implementation owns an executable stage. The in-process recovery
+    /// driver and the black-box stateful integration lane share one CI runner,
+    /// but they retain different evidence and must not silently borrow one
+    /// another's registry.
+    #[serde(default)]
+    pub driver: Driver,
     /// What the stage observes, in prose, for the reader who is deciding
     /// whether the evidence answers their question.
     pub covers: String,
@@ -151,6 +157,15 @@ pub struct Stage {
 pub enum Status {
     Executable,
     Blocked,
+}
+
+/// The executable implementation behind a stage on a CI lane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Driver {
+    #[default]
+    Qualification,
+    StatefulIntegration,
 }
 
 /// Which lane executes a stage. Two, because severing a link and promoting a
@@ -239,6 +254,8 @@ pub enum Evidence {
     RestoreDuration,
     /// What durable state did not survive, named rather than counted.
     DataLossBoundary,
+    /// Which usage records and outbox events survived the recovery target.
+    UsageLossBoundary,
     /// Secret metadata and catalogue state a restore must retain for the
     /// resources that a recovered revision references.
     DurableInventory,
@@ -255,7 +272,7 @@ pub enum Evidence {
 }
 
 impl Evidence {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::OutageTimeline,
         Self::ServingBehavior,
         Self::Revisions,
@@ -263,6 +280,7 @@ impl Evidence {
         Self::ColdStart,
         Self::RestoreDuration,
         Self::DataLossBoundary,
+        Self::UsageLossBoundary,
         Self::DurableInventory,
         Self::RevisionLossBoundary,
         Self::FailOpenClosed,
@@ -279,6 +297,7 @@ impl Evidence {
             Self::ColdStart => "cold_start",
             Self::RestoreDuration => "restore_duration",
             Self::DataLossBoundary => "data_loss_boundary",
+            Self::UsageLossBoundary => "usage_loss_boundary",
             Self::DurableInventory => "durable_inventory",
             Self::RevisionLossBoundary => "revision_loss_boundary",
             Self::FailOpenClosed => "fail_open_closed",

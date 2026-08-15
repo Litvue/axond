@@ -15,9 +15,10 @@
 #      endpoints; the default component publishes no admin Service because a
 #      CNI that ignores NetworkPolicy would make it cluster-wide. An operator
 #      port-forwards directly to a selected Pod, where `/admin/v1` answers while
-#      anonymous `/v1/chat/completions` answers `401 unauthorized`. The
-#      authenticated `503 inference_unavailable` convergence contract is held
-#      by the route regression test until principal projection lands;
+#      anonymous `/v1/chat/completions` answers `401 unauthorized` before an
+#      inbound principal exists; an authenticated caller is covered by the
+#      stateful integration lane and receives `503 inference_unavailable` until
+#      an active serving revision exists;
 #   3. an upgrade completes with `strategy: Recreate`, and the counterfactual —
 #      the base's `RollingUpdate` with `maxUnavailable: 0` — hangs, because it
 #      waits for an availability this fleet never reports;
@@ -163,6 +164,7 @@ kube -n axond create secret generic axond-secrets \
   --from-literal=GW_CONTROL_PLANE_DSN='postgres://postgres:stateful-drill@postgres.axond.svc:5432/postgres' \
   --from-literal=GW_SECRET_STORE_KEK='c3RhdGVmdWwtZHJpbGwta2VrLTMyLWJ5dGVzLWxvbmc=' \
   --from-literal=GW_ADMIN_BREAKGLASS='stateful-drill-breakglass-credential' \
+  --from-literal=GW_LAST_KNOWN_GOOD_KEY='MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' \
   --dry-run=client -o yaml | kube apply -f - >/dev/null
 ok "postgres.axond.svc:5432 and the axond-secrets references"
 
@@ -243,7 +245,7 @@ done
 kubelet's backoff; a Pod stuck in CrashLoopBackOff reports Running and not Ready too: \
 $(kube -n axond get pods -o wide 2>&1)"
 running="$(kube -n axond get pods -l app.kubernetes.io/name=axond \
-  --field-selector=status.phase=Running -o name | wc -l)"
+  --field-selector=status.phase=Running -o name | wc -l | tr -d '[:space:]')"
 [[ "$running" == 3 ]] || fail "expected three Running replicas, got ${running}"
 # Only once the fleet is up is a Ready condition worth reading: the readiness
 # probe runs every 5s, so one would have appeared by now if it were coming.
@@ -301,8 +303,8 @@ code="$(probe -X POST -H 'content-type: application/json' -d '{}' \
   http://127.0.0.1:18443/v1/chat/completions)"
 [[ "$code" == 401 ]] || fail "anonymous inference answered ${code}, not 401"
 grep -q '"unauthorized"' "${workdir}/body" ||
-  fail "the anonymous refusal is not the unauthorized error: $(cat "${workdir}/body")"
-ok "/v1/chat/completions 401 unauthorized (auth-first)"
+  fail "the anonymous refusal is not the typed unauthorized error: $(cat "${workdir}/body")"
+ok "/v1/chat/completions 401 unauthorized before convergence"
 
 # The administrative surface is authenticated, so an unauthenticated probe is
 # what proves it is *there*: a typed admin error is the surface answering, and it

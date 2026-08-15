@@ -69,10 +69,10 @@
 //! # Which provider it authenticates to
 //!
 //! A credential body names a provider *resource*; a config credential names a
-//! provider *id*. The bridge is the provider resource's slug, and the deployment
-//! must declare a `[[provider]]` with that id — endpoints and wire families are
-//! still bootstrap-owned, because projecting provider connections is its own
-//! slice. The two declarations must agree on more than the id: a credential
+//! provider *id*. The bridge is the provider resource's readable slug, qualified
+//! by durable ownership when that slug is reused, and the projection emits the
+//! corresponding runtime provider id. The two declarations must agree on more
+//! than the id: a credential
 //! whose provider resource speaks one wire family while the `[[provider]]` of
 //! that id is declared as another is refused, because presenting a key in a wire
 //! family its account does not belong to is a key sent to the wrong upstream.
@@ -86,18 +86,19 @@
 //! withdrawn tenant's leftover key serves nothing, and letting it refuse the
 //! candidate would turn one dormant tenant into a fleet that stops converging.
 //!
-//! A stateful file may not declare `[[provider]]` at all, so that requirement is
-//! the same standing gate [`TenancyProjection`] has on the default namespace: it
-//! is met once the slice projecting provider connections from desired state lands,
-//! and until then nothing in `serve` constructs this projection.
+//! A stateful file may not declare `[[provider]]` at all. The production
+//! convergence chain constructs provider connections first, then projects these
+//! credentials against their deterministic runtime ids. A credential that names
+//! no durable connection is refused before publication.
 
 use std::collections::{BTreeMap, HashSet};
 
 use super::compile::{ProjectionError, RevisionProjection};
+use super::principals::PrincipalProjection;
 use super::tenancy::TenancyProjection;
-use crate::config::{Config, Credential, ProjectIdentity, ProviderWire};
+use crate::config::{Config, Credential, ProjectIdentity, Provider, ProviderKind, ProviderWire};
 use crate::desired_state::credentials::{Credentials, ProviderCredential};
-use crate::desired_state::providers::Providers;
+use crate::desired_state::providers::{Provider as DurableProvider, Providers};
 use crate::desired_state::{DesiredState, RevisionId, SecretLifecycle, SecretOwner, WireFamily};
 
 /// Projects a revision's active provider credentials onto `[[credential]]`,
@@ -109,8 +110,15 @@ use crate::desired_state::{DesiredState, RevisionId, SecretLifecycle, SecretOwne
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CredentialProjection;
 
-/// The production projection: tenancy, then the credentials that authenticate its
-/// namespaces.
+/// Projects durable provider connections onto the deployment-wide provider
+/// table. A provider resource's slug is the stable human label; when two
+/// tenants reuse it, the runtime id is qualified by durable ownership so one
+/// endpoint cannot silently replace another.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProviderProjection;
+
+/// The production projection: tenancy, credentials, and inbound principals for
+/// the namespaces they authenticate.
 ///
 /// This projection intentionally does not project inbound gateway principals.
 /// Stateful compilation reports that as a typed `unsupported` refusal instead
@@ -128,6 +136,10 @@ impl RevisionProjection for RuntimeProjection {
         "runtime"
     }
 
+    fn projects_inbound_principals(&self) -> bool {
+        true
+    }
+
     fn project(
         &self,
         bootstrap: &Config,
@@ -135,7 +147,51 @@ impl RevisionProjection for RuntimeProjection {
         source: RevisionId,
     ) -> Result<Config, ProjectionError> {
         let namespaces = TenancyProjection.project(bootstrap, state, source)?;
-        CredentialProjection.project(&namespaces, state, source)
+        let providers = ProviderProjection.project(&namespaces, state, source)?;
+        let credentials = CredentialProjection.project(&providers, state, source)?;
+        PrincipalProjection.project(&credentials, state, source)
+    }
+}
+
+impl RevisionProjection for ProviderProjection {
+    fn name(&self) -> &'static str {
+        "providers"
+    }
+
+    fn project(
+        &self,
+        bootstrap: &Config,
+        state: &DesiredState,
+        _source: RevisionId,
+    ) -> Result<Config, ProjectionError> {
+        let providers = Providers::of(state).map_err(|error| ProjectionError::Body {
+            reference: error.reference(),
+            detail: error.to_string(),
+        })?;
+        let mut config = bootstrap.clone();
+        let mut seen = HashSet::new();
+        for provider in providers.all() {
+            let id = runtime_provider_id(&providers, provider);
+            if !seen.insert(id.clone()) {
+                return Err(ProjectionError::Incomplete {
+                    detail: format!(
+                        "{} declares runtime provider id `{id}` more than once; one runtime provider \
+                         id cannot safely choose between durable endpoints",
+                        provider.reference
+                    ),
+                });
+            }
+            let kind = match provider.body.wire_family() {
+                WireFamily::OpenaiChat => ProviderKind::OpenaiCompatible,
+                WireFamily::AnthropicMessages => ProviderKind::Anthropic,
+            };
+            config.provider.push(Provider {
+                id,
+                kind,
+                base_url: provider.body.endpoint().to_owned(),
+            });
+        }
+        Ok(config)
     }
 }
 
@@ -289,18 +345,22 @@ fn provider_id(
                     credential.body.provider()
                 ),
             })?;
-    let slug = declared.slug.as_str();
-    let Some(bootstrap) = config.provider.iter().find(|provider| provider.id == slug) else {
+    let provider_id = runtime_provider_id(providers, declared);
+    let Some(bootstrap) = config
+        .provider
+        .iter()
+        .find(|provider| provider.id == provider_id)
+    else {
         return Err(ProjectionError::Incomplete {
             detail: format!(
-                "{} authenticates to provider `{slug}`, which this deployment does not declare: a \
+                "{} authenticates to provider `{provider_id}`, which this deployment does not declare: a \
                  provider's endpoint and wire family are still bootstrap-owned, so a credential \
                  for a provider no `[[provider]]` names could not dial anything",
                 credential.reference
             ),
         });
     };
-    // The slug matching is not enough: the two declarations must also agree on
+    // The runtime id matching is not enough: the two declarations must also agree on
     // what they are talking to. A key presented in the wrong wire family's
     // request is a credential leaked to the wrong upstream account, so the
     // mismatch is refused for the same reason an undeclared provider is.
@@ -308,7 +368,7 @@ fn provider_id(
     if bootstrap.kind.wire() != wire {
         return Err(ProjectionError::Incomplete {
             detail: format!(
-                "{} authenticates to provider `{slug}`, which this revision speaks {} to while \
+                "{} authenticates to provider `{provider_id}`, which this revision speaks {} to while \
                  this deployment declares it as {}: a credential must not be presented in a wire \
                  family its account does not belong to",
                 credential.reference,
@@ -317,7 +377,25 @@ fn provider_id(
             ),
         });
     }
-    Ok(slug.to_owned())
+    Ok(provider_id)
+}
+
+/// The config id for one durable provider connection. A unique slug stays
+/// readable; a reused slug carries the owner's durable scope, making the
+/// mapping deterministic across replicas and safe across tenants.
+pub(crate) fn runtime_provider_id(providers: &Providers, provider: &DurableProvider) -> String {
+    let duplicate = providers
+        .all()
+        .filter(|other| other.slug == provider.slug)
+        .nth(1)
+        .is_some();
+    if !duplicate {
+        return provider.slug.as_str().to_owned();
+    }
+    match provider.body.project() {
+        Some(project) => format!("{}@{}/{}", provider.slug, provider.body.tenant(), project),
+        None => format!("{}@{}", provider.slug, provider.body.tenant()),
+    }
 }
 
 /// The wire a family is spoken over. Total, so a new family cannot be added
@@ -813,11 +891,10 @@ mod tests {
         assert_eq!(projected(&state), []);
     }
 
-    /// The deployment still owns provider endpoints, so a credential for a
-    /// provider no `[[provider]]` names is an operator-actionable mismatch: it
-    /// refuses the candidate rather than serving a pool that cannot dial.
+    /// Provider connections are projected from durable state now, so a
+    /// credential can bring its matching endpoint into a stateful candidate.
     #[test]
-    fn a_credential_for_a_provider_the_deployment_does_not_declare_refuses() {
+    fn a_durable_provider_connection_is_projected_for_its_credential() {
         let mut state = DesiredState::new();
         let connection = ProviderBody::for_tenant(
             fixtures::provider_id(CREDENTIAL),
@@ -842,14 +919,18 @@ mod tests {
             })
             .expect("a valid revision");
 
-        let Err(error) = RuntimeProjection.project(&bootstrap(), &state, fixtures::revision_id(3))
-        else {
-            panic!("a credential for an undeclared provider must refuse the candidate");
-        };
-        assert!(
-            matches!(error, ProjectionError::Incomplete { .. }),
-            "{error:?}"
+        let config = RuntimeProjection
+            .project(&bootstrap(), &state, fixtures::revision_id(3))
+            .expect("the durable connection supplies the provider endpoint");
+        assert_eq!(
+            config
+                .provider
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["openai", "elsewhere",]
         );
+        assert_eq!(config.credential[0].provider, "elsewhere");
     }
 
     /// And matching the id is not enough. A revision whose provider speaks

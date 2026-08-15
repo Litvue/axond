@@ -6,11 +6,9 @@ Stateful mode
 landing on its own. The integration seam connects a bootstrap file to a control
 plane, a control plane to a compiled immutable snapshot, and that snapshot to
 the request path, plus the evidence that each of #160's release gates holds on
-the assembled system. A cold or unconverged replica remains fail-closed. A
-valid projected snapshot or signed last-known-good cache is the intended future
-serving posture, but this build's production projection has no inbound
-caller-principal source, so no stateful serving or cache-recovery claim is
-active yet.
+the assembled system. A cold or unconverged replica remains fail-closed; a
+valid projected snapshot or signed last-known-good cache is the only serving
+posture.
 
 This page is the integration plan and its acceptance matrix. It exists so that
 "is stateful mode ready?" has a single answer with a reference behind each line,
@@ -68,10 +66,9 @@ wave 0  (landed)   revision journal · convergence loop · LKG cache · prefligh
                    #276 runtime policy activation          #249 usage outbox
                    #307 live control-plane status          #315 forced refresh
                         │
-wave 1  (in flight) #302 availability projection          #311 catalogue import at runtime
-                   #318 request-path pricing
-                   — every one of them edits the `serve` seam
-                   #312 credential lifecycle administered — edits this harness
+wave 1  (landed)   availability projection · catalogue import at runtime
+                   request-path pricing · credential lifecycle administration
+                   durable workload principals · provider/model serving projection
                         │
 wave 2  (integration) IG-01 … IG-05: boot → connect → hydrate → compile → publish → serve
                         │
@@ -116,17 +113,17 @@ here without a scenario, or a scenario without a row, fails the suite.
 | --- | --- | --- | --- | --- | --- |
 | IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap reaches its control plane and serves `/admin/v1`; anonymous inference is refused by auth first and authenticated inference remains behind the typed convergence refusal until principal projection exists | | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_serves_administration_and_refuses_inference`, `stateful_boot_refuses_an_unresolved_reference` | wired |
 | IG-02 | Postgres-first control plane | Operator preflight, forward-only migration, and the connect a replica performs before it serves | | `preflight_describes_a_stateless_install`, `migrate_prepares_a_control_plane_before_replicas_start` | wired |
-| IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | | `hydrate_compile_publish_is_one_atomic_step` | blocked |
-| IG-04 | Provider secrets rotate without redeployment | Resolve every credential a candidate snapshot needs through the SecretStore during compilation, never on the request path | IG-03 | `secrets_resolve_during_compilation_only` | blocked |
-| IG-05 | Every mutation validated, revisioned, authorized, audited | The authenticated `/admin/v1` path from request to published revision: preconditions, idempotent replay, revision conflicts, and the audit event that attributes the credential. Breakglass end to end; OIDC principals against scoped grants once a replica authenticates one | admin OIDC authenticator | `an_admin_mutation_publishes_an_audited_revision` | partial |
-| IG-06 | No control-plane reads on ordinary inference | Routing, catalogue, authentication, and pricing read only the published snapshot | IG-03 | `inference_touches_no_control_plane_connection` | blocked |
-| IG-07 | Control-plane loss leaves last-known-good serving | Bounded backoff, staleness reporting, and cold boot from the signed last-known-good cache | IG-03 | `control_plane_loss_keeps_the_last_known_good_snapshot_serving` | blocked |
-| IG-08 | Bounded, observable runtime | Readiness reflects convergence rather than process liveness; `/status` reports desired, loaded, active, and lag | IG-03 | `readiness_and_status_report_convergence` | blocked |
-| IG-09 | Every request records the effective price version | The compiled snapshot carries the approved price-book identity into each usage record | IG-03 | `every_usage_record_names_the_price_version` | blocked |
-| IG-10 | Tenant catalogue views isolated and explained | The tenant-facing catalogue is projected from the snapshot and explains effective availability. The administrative half serves now — `GET /admin/v1/catalogue` reads one tenant's enablements, aliases and unavailability reasons from the published revision — so what this gate waits on is the *served* catalogue: the alias a caller invokes, projected into a snapshot | IG-03 | `a_tenant_catalogue_is_isolated_and_explains_itself` | blocked |
+| IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | | `stateful_revision_compiles_rotates_and_recovers` | wired |
+| IG-04 | Provider secrets rotate without redeployment | Resolve every credential a candidate snapshot needs through the SecretStore during compilation, never on the request path | IG-03 | `stateful_revision_compiles_rotates_and_recovers` | wired |
+| IG-05 | Every mutation validated, revisioned, authorized, audited | The authenticated `/admin/v1` path from request to published revision: preconditions, idempotent replay, revision conflicts, scoped OIDC authorization, and audit attribution for both credential populations | | `an_admin_mutation_publishes_an_audited_revision`, `an_oidc_principal_is_authorized_against_the_active_directory` | wired |
+| IG-06 | No control-plane reads on ordinary inference | Routing, catalogue, authentication, and pricing read only the published snapshot | IG-03 | `stateful_revision_compiles_rotates_and_recovers` | wired |
+| IG-07 | Control-plane loss leaves last-known-good serving | Bounded backoff, staleness reporting, and cold boot from the signed last-known-good cache | IG-03 | `stateful_revision_compiles_rotates_and_recovers` | wired |
+| IG-08 | Bounded, observable runtime | Readiness reflects convergence rather than process liveness; `/status` reports desired, loaded, active, and lag | IG-03 | `stateful_revision_compiles_rotates_and_recovers` | wired |
+| IG-09 | Every request records the effective price version | The compiled snapshot carries the approved price-book identity into each usage record | IG-03 | `stateful_revision_compiles_rotates_and_recovers` | wired |
+| IG-10 | Tenant catalogue views isolated and explained | The administrative catalogue reads one tenant's enablements, aliases, imported metadata, price provenance, and unavailability reasons from the control plane, while inference discovery reads the projected snapshot. A control-plane outage must refuse the administrative read rather than pretending that a serving snapshot is a durable management catalogue. | IG-03, #149 | `stateful_revision_compiles_rotates_and_recovers` | wired |
 | IG-11 | Published capacity and failure-recovery evidence | Stateful profiles in the qualification harness: convergence under load, control-plane outage, rolling upgrade | IG-03 … IG-08, #156 | `stateful_qualification_profiles_are_published` | blocked |
 
-## The next gate that can become executable
+## What is now executable, and what remains
 
 IG-01 is wired: a replica boots against a migrated control plane, serves
 `/admin/v1`, and remains fail-closed and unready until a valid projected
@@ -134,78 +131,53 @@ snapshot or cache is active — so the scenarios above assert a running stateful
 process, and the loud-failure half asserts the *reference* a boot could not
 resolve rather than any nonzero exit.
 
-IG-03 is next, and it is what the remaining blocked gates wait behind: until a
-published revision compiles into a runtime snapshot, IG-04 and IG-06 through
-IG-11 have no served revision to assert against, which is why their scenarios
-assert today's fail-closed posture instead. Much of its foundation is on main — the
-policy document type (#253), the derived availability contracts (#250), the
-`/admin/v1` boundary and its served runtime (#254, #143), the models.dev
-catalogue import (#207), the envelope-encrypted SecretStore (#275), and now
-tenancy, principals, RBAC and audit boundaries (#252) and model enablement with
-project aliases (#255), on top of the wave-0 journal, convergence loop, and
-last-known-good cache. Runtime policy activation (#276) was the last contract a
-compiled snapshot could not resolve, and it has landed with the usage outbox
-(#249): no gate waiting on IG-03 waits on a contract slice any more. IG-03 waits
-on integration alone. Two gates still name a slice of their own: IG-05 the admin
-OIDC authenticator, which is not downstream of compilation, and IG-11 the
-qualification epic (#156), which is — it waits on IG-03 … IG-08 as well.
+IG-03 through IG-10 are now wired by one service-backed scenario. The scenario
+proves two-tenant isolation in both projected discovery and the administrative
+catalogue, resolves pinned imported metadata and effective price provenance,
+withdraws and restores an alias without a redeploy, and proves that the
+administrative read refuses without Postgres; it does not claim that a serving
+cache is a durable management catalogue. The production
+chain projects tenancy, provider connections, credentials, workload principals,
+the exact retained catalogue payload, aliases, and effective approved pricing
+before it publishes a candidate. The harness publishes that graph into a live
+process, drives a controlled upstream, rotates the provider secret, verifies the
+price-book identity in usage output, and then cold-boots replacements with the
+control plane unavailable from a valid cache, no cache, and edited caches. It
+checks authenticated administration, anonymous refusal, readiness, and recovery
+to `source = control-plane`. The signed desired-state cache is also checked
+against the encrypted serving-cache revision so a recovered OIDC identity retains
+its directory authority without allowing a stale directory to authorize a
+different serving snapshot. The same run now writes the sanitized #219 artifacts
+for cached serving, cache refusal, and secret rotation; the recovery manifest
+marks those stages as owned by this black-box lane rather than by the in-process
+severable-link driver.
 
-What it waits on is the principal-projection seam. The reconciler and compiler
-are now constructed by `serve`, but the production chain returns typed
-`unsupported` before it can publish a keyless candidate. The desired-state
-identity model retains only workload-key digests, not recoverable caller
-secrets, so this PR does not invent a projection from unrelated material. The
-principal-projection slice must provide that source and its isolation rules
-before IG-03 can become executable; the cache-storage slice must provide durable
-per-replica storage before cold-boot recovery is enabled in the Recreate
-deployment.
+The outage in the automated test is isolated DSN fault injection so concurrent CI
+scenarios do not stop a shared Postgres service. The manual qualification drill
+still stops and restores the real Postgres instance; that remains the stronger
+operational evidence for #219. IG-11 remains downstream of these gates and still
+needs retained fleet load, fault, rolling-upgrade, and long-soak evidence.
 
-So the next integration pull request is IG-03, opened once that seam settles —
-not against those branches, and not duplicating the compilation a contract slice
-owns. In order, it:
-
-1. constructs the control-plane backend, `MaterialLedger`, `LastKnownGood` cache
-   and `Reconciler` in the stateful arm of `serve`, from the bootstrap file the
-   administrative surface is already built from, and drops the `dead_code`
-   allowance that says nothing does;
-2. bootstraps once before the listener binds — head revision hydrated and
-   compiled, or the signed cache adopted, or a loud refusal — so a replica never
-   reaches the request path with an empty snapshot;
-3. publishes the compiled snapshot into the inference state as one whole value,
-   swapped behind the same generation-held drain runtime policy activation
-   (#276) established, so no request observes half a revision;
-4. runs the convergence loop behind the boot, leaving the previous snapshot
-   serving when a compile or the database fails;
-5. replaces `hydrate_compile_publish_is_one_atomic_step`'s refusal assertion with
-   a scenario that publishes a revision through `/admin/v1`, waits for the
-   snapshot it compiles into, and asserts inference is served from it — and moves
-   the IG-03 row with it.
-
-IG-07 and IG-08 follow it immediately and cheaply, because steps 2 and 4 are what
-their scenarios assert: a cold boot from the cache with the control plane down,
-and readiness that reflects convergence rather than process liveness.
-
-IG-05's authenticated administrative path moved independently of
-compilation, since `/admin/v1` already serves: a breakglass mutation is
-validated, published as a revision, replayed under its idempotency key, refused
-when it expects a superseded revision, and read back with the audit event that
-attributes it — all on a running replica against a real control plane. It is
-`partial` rather than `wired` because the credential doing all of that is
-breakglass; a replica does not yet authenticate an OIDC principal, so
-authorizing one against a scoped grant has no running process to assert against.
-That a deployment can be administered before it can serve inference is the
-honest shape of stateful mode today: durable desired state is written and
-audited, and nothing projects it into the request path yet.
+IG-05 is wired end to end. The breakglass scenario proves preconditions,
+idempotent replay, revision conflict handling, and audit attribution on a real
+control plane. The OIDC scenario publishes a human principal and a project-
+scoped workload key into durable desired state, waits for the active
+authorization and serving snapshots, authenticates a local Ed25519 bearer
+through the configured JWKS verifier, proves a tenant-scoped catalogue read and
+cross-tenant refusal, and publishes a project whose audit event records the
+issuer-scoped human. Breakglass remains mandatory as the identity-provider
+recovery path; valid OIDC authentication without a projected directory entry
+still has no authority.
 
 IG-11 is furthest out, and the [qualification
 packet](./qualification.md) says why in the terms it owns: capacity is
-`evidenced`, endurance, rollout and recovery are `harnessed` with no heavy run
-behind them, and fault is `unbuilt`. Recovery gained its driver with #219 —
-ten stages against a real Postgres — but every one of its scenarios still has a
-blocked stage, for the reason above: stateful serving is not assembled.
-Everything measured so far is one stateless process. Nothing in this page's
-status column, and nothing merged so far, should be read as evidence that
-stateful serving runs in production.
+`evidenced`, while endurance, rollout, recovery, and fault remain `harnessed`
+until heavy records are retained. Recovery now has twenty-two executable
+stages against real Postgres across the in-process and black-box lanes,
+including the durable usage-boundary measurement. The local heavy fault and rollout runs,
+and both endurance smoke runs, are qualification progress but are not yet
+production records. Nothing in this page's status column should be read as
+evidence that stateful serving is production-ready.
 
 ## What "wired" requires
 

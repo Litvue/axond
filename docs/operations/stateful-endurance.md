@@ -118,7 +118,11 @@ just stateful-endurance 2400000
 
 The `Endurance` workflow's second job runs this soak monthly and on dispatch,
 against a PostgreSQL service container, and uploads the result with its time
-series.
+series plus a compact qualification record at
+`target/qualification-records/stateful-endurance-soak.toml`. The record binds
+the workload, duration provenance, verdicts, manifest, binary, and machine to
+the raw JSON artifact; it is supplemental fleet evidence for #221, while the
+five-slice #156 packet remains the reviewed promotion boundary.
 
 ## What a run leaves behind
 
@@ -126,6 +130,15 @@ series.
 `<profile>.replica-N.samples.jsonl` beside it is every resource sample each
 replica — including the ones that were retired and replaced — was observed to
 take, written as it went.
+
+The compact record can be generated from a downloaded soak artifact with:
+
+```bash
+python3 ops/qualification-evidence.py target/stateful-endurance/soak \
+  --slice stateful-endurance --tier soak --runner local \
+  --note "two-replica stateful endurance host" \
+  --out target/qualification-records/stateful-endurance-soak.toml
+```
 
 The result carries the measurements and the identity of everything that produced
 them: the SHA-256 of the binary, of the normalised config, and of the manifest

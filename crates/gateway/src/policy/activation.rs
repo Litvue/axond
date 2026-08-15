@@ -1041,6 +1041,28 @@ mod tests {
         .expect("a deployment that enforces no caps converges on a revision with no document");
     }
 
+    #[test]
+    fn an_empty_bootstrap_platform_namespace_does_not_block_project_convergence() {
+        let document = body(scope(), 1, 1_000);
+        let mut candidate = governed(
+            "acme/core",
+            NamespacePolicy {
+                body: document,
+                generation: generation(&document, 1),
+            },
+        );
+        candidate.namespace.push(crate::config::Namespace {
+            id: "platform".to_owned(),
+            default: true,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+        });
+
+        plan(&empty(), &PolicyView::of(&candidate), shared())
+            .expect("the synthetic bootstrap namespace has no serving project");
+    }
+
     /// The floor an operator raised to revoke tokens is not lowered by changing
     /// *which* document states it. Both directions of a handover are compared by
     /// value, and a falling floor is refused in either.

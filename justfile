@@ -56,6 +56,8 @@ docs-check: ops-venv
     python3 ops/check-docs.py
     python3 ops/check-release-config.py --self-test
     python3 ops/check-release-config.py
+    python3 ops/qualification-evidence.py --self-test
+    python3 ops/promote-qualification.py --self-test
     sh -n install.sh
     bash -n ops/publish-image-index.sh
     bash -n ops/verify-image-evidence.sh
@@ -64,6 +66,7 @@ docs-check: ops-venv
     target/ops-venv/bin/python ops/check-recovery-evidence.py --self-test
     bash -n ops/rollout-drill.sh
     bash -n ops/stateful-deploy-drill.sh
+    bash -n ops/stateful-persistent-drill.sh
     bash ops/check-compose-platform.sh
     bash ops/check-installer-download.sh
     bash ops/check-index-promotion.sh
@@ -88,6 +91,7 @@ deploy-check:
 # Docker. About a minute; documented in
 # docs/operations/backup-and-recovery.md.
 restore-drill: ops-venv
+    cargo build -p axond --locked
     AXOND_PYTHON="$PWD/target/ops-venv/bin/python" bash ops/restore-drill.sh
 
 # Roll the production overlay out on a real three-worker kind cluster, then prove
@@ -104,6 +108,13 @@ rollout-drill:
 # five minutes; documented in docs/deployment/kubernetes.md.
 stateful-deploy-drill:
     bash ops/stateful-deploy-drill.sh
+
+# Deploy the opt-in persistent StatefulSet overlay on a real three-worker kind
+# cluster and prove a retained ordinal PVC survives Pod replacement. Needs
+# Docker, kind, kubectl, and kustomize. About five minutes; documented in
+# docs/deployment/kubernetes.md.
+stateful-persistent-drill:
+    bash ops/stateful-persistent-drill.sh
 
 # Refresh the manifest gate's lockfile, excluding releases newer than a week.
 deploy-lock:

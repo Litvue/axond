@@ -15,21 +15,19 @@ an inference request.
 | --- | --- |
 | `/admin/v1` | Served, authenticated, backed by the control plane. |
 | `/healthz` | `200` — the process is alive and administrable. |
-| `/readyz` | `503` — never route inference traffic to it. |
-| anonymous `/v1/...` | `401 unauthorized` — authentication comes before convergence state. |
-| authenticated `/v1/...` | `503 inference_unavailable` while no projected revision is active. |
+| `/readyz` | `503` until a complete projected snapshot or signed last-known-good cache is active. |
+| `/v1/...` | Authenticated requests use the active snapshot; anonymous requests remain `401`, and a typed revision missing a provider, principal, retained catalogue, or effective approved price remains fail-closed. |
 
-A published revision cannot be compiled into a runtime snapshot yet: the
-production projection is still missing inbound caller principals, which is the
-explicit dependency in [revision convergence](./revision-convergence.md).
-Inference is refused per request rather than answered from an empty
-configuration — an empty configuration would look, to a caller, like a
-deployment that is configured and simply lacks what was asked for. Anonymous
-callers see only `401 unauthorized`; a valid caller reaches the typed
-`503 inference_unavailable` convergence refusal. `axond check preflight` reports
-the bootstrap/reference posture before a rollout gates on it. **Serve inference
-from `mode = "stateless"` until the principal-projection slice lands**; use
-stateful mode to build and review desired state.
+A published revision can now compile through the stateful projection when its
+durable provider connection, active project workload principal, retained
+catalogue payload, and effective approved price-book coverage are all present.
+The candidate is still refused rather than partially published when any one is
+missing, and an empty or unconverged snapshot never answers inference. The
+compiler path and live integration matrix prove the authenticated serving path
+against a controlled upstream. A production qualification claim still requires
+retained fleet-level load, fault, rollout, and long-soak evidence. Use the persistent
+StatefulSet option when cold-start last-known-good recovery must survive Pod
+replacement.
 
 A stateless deployment answers every `/admin/v1` path with
 `501 stateful_mode_required`, before authentication and without opening any
@@ -136,11 +134,13 @@ record, or a state read.
 | `/admin/v1/catalogue` | `GET` | One tenant's management catalogue: what it has enabled, its first-class aliases and ordered targets, and why a model is not routable. `?tenant=` is required. |
 | `/admin/v1/tenants` | `POST` | A tenant and its lifecycle. |
 | `/admin/v1/projects` | `POST` | A project (namespace) inside a tenant. |
+| `/admin/v1/principals` | `POST` | A durable workload or human identity. Workloads carry only a key digest; humans carry an explicit issuer-scoped subject. Key material is never returned. |
 | `/admin/v1/providers` | `POST` | A provider connection: wire family and endpoint. |
 | `/admin/v1/credentials` | `POST` | A provider credential: a secret reference and its lifecycle. |
 | `/admin/v1/catalogs` | `POST` | A provider's model catalogue snapshot. |
 | `/admin/v1/models` | `POST` | A model enablement and its observed price. |
 | `/admin/v1/aliases` | `POST` | A routing alias and its ordered targets. |
+| `/admin/v1/prices` | `POST` | A deployment PriceBook. Approval records the authenticated actor and effective rates are compiled into the serving snapshot. |
 | `/admin/v1/policies` | `POST` | Budgets, concurrency limits, and token epoch for a scope. |
 | `/admin/v1/rollback` | `POST` | Republish an earlier revision's complete state as a *new* revision. |
 | `/admin/v1/secrets` | `POST` | Store credential material as a new secret's first version, staged. |
@@ -222,16 +222,22 @@ no evidence in either answer that another tenant's enablements exist.
 | `wire_family` | The wire contract an offering speaks. |
 | `offering` | One offering id, for a single-model read. |
 | `billable` | `true` or `false`: whether an approved price makes the offering billable. |
+| `provider` | Exact imported provider identity, such as `openai`. |
+| `capability` | Imported model capability, such as `tool-call`. |
+| `modality` | Imported input or output modality, such as `text` or `image`. |
+| `lifecycle` | Imported catalogue lifecycle, such as `stable`, `preview`, or `deprecated`. |
+| `availability` | The scoped effective availability state reported by the replica. |
 
-An unknown parameter is refused with `400 admin_request_invalid` rather than
-ignored. A caller that asked to narrow and was silently not narrowed would read
-the answer as authoritative, so the filters this build cannot yet evaluate —
-`provider`, `capability`, `modality`, `availability`, all of which need the
-catalogue-import and availability slices' metadata — are refused by the same rule,
-and the response names the same gap in `pending`:
+An unknown parameter, malformed enum value, or repeated parameter is refused with
+`400 admin_request_invalid` rather than ignored. A caller that asked to narrow
+and was silently not narrowed would read the answer as authoritative. Provider,
+capability, modality, and lifecycle filters use the exact pinned catalogue
+snapshot; `availability` uses the replica's scoped availability view. If those
+readers are not attached, the response remains explicit in `pending` and a
+filter that depends on missing metadata matches no entries.
 
-The query is bounded to 2 KiB and six parameters (the required `tenant` plus the
-five supported filters). Repeated parameters are rejected by the query parser;
+The query is bounded to 2 KiB and eleven parameters (the required `tenant` plus
+ten supported filters). Repeated parameters are rejected by the query parser;
 there is no “last value wins” interpretation for a catalogue filter.
 
 ```json
@@ -246,6 +252,8 @@ there is no “last value wins” interpretation for a catalogue filter.
       "scope": { "kind": "project", "tenant": "...", "project": "..." },
       "wire_family": "openai-chat",
       "state": "enabled",
+      "routable": true,
+      "unavailable": [],
       "targets": [
         { "enablement": "res_...", "version": 1 }
       ]
@@ -265,10 +273,30 @@ there is no “last value wins” interpretation for a catalogue filter.
       "routable": false,
       "billable": false,
       "aliases": ["default"],
-      "unavailable": ["unpriced"]
+      "unavailable": ["unpriced"],
+      "metadata": {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "published_model": "gpt-4o",
+        "capabilities": ["tool-call"],
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+        "catalog_lifecycle": "stable",
+        "context_tokens": 128000
+      },
+      "price": {
+        "book": "pb_...",
+        "book_version": 7,
+        "catalog": "cat_...",
+        "catalog_version": 3,
+        "source": "operator"
+      },
+      "availability": {
+        "state": "available"
+      }
     }
   ],
-  "pending": ["offering-metadata", "availability"]
+  "pending": []
 }
 ```
 
@@ -290,8 +318,11 @@ active routing graph.
 on each offering entry. It preserves the durable alias id and version, its
 project scope and wire family, and the ordered enablement targets. The target
 references are not provider-local model ids: resolving those requires the pinned
-catalogue snapshot, and remains named in `pending` until that metadata reader is
-attached.
+catalogue snapshot. `routable` and `unavailable` are derived from desired state: an enabled
+alias is routable when any exact target is enabled and billable. Project override
+precedence does not rewrite an alias's explicit tenant-default target. The reasons
+are `disabled`, `no-targets`, `disabled-target`, and `unpriced-target`; an
+unusable fallback does not make the alias unavailable if a later target is usable.
 
 ## Conditional reads
 

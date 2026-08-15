@@ -142,6 +142,7 @@ impl AdminAuthorizer for FakeAdminAuthorizer {
         &self,
         identity: &AdminIdentity,
         action: AdminAction,
+        _surface: crate::desired_state::Surface,
         scope: &ResourceScope,
     ) -> Result<AdminGrant, AdminAuthError> {
         if !self.actions.contains(&action) {

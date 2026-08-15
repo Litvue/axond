@@ -54,6 +54,9 @@ BASE = ROOT / "deploy/kubernetes/base"
 PRODUCTION = ROOT / "deploy/kubernetes/overlays/production"
 AUTOSCALING = ROOT / "deploy/kubernetes/components/autoscaling"
 PRODUCTION_STATEFUL = ROOT / "deploy/kubernetes/overlays/production-stateful"
+PRODUCTION_STATEFUL_PERSISTENT = (
+    ROOT / "deploy/kubernetes/overlays/production-stateful-persistent"
+)
 KUBERNETES_DOC = ROOT / "docs/deployment/kubernetes.md"
 STATEFUL_DOC = ROOT / "docs/deployment/stateful-backends.md"
 RECOVERY_DOC = ROOT / "docs/operations/backup-and-recovery.md"
@@ -63,6 +66,7 @@ REVOCATION_SOURCE = ROOT / "crates/gateway/src/revocation/redis.rs"
 DRILL = ROOT / "ops/restore-drill.sh"
 ROLLOUT_DRILL = ROOT / "ops/rollout-drill.sh"
 STATEFUL_DRILL = ROOT / "ops/stateful-deploy-drill.sh"
+STATEFUL_PERSISTENT_DRILL = ROOT / "ops/stateful-persistent-drill.sh"
 TELEMETRY_SOURCE = ROOT / "crates/gateway/src/telemetry/mod.rs"
 
 IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
@@ -145,6 +149,21 @@ def one(documents: list[Document], kind: str) -> Document:
     return found[0]
 
 
+WORKLOAD_KINDS = ("Deployment", "StatefulSet")
+
+
+def workload_documents(documents: list[Document]) -> list[Document]:
+    """Return the controller workloads whose Pod templates the gate checks."""
+    return [document for document in documents if document.get("kind") in WORKLOAD_KINDS]
+
+
+def one_workload(documents: list[Document]) -> Document:
+    found = workload_documents(documents)
+    if len(found) != 1:
+        raise AssertionError(f"expected exactly one workload, found {len(found)}")
+    return found[0]
+
+
 def containers(deployment: Document) -> list[Document]:
     return deployment["spec"]["template"]["spec"].get("containers", [])
 
@@ -223,11 +242,13 @@ def check_termination_budget(documents: list[Document], label: str) -> list[str]
     """
     budget_ms = shutdown_budget_ms()
     failures: list[str] = []
-    for deployment in of_kind(documents, "Deployment"):
+    for deployment in workload_documents(documents):
         pod = deployment["spec"]["template"]["spec"]
         grace = pod.get("terminationGracePeriodSeconds")
         if grace is None:
-            failures.append(f"{label}: the Deployment does not set terminationGracePeriodSeconds")
+            failures.append(
+                f"{label}: the {deployment['kind']} does not set terminationGracePeriodSeconds"
+            )
             continue
         for container in containers(deployment):
             hook = container.get("lifecycle", {}).get("preStop", {})
@@ -260,7 +281,7 @@ def check_resources(documents: list[Document], label: str) -> list[str]:
     """
     admission = gateway_config(documents).get("admission", {})
     failures: list[str] = []
-    for deployment in of_kind(documents, "Deployment"):
+    for deployment in workload_documents(documents):
         for container in containers(deployment):
             resources = container.get("resources", {})
             for section in ("requests", "limits"):
@@ -306,7 +327,7 @@ def parse_quantity(quantity: str | int) -> int:
 
 def check_topology_spread(documents: list[Document], label: str) -> list[str]:
     """Replicas are spread across nodes at minimum, and zones where they exist."""
-    deployment = one(documents, "Deployment")
+    deployment = one_workload(documents)
     constraints = deployment["spec"]["template"]["spec"].get("topologySpreadConstraints", [])
     by_key = {constraint.get("topologyKey"): constraint for constraint in constraints}
     failures: list[str] = []
@@ -322,7 +343,11 @@ def check_topology_spread(documents: list[Document], label: str) -> list[str]:
     # A hard constraint that counts the Pods it is replacing deadlocks against
     # `maxUnavailable: 0` on a cluster with as many nodes as replicas: the surge
     # Pod is unschedulable and nothing may be evicted to make room for it.
-    if node is not None and "pod-template-hash" not in node.get("matchLabelKeys", []):
+    if (
+        deployment["kind"] == "Deployment"
+        and node is not None
+        and "pod-template-hash" not in node.get("matchLabelKeys", [])
+    ):
         failures.append(
             f"{label}: the per-node spread constraint counts every axond Pod, so a "
             "rolling update's surge Pod exceeds its own skew and never schedules; scope the skew "
@@ -333,7 +358,7 @@ def check_topology_spread(documents: list[Document], label: str) -> list[str]:
         if selector != SELECTOR:
             failures.append(
                 f"{label}: the {key} spread constraint selects {selector!r} rather "
-                f"than the Deployment's own {SELECTOR!r}, so it spreads a different set of Pods"
+                f"than the workload's own {SELECTOR!r}, so it spreads a different set of Pods"
             )
     return failures
 
@@ -404,7 +429,7 @@ def pod_labels(documents: list[Document]) -> tuple[Document, ...]:
     """Every Pod label set the overlay schedules, gateway and Job alike."""
     seen: list[Document] = []
     for document in documents:
-        if document.get("kind") not in ("Deployment", "Job"):
+        if document.get("kind") not in (*WORKLOAD_KINDS, "Job"):
             continue
         labels = document["spec"]["template"]["metadata"].get("labels", {})
         selector = {"app.kubernetes.io/name": labels.get("app.kubernetes.io/name")}
@@ -459,7 +484,7 @@ def check_service_port(documents: list[Document], label: str) -> list[str]:
     config = gateway_config(documents)
     bind_port = int(config["server"]["bind"].rsplit(":", 1)[1])
     failures: list[str] = []
-    for container in containers(one(documents, "Deployment")):
+    for container in containers(one_workload(documents)):
         ports = {port["containerPort"] for port in container.get("ports", [])}
         if bind_port not in ports:
             failures.append(
@@ -500,13 +525,13 @@ def check_disruption_budget(
     than a strict guarantee, and an autoscaler allowed to scale below
     `minAvailable + 1` reintroduces the same deadlock at its floor.
     """
-    deployment = one(documents, "Deployment")
+    deployment = one_workload(documents)
     budget = one(documents, "PodDisruptionBudget")
     minimum = budget["spec"]["minAvailable"]
     replicas = deployment["spec"].get("replicas")
     failures: list[str] = []
     if replicas is None:
-        failures.append(f"{label}: the Deployment does not declare replicas")
+        failures.append(f"{label}: the {deployment['kind']} does not declare replicas")
     elif replicas < minimum + 1:
         failures.append(
             f"{label}: {replicas} replicas against minAvailable {minimum} leaves no "
@@ -514,7 +539,10 @@ def check_disruption_budget(
         )
     # A Recreate fleet has no rolling update to bound; `check_stateful` asserts
     # that it upgrades that way and keeps no rollingUpdate settings beside it.
-    if deployment["spec"].get("strategy", {}).get("type") != "Recreate":
+    if (
+        deployment["kind"] == "Deployment"
+        and deployment["spec"].get("strategy", {}).get("type") != "Recreate"
+    ):
         strategy = deployment["spec"].get("strategy", {}).get("rollingUpdate", {})
         if strategy.get("maxUnavailable") != 0:
             failures.append(
@@ -940,6 +968,168 @@ def check_stateful(documents: list[Document]) -> list[str]:
     return failures
 
 
+def check_stateful_persistent(documents: list[Document]) -> list[str]:
+    """The opt-in StatefulSet keeps one authenticated cache per replica."""
+    label = "overlays/production-stateful-persistent"
+    failures: list[str] = []
+    deployments = of_kind(documents, "Deployment")
+    if deployments:
+        failures.append(
+            f"{label}: the persistent option still renders a Deployment; the parent Recreate "
+            "workload must be replaced by a StatefulSet"
+        )
+    statefulsets = of_kind(documents, "StatefulSet")
+    if len(statefulsets) != 1:
+        failures.append(
+            f"{label}: expected exactly one axond StatefulSet, found {len(statefulsets)}"
+        )
+        return failures
+
+    statefulset = statefulsets[0]
+    spec = statefulset["spec"]
+    if statefulset["metadata"]["name"] != "axond":
+        failures.append(f"{label}: the StatefulSet is not named axond")
+    if spec.get("serviceName") != "axond-headless":
+        failures.append(
+            f"{label}: serviceName is {spec.get('serviceName')!r}, not axond-headless"
+        )
+    if spec.get("replicas") != 3:
+        failures.append(f"{label}: the StatefulSet must declare three replicas")
+    if spec.get("podManagementPolicy") != "Parallel":
+        failures.append(
+            f"{label}: podManagementPolicy is {spec.get('podManagementPolicy')!r}; "
+            "unready replicas must not block creation of later PVC-backed ordinals"
+        )
+    if spec.get("updateStrategy", {}).get("type") != "OnDelete":
+        failures.append(
+            f"{label}: updateStrategy is {spec.get('updateStrategy', {}).get('type')!r}; "
+            "the current intentionally unready stateful process requires explicit restarts"
+        )
+    if spec.get("selector", {}).get("matchLabels") != SELECTOR:
+        failures.append(f"{label}: the StatefulSet selector is not {SELECTOR!r}")
+
+    retention = spec.get("persistentVolumeClaimRetentionPolicy", {})
+    for field in ("whenDeleted", "whenScaled"):
+        if retention.get(field) != "Retain":
+            failures.append(
+                f"{label}: persistentVolumeClaimRetentionPolicy.{field} must be Retain; "
+                "a replica's signed cache must survive workload deletion and scale changes"
+            )
+
+    budget = one(documents, "PodDisruptionBudget")
+    if budget["spec"].get("unhealthyPodEvictionPolicy") != "AlwaysAllow":
+        failures.append(
+            f"{label}: the disruption budget must set unhealthyPodEvictionPolicy: AlwaysAllow "
+            "while the current stateful replicas remain unready"
+        )
+
+    claims = spec.get("volumeClaimTemplates", [])
+    if (
+        len(claims) != 1
+        or claims[0].get("metadata", {}).get("name") != "last-known-good"
+    ):
+        failures.append(
+            f"{label}: the StatefulSet must declare exactly one last-known-good PVC template"
+        )
+    else:
+        claim = claims[0]
+        claim_spec = claim.get("spec", {})
+        if claim_spec.get("accessModes") != ["ReadWriteOnce"]:
+            failures.append(
+                f"{label}: the last-known-good PVC must use ReadWriteOnce per-replica storage"
+            )
+        if claim_spec.get("resources", {}).get("requests", {}).get("storage") != "1Gi":
+            failures.append(
+                f"{label}: the last-known-good PVC must request 1Gi of durable storage"
+            )
+
+    pod = spec["template"]["spec"]
+    axond = next(
+        (
+            container
+            for container in pod.get("containers", [])
+            if container.get("name") == "axond"
+        ),
+        None,
+    )
+    cache_mount = next(
+        (
+            mount
+            for mount in (axond or {}).get("volumeMounts", [])
+            if mount.get("name") == "last-known-good"
+        ),
+        None,
+    )
+    if cache_mount is None or cache_mount.get("mountPath") != "/var/lib/axond":
+        failures.append(
+            f"{label}: the StatefulSet does not mount last-known-good at /var/lib/axond"
+        )
+    elif cache_mount.get("readOnly"):
+        failures.append(f"{label}: the last-known-good PVC is mounted read-only")
+    if any(volume.get("name") == "last-known-good" for volume in pod.get("volumes", [])):
+        failures.append(
+            f"{label}: last-known-good is declared as a Pod volume; it must come from the "
+            "StatefulSet PVC template rather than emptyDir or hostPath"
+        )
+
+    service = next(
+        (
+            service
+            for service in of_kind(documents, "Service")
+            if service["metadata"]["name"] == "axond-headless"
+        ),
+        None,
+    )
+    if service is None:
+        failures.append(f"{label}: the StatefulSet governing headless Service is missing")
+    else:
+        service_spec = service["spec"]
+        if service_spec.get("clusterIP") != "None":
+            failures.append(f"{label}: axond-headless is not headless")
+        if service_spec.get("publishNotReadyAddresses"):
+            failures.append(
+                f"{label}: axond-headless publishes not-ready addresses; the current stateful "
+                "fleet must not gain a bypass around /readyz"
+            )
+        if service_spec.get("selector") != SELECTOR:
+            failures.append(f"{label}: axond-headless does not select {SELECTOR!r}")
+
+    caller_service = next(
+        (
+            service
+            for service in of_kind(documents, "Service")
+            if service["metadata"]["name"] == "axond"
+        ),
+        None,
+    )
+    if caller_service is not None and caller_service["spec"].get("publishNotReadyAddresses"):
+        failures.append(
+            f"{label}: the caller-facing axond Service publishes not-ready addresses; "
+            "the current stateful fleet must remain unreachable until /readyz passes"
+        )
+
+    config = gateway_config(documents)
+    convergence = config.get("convergence", {})
+    if convergence.get("cache_path") != "/var/lib/axond/last-known-good.snapshot":
+        failures.append(
+            f"{label}: [convergence].cache_path does not point into the PVC-backed cache mount"
+        )
+    if convergence.get("cache_key_env") != "GW_LAST_KNOWN_GOOD_KEY":
+        failures.append(
+            f"{label}: [convergence].cache_key_env is not GW_LAST_KNOWN_GOOD_KEY"
+        )
+
+    for document in (statefulset, *of_kind(documents, "Job")):
+        for container in containers(document):
+            image = container["image"]
+            if image != f"{IMAGE_REPOSITORY}@{SENTINEL_DIGEST}":
+                failures.append(
+                    f"{label}: container {container['name']!r} runs {image!r}; every image "
+                    "must remain pinned to this overlay's unresolved sentinel"
+                )
+    return failures
+
+
 def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
     """The stateful overlay's behaviour has a cluster proof, and CI runs it.
 
@@ -990,12 +1180,51 @@ def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> lis
             "the drill would no longer document the authenticated convergence contract",
         ),
         (
-            "principal projection lands",
-            "the drill would claim active serving before its production dependency exists",
+            "an active serving revision exists",
+            "the drill would claim serving without an active projected revision",
         ),
     ):
         if contract not in drill:
             failures.append(f"ops/stateful-deploy-drill.sh: {lost}")
+    return failures
+
+
+def check_stateful_persistent_drill(
+    workflow: dict[str, Any], page: str, drill: str
+) -> list[str]:
+    """The opt-in StatefulSet has a runtime PVC-retention proof in CI."""
+    failures: list[str] = []
+    jobs = workflow["jobs"]
+    lane = jobs.get("stateful-persistent-drill")
+    if lane is None:
+        failures.append(
+            ".github/workflows/ci.yml: the stateful-persistent-drill lane is missing"
+        )
+    elif not any(
+        "ops/stateful-persistent-drill.sh" in str(step.get("run", ""))
+        for step in lane["steps"]
+    ):
+        failures.append(
+            ".github/workflows/ci.yml: the stateful-persistent-drill lane does not run the drill"
+        )
+    elif (reason := unblocked_lane(jobs, "stateful-persistent-drill")) is not None:
+        failures.append(
+            f".github/workflows/ci.yml: {reason}, so PVC loss across Pod replacement "
+            "would not block a merge"
+        )
+    if "ops/stateful-persistent-drill.sh" not in page:
+        failures.append(
+            "docs/deployment/kubernetes.md: ops/stateful-persistent-drill.sh is not documented"
+        )
+    for assertion in (
+        "three retained PVC-backed ordinals",
+        "survives Pod replacement",
+    ):
+        if assertion not in drill:
+            failures.append(
+                f"ops/stateful-persistent-drill.sh: the {assertion!r} assertion is gone; "
+                "the persistent overlay would have only a manifest check"
+            )
     return failures
 
 
@@ -1007,9 +1236,11 @@ def check_documented() -> list[str]:
         "deploy/kubernetes/base",
         "deploy/kubernetes/overlays/production",
         "deploy/kubernetes/overlays/production-stateful",
+        "deploy/kubernetes/overlays/production-stateful-persistent",
         "deploy/kubernetes/components/autoscaling",
         "deploy/kubernetes/components/stateful",
         "ops/pin-image-digest.sh",
+        "ops/stateful-persistent-drill.sh",
     ):
         if path not in page:
             failures.append(f"docs/deployment/kubernetes.md: {path} is not documented")
@@ -1067,7 +1298,7 @@ def check_digest_scope() -> list[str]:
         overlays = ROOT / "deploy/kubernetes/overlays"
         copied = root / "deploy/kubernetes/overlays"
         copied.mkdir(parents=True)
-        for overlay in ("production", "production-stateful"):
+        for overlay in ("production", "production-stateful", "production-stateful-persistent"):
             (copied / overlay).mkdir()
             shutil.copy(
                 overlays / overlay / "kustomization.yaml", copied / overlay / "kustomization.yaml"
@@ -1075,6 +1306,11 @@ def check_digest_scope() -> list[str]:
         pinned = copied / "production/kustomization.yaml"
         pinned.write_text(
             pinned.read_text(encoding="utf-8").replace(SENTINEL_DIGEST, resolved), encoding="utf-8"
+        )
+        persistent_pinned = copied / "production-stateful-persistent/kustomization.yaml"
+        persistent_pinned.write_text(
+            persistent_pinned.read_text(encoding="utf-8").replace(SENTINEL_DIGEST, resolved),
+            encoding="utf-8",
         )
 
         def check(*arguments: str) -> int:
@@ -1094,6 +1330,7 @@ def check_digest_scope() -> list[str]:
                 "the named overlay is resolved, named by path",
             ),
             (("overlays/production-stateful",), 0, "the named overlay is unresolved"),
+            (("overlays/production-stateful-persistent",), 1, "the named overlay is resolved"),
             (("overlays/nowhere",), 0, "the named overlay does not exist"),
         )
         for arguments, forbidden, because in expectations:
@@ -1111,6 +1348,7 @@ def gate(
     production: list[Document],
     autoscaled: list[Document],
     stateful: list[Document],
+    stateful_persistent: list[Document],
 ) -> list[str]:
     return [
         *check_stateful(stateful),
@@ -1131,6 +1369,32 @@ def gate(
             stateful, TELEMETRY_SOURCE.read_text(encoding="utf-8"), "overlays/production-stateful"
         ),
         *check_disruption_budget(stateful, "overlays/production-stateful"),
+        *check_stateful_persistent(stateful_persistent),
+        *check_termination_budget(
+            stateful_persistent, "overlays/production-stateful-persistent"
+        ),
+        *check_resources(stateful_persistent, "overlays/production-stateful-persistent"),
+        *check_service_port(stateful_persistent, "overlays/production-stateful-persistent"),
+        *check_topology_spread(
+            stateful_persistent, "overlays/production-stateful-persistent"
+        ),
+        *check_namespaces(stateful_persistent, "overlays/production-stateful-persistent"),
+        *check_example_secret(
+            stateful_persistent, base, "overlays/production-stateful-persistent"
+        ),
+        *check_network_policies(
+            stateful_persistent,
+            "overlays/production-stateful-persistent",
+            pod_labels(stateful_persistent),
+        ),
+        *check_telemetry_egress(
+            stateful_persistent,
+            TELEMETRY_SOURCE.read_text(encoding="utf-8"),
+            "overlays/production-stateful-persistent",
+        ),
+        *check_disruption_budget(
+            stateful_persistent, "overlays/production-stateful-persistent"
+        ),
         *check_image_pinning(base, production),
         *check_termination_budget(base, "base"),
         *check_termination_budget(production, "overlays/production"),
@@ -1156,14 +1420,46 @@ def self_test() -> int:
     production = render(PRODUCTION)
     autoscaled = render(PRODUCTION, (AUTOSCALING,))
     stateful = render(PRODUCTION_STATEFUL)
+    stateful_persistent = render(PRODUCTION_STATEFUL_PERSISTENT)
     failures: list[str] = []
 
     def expect_failure(name: str, produced: list[str]) -> None:
         if not produced:
             failures.append(f"self-test: {name} did not fail on a manifest it must reject")
 
-    if gate(base, production, autoscaled, stateful):
+    if gate(base, production, autoscaled, stateful, stateful_persistent):
         failures.append("self-test: the committed manifests must pass the gate")
+
+    persistent_deployment = copy.deepcopy(stateful_persistent)
+    persistent_deployment.append(
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "axond", "namespace": "axond"},
+            "spec": {"replicas": 3},
+        }
+    )
+    expect_failure(
+        "the persistent option retaining the Recreate Deployment",
+        check_stateful_persistent(persistent_deployment),
+    )
+
+    persistent_empty_dir = copy.deepcopy(stateful_persistent)
+    persistent_pod = one(persistent_empty_dir, "StatefulSet")["spec"]["template"]["spec"]
+    persistent_pod["volumes"].append({"name": "last-known-good", "emptyDir": {}})
+    expect_failure(
+        "a persistent option falling back to emptyDir",
+        check_stateful_persistent(persistent_empty_dir),
+    )
+
+    persistent_deleted = copy.deepcopy(stateful_persistent)
+    one(persistent_deleted, "StatefulSet")["spec"]["persistentVolumeClaimRetentionPolicy"][
+        "whenDeleted"
+    ] = "Delete"
+    expect_failure(
+        "a persistent option deleting a replica cache with the workload",
+        check_stateful_persistent(persistent_deleted),
+    )
 
     rolling = copy.deepcopy(stateful)
     one(rolling, "Deployment")["spec"]["strategy"] = {
@@ -1630,6 +1926,42 @@ def self_test() -> int:
             ),
         )
 
+    persistent_drill = STATEFUL_PERSISTENT_DRILL.read_text(encoding="utf-8")
+    if check_stateful_persistent_drill(workflow, kubernetes_page, persistent_drill):
+        failures.append(
+            "self-test: the committed stateful persistent drill wiring must pass the gate"
+        )
+    optional_persistent = copy.deepcopy(workflow)
+    optional_persistent["jobs"]["CI-Success"]["needs"].remove("stateful-persistent-drill")
+    expect_failure(
+        "optional stateful persistent lane",
+        check_stateful_persistent_drill(
+            optional_persistent, kubernetes_page, persistent_drill
+        ),
+    )
+    unasserted_persistent = copy.deepcopy(workflow)
+    for step in unasserted_persistent["jobs"]["CI-Success"]["steps"]:
+        if "run" in step:
+            step["run"] = re.sub(
+                r"^.*needs\.stateful-persistent-drill\.result.*$",
+                "",
+                step["run"],
+                flags=re.MULTILINE,
+            )
+    expect_failure(
+        "a needed stateful persistent lane CI-Success never asserts",
+        check_stateful_persistent_drill(
+            unasserted_persistent, kubernetes_page, persistent_drill
+        ),
+    )
+    for assertion in ("three retained PVC-backed ordinals", "survives Pod replacement"):
+        expect_failure(
+            f"persistent drill without {assertion!r}",
+            check_stateful_persistent_drill(
+                workflow, kubernetes_page, persistent_drill.replace(assertion, "runs")
+            ),
+        )
+
     for failure in failures:
         print(failure, file=sys.stderr)
     if failures:
@@ -1648,6 +1980,7 @@ def main(argv: list[str]) -> int:
             render(PRODUCTION),
             render(PRODUCTION, (AUTOSCALING,)),
             render(PRODUCTION_STATEFUL),
+            render(PRODUCTION_STATEFUL_PERSISTENT),
         ),
         *check_component_layering(
             (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")

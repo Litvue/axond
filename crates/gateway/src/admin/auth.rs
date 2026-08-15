@@ -40,7 +40,7 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::desired_state::{Action, Actor, MutationKind, ResourceScope};
+use crate::desired_state::{Action, Actor, DenialReason, MutationKind, ResourceScope};
 use crate::principals::constant_time_eq;
 
 /// The prefix every minted inference token carries. Presented to `/admin/v1` it
@@ -426,6 +426,8 @@ pub enum AdminAuthError {
     TokenRejected,
     #[error("issuer `{issuer}` is not trusted for administration")]
     UntrustedIssuer { issuer: String },
+    #[error("the administrative directory refused the request: {reason}")]
+    Directory { reason: DenialReason },
     #[error("the identity provider could not be consulted")]
     IdentityProviderUnavailable,
     #[error(transparent)]
@@ -442,7 +444,7 @@ impl AdminAuthError {
     pub const fn is_authorization(&self) -> bool {
         matches!(
             self,
-            Self::ActionNotPermitted { .. } | Self::ScopeNotPermitted
+            Self::ActionNotPermitted { .. } | Self::ScopeNotPermitted | Self::Directory { .. }
         )
     }
 
@@ -557,6 +559,7 @@ pub trait AdminAuthorizer: Send + Sync {
         &self,
         identity: &AdminIdentity,
         action: AdminAction,
+        surface: crate::desired_state::Surface,
         scope: &ResourceScope,
     ) -> Result<AdminGrant, AdminAuthError>;
 }

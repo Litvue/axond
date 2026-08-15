@@ -73,11 +73,12 @@ use super::error::AdminError;
 use super::handlers;
 use super::protocol::{ADMIN_PREFIX, MutationPreconditions};
 use super::resources::{
-    AliasRequest, CatalogRequest, CredentialRequest, ModelRequest, PolicyRequest, ProjectRequest,
-    ProviderRequest, TenantRequest,
+    AliasRequest, CatalogRequest, CredentialRequest, ModelRequest, PolicyRequest, PriceBookRequest,
+    PrincipalRequest, ProjectRequest, ProviderRequest, TenantRequest,
 };
 use super::service::AdminService;
 use crate::availability::AvailabilityReader;
+use crate::backends::catalog_store::CatalogStore;
 use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::desired_state::{ResourceScope, Surface};
 
@@ -98,6 +99,9 @@ pub struct AdminApi {
     /// tenant reach right now" is asked during the outage that would make the
     /// store unreachable.
     pub availability: Option<Arc<dyn AvailabilityReader>>,
+    /// The retained catalogue reader used only by the authenticated management
+    /// catalogue. Inference never receives this handle.
+    pub catalogue: Option<Arc<dyn CatalogStore>>,
 }
 
 impl AdminApi {
@@ -112,6 +116,7 @@ impl AdminApi {
             authorizer,
             convergence: None,
             availability: None,
+            catalogue: None,
         }
     }
 
@@ -119,6 +124,13 @@ impl AdminApi {
     #[must_use]
     pub fn with_availability(mut self, availability: Arc<dyn AvailabilityReader>) -> Self {
         self.availability = Some(availability);
+        self
+    }
+
+    /// Attach the retained catalogue reader for metadata-rich management reads.
+    #[must_use]
+    pub fn with_catalogue(mut self, catalogue: Arc<dyn CatalogStore>) -> Self {
+        self.catalogue = Some(catalogue);
         self
     }
 
@@ -163,7 +175,7 @@ impl AdminApi {
         surface: Surface,
         scope: &ResourceScope,
     ) -> Result<AdminGrant, AdminError> {
-        match self.authorizer.authorize(identity, action, scope) {
+        match self.authorizer.authorize(identity, action, surface, scope) {
             Ok(grant) => Ok(grant),
             Err(refusal) => {
                 let error = AdminError::from(refusal);
@@ -190,7 +202,12 @@ impl AdminApi {
         action: AdminAction,
     ) -> bool {
         self.authorizer
-            .authorize(identity, action, &ResourceScope::Deployment)
+            .authorize(
+                identity,
+                action,
+                crate::desired_state::Surface::Model,
+                &ResourceScope::Deployment,
+            )
             .is_ok()
     }
 }
@@ -270,6 +287,11 @@ pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
             router: handlers::publish_route::<ProjectRequest>,
         },
         AdminRouteSpec {
+            path: "/principals",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<PrincipalRequest>,
+        },
+        AdminRouteSpec {
             path: "/providers",
             action: AdminAction::Publish,
             router: handlers::publish_route::<ProviderRequest>,
@@ -298,6 +320,11 @@ pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
             path: "/policies",
             action: AdminAction::Publish,
             router: handlers::publish_route::<PolicyRequest>,
+        },
+        AdminRouteSpec {
+            path: "/prices",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<PriceBookRequest>,
         },
         // Material, not documents: the four rows that make a credential
         // rotatable without a redeploy. None of them publishes a revision, so
