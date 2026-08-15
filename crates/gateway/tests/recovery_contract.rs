@@ -321,7 +321,7 @@ fn a_retired_blocker_says_what_became_of_the_slice() {
         page,
         committed,
         "{} and its retired-dependency table disagree about which slices were retired",
-        recovery::MANIFEST_RELATIVE
+        recovery::CONTRACT_RELATIVE
     );
     for retired in &manifest.retired_blockers {
         assert!(
