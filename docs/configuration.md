@@ -122,8 +122,9 @@ prefix for secret-bearing variables.
 
 #### `[control_plane]`
 
-Required in stateful mode. Initial cold boot needs the control plane: a replica
-with no snapshot fails readiness rather than serving partial state.
+Required in stateful mode. Initial cold boot may expose liveness and authenticated
+administration while it waits for the control plane, but a replica with no valid
+snapshot fails readiness rather than serving partial state.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -178,22 +179,26 @@ bounds for one server is a knob with no decision behind it. See
 
 Optional in stateful mode. It controls the authenticated local
 last-known-good snapshot used only when a replica cold-boots while the control
-plane is unreachable. The cache contains projected state and references, never
-plaintext secret material. Set both fields or neither.
+plane is unreachable. The signed desired-state file contains projected state and
+references; the sibling encrypted serving file contains the material needed to
+rebuild an already-admitted snapshot without the SecretStore. Neither file is
+usable without the deployment cache key. Set both fields or neither.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `cache_path` | path | unset | Per-replica file containing the signed last-known-good projected snapshot. |
+| `cache_path` | path | unset | Per-replica signed desired-state cache; an encrypted `.serving` sibling stores the compiled serving snapshot. |
 | `cache_key_env` | string | unset | Environment-variable name containing canonical padded base64 for exactly 32 CSPRNG bytes. Leading/trailing whitespace and raw passphrases are refused; the value is never logged. |
 
 A valid cache permits cold boot during a control-plane outage. Missing, invalid,
-tampered, or keyless projected state remains fail-closed; the cache is not a
-fallback for a candidate that fails validation or secret resolution.
+or tampered projected state leaves the process alive but unready while
+convergence retries; keyless projected state remains fail-closed. The cache is
+not a fallback for a candidate that fails validation or secret resolution.
 
-The current desired-state projection does not yet supply inbound caller
-principals, so stateful candidates report a typed `unsupported` refusal and the
-replica remains not Ready until that projection lands. Configuring the cache
-does not weaken that gate or create a keyless serving path.
+The stateful projection supplies recoverable project-scoped inbound principals,
+so a revision with complete provider, retained catalogue, credential, and
+approved pricing evidence can compile into a serving snapshot. A missing
+principal or any other required evidence remains a typed refusal; configuring
+the cache does not weaken that gate or create a keyless serving path.
 
 Generate `GW_LAST_KNOWN_GOOD_KEY` as one canonical padded base64 value from 32
 random bytes (for example, `openssl rand -base64 32` with its trailing newline
@@ -214,6 +219,25 @@ operator action ambiguous, so two are rejected.
 | `id` | string | the source reference | Non-secret attribution label for audit events. |
 
 Exactly one of `env` and `file` must be non-empty; zero or both is rejected.
+
+#### `[admin_oidc]`
+
+Optional human administration through one configured OIDC issuer. The gateway
+verifies the bearer token's signature against the explicit JWKS endpoint and
+then resolves its `(issuer, subject)` against the active desired-state
+directory; a valid token without a published principal remains forbidden.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `issuer` | string | — | Exact `iss` claim accepted. |
+| `audience` | string | — | Required `aud` value. |
+| `jwks_url` | string | — | JWKS endpoint. HTTPS is required in deployed environments; HTTP is reserved for loopback qualification. |
+
+The endpoint is operator-configured rather than discovered from token data,
+redirects are refused, keys are cached for five minutes, and only asymmetric
+signature algorithms are accepted. `[[admin_breakglass]]` remains mandatory
+and is checked before OIDC so an identity-provider outage cannot remove the
+recovery path.
 
 ## `[server]`
 

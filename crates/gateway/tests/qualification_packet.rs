@@ -15,7 +15,7 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use support::packet::{self, EPIC_ISSUE, Runner, Scenario, SliceId, Status};
 use support::recovery;
@@ -256,97 +256,224 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
                 "{relative}: a record without a commit and a binary digest is anonymous"
             );
 
-            let recorded: BTreeSet<String> = record
-                .profiles
-                .iter()
-                .map(|profile| profile.id.clone())
-                .collect();
-            assert_eq!(
-                recorded, profiles,
-                "{relative}: the record and the manifest disagree about the profiles"
-            );
+            if slice.id == SliceId::Capacity {
+                assert!(
+                    record.observations.is_empty(),
+                    "{relative}: capacity records use profile rows, not generic observations"
+                );
+                let recorded: BTreeSet<String> = record
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.id.clone())
+                    .collect();
+                assert_eq!(
+                    recorded, profiles,
+                    "{relative}: the record and the manifest disagree about the profiles"
+                );
 
-            for profile in &record.profiles {
-                let id = &profile.id;
-                assert!(
-                    profile.verdicts > 0,
-                    "{relative}: {id} was measured against no threshold"
-                );
-                assert!(
-                    profile.passed,
-                    "{relative}: {id} is retained as evidence of a run that failed its gates"
-                );
-                assert!(
-                    profile.elapsed_ms > 0 && !profile.config_sha256.is_empty(),
-                    "{relative}: {id} records neither how long it ran nor what it booted"
-                );
-                assert_eq!(
-                    profile.offered, profile.requests,
-                    "{relative}: {id} offered fewer requests than the manifest asks for"
-                );
-                assert_eq!(
-                    profile.accepted + profile.rejected + profile.errors,
-                    profile.offered,
-                    "{relative}: {id} loses requests between offered and accounted for"
-                );
-                assert_eq!(
-                    profile.missing_usage_records, 0,
-                    "{relative}: {id} lost usage rows"
-                );
-                assert_eq!(
-                    profile.leaked_upstream_streams, 0,
-                    "{relative}: {id} left an upstream stream open"
-                );
-                // A profile that carries one of the specific claims carries the
-                // count behind it, at the value that makes it a claim. Without
-                // this a re-run that quietly started crossing tenants, or
-                // outliving its bound, could still be retained as evidence:
-                // the throughput above would look the same.
-                if let Some(tenants) = profile.tenants {
+                for profile in &record.profiles {
+                    let id = &profile.id;
                     assert!(
-                        tenants > 1,
-                        "{relative}: {id} claims tenant isolation with {tenants} tenant"
+                        profile.verdicts > 0,
+                        "{relative}: {id} was measured against no threshold"
+                    );
+                    assert!(
+                        profile.passed,
+                        "{relative}: {id} is retained as evidence of a run that failed its gates"
+                    );
+                    assert!(
+                        profile.elapsed_ms > 0 && !profile.config_sha256.is_empty(),
+                        "{relative}: {id} records neither how long it ran nor what it booted"
                     );
                     assert_eq!(
-                        (
-                            profile.foreign_credential_uses,
-                            profile.misattributed_usage_records
-                        ),
-                        (Some(0), Some(0)),
-                        "{relative}: {id} retains a run where a credential or a \
+                        profile.offered, profile.requests,
+                        "{relative}: {id} offered fewer requests than the manifest asks for"
+                    );
+                    assert_eq!(
+                        profile.accepted + profile.rejected + profile.errors,
+                        profile.offered,
+                        "{relative}: {id} loses requests between offered and accounted for"
+                    );
+                    assert_eq!(
+                        profile.missing_usage_records, 0,
+                        "{relative}: {id} lost usage rows"
+                    );
+                    assert_eq!(
+                        profile.leaked_upstream_streams, 0,
+                        "{relative}: {id} left an upstream stream open"
+                    );
+                    // A profile that carries one of the specific claims carries the
+                    // count behind it, at the value that makes it a claim. Without
+                    // this a re-run that quietly started crossing tenants, or
+                    // outliving its bound, could still be retained as evidence:
+                    // the throughput above would look the same.
+                    if let Some(tenants) = profile.tenants {
+                        assert!(
+                            tenants > 1,
+                            "{relative}: {id} claims tenant isolation with {tenants} tenant"
+                        );
+                        assert_eq!(
+                            (
+                                profile.foreign_credential_uses,
+                                profile.misattributed_usage_records
+                            ),
+                            (Some(0), Some(0)),
+                            "{relative}: {id} retains a run where a credential or a \
                          charge crossed a namespace"
-                    );
-                }
-                if let Some(bound) = profile.upstream_bound_ms {
-                    assert_eq!(
-                        profile.over_bound,
-                        Some(0),
-                        "{relative}: {id} retains a run that outlived the bound \
+                        );
+                    }
+                    if let Some(bound) = profile.upstream_bound_ms {
+                        assert_eq!(
+                            profile.over_bound,
+                            Some(0),
+                            "{relative}: {id} retains a run that outlived the bound \
                          the replica declares"
-                    );
-                    assert!(
-                        profile
-                            .max_latency_ms
-                            .is_some_and(|slowest| slowest >= bound as f64),
-                        "{relative}: {id} declares a {bound} ms bound nothing in \
+                        );
+                        assert!(
+                            profile
+                                .max_latency_ms
+                                .is_some_and(|slowest| slowest >= bound as f64),
+                            "{relative}: {id} declares a {bound} ms bound nothing in \
                          the run ever reached, so the bound was not exercised"
-                    );
-                }
-                if let Some(ceiling) = profile.admission_max_in_flight {
-                    assert!(
-                        profile.rejected > 0,
-                        "{relative}: {id} booted a ceiling of {ceiling} and shed \
+                        );
+                    }
+                    if let Some(ceiling) = profile.admission_max_in_flight {
+                        assert!(
+                            profile.rejected > 0,
+                            "{relative}: {id} booted a ceiling of {ceiling} and shed \
                          nothing, so the ceiling was not exercised"
+                        );
+                    }
+                    if profile.admission_max_in_flight.is_some()
+                        || profile.upstream_bound_ms.is_some()
+                    {
+                        assert_eq!(
+                            profile.served_after_load,
+                            Some(true),
+                            "{relative}: {id} pushed the replica to a limit and never \
+                         checked it could still serve afterwards"
+                        );
+                    }
+                }
+            } else if slice.id == SliceId::Recovery {
+                assert!(
+                    record.profiles.is_empty() && record.observations.is_empty(),
+                    "{relative}: recovery records use stage rows only"
+                );
+                let expected: BTreeMap<String, String> = manifest
+                    .scenarios
+                    .iter()
+                    .flat_map(|scenario| {
+                        scenario
+                            .stages
+                            .iter()
+                            .filter(|stage| stage.status == "executable")
+                            .map(|stage| {
+                                (
+                                    format!("{}/{}", scenario.id, stage.id),
+                                    stage.runner.clone().unwrap_or_default(),
+                                )
+                            })
+                    })
+                    .collect();
+                let recorded: BTreeSet<String> =
+                    record.stages.iter().map(|stage| stage.id.clone()).collect();
+                assert_eq!(
+                    recorded,
+                    expected.keys().cloned().collect(),
+                    "{relative}: the record and recovery manifest disagree about executable stages"
+                );
+                assert_eq!(
+                    record.stages.len(),
+                    expected.len(),
+                    "{relative}: a recovery stage appears more than once"
+                );
+                for stage in &record.stages {
+                    assert_eq!(
+                        stage.runner, expected[&stage.id],
+                        "{relative}: {} is attributed to the wrong recovery lane",
+                        stage.id
+                    );
+                    assert!(
+                        !stage.artifact_sha256.is_empty()
+                            && stage.elapsed_ms > 0
+                            && stage.verdicts > 0,
+                        "{relative}: {} retains no artifact identity or judged duration",
+                        stage.id
+                    );
+                    assert!(
+                        stage.passed,
+                        "{relative}: {} is retained as evidence of failed recovery",
+                        stage.id
                     );
                 }
-                if profile.admission_max_in_flight.is_some() || profile.upstream_bound_ms.is_some()
-                {
-                    assert_eq!(
-                        profile.served_after_load,
-                        Some(true),
-                        "{relative}: {id} pushed the replica to a limit and never \
-                         checked it could still serve afterwards"
+            } else {
+                assert!(
+                    record.profiles.is_empty(),
+                    "{relative}: non-capacity records use observation rows, not capacity profiles"
+                );
+                let recorded: BTreeSet<String> = record
+                    .observations
+                    .iter()
+                    .map(|observation| observation.id.clone())
+                    .collect();
+                assert_eq!(
+                    recorded, profiles,
+                    "{relative}: the record and the manifest disagree about the workloads"
+                );
+                for observation in &record.observations {
+                    assert!(
+                        !observation.artifact_sha256.is_empty(),
+                        "{relative}: {} has no raw artifact digest",
+                        observation.id
                     );
+                    assert!(
+                        observation.elapsed_ms > 0 && observation.verdicts > 0,
+                        "{relative}: {} records no run duration or verdicts",
+                        observation.id
+                    );
+                    assert!(
+                        observation.passed,
+                        "{relative}: {} is retained as evidence of a failed workload",
+                        observation.id
+                    );
+                    if slice.id == SliceId::Endurance {
+                        let required_duration = manifest
+                            .profiles
+                            .iter()
+                            .find(|workload| workload.id == observation.id)
+                            .and_then(|workload| workload.soak.as_ref())
+                            .map(|soak| soak.duration_ms)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{relative}: {} has no committed soak duration",
+                                    observation.id
+                                )
+                            });
+                        assert_eq!(
+                            observation.manifest_duration_ms,
+                            Some(required_duration),
+                            "{relative}: {} does not retain the committed soak duration",
+                            observation.id
+                        );
+                        assert!(
+                            observation
+                                .duration_ms
+                                .is_some_and(|duration| duration >= required_duration),
+                            "{relative}: {} offered less than the committed {} ms soak",
+                            observation.id,
+                            required_duration
+                        );
+                        assert!(
+                            observation.requested_duration_ms.is_some()
+                                && observation
+                                    .duration_source
+                                    .as_deref()
+                                    .is_some_and(|source| !source.is_empty()),
+                            "{relative}: {} does not retain how the soak duration was selected",
+                            observation.id
+                        );
+                    }
                 }
             }
         }

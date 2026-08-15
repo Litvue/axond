@@ -20,7 +20,9 @@ use gateway_core::{
     AnthropicAdapter, CircuitBreaker, OpenAiCompatibleAdapter, OpenAiFlavor, ProviderAdapter,
 };
 use gateway_transport::{HttpDispatcher, build_client};
+use secrecy::zeroize::Zeroize;
 use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 
 use crate::admission::{AdmissionControl, DiagnosticCredential};
 use crate::aliases::AliasScope;
@@ -29,14 +31,28 @@ use crate::backends::catalog::CatalogReport;
 use crate::backends::catalog_runtime::CatalogStatus;
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::health::BackendHealth;
+use crate::backends::secrets::SecretMaterial;
 use crate::budget::BudgetStore;
-use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
+use crate::config::{
+    CatalogBinding, Config, GatewayVerifierAlgorithm, Namespace, NamespacePolicy, ProjectIdentity,
+    ProjectedPrincipal, ProviderKind,
+};
 use crate::convergence::SystemClock;
-use crate::convergence::secrets::ResolvedSecrets;
+use crate::convergence::secrets::{MaterialLedger, ResolvedSecrets};
 use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
-use crate::desired_state::WorkloadKey;
-use crate::desired_state::pricing::PricingSnapshot;
+use crate::desired_state::mutation::Actor;
+use crate::desired_state::policy::{
+    BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
+};
+use crate::desired_state::pricing::{
+    Approval, EffectiveInstant, EffectiveInterval, PricedTarget, PricingSnapshot,
+};
+use crate::desired_state::tenancy::DisplayName;
+use crate::desired_state::{
+    AuthorizationSnapshot, Checksum, ResourceId, ResourceKind, ResourceRef, ResourceVersionNumber,
+};
+use crate::desired_state::{ProjectId, RevisionId, SecretRef, TenantId, WorkloadKey};
 use crate::key_material::{self, KeyMaterialError};
 use crate::policy::PolicyRuntime;
 use crate::principals::{
@@ -308,6 +324,10 @@ pub struct ConfigSnapshot {
     /// cannot be routed by revision *N+1* and priced by *N*. `None` for a
     /// file-configured deployment, whose prices are the ones `[[model]]` declares.
     pricing: Option<PricingSnapshot>,
+    /// The administrative identity directory admitted with this revision. It
+    /// is swapped alongside the serving snapshot and is never consulted by an
+    /// inference request.
+    admin_authorization: Option<Arc<AuthorizationSnapshot>>,
 }
 
 pub struct ResolvedMinting {
@@ -319,6 +339,571 @@ pub struct ResolvedMinting {
     pub scope: Option<HashSet<Capability>>,
     pub aliases: Option<AliasScope>,
     pub max_request_microdollars: Option<u64>,
+}
+
+/// The process-independent portion of a compiled stateful snapshot.
+///
+/// Bootstrap configuration is intentionally not duplicated here: it remains
+/// owned by the deployment file. Only the durable projection and the values
+/// derived from it are recorded, which makes a cache restore obey the same
+/// boundary as ordinary convergence.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedServingSnapshot {
+    pub(crate) revision: String,
+    pub(crate) generation: u64,
+    pub(crate) namespaces: Vec<CachedNamespace>,
+    pub(crate) providers: Vec<CachedProvider>,
+    pub(crate) models: Vec<CachedModel>,
+    pub(crate) credentials: Vec<CachedCredential>,
+    pub(crate) principals: Vec<CachedPrincipal>,
+    pub(crate) secrets: Vec<CachedSecret>,
+    pub(crate) pricing: Option<CachedPricing>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedNamespace {
+    pub(crate) id: String,
+    pub(crate) default: bool,
+    pub(crate) allow_platform_fallback: bool,
+    pub(crate) project: Option<CachedProjectIdentity>,
+    pub(crate) policy: Option<CachedPolicy>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedProjectIdentity {
+    pub(crate) tenant: String,
+    pub(crate) project: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedPolicy {
+    pub(crate) tenant: String,
+    pub(crate) project: Option<String>,
+    pub(crate) epoch: u64,
+    pub(crate) subject_limit_microdollars: u64,
+    pub(crate) namespace_limit_microdollars: Option<u64>,
+    pub(crate) reservation_ttl_seconds: u64,
+    pub(crate) max_in_flight_per_subject: u64,
+    pub(crate) lease_ttl_seconds: u64,
+    pub(crate) minimum_token_epoch: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedProvider {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) base_url: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedModel {
+    pub(crate) name: String,
+    pub(crate) namespace: Option<String>,
+    pub(crate) targets: Vec<CachedTarget>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedTarget {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) price: gateway_core::ModelPrice,
+    pub(crate) catalog: Option<CachedCatalogBinding>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedCatalogBinding {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedCredential {
+    pub(crate) namespace: String,
+    pub(crate) provider: String,
+    pub(crate) env: Option<String>,
+    pub(crate) id: Option<String>,
+    pub(crate) weight: u32,
+    pub(crate) secret: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedPrincipal {
+    pub(crate) namespace: String,
+    pub(crate) subject: String,
+    pub(crate) digest: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedSecret {
+    pub(crate) reference: String,
+    /// This field is only present inside the encrypted cache payload. It must
+    /// never be written to the signed desired-state cache or an unencrypted
+    /// diagnostic.
+    pub(crate) material: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedPricing {
+    pub(crate) book: String,
+    pub(crate) checksum: String,
+    pub(crate) catalog: String,
+    pub(crate) catalog_version: Option<u64>,
+    pub(crate) approval: CachedApproval,
+    pub(crate) effective_from: u64,
+    pub(crate) effective_until: Option<u64>,
+    pub(crate) targets: Vec<CachedPriceTarget>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum CachedApproval {
+    Draft,
+    Approved {
+        actor: CachedActor,
+        at: u64,
+        citation: Option<String>,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CachedActor {
+    Human { issuer: String, subject: String },
+    Breakglass,
+    Workload { tenant: String, principal: String },
+    System { component: String },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedPriceTarget {
+    pub(crate) provider: String,
+    pub(crate) published_model_id: String,
+    pub(crate) price: gateway_core::ModelPrice,
+}
+
+impl ConfigSnapshot {
+    /// Capture the exact projection needed to rebuild a serving snapshot after
+    /// a process restart. The caller encrypts the returned structure before it
+    /// reaches disk; the cache writer explicitly zeroizes the temporary copy
+    /// after serialization.
+    pub(crate) fn cached_serving(&self, revision: RevisionId) -> CachedServingSnapshot {
+        let config = &self.config;
+        CachedServingSnapshot {
+            revision: revision.to_string(),
+            generation: self.generation,
+            namespaces: config
+                .namespace
+                .iter()
+                .map(|namespace| CachedNamespace {
+                    id: namespace.id.clone(),
+                    default: namespace.default,
+                    allow_platform_fallback: namespace.allow_platform_fallback,
+                    project: namespace.project.map(|identity| CachedProjectIdentity {
+                        tenant: identity.tenant.to_string(),
+                        project: identity.project.to_string(),
+                    }),
+                    policy: namespace.policy.map(|policy| CachedPolicy {
+                        tenant: policy.body.scope().tenant().to_string(),
+                        project: policy.body.scope().project().map(|id| id.to_string()),
+                        epoch: policy.body.epoch().get(),
+                        subject_limit_microdollars: policy
+                            .body
+                            .budget()
+                            .subject_limit_microdollars(),
+                        namespace_limit_microdollars: policy
+                            .body
+                            .budget()
+                            .namespace_limit_microdollars(),
+                        reservation_ttl_seconds: policy.body.budget().reservation_ttl_seconds(),
+                        max_in_flight_per_subject: policy
+                            .body
+                            .concurrency()
+                            .max_in_flight_per_subject(),
+                        lease_ttl_seconds: policy.body.concurrency().lease_ttl_seconds(),
+                        minimum_token_epoch: policy.body.revocation().minimum_token_epoch(),
+                    }),
+                })
+                .collect(),
+            providers: config
+                .provider
+                .iter()
+                .map(|provider| CachedProvider {
+                    id: provider.id.clone(),
+                    kind: match provider.kind {
+                        ProviderKind::Openai => "openai",
+                        ProviderKind::Anthropic => "anthropic",
+                        ProviderKind::OpenaiCompatible => "openai-compatible",
+                    }
+                    .to_owned(),
+                    base_url: provider.base_url.clone(),
+                })
+                .collect(),
+            models: config
+                .model
+                .iter()
+                .map(|model| CachedModel {
+                    name: model.name.clone(),
+                    namespace: model.namespace.clone(),
+                    targets: model
+                        .targets
+                        .iter()
+                        .map(|target| CachedTarget {
+                            provider: target.provider.clone(),
+                            model: target.model.clone(),
+                            price: target.price,
+                            catalog: target.catalog.as_ref().map(|binding| CachedCatalogBinding {
+                                provider: binding.provider.to_string(),
+                                model: binding.model.clone(),
+                            }),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            credentials: config
+                .credential
+                .iter()
+                .map(|credential| CachedCredential {
+                    namespace: credential.namespace.clone(),
+                    provider: credential.provider.clone(),
+                    env: credential.env.clone(),
+                    id: credential.id.clone(),
+                    weight: credential.weight,
+                    secret: credential.secret.map(|reference| reference.to_string()),
+                })
+                .collect(),
+            principals: config
+                .projected_principals
+                .iter()
+                .map(|principal| CachedPrincipal {
+                    namespace: principal.namespace.clone(),
+                    subject: principal.subject.clone(),
+                    digest: principal.digest.to_string(),
+                })
+                .collect(),
+            secrets: self
+                .secrets
+                .references()
+                .into_iter()
+                .filter_map(|reference| {
+                    self.secrets.get(reference).map(|material| CachedSecret {
+                        reference: reference.to_string(),
+                        material: material.expose().to_owned(),
+                    })
+                })
+                .collect(),
+            pricing: self.pricing.as_ref().map(cached_pricing),
+        }
+    }
+
+    /// Rebuild a compiled snapshot over the current bootstrap-owned settings.
+    /// Every durable field is parsed and the ordinary compiled snapshot gate is
+    /// run again before the value can be published.
+    pub(crate) fn from_cached_serving(
+        mut bootstrap: Config,
+        env: &HashMap<String, String>,
+        cached: CachedServingSnapshot,
+    ) -> Result<(RevisionId, Self), String> {
+        let revision = RevisionId::parse(&cached.revision).map_err(|error| error.to_string())?;
+        bootstrap.namespace = cached
+            .namespaces
+            .into_iter()
+            .map(|namespace| cached_namespace(namespace, revision))
+            .collect::<Result<Vec<_>, _>>()?;
+        bootstrap.provider = cached
+            .providers
+            .into_iter()
+            .map(|provider| {
+                let kind = match provider.kind.as_str() {
+                    "openai" => ProviderKind::Openai,
+                    "anthropic" => ProviderKind::Anthropic,
+                    "openai-compatible" => ProviderKind::OpenaiCompatible,
+                    other => return Err(format!("cached provider kind `{other}` is unsupported")),
+                };
+                Ok(crate::config::Provider {
+                    id: provider.id,
+                    kind,
+                    base_url: provider.base_url,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        bootstrap.model = cached
+            .models
+            .into_iter()
+            .map(|model| {
+                Ok(crate::config::Model {
+                    name: model.name,
+                    namespace: model.namespace,
+                    targets: model
+                        .targets
+                        .into_iter()
+                        .map(|target| {
+                            Ok(crate::config::Target {
+                                provider: target.provider,
+                                model: target.model,
+                                price: target.price,
+                                catalog: target
+                                    .catalog
+                                    .map(|binding| {
+                                        CatalogBinding::new(&binding.provider, &binding.model)
+                                            .map_err(|error| error.to_string())
+                                    })
+                                    .transpose()?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        bootstrap.credential = cached
+            .credentials
+            .into_iter()
+            .map(|credential| {
+                Ok(crate::config::Credential {
+                    namespace: credential.namespace,
+                    provider: credential.provider,
+                    env: credential.env,
+                    secret: credential
+                        .secret
+                        .as_deref()
+                        .map(SecretRef::parse)
+                        .transpose()
+                        .map_err(|error| error.to_string())?,
+                    id: credential.id,
+                    weight: credential.weight,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        bootstrap.projected_principals = cached
+            .principals
+            .into_iter()
+            .map(|principal| {
+                Ok(ProjectedPrincipal {
+                    namespace: principal.namespace,
+                    subject: principal.subject,
+                    digest: Checksum::parse(&principal.digest)
+                        .map_err(|error| error.to_string())?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        bootstrap
+            .validate_compiled()
+            .map_err(|error| error.to_string())?;
+        let materials = cached
+            .secrets
+            .into_iter()
+            .map(|secret| {
+                Ok((
+                    SecretRef::parse(&secret.reference).map_err(|error| error.to_string())?,
+                    SecretMaterial::new(secret.material),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let secrets = ResolvedSecrets::from_cached(MaterialLedger::new(), materials);
+        let mut snapshot = Self::build_compiled_with(bootstrap, env, cached.generation, secrets)
+            .map_err(|error| error.to_string())?;
+        if let Some(pricing) = cached.pricing {
+            snapshot = snapshot.with_pricing(pricing_snapshot(pricing)?);
+        }
+        Ok((revision, snapshot))
+    }
+}
+
+impl CachedServingSnapshot {
+    pub(crate) fn zeroize_secrets(&mut self) {
+        for secret in &mut self.secrets {
+            secret.material.zeroize();
+        }
+    }
+}
+
+fn cached_namespace(namespace: CachedNamespace, revision: RevisionId) -> Result<Namespace, String> {
+    let project = namespace
+        .project
+        .map(|identity| -> Result<ProjectIdentity, String> {
+            Ok(ProjectIdentity {
+                tenant: TenantId::parse(&identity.tenant).map_err(|error| error.to_string())?,
+                project: ProjectId::parse(&identity.project).map_err(|error| error.to_string())?,
+            })
+        })
+        .transpose()?;
+    let policy = namespace
+        .policy
+        .map(|policy| -> Result<NamespacePolicy, String> {
+            let tenant = TenantId::parse(&policy.tenant).map_err(|error| error.to_string())?;
+            let project = policy
+                .project
+                .as_deref()
+                .map(ProjectId::parse)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let scope = match project {
+                Some(project) => PolicyScope::Project { tenant, project },
+                None => PolicyScope::Tenant(tenant),
+            };
+            let body = PolicyBody::new(
+                scope,
+                PolicyEpoch::new(policy.epoch).map_err(|error| error.to_string())?,
+                BudgetPolicy::stored(
+                    policy.subject_limit_microdollars,
+                    policy.namespace_limit_microdollars,
+                    policy.reservation_ttl_seconds,
+                )
+                .map_err(|error| error.to_string())?,
+                ConcurrencyPolicy::new(policy.max_in_flight_per_subject, policy.lease_ttl_seconds)
+                    .map_err(|error| error.to_string())?,
+                RevocationPolicy::new(policy.minimum_token_epoch),
+            );
+            Ok(NamespacePolicy {
+                body,
+                generation: body.generation(revision),
+            })
+        })
+        .transpose()?;
+    Ok(Namespace {
+        id: namespace.id,
+        default: namespace.default,
+        allow_platform_fallback: namespace.allow_platform_fallback,
+        project,
+        policy,
+    })
+}
+
+fn cached_pricing(pricing: &PricingSnapshot) -> CachedPricing {
+    CachedPricing {
+        book: pricing.book().to_string(),
+        checksum: pricing.checksum().to_string(),
+        catalog: pricing.catalog().checksum().to_string(),
+        catalog_version: pricing.catalog_version().map(|version| version.get()),
+        approval: match pricing.approval() {
+            Approval::Draft => CachedApproval::Draft,
+            Approval::Approved { by, at, citation } => CachedApproval::Approved {
+                actor: cached_actor(by),
+                at: at.millis(),
+                citation: citation
+                    .as_ref()
+                    .map(|citation| citation.as_str().to_owned()),
+            },
+        },
+        effective_from: pricing.effective().starts().millis(),
+        effective_until: pricing.effective().ends().map(|instant| instant.millis()),
+        targets: pricing
+            .targets()
+            .map(|(target, price)| CachedPriceTarget {
+                provider: target.provider.to_string(),
+                published_model_id: target.published_model_id.clone(),
+                price: *price,
+            })
+            .collect(),
+    }
+}
+
+fn cached_actor(actor: &Actor) -> CachedActor {
+    match actor {
+        Actor::Human { issuer, subject } => CachedActor::Human {
+            issuer: issuer.clone(),
+            subject: subject.clone(),
+        },
+        Actor::Breakglass => CachedActor::Breakglass,
+        Actor::Workload { tenant, principal } => CachedActor::Workload {
+            tenant: tenant.to_string(),
+            principal: principal.to_string(),
+        },
+        Actor::System { component } => CachedActor::System {
+            component: component.clone(),
+        },
+    }
+}
+
+fn restore_actor(actor: CachedActor) -> Result<Actor, String> {
+    Ok(match actor {
+        CachedActor::Human { issuer, subject } => Actor::Human { issuer, subject },
+        CachedActor::Breakglass => Actor::Breakglass,
+        CachedActor::Workload { tenant, principal } => Actor::Workload {
+            tenant: TenantId::parse(&tenant).map_err(|error| error.to_string())?,
+            principal: crate::desired_state::PrincipalId::parse(&principal)
+                .map_err(|error| error.to_string())?,
+        },
+        CachedActor::System { component } => Actor::System { component },
+    })
+}
+
+fn parse_resource_reference(text: &str) -> Result<ResourceRef, String> {
+    let (kind, rest) = text
+        .split_once('/')
+        .ok_or_else(|| "cached price-book reference has no kind separator".to_owned())?;
+    let (id, version) = rest
+        .rsplit_once('@')
+        .ok_or_else(|| "cached price-book reference has no version".to_owned())?;
+    let kind = ResourceKind::ALL
+        .iter()
+        .copied()
+        .find(|candidate| candidate.as_str() == kind)
+        .ok_or_else(|| format!("cached price-book kind `{kind}` is unsupported"))?;
+    let id = ResourceId::parse(id).map_err(|error| error.to_string())?;
+    let version = version
+        .strip_prefix('v')
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(ResourceVersionNumber::new)
+        .ok_or_else(|| "cached price-book version is invalid".to_owned())?;
+    Ok(ResourceRef::new(kind, id, version))
+}
+
+fn pricing_snapshot(cached: CachedPricing) -> Result<PricingSnapshot, String> {
+    let approval = match cached.approval {
+        CachedApproval::Draft => Approval::Draft,
+        CachedApproval::Approved {
+            actor,
+            at,
+            citation,
+        } => Approval::Approved {
+            by: restore_actor(actor)?,
+            at: EffectiveInstant::from_millis(at),
+            citation: citation
+                .as_deref()
+                .map(DisplayName::parse)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+        },
+    };
+    let effective = match cached.effective_until {
+        Some(until) => EffectiveInterval::bounded(
+            EffectiveInstant::from_millis(cached.effective_from),
+            EffectiveInstant::from_millis(until),
+        )
+        .map_err(|error| error.to_string())?,
+        None => EffectiveInterval::from(EffectiveInstant::from_millis(cached.effective_from)),
+    };
+    let targets = cached
+        .targets
+        .into_iter()
+        .map(|target| {
+            Ok((
+                PricedTarget::new(
+                    crate::backends::catalog::ProviderId::parse(&target.provider)
+                        .map_err(|error| error.to_string())?,
+                    target.published_model_id,
+                ),
+                target.price,
+            ))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+    Ok(PricingSnapshot::from_cached(
+        parse_resource_reference(&cached.book)?,
+        Checksum::parse(&cached.checksum).map_err(|error| error.to_string())?,
+        crate::backends::catalog::CatalogContentId::from_checksum(
+            Checksum::parse(&cached.catalog).map_err(|error| error.to_string())?,
+        ),
+        match cached.catalog_version {
+            None => None,
+            Some(version) => Some(
+                ResourceVersionNumber::new(version)
+                    .ok_or_else(|| "cached catalogue version is zero".to_owned())?,
+            ),
+        },
+        approval,
+        effective,
+        targets,
+    ))
 }
 
 /// Why a config could not become a servable snapshot. Names the offending
@@ -688,6 +1273,7 @@ impl ConfigSnapshot {
             // by whatever produced the evidence.
             availability: None,
             pricing: None,
+            admin_authorization: None,
         })
     }
 
@@ -773,6 +1359,19 @@ impl ConfigSnapshot {
     /// The approved pricing this snapshot serves under, if any.
     pub const fn pricing(&self) -> Option<&PricingSnapshot> {
         self.pricing.as_ref()
+    }
+
+    /// The immutable administrative authorization view compiled with this
+    /// snapshot, if the snapshot came from a typed stateful revision.
+    pub fn admin_authorization_handle(&self) -> Option<Arc<AuthorizationSnapshot>> {
+        self.admin_authorization.clone()
+    }
+
+    /// Attach the administrative authorization view before publication.
+    #[must_use]
+    pub fn with_admin_authorization(mut self, authorization: Arc<AuthorizationSnapshot>) -> Self {
+        self.admin_authorization = Some(authorization);
+        self
     }
 
     pub async fn resolve_principal(

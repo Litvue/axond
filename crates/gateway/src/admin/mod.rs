@@ -87,6 +87,7 @@ pub mod conditional;
 pub mod diff;
 pub mod error;
 pub mod handlers;
+pub mod oidc;
 pub mod protocol;
 pub mod reads;
 pub mod resources;
@@ -129,8 +130,9 @@ pub use reads::{
 #[allow(unused_imports)]
 pub use resources::{
     AdminResourceRequest, AliasRequest, CatalogRequest, CredentialRequest, ModelRequest,
-    MutationEnvelope, MutationKindInput, PolicyRequest, ProjectRequest, ProviderRequest,
-    ResourcePlan, RollbackRequest, TenantRequest,
+    MutationEnvelope, MutationKindInput, PolicyRequest, PriceBookRequest, PriceRuleRequest,
+    PrincipalRequest, ProjectRequest, ProviderRequest, ResourcePlan, RollbackRequest,
+    TenantRequest,
 };
 #[allow(unused_imports)]
 pub use router::{AdminApi, AdminRouteSpec, admin_route_specs, router};

@@ -568,7 +568,7 @@ impl RulePrecedence {
         }
     }
 
-    fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|it| it.as_str() == text)
     }
 }
@@ -633,7 +633,7 @@ impl PriceOrigin {
         }
     }
 
-    fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|it| it.as_str() == text)
     }
 }
@@ -1724,6 +1724,30 @@ pub struct PricingSnapshot {
 }
 
 impl PricingSnapshot {
+    /// Rebuild a previously resolved snapshot from the authenticated compiled
+    /// serving cache. The cache writer captured these fields only after the
+    /// ordinary price-book resolver accepted them; keeping this constructor
+    /// crate-private prevents it from becoming an alternate approval path.
+    pub(crate) fn from_cached(
+        book: ResourceRef,
+        checksum: Checksum,
+        catalog: CatalogContentId,
+        catalog_version: Option<ResourceVersionNumber>,
+        approval: Approval,
+        effective: EffectiveInterval,
+        targets: BTreeMap<PricedTarget, ModelPrice>,
+    ) -> Self {
+        Self {
+            book,
+            checksum,
+            catalog,
+            catalog_version,
+            approval,
+            effective,
+            targets,
+        }
+    }
+
     /// Resolve a book at an instant.
     ///
     /// Total: every rule already holds the price it converts to, so there is no

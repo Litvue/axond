@@ -102,11 +102,19 @@ run_pinned_image() {
 }
 
 verify_sha256() {
-    # macOS ships shasum rather than the coreutils tool.
-    if command -v sha256sum >/dev/null 2>&1; then
-        echo "$2  $1" | sha256sum --check --quiet
-    else
+    # macOS may expose a BSD `sha256sum` compatibility command whose flags are
+    # not the GNU `--check --quiet` contract. Use the native verifier there;
+    # reserve sha256sum for Linux and other platforms where its interface is
+    # the one this script invokes.
+    if [[ $(uname -s) == Darwin* ]]; then
         echo "$2  $1" | shasum -a 256 --check --status
+    elif command -v sha256sum >/dev/null 2>&1; then
+        echo "$2  $1" | sha256sum --check --quiet
+    elif command -v shasum >/dev/null 2>&1; then
+        echo "$2  $1" | shasum -a 256 --check --status
+    else
+        echo "no SHA-256 verifier is installed" >&2
+        return 1
     fi
 }
 

@@ -228,8 +228,8 @@ of a serving fleet become wrong at once. The component answers each:
   A port-forward is a kubelet-mediated operator action rather than a
   cluster-wide network endpoint, so this remains fail-closed even when the CNI
   does not implement NetworkPolicy. The production overlay's ingress allowance
-  is also replaced by `admin-boundary.yaml`; because inference is refused on
-  this fleet, inheriting that allowance would expose `/admin/v1` to the public
+  is also replaced by `admin-boundary.yaml`; until a complete stateful snapshot
+  is qualified, inheriting that allowance would expose `/admin/v1` to the public
   ingress path.
 
   ```yaml
@@ -333,6 +333,7 @@ proven on a real cluster with its counterfactual:
 ```bash
 just stateful-deploy-drill        # ops/stateful-deploy-drill.sh on a three-worker
                                   # kind cluster, ~5 minutes
+just stateful-persistent-drill    # retained PVC ordinal replacement on kind
 ```
 
 The drill migrates once, asserts three Running and zero Ready replicas, probes
@@ -383,6 +384,18 @@ kubectl -n axond wait --for=condition=complete job/axond-migrate --timeout=5m
 kubectl -n axond get statefulset axond
 kubectl -n axond get pvc -l app.kubernetes.io/name=axond
 ```
+
+Run the disposable runtime qualification before enabling this option in a
+real cluster:
+
+```bash
+ops/stateful-persistent-drill.sh
+```
+
+That drill verifies the migration Job, three Bound PVCs, the cache mount, and
+ordinal replacement. The stateful integration recovery lane separately writes
+and restores the signed desired-state and encrypted compiled-serving caches;
+the two checks together cover both the cache format and the storage lifecycle.
 
 The four Secret values remain the same as the Recreate path, including the
 deployment-wide `GW_LAST_KNOWN_GOOD_KEY`. Provision that key before applying

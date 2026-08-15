@@ -75,6 +75,7 @@ pub mod pricing;
 pub mod principals;
 pub mod reconciler;
 pub mod secrets;
+pub mod serving;
 pub mod settings;
 pub mod status;
 pub mod tenancy;

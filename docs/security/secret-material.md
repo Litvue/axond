@@ -125,12 +125,14 @@ leases from, each naming the exact version the candidate resolved, so a request
 that reaches the fake provider with the sentinel key proves the shipped path
 carried it there.
 
-Two seams the harness still supplies, neither touching material: an alias's
-targets, because projecting a catalogue is its own slice, and which namespace an
-inbound key binds to, because binding a caller to a projected namespace is
-#252's. A projected project is reached by a qualified id no `axond.toml` can
-declare, so the suite rebinds its bootstrap key to it rather than inventing an
-identity model. Stateful `serve` is still not wired for the same reason.
+The live stateful integration now supplies both seams without putting material
+on the request path: catalogue projection supplies alias targets, and durable
+project-scoped workload principals supply a digest-backed inbound key bound to
+the qualified project namespace. A projected project is reached by a qualified
+id no `axond.toml` can declare, so the integration fixture obtains the one-time
+workload key from the administrative response and uses it only to exercise the
+shipped verifier. Human OIDC authentication remains an administrative-surface
+follow-up; it is not substituted with a workload key.
 
 The `/admin/v1` boundary is swept over its real route table and the real Postgres
 journal, with authentication and authorization faked — an administrator's
@@ -146,7 +148,7 @@ nor a twelve-character prefix of it reaches the caller. The administrative
 (`load_manifest`, `load_revision`, `audit_trail`, idempotency replay), which is
 where their payloads are built.
 
-Automatic cutover is still not wired: `serve` mounts the administrative surface
-but constructs no reconciler (#142), so a published credential becomes servable
-when a compiler runs — which the convergence tests drive — rather than on a
-running replica's own loop.
+Automatic cutover is wired: stateful `serve` constructs the reconciler after the
+listener is live, and a published credential becomes servable only after the
+off-request-path compile, secret resolution, validation, and atomic publication
+complete. A failed candidate leaves the prior snapshot active.

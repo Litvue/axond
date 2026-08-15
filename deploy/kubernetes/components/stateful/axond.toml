@@ -1,5 +1,8 @@
 # The whole file a stateful replica reads. Tenants, projects, providers,
-# credentials, catalogues, prices, aliases, and policy live in the control plane
+# credentials, model enablements, prices, aliases, and policy live in the
+# control plane. The imported catalogue is process-local ingestion backed by
+# durable Postgres retention, so convergence can hydrate the exact payload a
+# model enablement pinned.
 # and are administered through `/admin/v1`; declaring any of them here is a boot
 # error before the listener binds. `axond.stateful.example.toml` at the root of
 # the repository documents every field, including the optional enforcement
@@ -37,13 +40,20 @@ operation_timeout_ms = 30000
 backend = "postgres"
 kek_env = "GW_SECRET_STORE_KEK"
 
+[catalog]
+# Seed keeps the first boot air-gapped; scheduled refresh can be switched to
+# models-dev in a reviewed rollout. Retention inherits GW_CONTROL_PLANE_DSN.
+source = "seed"
+store = "postgres"
+bootstrap = "seed"
+
 [[admin_breakglass]]
 env = "GW_ADMIN_BREAKGLASS"
 id = "breakglass"
 
 # Per-replica ceilings, sized against this Pod's 512Mi limit exactly as the
 # base's stateless config is. They bound `/admin/v1` request bodies here rather
-# than inference, because inference is refused on this replica.
+# than inference until convergence publishes a complete serving snapshot.
 [admission]
 max_request_bytes = 1_048_576
 max_in_flight = 32

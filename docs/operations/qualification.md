@@ -1,7 +1,7 @@
 # The production qualification packet
 
 What has actually been measured about running Axond in production, what has only
-been declared, and what has not been built — in one place, so the difference
+been declared or harnessed, and what has not yet been retained — in one place, so the difference
 between a merged harness and an answered question stays visible.
 
 Production qualification ([#156](https://github.com/Litvue/axond/issues/156))
@@ -11,9 +11,9 @@ decomposes into five slices. They landed, and will land, at different depths:
 | --- | --- | --- | --- |
 | `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `evidenced` | Driver, eight committed profiles — including multi-tenant isolation, admission shedding, and a bounded stalling backend — reduced tier on every change, heavy tier on demand, and two retained runs. |
 | `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Two drivers and committed mixes — one stateless, one against a fleet with a durable usage sink — whose smoke tiers run in CI. Neither 12–24 hour tier has been dispatched. |
-| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver, committed scenarios, and nine stages running against a real Postgres in two lanes — the outage, the cold boots, convergence, a logical restore, and a point-in-time recovery. Every scenario still has a blocked stage: stateful serving is not assembled yet. |
-| `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `unbuilt` | Nothing. The fake upstream already injects the provider faults a matrix would drive. |
-| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver, committed scenarios, and a reduced tier in CI. The heavy tier has never been dispatched, and mixed-version serving waits on a stateful replica. |
+| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver, committed scenarios, and twenty-two executable stages running against real PostgreSQL in two lanes — outage, cold boots, cached process serving, cache refusal, secret rotation, convergence, durable inventory, logical restore, point-in-time recovery, and the durable usage boundary. No complete fleet record is retained yet. |
+| `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `harnessed` | Committed provider, transport, Redis, and Postgres fault matrix plus a driver; the full pinned-service matrix has passed locally, but no clean heavy artifact is retained yet. |
+| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver, committed scenarios, reduced and heavy tiers; the local heavy run passed, but no retained record is committed, and mixed-version serving across a migration still needs a stateful multi-replica qualification. |
 
 `qualification/packet.toml` is that table as data — question, inputs, lanes,
 retained runs, and what each slice still owes; see
@@ -26,17 +26,17 @@ the manifest it names is a test failure.
 
 ## What the packet may not be read as
 
-- **Not a claim that Axond is production-qualified.** One of five slices has no
-  driver at all, three have a driver with no retained heavy run behind them,
-  and no slice has retained a run of a fleet. #156 stays open until every slice
+- **Not a claim that Axond is production-qualified.** One of five slices is
+  evidenced and four have a driver with no retained heavy run behind them; no
+  slice has retained a run of a fleet. #156 stays open until every slice
   is `evidenced`; `closure.satisfied` in the packet is derived from the slices,
   so it cannot be set by hand.
-- **Not evidence about stateful serving.** Every retained record is Tier 0: one
-  process, no Redis, no Postgres, no control plane. The stateful endurance
-  harness does drive a fleet with a durable usage sink, but only its ninety-second
-  smoke tier has run, and a correctness run is not a measurement. See
-  [recovery qualification](./recovery-qualification.md) for what stateful
-  recovery will have to show.
+- **Not a stateful fleet baseline.** Every retained #156 record is Tier 0: one
+  process, no Redis, no Postgres, no control plane. Separate #219 process
+  evidence now proves projected state, cache recovery, cache refusal, and
+  rotation against real PostgreSQL, but it is not a multi-replica load or soak
+  measurement. The stateful endurance harness has run its ninety-second smoke
+  tier, but the 12–24 hour tiers have not been dispatched.
 - **Not a fleet baseline.** Both retained runs are local (see below).
 
 ## The status ladder
@@ -53,8 +53,9 @@ than from what it says:
 
 ## Retained evidence
 
-A run's full artifacts (`target/capacity/**/*.json`) are complete and
-disposable. What the repository keeps is a *record*: the numbers, plus the
+A run's full artifacts (`target/<slice>/**/*.json`) are complete and
+disposable. What the repository keeps is a *record*: the numbers or workload
+observations, plus the
 provenance that decides what may legitimately be compared with what — commit,
 binary digest and cargo profile, manifest digest, fixture count, the machine,
 and, per profile, the config the process actually booted. The manifest digest is
@@ -92,11 +93,69 @@ ops/qualification-evidence.py target/capacity/heavy \
   --out qualification/capacity/evidence/heavy-local.toml
 ```
 
-A runner-recorded record comes from the `Capacity` workflow instead: dispatch it,
-download the `capacity-results` artifact, and pass the extracted directory with
-`--runner github-actions`. Comparing two records is only meaningful when their
+A runner-recorded record comes from the `Capacity` workflow instead: dispatch it
+and download its `qualification-record-capacity` artifact (the raw
+`capacity-results` artifact remains beside it for detail). Locally, pass the
+extracted results directory with `--runner github-actions`. Comparing two records is only meaningful when their
 `[binary]`, `[inputs]`, and `[hardware]` blocks match; where they do, a moved
 number is a regression rather than a different machine.
+
+The other load-shaped slices use the same provenance envelope and a compact
+`[[observation]]` per committed workload. The raw artifact remains the detailed
+diagnosis; the observation binds its SHA-256 digest, elapsed time, verdict count,
+and pass result to the manifest that produced it. The heavy rollout and
+endurance workflows, including the supplemental stateful-endurance lane, the
+full service-backed fault lane, and the combined recovery job publish records
+as `qualification-record-*` workflow artifacts:
+
+```bash
+ops/qualification-evidence.py target/faults \
+  --slice fault --tier full --runner local \
+  --note "local pinned Redis/Postgres matrix" \
+  --out qualification/faults/evidence/full-local.toml
+
+ops/qualification-evidence.py target/rollout/heavy \
+  --slice rollout --tier heavy --runner local \
+  --note "local heavy rollout" \
+  --out qualification/rollout/evidence/heavy-local.toml
+
+ops/qualification-evidence.py target/recovery \
+  --slice recovery --tier serving --runner local \
+  --binary target/debug/axond \
+  --note "local stateful-tests plus restore-drill" \
+  --out target/qualification-records/recovery-serving.toml
+```
+
+Run `python3 ops/qualification-evidence.py --self-test` to exercise the
+generic writer's refusal of missing workloads and failed verdicts. A generated
+record is still not evidence until it passes the promotion boundary and its
+path is added to the packet:
+
+```bash
+python3 ops/promote-qualification.py \
+  target/qualification-records/rollout-heavy.toml \
+  --artifacts target/rollout/heavy \
+  --out qualification/rollout/evidence/heavy-ci.toml
+
+python3 ops/promote-qualification.py \
+  target/qualification-records/recovery-serving.toml \
+  --artifacts target/recovery \
+  --out qualification/recovery/evidence/serving-ci.toml
+```
+
+Promotion verifies the source tree, manifest, binary, and workload coverage as
+before, and now also hashes every supplied raw JSON artifact. A compact record
+cannot be promoted from a TOML file alone: its claimed artifact digests must
+match the complete raw-artifact directory from the same run.
+
+Promotion refuses dirty provenance, stale manifest hashes, wrong heavy tiers,
+partial workload sets, failed verdicts, and an endurance `soak` run shorter than
+the committed 12-hour duration. A shortened dispatched soak can still be
+generated and uploaded for diagnosis, but it cannot be promoted as #156
+evidence. Recovery promotion additionally requires all 22 executable stages,
+with the stateful-test and restore-drill lane attribution from the manifest.
+Promotion does not edit the packet; the status and `retained` path remain a
+reviewed change checked by the packet test.
 
 ## What each slice still owes
 
@@ -104,28 +163,32 @@ number is a regression rather than a different machine.
   hours can exercise (`max_rss_drift_kib_per_hour` and its neighbours) have no
   run behind them, so the soak tiers are declared bounds rather than measured
   ones.
-- **`recovery`** — every stage that needs a served request: serving through the
-  outage, from a restored cache, and across a recovery, plus the rotation whose
-  evidence is a request authenticated with rotated material. They wait on the
-  resource slices that give a stateful replica something to serve. The durable
-  half runs today in both lanes. The packet mirrors the manifest's own
-  dependency map and is tested against it, so landing a slice moves both.
-- **`fault`** — a manifest and a driver. The provider rows are unblocked today;
-  the backend rows need a stateful replica to fail.
-- **`rollout`** — a manifest, a driver, and a fleet: two or more replicas behind
-  an ingress, with the artifact-digest, migration, and timeline metadata a
-  rollout has to retain.
+- **`recovery`** — all twenty-two executable stages: serving through the outage,
+  from a restored cache, and across a recovery, plus the rotation whose evidence
+  is a request authenticated with rotated material. Both the stateful-test and
+  restore-drill lanes run today against real PostgreSQL, including the durable
+  usage boundary. The remaining qualification step is a clean, retained
+  fleet-level record; the packet mirrors the manifest's dependency map and is
+  tested against it so future dependencies cannot disappear silently.
+- **`fault`** — a clean retained run of the full provider, transport, Redis, and
+  Postgres matrix. The manifest and driver are present, and local execution has
+  passed, but no reproducible heavy artifact is retained yet.
+- **`rollout`** — a manifest, a driver, and a stateful fleet: two or more
+  replicas behind an ingress, with the artifact-digest, migration, and timeline
+  metadata a rollout has to retain.
 - **All of them** — a second reference tier. Every number retained so far is
   single-replica.
 
-One question the packet is regularly asked for, and cannot answer: **stateful
-convergence**. A stateful replica boots and serves `/admin/v1`; what it refuses,
-per request, is inference, until revision convergence ships. So there is no
-stateful replica *serving* to converge, and a profile written against one today
-would measure the refusal and retain it as evidence of something else. That is
-why the `recovery` slice stays `harnessed`: its durable stages run against a real
-Postgres, and every stage that needs a served request is blocked in the scenario
-rather than measured. It is also why no capacity profile claims it.
+One question the packet is regularly asked for, and still cannot answer: a
+**stateful fleet qualification baseline**. A stateful replica now compiles
+durable tenant/project principals and serves after a complete snapshot is
+published; without one it keeps readiness and inference fail-closed. The
+single-process evidence belongs to #219, while a profile against multiple
+replicas, offered load, and recovery remains outstanding. That is why the
+`recovery` slice stays `harnessed`: its twenty-two executable stages run against
+real PostgreSQL, including the usage-boundary measurement, but no complete fleet
+record is retained. It is also why no capacity profile claims stateful
+serving.
 
 ## Related
 

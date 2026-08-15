@@ -6,24 +6,20 @@
 //! together, which is where every release gate in
 //! [#160](https://github.com/Litvue/axond/issues/160) actually lives.
 //!
-//! Two rules keep it honest while stateful mode is still being assembled.
+//! Two rules keep it honest while stateful qualification is still incomplete.
 //!
 //! **A gate is `Wired` only when its scenario asserts the property on a running
 //! process.** Not when its dependencies merged, and not when a type exists.
 //!
-//! **A `Blocked` gate still runs.** Its scenario asserts the standing refusal:
-//! a stateful replica boots and serves `/admin/v1`, and refuses *inference*
-//! rather than serving the empty snapshot an uncompiled revision would leave
-//! behind. That refusal is what makes the unproven gates safe, so it is the
-//! thing worth testing until each one is wired — and when convergence lands,
-//! the scenario fails here and has to be rewritten into the real assertion
-//! instead of quietly passing.
+//! **A `Blocked` gate still runs.** Its scenario records the safe boundary that
+//! remains unqualified. The wired scenarios below assert their properties on a
+//! running process; the remaining blocked qualification scenario does not get
+//! to borrow those results.
 //!
 //! **A gate is `Partial` when a running process proves the path that exists and
-//! a named slice still owns the rest.** IG-05 is the current one: a mutation is
-//! validated, revisioned, and audited against a real control plane through the
-//! breakglass credential, while authorizing an OIDC principal against a scoped
-//! grant waits on a replica that authenticates one.
+//! a named slice still owns the rest.** IG-11 is the current blocked
+//! qualification gate; IG-05 now covers both breakglass and a scoped OIDC human
+//! on a running replica.
 //!
 //! The gate table below and the matrix in
 //! `docs/operations/stateful-integration.md` are checked against each other, so
@@ -39,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use support::fault::injector::{FaultProxy, Mode, redirect};
 use support::schema::{self, Schema};
 use support::stateful::{self, ControlPlane};
 use support::{GATEWAY_KEY, boot, client};
@@ -90,43 +87,46 @@ const GATES: &[Gate] = &[
     },
     Gate {
         id: "IG-03",
-        status: Status::Blocked,
-        scenarios: &["hydrate_compile_publish_is_one_atomic_step"],
+        status: Status::Wired,
+        scenarios: &["stateful_revision_compiles_rotates_and_recovers"],
     },
     Gate {
         id: "IG-04",
-        status: Status::Blocked,
-        scenarios: &["secrets_resolve_during_compilation_only"],
+        status: Status::Wired,
+        scenarios: &["stateful_revision_compiles_rotates_and_recovers"],
     },
     Gate {
         id: "IG-05",
-        status: Status::Partial,
-        scenarios: &["an_admin_mutation_publishes_an_audited_revision"],
+        status: Status::Wired,
+        scenarios: &[
+            "an_admin_mutation_publishes_an_audited_revision",
+            "an_oidc_principal_is_authorized_against_the_active_directory",
+        ],
     },
     Gate {
         id: "IG-06",
-        status: Status::Blocked,
-        scenarios: &["inference_touches_no_control_plane_connection"],
+        status: Status::Wired,
+        scenarios: &["stateful_revision_compiles_rotates_and_recovers"],
     },
     Gate {
         id: "IG-07",
-        status: Status::Blocked,
-        scenarios: &["control_plane_loss_keeps_the_last_known_good_snapshot_serving"],
+        status: Status::Wired,
+        scenarios: &["stateful_revision_compiles_rotates_and_recovers"],
     },
     Gate {
         id: "IG-08",
-        status: Status::Blocked,
-        scenarios: &["readiness_and_status_report_convergence"],
+        status: Status::Wired,
+        scenarios: &["stateful_revision_compiles_rotates_and_recovers"],
     },
     Gate {
         id: "IG-09",
-        status: Status::Blocked,
-        scenarios: &["every_usage_record_names_the_price_version"],
+        status: Status::Wired,
+        scenarios: &["stateful_revision_compiles_rotates_and_recovers"],
     },
     Gate {
         id: "IG-10",
-        status: Status::Blocked,
-        scenarios: &["a_tenant_catalogue_is_isolated_and_explains_itself"],
+        status: Status::Wired,
+        scenarios: &["stateful_revision_compiles_rotates_and_recovers"],
     },
     Gate {
         id: "IG-11",
@@ -266,6 +266,78 @@ fn a_wired_gate_runs_in_a_required_ci_lane() {
     }
 }
 
+/// The recovery packet is only complete when the two recovery lanes and the
+/// binary they produced are assembled into one record. Keeping this check in
+/// the integration suite prevents a workflow edit from silently reverting to
+/// two independently green, but non-promotable, uploads.
+#[test]
+fn the_complete_recovery_record_is_required_by_ci() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
+    )
+    .expect("the CI workflow is committed");
+
+    for required in [
+        "  recovery-record:",
+        "name: recovery-evidence",
+        "name: restore-drill-evidence",
+        "name: recovery-binary-stateful",
+        "name: recovery-binary-restore",
+        "run: cargo build -p axond --locked",
+        "--slice recovery --tier serving",
+        "name: qualification-record-recovery",
+        "      - recovery-record",
+        "test \"${{ needs.recovery-record.result }}\" = success",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "the CI workflow no longer requires the complete recovery record component {required:?}"
+        );
+    }
+}
+
+/// The recovery manifest's process-level stages are owned by this black-box
+/// lane, not silently by the in-process severable-link driver. The artifact
+/// checker verifies that they ran; this registry check verifies that the lane
+/// and the manifest continue to point at the same implementation.
+#[test]
+fn process_recovery_stages_are_owned_by_the_stateful_integration_lane() {
+    let manifest = support::recovery::load();
+    let expected = [
+        "control-plane-outage/serving",
+        "control-plane-outage/administration",
+        "cold-boot-valid-cache/serving",
+        "recovery-convergence/serving",
+        "recovery-convergence/administration",
+        "secret-rotation/rotation",
+        "secret-rotation/serving",
+    ];
+    for key in expected {
+        let (scenario_id, stage_id) = key.split_once('/').expect("a recovery stage key");
+        let scenario = manifest
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.id == scenario_id)
+            .unwrap_or_else(|| panic!("the recovery manifest has no {scenario_id} scenario"));
+        let stage = scenario
+            .stages
+            .iter()
+            .find(|stage| stage.id == stage_id)
+            .unwrap_or_else(|| panic!("the recovery manifest has no {key} stage"));
+        assert_eq!(stage.status, support::recovery::Status::Executable, "{key}");
+        assert_eq!(
+            stage.runner,
+            Some(support::recovery::Runner::StatefulTests),
+            "{key}"
+        );
+        assert_eq!(
+            stage.driver,
+            support::recovery::Driver::StatefulIntegration,
+            "{key}"
+        );
+    }
+}
+
 // ── The standing refusal every blocked gate rests on ─────────────────────────
 
 /// A complete stateful bootstrap whose references are satisfied, pointed at no
@@ -309,30 +381,170 @@ fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>, SocketAddr)
     (config, env, bind)
 }
 
-/// A stateful deployment still refuses *inference*, so a gate that depends on a
-/// revision reaching the request path cannot be silently unproven: a replica
-/// administers, and nothing it is told to serve is served.
-///
-/// Every blocked gate asserts this, through the operator-facing report of it:
-/// `check preflight` fails on its `serving` line. When convergence lands, these
-/// assertions fail — which is the point: each gate is then rewritten into the
-/// property it was always meant to prove, and its matrix row moves with it.
-fn stateful_serving_is_still_refused(gate: &str) {
-    let (config, env, _bind) = stateful_bootstrap();
-    let run = stateful::run(&config, &["check", "preflight"], &env);
-    assert!(
-        !run.succeeded(),
-        "{gate}: a stateful deployment no longer refuses inference, so this gate's real scenario is \
-         now possible and required. Rewrite it and move its row in \
-         docs/operations/stateful-integration.md.\n{}",
-        run.context()
+const INTEGRATION_TENANT: &str = "ten_019ff9e0-0000-7000-8000-000000000001";
+const INTEGRATION_PROJECT: &str = "prj_019ff9e0-0000-7000-8000-000000000002";
+const OIDC_PROJECT: &str = "prj_019ff9e0-0000-7000-8000-00000000000a";
+const INTEGRATION_PRINCIPAL: &str = "prn_019ff9e0-0000-7000-8000-000000000003";
+const INTEGRATION_PROVIDER: &str = "res_019ff9e0-0000-7000-8000-000000000004";
+const INTEGRATION_CREDENTIAL: &str = "res_019ff9e0-0000-7000-8000-000000000005";
+const INTEGRATION_CATALOG: &str = "res_019ff9e0-0000-7000-8000-000000000006";
+const INTEGRATION_ENABLEMENT: &str = "res_019ff9e0-0000-7000-8000-000000000007";
+const INTEGRATION_PRICE_BOOK: &str = "res_019ff9e0-0000-7000-8000-000000000008";
+const INTEGRATION_ALIAS: &str = "res_019ff9e0-0000-7000-8000-000000000009";
+const INTEGRATION_ALIAS_SLUG: &str = "wave2-chat";
+const SECOND_TENANT: &str = "ten_019ff9e0-0000-7000-8000-000000000011";
+const SECOND_PROJECT: &str = "prj_019ff9e0-0000-7000-8000-000000000012";
+const SECOND_PRINCIPAL: &str = "prn_019ff9e0-0000-7000-8000-000000000013";
+const SECOND_PROVIDER: &str = "res_019ff9e0-0000-7000-8000-000000000014";
+const SECOND_CREDENTIAL: &str = "res_019ff9e0-0000-7000-8000-000000000015";
+const SECOND_ENABLEMENT: &str = "res_019ff9e0-0000-7000-8000-000000000016";
+const SECOND_ALIAS: &str = "res_019ff9e0-0000-7000-8000-000000000017";
+const SECOND_ALIAS_SLUG: &str = "wave2-other";
+fn integration_workload_key() -> String {
+    format!("axw1.{}", "d0".repeat(32))
+}
+
+fn second_workload_key() -> String {
+    format!("axw1.{}", "e1".repeat(32))
+}
+
+fn sha256_checksum(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut rendered = String::from("sha256:");
+    for byte in digest.as_ref() {
+        use std::fmt::Write;
+        write!(&mut rendered, "{byte:02x}").expect("a string accepts formatting");
+    }
+    rendered
+}
+
+/// Offering ids use the desired-state canonical encoding rather than the
+/// catalogue's display names. Keep this tiny mirror in the black-box harness so
+/// the admin document names the same immutable offering an importer derived.
+fn offering_id(provider: &str, model: &str) -> String {
+    fn string(value: &str, output: &mut Vec<u8>) {
+        output.push(0x03);
+        output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        output.extend_from_slice(value.as_bytes());
+    }
+
+    let mut canonical = b"axond.desired-state\0\x01".to_vec();
+    canonical.push(0x07); // map
+    canonical.extend_from_slice(&2_u64.to_be_bytes());
+    string("model", &mut canonical);
+    string(model, &mut canonical);
+    string("provider", &mut canonical);
+    string(provider, &mut canonical);
+    format!("off_{}", &sha256_checksum(&canonical)[7..])
+}
+
+async fn publish_resource(
+    replica: &stateful::Replica,
+    http: &reqwest::Client,
+    path: &str,
+    idempotency: &str,
+    expected: &str,
+    document: serde_json::Value,
+) -> String {
+    let document = if document.get("summary").is_some() {
+        document
+    } else {
+        let mutation = if document.get("rotate") == Some(&serde_json::Value::Bool(true)) {
+            "update"
+        } else {
+            "create"
+        };
+        serde_json::json!({
+            "summary": "publish a stateful serving resource",
+            "mutation": mutation,
+            "resource": document,
+        })
+    };
+    let response = replica
+        .breakglass(
+            http.post(replica.admin_url(path))
+                .header("idempotency-key", idempotency)
+                .header("x-axond-expected-revision", expected)
+                .json(&document),
+            "IG-03: publish a complete serving revision",
+        )
+        .send()
+        .await
+        .expect("a resource publish response");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("a publish body");
+    assert_eq!(
+        status,
+        200,
+        "the typed serving resource must publish ({path}, {idempotency}, expected {expected}): {body}\n{}",
+        replica.output()
     );
-    assert!(
-        run.reported().contains("serving"),
-        "{gate}: preflight failed for some reason other than the serving refusal, which is not \
-         what this gate is waiting on.\n{}",
-        run.context()
-    );
+    body["revision"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a publish names its revision: {body}"))
+        .to_owned()
+}
+
+async fn wait_for_catalogue_identity(control_plane: &ControlPlane) -> (String, String, u64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(identity) = control_plane.catalogue_identity().await {
+            return identity;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the seeded catalogue was not retained:\n{}",
+            control_plane.config.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_convergence(
+    replica: &stateful::Replica,
+    http: &reqwest::Client,
+    revision: &str,
+    source: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = replica
+            .breakglass(
+                http.get(replica.admin_url("/convergence")),
+                "IG-08: observe convergence",
+            )
+            .send()
+            .await
+            .expect("a convergence response");
+        if response.status() == 200 {
+            let body: serde_json::Value = response.json().await.expect("a convergence body");
+            if body["active"] == revision && body["loaded"] == revision && body["source"] == source
+            {
+                return body;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica did not reach revision {revision} from {source}:\n{}",
+            replica.output()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_log(replica: &stateful::Replica, needles: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = replica.output();
+        if needles.iter().all(|needle| output.contains(needle)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica log did not retain the expected usage identity {needles:?}:\n{output}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 // ── IG-01: explicit operating modes ──────────────────────────────────────────
@@ -869,42 +1081,18 @@ async fn a_setup_that_fails_after_creating_its_schema_leaves_nothing_behind() {
     );
 }
 
-// ── Gates whose wiring has not landed ────────────────────────────────────────
-//
-// Each of these is a placeholder for one property, and each asserts the refusal
-// that stands in for it. The doc comment on every scenario is the assertion it
-// becomes; see docs/operations/stateful-integration.md for what it waits on.
-
-/// Becomes: a published revision is hydrated, compiled, and swapped in as one
-/// whole snapshot, and a candidate that fails any step changes nothing.
-#[test]
-fn hydrate_compile_publish_is_one_atomic_step() {
-    stateful_serving_is_still_refused("IG-03");
-}
-
-/// Becomes: every credential a snapshot needs is resolved through the
-/// SecretStore during compilation, and rotating one is a new snapshot rather
-/// than a redeploy.
-#[test]
-fn secrets_resolve_during_compilation_only() {
-    stateful_serving_is_still_refused("IG-04");
-}
-
 // ── IG-05: validated, revisioned, authorized, audited mutations ──────────────
 
-/// One authenticated mutation, followed from the request to the revision it
+/// One breakglass-authenticated mutation, followed from the request to the revision it
 /// published and the audit event that attributes it.
 ///
-/// `partial` in the matrix, and precisely: everything here happens through the
-/// breakglass credential, which is the only administrative principal a
-/// deployment has before it has been administered into existence. Authorizing an
-/// OIDC principal against a scoped grant waits on a replica that authenticates
-/// one, and gets a scenario of its own rather than an assumption here.
+/// This preserves the recovery credential's separate audit identity; the
+/// issuer-scoped human path is exercised by the scenario immediately below.
 #[tokio::test]
 async fn an_admin_mutation_publishes_an_audited_revision() {
     let Some(control_plane) = ControlPlane::create().await else {
         eprintln!(
-            "SKIPPED without AXOND_TEST_POSTGRES_DSN: IG-05's `partial` row is NOT proven by this \
+            "SKIPPED without AXOND_TEST_POSTGRES_DSN: IG-05's wired breakglass scenario is NOT proven by this \
              run. It is proven by CI's required `Stateful tests` lane, which sets \
              AXOND_TEST_REQUIRE_SERVICES=1 so this skip is a failure there."
         );
@@ -1104,40 +1292,1670 @@ async fn an_admin_mutation_publishes_an_audited_revision() {
     );
 }
 
-/// Becomes: a served inference request opens no control-plane connection and
-/// issues no control-plane query, observed with the database made unreachable.
-#[test]
-fn inference_touches_no_control_plane_connection() {
-    stateful_serving_is_still_refused("IG-06");
+/// A human principal is published into durable desired state, projected into
+/// the active authorization snapshot, and then used through the real OIDC/JWKS
+/// verifier. The same bearer can manage its tenant but cannot even read another
+/// tenant's catalogue; the successful mutation is attributed to the issuer and
+/// subject that signed it.
+#[tokio::test]
+async fn an_oidc_principal_is_authorized_against_the_active_directory() {
+    let Some(control_plane) = ControlPlane::create().await else {
+        eprintln!(
+            "SKIPPED without AXOND_TEST_POSTGRES_DSN: IG-05's OIDC runtime path is proven by CI's required Stateful tests lane"
+        );
+        return;
+    };
+    let provider = support::oidc::OidcProvider::start().await;
+    control_plane.enable_oidc(&provider);
+    let migrated = control_plane.run(&["migrate", "apply"]);
+    assert!(migrated.succeeded(), "{}", migrated.context());
+    let replica = control_plane.serve().await;
+    let http = client();
+    let subject = "alice";
+    let token = provider.token(subject);
+
+    let mut revision = publish_resource(
+        &replica,
+        &http,
+        "/tenants",
+        "ig-05-oidc-tenant-a",
+        "empty",
+        serde_json::json!({
+            "tenant": INTEGRATION_TENANT,
+            "slug": "oidc-a",
+            "display_name": "OIDC tenant A",
+        }),
+    )
+    .await;
+    revision = publish_resource(
+        &replica,
+        &http,
+        "/tenants",
+        "ig-05-oidc-tenant-b",
+        &revision,
+        serde_json::json!({
+            "tenant": SECOND_TENANT,
+            "slug": "oidc-b",
+            "display_name": "OIDC tenant B",
+        }),
+    )
+    .await;
+    revision = publish_resource(
+        &replica,
+        &http,
+        "/projects",
+        "ig-05-oidc-inference-project",
+        &revision,
+        serde_json::json!({
+            "project": INTEGRATION_PROJECT,
+            "tenant": INTEGRATION_TENANT,
+            "slug": "inference",
+            "display_name": "Inference",
+        }),
+    )
+    .await;
+    revision = publish_resource(
+        &replica,
+        &http,
+        "/principals",
+        "ig-05-oidc-inference-principal",
+        &revision,
+        serde_json::json!({
+            "principal": SECOND_PRINCIPAL,
+            "tenant": INTEGRATION_TENANT,
+            "project": INTEGRATION_PROJECT,
+            "slug": "inference-workload",
+            "display_name": "Inference workload",
+            "key_digest": sha256_checksum(integration_workload_key().as_bytes()),
+            "roles": ["developer"],
+        }),
+    )
+    .await;
+    revision = publish_resource(
+        &replica,
+        &http,
+        "/principals",
+        "ig-05-oidc-human",
+        &revision,
+        serde_json::json!({
+            "principal": INTEGRATION_PRINCIPAL,
+            "tenant": INTEGRATION_TENANT,
+            "slug": "alice",
+            "display_name": "Alice",
+            "identity_kind": "human",
+            "issuer": provider.issuer(),
+            "subject": subject,
+            "roles": ["tenant-admin"],
+        }),
+    )
+    .await;
+    wait_for_convergence(&replica, &http, &revision, "control-plane").await;
+
+    let anonymous = http
+        .get(replica.admin_url(&format!("/catalogue?tenant={INTEGRATION_TENANT}")))
+        .send()
+        .await
+        .expect("anonymous catalogue response");
+    assert_eq!(anonymous.status(), 401, "anonymous admin access is refused");
+
+    let own_catalogue = http
+        .get(replica.admin_url(&format!("/catalogue?tenant={INTEGRATION_TENANT}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("OIDC tenant catalogue response");
+    assert_eq!(
+        own_catalogue.status(),
+        200,
+        "OIDC human can read its tenant"
+    );
+
+    let foreign_catalogue = http
+        .get(replica.admin_url(&format!("/catalogue?tenant={SECOND_TENANT}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("cross-tenant catalogue response");
+    assert_eq!(
+        foreign_catalogue.status(),
+        403,
+        "OIDC human cannot read another tenant"
+    );
+
+    let project = http
+        .post(replica.admin_url("/projects"))
+        .bearer_auth(&token)
+        .header("idempotency-key", "ig-05-oidc-project")
+        .header("x-axond-expected-revision", &revision)
+        .json(&serde_json::json!({
+            "summary": "create the OIDC tenant project",
+            "mutation": "create",
+                "resource": {
+                "project": OIDC_PROJECT,
+                "tenant": INTEGRATION_TENANT,
+                "slug": "alice-project",
+                "display_name": "Alice project",
+            },
+        }))
+        .send()
+        .await
+        .expect("OIDC project publication response");
+    assert_eq!(
+        project.status(),
+        200,
+        "OIDC human can publish in its tenant"
+    );
+    let project: serde_json::Value = project.json().await.expect("OIDC project result");
+    let project_revision = project["revision"]
+        .as_str()
+        .expect("OIDC project publication names its revision")
+        .to_owned();
+    wait_for_convergence(&replica, &http, &project_revision, "control-plane").await;
+
+    let audit = replica
+        .breakglass(
+            http.get(replica.admin_url(&format!("/audit/{project_revision}"))),
+            "IG-05: verify the OIDC mutation attribution",
+        )
+        .send()
+        .await
+        .expect("OIDC audit response");
+    assert_eq!(audit.status(), 200, "OIDC publication has an audit record");
+    let audit: serde_json::Value = audit.json().await.expect("OIDC audit body");
+    let actor = &audit["events"][0]["actor"];
+    assert_eq!(actor["kind"], "human", "the OIDC actor is a human");
+    assert_eq!(actor["issuer"], provider.issuer());
+    assert_eq!(actor["subject"], subject);
+
+    // The encrypted serving cache is what makes inference recoverable, while
+    // the signed desired-state sibling carries the directory that gives this
+    // OIDC identity its tenant-scoped authority. A cold boot with Postgres
+    // unavailable must therefore authenticate the token and reach the
+    // control-plane refusal (503), rather than lose the directory and return a
+    // misleading authorization denial (403).
+    drop(replica);
+    let outage = control_plane.serve_without_control_plane().await;
+    let cached_oidc_read = http
+        .get(outage.admin_url(&format!("/catalogue?tenant={INTEGRATION_TENANT}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("cached OIDC administrative response");
+    let cached_oidc_status = cached_oidc_read.status();
+    let cached_oidc_body: serde_json::Value = cached_oidc_read
+        .json()
+        .await
+        .expect("cached OIDC administrative error body");
+    assert_eq!(cached_oidc_status, 503, "{}", outage.output());
+    assert_eq!(
+        cached_oidc_body["error"]["type"], "control_plane_unavailable",
+        "the cached OIDC identity was authorized before the management read reached the unavailable journal: {cached_oidc_body}"
+    );
 }
 
-/// Becomes: with the control plane down, a running replica keeps serving its
-/// active snapshot and a restarting one cold-boots from the signed
-/// last-known-good cache.
-#[test]
-fn control_plane_loss_keeps_the_last_known_good_snapshot_serving() {
-    stateful_serving_is_still_refused("IG-07");
+/// IG-03 through IG-10 share one expensive, service-backed path. It publishes a
+/// complete typed revision, serves it through a controlled upstream, rotates the
+/// SecretStore-backed credential, then cold-boots a replacement with Postgres
+/// unavailable from the encrypted compiled-serving cache.
+#[tokio::test]
+async fn stateful_revision_compiles_rotates_and_recovers() {
+    let Some(control_plane) = ControlPlane::create().await else {
+        eprintln!(
+            "SKIPPED without AXOND_TEST_POSTGRES_DSN: the live stateful revision scenario is proven by CI's required Stateful tests lane"
+        );
+        return;
+    };
+    let upstream = support::FakeUpstream::start().await;
+    let migrated = control_plane.run(&["migrate", "apply"]);
+    assert!(migrated.succeeded(), "{}", migrated.context());
+    let replica = control_plane.serve().await;
+    let http = client();
+
+    let first_material = format!("sk-wave2-v1-{}", control_plane.schema);
+    let second_material = format!("sk-wave2-v2-{}", control_plane.schema);
+    let workload_key = integration_workload_key();
+    let staged = replica
+        .breakglass(
+            http.post(replica.admin_url("/secrets"))
+                .json(&serde_json::json!({
+                    "tenant": INTEGRATION_TENANT,
+                    "project": INTEGRATION_PROJECT,
+                    "material": first_material,
+                })),
+            "IG-04: stage the first provider secret",
+        )
+        .send()
+        .await
+        .expect("a secret stage response");
+    assert_eq!(staged.status(), 200, "{}", replica.output());
+    let staged: serde_json::Value = staged.json().await.expect("a staged secret body");
+    let first_reference = staged["reference"]
+        .as_str()
+        .expect("the staged secret names a version")
+        .to_owned();
+    let secret_id = first_reference
+        .split_once('@')
+        .expect("the secret reference is versioned")
+        .0
+        .to_owned();
+    let activated = replica
+        .breakglass(
+            http.post(replica.admin_url("/secrets/lifecycle"))
+                .json(&serde_json::json!({
+                    "tenant": INTEGRATION_TENANT,
+                    "project": INTEGRATION_PROJECT,
+                    "reference": first_reference,
+                    "lifecycle": "active",
+                })),
+            "IG-04: activate the first provider secret",
+        )
+        .send()
+        .await
+        .expect("a secret lifecycle response");
+    assert_eq!(activated.status(), 200, "{}", replica.output());
+
+    let tenant_b_material = format!("sk-wave2-tenant-b-{}", control_plane.schema);
+    let second_workload_key = second_workload_key();
+    let second_staged = replica
+        .breakglass(
+            http.post(replica.admin_url("/secrets"))
+                .json(&serde_json::json!({
+                    "tenant": SECOND_TENANT,
+                    "project": SECOND_PROJECT,
+                    "material": tenant_b_material,
+                })),
+            "IG-10: stage the second tenant provider secret",
+        )
+        .send()
+        .await
+        .expect("a second tenant secret stage response");
+    assert_eq!(second_staged.status(), 200, "{}", replica.output());
+    let second_staged: serde_json::Value = second_staged
+        .json()
+        .await
+        .expect("a second tenant staged secret body");
+    let second_reference = second_staged["reference"]
+        .as_str()
+        .expect("the second tenant secret names a version")
+        .to_owned();
+    let second_secret_id = second_reference
+        .split_once('@')
+        .expect("the second tenant secret reference is versioned")
+        .0
+        .to_owned();
+    let second_activated = replica
+        .breakglass(
+            http.post(replica.admin_url("/secrets/lifecycle"))
+                .json(&serde_json::json!({
+                    "tenant": SECOND_TENANT,
+                    "project": SECOND_PROJECT,
+                    "reference": second_reference,
+                    "lifecycle": "active",
+                })),
+            "IG-10: activate the second tenant provider secret",
+        )
+        .send()
+        .await
+        .expect("a second tenant secret lifecycle response");
+    assert_eq!(second_activated.status(), 200, "{}", replica.output());
+
+    let (catalog_digest, catalog_content, catalog_size) =
+        wait_for_catalogue_identity(&control_plane).await;
+    let offering = offering_id("openai", "gpt-4o");
+    let key_digest = sha256_checksum(workload_key.as_bytes());
+    let second_key_digest = sha256_checksum(second_workload_key.as_bytes());
+    let endpoint = upstream.base_url.clone();
+    let mut revision = String::from("empty");
+
+    let documents = [
+        (
+            "/tenants",
+            "ig-03-tenant",
+            serde_json::json!({
+                "summary": "publish the wave 2 tenant",
+                "mutation": "create",
+                "resource": {
+                    "tenant": INTEGRATION_TENANT,
+                    "slug": "wave2",
+                    "display_name": "Wave 2",
+                },
+            }),
+        ),
+        (
+            "/projects",
+            "ig-03-project",
+            serde_json::json!({
+                "summary": "publish the wave 2 project",
+                "mutation": "create",
+                "resource": {
+                    "project": INTEGRATION_PROJECT,
+                    "tenant": INTEGRATION_TENANT,
+                    "slug": "inference",
+                    "display_name": "Inference",
+                },
+            }),
+        ),
+        (
+            "/principals",
+            "ig-03-principal",
+            serde_json::json!({
+                "principal": INTEGRATION_PRINCIPAL,
+                "tenant": INTEGRATION_TENANT,
+                "project": INTEGRATION_PROJECT,
+                "slug": "wave2-workload",
+                "display_name": "Wave 2 workload",
+                "key_digest": key_digest,
+                "roles": ["operator"],
+            }),
+        ),
+        (
+            "/providers",
+            "ig-03-provider",
+            serde_json::json!({
+                "provider": INTEGRATION_PROVIDER,
+                "tenant": INTEGRATION_TENANT,
+                "project": INTEGRATION_PROJECT,
+                "slug": "openai",
+                "display_name": "Fixture OpenAI",
+                "wire_family": "openai-chat",
+                "endpoint": endpoint,
+            }),
+        ),
+        (
+            "/credentials",
+            "ig-04-credential",
+            serde_json::json!({
+                "credential": INTEGRATION_CREDENTIAL,
+                "tenant": INTEGRATION_TENANT,
+                "project": INTEGRATION_PROJECT,
+                "provider": INTEGRATION_PROVIDER,
+                "slug": "openai-primary",
+                "display_name": "Fixture OpenAI primary",
+                "secret": secret_id,
+                "secret_version": 1,
+                "lifecycle": "active",
+            }),
+        ),
+        (
+            "/catalogs",
+            "ig-03-catalog",
+            serde_json::json!({
+                "catalog": INTEGRATION_CATALOG,
+                "slug": "seed",
+                "digest": catalog_digest,
+                "size_bytes": catalog_size,
+            }),
+        ),
+        (
+            "/models",
+            "ig-03-model",
+            serde_json::json!({
+                "enablement": INTEGRATION_ENABLEMENT,
+                "tenant": INTEGRATION_TENANT,
+                "project": INTEGRATION_PROJECT,
+                "slug": "gpt-4o",
+                "offering": offering,
+                "catalog": INTEGRATION_CATALOG,
+                "snapshot": catalog_digest,
+                "wire_family": "openai-chat",
+                "state": "enabled",
+            }),
+        ),
+        (
+            "/prices",
+            "ig-09-price",
+            serde_json::json!({
+                "price_book": INTEGRATION_PRICE_BOOK,
+                "slug": "wave2-prices",
+                "catalog": catalog_content,
+                "catalog_version": 1,
+                "state": "approved",
+                "approved_at_millis": 1,
+                "approval_citation": "IG-09 live price identity",
+                "rules": [{
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "precedence": "baseline",
+                    "from_millis": 0,
+                    "input_nano_dollars_per_million": 2_500_000_000_u64,
+                    "output_nano_dollars_per_million": 10_000_000_000_u64,
+                    "origin": "operator",
+                    "citation": "IG-09 live price identity",
+                }],
+            }),
+        ),
+        (
+            "/aliases",
+            "ig-03-alias",
+            serde_json::json!({
+                "alias": INTEGRATION_ALIAS,
+                "tenant": INTEGRATION_TENANT,
+                "project": INTEGRATION_PROJECT,
+                "slug": INTEGRATION_ALIAS_SLUG,
+                "wire_family": "openai-chat",
+                "state": "enabled",
+                "targets": [{ "enablement": INTEGRATION_ENABLEMENT }],
+            }),
+        ),
+        (
+            "/tenants",
+            "ig-10-tenant-b",
+            serde_json::json!({
+                "summary": "publish the second isolation tenant",
+                "mutation": "create",
+                "resource": {
+                    "tenant": SECOND_TENANT,
+                    "slug": "wave2-other",
+                    "display_name": "Wave 2 Other",
+                },
+            }),
+        ),
+        (
+            "/projects",
+            "ig-10-project-b",
+            serde_json::json!({
+                "summary": "publish the second isolation project",
+                "mutation": "create",
+                "resource": {
+                    "project": SECOND_PROJECT,
+                    "tenant": SECOND_TENANT,
+                    "slug": "inference",
+                    "display_name": "Other Inference",
+                },
+            }),
+        ),
+        (
+            "/principals",
+            "ig-10-principal-b",
+            serde_json::json!({
+                "principal": SECOND_PRINCIPAL,
+                "tenant": SECOND_TENANT,
+                "project": SECOND_PROJECT,
+                "slug": "wave2-other-workload",
+                "display_name": "Wave 2 Other workload",
+                "key_digest": second_key_digest,
+                "roles": ["operator"],
+            }),
+        ),
+        (
+            "/providers",
+            "ig-10-provider-b",
+            serde_json::json!({
+                "provider": SECOND_PROVIDER,
+                "tenant": SECOND_TENANT,
+                "project": SECOND_PROJECT,
+                "slug": "openai",
+                "display_name": "Fixture OpenAI Other",
+                "wire_family": "openai-chat",
+                "endpoint": endpoint,
+            }),
+        ),
+        (
+            "/credentials",
+            "ig-10-credential-b",
+            serde_json::json!({
+                "credential": SECOND_CREDENTIAL,
+                "tenant": SECOND_TENANT,
+                "project": SECOND_PROJECT,
+                "provider": SECOND_PROVIDER,
+                "slug": "openai-other",
+                "display_name": "Fixture OpenAI other",
+                "secret": second_secret_id,
+                "secret_version": 1,
+                "lifecycle": "active",
+            }),
+        ),
+        (
+            "/models",
+            "ig-10-model-b",
+            serde_json::json!({
+                "enablement": SECOND_ENABLEMENT,
+                "tenant": SECOND_TENANT,
+                "project": SECOND_PROJECT,
+                "slug": "gpt-4o-other",
+                "offering": offering,
+                "catalog": INTEGRATION_CATALOG,
+                "snapshot": catalog_digest,
+                "wire_family": "openai-chat",
+                "state": "enabled",
+            }),
+        ),
+        (
+            "/aliases",
+            "ig-10-alias-b",
+            serde_json::json!({
+                "alias": SECOND_ALIAS,
+                "tenant": SECOND_TENANT,
+                "project": SECOND_PROJECT,
+                "slug": SECOND_ALIAS_SLUG,
+                "wire_family": "openai-chat",
+                "state": "enabled",
+                "targets": [{ "enablement": SECOND_ENABLEMENT }],
+            }),
+        ),
+    ];
+    for (path, idempotency, document) in documents {
+        revision = publish_resource(&replica, &http, path, idempotency, &revision, document).await;
+    }
+
+    let convergence = wait_for_convergence(&replica, &http, &revision, "control-plane").await;
+    assert_eq!(convergence["converged"], true, "{convergence}");
+    assert_eq!(
+        client()
+            .get(replica.url("/readyz"))
+            .send()
+            .await
+            .expect("a readiness response")
+            .status(),
+        200,
+        "{}",
+        replica.output()
+    );
+
+    // Keep one direct replica as the operator that can publish the recovery
+    // revision, and put a second serving replica behind the same cuttable TCP
+    // path used by the fault qualification lane. This is process-level outage
+    // evidence: Postgres is real and untouched, while the replica's live pool
+    // connections are actually severed underneath it.
+    let (upstream_host, _) = redirect(&control_plane.dsn, SocketAddr::from(([127, 0, 0, 1], 1)))
+        .expect("the required Postgres fixture uses a redirectable TCP DSN");
+    let postgres_proxy = FaultProxy::start(&upstream_host).await;
+    let (_, proxied_dsn) = redirect(&control_plane.dsn, postgres_proxy.addr)
+        .expect("the Postgres fixture DSN redirects through the fault proxy");
+    let faulted = control_plane.serve_with_dsn(&proxied_dsn).await;
+    let faulted_convergence =
+        wait_for_convergence(&faulted, &http, &revision, "control-plane").await;
+
+    let healthy_faulted_chat = http
+        .post(faulted.url("/v1/chat/completions"))
+        .bearer_auth(&workload_key)
+        .json(&serde_json::json!({
+            "model": INTEGRATION_ALIAS_SLUG,
+            "messages": [{"role": "user", "content": "before-outage"}],
+        }))
+        .send()
+        .await
+        .expect("the proxied replica serves before the outage");
+    assert_eq!(healthy_faulted_chat.status(), 200, "{}", faulted.output());
+
+    postgres_proxy.set(Mode::Outage);
+    let severed_deadline = Instant::now() + Duration::from_secs(5);
+    while postgres_proxy.severed() == 0 {
+        assert!(
+            Instant::now() < severed_deadline,
+            "the Postgres proxy did not sever a live connection"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let outage_state = faulted
+        .breakglass(
+            http.get(faulted.admin_url("/state")),
+            "#219: read state during the Postgres outage",
+        )
+        .send()
+        .await
+        .expect("the outage administrative response");
+    let outage_state_status = outage_state.status().as_u16();
+    let outage_state_body = outage_state.text().await.expect("the outage state body");
+    assert_eq!(outage_state_status, 503, "{outage_state_body}");
+
+    let anonymous_state = http
+        .get(faulted.admin_url("/state"))
+        .send()
+        .await
+        .expect("the anonymous outage administrative response");
+    let anonymous_state_status = anonymous_state.status().as_u16();
+    assert_eq!(anonymous_state_status, 401, "{}", faulted.output());
+
+    let outage_document = serde_json::json!({
+        "summary": "probe a mutation during a Postgres outage",
+        "mutation": "update",
+        "resource": {
+            "alias": INTEGRATION_ALIAS,
+            "tenant": INTEGRATION_TENANT,
+            "project": INTEGRATION_PROJECT,
+            "slug": INTEGRATION_ALIAS_SLUG,
+            "wire_family": "openai-chat",
+            "state": "enabled",
+            "targets": [{ "enablement": INTEGRATION_ENABLEMENT }],
+        },
+    });
+    let outage_write = faulted
+        .breakglass(
+            http.post(faulted.admin_url("/aliases"))
+                .header("idempotency-key", "ig-219-outage-write")
+                .header("x-axond-expected-revision", &revision)
+                .json(&outage_document),
+            "#219: attempt a mutation during the Postgres outage",
+        )
+        .send()
+        .await
+        .expect("the outage mutation response");
+    let outage_write_status = outage_write.status().as_u16();
+    let outage_write_body = outage_write.text().await.expect("the outage mutation body");
+    assert_eq!(outage_write_status, 503, "{outage_write_body}");
+
+    let outage_chat = http
+        .post(faulted.url("/v1/chat/completions"))
+        .bearer_auth(&workload_key)
+        .json(&serde_json::json!({
+            "model": INTEGRATION_ALIAS_SLUG,
+            "messages": [{"role": "user", "content": "during-outage"}],
+        }))
+        .send()
+        .await
+        .expect("the cached snapshot serves during the outage");
+    let outage_chat_status = outage_chat.status().as_u16();
+    assert_eq!(outage_chat_status, 200, "{}", faulted.output());
+    let outage_chat_status_text = outage_chat_status.to_string();
+    let outage_state_status_text = outage_state_status.to_string();
+    let outage_write_status_text = outage_write_status.to_string();
+    let anonymous_state_status_text = anonymous_state_status.to_string();
+
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "control-plane-outage",
+        "serving",
+        "control_plane_outage",
+        &["serving_behavior", "fail_open_closed"],
+        &[
+            (
+                "revision-converged",
+                "the proxy replica served a complete revision before the cut",
+            ),
+            (
+                "postgres-connections-severed",
+                "the TCP fault proxy dropped live Postgres connections",
+            ),
+            (
+                "inference-served",
+                "the active snapshot answered while Postgres was unavailable",
+            ),
+        ],
+        &[
+            ("revision", serde_json::json!(revision.clone())),
+            (
+                "converged",
+                serde_json::json!(faulted_convergence["converged"].clone()),
+            ),
+            (
+                "proxy_severed_connections",
+                serde_json::json!(postgres_proxy.severed()),
+            ),
+            ("inference_status", serde_json::json!(outage_chat_status)),
+        ],
+        &[(
+            "max_serving_error_fraction",
+            "0.0",
+            "0.0",
+            "the cached snapshot answered the offered outage request",
+        )],
+        &[
+            (
+                "inference_remains_available",
+                "200",
+                &outage_chat_status_text,
+                "the active serving snapshot is independent of the unavailable journal",
+            ),
+            (
+                "postgres_path_was_severed",
+                "at-least-one",
+                "at-least-one",
+                "the outage was injected below the running process",
+            ),
+        ],
+    );
+
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "control-plane-outage",
+        "administration",
+        "control_plane_outage",
+        &["audit_auth"],
+        &[
+            (
+                "authenticated-read-refused",
+                "the authenticated desired-state read failed closed",
+            ),
+            (
+                "mutation-refused",
+                "the administrative mutation did not reach the journal",
+            ),
+            (
+                "anonymous-refused",
+                "the administrative route authenticated before disclosing state",
+            ),
+        ],
+        &[
+            (
+                "authenticated_state_status",
+                serde_json::json!(outage_state_status),
+            ),
+            ("mutation_status", serde_json::json!(outage_write_status)),
+            (
+                "anonymous_state_status",
+                serde_json::json!(anonymous_state_status),
+            ),
+            ("authenticated_state_body", serde_json::json!("redacted")),
+            ("mutation_body", serde_json::json!("redacted")),
+        ],
+        &[],
+        &[
+            (
+                "authenticated_administration_refused",
+                "503",
+                &outage_state_status_text,
+                "the authenticated read did not fall back to stale desired state",
+            ),
+            (
+                "mutation_refused",
+                "503",
+                &outage_write_status_text,
+                "the outage did not accept an administrative write",
+            ),
+            (
+                "anonymous_administration_refused",
+                "401",
+                &anonymous_state_status_text,
+                "authentication remained first during the outage",
+            ),
+        ],
+    );
+
+    let recovery_revision = publish_resource(
+        &replica,
+        &http,
+        "/aliases",
+        "ig-219-recovery-alias",
+        &revision,
+        outage_document,
+    )
+    .await;
+    postgres_proxy.set(Mode::Pass);
+    let recovered_convergence =
+        wait_for_convergence(&faulted, &http, &recovery_revision, "control-plane").await;
+    let recovered_chat = http
+        .post(faulted.url("/v1/chat/completions"))
+        .bearer_auth(&workload_key)
+        .json(&serde_json::json!({
+            "model": INTEGRATION_ALIAS_SLUG,
+            "messages": [{"role": "user", "content": "after-recovery"}],
+        }))
+        .send()
+        .await
+        .expect("the recovered snapshot serves after Postgres returns");
+    let recovered_chat_status = recovered_chat.status().as_u16();
+    assert_eq!(recovered_chat_status, 200, "{}", faulted.output());
+    let recovered_chat_status_text = recovered_chat_status.to_string();
+
+    let recovered_audit = faulted
+        .breakglass(
+            http.get(faulted.admin_url(&format!("/audit/{recovery_revision}"))),
+            "#219: read the recovered revision audit",
+        )
+        .send()
+        .await
+        .expect("the recovered audit response");
+    let recovered_audit_status = recovered_audit.status().as_u16();
+    let recovered_audit: serde_json::Value = recovered_audit
+        .json()
+        .await
+        .expect("the recovered audit body");
+    assert_eq!(recovered_audit_status, 200, "{}", faulted.output());
+    assert_eq!(
+        recovered_audit["events"][0]["actor"]["kind"], "breakglass",
+        "recovery audit attribution survives: {recovered_audit}"
+    );
+    let recovered_audit_status_text = recovered_audit_status.to_string();
+
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "recovery-convergence",
+        "serving",
+        "recovery_convergence",
+        &["serving_behavior"],
+        &[
+            (
+                "journal-returned",
+                "the Postgres fault proxy resumed forwarding",
+            ),
+            (
+                "revision-converged",
+                "the running replica loaded the revision published during the outage",
+            ),
+            (
+                "inference-served",
+                "the recovered serving snapshot answered traffic",
+            ),
+        ],
+        &[
+            ("revision", serde_json::json!(recovery_revision.clone())),
+            (
+                "source",
+                serde_json::json!(recovered_convergence["source"].clone()),
+            ),
+            (
+                "converged",
+                serde_json::json!(recovered_convergence["converged"].clone()),
+            ),
+            ("chat_status", serde_json::json!(recovered_chat_status)),
+        ],
+        &[(
+            "max_serving_error_fraction",
+            "0.0",
+            "0.0",
+            "the recovered snapshot answered the offered request",
+        )],
+        &[
+            (
+                "recovered_revision_loaded",
+                "true",
+                "true",
+                "the replica converged without restart or operator intervention",
+            ),
+            (
+                "recovered_inference_served",
+                "200",
+                &recovered_chat_status_text,
+                "serving resumed after the journal returned",
+            ),
+        ],
+    );
+
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "recovery-convergence",
+        "administration",
+        "recovery_convergence",
+        &["audit_auth"],
+        &[
+            (
+                "journal-returned",
+                "the recovered administrative surface reached Postgres",
+            ),
+            (
+                "audit-read",
+                "the recovered revision audit was read through authenticated admin",
+            ),
+        ],
+        &[
+            ("audit_status", serde_json::json!(recovered_audit_status)),
+            (
+                "actor",
+                serde_json::json!(recovered_audit["events"][0]["actor"]["kind"].clone()),
+            ),
+        ],
+        &[],
+        &[
+            (
+                "recovered_audit_is_readable",
+                "200",
+                &recovered_audit_status_text,
+                "the recovered control plane exposes its attributed audit trail",
+            ),
+            (
+                "recovered_audit_is_authenticated",
+                "breakglass",
+                "breakglass",
+                "the recovered audit event retains its actor attribution",
+            ),
+        ],
+    );
+    drop(faulted);
+    // The outage drill publishes a real recovery revision through the direct
+    // replica. Carry that new head into the remainder of the scenario before
+    // publishing the tenant-isolation disablement below.
+    revision = recovery_revision;
+
+    let models = http
+        .get(replica.url("/v1/models"))
+        .bearer_auth(&workload_key)
+        .send()
+        .await
+        .expect("a model discovery response");
+    assert_eq!(models.status(), 200, "{}", replica.output());
+    let models: serde_json::Value = models.json().await.expect("a model discovery body");
+    assert!(
+        models["data"].as_array().is_some_and(|entries| entries
+            .iter()
+            .any(|entry| entry["id"] == INTEGRATION_ALIAS_SLUG)),
+        "the projected alias is discoverable: {models}"
+    );
+    assert!(
+        models["data"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().all(|entry| entry["id"] != SECOND_ALIAS_SLUG)),
+        "tenant A discovery must not leak tenant B's alias: {models}"
+    );
+    let second_models = http
+        .get(replica.url("/v1/models"))
+        .bearer_auth(&second_workload_key)
+        .send()
+        .await
+        .expect("the second tenant model discovery response");
+    assert_eq!(second_models.status(), 200, "{}", replica.output());
+    let second_models: serde_json::Value = second_models
+        .json()
+        .await
+        .expect("the second tenant model discovery body");
+    assert!(
+        second_models["data"]
+            .as_array()
+            .is_some_and(
+                |entries| entries.iter().any(|entry| entry["id"] == SECOND_ALIAS_SLUG)
+                    && entries
+                        .iter()
+                        .all(|entry| entry["id"] != INTEGRATION_ALIAS_SLUG)
+            ),
+        "tenant B discovery must contain only tenant B's alias: {second_models}"
+    );
+
+    // Discovery is only half of the boundary. A caller must not be able to
+    // enumerate a durable neighbour by comparing the refusal for its alias
+    // with the refusal for a name that is not projected anywhere. Both must be
+    // the same typed 404, and neither request may spend the neighbour's
+    // credential by reaching the provider.
+    let provider_requests_before_refusals = upstream.state.requests().len();
+    let nonexistent = http
+        .post(replica.url("/v1/chat/completions"))
+        .bearer_auth(&workload_key)
+        .json(&serde_json::json!({
+            "model": "wave2-does-not-exist",
+            "messages": [{"role": "user", "content": "unknown"}],
+        }))
+        .send()
+        .await
+        .expect("an unknown-model refusal");
+    assert_eq!(nonexistent.status(), 404, "{}", replica.output());
+    let nonexistent: serde_json::Value = nonexistent
+        .json()
+        .await
+        .expect("an unknown-model error envelope");
+    assert_eq!(nonexistent["error"]["type"], "unknown_model");
+
+    let foreign = http
+        .post(replica.url("/v1/chat/completions"))
+        .bearer_auth(&workload_key)
+        .json(&serde_json::json!({
+            "model": SECOND_ALIAS_SLUG,
+            "messages": [{"role": "user", "content": "foreign"}],
+        }))
+        .send()
+        .await
+        .expect("a cross-tenant alias refusal");
+    assert_eq!(foreign.status(), 404, "{}", replica.output());
+    let foreign: serde_json::Value = foreign.json().await.expect("a cross-tenant error envelope");
+    assert_eq!(foreign["error"]["type"], nonexistent["error"]["type"]);
+    assert_eq!(
+        upstream.state.requests().len(),
+        provider_requests_before_refusals,
+        "cross-tenant and unknown aliases are refused before provider dispatch"
+    );
+
+    let catalogue = replica
+        .breakglass(
+            http.get(replica.admin_url(&format!(
+                "/catalogue?tenant={INTEGRATION_TENANT}&project={INTEGRATION_PROJECT}"
+            ))),
+            "IG-10: inspect the healthy tenant catalogue",
+        )
+        .send()
+        .await
+        .expect("healthy catalogue response");
+    assert_eq!(catalogue.status(), 200, "{}", replica.output());
+    let catalogue: serde_json::Value = catalogue.json().await.expect("healthy catalogue body");
+    assert!(
+        catalogue.to_string().contains(INTEGRATION_ALIAS_SLUG),
+        "the healthy tenant catalogue retains its alias: {catalogue}"
+    );
+    assert!(
+        catalogue["aliases"]
+            .as_array()
+            .is_some_and(|aliases| aliases
+                .iter()
+                .all(|alias| alias["slug"] != SECOND_ALIAS_SLUG)),
+        "tenant A's management catalogue must not enumerate tenant B: {catalogue}"
+    );
+    let entry = catalogue["entries"]
+        .as_array()
+        .and_then(|entries| entries.first())
+        .unwrap_or_else(|| panic!("tenant A has a catalogue entry: {catalogue}"));
+    assert_eq!(entry["metadata"]["provider"], "openai");
+    assert_eq!(entry["metadata"]["published_model"], "gpt-4o");
+    assert!(
+        entry["metadata"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|value| value == "tool-call")),
+        "catalogue metadata carries the imported capability: {catalogue}"
+    );
+    assert_eq!(entry["price"]["source"], "operator");
+    assert_eq!(entry["price"]["book_version"], 1);
+    assert!(
+        !catalogue["pending"]
+            .as_array()
+            .is_some_and(|pending| pending.iter().any(|value| value == "offering-metadata"))
+    );
+    let second_catalogue = replica
+        .breakglass(
+            http.get(replica.admin_url(&format!(
+                "/catalogue?tenant={SECOND_TENANT}&project={SECOND_PROJECT}"
+            ))),
+            "IG-10: inspect the second tenant catalogue",
+        )
+        .send()
+        .await
+        .expect("second healthy catalogue response");
+    assert_eq!(second_catalogue.status(), 200, "{}", replica.output());
+    let second_catalogue: serde_json::Value = second_catalogue
+        .json()
+        .await
+        .expect("second healthy catalogue body");
+    assert!(
+        second_catalogue.to_string().contains(SECOND_ALIAS_SLUG)
+            && !second_catalogue
+                .to_string()
+                .contains(INTEGRATION_ALIAS_SLUG),
+        "tenant B's management catalogue is isolated: {second_catalogue}"
+    );
+
+    revision = publish_resource(
+        &replica,
+        &http,
+        "/aliases",
+        "ig-10-alias-disable",
+        &revision,
+        serde_json::json!({
+            "alias": INTEGRATION_ALIAS,
+            "tenant": INTEGRATION_TENANT,
+            "project": INTEGRATION_PROJECT,
+            "slug": INTEGRATION_ALIAS_SLUG,
+            "wire_family": "openai-chat",
+            "state": "disabled",
+            "targets": [{ "enablement": INTEGRATION_ENABLEMENT }],
+        }),
+    )
+    .await;
+    wait_for_convergence(&replica, &http, &revision, "control-plane").await;
+    let disabled_models = http
+        .get(replica.url("/v1/models"))
+        .bearer_auth(&workload_key)
+        .send()
+        .await
+        .expect("disabled alias discovery response");
+    assert_eq!(disabled_models.status(), 200, "{}", replica.output());
+    let disabled_models: serde_json::Value = disabled_models
+        .json()
+        .await
+        .expect("disabled alias discovery body");
+    assert!(!disabled_models["data"].as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry["id"] == INTEGRATION_ALIAS_SLUG)
+    }));
+
+    revision = publish_resource(
+        &replica,
+        &http,
+        "/aliases",
+        "ig-10-alias-enable",
+        &revision,
+        serde_json::json!({
+            "alias": INTEGRATION_ALIAS,
+            "tenant": INTEGRATION_TENANT,
+            "project": INTEGRATION_PROJECT,
+            "slug": INTEGRATION_ALIAS_SLUG,
+            "wire_family": "openai-chat",
+            "state": "enabled",
+            "targets": [{ "enablement": INTEGRATION_ENABLEMENT }],
+        }),
+    )
+    .await;
+    wait_for_convergence(&replica, &http, &revision, "control-plane").await;
+
+    let chat = http
+        .post(replica.url("/v1/chat/completions"))
+        .bearer_auth(&workload_key)
+        .json(&serde_json::json!({
+            "model": INTEGRATION_ALIAS_SLUG,
+            "messages": [{"role": "user", "content": "wave2"}],
+        }))
+        .send()
+        .await
+        .expect("a live inference response");
+    assert_eq!(chat.status(), 200, "{}", replica.output());
+    let first_request = upstream.state.last_request();
+    assert_eq!(
+        support::upstream::credential_digest(
+            first_request.authorization.as_deref().unwrap_or_default()
+        ),
+        support::upstream::credential_digest(&first_material),
+        "the first compiled snapshot resolved the first secret without exposing it"
+    );
+
+    wait_for_log(
+        &replica,
+        &["price_book", &format!("price/{INTEGRATION_PRICE_BOOK}@v1")],
+    )
+    .await;
+
+    let rotated = replica
+        .breakglass(
+            http.post(replica.admin_url("/secrets/rotate"))
+                .json(&serde_json::json!({
+                    "tenant": INTEGRATION_TENANT,
+                    "project": INTEGRATION_PROJECT,
+                    "reference": first_reference,
+                    "material": second_material,
+                })),
+            "IG-04: stage the rotated provider secret",
+        )
+        .send()
+        .await
+        .expect("a secret rotation response");
+    assert_eq!(rotated.status(), 200, "{}", replica.output());
+    let rotated: serde_json::Value = rotated.json().await.expect("a rotated secret body");
+    let second_reference = rotated["reference"]
+        .as_str()
+        .expect("the rotated secret names a version")
+        .to_owned();
+    let activated = replica
+        .breakglass(
+            http.post(replica.admin_url("/secrets/lifecycle"))
+                .json(&serde_json::json!({
+                    "tenant": INTEGRATION_TENANT,
+                    "project": INTEGRATION_PROJECT,
+                    "reference": second_reference,
+                    "lifecycle": "active",
+                })),
+            "IG-04: activate the rotated provider secret",
+        )
+        .send()
+        .await
+        .expect("the rotated secret activation response");
+    assert_eq!(activated.status(), 200, "{}", replica.output());
+
+    revision = publish_resource(
+        &replica,
+        &http,
+        "/credentials",
+        "ig-04-credential-rotate",
+        &revision,
+        serde_json::json!({
+            "credential": INTEGRATION_CREDENTIAL,
+            "tenant": INTEGRATION_TENANT,
+            "project": INTEGRATION_PROJECT,
+            "provider": INTEGRATION_PROVIDER,
+            "slug": "openai-primary",
+            "display_name": "Fixture OpenAI primary rotated",
+            "secret": secret_id,
+            "rotate": true,
+            "lifecycle": "active",
+        }),
+    )
+    .await;
+    let convergence = wait_for_convergence(&replica, &http, &revision, "control-plane").await;
+    assert_eq!(convergence["converged"], true, "{convergence}");
+    let chat = http
+        .post(replica.url("/v1/chat/completions"))
+        .bearer_auth(&workload_key)
+        .json(&serde_json::json!({
+            "model": INTEGRATION_ALIAS_SLUG,
+            "messages": [{"role": "user", "content": "rotated"}],
+        }))
+        .send()
+        .await
+        .expect("a rotated inference response");
+    assert_eq!(chat.status(), 200, "{}", replica.output());
+    let rotated_request = upstream.state.last_request();
+    assert_eq!(
+        support::upstream::credential_digest(
+            rotated_request.authorization.as_deref().unwrap_or_default()
+        ),
+        support::upstream::credential_digest(&second_material),
+        "the rotated revision resolved the new secret during compilation"
+    );
+    let rotation_audit = replica
+        .breakglass(
+            http.get(replica.admin_url(&format!("/audit/{revision}"))),
+            "IG-04: read the rotated revision audit",
+        )
+        .send()
+        .await
+        .expect("a rotated revision audit response");
+    assert_eq!(rotation_audit.status(), 200, "{}", replica.output());
+    let rotation_audit: serde_json::Value = rotation_audit
+        .json()
+        .await
+        .expect("a rotated revision audit body");
+    assert_eq!(
+        rotation_audit["events"][0]["actor"]["kind"], "breakglass",
+        "the rotated revision audit retains authenticated attribution: {rotation_audit}"
+    );
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "secret-rotation",
+        "rotation",
+        "secret_rotation",
+        &["revisions", "convergence_lag"],
+        &[
+            (
+                "secret-activated",
+                "the successor secret version was activated",
+            ),
+            (
+                "revision-published",
+                "the credential revision was published",
+            ),
+            (
+                "converged",
+                "the running replica loaded the successor revision",
+            ),
+        ],
+        &[
+            ("revision", serde_json::json!(revision.clone())),
+            ("source", serde_json::json!(convergence["source"].clone())),
+            (
+                "converged",
+                serde_json::json!(convergence["converged"].clone()),
+            ),
+        ],
+        &[],
+        &[
+            (
+                "rotated_revision_published",
+                "true",
+                "true",
+                "the successor credential reference was part of the published revision",
+            ),
+            (
+                "no_restart",
+                "true",
+                "true",
+                "the same replica served before and after the rotation",
+            ),
+        ],
+    );
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "secret-rotation",
+        "serving",
+        "secret_rotation",
+        &["serving_behavior", "audit_auth"],
+        &[
+            (
+                "rotated-request-served",
+                "the request completed through the rotated credential",
+            ),
+            (
+                "audit-read",
+                "the rotated publication was read through authenticated admin",
+            ),
+        ],
+        &[
+            ("chat_status", serde_json::json!(200)),
+            ("audit_status", serde_json::json!(200)),
+            (
+                "credential",
+                serde_json::json!("rotated-provider-reference"),
+            ),
+        ],
+        &[(
+            "max_serving_error_fraction",
+            "0.0",
+            "0.0",
+            "the rotated request was answered successfully",
+        )],
+        &[
+            (
+                "rotated_material_authenticated_upstream",
+                "true",
+                "true",
+                "the fake upstream observed the successor credential digest",
+            ),
+            (
+                "authenticated_audit_attribution",
+                "breakglass",
+                "breakglass",
+                "the rotated publication audit event retained its authenticated actor",
+            ),
+        ],
+    );
+
+    let signed = std::fs::read(&control_plane.cache_path).expect("the signed LKG cache exists");
+    let compiled = std::fs::read(control_plane.cache_path.with_extension("serving"))
+        .expect("the encrypted compiled-serving cache exists");
+    assert!(
+        !signed
+            .windows(first_material.len())
+            .any(|window| window == first_material.as_bytes())
+    );
+    assert!(
+        !signed
+            .windows(second_material.len())
+            .any(|window| window == second_material.as_bytes())
+    );
+    assert!(
+        !compiled
+            .windows(first_material.len())
+            .any(|window| window == first_material.as_bytes())
+    );
+    assert!(
+        !compiled
+            .windows(second_material.len())
+            .any(|window| window == second_material.as_bytes())
+    );
+    assert_eq!(&compiled[..24], b"axond.compiled-serving\0\x01");
+
+    drop(replica);
+    let outage = control_plane.serve_without_control_plane().await;
+    assert!(
+        outage
+            .output()
+            .contains("restored compiled serving snapshot"),
+        "cold boot must state that the compiled cache was restored:\n{}",
+        outage.output()
+    );
+    let ready = http
+        .get(outage.url("/readyz"))
+        .send()
+        .await
+        .expect("outage readiness response");
+    assert_eq!(ready.status(), 200, "{}", outage.output());
+    let outage_convergence =
+        wait_for_convergence(&outage, &http, &revision, "last-known-good").await;
+    assert_eq!(
+        outage_convergence["converged"], false,
+        "{outage_convergence}"
+    );
+    let outage_models = http
+        .get(outage.url("/v1/models"))
+        .bearer_auth(&workload_key)
+        .send()
+        .await
+        .expect("outage model discovery response");
+    assert_eq!(outage_models.status(), 200, "{}", outage.output());
+    let anonymous = http
+        .get(outage.url("/v1/models"))
+        .send()
+        .await
+        .expect("anonymous outage response");
+    assert_eq!(anonymous.status(), 401, "{}", outage.output());
+    let outage_chat = http
+        .post(outage.url("/v1/chat/completions"))
+        .bearer_auth(&workload_key)
+        .json(&serde_json::json!({
+            "model": INTEGRATION_ALIAS_SLUG,
+            "messages": [{"role": "user", "content": "cold-start"}],
+        }))
+        .send()
+        .await
+        .expect("outage inference response");
+    assert_eq!(outage_chat.status(), 200, "{}", outage.output());
+    let catalogue = outage
+        .breakglass(
+            http.get(outage.admin_url(&format!("/catalogue?tenant={INTEGRATION_TENANT}"))),
+            "IG-10: refuse an administrative catalogue read without the control plane",
+        )
+        .send()
+        .await
+        .expect("outage catalogue response");
+    assert_eq!(catalogue.status(), 503, "{}", outage.output());
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "cold-boot-valid-cache",
+        "serving",
+        "cold_boot_valid_cache",
+        &["serving_behavior", "fail_open_closed"],
+        &[
+            (
+                "cache-restored",
+                "the encrypted compiled-serving cache was restored",
+            ),
+            ("ready", "the restored replica answered readiness"),
+            (
+                "inference-served",
+                "the restored snapshot answered inference",
+            ),
+            (
+                "anonymous-refused",
+                "the restored snapshot kept inbound auth enforced",
+            ),
+            (
+                "administration-refused",
+                "the administrative catalogue refused without Postgres",
+            ),
+        ],
+        &[
+            ("ready_status", serde_json::json!(200)),
+            ("models_status", serde_json::json!(200)),
+            ("chat_status", serde_json::json!(200)),
+            ("anonymous_models_status", serde_json::json!(401)),
+            ("admin_catalogue_status", serde_json::json!(503)),
+            (
+                "source",
+                serde_json::json!(outage_convergence["source"].clone()),
+            ),
+            (
+                "converged",
+                serde_json::json!(outage_convergence["converged"].clone()),
+            ),
+        ],
+        &[(
+            "max_serving_error_fraction",
+            "0.0",
+            "0.0",
+            "the cached inference request was answered successfully",
+        )],
+        &[
+            (
+                "readiness_serves_cached_snapshot",
+                "200",
+                "200",
+                "the restored process reported ready",
+            ),
+            (
+                "anonymous_inference_refused",
+                "401",
+                "401",
+                "authentication remained enforced after cold start",
+            ),
+            (
+                "administrative_read_refused_without_control_plane",
+                "503",
+                "503",
+                "management reads did not pretend the serving cache was durable desired state",
+            ),
+        ],
+    );
+
+    drop(outage);
+
+    let recovered = control_plane.serve().await;
+    let recovered_convergence =
+        wait_for_convergence(&recovered, &http, &revision, "control-plane").await;
+    assert_eq!(
+        recovered_convergence["converged"], true,
+        "{recovered_convergence}"
+    );
 }
 
-/// Becomes: readiness reflects convergence rather than process liveness, and
-/// `/status` reports desired, loaded, active, and lag.
-#[test]
-fn readiness_and_status_report_convergence() {
-    stateful_serving_is_still_refused("IG-08");
-}
+/// The cache refusal stages are independent of the full serving graph: a
+/// replica with no valid projected snapshot must boot far enough to expose
+/// authenticated administration, while readiness and inference remain closed.
+/// Keeping this as a small real-process scenario also means the #158 evidence
+/// does not depend on the provider fixture or on a successful inference call.
+#[tokio::test]
+async fn cold_boot_cache_refusals_are_ready_only_when_authenticated_and_projected() {
+    let Some(control_plane) = ControlPlane::create().await else {
+        eprintln!(
+            "SKIPPED without AXOND_TEST_POSTGRES_DSN: cache refusal evidence requires a real stateful process"
+        );
+        return;
+    };
+    let migrated = control_plane.run(&["migrate", "apply"]);
+    assert!(migrated.succeeded(), "{}", migrated.context());
+    let http = client();
 
-/// Becomes: every usage record names the approved price-book version the
-/// request was charged against.
-#[test]
-fn every_usage_record_names_the_price_version() {
-    stateful_serving_is_still_refused("IG-09");
-}
+    let no_cache = control_plane.serve_without_control_plane_unready().await;
+    let no_cache_ready = http
+        .get(no_cache.url("/readyz"))
+        .send()
+        .await
+        .expect("no-cache readiness response");
+    let no_cache_admin = no_cache
+        .breakglass(
+            http.get(no_cache.admin_url("/state")),
+            "recovery: inspect no-cache administrative state",
+        )
+        .send()
+        .await
+        .expect("no-cache administrative response");
+    let no_cache_anon_admin = http
+        .get(no_cache.admin_url("/state"))
+        .send()
+        .await
+        .expect("no-cache anonymous administrative response");
+    let no_cache_models = http
+        .get(no_cache.url("/v1/models"))
+        .send()
+        .await
+        .expect("no-cache inference response");
+    assert_eq!(no_cache_ready.status(), 503, "{}", no_cache.output());
+    assert_eq!(no_cache_admin.status(), 503, "{}", no_cache.output());
+    assert_eq!(no_cache_anon_admin.status(), 401, "{}", no_cache.output());
+    assert_eq!(no_cache_models.status(), 401, "{}", no_cache.output());
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "cold-boot-no-cache",
+        "readiness",
+        "cold_boot_no_cache",
+        &["fail_open_closed", "audit_auth"],
+        &[
+            (
+                "booted-without-cache",
+                "the replica opened its authenticated administrative surface",
+            ),
+            (
+                "readiness-refused",
+                "the replica had no valid serving snapshot",
+            ),
+        ],
+        &[
+            ("ready_status", serde_json::json!(503)),
+            ("admin_state_status", serde_json::json!(503)),
+            ("anonymous_admin_status", serde_json::json!(401)),
+            ("anonymous_models_status", serde_json::json!(401)),
+        ],
+        &[],
+        &[
+            (
+                "readiness_refuses_without_cache",
+                "503",
+                "503",
+                "a cacheless cold boot remains unready",
+            ),
+            (
+                "authenticated_administration_refuses_without_control_plane",
+                "503",
+                "503",
+                "the unready process keeps the administrative route but cannot read the unavailable journal",
+            ),
+            (
+                "administration_requires_authentication",
+                "401",
+                "401",
+                "the unready process does not weaken administrative authentication",
+            ),
+        ],
+    );
+    drop(no_cache);
 
-/// Becomes: a tenant's catalogue view contains only what that tenant may call
-/// and explains why each entry is available or not.
-#[test]
-fn a_tenant_catalogue_is_isolated_and_explains_itself() {
-    stateful_serving_is_still_refused("IG-10");
+    std::fs::write(&control_plane.cache_path, b"edited signed cache")
+        .expect("write the invalid signed cache");
+    std::fs::write(
+        control_plane.cache_path.with_extension("serving"),
+        b"edited compiled serving cache",
+    )
+    .expect("write the invalid compiled serving cache");
+    let invalid_cache = control_plane.serve_without_control_plane_unready().await;
+    let invalid_ready = http
+        .get(invalid_cache.url("/readyz"))
+        .send()
+        .await
+        .expect("invalid-cache readiness response");
+    let invalid_admin = invalid_cache
+        .breakglass(
+            http.get(invalid_cache.admin_url("/state")),
+            "recovery: inspect invalid-cache administrative state",
+        )
+        .send()
+        .await
+        .expect("invalid-cache administrative response");
+    let invalid_anon_admin = http
+        .get(invalid_cache.admin_url("/state"))
+        .send()
+        .await
+        .expect("invalid-cache anonymous administrative response");
+    let invalid_models = http
+        .get(invalid_cache.url("/v1/models"))
+        .send()
+        .await
+        .expect("invalid-cache inference response");
+    assert_eq!(invalid_ready.status(), 503, "{}", invalid_cache.output());
+    assert_eq!(invalid_admin.status(), 503, "{}", invalid_cache.output());
+    assert_eq!(
+        invalid_anon_admin.status(),
+        401,
+        "{}",
+        invalid_cache.output()
+    );
+    assert_eq!(invalid_models.status(), 401, "{}", invalid_cache.output());
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "cold-boot-invalid-cache",
+        "readiness",
+        "cold_boot_invalid_cache",
+        &["fail_open_closed", "audit_auth"],
+        &[
+            (
+                "booted-with-invalid-cache",
+                "the replica opened its authenticated administrative surface",
+            ),
+            (
+                "readiness-refused",
+                "cache authentication failed and no snapshot was published",
+            ),
+        ],
+        &[
+            ("ready_status", serde_json::json!(503)),
+            ("admin_state_status", serde_json::json!(503)),
+            ("anonymous_admin_status", serde_json::json!(401)),
+            ("anonymous_models_status", serde_json::json!(401)),
+        ],
+        &[],
+        &[
+            (
+                "readiness_refuses_with_invalid_cache",
+                "503",
+                "503",
+                "an edited cache cannot make a replica ready",
+            ),
+            (
+                "authenticated_administration_refuses_without_control_plane",
+                "503",
+                "503",
+                "cache refusal does not pretend the unavailable journal is readable",
+            ),
+            (
+                "administration_requires_authentication",
+                "401",
+                "401",
+                "cache refusal does not weaken administrative authentication",
+            ),
+        ],
+    );
+    drop(invalid_cache);
 }
 
 /// Becomes: the qualification harness publishes stateful capacity envelopes and
@@ -1145,5 +2963,11 @@ fn a_tenant_catalogue_is_isolated_and_explains_itself() {
 /// upgrade.
 #[test]
 fn stateful_qualification_profiles_are_published() {
-    stateful_serving_is_still_refused("IG-11");
+    let (config, env, _) = stateful_bootstrap();
+    let run = stateful::run(&config, &["check", "preflight"], &env);
+    assert!(
+        !run.succeeded(),
+        "IG-11 remains blocked until load and long-soak evidence exists"
+    );
+    assert!(run.reported().contains("serving"), "{}", run.context());
 }

@@ -134,20 +134,17 @@ impl std::fmt::Debug for PostgresSecrets {
 }
 
 impl PostgresSecrets {
-    /// Connect, optionally apply the shipped DDL, and prove the table is
-    /// readable.
+    /// Build the reconnecting resolver without opening the first connection.
     ///
-    /// The KEK is resolved by the caller — it comes from an env var or a file
-    /// named in bootstrap config — so this takes the key rather than the
-    /// reference: a store that read the material itself would be a second place
-    /// key bytes are handled.
-    pub async fn connect(
+    /// A compiled serving cache may make a replica useful during a database
+    /// outage. This object still cannot resolve a new revision until Postgres
+    /// returns, and it never supplies material to the request path.
+    pub fn deferred(
         dsn: &str,
         settings: SecretStoreSettings,
         kek: DeploymentKek,
     ) -> Result<Self, SecretError> {
         let mut config: Config = dsn.parse().map_err(|error| {
-            // The DSN itself is never echoed: it carries a password.
             denied(format!("the secret-store DSN could not be parsed: {error}"))
         })?;
         config.connect_timeout(settings.connect_timeout);
@@ -165,20 +162,53 @@ impl PostgresSecrets {
                 Ok(schema.to_owned())
             })
             .transpose()?;
-
-        let store = Self {
+        Ok(Self {
             config,
             settings,
             search_path,
             kek,
             ids: Uuid7Generator::new(),
             client: tokio::sync::Mutex::new(None),
-        };
+        })
+    }
+
+    /// Connect, optionally apply the shipped DDL, and prove the table is
+    /// readable.
+    ///
+    /// The KEK is resolved by the caller — it comes from an env var or a file
+    /// named in bootstrap config — so this takes the key rather than the
+    /// reference: a store that read the material itself would be a second place
+    /// key bytes are handled.
+    pub async fn connect(
+        dsn: &str,
+        settings: SecretStoreSettings,
+        kek: DeploymentKek,
+    ) -> Result<Self, SecretError> {
+        let store = Self::deferred(dsn, settings, kek)?;
+        store.connect_initial().await?;
+        Ok(store)
+    }
+
+    /// Connect when possible, otherwise return the same reconnecting store with
+    /// an empty client. Permanent configuration/schema refusals remain errors.
+    pub async fn connect_or_defer(
+        dsn: &str,
+        settings: SecretStoreSettings,
+        kek: DeploymentKek,
+    ) -> Result<Self, SecretError> {
+        let store = Self::deferred(dsn, settings, kek)?;
+        match store.connect_initial().await {
+            Ok(()) | Err(SecretError::Unavailable { .. }) => Ok(store),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn connect_initial(&self) -> Result<(), SecretError> {
         // Only this call site is a boot: a bad password or an absent database is
         // a deployment to fix, and a replica that has not started yet loses
         // nothing by saying so. `connect_client` is also the reconnect path, and
         // there the same codes stay retryable — see `run`.
-        let client = tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
+        let client = tokio::time::timeout(self.settings.connect_timeout, self.connect_client())
             .await
             .map_err(|_| unavailable_message("connection timed out"))?
             .map_err(|error| {
@@ -197,9 +227,9 @@ impl PostgresSecrets {
             })?;
         let writability = Writability::of(&client).await;
         writability.report();
-        store.prepare_schema(&client, writability).await?;
-        *store.client.lock().await = Some(client);
-        Ok(store)
+        self.prepare_schema(&client, writability).await?;
+        *self.client.lock().await = Some(client);
+        Ok(())
     }
 
     /// The KEK reference material is currently sealed under. A name, for the

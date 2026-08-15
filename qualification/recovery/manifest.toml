@@ -15,9 +15,10 @@
 # scenario became executable at different times. The control-plane half — losing
 # Postgres, cold-booting from the signed cache, converging when it returns — runs
 # today against a real database, and the driver writes its evidence to
-# `target/recovery/`. The serving half needs a revision projection a replica can
-# serve, which is a later slice, so it is a stage of its own with its own
-# blockers rather than a footnote on a scenario that claims to be executable.
+# `target/recovery/`. The serving half is a stage of its own. The black-box
+# stateful integration lane now owns the cached-serving and secret-rotation
+# stages that it directly proves; the in-process recovery driver retains the
+# severable-link stages.
 # A scenario is executable exactly when all of its stages are.
 #
 # `status` is the honest state of that code, per stage: `executable` means a
@@ -95,31 +96,23 @@ evidence = ["outage_timeline", "revisions", "convergence_lag"]
 
 [[scenario.stage]]
 id = "serving"
-status = "blocked"
+status = "executable"
+runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 Inference offered across the same window, so the serving-error ceiling is \
 measured against requests rather than asserted about an empty snapshot."""
 evidence = ["serving_behavior", "fail_open_closed"]
 
-[[scenario.stage.blocked_on]]
-issue = 148
-needs = "a revision projection a replica can actually serve, so `serving_behavior` is measured against traffic rather than asserted about an empty snapshot"
-
-[[scenario.stage.blocked_on]]
-issue = 149
-needs = "tenant model enablement and aliases, so the requests offered during the outage resolve to a target"
-
 [[scenario.stage]]
 id = "administration"
-status = "blocked"
+status = "executable"
+runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 Authenticated and unauthenticated administrative calls across the window, and \
 the audit rows they do or do not leave behind."""
 evidence = ["audit_auth"]
-
-[[scenario.stage.blocked_on]]
-issue = 144
-needs = "durable principals, RBAC, and the administrative surface they guard, so an unauthenticated administrative call has an authority to be refused by rather than a store method to call directly"
 
 # ── Cold boot, three cache states ────────────────────────────────────────────
 
@@ -151,15 +144,13 @@ evidence = ["outage_timeline", "cold_start", "revisions"]
 
 [[scenario.stage]]
 id = "serving"
-status = "blocked"
+status = "executable"
+runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 The restored snapshot answering requests, so a cold boot from cache is qualified \
 by traffic rather than by a successful bootstrap alone."""
 evidence = ["serving_behavior", "fail_open_closed"]
-
-[[scenario.stage.blocked_on]]
-issue = 148
-needs = "a projection, so a restored cache compiles into a snapshot that answers requests"
 
 [[scenario]]
 id = "cold-boot-no-cache"
@@ -189,15 +180,13 @@ evidence = ["outage_timeline", "cold_start"]
 
 [[scenario.stage]]
 id = "readiness"
-status = "blocked"
+status = "executable"
+runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 The readiness endpoint a deployment probes, and what an operator's tooling sees \
 when a replica refuses to start."""
 evidence = ["fail_open_closed", "audit_auth"]
-
-[[scenario.stage.blocked_on]]
-issue = 158
-needs = "the production deployment overlay whose readiness contract this scenario is evidence for"
 
 [[scenario]]
 id = "cold-boot-invalid-cache"
@@ -227,15 +216,13 @@ evidence = ["outage_timeline", "cold_start"]
 
 [[scenario.stage]]
 id = "readiness"
-status = "blocked"
+status = "executable"
+runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 The readiness endpoint and the operator-facing report of a cache that refused \
 itself."""
 evidence = ["fail_open_closed", "audit_auth"]
-
-[[scenario.stage.blocked_on]]
-issue = 158
-needs = "the deployment overlay that provisions the cache signing key, so a wrong-key boot is the deployed failure mode rather than a synthetic one"
 
 # ── Coming back ──────────────────────────────────────────────────────────────
 
@@ -269,31 +256,23 @@ evidence = ["outage_timeline", "revisions", "convergence_lag", "revision_loss_bo
 
 [[scenario.stage]]
 id = "serving"
-status = "blocked"
+status = "executable"
+runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 Traffic across the recovery, so convergence is qualified by what a replica \
 serves and not only by what it reports."""
 evidence = ["serving_behavior"]
 
-[[scenario.stage.blocked_on]]
-issue = 148
-needs = "a projection, so convergence has a runtime snapshot to publish"
-
-[[scenario.stage.blocked_on]]
-issue = 150
-needs = "dynamically configurable budgets, rate limits, and revocation, so a converged revision changes policy a request can be observed under"
-
 [[scenario.stage]]
 id = "administration"
-status = "blocked"
+status = "executable"
+runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 The audit trail across the outage and the recovery, read through the \
 administrative surface that authenticates its callers."""
 evidence = ["audit_auth"]
-
-[[scenario.stage.blocked_on]]
-issue = 144
-needs = "durable principals and RBAC, so the audit trail is read back through an authenticated administrative surface rather than through the store"
 
 [[scenario]]
 id = "secret-rotation"
@@ -314,27 +293,23 @@ max_unauthenticated_admin_successes = 0
 
 [[scenario.stage]]
 id = "rotation"
-status = "blocked"
+status = "executable"
+runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 Rotating the material behind a credential reference and publishing the revision \
 that carries it, without restarting or redeploying a replica."""
 evidence = ["revisions", "convergence_lag"]
 
-[[scenario.stage.blocked_on]]
-issue = 145
-needs = "the SecretStore implementation and the zero-redeploy credential lifecycle this scenario is the evidence for"
-
 [[scenario.stage]]
 id = "serving"
-status = "blocked"
+status = "executable"
+runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 Requests authenticated with the rotated material, and in-flight requests \
 finishing under the snapshot they started on."""
 evidence = ["serving_behavior", "audit_auth"]
-
-[[scenario.stage.blocked_on]]
-issue = 148
-needs = "credential entitlement reconciliation, so a rotated credential is observable in what a replica serves"
 
 # ── Losing the database, and getting it back ─────────────────────────────────
 
@@ -345,7 +320,7 @@ description = """
 The control-plane database is lost and restored from a backup taken while the \
 fleet was serving. Revisions, tenancy, secret metadata, pricing, and audit rows \
 all come back together; the restored journal hydrates its head revision; and the \
-replicas that kept serving converge onto it rather than fighting it."""
+survivor that kept serving reconnects, converges onto it, and answers inference traffic."""
 
 [scenario.gate]
 max_serving_error_fraction = 0.0
@@ -364,10 +339,10 @@ A deployment is built through `axond admin` against a running replica, backed \
 up while that replica administers it, and restored into a database it never \
 wrote: the revision chain, its checksums, the tenancy and access projections, \
 the credential references, and the audit rows all come back, a replica booted \
-on the restored journal reads the same head, and a publication against that \
-head is accepted. Before a projected serving snapshot exists, that restored \
-replica fails readiness and inference closed rather than presenting durable \
-state as a ready serving configuration."""
+on the restored journal reads the same head, accepts a publication against that \
+head, becomes ready, and serves the projected fixture. The survivor then \
+reconnects to the restored journal, converges to its new head, and answers \
+inference traffic."""
 evidence = ["outage_timeline", "revisions", "restore_duration", "revision_loss_boundary", "fail_open_closed"]
 
 [[scenario.stage]]
@@ -382,38 +357,24 @@ evidence = ["audit_auth"]
 
 [[scenario.stage]]
 id = "durable-inventory"
-status = "blocked"
+status = "executable"
+runner = "restore-drill"
 covers = """
 The durable state a restore has to bring back beyond the journal and its \
 tenancy: wrapped secret material and its lifecycle, imported catalogue \
 snapshots, and effective-dated price books. Named per class rather than \
 counted, because a restore that brought back the revisions and lost the \
 material they reference is a restore that reads as complete."""
-evidence = ["data_loss_boundary"]
-
-[[scenario.stage.blocked_on]]
-issue = 145
-needs = "the staging and rotation path for wrapped material, so a restore can be checked to bring secret metadata and its lifecycle back with the credentials that reference it"
-
-[[scenario.stage.blocked_on]]
-issue = 146
-needs = "an operator path that imports a catalogue snapshot, so a restored revision's blob references point at content that has to survive with it"
-
-[[scenario.stage.blocked_on]]
-issue = 147
-needs = "effective-dated price books, so the restore covers pricing state and not only routing and tenancy state"
+evidence = ["usage_loss_boundary"]
 
 [[scenario.stage]]
 id = "reconvergence"
-status = "blocked"
+status = "executable"
+runner = "restore-drill"
 covers = """
 The replicas that kept serving converging onto the restored journal, and the \
 traffic that says they did so without fighting it."""
 evidence = ["serving_behavior", "convergence_lag"]
-
-[[scenario.stage.blocked_on]]
-issue = 148
-needs = "a projection and the reconciler that publishes it in `serve`, so a replica converging onto a restored journal is observable in what it serves rather than only in what it reads"
 
 [[scenario]]
 id = "point-in-time-recovery"
@@ -461,27 +422,24 @@ evidence = ["audit_auth"]
 
 [[scenario.stage]]
 id = "usage-boundary"
-status = "blocked"
+status = "executable"
+runner = "restore-drill"
 covers = """
-The same boundary measured over usage: which usage records survived the \
-recovery target, and under which identity a replayed request is the same \
-request."""
+The same boundary measured over usage records and their durable outbox events: \
+the request answered before the recovery target survives under its canonical \
+globally unique identity, while the request answered after the target is absent \
+and is not replayed."""
 evidence = ["data_loss_boundary"]
-
-[[scenario.stage.blocked_on]]
-issue = 155
-needs = "the explicit decision on the durable usage outbox and globally unique request ids: whether a recovery boundary is measured over usage records at all, and against which identity"
 
 [[scenario.stage]]
 id = "reconvergence"
-status = "blocked"
+status = "executable"
+runner = "restore-drill"
 covers = """
-Serving across the recovery and converging onto the recovered head."""
+Serving across the recovery and converging onto the recovered head, with \
+inference traffic answered by the survivor after it reconnects to the promoted \
+PITR cluster."""
 evidence = ["serving_behavior", "convergence_lag"]
-
-[[scenario.stage.blocked_on]]
-issue = 148
-needs = "a projection and the reconciler that publishes it in `serve`, so serving across a point-in-time recovery is measured rather than assumed"
 
 # Slices #219 once waited on and no longer does. Recorded rather than deleted:
 # a slice that simply disappears from the map is indistinguishable from a stage

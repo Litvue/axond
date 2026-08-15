@@ -501,9 +501,12 @@ fn config_toml(
     let price = format!(
         "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
     );
-    let model = |name: &str, provider: &str| {
+    let model = |name: &str, namespace: Option<&str>, provider: &str| {
+        let namespace = namespace
+            .map(|namespace| format!("namespace = \"{namespace}\"\n"))
+            .unwrap_or_default();
         format!(
-            "[[model]]\nname = \"{name}\"\ntargets = [ {{ provider = \"{provider}\", model = \"{target}\", price = {price} }} ]\n\n",
+            "[[model]]\nname = \"{name}\"\n{namespace}targets = [ {{ provider = \"{provider}\", model = \"{target}\", price = {price} }} ]\n\n",
             target = target::CHAT,
         )
     };
@@ -636,9 +639,9 @@ overall_timeout_ms = 30000
         ]
         .concat(),
         models = [
-            model(ACME.alias, ACME.provider),
-            model(GLOBEX.alias, GLOBEX.provider),
-            model(PLATFORM_ALIAS, PLATFORM_PROVIDER),
+            model(ACME.alias, Some(ACME.namespace), ACME.provider),
+            model(GLOBEX.alias, Some(GLOBEX.namespace), GLOBEX.provider),
+            model(PLATFORM_ALIAS, None, PLATFORM_PROVIDER),
         ]
         .concat(),
     )

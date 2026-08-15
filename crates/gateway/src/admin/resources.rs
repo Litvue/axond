@@ -36,15 +36,18 @@ use serde::de::DeserializeOwned;
 
 use super::error::AdminError;
 use super::service::DesiredStateEdit;
+use crate::backends::catalog::{CatalogContentId, ProviderId};
 use crate::desired_state::{
-    AliasTarget, BlobKind, BlobRef, BudgetBound, BudgetPolicy, CatalogOffering, Checksum,
-    ConcurrencyPolicy, DesiredState, DisplayName, InvalidDisplayName, InvalidId, InvalidSlug,
-    InvalidUuid7, ModelAliasBody, ModelEnablementBody, ModelLifecycle, ModelOwner, ObservedPrice,
-    OfferingId, PolicyBody, PolicyEpoch, PolicyScope, ProjectBody, ProjectId, ProviderBody,
-    ProviderCredentialBody, ResourceBody, ResourceId, ResourceKind, ResourceRef, ResourceScope,
-    ResourceVersion, ResourceVersionNumber, RevocationPolicy, SecretId, SecretLifecycle,
-    SecretOwner, SecretRef, SecretVersion, Slug, Surface, TenantBody, TenantId, TenantLifecycle,
-    ValidationError, WireFamily,
+    Actor, AliasTarget, Approval, ApprovedRate, ApprovedRates, BlobKind, BlobRef, BudgetBound,
+    BudgetPolicy, CatalogOffering, Checksum, ConcurrencyPolicy, Credential, DesiredState,
+    DisplayName, EffectiveInstant, EffectiveInterval, IdentityBody, IdentityKind,
+    InvalidDisplayName, InvalidId, InvalidSlug, InvalidUuid7, ModelAliasBody, ModelEnablementBody,
+    ModelLifecycle, ModelOwner, ObservedPrice, OfferingId, PolicyBody, PolicyEpoch, PolicyScope,
+    PriceBookBody, PriceOrigin, PriceProvenance, PriceRule, PricedTarget, PrincipalId, ProjectBody,
+    ProjectId, ProviderBody, ProviderCredentialBody, ResourceBody, ResourceId, ResourceKind,
+    ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, RevocationPolicy, Role,
+    RulePrecedence, SecretId, SecretLifecycle, SecretOwner, SecretRef, SecretVersion, Slug,
+    Surface, TenantBody, TenantId, TenantLifecycle, ValidationError, WireFamily,
 };
 
 /// What a handler contributes to a mutation: where it applies, and what it does.
@@ -73,11 +76,33 @@ impl ResourcePlan {
         }
     }
 
+    fn new_with_actor<E>(scope: ResourceScope, edit: E) -> Self
+    where
+        E: Fn(&mut DesiredState, &Actor) -> Result<(), ValidationError> + Send + Sync + 'static,
+    {
+        Self {
+            scope,
+            edit: Arc::new(ActorAwareEdit(edit)),
+            retires: false,
+        }
+    }
+
     /// The same plan, marked as retiring the resource it publishes.
     #[must_use]
     fn retiring(mut self, retires: bool) -> Self {
         self.retires = retires;
         self
+    }
+}
+
+struct ActorAwareEdit<F>(F);
+
+impl<F> DesiredStateEdit for ActorAwareEdit<F>
+where
+    F: Fn(&mut DesiredState, &Actor) -> Result<(), ValidationError> + Send + Sync,
+{
+    fn edit(&self, state: &mut DesiredState, actor: &Actor) -> Result<(), ValidationError> {
+        (self.0)(state, actor)
     }
 }
 
@@ -229,6 +254,131 @@ impl AdminResourceRequest for ProjectRequest {
             move |state: &mut DesiredState| {
                 let version = next_version(state, ResourceKind::Project, body.resource_id());
                 publish(state, body.version_at(slug.clone(), version))?;
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// The document `POST /admin/v1/principals` reads.
+///
+/// Workload material never crosses the control-plane API. The caller presents
+/// the digest of a one-time `axw1.` key it minted through its secret-delivery
+/// workflow; the revision retains only that digest and the resulting snapshot
+/// reconstructs the verifier. Omitting the digest is the typed revocation form.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalRequest {
+    pub principal: String,
+    pub tenant: String,
+    #[serde(default)]
+    pub project: Option<String>,
+    pub slug: String,
+    pub display_name: String,
+    /// `workload` is the backwards-compatible default. Human principals must
+    /// say `human` explicitly so an issuer-scoped identity is never inferred
+    /// from a partially populated document.
+    #[serde(default)]
+    pub identity_kind: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub key_digest: Option<String>,
+    pub roles: Vec<String>,
+}
+
+impl AdminResourceRequest for PrincipalRequest {
+    const SCHEMA: &'static str = "principal";
+
+    const SURFACE: Surface = Surface::Principal;
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let principal = PrincipalId::parse(&self.principal)
+            .map_err(|error| malformed_id::<Self>("principal", PrincipalId::PREFIX, error))?;
+        let tenant = tenant_id::<Self>(&self.tenant)?;
+        let project = self
+            .project
+            .as_deref()
+            .map(project_id::<Self>)
+            .transpose()?;
+        let scope = match project {
+            Some(project) => ResourceScope::Project { tenant, project },
+            None => ResourceScope::Tenant(tenant),
+        };
+        let slug = slug::<Self>(&self.slug)?;
+        let display_name = display_name::<Self>(&self.display_name)?;
+        let mut roles = Vec::with_capacity(self.roles.len());
+        for role in &self.roles {
+            roles.push(Role::parse(role).ok_or_else(|| {
+                unknown::<Self>("roles", Role::ALL.iter().map(|role| role.as_str()))
+            })?);
+        }
+        let kind = match self.identity_kind.as_deref().unwrap_or("workload") {
+            value if value == IdentityKind::Human.as_str() => IdentityKind::Human,
+            value if value == IdentityKind::Workload.as_str() => IdentityKind::Workload,
+            _ => {
+                return Err(unknown::<Self>(
+                    "identity_kind",
+                    IdentityKind::ALL.iter().map(|kind| kind.as_str()),
+                ));
+            }
+        };
+        let credential = match kind {
+            IdentityKind::Human => {
+                if self.key_digest.is_some() {
+                    return Err(malformed::<Self>(
+                        "key_digest",
+                        "is not allowed for human identities",
+                    ));
+                }
+                let issuer = self
+                    .issuer
+                    .as_deref()
+                    .filter(|issuer| !issuer.trim().is_empty())
+                    .ok_or_else(|| malformed::<Self>("issuer", "is required for human identities"))?
+                    .trim()
+                    .to_owned();
+                let subject = self
+                    .subject
+                    .as_deref()
+                    .filter(|subject| !subject.trim().is_empty())
+                    .ok_or_else(|| {
+                        malformed::<Self>("subject", "is required for human identities")
+                    })?
+                    .trim()
+                    .to_owned();
+                Credential::Oidc { issuer, subject }
+            }
+            IdentityKind::Workload => {
+                if self.issuer.is_some() {
+                    return Err(malformed::<Self>(
+                        "issuer",
+                        "is not allowed for workload identities",
+                    ));
+                }
+                if self.subject.is_some() {
+                    return Err(malformed::<Self>(
+                        "subject",
+                        "is not allowed for workload identities",
+                    ));
+                }
+                let digest = self
+                    .key_digest
+                    .as_deref()
+                    .map(|digest| checksum::<Self>("key_digest", digest))
+                    .transpose()?;
+                Credential::MintedKey { digest }
+            }
+        };
+        let body = IdentityBody::new(principal, display_name, credential, roles)
+            .map_err(|error| malformed::<Self>("roles", &error.to_string()))?;
+        Ok(ResourcePlan::new(
+            scope.clone(),
+            move |state: &mut DesiredState| {
+                let version = next_version(state, ResourceKind::Identity, body.resource_id());
+                publish(state, body.version_at(scope.clone(), slug.clone(), version))?;
                 Ok(())
             },
         ))
@@ -476,6 +626,169 @@ impl AdminResourceRequest for CatalogRequest {
                 // payload's declaration, which is a validation failure no author
                 // could otherwise repair.
                 state.retain_referenced_blobs();
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// One effective-dated price rule in a deployment PriceBook.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceRuleRequest {
+    pub provider: String,
+    pub model: String,
+    pub precedence: String,
+    pub from_millis: u64,
+    #[serde(default)]
+    pub until_millis: Option<u64>,
+    pub input_nano_dollars_per_million: u64,
+    pub output_nano_dollars_per_million: u64,
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub citation: Option<String>,
+}
+
+/// The document `POST /admin/v1/prices` reads.
+///
+/// The request may describe a draft or an approved book, but it cannot name the
+/// approver: an approved body records the authenticated administrative actor
+/// that actually published it. This is the management seam that turns a typed
+/// PriceBook into a serving price rather than accepting caller-supplied audit
+/// metadata.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceBookRequest {
+    pub price_book: String,
+    pub slug: String,
+    pub catalog: String,
+    pub catalog_version: u64,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub approved_at_millis: Option<u64>,
+    #[serde(default)]
+    pub approval_citation: Option<String>,
+    pub rules: Vec<PriceRuleRequest>,
+}
+
+impl AdminResourceRequest for PriceBookRequest {
+    const SCHEMA: &'static str = "price-book";
+
+    const SURFACE: Surface = Surface::Price;
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let price_book = resource_id::<Self>("price_book", &self.price_book)?;
+        let slug = slug::<Self>(&self.slug)?;
+        let catalog = CatalogContentId::from_checksum(checksum::<Self>("catalog", &self.catalog)?);
+        let catalog_version = ResourceVersionNumber::new(self.catalog_version)
+            .ok_or_else(|| malformed::<Self>("catalog_version", "versions start at 1"))?;
+        let approved = match self.state.as_deref() {
+            None | Some("draft") => false,
+            Some("approved") => true,
+            Some(_) => {
+                return Err(unknown::<Self>("state", ["draft", "approved"]));
+            }
+        };
+        let approved_at = match (approved, self.approved_at_millis) {
+            (true, Some(at)) => Some(EffectiveInstant::from_millis(at)),
+            (true, None) => {
+                return Err(malformed::<Self>(
+                    "approved_at_millis",
+                    "is required when state is `approved`",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(malformed::<Self>(
+                    "approved_at_millis",
+                    "is only accepted when state is `approved`",
+                ));
+            }
+            (false, None) => None,
+        };
+        let approval_citation = match self.approval_citation {
+            Some(citation) if approved => Some(display_name::<Self>(&citation)?),
+            Some(_) => {
+                return Err(malformed::<Self>(
+                    "approval_citation",
+                    "is only accepted when state is `approved`",
+                ));
+            }
+            None => None,
+        };
+
+        let mut rules = Vec::with_capacity(self.rules.len());
+        for (index, request) in self.rules.into_iter().enumerate() {
+            let provider = ProviderId::parse(&request.provider).map_err(|_| {
+                malformed::<Self>("rules", &format!("entry {index} has an invalid provider"))
+            })?;
+            if request.model.is_empty()
+                || request.model.len() > 256
+                || request.model.chars().any(char::is_control)
+            {
+                return Err(malformed::<Self>(
+                    "rules",
+                    &format!("entry {index} has an invalid model"),
+                ));
+            }
+            let precedence = RulePrecedence::parse(&request.precedence).ok_or_else(|| {
+                malformed::<Self>("rules", &format!("entry {index} has an invalid precedence"))
+            })?;
+            let effective_from = EffectiveInstant::from_millis(request.from_millis);
+            let effective = match request.until_millis {
+                Some(until) => {
+                    EffectiveInterval::bounded(effective_from, EffectiveInstant::from_millis(until))
+                        .map_err(|error| {
+                            malformed::<Self>("rules", &format!("entry {index}: {error}"))
+                        })?
+                }
+                None => EffectiveInterval::from(effective_from),
+            };
+            let origin = match request.origin.as_deref() {
+                None => PriceOrigin::Catalogue,
+                Some(origin) => PriceOrigin::parse(origin).ok_or_else(|| {
+                    malformed::<Self>("rules", &format!("entry {index} has an invalid origin"))
+                })?,
+            };
+            let provenance = match request.citation {
+                Some(citation) => PriceProvenance::cited(origin, display_name::<Self>(&citation)?),
+                None => PriceProvenance::stated(origin),
+            };
+            let rates = ApprovedRates::new(
+                ApprovedRate::from_nanos(request.input_nano_dollars_per_million),
+                ApprovedRate::from_nanos(request.output_nano_dollars_per_million),
+            );
+            rules.push(
+                PriceRule::new(
+                    PricedTarget::new(provider, request.model),
+                    precedence,
+                    effective,
+                    rates,
+                    provenance,
+                )
+                .map_err(|error| malformed::<Self>("rules", &format!("entry {index}: {error}")))?,
+            );
+        }
+
+        Ok(ResourcePlan::new_with_actor(
+            ResourceScope::Deployment,
+            move |state: &mut DesiredState, actor: &Actor| {
+                let approval = match (approved, approved_at) {
+                    (true, Some(at)) => Approval::Approved {
+                        by: actor.clone(),
+                        at,
+                        citation: approval_citation.clone(),
+                    },
+                    (false, None) => Approval::Draft,
+                    _ => unreachable!("price approval was validated before the edit"),
+                };
+                let body = rules.iter().cloned().fold(
+                    PriceBookBody::new(catalog, catalog_version, approval),
+                    PriceBookBody::with_rule,
+                );
+                let version = next_version(state, ResourceKind::Price, price_book);
+                publish(state, body.version_at(price_book, slug.clone(), version))?;
                 Ok(())
             },
         ))
@@ -1042,6 +1355,78 @@ mod tests {
             lifecycle: Some("active".to_owned()),
             rotate: false,
         }
+    }
+
+    #[test]
+    fn approved_price_books_record_the_authenticated_actor() {
+        let request = PriceBookRequest {
+            price_book: fixtures::resource_id(31).to_string(),
+            slug: "deployment-prices".to_owned(),
+            catalog: fixtures::catalog_content_id().checksum().to_string(),
+            catalog_version: fixtures::catalog_version().get(),
+            state: Some("approved".to_owned()),
+            approved_at_millis: Some(0),
+            approval_citation: Some("CHG-PRICE-1".to_owned()),
+            rules: vec![PriceRuleRequest {
+                provider: "openai".to_owned(),
+                model: "gpt-4o".to_owned(),
+                precedence: "baseline".to_owned(),
+                from_millis: 0,
+                until_millis: None,
+                input_nano_dollars_per_million: 1_000_000,
+                output_nano_dollars_per_million: 2_000_000,
+                origin: Some("catalogue".to_owned()),
+                citation: None,
+            }],
+        };
+        let plan = request.plan().expect("the typed price document is valid");
+        let actor = fixtures::actor();
+        let mut state = DesiredState::new();
+        plan.edit
+            .edit(&mut state, &actor)
+            .expect("the price document publishes");
+        let resource = state
+            .version_of(ResourceKind::Price, fixtures::resource_id(31))
+            .expect("the price resource is present");
+        let body = PriceBookBody::read(resource).expect("the published body is typed");
+        assert_eq!(body.approval().approver(), Some(&actor));
+        assert_eq!(body.rules().len(), 1);
+    }
+
+    #[test]
+    fn principal_documents_publish_project_workload_digests_without_material() {
+        let key = fixtures::workload_key(0xd0);
+        let plan = PrincipalRequest {
+            principal: fixtures::principal_id(33).to_string(),
+            tenant: fixtures::tenant_id(1).to_string(),
+            project: Some(fixtures::project_id(2).to_string()),
+            slug: "inference".to_owned(),
+            display_name: "Inference workload".to_owned(),
+            identity_kind: None,
+            issuer: None,
+            subject: None,
+            key_digest: Some(Checksum::of(key.as_bytes()).to_string()),
+            roles: vec!["developer".to_owned()],
+        }
+        .plan()
+        .expect("the typed principal document is valid");
+        let mut state = fixtures::state();
+        plan.edit
+            .edit(&mut state, &fixtures::actor())
+            .expect("the principal document publishes");
+        let resource = state
+            .version_of(
+                ResourceKind::Identity,
+                ResourceId::new(fixtures::principal_id(33).uuid()),
+            )
+            .expect("the principal resource is present");
+        let body = IdentityBody::read(resource).expect("the published identity is typed");
+        assert_eq!(
+            body.credential(),
+            &Credential::MintedKey {
+                digest: Some(Checksum::of(key.as_bytes()))
+            }
+        );
     }
 
     fn refusal(request: CredentialRequest) -> String {

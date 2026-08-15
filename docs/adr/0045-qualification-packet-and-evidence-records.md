@@ -53,13 +53,20 @@ assert_eq!(packet.closure.satisfied, outstanding.is_empty());
 ```
 
 **The evidence record** (`qualification/<slice>/evidence/*.toml`, written by
-`ops/qualification-evidence.py`) is a run's numbers plus the provenance that
+`ops/qualification-evidence.py`) is a run's numbers or workload observations
+plus the provenance that
 decides what may legitimately be compared with what: commit and clean-tree flag,
 binary digest, cargo profile and compiler, the manifest digest, the machine, and
-per profile the config the process booted. Every retained record, whichever
+per profile the config the process booted. Generic observations additionally
+bind each workload to the digest of its raw artifact. Every retained record, whichever
 slice retains it, is checked against the manifest it names — same workload set,
 matching digest, all gates passed, nothing lost between offered and accounted
-for.
+for. Endurance observations also retain the offered duration, the committed
+duration, and the duration source; the promotion boundary refuses a `soak` run
+that is shorter than the committed long tier.
+Recovery records retain one row per executable manifest stage and the digest of
+its raw stage artifact, so the stateful-test and restore-drill halves cannot be
+promoted independently.
 
 Two consequences are deliberate. Editing a profile's scale or thresholds changes
 the manifest digest and *invalidates every record taken before the edit*, which

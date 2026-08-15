@@ -58,6 +58,12 @@ pub struct Config {
     /// credential, referenced the way `[[gateway_key]]` is.
     #[serde(default)]
     pub admin_breakglass: Vec<AdminBreakglass>,
+    /// Optional OIDC issuer used to authenticate human `/admin/v1` callers.
+    /// The issuer, audience, and JWKS endpoint are bootstrap references; the
+    /// resulting identity is authorized against the active desired-state
+    /// directory, never against a request-time control-plane read.
+    #[serde(default)]
+    pub admin_oidc: Option<AdminOidc>,
     #[serde(default)]
     pub namespace: Vec<Namespace>,
     #[serde(default)]
@@ -175,13 +181,14 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 27] = [
+const OVERRIDE_KEYS: [&str; 28] = [
     "mode",
     "server",
     "control_plane",
     "convergence",
     "secret_store",
     "admin_breakglass",
+    "admin_oidc",
     "namespace",
     "provider",
     "model",
@@ -400,6 +407,22 @@ pub struct AdminBreakglass {
     /// reference, which is a name, not a value.
     #[serde(default)]
     pub id: Option<String>,
+}
+
+/// The non-secret OIDC verifier configuration for human administration.
+///
+/// JWKS is configured explicitly rather than discovered from an untrusted token
+/// issuer. This keeps the network destination operator-owned and makes the
+/// bootstrap contract deterministic; the endpoint is fetched only by the
+/// administrative authentication path and is cached between requests.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AdminOidc {
+    /// Exact `iss` claim accepted in an ID/access token.
+    pub issuer: String,
+    /// Audience accepted in the token's `aud` claim.
+    pub audience: String,
+    /// HTTPS (or a loopback HTTP endpoint for local qualification) JWKS URL.
+    pub jwks_url: String,
 }
 
 impl AdminBreakglass {
@@ -2588,7 +2611,17 @@ impl Config {
         self.validate_gateway_minting(&namespaces)?;
         self.validate_gateway_token_epochs(&namespaces)?;
         self.validate_usage_sinks()?;
-        self.validate_budget()?;
+        // A compiled stateful candidate carries the bootstrap backend
+        // selection, but its cap values arrive in the durable policy attached
+        // to each projected namespace. Re-running the file-level budget-value
+        // gate here would reject the deliberate stateful shape
+        // (`limit_microdollars = 0`) before PolicyRuntime can apply those
+        // published values. The bootstrap path already validates backend
+        // connectivity and layout; stateless candidates still validate their
+        // complete file-owned budget.
+        if self.mode != Mode::Stateful {
+            self.validate_budget()?;
+        }
         self.validate_rate_limit()?;
         self.validate_revocation()?;
         Ok(())
@@ -2606,6 +2639,7 @@ impl Config {
         self.validate_control_plane()?;
         self.validate_secret_store()?;
         self.validate_admin_breakglass()?;
+        self.validate_admin_oidc()?;
         self.validate_process_local_bounds()?;
         self.validate_usage_sinks()?;
         self.validate_hot_state_connectivity()?;
@@ -2717,6 +2751,9 @@ impl Config {
         }
         if !self.admin_breakglass.is_empty() {
             sections.push("`[[admin_breakglass]]`");
+        }
+        if self.admin_oidc.is_some() {
+            sections.push("`[admin_oidc]`");
         }
         if self.convergence != ConvergenceConfig::default() {
             sections.push("`[convergence]`");
@@ -2959,6 +2996,50 @@ impl Config {
         };
         if source == "env" {
             reject_env_override_collision("[[admin_breakglass]] env", reference)?;
+        }
+        Ok(())
+    }
+
+    /// Validate the operator-owned OIDC network boundary without contacting the
+    /// provider. Human administration remains optional because the mandatory
+    /// breakglass credential is the recovery path when no IdP is configured or
+    /// when it is unavailable.
+    fn validate_admin_oidc(&self) -> Result<(), ConfigError> {
+        let Some(oidc) = self.admin_oidc.as_ref() else {
+            return Ok(());
+        };
+        for (field, value) in [
+            ("issuer", oidc.issuer.trim()),
+            ("audience", oidc.audience.trim()),
+            ("jwks_url", oidc.jwks_url.trim()),
+        ] {
+            if value.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "`[admin_oidc] {field}` must not be empty"
+                )));
+            }
+        }
+        let issuer = reqwest::Url::parse(oidc.issuer.trim()).map_err(|error| {
+            ConfigError::Invalid(format!(
+                "`[admin_oidc] issuer` is not an absolute URL: {error}"
+            ))
+        })?;
+        let jwks = reqwest::Url::parse(oidc.jwks_url.trim()).map_err(|error| {
+            ConfigError::Invalid(format!(
+                "`[admin_oidc] jwks_url` is not an absolute URL: {error}"
+            ))
+        })?;
+        if !matches!(issuer.scheme(), "https" | "http") {
+            return Err(ConfigError::Invalid(
+                "`[admin_oidc] issuer` must use `https` (or `http` for a local qualification endpoint)"
+                    .into(),
+            ));
+        }
+        if !matches!(jwks.scheme(), "https" | "http") {
+            return Err(ConfigError::Invalid(
+                "`[admin_oidc] jwks_url` must use `https` (or `http` for a local qualification endpoint)"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -5518,6 +5599,32 @@ dsn_env = "AXOND_REDIS_URL"
         let config =
             Config::from_toml_str(&toml).expect("connectivity references are bootstrap-owned");
         assert_eq!(config.budget.backend, BudgetBackend::Redis);
+    }
+
+    /// A compiled stateful revision gets its cap values from the durable policy,
+    /// so the resource-graph gate must not re-run the file-level zero-cap check
+    /// against the bootstrap connectivity shape.
+    #[test]
+    fn compiled_stateful_candidates_do_not_reject_bootstrap_budget_values() {
+        let toml = format!(
+            "{STATEFUL}\n[budget]\nbackend = \"postgres\"\ndsn_env = \"AXOND_BUDGET_DSN\"\nnamespace_scope = true\n"
+        );
+        let mut config = Config::from_toml_str(&toml).expect("shared layout is valid");
+        config.namespace.push(Namespace {
+            id: "platform".to_owned(),
+            default: true,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+        });
+        config.projected_principals.push(ProjectedPrincipal {
+            namespace: "platform".to_owned(),
+            subject: "workload".to_owned(),
+            digest: crate::desired_state::Checksum::of(b"axw1.dddddd"),
+        });
+        config
+            .validate_compiled()
+            .expect("compiled policy supplies the budget values");
     }
 
     #[test]

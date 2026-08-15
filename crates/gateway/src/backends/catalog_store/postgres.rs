@@ -22,9 +22,9 @@
 //! path is: a `SQLSTATE` only an operator can clear — no table, no grant, no such
 //! database — is [`CatalogStoreError::Denied`] and carries a remedy, because
 //! retrying it forever changes nothing, while everything else is
-//! [`CatalogStoreError::Unavailable`] and costs one refused refresh. Both refuse
-//! the *import*, never an inference request: nothing in this module is on the
-//! request path.
+//! [`CatalogStoreError::Unavailable`] and costs one refused refresh or candidate
+//! compilation. Neither reaches an inference request: this module is consulted
+//! only before a snapshot is published.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -96,14 +96,11 @@ impl std::fmt::Debug for PostgresCatalogStore {
 }
 
 impl PostgresCatalogStore {
-    /// Connect, optionally apply the shipped DDL, and prove both tables are
-    /// readable.
-    pub async fn connect(
-        dsn: &str,
-        settings: CatalogStoreSettings,
-    ) -> Result<Self, CatalogStoreError> {
+    /// Build the reconnecting catalogue store without opening the first
+    /// connection. A compiled serving cache may make metadata temporarily
+    /// unavailable while inference continues; refresh retries through `run`.
+    pub fn deferred(dsn: &str, settings: CatalogStoreSettings) -> Result<Self, CatalogStoreError> {
         let mut config: Config = dsn.parse().map_err(|error| {
-            // The DSN itself is never echoed: it carries a password.
             CatalogStoreError::denied(
                 BACKEND,
                 format!("the catalogue-store DSN could not be parsed: {error}"),
@@ -126,13 +123,21 @@ impl PostgresCatalogStore {
                 Ok(schema.to_owned())
             })
             .transpose()?;
-
-        let store = Self {
+        Ok(Self {
             config,
             settings,
             search_path,
             client: tokio::sync::Mutex::new(None),
-        };
+        })
+    }
+
+    /// Connect, optionally apply the shipped DDL, and prove both tables are
+    /// readable.
+    pub async fn connect(
+        dsn: &str,
+        settings: CatalogStoreSettings,
+    ) -> Result<Self, CatalogStoreError> {
+        let store = Self::deferred(dsn, settings)?;
         let client = tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
             .await
             .map_err(|_| CatalogStoreError::unavailable(BACKEND, "connection timed out"))?
@@ -143,6 +148,28 @@ impl PostgresCatalogStore {
                         .to_owned()
                 })
             })?;
+        store.prepare_schema(&client).await?;
+        *store.client.lock().await = Some(client);
+        Ok(store)
+    }
+
+    /// Connect when possible, otherwise return a store that will reconnect on
+    /// its first refresh/read operation. Schema and permission refusals remain
+    /// fatal because a cache cannot make an invalid durable backend safe.
+    pub async fn connect_or_defer(
+        dsn: &str,
+        settings: CatalogStoreSettings,
+    ) -> Result<Self, CatalogStoreError> {
+        let store = Self::deferred(dsn, settings)?;
+        let client = match tokio::time::timeout(
+            store.settings.connect_timeout,
+            store.connect_client(),
+        )
+        .await
+        {
+            Ok(Ok(client)) => client,
+            Ok(Err(_)) | Err(_) => return Ok(store),
+        };
         store.prepare_schema(&client).await?;
         *store.client.lock().await = Some(client);
         Ok(store)
@@ -341,6 +368,31 @@ impl CatalogStore for PostgresCatalogStore {
                     )
                     .await
                     .map_err(|error| statement_failure("read a retained catalogue", &error))?;
+                row.as_ref().map(decode_snapshot).transpose()
+            })
+        })
+        .await
+    }
+
+    async fn retained_by_raw_digest(
+        &self,
+        digest: crate::desired_state::Checksum,
+    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
+        let digest = digest.to_string();
+        self.run(move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(
+                        &format!(
+                            "SELECT {SNAPSHOT_COLUMNS} FROM axond_catalog_snapshot \
+                             WHERE raw_digest = $1"
+                        ),
+                        &[&digest],
+                    )
+                    .await
+                    .map_err(|error| {
+                        statement_failure("read a catalogue by payload digest", &error)
+                    })?;
                 row.as_ref().map(decode_snapshot).transpose()
             })
         })

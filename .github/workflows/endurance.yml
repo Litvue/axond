@@ -75,6 +75,13 @@ jobs:
           # `inputs` is unset on the monthly schedule, which therefore takes
           # the same five hours rather than the manifest's twelve.
           AXOND_ENDURANCE_DURATION_MS: ${{ inputs.duration_ms || '18000000' }}
+      - name: Build the stateless endurance qualification record
+        if: success()
+        run: |
+          python3 ops/qualification-evidence.py target/endurance/soak \
+            --slice endurance --tier soak --runner github-actions \
+            --note "GitHub Actions ubuntu-latest, dispatched endurance soak" \
+            --out target/qualification-records/endurance-soak.toml
       - name: Publish the result artifacts
         # Uploaded even on failure: a run that missed a threshold is the run
         # whose evidence is worth reading. The time series is uploaded with the
@@ -88,6 +95,15 @@ jobs:
             target/endurance/**/*.json
             target/endurance/**/*.samples.jsonl
           if-no-files-found: error
+          retention-days: 90
+      - name: Publish the endurance qualification record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-record-endurance
+          path: target/qualification-records/endurance-soak.toml
+          if-no-files-found: warn
+          retention-days: 90
 
   stateful-endurance:
     name: Stateful mixed-workload endurance
@@ -130,6 +146,13 @@ jobs:
           AXOND_STATEFUL_ENDURANCE_DURATION_MS: ${{ inputs.duration_ms || '18000000' }}
           AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
           AXOND_TEST_REQUIRE_SERVICES: '1'
+      - name: Build the stateful endurance qualification record
+        if: success()
+        run: |
+          python3 ops/qualification-evidence.py target/stateful-endurance/soak \
+            --slice stateful-endurance --tier soak --runner github-actions \
+            --note "GitHub Actions ubuntu-latest, dispatched stateful endurance soak" \
+            --out target/qualification-records/stateful-endurance-soak.toml
       - name: Publish the result artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -139,3 +162,12 @@ jobs:
             target/stateful-endurance/**/*.json
             target/stateful-endurance/**/*.samples.jsonl
           if-no-files-found: error
+          retention-days: 90
+      - name: Publish the stateful endurance qualification record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-record-stateful-endurance
+          path: target/qualification-records/stateful-endurance-soak.toml
+          if-no-files-found: warn
+          retention-days: 90

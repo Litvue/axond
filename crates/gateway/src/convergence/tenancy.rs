@@ -3,8 +3,8 @@
 //! This is the tenancy stage of [`RevisionProjection`]: it reads the one body
 //! schema the domain knows ([`crate::desired_state::tenancy`]) and fills the one
 //! config section that boundary owns — `[[namespace]]`. Provider connections,
-//! models, prices, and the remaining serving policy still belong to later slices;
-//! a projection that guessed at those bodies would have to be unshipped.
+//! model targets, prices, and remaining serving policy are projected by later
+//! stages in the compiler, each from its own durable contract.
 //!
 //! # A project *is* a namespace, and it is named beyond its tenant
 //!
@@ -49,28 +49,26 @@
 //! - a projected namespace whose id a bootstrap namespace already claims
 //!   ([`ProjectionError::Incomplete`]): merging them would put durable state and
 //!   file-owned state on one name, and dropping either silently is worse;
-//! - a bootstrap configuration that declares no default namespace
-//!   ([`ProjectionError::Incomplete`] again): a projected project is never
-//!   promoted to the deployment default, so there would be nothing to serve a
-//!   request that names no namespace. Which project a deployment defaults to is a
-//!   decision the later runtime slice makes from desired state; until then a
-//!   stateful bootstrap declares its own default, and a refusal that says so is
-//!   worth more than a config that fails the boot gate one step later.
+//! - a bootstrap configuration that declares namespaces but no default
+//!   ([`ProjectionError::Incomplete`] again): a projection never guesses which
+//!   existing file-owned namespace should receive unnamed traffic. A completely
+//!   empty stateful bootstrap gets the deterministic synthetic `platform`
+//!   namespace instead; durable projects are always separately qualified.
 //!
 //! # Serving boundary
 //!
 //! `serve` constructs this projection as part of the stateful convergence chain.
 //! The runtime chain now adds recoverable workload principals after tenancy, but
-//! a bootstrap without a default namespace and a revision without routable
-//! provider/model metadata remain deliberate refusals. This seam is exercised
-//! through [`RevisionCompiler`](super::compile::RevisionCompiler), and readiness
-//! still requires a complete serving snapshot rather than a key alone.
+//! a revision without routable provider/model metadata remains a deliberate
+//! refusal. This seam is exercised through
+//! [`RevisionCompiler`](super::compile::RevisionCompiler), and readiness still
+//! requires a complete serving snapshot rather than a key alone.
 //!
 //! Two things the runtime slice owns, recorded here because this module is what
 //! creates the need for them:
 //!
-//! - **selecting a default namespace** from desired state, which is why a
-//!   bootstrap without one is refused above rather than given one;
+//! - **keeping an unnamed default stable.** An empty stateful bootstrap receives
+//!   the fixed `platform` namespace; no durable project is promoted into it;
 //! - **`/` where an id is *used*.** A qualified id is the first namespace id no
 //!   `axond.toml` could have written. Its charset is now gated for every compiled
 //!   config, but a charset rule only says the id is well formed; before a
@@ -109,28 +107,33 @@ impl RevisionProjection for TenancyProjection {
             detail: error.to_string(),
         })?;
         let mut config = bootstrap.clone();
-        // Refused deliberately, and *before* any project is projected: a
-        // deployment needs one namespace to serve a request that names none, and
-        // this projection has no authority to nominate one. Promoting a project —
-        // the first, the lowest id, the only one — would make an unrelated
-        // publication silently move where unnamed traffic lands. Selecting a
-        // default from desired state is the later runtime slice's job, so until it
-        // exists a stateful bootstrap that declares no default is refused here,
-        // naming the missing section, rather than passed on to fail the boot gate
-        // as a generic invalid configuration.
+        // Stateful bootstrap deliberately declares no durable namespace. Keep a
+        // deterministic, deployment-wide platform namespace for requests that
+        // carry no project identity; never promote the first durable project,
+        // because publication order must not move where unnamed traffic lands.
+        // A bootstrap that does declare namespaces but forgets its default is a
+        // malformed local configuration and remains a refusal.
         if !bootstrap
             .namespace
             .iter()
             .any(|namespace| namespace.default)
         {
-            return Err(ProjectionError::Incomplete {
-                detail: "the bootstrap configuration declares no default namespace, and \
-                         projecting a project cannot make one the default: a published project \
-                         must not silently become where unnamed traffic lands. Declare a \
-                         default `[[namespace]]` in the bootstrap configuration; selecting a \
-                         default from desired state is not part of this slice"
-                    .to_owned(),
-            });
+            if bootstrap.namespace.is_empty() {
+                config.namespace.push(Namespace {
+                    id: "platform".to_owned(),
+                    default: true,
+                    allow_platform_fallback: false,
+                    project: None,
+                    policy: None,
+                });
+            } else {
+                return Err(ProjectionError::Incomplete {
+                    detail: "the bootstrap configuration declares namespaces but no default: \
+                             stateful projection cannot choose an existing namespace for \
+                             unnamed traffic"
+                        .to_owned(),
+                });
+            }
         }
         let declared: BTreeSet<String> = bootstrap
             .namespace
@@ -453,14 +456,10 @@ namespace = "acme/core"
     }
 
     /// The stateful bootstrap shape: `[[namespace]]` is a control-plane-owned
-    /// section, so a stateful file declares none and therefore declares no
-    /// default. The refusal has to be deliberate and say what is missing —
-    /// promoting a project would let an unrelated publication move where unnamed
-    /// traffic lands, and projecting anyway would surface as the boot gate's
-    /// generic "exactly one namespace must set `default = true`" one stage later,
-    /// naming no cause an operator can act on.
+    /// section, so a stateful file declares none. Projection supplies the fixed
+    /// platform default and never promotes a durable project into it.
     #[tokio::test]
-    async fn a_bootstrap_with_no_default_namespace_is_refused_rather_than_given_one() {
+    async fn an_empty_stateful_bootstrap_gets_a_stable_platform_default() {
         let bootstrap = Config::from_toml_str(
             r#"
 mode = "stateful"
@@ -481,16 +480,26 @@ env = "GW_ADMIN_BREAKGLASS"
             "a stateful file declares no namespace at all"
         );
 
-        let error = TenancyProjection
+        let projected = TenancyProjection
             .project(&bootstrap, &state(), revision_id(3))
-            .expect_err("a projection may not nominate a default namespace");
-        let ProjectionError::Incomplete { detail } = &error else {
-            panic!("expected a deliberate incompleteness, got {error:?}");
-        };
-        assert!(detail.contains("default namespace"), "{detail}");
-        assert!(
-            detail.contains("not part of this slice"),
-            "the refusal says default selection is still gated: {detail}"
+            .expect("an empty stateful bootstrap gets a deterministic default");
+        assert_eq!(
+            projected
+                .namespace
+                .iter()
+                .filter(|namespace| namespace.default)
+                .map(|namespace| namespace.id.as_str())
+                .collect::<Vec<_>>(),
+            ["platform"]
+        );
+        assert_eq!(
+            projected
+                .namespace
+                .iter()
+                .filter(|namespace| namespace.project.is_some())
+                .map(|namespace| namespace.id.as_str())
+                .collect::<Vec<_>>(),
+            ["acme/core"]
         );
 
         // The production stateful compiler rejects this projection chain at

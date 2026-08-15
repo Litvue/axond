@@ -138,6 +138,7 @@ jobs:
           name: endurance-results-smoke
           path: target/endurance/smoke/*.json
           if-no-files-found: warn
+          retention-days: 90
       # Likewise for the reduced rollout scenarios (ADR 0041). This lane has no
       # database, so their rollback fence records itself as skipped; the
       # `stateful-tests` lane below evaluates it.
@@ -148,6 +149,7 @@ jobs:
           name: rollout-results-reduced
           path: target/rollout/**/*.json
           if-no-files-found: warn
+          retention-days: 90
       # The fault matrix qualifies timing, so it does not run beside the rest of
       # the suite: this step has the machine to itself, one row at a time. The
       # state-tier rows skip without a datastore and run in the stateful lane.
@@ -169,6 +171,7 @@ jobs:
           name: fault-results-stateless
           path: target/faults/**/*.json
           if-no-files-found: error
+          retention-days: 90
 
   # The pull-request half of the fuzzing program (`fuzz/`, issue #212). The
   # coverage-guided runs are scheduled in `fuzz.yml` because they are unbounded;
@@ -274,6 +277,13 @@ jobs:
           AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
           AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
           AXOND_TEST_REQUIRE_SERVICES: "1"
+      # `cargo test` leaves the gateway binary in the test profile, while the
+      # restore lane records a normal dev-profile build. Rebuild explicitly so
+      # the aggregated recovery record can prove one binary identity across
+      # both lanes instead of comparing two Cargo profiles.
+      - name: Build the recovery provenance binary
+        if: success()
+        run: cargo build -p axond --locked
       # The recovery stages that run today are part of the suite above, and
       # their point is the evidence they retain (ADR 0037). A passing suite that
       # left no artifact is the failure an evidence directory cannot describe on
@@ -282,7 +292,9 @@ jobs:
       - name: Check the stateful lane retained its evidence
         run: |
           python3 ops/check-recovery-evidence.py --runner stateful-tests \
-            --since-unix-ms "$lane_started_ms"
+            --since-unix-ms "$lane_started_ms" \
+            --forbid-env AXOND_TEST_POSTGRES_DSN \
+            --forbid-env AXOND_TEST_REDIS_URL
       # `warn` on the upload: an earlier target failing stops the suite before
       # the recovery stages run, and that lane's finding is the failing test.
       - name: Publish the recovery evidence
@@ -292,6 +304,15 @@ jobs:
           name: recovery-evidence
           path: target/recovery/*.json
           if-no-files-found: warn
+          retention-days: 90
+      - name: Publish the stateful-test binary provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recovery-binary-stateful
+          path: target/debug/axond
+          if-no-files-found: warn
+          retention-days: 90
       # This lane has the control plane the forward-only rollback fence needs, so
       # its rollout artifacts are the ones that record the fence as evaluated.
       - name: Publish the stateful rollout results
@@ -301,6 +322,7 @@ jobs:
           name: rollout-results-stateful
           path: target/rollout/**/*.json
           if-no-files-found: warn
+          retention-days: 90
       # The full fault matrix, state tiers included: `AXOND_TEST_REQUIRE_SERVICES`
       # makes a skipped backend row a failure here rather than a quiet gap, and
       # the step runs the binary alone so an injected latency is the only load
@@ -319,6 +341,33 @@ jobs:
           name: fault-results
           path: target/faults/**/*.json
           if-no-files-found: warn
+          retention-days: 90
+      # The raw matrix is the diagnosis; this compact record is the packet's
+      # promotable index. It is emitted only after the full service-backed lane
+      # passes, and keeps the manifest/binary/machine provenance beside every
+      # fault row rather than asking a later editor to reconstruct it.
+      - name: Build the full fault qualification record
+        if: success()
+        run: |
+          python3 ops/qualification-evidence.py target/faults \
+            --slice fault --tier full --runner github-actions \
+            --note "GitHub Actions ubuntu-latest, full pinned Redis/Postgres matrix" \
+            --out target/qualification-records/fault-full.toml
+      - name: Verify the full fault record and raw artifacts
+        if: success()
+        run: |
+          python3 ops/promote-qualification.py \
+            target/qualification-records/fault-full.toml \
+            --artifacts target/faults \
+            --out target/qualification-records/validated-fault-full.toml
+      - name: Publish the full fault qualification record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-record-fault
+          path: target/qualification-records/fault-full.toml
+          if-no-files-found: warn
+          retention-days: 90
 
   # Keep the 90-second endurance qualification out of the shared stateful test
   # invocation. It is opt-in in the test binary and gets its own runner, so the
@@ -381,6 +430,7 @@ jobs:
             target/stateful-endurance/smoke/*.json
             target/stateful-endurance/smoke/*.samples.jsonl
           if-no-files-found: warn
+          retention-days: 90
 
   sdk-compat:
     name: Provider-SDK compatibility
@@ -471,6 +521,8 @@ jobs:
           python3 ops/check-release-config.py --self-test
           python3 ops/check-release-config.py
           python3 ops/check-recovery-evidence.py --self-test
+          python3 ops/qualification-evidence.py --self-test
+          python3 ops/promote-qualification.py --self-test
           shellcheck install.sh ops/publish-image-index.sh \
             ops/verify-image-evidence.sh ops/check-compose-platform.sh \
             ops/check-installer-download.sh ops/check-index-promotion.sh \
@@ -779,6 +831,80 @@ jobs:
           name: restore-drill-evidence
           path: target/recovery/*.json
           if-no-files-found: warn
+          retention-days: 90
+      - name: Publish the restore-drill binary provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recovery-binary-restore
+          path: target/debug/axond
+          if-no-files-found: warn
+          retention-days: 90
+
+  # The #219 packet record is assembled only after both real-service lanes have
+  # completed: stateful-tests owns the live outage/cache/rotation stages, while
+  # restore-drill owns logical restore, PITR, and the durable usage boundary.
+  # Neither partial upload is evidence of the recovery slice by itself.
+  recovery-record:
+    name: Build the complete recovery qualification record
+    if: ${{ always() }}
+    needs:
+      - stateful-tests
+      - restore-drill
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both recovery source lanes
+        run: |
+          test "${{ needs.stateful-tests.result }}" = success
+          test "${{ needs.restore-drill.result }}" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download stateful-test recovery stages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: recovery-evidence
+          path: target/recovery
+      - name: Download restore-drill recovery stages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: restore-drill-evidence
+          path: target/recovery
+      - name: Download the stateful-test binary provenance
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: recovery-binary-stateful
+          path: target/recovery-binaries/stateful
+      - name: Download the restore-drill binary provenance
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: recovery-binary-restore
+          path: target/recovery-binaries/restore
+      - name: Require one binary identity across both recovery lanes
+        run: |
+          test -f target/recovery-binaries/stateful/axond
+          test -f target/recovery-binaries/restore/axond
+          test "$(sha256sum target/recovery-binaries/stateful/axond | awk '{print $1}')" = \
+            "$(sha256sum target/recovery-binaries/restore/axond | awk '{print $1}')"
+      - name: Build the complete recovery qualification record
+        run: |
+          python3 ops/qualification-evidence.py target/recovery \
+            --slice recovery --tier serving --runner github-actions \
+            --binary target/recovery-binaries/stateful/axond \
+            --note "GitHub Actions ubuntu-latest, stateful-tests plus restore-drill" \
+            --out target/qualification-records/recovery-serving.toml
+      - name: Verify the recovery record and raw artifacts
+        run: |
+          python3 ops/promote-qualification.py \
+            target/qualification-records/recovery-serving.toml \
+            --artifacts target/recovery \
+            --out target/qualification-records/validated-recovery-serving.toml
+      - name: Publish the complete recovery qualification record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-record-recovery
+          path: target/qualification-records/recovery-serving.toml
+          if-no-files-found: warn
+          retention-days: 90
 
   # Whether a rolling update completes is a scheduling outcome, not a manifest
   # property: kube-scheduler counting skew across ReplicaSets decides it, and no
@@ -863,6 +989,37 @@ jobs:
           AXOND_STATEFUL_IMAGE: axond-ci-stateful
         run: bash ops/stateful-deploy-drill.sh
 
+  # The opt-in persistent overlay is a separate workload shape, not a static
+  # claim layered on top of the Recreate drill. Run it on a real three-worker
+  # cluster and require an ordinal PVC to retain data across Pod replacement.
+  stateful-persistent-drill:
+    name: StatefulSet PVC drill (three nodes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install kind and kubectl
+        env:
+          KIND_VERSION: v0.30.0
+          KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
+          KUBECTL_VERSION: v1.33.4
+          KUBECTL_SHA256: c2ba72c115d524b72aaee9aab8df8b876e1596889d2f3f27d68405262ce86ca1
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/kind \
+            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  /tmp/kind" | sha256sum --check --strict
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          curl -fsSL -o /tmp/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum --check --strict
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+      - name: Build the image the overlay deploys
+        run: docker build --tag axond-ci-stateful-persistent .
+      - name: Deploy the persistent overlay and drill PVC replacement
+        env:
+          AXOND_STATEFUL_PERSISTENT_IMAGE: axond-ci-stateful-persistent
+        run: bash ops/stateful-persistent-drill.sh
+
   quickstart-smoke:
     name: Compose quickstart smoke
     runs-on: ubuntu-latest
@@ -899,6 +1056,8 @@ jobs:
       - restore-drill
       - rollout-drill
       - stateful-deploy-drill
+      - stateful-persistent-drill
+      - recovery-record
       - quickstart-smoke
     runs-on: ubuntu-latest
     steps:
@@ -926,4 +1085,6 @@ jobs:
           test "${{ needs.restore-drill.result }}" = success
           test "${{ needs.rollout-drill.result }}" = success
           test "${{ needs.stateful-deploy-drill.result }}" = success
+          test "${{ needs.stateful-persistent-drill.result }}" = success
+          test "${{ needs.recovery-record.result }}" = success
           test "${{ needs.quickstart-smoke.result }}" = success

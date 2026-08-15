@@ -66,6 +66,7 @@ REVOCATION_SOURCE = ROOT / "crates/gateway/src/revocation/redis.rs"
 DRILL = ROOT / "ops/restore-drill.sh"
 ROLLOUT_DRILL = ROOT / "ops/rollout-drill.sh"
 STATEFUL_DRILL = ROOT / "ops/stateful-deploy-drill.sh"
+STATEFUL_PERSISTENT_DRILL = ROOT / "ops/stateful-persistent-drill.sh"
 TELEMETRY_SOURCE = ROOT / "crates/gateway/src/telemetry/mod.rs"
 
 IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
@@ -1183,6 +1184,45 @@ def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> lis
     return failures
 
 
+def check_stateful_persistent_drill(
+    workflow: dict[str, Any], page: str, drill: str
+) -> list[str]:
+    """The opt-in StatefulSet has a runtime PVC-retention proof in CI."""
+    failures: list[str] = []
+    jobs = workflow["jobs"]
+    lane = jobs.get("stateful-persistent-drill")
+    if lane is None:
+        failures.append(
+            ".github/workflows/ci.yml: the stateful-persistent-drill lane is missing"
+        )
+    elif not any(
+        "ops/stateful-persistent-drill.sh" in str(step.get("run", ""))
+        for step in lane["steps"]
+    ):
+        failures.append(
+            ".github/workflows/ci.yml: the stateful-persistent-drill lane does not run the drill"
+        )
+    elif (reason := unblocked_lane(jobs, "stateful-persistent-drill")) is not None:
+        failures.append(
+            f".github/workflows/ci.yml: {reason}, so PVC loss across Pod replacement "
+            "would not block a merge"
+        )
+    if "ops/stateful-persistent-drill.sh" not in page:
+        failures.append(
+            "docs/deployment/kubernetes.md: ops/stateful-persistent-drill.sh is not documented"
+        )
+    for assertion in (
+        "three retained PVC-backed ordinals",
+        "survives Pod replacement",
+    ):
+        if assertion not in drill:
+            failures.append(
+                f"ops/stateful-persistent-drill.sh: the {assertion!r} assertion is gone; "
+                "the persistent overlay would have only a manifest check"
+            )
+    return failures
+
+
 def check_documented() -> list[str]:
     """The operator-facing page names the paths and the sentinel workflow."""
     page = KUBERNETES_DOC.read_text(encoding="utf-8")
@@ -1195,6 +1235,7 @@ def check_documented() -> list[str]:
         "deploy/kubernetes/components/autoscaling",
         "deploy/kubernetes/components/stateful",
         "ops/pin-image-digest.sh",
+        "ops/stateful-persistent-drill.sh",
     ):
         if path not in page:
             failures.append(f"docs/deployment/kubernetes.md: {path} is not documented")
@@ -1870,6 +1911,42 @@ def self_test() -> int:
             f"stateful drill without {counterfactual!r}",
             check_stateful_drill(
                 workflow, kubernetes_page, stateful_drill.replace(counterfactual, "runs")
+            ),
+        )
+
+    persistent_drill = STATEFUL_PERSISTENT_DRILL.read_text(encoding="utf-8")
+    if check_stateful_persistent_drill(workflow, kubernetes_page, persistent_drill):
+        failures.append(
+            "self-test: the committed stateful persistent drill wiring must pass the gate"
+        )
+    optional_persistent = copy.deepcopy(workflow)
+    optional_persistent["jobs"]["CI-Success"]["needs"].remove("stateful-persistent-drill")
+    expect_failure(
+        "optional stateful persistent lane",
+        check_stateful_persistent_drill(
+            optional_persistent, kubernetes_page, persistent_drill
+        ),
+    )
+    unasserted_persistent = copy.deepcopy(workflow)
+    for step in unasserted_persistent["jobs"]["CI-Success"]["steps"]:
+        if "run" in step:
+            step["run"] = re.sub(
+                r"^.*needs\.stateful-persistent-drill\.result.*$",
+                "",
+                step["run"],
+                flags=re.MULTILINE,
+            )
+    expect_failure(
+        "a needed stateful persistent lane CI-Success never asserts",
+        check_stateful_persistent_drill(
+            unasserted_persistent, kubernetes_page, persistent_drill
+        ),
+    )
+    for assertion in ("three retained PVC-backed ordinals", "survives Pod replacement"):
+        expect_failure(
+            f"persistent drill without {assertion!r}",
+            check_stateful_persistent_drill(
+                workflow, kubernetes_page, persistent_drill.replace(assertion, "runs")
             ),
         )
 

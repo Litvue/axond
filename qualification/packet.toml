@@ -3,8 +3,10 @@
 # #156 asks for reproducible evidence in place of qualitative production claims,
 # and it decomposes into five slices — capacity, provider and backend faults,
 # stateful recovery, multi-replica rollout, and a long soak. Each has landed to a
-# different depth: one is evidenced with retained runs, three are harnessed
-# with drivers but no heavy run behind them, and one is unbuilt. That spread is
+# different depth: one is evidenced with retained runs, and four are harnessed
+# with drivers but no heavy *record* retained in the packet. The local fault and
+# rollout heavy tiers have now been exercised, but a run outside the committed
+# evidence set cannot promote a slice. That spread is
 # the whole point of this file. An epic whose children
 # are merged is not an epic whose question is answered, and the difference is
 # only reviewable if it is written down where it cannot rot.
@@ -86,8 +88,8 @@ manifest = "qualification/recovery/manifest.toml"
 # the database away from underneath them (ADR 0037). The second lane is
 # `ops/restore-drill.sh`, which recovers a database and hands it to a replica.
 driver = "crates/gateway/src/qualification/recovery.rs"
-# Keeps the committed scenarios from decaying into a wish list while the stages
-# that need a served request wait on their dependencies.
+# Keeps the committed scenarios from decaying into a wish list while every
+# executable stage has an owned runner and the dependency map stays explicit.
 contract_test = "crates/gateway/tests/recovery_contract.rs"
 contract = "docs/operations/recovery-qualification.md"
 adr = "docs/adr/0037-recovery-qualification-harness.md"
@@ -99,34 +101,41 @@ heavy_lane = ".github/workflows/ci.yml"
 heavy_tier = "serving"
 retained = []
 outstanding = """
-Nine stages run against a real Postgres and retain evidence — the outage, the \
-three cold boots, journal convergence, a logical restore, and a point-in-time \
-recovery — but every scenario still has a blocked stage, because a stateful \
-replica cannot serve a projected revision, so nothing that needs an offered \
-request is measured."""
+Twenty-two executable stages run against real PostgreSQL and retain evidence — the \
+outage, three cold boots, journal convergence, secret rotation, durable restore \
+inventory, logical restore, point-in-time recovery, and restore/PITR \
+reconvergence, and the usage boundary over the durable outbox and sink. The \
+restore drill now measures the usage boundary, but no complete fleet record is \
+retained in the packet yet."""
 # Mirrors the union of the recovery manifest's own dependency map, and is
 # checked against it.
-blocked_on = [144, 145, 146, 147, 148, 149, 150, 155, 158]
+blocked_on = []
 
 # The fault slice: what a failing dependency does to a request.
 [[slice]]
 id = "fault"
 issue = 218
-status = "unbuilt"
+status = "harnessed"
 question = """
 How every provider and backend failure — 429 and 5xx, DNS, TLS and connect \
 stalls, truncation, idle streams, oversized errors, Redis and Postgres latency \
 and outage — is classified, deadlined, retried, cleaned up, accounted for, and \
 reported without leaking a URL, a credential, or a DSN."""
 covers = ["provider_faults", "backend_outage"]
+manifest = "qualification/faults/manifest.toml"
+driver = "crates/gateway/tests/faults.rs"
+contract = "docs/operations/fault-qualification.md"
+adr = "docs/adr/0048-fault-qualification-harness.md"
+reduced_lane = "cargo test --workspace"
+heavy_lane = ".github/workflows/ci.yml"
+heavy_tier = "full"
 retained = []
 outstanding = """
-No manifest and no driver. The provider rows are unblocked — the deterministic \
-fake upstream already injects the faults the endurance mix draws from, and the \
-capacity slice's `backend-limits` profile already holds a stalling upstream to \
-the replica's own bound — while the backend rows need a stateful replica to \
-fail. One stall shape under load is not the matrix: 429 and 5xx, DNS and TLS \
-and connect failures, truncation, and idle streams have no run behind them."""
+The committed matrix and driver now cover provider, transport, Redis, and \
+Postgres faults, and the stateless provider/transport lane runs in CI. The full \
+matrix has passed locally against the pinned services, but no clean heavy \
+artifact is retained in the packet yet; the provider, transport, and backend \
+rows still need a retained run from the supported fault lane."""
 blocked_on = [158]
 
 # The rollout slice: what a fleet does while it is being replaced.
@@ -148,9 +157,9 @@ heavy_lane = ".github/workflows/rollout.yml"
 heavy_tier = "heavy"
 retained = []
 outstanding = """
-The heavy tier has never been dispatched, so no run of a fleet under load is \
-retained; mixed-version serving across a migration still waits on a stateful \
-replica."""
+The heavy tier has now passed locally, but no run of a fleet under load is \
+retained in the packet; mixed-version serving across a migration still needs a \
+stateful replica qualification."""
 blocked_on = [158]
 
 # What closing #156 requires. `satisfied` is not an opinion: the contract test

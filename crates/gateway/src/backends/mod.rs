@@ -20,7 +20,7 @@
 //! | [`control_plane::ControlPlaneStore`] | Durable desired state: revisions, manifests, resource versions, audit | Control plane only | here |
 //! | [`secrets::SecretStore`] | Wrapped secret material and unwrapping | Snapshot compilation only | here |
 //! | [`catalog::CatalogSource`] | Model metadata ingestion | Background refresh only | here |
-//! | [`catalog_store::CatalogStore`] | Durable retention of imported catalogue snapshots | Background refresh only | here |
+//! | [`catalog_store::CatalogStore`] | Durable retention and convergence lookup of imported catalogue snapshots | Background refresh + snapshot compilation | here |
 //! | [`crate::budget::BudgetStore`] | Spend caps | Request path (opt-in) | [`crate::budget`] |
 //! | [`crate::rate_limit::RateLimiter`] | Inbound admission | Request path (opt-in) | [`crate::rate_limit`] |
 //! | [`crate::revocation::RevocationStore`] | Precise `jti` revocation | Request path (opt-in) | [`crate::revocation`] |
@@ -39,14 +39,9 @@
 //! [`RESPONSIBILITIES`] is the machine-checkable version of the table above, and
 //! it is what the tests assert against.
 //!
-//! ## Scaffolding only
-//!
-//! These are contracts, not implementations. Nothing here is wired into
-//! `serve`, so the running gateway is byte-for-byte the stateless gateway it
-//! was: no new boot step, no new request-path work, no Postgres. Durable
-//! implementations land in #141 (revisioned `ControlPlaneStore` on Postgres)
-//! and #142 (revision → snapshot reconciliation); the shapes here are kept
-//! minimal so those slices can extend them without a rewrite.
+//! The catalogue store's background refresher and convergence reader are both
+//! intentionally off the request path. Requests receive a concrete immutable
+//! snapshot; they never retain a store handle or cause a catalogue query.
 
 pub mod catalog;
 pub mod catalog_pins;

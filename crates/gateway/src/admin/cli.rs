@@ -48,6 +48,10 @@ const RESOURCES: &[(&str, &str)] = &[
     ("tenants", "a tenant and its lifecycle state"),
     ("projects", "a project (namespace) inside a tenant"),
     (
+        "principals",
+        "a durable workload or human identity and its administrative grants",
+    ),
+    (
         "providers",
         "a provider connection: wire family and endpoint",
     ),
@@ -58,6 +62,10 @@ const RESOURCES: &[(&str, &str)] = &[
     ("catalogs", "a provider's model catalogue snapshot"),
     ("models", "a model enablement and its price"),
     ("aliases", "a routing alias and its ordered targets"),
+    (
+        "prices",
+        "a deployment price book and effective approved rates",
+    ),
     (
         "policies",
         "budgets, concurrency limits, and revocation for a scope",

@@ -66,12 +66,13 @@ use super::reads::{
     StateView,
 };
 use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
+use crate::backends::catalog_store::CatalogStore;
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::secrets::SecretStore;
 use crate::config::Mode;
 use crate::convergence::{ChangeSignal, RevisionReport};
 use crate::desired_state::{
-    AccessDenial, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
+    AccessDenial, Actor, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
     LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
     Uuid7Generator, ValidationError,
 };
@@ -106,14 +107,17 @@ fn scope_covers(granted: &ResourceScope, resource: &ResourceScope) -> bool {
 /// exist in this revision") are validation failures of the same kind the domain
 /// raises, and belong in the same typed refusal.
 pub trait DesiredStateEdit: Send + Sync {
-    fn edit(&self, state: &mut DesiredState) -> Result<(), ValidationError>;
+    /// Rewrite the complete candidate state. The actor is available for resource
+    /// bodies whose semantics include an authenticated approval (for example an
+    /// approved deployment PriceBook); ordinary resources deliberately ignore it.
+    fn edit(&self, state: &mut DesiredState, actor: &Actor) -> Result<(), ValidationError>;
 }
 
 impl<F> DesiredStateEdit for F
 where
     F: Fn(&mut DesiredState) -> Result<(), ValidationError> + Send + Sync,
 {
-    fn edit(&self, state: &mut DesiredState) -> Result<(), ValidationError> {
+    fn edit(&self, state: &mut DesiredState, _actor: &Actor) -> Result<(), ValidationError> {
         self(state)
     }
 }
@@ -340,6 +344,7 @@ impl AdminService {
             scope: scope.clone(),
             reason: match refusal {
                 AdminAuthError::ActionNotPermitted { .. } => DenialReason::RoleLacksAction,
+                AdminAuthError::Directory { reason } => *reason,
                 _ => DenialReason::OutOfScope,
             },
             recorded_at: SystemTime::now(),
@@ -422,13 +427,38 @@ impl AdminService {
         grant: &AdminGrant,
         request: &CatalogueRequest,
     ) -> Result<CatalogueView, AdminError> {
+        self.model_catalogue_with_context(grant, request, None, None, SystemTime::now())
+            .await
+    }
+
+    pub async fn model_catalogue_with_context(
+        &self,
+        grant: &AdminGrant,
+        request: &CatalogueRequest,
+        catalogue: Option<&dyn CatalogStore>,
+        availability: Option<&dyn AvailabilityReader>,
+        now: SystemTime,
+    ) -> Result<CatalogueView, AdminError> {
         Self::permits(grant, AdminAction::ReadState)?;
         if !scope_covers(grant.scope(), &request.scope()) {
             return Err(AdminError::Forbidden(AdminAuthError::ScopeNotPermitted));
         }
         let store = self.store()?;
         let revision = store.load_desired_revision().await.map_err(log_store)?;
-        CatalogueView::of(revision.as_ref(), request)
+        let disclosure = if grant.scope() == &ResourceScope::Deployment {
+            StatusScope::Deployment
+        } else {
+            StatusScope::Namespace
+        };
+        CatalogueView::of_with_context(
+            revision.as_ref(),
+            request,
+            catalogue,
+            availability,
+            disclosure,
+            now,
+        )
+        .await
     }
 
     /// A bounded page of revision history, newest first.
@@ -683,8 +713,10 @@ impl AdminService {
 
         // 4. The complete candidate, and the authority to have changed what it
         // changed rather than only what it said it would.
+        let identity = grant.identity();
         let mut candidate_state = current_state.clone();
-        edit.edit(&mut candidate_state)?;
+        let actor = identity.actor();
+        edit.edit(&mut candidate_state, &actor)?;
         if let Err(error) = Self::within_scope(grant.scope(), current_state, &candidate_state) {
             self.denied(grant, request, &error).await;
             return Err(error);
@@ -693,7 +725,6 @@ impl AdminService {
         // 5 and 6. Validate the whole candidate, then diff two complete states.
         let mutation = MutationId::new(self.ids.next());
         let submitted_at = SystemTime::now();
-        let identity = grant.identity();
         let candidate = RevisionCandidate {
             expected,
             state: candidate_state,

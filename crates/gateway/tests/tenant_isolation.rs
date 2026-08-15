@@ -143,37 +143,35 @@ async fn a_tenant_sees_only_the_models_its_own_credentials_can_serve() {
 /// Naming another tenant's alias is refused, and refused *before* the provider
 /// is reached.
 ///
-/// Both halves matter. A 502 that had already dispatched upstream would mean the
-/// other tenant's credential had been spent, and the caller could infer the
-/// alias exists from the latency alone. So the upstream's recorded requests are
-/// asserted to be empty, not merely free of the other tenant's key.
+/// Both halves matter. The refusal must have the same typed 404 shape as a model
+/// that does not exist, or the caller could enumerate another tenant's aliases.
+/// It must also happen before the provider is reached, so the upstream's recorded
+/// requests are asserted to be empty, not merely free of the other tenant's key.
 #[tokio::test]
 async fn a_tenant_cannot_invoke_another_tenants_alias() {
     let deployment = boot(Durability::None).await.expect("a stateless boot");
 
     for (caller, other) in [(&ACME, &GLOBEX), (&GLOBEX, &ACME)] {
+        let unknown = post_chat(&deployment, caller.key, "does-not-exist").await;
+        assert_eq!(unknown.status(), 404, "an unknown alias is a typed 404");
+        let unknown_body: Value = unknown.json().await.expect("a typed unknown-model error");
+        assert_eq!(unknown_body["error"]["type"], json!("unknown_model"));
+
         let response = post_chat(&deployment, caller.key, other.alias).await;
         assert_eq!(
             response.status(),
-            502,
+            404,
             "{} is refused {}: {response:?}",
             caller.namespace,
             other.alias
         );
         let body: Value = response.json().await.expect("a typed error");
-        assert_eq!(body["error"]["type"], json!("no_credential"));
+        assert_eq!(body["error"]["type"], json!("unknown_model"));
         let message = body["error"]["message"]
             .as_str()
             .expect("a message")
             .to_owned();
-        assert!(
-            message.contains(caller.namespace),
-            "the refusal is about the caller's own namespace: {message}"
-        );
-        assert!(
-            !message.contains(other.credential_id) && !message.contains(other.upstream_key),
-            "a refusal names nothing of the other tenant's: {message}"
-        );
+        assert!(!message.contains(other.credential_id) && !message.contains(other.upstream_key));
     }
 
     assert!(

@@ -1,23 +1,24 @@
 //! The authorities a running gateway builds: who `/admin/v1` accepts, and what
 //! they may do.
 //!
-//! This slice ships breakglass only. Human administration is OIDC (ADR 0027),
-//! and an OIDC verifier is a network dependency with its own configuration,
-//! discovery, and key rotation; what a stateful deployment cannot boot without
-//! is the credential that works *when the identity provider does not*, which is
-//! why [`Config::validate`] already requires exactly one `[[admin_breakglass]]`.
-//! An OIDC authenticator lands as a second [`AdminAuthenticator`] beside this
-//! one, and nothing downstream changes: both produce an [`AdminIdentity`].
+//! Stateful administration always retains one breakglass credential for
+//! identity-provider recovery. When `[admin_oidc]` is configured, the same
+//! surface also verifies issuer-scoped human bearer tokens against the explicit
+//! JWKS endpoint; both authenticators produce an [`AdminIdentity`]. The active
+//! revision's immutable directory then supplies the human's scoped grant, so
+//! authentication alone never creates authority.
 //!
-//! Until then a presented credential that is not the configured breakglass one
-//! is [`AdminAuthError::UnknownCredential`] — never "accepted because no
-//! authority is configured".
+//! Without `[admin_oidc]`, a non-breakglass credential is refused as
+//! [`AdminAuthError::UnknownCredential`]. Without an active directory entry, a
+//! valid OIDC token is authenticated but refused authorization — never accepted
+//! because no authority is configured.
 //!
 //! [`Config::validate`]: crate::config::Config::validate
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use axum::Router;
 use secrecy::SecretString;
@@ -26,14 +27,16 @@ use super::auth::{
     AdminAction, AdminAuthError, AdminAuthenticator, AdminAuthorizer, AdminGrant, AdminIdentity,
     AdminPresented,
 };
+use super::oidc::{OidcBootError, OidcVerifier};
 use super::router::{self, AdminApi};
 use super::service::AdminService;
 use crate::availability::AvailabilityReader;
+use crate::backends::catalog_store::CatalogStore;
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::secrets::{SecretError, SecretResolver};
 use crate::config::{AdminBreakglass, Config, KeyMaterialSource, Mode};
-use crate::desired_state::ResourceScope;
+use crate::desired_state::{Action, AuthorizationSnapshot, Caller, DenialReason, ResourceScope};
 use crate::key_material::{self, KeyMaterialError};
 use crate::status::probes::ControlPlaneProbe;
 use crate::status::registry::StatusSettings;
@@ -66,11 +69,40 @@ pub enum BootError {
     /// material or a KEK, so this is safe to print at boot.
     #[error("the secret store could not be opened: {0}")]
     SecretStore(#[from] SecretError),
+    #[error("the OIDC administrative verifier could not be built: {0}")]
+    Oidc(#[from] OidcBootError),
     #[error(
         "`mode = \"stateful\"` requires `[secret_store]`, which configuration validation should \
          already have required"
     )]
     MissingSecretStore,
+}
+
+/// The active revision's administrative directory, swapped with the serving
+/// snapshot after a candidate is admitted. It is intentionally empty until a
+/// typed stateful revision is active, so an authenticated human cannot gain
+/// authority from a bootstrap or partially compiled state.
+#[derive(Clone)]
+pub struct AuthorizationState(Arc<ArcSwapOption<AuthorizationSnapshot>>);
+
+impl AuthorizationState {
+    pub fn new() -> Self {
+        Self(Arc::new(ArcSwapOption::empty()))
+    }
+
+    pub fn update(&self, authorization: Option<Arc<AuthorizationSnapshot>>) {
+        self.0.store(authorization);
+    }
+
+    fn active(&self) -> Option<Arc<AuthorizationSnapshot>> {
+        self.0.load_full()
+    }
+}
+
+impl Default for AuthorizationState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Build the `/admin/v1` surface this process serves.
@@ -102,12 +134,25 @@ pub async fn surface_with_change_signal(
     env: &HashMap<String, String>,
     change_signal: Option<Arc<crate::convergence::ChangeSignal>>,
 ) -> Result<Surface, BootError> {
+    surface_with_change_signal_and_recovery(config, env, change_signal, false).await
+}
+
+/// Build the administrative surface with an already authenticated serving
+/// cache as a cold-start recovery permit. Only an initial backend-unavailable
+/// result is deferred; all other boot refusals retain the strict posture.
+pub async fn surface_with_change_signal_and_recovery(
+    config: &Config,
+    env: &HashMap<String, String>,
+    change_signal: Option<Arc<crate::convergence::ChangeSignal>>,
+    allow_recovery: bool,
+) -> Result<Surface, BootError> {
     if config.mode == Mode::Stateless {
         return Ok(Surface {
             api: None,
             mode: "stateless",
             control_plane: None,
             secret_resolver: None,
+            authorization: AuthorizationState::new(),
         });
     }
     let (Some(control_plane), Some(breakglass)) = (
@@ -116,7 +161,15 @@ pub async fn surface_with_change_signal(
     ) else {
         return Err(BootError::Incomplete);
     };
-    let authenticator = BreakglassAuthenticator::resolve(breakglass, env)?;
+    let breakglass = BreakglassAuthenticator::resolve(breakglass, env)?;
+    let authorization = AuthorizationState::new();
+    let authenticator: Arc<dyn AdminAuthenticator> = match config.admin_oidc.as_ref() {
+        Some(oidc) => Arc::new(OidcAdminAuthenticator {
+            breakglass,
+            verifier: OidcVerifier::new(oidc)?,
+        }),
+        None => Arc::new(breakglass),
+    };
     let dsn = env
         .get(control_plane.dsn_env.as_deref().unwrap_or_default())
         .map(String::as_str)
@@ -132,8 +185,17 @@ pub async fn surface_with_change_signal(
     // The diagnostic has to be paced against the bounds the store will actually
     // take, so they are read here rather than re-derived from config elsewhere.
     let pacing = ControlPlaneProbe::pacing(&settings);
-    let store: Arc<dyn ControlPlaneStore> =
-        Arc::new(PostgresControlPlane::connect(dsn, settings).await?);
+    let store: Arc<dyn ControlPlaneStore> = if allow_recovery {
+        match PostgresControlPlane::connect(dsn, settings.clone()).await {
+            Ok(store) => Arc::new(store),
+            Err(ControlPlaneError::Unavailable { .. }) => {
+                Arc::new(PostgresControlPlane::deferred(dsn, settings)?)
+            }
+            Err(error) => return Err(BootError::ControlPlane(error)),
+        }
+    } else {
+        Arc::new(PostgresControlPlane::connect(dsn, settings).await?)
+    };
     // Opened at boot, for the reason the control plane is: the deployment that
     // cannot reach its material cannot rotate a credential, and finding that out
     // during an incident is finding it out too late. Configuration validation
@@ -143,21 +205,26 @@ pub async fn surface_with_change_signal(
         .secret_store
         .as_ref()
         .ok_or(BootError::MissingSecretStore)?;
-    let secrets = crate::backends::secrets::build(secret_store, control_plane, env).await?;
+    let secrets = if allow_recovery {
+        crate::backends::secrets::build_allow_unavailable(secret_store, control_plane, env).await?
+    } else {
+        crate::backends::secrets::build(secret_store, control_plane, env).await?
+    };
     let resolver: Arc<dyn SecretResolver> = secrets.clone();
     let service = AdminService::stateful(Arc::clone(&store))
         .with_secrets(secrets)
         .with_change_signal(change_signal);
     let api = AdminApi::new(
         Arc::new(service),
-        Arc::new(authenticator),
-        Arc::new(BreakglassAuthorizer),
+        authenticator,
+        Arc::new(ActiveSnapshotAuthorizer::new(authorization.clone())),
     );
     Ok(Surface {
         api: Some(api),
         mode: "stateful",
         control_plane: Some(ObservedControlPlane { store, pacing }),
         secret_resolver: Some(resolver),
+        authorization,
     })
 }
 
@@ -174,9 +241,23 @@ pub struct Surface {
     /// The read-only resolver used by candidate compilation. It is the same
     /// store administration owns, so outages and ownership checks agree.
     pub secret_resolver: Option<Arc<dyn SecretResolver>>,
+    /// Handle updated by the convergence sink when a complete revision becomes
+    /// active. The serving process and `/admin/v1` therefore authorize against
+    /// one generation rather than independently observed state.
+    pub authorization: AuthorizationState,
 }
 
 impl Surface {
+    /// Attach the retained catalogue reader after the background import has
+    /// opened its store. The administrative router is not wrapped in `Arc` until
+    /// `router`, so this remains a one-time boot-time attachment.
+    pub fn with_catalogue(mut self, catalogue: Arc<dyn CatalogStore>) -> Self {
+        if let Some(api) = self.api.take() {
+            self.api = Some(api.with_catalogue(catalogue));
+        }
+        self
+    }
+
     /// The router to merge into the served application, reading this replica's
     /// derived availability from `availability` where it has any.
     ///
@@ -215,6 +296,93 @@ impl Surface {
 pub struct ObservedControlPlane {
     pub store: Arc<dyn ControlPlaneStore>,
     pub pacing: StatusSettings,
+}
+
+/// The live administrative authenticator. Breakglass is checked first so an
+/// identity-provider outage never removes the recovery credential; every other
+/// bearer is sent through the configured OIDC/JWKS verifier.
+pub struct OidcAdminAuthenticator {
+    breakglass: BreakglassAuthenticator,
+    verifier: OidcVerifier,
+}
+
+#[async_trait]
+impl AdminAuthenticator for OidcAdminAuthenticator {
+    fn name(&self) -> &'static str {
+        "oidc+breakglass"
+    }
+
+    async fn authenticate(
+        &self,
+        presented: &AdminPresented,
+    ) -> Result<AdminIdentity, AdminAuthError> {
+        if presented.credential.matches(&self.breakglass.material) {
+            return self.breakglass.authenticate(presented).await;
+        }
+        self.verifier
+            .authenticate(presented.credential.expose())
+            .await
+    }
+}
+
+/// Authorizes OIDC humans against the directory of the active revision while
+/// retaining the deployment-wide recovery authority of breakglass.
+pub struct ActiveSnapshotAuthorizer {
+    state: AuthorizationState,
+}
+
+impl ActiveSnapshotAuthorizer {
+    pub fn new(state: AuthorizationState) -> Self {
+        Self { state }
+    }
+}
+
+impl AdminAuthorizer for ActiveSnapshotAuthorizer {
+    fn name(&self) -> &'static str {
+        "active-revision-directory"
+    }
+
+    fn authorize(
+        &self,
+        identity: &AdminIdentity,
+        action: AdminAction,
+        surface: crate::desired_state::Surface,
+        scope: &ResourceScope,
+    ) -> Result<AdminGrant, AdminAuthError> {
+        if matches!(identity, AdminIdentity::Breakglass { .. }) {
+            return Ok(AdminGrant::granted(identity.clone(), action, scope.clone()));
+        }
+        let AdminIdentity::Human { issuer, subject } = identity else {
+            return Err(AdminAuthError::Directory {
+                reason: DenialReason::UnknownPrincipal,
+            });
+        };
+        let Some(snapshot) = self.state.active() else {
+            return Err(AdminAuthError::Directory {
+                reason: DenialReason::UnknownPrincipal,
+            });
+        };
+        let caller = Caller::Human {
+            issuer: issuer.clone(),
+            subject: subject.clone(),
+        };
+        let operation = match action {
+            AdminAction::ReadState
+            | AdminAction::ReadHistory
+            | AdminAction::ReadAudit
+            | AdminAction::ReadConvergence
+            | AdminAction::ReadAvailability
+            | AdminAction::ReadSecrets => Action::Read,
+            AdminAction::Publish | AdminAction::Rollback => Action::Update,
+            AdminAction::WriteSecrets => Action::Rotate,
+        };
+        snapshot
+            .authorize(&caller, surface, operation, scope.clone())
+            .map(|_| AdminGrant::granted(identity.clone(), action, scope.clone()))
+            .map_err(|denial| AdminAuthError::Directory {
+                reason: denial.reason(),
+            })
+    }
 }
 
 /// Authenticates the one configured breakglass credential.
@@ -314,6 +482,7 @@ impl AdminAuthorizer for BreakglassAuthorizer {
         &self,
         identity: &AdminIdentity,
         action: AdminAction,
+        _surface: crate::desired_state::Surface,
         scope: &ResourceScope,
     ) -> Result<AdminGrant, AdminAuthError> {
         match identity {

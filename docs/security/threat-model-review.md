@@ -256,7 +256,7 @@ consult: `a_tenant_read_is_isolated_and_explains_each_entry`,
 `a_read_names_the_facts_it_could_not_consult`,
 `the_management_catalogue_reports_what_a_tenant_published`,
 `a_catalogue_read_outside_the_grant_is_forbidden`, and
-`a_catalogue_filter_this_build_cannot_read_is_refused` — a filter this build
+`a_catalogue_filter_that_cannot_be_parsed_is_refused` — a filter this build
 cannot evaluate is refused rather than silently ignored, because an answer a
 caller believes was narrowed is an entitlement claim it did not make.
 

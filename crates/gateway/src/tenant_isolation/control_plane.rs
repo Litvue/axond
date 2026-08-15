@@ -20,12 +20,12 @@
 //!   the same projection read with deployment authority does contain the other
 //!   tenant — so the refusal is load-bearing rather than an empty answer.
 //!
-//! Human, OIDC-issued authority is not yet wired into the stateful runtime
-//! ([`crate::admin::runtime`] grants deployment-scoped breakglass authority), so
-//! these scenarios construct the grant a tenant-scoped authorizer will hand the
-//! service rather than authenticating one. That is the seam the service enforces
-//! at; `docs/security/tenant-isolation-evidence.md` records what remains blocked
-//! on the runtime half.
+//! These scenarios construct the grant a tenant-scoped authorizer hands the
+//! service rather than authenticating one, which keeps the database/service
+//! assertions independent of the HTTP verifier. The live OIDC projection and
+//! scoped request path are covered by
+//! `an_oidc_principal_is_authorized_against_the_active_directory` in the
+//! stateful integration harness.
 
 use std::sync::Arc;
 

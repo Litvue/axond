@@ -11,7 +11,9 @@ are the same signals as assets you can import, and every rule's `runbook_url`
 points at a section of this page.
 
 **What is live today.** The dependency-status family is live for the dependencies
-a deployment actually opens; the convergence family is not produced at all.
+a deployment actually opens. Stateful replicas also emit convergence and
+candidate-publication signals; stateless replicas do not open the control plane
+and therefore do not emit that family.
 
 * **Status.** A replica runs a refresher over the dependencies **it actually
   opened**, so which components report a state is a property of your
@@ -72,15 +74,14 @@ a deployment actually opens; the convergence family is not produced at all.
   stale that is being observed exactly as configured. A control plane configured
   to take longer than the cap is reported `unavailable`/`timeout` rather than
   reported on less often, and the replica logs that at boot.
-* **Revision convergence.** No reconciler is constructed either (the
-  `convergence` module is contract-only until a projection from resource bodies
-  to a servable config lands), so every `axond_revision_*` series — `lag`,
-  `converged`, `consecutive_failures`, `rejections`, `attempts`,
-  `last_known_good`, `convergence_duration` — is absent too, and the `revision`
-  summary in an operator's `GET /admin/v1/status` is `null` on every replica.
-  When the reconciler lands it must hand its own status handle to both the
-  status page and the administrative surface, or one replica would answer two
-  convergence stories.
+* **Revision convergence.** Stateful `serve` constructs the off-request-path
+  reconciler and projects resource bodies into a servable config, so every
+  `axond_revision_*` series — `lag`, `converged`, `consecutive_failures`,
+  `rejections`, `attempts`, `last_known_good`, `convergence_duration` — is
+  present for stateful replicas. Stateless replicas do not expose revision
+  series, and their `revision` summary is `null` by design. The stateful
+  reconciler hands one status handle to both the status page and the
+  administrative surface, so both views describe the same convergence state.
 
 The five status-side rules — `AxondDependencyImpaired`,
 `AxondStatusObservationsStale`, `AxondStatusRefreshesFailing`,

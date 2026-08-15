@@ -8,7 +8,9 @@ a backend below is an opt-in for one capability. "Stateful backend" here does no
 mean the stateful control plane accepted in
 [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md), which moves
 resource ownership into Postgres behind
-[`/admin/v1`](../operations/admin-api.md) and does not serve inference yet.
+[`/admin/v1`](../operations/admin-api.md). Stateful inference is enabled only
+after convergence publishes a complete serving snapshot; otherwise the gateway
+remains fail-closed.
 Redis is a hot-state backend in both modes and is never a durable store of
 record.
 
@@ -148,9 +150,11 @@ safe to dump and useless without that key
 ([ADR 0039](../adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
 Back the KEK up somewhere the database's backups are not: losing it makes every
 stored version unrecoverable, and there is no recovery path but restaging material.
-Nothing here is on the request path — the store is read only while a candidate
-revision is compiled — so an outage of it stalls administration and convergence
-while replicas keep serving the snapshot they hold.
+Nothing here is on the ordinary request path — the store is read while a
+candidate revision is compiled. An outage stalls administration and ordinary
+convergence, while replicas with an active snapshot keep serving. A replica
+that cold-boots during the outage can use its encrypted compiled-serving cache
+when one was written after a prior admitted revision.
 
 The control-plane journal of `mode = "stateful"` is the exception to applying DDL
 by hand: it keeps a migration ledger, so the binary can tell what a database

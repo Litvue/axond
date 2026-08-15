@@ -1479,10 +1479,10 @@ async fn a_catalogue_read_outside_the_grant_is_forbidden() {
 }
 
 /// A malformed filter is a typed refusal rather than a silently ignored
-/// parameter: a caller that filtered on a spelling this build does not know must
-/// not be handed an unfiltered catalogue and believe it was filtered.
+/// parameter: a caller that filtered on a spelling or enum this build does not
+/// know must not be handed an unfiltered catalogue and believe it was filtered.
 #[tokio::test]
-async fn a_catalogue_filter_this_build_cannot_read_is_refused() {
+async fn a_catalogue_filter_that_cannot_be_parsed_is_refused() {
     let deployment = Deployment::new();
     build(&deployment).await;
 
@@ -1491,6 +1491,10 @@ async fn a_catalogue_filter_this_build_cannot_read_is_refused() {
         format!("tenant={}&state=retired", fixtures::tenant_id(1)),
         format!("tenant={}&wire_family=telepathy", fixtures::tenant_id(1)),
         format!("tenant={}&offering=nonsense", fixtures::tenant_id(1)),
+        format!("tenant={}&capability=telepathy", fixtures::tenant_id(1)),
+        format!("tenant={}&modality=telepathy", fixtures::tenant_id(1)),
+        format!("tenant={}&lifecycle=telepathy", fixtures::tenant_id(1)),
+        format!("tenant={}&availability=telepathy", fixtures::tenant_id(1)),
         format!("tenant={}&unknown=1", fixtures::tenant_id(1)),
         format!(
             "tenant={}&state=enabled&state=disabled",

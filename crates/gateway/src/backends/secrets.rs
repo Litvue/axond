@@ -401,14 +401,41 @@ pub async fn build(
     control_plane: &crate::config::ControlPlane,
     env: &HashMap<String, String>,
 ) -> Result<Arc<dyn SecretStore>, SecretError> {
+    build_with_mode(secret_store, control_plane, env, false).await
+}
+
+/// Build the secret store while allowing a previously authenticated compiled
+/// snapshot to carry serving through an initial Postgres outage. Only an
+/// unavailable connection is deferred; malformed configuration, missing KEK,
+/// or a schema/permission refusal still fails boot.
+pub async fn build_allow_unavailable(
+    secret_store: &crate::config::SecretStore,
+    control_plane: &crate::config::ControlPlane,
+    env: &HashMap<String, String>,
+) -> Result<Arc<dyn SecretStore>, SecretError> {
+    build_with_mode(secret_store, control_plane, env, true).await
+}
+
+async fn build_with_mode(
+    secret_store: &crate::config::SecretStore,
+    control_plane: &crate::config::ControlPlane,
+    env: &HashMap<String, String>,
+    allow_unavailable: bool,
+) -> Result<Arc<dyn SecretStore>, SecretError> {
     match secret_store.backend {
         crate::config::SecretStoreBackend::Postgres => {
             let dsn = dsn(secret_store, control_plane, env)?;
             let kek = deployment_kek(secret_store, env)?;
             let settings = postgres::SecretStoreSettings::from_config(secret_store, control_plane);
-            Ok(Arc::new(
-                postgres::PostgresSecrets::connect(&dsn, settings, kek).await?,
-            ))
+            if allow_unavailable {
+                Ok(Arc::new(
+                    postgres::PostgresSecrets::connect_or_defer(&dsn, settings, kek).await?,
+                ))
+            } else {
+                Ok(Arc::new(
+                    postgres::PostgresSecrets::connect(&dsn, settings, kek).await?,
+                ))
+            }
         }
     }
 }

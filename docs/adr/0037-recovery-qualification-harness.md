@@ -140,12 +140,14 @@ which is what makes the recovery half mean anything.
 **The driver lives in the crate, not in `tests/`.** Unlike capacity and soak,
 which qualify a process from outside, a recovery stage has to hold a replica's
 reconciler, its signed cache, and a real `PostgresControlPlane` at once and then
-take the database away from underneath them. None of that is reachable from
-outside the binary while stateful boot is not wired to `serve`. The cost is
-recorded in the artifacts: the cold-boot stages note that the store handle is
-built before the cut, because `connect` against an unreachable database fails
-before a reconciler exists. When stateful `serve` lands, the serving stages
-bring the driver back out to a process.
+take the database away from underneath them. The stateful integration lane now
+qualifies process-level serving; this driver remains internal because it owns
+the severable link and the reconciler directly. The cost is recorded in the
+artifacts: the cold-boot stages note that the store handle is built before the
+cut, because `connect` against an unreachable database fails before a
+reconciler exists. The recovery driver's remaining serving stages still need to
+retain the HTTP observations before they can become executable; cached-serving
+and rotation are already retained by the black-box stateful integration lane.
 
 **No database, no evidence.** A run without `AXOND_TEST_POSTGRES_DSN` writes no
 artifact rather than falling back to an in-process control plane, which is the
@@ -197,7 +199,8 @@ that accepts everything.
 
 Consequences of the amendment:
 
-- Nine stages produce evidence: five in-process, four in the restore lane.
+- Twelve stages produce evidence: five in-process, three through the black-box
+  stateful integration lane, and four in the restore lane.
 - The drill's credential and cache-signing key are generated per run and never
   printed, and the checker is given both, so an artifact that leaked one fails
   the lane instead of being uploaded.

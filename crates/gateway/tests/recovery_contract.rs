@@ -252,50 +252,36 @@ fn the_dependency_map_is_complete_in_both_directions() {
 
 /// Durable inventory is the only recovery stage that can claim restoration of
 /// the state introduced by the catalogue, pricing, and SecretStore slices.
-/// Keep those edges exact: attaching one to serving or reconvergence would
-/// either make the wrong stage appear unblocked or overstate what the restore
-/// drill proves.
+/// Once its real restore-drill implementation exists, those slices must no
+/// longer remain as dependency edges on a blocked stage.
 #[test]
-fn durable_inventory_owns_the_secret_catalogue_and_pricing_dependencies() {
+fn durable_inventory_is_owned_by_the_restore_drill() {
     let manifest = recovery::load();
-    let owners = |issue| {
-        manifest
-            .scenarios
-            .iter()
-            .flat_map(|scenario| {
-                scenario.stages.iter().flat_map(move |stage| {
-                    stage
-                        .blocked_on
-                        .iter()
-                        .filter(move |dependency| dependency.issue == issue)
-                        .map(move |_| format!("{}/{}", scenario.id, stage.id))
-                })
-            })
-            .collect::<BTreeSet<_>>()
-    };
-    let expected = |stages: &[&str]| {
-        stages
-            .iter()
-            .map(|stage| (*stage).to_owned())
-            .collect::<BTreeSet<_>>()
-    };
-
-    assert_eq!(
-        owners(145),
-        expected(&[
-            "backup-restore/durable-inventory",
-            "secret-rotation/rotation",
-        ])
-    );
-    assert_eq!(owners(146), expected(&["backup-restore/durable-inventory"]));
-    assert_eq!(owners(147), expected(&["backup-restore/durable-inventory"]));
-    assert_eq!(
-        owners(158),
-        expected(&[
-            "cold-boot-no-cache/readiness",
-            "cold-boot-invalid-cache/readiness",
-        ])
-    );
+    let stage = manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == "backup-restore")
+        .and_then(|scenario| {
+            scenario
+                .stages
+                .iter()
+                .find(|stage| stage.id == "durable-inventory")
+        })
+        .expect("backup-restore/durable-inventory is declared");
+    assert_eq!(stage.status, Status::Executable);
+    assert_eq!(stage.runner, Some(Runner::RestoreDrill));
+    assert!(stage.blocked_on.is_empty());
+    for issue in [145_u32, 146, 147, 149] {
+        assert!(
+            manifest
+                .scenarios
+                .iter()
+                .flat_map(|scenario| scenario.stages.iter())
+                .flat_map(|stage| stage.blocked_on.iter())
+                .all(|dependency| dependency.issue != issue),
+            "completed slice #{issue} must not remain a recovery blocker"
+        );
+    }
 }
 
 /// A slice may leave the dependency map, but only by saying what became of it.

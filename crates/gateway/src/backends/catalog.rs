@@ -822,6 +822,13 @@ impl ModelCapability {
             Self::Experimental => "experimental",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|capability| capability.as_str() == value)
+    }
 }
 
 /// Where a model sits in its published lifecycle.
@@ -854,6 +861,13 @@ impl ModelLifecycle {
             Self::Beta => "beta",
             Self::Deprecated => "deprecated",
         }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|lifecycle| lifecycle.as_str() == value)
     }
 
     /// Whether the source marks the model as retiring or retired.
