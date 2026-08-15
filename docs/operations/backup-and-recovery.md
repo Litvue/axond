@@ -162,11 +162,12 @@ retained snapshot history, and payload bytes. The drill never writes those rows
 by hand and the evidence checker rejects the generated provider material as
 well as the breakglass credential.
 
-Approved, effective-dated price-book history is intentionally not asserted by
-this procedure yet. The current main branch has the pricing domain and request
-consumers but no operator/admin publication path for an approved price-book
-resource; the recovery manifest records that as an explicit blocked stage rather
-than treating direct SQL fixture data as production evidence.
+Approved, effective-dated price-book history is asserted by this procedure. The
+drill publishes the approved resource through the operator/admin path, records
+its catalogue pin, approval citation, rates, and provenance, and verifies that
+the exact history survives logical restore. This is restore evidence for the
+durable pricing surface; the qualification packet still requires a retained
+fleet-level recovery record before #219 or #156 can close.
 
 Both restored databases are accepted by `axond migrate status` or the drill
 fails. The `Restore and PITR drill` CI lane runs it on every change, so the
