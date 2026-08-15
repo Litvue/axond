@@ -208,7 +208,7 @@ fuzz-lock:
 fuzz target seconds="60":
     mkdir -p fuzz/corpus/{{target}}
     cp -n fuzz/seeds/{{target}}/* fuzz/corpus/{{target}}/ || true
-    cd fuzz && host_target="${AXOND_FUZZ_TARGET:-$(rustc +nightly -vV | sed -n 's/^host: //p')}"; case "$host_target" in *-unknown-linux-musl) host_target="${host_target%-musl}-gnu" ;; esac; cargo +nightly fuzz run --target "$host_target" {{target}} corpus/{{target}} -- -max_total_time={{seconds}} -max_len=65536 -rss_limit_mb=2048 -malloc_limit_mb=1024 -timeout=25
+    cd fuzz && if [ -n "${AXOND_FUZZ_TARGET:-}" ]; then host_target="$AXOND_FUZZ_TARGET"; else host_target="$(rustc +nightly -vV | sed -n 's/^host: //p')"; case "$host_target" in *-unknown-linux-musl) host_target="${host_target%-musl}-gnu" ;; esac; fi; cargo +nightly fuzz run --target "$host_target" {{target}} corpus/{{target}} -- -max_total_time={{seconds}} -max_len=65536 -rss_limit_mb=2048 -malloc_limit_mb=1024 -timeout=25
 
 # Every fuzz target in turn, the way the scheduled lane runs them.
 fuzz-all seconds="60":
