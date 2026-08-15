@@ -1,0 +1,188 @@
+# A retained fault qualification run, reduced to workload observations.
+# The raw JSON artifacts remain alongside the workflow result; each
+# observation below binds one workload to its artifact digest and verdicts.
+
+schema_version = 1
+slice = "fault"
+tier = "full"
+runner = "github-actions"
+runner_note = "GitHub Actions ubuntu-latest, full pinned Redis/Postgres matrix"
+
+[source]
+git_commit = "c18b7a50a02941efaa2b6470b9a5f042175bd715"
+git_dirty = false
+crate_version = "0.3.39"
+
+[binary]
+sha256 = "c7c2503149259ace4bdadbf826ddef4c72d67c5aa825489cf6fba32433beddc1"
+version = "0.3.39"
+cargo_profile = "debug"
+rustc = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+
+[inputs]
+manifest = "qualification/faults/manifest.toml"
+manifest_sha256 = "65dbe368ee409afc247b0cce55901a2ba803c10e0524cce8f7e4b447975ca7ac"
+fixtures = 8
+
+[hardware]
+os = "linux"
+arch = "x86_64"
+kernel = "6.17.0-1022-azure"
+cpu_model = "AMD EPYC 7763 64-Core Processor"
+cpus = 4
+total_memory_kib = 16373452
+containerized = true
+
+[[observation]]
+id = "oversized-error-body"
+artifact_sha256 = "ccb5fecdcc21e357192e032ea57b8c232678f9bb2446ff2c92ad8b96ae662357"
+elapsed_ms = 19
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "oversized-response-body"
+artifact_sha256 = "483bc149a19827c092db683b809cb1cfc4e93cdc5e4bf15a58fbb6249757ae8a"
+elapsed_ms = 20
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "postgres-latency"
+artifact_sha256 = "9fb0a8cb9d46579d4f1f34bd467fbde4ad58b6d9cce3cce209deeabc8a350f87"
+elapsed_ms = 6529
+verdicts = 19
+passed = true
+
+[[observation]]
+id = "postgres-outage-fail-closed"
+artifact_sha256 = "ec2b363d24a3cafc0a7efcad12adb8fb8bcff30d277b410d157e92e4b744469c"
+elapsed_ms = 2
+verdicts = 19
+passed = true
+
+[[observation]]
+id = "postgres-outage-fail-open"
+artifact_sha256 = "b49ad017fd69437412726e8e650b6293533ecccb0e7ce90d351686ebb5c322d7"
+elapsed_ms = 4
+verdicts = 20
+passed = true
+
+[[observation]]
+id = "postgres-recovery"
+artifact_sha256 = "c96050afac67b001184a13322ed9c87727eef59eb17ec43281dc42bd0a636bdd"
+elapsed_ms = 76
+verdicts = 21
+passed = true
+
+[[observation]]
+id = "provider-rate-limited"
+artifact_sha256 = "b42575e870bc240b2b39c3478d7822542e210617fb1efa13401b9ebdc065bd89"
+elapsed_ms = 5
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "provider-rate-limited-failover"
+artifact_sha256 = "4a867d97707f7d51e10d506e62aa5b77702ce0b38a611d29cca0820910370233"
+elapsed_ms = 6
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "provider-server-error"
+artifact_sha256 = "49276439fb8ed3a1b61ee82c888f0097143204ef085bc4c2437b3a9ffbd211f5"
+elapsed_ms = 4
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "provider-server-error-failover"
+artifact_sha256 = "33b96933559d6d323309eee795e7b383299463758c1975a3eb0a6099d7c47f03"
+elapsed_ms = 6
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "redis-latency"
+artifact_sha256 = "042f8f2ff853300f2ae1b45b36a432e85b12a46e0b4b4f8bd502527ed242a1ff"
+elapsed_ms = 307
+verdicts = 19
+passed = true
+
+[[observation]]
+id = "redis-outage-fail-closed"
+artifact_sha256 = "68dea299347b1db60acb49b493ae0dce680aa50c257f0f1d703762dc53f6e5f6"
+elapsed_ms = 2004
+verdicts = 19
+passed = true
+
+[[observation]]
+id = "redis-outage-fail-open"
+artifact_sha256 = "e59d8bdb8e521a767d5911a6d712559149a74cb8e15f491f61463389cfa3be85"
+elapsed_ms = 2005
+verdicts = 20
+passed = true
+
+[[observation]]
+id = "redis-recovery"
+artifact_sha256 = "cce38d7e199dc3d5edfaedb34d0f53b12a2cdd86d3c5d87118e6b305c087357e"
+elapsed_ms = 5
+verdicts = 21
+passed = true
+
+[[observation]]
+id = "stream-idle-after-bytes"
+artifact_sha256 = "3bcc53bf5aec5a3223b91a8fe3dc5f34db07ff184a61a3ce2cee3eaf3fb085ad"
+elapsed_ms = 607
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "stream-idle-before-bytes"
+artifact_sha256 = "d7201dc9c59ea30b499290231be8b2ac5cf112c10382e3cd85cb92ed34631d9c"
+elapsed_ms = 606
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "stream-truncation"
+artifact_sha256 = "c5dd3972bb4696e4fd4d8bc8c3d70c16586a8dc7651a45b082be803f26faa193"
+elapsed_ms = 5
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "transport-buffered-body-timeout"
+artifact_sha256 = "911138517840504df0de221e1d3b012ca8647049259cecc12b14905a8daf6e8b"
+elapsed_ms = 607
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "transport-connect-refused"
+artifact_sha256 = "263c9fcdba306c2f1c70516ac7caf4fb162e9b182f840e04378c2a8ecc3dff3b"
+elapsed_ms = 3
+verdicts = 19
+passed = true
+
+[[observation]]
+id = "transport-dns-failure"
+artifact_sha256 = "faf6cfced60b6c57a5f628dc09e055eb7c2e30e9592061052001b87b11a8aa98"
+elapsed_ms = 16
+verdicts = 19
+passed = true
+
+[[observation]]
+id = "transport-response-header-timeout"
+artifact_sha256 = "dadac3eda74e1e468739ddd5ceeca24eb3b83571084f995fef3622c1eabf5aa2"
+elapsed_ms = 605
+verdicts = 18
+passed = true
+
+[[observation]]
+id = "transport-tls-handshake"
+artifact_sha256 = "cf058894006a4ba4bfe1ebd3ea627e18ce34105b95ff62defcd224c61d37ae3b"
+elapsed_ms = 4
+verdicts = 19
+passed = true
