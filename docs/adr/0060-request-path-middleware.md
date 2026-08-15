@@ -4,7 +4,7 @@ Date: 2026-08-15
 
 ## Status
 
-Proposed
+Accepted
 
 Opens the extension seam the request path has never had, under the accounting
 contract of [ADR 0005](./0005-streaming-relay.md) and
