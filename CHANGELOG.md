@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.40](https://github.com/Litvue/axond/compare/v0.3.39...v0.3.40) (2026-08-15)
+
+
+### Features
+
+* **stateful:** add durable recovery and catalogue contracts ([0aaa258](https://github.com/Litvue/axond/commit/0aaa2589d8cce6a6f62ba18556ebd230f41af3f1))
+* **stateful:** complete wave 2 qualification ([c18b7a5](https://github.com/Litvue/axond/commit/c18b7a50a02941efaa2b6470b9a5f042175bd715))
+* **stateful:** complete wave 2 qualification ([86d9289](https://github.com/Litvue/axond/commit/86d9289b0252d6ea46a5747912ba7d264641fc96))
+* **stateful:** project durable workload principals ([e18e64a](https://github.com/Litvue/axond/commit/e18e64a2ed7e3635284dbed0a0bf612f8d1652a0))
+
+
+### Documentation
+
+* **adr:** add request-path middleware seam decision ([#350](https://github.com/Litvue/axond/issues/350)) ([afffe41](https://github.com/Litvue/axond/commit/afffe41ac286a6bdfced75c68a9546fd72040c31))
+
+
+### Tests
+
+* **qualification:** retain fault and recovery evidence ([#353](https://github.com/Litvue/axond/issues/353)) ([114c6fd](https://github.com/Litvue/axond/commit/114c6fde7618ef0730711eb3cb6b5c2b2b409250))
+
 ## [0.3.39](https://github.com/Litvue/axond/compare/v0.3.38...v0.3.39) (2026-08-14)
 
 
