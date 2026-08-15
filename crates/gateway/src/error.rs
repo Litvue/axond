@@ -90,6 +90,17 @@ pub enum GatewayError {
         requested_tokens: u64,
         limit_tokens: u64,
     },
+    /// A request was refused by a content middleware before any provider work
+    /// began. The reason is a stable, bounded code; middleware diagnostics and
+    /// request content stay in operator telemetry rather than this envelope.
+    #[allow(dead_code)]
+    #[error("request refused by middleware: {reason}")]
+    MiddlewareRefused { reason: &'static str },
+    /// A fail-closed middleware could not complete within its declared bound
+    /// or returned an internal failure before provider dispatch.
+    #[allow(dead_code)]
+    #[error("middleware is unavailable")]
+    MiddlewareUnavailable,
     #[error("the gateway is shutting down and is no longer accepting requests")]
     Draining,
     #[error("unauthorized")]
@@ -160,6 +171,8 @@ impl GatewayError {
             Self::RequestTooLarge | Self::PromptTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::OutputLimitExceeded { .. } => StatusCode::BAD_REQUEST,
+            Self::MiddlewareRefused { .. } => StatusCode::BAD_REQUEST,
+            Self::MiddlewareUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             // Retryable elsewhere immediately: this replica is leaving, not
             // failing, and readiness has already said so.
             Self::Draining => StatusCode::SERVICE_UNAVAILABLE,
@@ -213,6 +226,8 @@ impl GatewayError {
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::PromptTooLarge { .. } => "prompt_too_large",
             Self::OutputLimitExceeded { .. } => "output_limit_exceeded",
+            Self::MiddlewareRefused { .. } => "middleware_refused",
+            Self::MiddlewareUnavailable => "middleware_unavailable",
             Self::Draining => "draining",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),

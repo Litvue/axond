@@ -25,7 +25,9 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use gateway_core::{ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder};
+use gateway_core::{
+    MiddlewareStateBag, ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder,
+};
 use gateway_transport::{ByteStream, TransportError};
 use opentelemetry::Context;
 use serde_json::{Value, json};
@@ -288,6 +290,32 @@ pub fn relay_opened(
     framing: Framing,
     rotation: Option<RotationHandle>,
 ) -> Response {
+    relay_opened_with_state(
+        state,
+        ctx,
+        decoder,
+        bytes,
+        started,
+        framing,
+        rotation,
+        MiddlewareStateBag::default(),
+    )
+}
+
+/// Variant of [`relay_opened`] used by the middleware chain.  The state bag is
+/// moved into `Accounting`, which is owned by the response body and therefore
+/// survives the handler and drops on normal completion, client hangup, or
+/// cancellation together with the existing accounting owner.
+pub fn relay_opened_with_state(
+    state: AppState,
+    ctx: StreamContext,
+    decoder: Box<dyn ProviderStreamDecoder>,
+    bytes: ByteStream,
+    started: Instant,
+    framing: Framing,
+    rotation: Option<RotationHandle>,
+    middleware_state: MiddlewareStateBag,
+) -> Response {
     // A stream's *total* lifetime, as opposed to the transport's idle bound,
     // which a trickle of keepalives resets forever.
     let limits = state.0.admission.limits();
@@ -301,7 +329,7 @@ pub fn relay_opened(
         pending: VecDeque::new(),
         phase: Phase::Streaming,
         framing,
-        accounting: Accounting::new(state, ctx, started),
+        accounting: Accounting::new_with_state(state, ctx, started, middleware_state),
         rotation,
         queued_downstream: false,
         deadline,
@@ -330,6 +358,19 @@ pub fn relay_opened(
 /// still reconciles exactly one record like the buffered path.
 pub fn settle_upstream_error(state: AppState, ctx: StreamContext, started: Instant) {
     let mut accounting = Accounting::new(state, ctx, started);
+    accounting.settle(Status::UpstreamError);
+}
+
+/// Settle a streamed request that never opened a stream while retaining the
+/// same response-lifetime ownership rule for middleware state.
+#[allow(dead_code)]
+pub fn settle_upstream_error_with_state(
+    state: AppState,
+    ctx: StreamContext,
+    started: Instant,
+    #[allow(dead_code)] middleware_state: MiddlewareStateBag,
+) {
+    let mut accounting = Accounting::new_with_state(state, ctx, started, middleware_state);
     accounting.settle(Status::UpstreamError);
 }
 
@@ -777,6 +818,11 @@ struct Accounting {
     /// measure of output a stream has before the provider's usage arrives.
     relayed_chars: usize,
     carried_output_tokens: u64,
+    /// Request-scope middleware state. It is intentionally owned here rather
+    /// than by the handler so cancellation and client hangup retain the same
+    /// response-lifetime drop boundary as budget and admission accounting.
+    #[allow(dead_code)]
+    middleware_state: MiddlewareStateBag,
     /// Time to the first relayed token, which for a stream is the number a
     /// caller actually feels.
     ttft_ms: Option<u64>,
@@ -785,6 +831,15 @@ struct Accounting {
 
 impl Accounting {
     fn new(state: AppState, ctx: StreamContext, started: Instant) -> Self {
+        Self::new_with_state(state, ctx, started, MiddlewareStateBag::default())
+    }
+
+    fn new_with_state(
+        state: AppState,
+        ctx: StreamContext,
+        started: Instant,
+        middleware_state: MiddlewareStateBag,
+    ) -> Self {
         Self {
             state,
             ctx,
@@ -792,6 +847,7 @@ impl Accounting {
             usage: ModelUsage::default(),
             relayed_chars: 0,
             carried_output_tokens: 0,
+            middleware_state,
             ttft_ms: None,
             settled: false,
         }
@@ -1018,6 +1074,14 @@ mod tests {
     }
 
     struct LedgerSink(Arc<Ledger>);
+
+    struct MiddlewareDropCounter(Arc<AtomicUsize>);
+
+    impl Drop for MiddlewareDropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[async_trait]
     impl UsageSink for LedgerSink {
@@ -1306,6 +1370,22 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             estimated_input_tokens: 8,
             attempts: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn accounting_owns_middleware_state_until_the_response_owner_drops() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut middleware_state = MiddlewareStateBag::new(1);
+        middleware_state.insert(
+            0,
+            gateway_core::MiddlewareState::new(MiddlewareDropCounter(Arc::clone(&dropped))),
+        );
+        let state = state_for("http://127.0.0.1:1", Arc::new(Ledger::default()));
+        let accounting =
+            Accounting::new_with_state(state, context(), Instant::now(), middleware_state);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(accounting);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     /// The ledger is written from a detached settlement task; poll briefly

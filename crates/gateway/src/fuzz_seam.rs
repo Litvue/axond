@@ -36,6 +36,8 @@ mod credentials;
 mod desired_state;
 mod error;
 mod key_material;
+#[allow(dead_code)]
+mod middleware;
 mod mint;
 mod ops;
 mod policy;
