@@ -620,3 +620,21 @@ fn the_packet_and_its_prose_agree() {
         packet::CONTRACT_RELATIVE
     );
 }
+
+/// Cross-slice dependency removals stay reviewable in both the data file and
+/// the operator-facing page rather than disappearing as an untested deletion.
+#[test]
+fn retired_cross_slice_dependencies_are_recorded() {
+    let packet = std::fs::read_to_string(packet::manifest_path())
+        .expect("qualification packet should be readable as text");
+    let contract = packet::contract_text();
+
+    assert!(
+        packet.contains("#158 dependency formerly attached to fault and"),
+        "the packet must explain why #158 no longer blocks its slices"
+    );
+    assert!(
+        contract.contains("## Dependency retirements") && contract.contains("formerly named #158"),
+        "the qualification page must record the retired #158 dependency"
+    );
+}

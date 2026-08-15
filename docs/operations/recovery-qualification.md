@@ -266,8 +266,9 @@ promotion.
 
 The former #155 dependency is resolved by that stage's explicit contract: usage
 is measured through the Postgres outbox and sink, keyed by canonical globally
-unique request IDs. The run remains harnessed until a clean fleet-level record is
-retained alongside the stage artifacts.
+unique request IDs. The retained process-level record now covers all executable
+stages; #219 remains open until a clean fleet-level record is retained alongside
+the stage artifacts.
 
 The manifest carries the same map per scenario, so landing a slice tells you
 which scenarios it unblocks.
@@ -278,6 +279,7 @@ which scenarios it unblocks.
 | --- | --- |
 | #146 | Retired for recovery qualification: the restore lane exercises the existing Postgres-backed catalogue store and checks its retained active snapshot. The remaining import/source behavior stays on #146. |
 | #159 | The part a recovery scenario needed — a database running with WAL archiving, and the evidence published as an artifact — is here: `ops/restore-drill.sh` runs that lane, and `ops/check-recovery-evidence.py` fails it when an executable stage leaves no artifact. The rest of #159 — disclosure, fuzzing, SDK compatibility — blocks no recovery stage, so it stays tracked on #159 itself rather than on a stage invented to wait on it. |
+| #158 | Retired as a recovery dependency: the stateful deployment, persistent-volume, and preflight qualification work remains tracked on #158, while the executable recovery stages and their retained process record no longer wait on it. |
 
 The manifest carries the same list in `[[retired_blocker]]`, and
 `RETIRED_BLOCKERS` in the contract test holds the two together, so a slice can

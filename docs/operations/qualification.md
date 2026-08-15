@@ -26,18 +26,18 @@ the manifest it names is a test failure.
 
 ## What the packet may not be read as
 
-- **Not a claim that Axond is production-qualified.** One of five slices is
-  evidenced and four have a driver with no retained heavy run behind them; no
+- **Not a claim that Axond is production-qualified.** Three of five slices are
+  evidenced and two have a driver with no retained heavy run behind them; no
   slice has retained a run of a fleet. #156 stays open until every slice
   is `evidenced`; `closure.satisfied` in the packet is derived from the slices,
   so it cannot be set by hand.
-- **Not a stateful fleet baseline.** Every retained #156 record is Tier 0: one
-  process, no Redis, no Postgres, no control plane. Separate #219 process
-  evidence now proves projected state, cache recovery, cache refusal, and
-  rotation against real PostgreSQL, but it is not a multi-replica load or soak
-  measurement. The stateful endurance harness has run its ninety-second smoke
-  tier, but the 12–24 hour tiers have not been dispatched.
-- **Not a fleet baseline.** Both retained runs are local (see below).
+- **Not a stateful fleet baseline.** The two capacity records are Tier 0 local
+  runs; the retained fault and recovery records are process-level GitHub
+  Actions runs against pinned Redis/Postgres lanes. None is a multi-replica
+  load or soak measurement. The stateful endurance harness has run its
+  ninety-second smoke tier, but the 12–24 hour tiers have not been dispatched.
+- **Not a fleet baseline.** The retained CI records qualify process behavior,
+  not offered load across replicas.
 
 ## The status ladder
 
@@ -74,15 +74,29 @@ check out.
 | --- | --- | --- | --- | --- |
 | `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `8e2cbb566e82` | `8ba8b96` |
 | `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `8e2cbb566e82` | `8ba8b96` |
+| `qualification/faults/evidence/full-ci.toml` | full | github-actions | `c7c250314925` | `c18b7a5` |
+| `qualification/recovery/evidence/serving-ci.toml` | serving | github-actions | `4c1789c306b9` | `c18b7a5` |
 
-Both were produced on an 8 vCPU cloud VM from a **debug build**, which is what
+The two capacity records were produced on an 8 vCPU cloud VM from a **debug build**, which is what
 `cargo test` builds. They are the first envelope, not a fleet baseline: a release
 build on production-representative hardware will move every number in them, and
 `runner = "local"` is in the record so that caveat travels with the data instead
-of with this paragraph. The contract test requires a locally recorded run to be
-disclosed here by path and by the digest of the binary that produced it, so
-re-running a tier — which rebuilds the binary, and so changes the digest —
-without rewriting this table is a test failure rather than a stale paragraph.
+of with this paragraph. The CI records are retained process-level fault and
+recovery evidence; their GitHub Actions provenance and Redis/Postgres lanes do
+not make them fleet-load measurements. The contract test requires a locally
+recorded run to be disclosed here by path and by the digest of the binary that
+produced it, so re-running a tier — which rebuilds the binary, and so changes
+the digest — without rewriting this table is a test failure rather than a stale
+paragraph.
+
+## Dependency retirements
+
+The fault and rollout slices formerly named #158 in `blocked_on`. That edge is
+retired rather than silently deleted: the stateful deployment, persistent
+volume, and preflight work remains tracked on [#158](https://github.com/Litvue/axond/issues/158),
+while the fault and rollout qualification contracts now own their executable
+evidence. The packet header records the same retirement, and this paragraph is
+checked by the qualification packet test.
 
 Write a record from a run's artifacts:
 
