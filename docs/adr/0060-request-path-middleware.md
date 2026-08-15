@@ -113,13 +113,20 @@ structurally cannot be middleware, and a redact/unredact pair cannot survive its
 own stream. It is in the primitive from the first commit for that reason, not as
 a later capability.
 
-**Content middleware runs after the permits and before the estimate.** The cheap
-pre-admission bounds check on the arriving body is kept as a fail-fast, the
-chain runs once the admission and rate-limit permits are held, and the bounds
-check is then **re-run on the mutated body** as the authoritative one. Running
-the chain before the permits would make a middleware — which may be expensive —
-into an amplification surface reachable by anything that authenticates; running
-it after the estimate would price a body that was never sent.
+**Content middleware runs after the permits and before the estimate, and
+everything derived from the estimate is derived from the mutated body.** The
+cheap pre-admission check on the arriving body is kept as a fail-fast, the chain
+runs once the admission and rate-limit permits are held, and then the whole
+estimate-derived group is recomputed as the authoritative one: the token
+estimate, the `max_prompt_tokens` and `max_output_tokens` ceilings, the caller's
+`max_request_microdollars` per-request cost ceiling, and the amount the budget
+reservation is taken for. Today all of these come from a single `estimate`
+computed once, well before admission, so this splits that computation in two —
+and moving only the token bounds would leave a middleware that grows a body able
+to walk a request past the cost ceiling its caller was given and take a hold
+priced for a body that was never sent. Running the chain before the permits would
+make a middleware — which may be expensive — into an amplification surface
+reachable by anything that authenticates.
 
 **Core order is compile-time; only content middleware is configurable.** The
 stages that fail closed compose in source, in the order `routes::mount` and
