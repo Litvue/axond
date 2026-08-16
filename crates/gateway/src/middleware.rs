@@ -6,12 +6,15 @@
 //! refusal envelope.  The chain is deliberately not attached to `AppState` yet;
 //! an empty chain is the production default until typed policy delivery lands.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 #[cfg(test)]
 use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use gateway_core::{
     Middleware, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed, MiddlewareOutcome,
@@ -29,23 +32,89 @@ use crate::error::GatewayError;
 /// end-to-end invocation bound instead of spawning unbounded blocked threads.
 const MAX_BLOCKING_MIDDLEWARE_INVOCATIONS: usize = 64;
 
-/// Process-owned execution bounds shared by every chain in one serving state.
+/// No one middleware implementation may retain more than this many blocking
+/// workers after concurrent requests cross their invocation deadlines.
+const MAX_BLOCKING_INVOCATIONS_PER_MIDDLEWARE: usize = 4;
+
+/// Replica-owned execution bounds shared by every chain in one serving state.
 ///
-/// Keeping these handles in `AppState` gives production one process-wide bound
-/// while each independently constructed test state receives a fresh quarantine
-/// latch and semaphore.
+/// The global semaphore bounds the blocking work for the replica. A weak gate
+/// per middleware id adds a tighter bound and isolates abandoned invocations:
+/// while a timed-out call is still running, only that id applies its failure
+/// posture. The weak registry forgets inactive ids instead of growing with
+/// policy revisions.
 #[derive(Clone)]
 pub(crate) struct MiddlewareRuntime {
     slots: Arc<Semaphore>,
-    quarantined: Arc<AtomicBool>,
+    gates: Arc<Mutex<BTreeMap<String, Weak<MiddlewareGate>>>>,
 }
 
 impl Default for MiddlewareRuntime {
     fn default() -> Self {
         Self {
             slots: Arc::new(Semaphore::new(MAX_BLOCKING_MIDDLEWARE_INVOCATIONS)),
-            quarantined: Arc::new(AtomicBool::new(false)),
+            gates: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+}
+
+impl MiddlewareRuntime {
+    fn gate(&self, id: &str) -> Arc<MiddlewareGate> {
+        let mut gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(MiddlewareGate {
+            slots: Arc::new(Semaphore::new(MAX_BLOCKING_INVOCATIONS_PER_MIDDLEWARE)),
+            abandoned: AtomicUsize::new(0),
+        });
+        gates.insert(id.to_owned(), Arc::downgrade(&gate));
+        gate
+    }
+
+    #[cfg(test)]
+    fn with_slots(slots: Arc<Semaphore>) -> Self {
+        Self {
+            slots,
+            gates: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+}
+
+struct MiddlewareGate {
+    slots: Arc<Semaphore>,
+    abandoned: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum InvocationState {
+    Running,
+    TimedOut,
+    Completed,
+}
+
+/// Resolves a temporary id quarantine even when middleware panics. Tokio cannot
+/// cancel `spawn_blocking`, so this guard has to live inside the closure.
+struct InvocationGuard {
+    state: Arc<Mutex<InvocationState>>,
+    gate: Arc<MiddlewareGate>,
+}
+
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if matches!(*state, InvocationState::TimedOut) {
+            let previous = self.gate.abandoned.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0);
+        }
+        *state = InvocationState::Completed;
     }
 }
 
@@ -141,12 +210,7 @@ impl MiddlewareChain {
         runtime: &MiddlewareRuntime,
         request: &mut ProviderRequest,
     ) -> Result<MiddlewareStateBag, GatewayError> {
-        self.request_with_runtime(
-            request,
-            Arc::clone(&runtime.slots),
-            Arc::clone(&runtime.quarantined),
-        )
-        .await
+        self.request_with_runtime(request, runtime).await
     }
 
     #[cfg(test)]
@@ -157,41 +221,66 @@ impl MiddlewareChain {
         self.request(&MiddlewareRuntime::default(), request).await
     }
 
+    #[cfg(test)]
     async fn request_with_slots(
         &self,
         request: &mut ProviderRequest,
         slots: Arc<Semaphore>,
     ) -> Result<MiddlewareStateBag, GatewayError> {
-        self.request_with_runtime(request, slots, Arc::new(AtomicBool::new(false)))
+        self.request_with_runtime(request, &MiddlewareRuntime::with_slots(slots))
             .await
     }
 
     async fn request_with_runtime(
         &self,
         request: &mut ProviderRequest,
-        slots: Arc<Semaphore>,
-        quarantined: Arc<AtomicBool>,
+        runtime: &MiddlewareRuntime,
     ) -> Result<MiddlewareStateBag, GatewayError> {
         let mut states = MiddlewareStateBag::new(self.len());
         for (index, entry) in self.entries.iter().enumerate() {
-            if !entry.declaration().has_scope(MiddlewareScope::Request) {
+            let declaration = entry.declaration();
+            if !declaration.has_scope(MiddlewareScope::Request) {
                 continue;
             }
-            if quarantined.load(Ordering::Acquire) {
+            let gate = runtime.gate(&declaration.id);
+            if gate.abandoned.load(Ordering::Acquire) > 0 {
                 self.failure(
                     index,
-                    "blocking runtime quarantined after an abandoned invocation",
+                    "middleware id quarantined while an abandoned invocation is still running",
                 )?;
                 continue;
             }
-            let bound = entry.declaration().max_duration;
+            let bound = declaration.max_duration;
             let capacity_started = tokio::time::Instant::now();
             let deadline = capacity_started + bound;
-            let slot =
-                match tokio::time::timeout_at(deadline, Arc::clone(&slots).acquire_owned()).await {
+            let middleware_slot =
+                match tokio::time::timeout_at(deadline, Arc::clone(&gate.slots).acquire_owned())
+                    .await
+                {
                     Ok(Ok(slot)) => slot,
                     Ok(Err(_)) => {
-                        self.failure(index, "invocation capacity closed")?;
+                        self.failure(index, "middleware invocation capacity closed")?;
+                        continue;
+                    }
+                    Err(_) => {
+                        crate::telemetry::metrics::record_middleware_capacity_wait(
+                            capacity_started.elapsed().as_secs_f64() * 1_000.0,
+                            true,
+                        );
+                        self.failure(
+                            index,
+                            "invocation bound exceeded waiting for per-middleware capacity",
+                        )?;
+                        continue;
+                    }
+                };
+            let process_slot =
+                match tokio::time::timeout_at(deadline, Arc::clone(&runtime.slots).acquire_owned())
+                    .await
+                {
+                    Ok(Ok(slot)) => slot,
+                    Ok(Err(_)) => {
+                        self.failure(index, "process invocation capacity closed")?;
                         continue;
                     }
                     Err(_) => {
@@ -208,7 +297,8 @@ impl MiddlewareChain {
                     capacity_started.elapsed().as_secs_f64() * 1_000.0,
                     true,
                 );
-                drop(slot);
+                drop(process_slot);
+                drop(middleware_slot);
                 self.failure(index, "invocation bound exhausted waiting for capacity")?;
                 continue;
             }
@@ -218,10 +308,18 @@ impl MiddlewareChain {
             );
             let mut candidate = request.clone();
             let middleware = Arc::clone(entry);
+            let invocation_state = Arc::new(Mutex::new(InvocationState::Running));
+            let closure_state = Arc::clone(&invocation_state);
+            let closure_gate = Arc::clone(&gate);
             let invoked = tokio::time::timeout_at(
                 deadline,
                 tokio::task::spawn_blocking(move || {
-                    let _slot = slot;
+                    let _process_slot = process_slot;
+                    let _middleware_slot = middleware_slot;
+                    let _invocation_guard = InvocationGuard {
+                        state: closure_state,
+                        gate: closure_gate,
+                    };
                     let result = middleware.apply(MiddlewarePhase::Request(&mut candidate), None);
                     (candidate, result)
                 }),
@@ -234,7 +332,13 @@ impl MiddlewareChain {
                     continue;
                 }
                 Err(_) => {
-                    quarantined.store(true, Ordering::Release);
+                    let mut state = invocation_state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    if matches!(*state, InvocationState::Running) {
+                        gate.abandoned.fetch_add(1, Ordering::AcqRel);
+                        *state = InvocationState::TimedOut;
+                    }
                     self.failure(index, "invocation bound exceeded")?;
                     continue;
                 }
@@ -648,9 +752,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_abandoned_invocation_quarantines_later_blocking_work() {
+    async fn an_abandoned_invocation_quarantines_only_its_id_until_it_returns() {
         struct Slow {
             declaration: MiddlewareDeclaration,
+            calls: Arc<AtomicUsize>,
         }
         impl Middleware for Slow {
             fn declaration(&self) -> &MiddlewareDeclaration {
@@ -661,49 +766,70 @@ mod tests {
                 _phase: MiddlewarePhase<'_>,
                 _state: Option<&mut gateway_core::MiddlewareState>,
             ) -> gateway_core::MiddlewareResult {
+                self.calls.fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(500));
                 Ok(MiddlewareOutcome::continue_without_state())
             }
         }
 
         let mut declaration = MiddlewareDeclaration::new("stuck", [MiddlewareScope::Request]);
+        declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
         // Leave ample executor-scheduling time so this specifically exercises
         // a closure abandoned after it starts, not the pre-spawn deadline gate.
         declaration.max_duration = Duration::from_millis(100);
-        let chain =
-            MiddlewareChain::new(vec![Arc::new(Slow { declaration })]).expect("bounded chain");
-        let runtime = MiddlewareRuntime {
-            slots: Arc::new(Semaphore::new(1)),
-            quarantined: Arc::new(AtomicBool::new(false)),
-        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let chain = MiddlewareChain::new(vec![
+            Arc::new(Slow {
+                declaration,
+                calls: Arc::clone(&calls),
+            }),
+            Arc::new(Mutator {
+                declaration: MiddlewareDeclaration::new(
+                    "required-peer",
+                    [MiddlewareScope::Request],
+                ),
+            }),
+        ])
+        .expect("bounded chain");
+        let runtime = MiddlewareRuntime::with_slots(Arc::new(Semaphore::new(2)));
         let mut first = ProviderRequest {
             model: "alias".to_owned(),
             body: json!({}),
         };
 
-        assert!(matches!(
-            chain.request(&runtime, &mut first).await,
-            Err(GatewayError::MiddlewareUnavailable)
-        ));
-        assert!(runtime.quarantined.load(Ordering::Acquire));
+        chain
+            .request(&runtime, &mut first)
+            .await
+            .expect("the timed-out optional middleware must not disable its required peer");
+        assert_eq!(first.body["changed"], json!(true));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.gate("stuck").abandoned.load(Ordering::Acquire), 1);
 
-        let mut second = first.clone();
-        let refusal = tokio::time::timeout(
-            Duration::from_millis(20),
+        let mut second = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        tokio::time::timeout(
+            Duration::from_millis(75),
             chain.request(&runtime, &mut second),
         )
         .await
-        .expect("quarantined work must refuse without waiting for the occupied slot");
-        assert!(matches!(refusal, Err(GatewayError::MiddlewareUnavailable)));
+        .expect("the quarantined id must be skipped without waiting")
+        .expect("the required peer must still run");
+        assert_eq!(second.body["changed"], json!(true));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-        let healthy = MiddlewareChain::new(vec![Arc::new(Noop {
-            declaration: MiddlewareDeclaration::new("healthy", [MiddlewareScope::Request]),
-        })])
-        .expect("healthy chain");
-        healthy
-            .request_isolated(&mut second)
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let mut recovered = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        chain
+            .request(&runtime, &mut recovered)
             .await
-            .expect("a separately constructed runtime must not inherit quarantine");
+            .expect("the id is retried after its abandoned invocation returns");
+        assert_eq!(recovered.body["changed"], json!(true));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

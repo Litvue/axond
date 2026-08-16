@@ -121,7 +121,7 @@ pub struct Inner {
     /// shipped posture until typed policy delivery registers middleware; an
     /// empty chain is byte-neutral and keeps the request path unchanged.
     pub middleware: MiddlewareChain,
-    /// Blocking capacity and the quarantine latch for content middleware. This
+    /// Global and per-id blocking capacity for content middleware. This
     /// is process-owned in production and isolated per constructed test state.
     pub middleware_runtime: MiddlewareRuntime,
     config: ArcSwap<ConfigSnapshot>,

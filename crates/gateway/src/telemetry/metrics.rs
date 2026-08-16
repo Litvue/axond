@@ -428,7 +428,7 @@ impl Instruments {
     }
 }
 
-/// Observe contention for the process-wide blocking-middleware capacity bound.
+/// Observe contention for the global or per-id blocking-middleware capacity bound.
 /// No middleware or tenant identifier is attached: policy-defined identifiers
 /// would turn one saturation signal into an unbounded-cardinality surface.
 pub(crate) fn record_middleware_capacity_wait(duration_ms: f64, timed_out: bool) {
