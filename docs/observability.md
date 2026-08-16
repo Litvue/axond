@@ -131,6 +131,14 @@ A streamed response outlives its server span: the span records where the stream
 was routed before dispatch, and the final tokens/cost land on the metrics and
 the usage record instead.
 
+When request-path middleware is registered, the prompt estimate, request
+ceilings, and budget reservation are computed from the body after the chain has
+run. A captured inbound request may therefore be smaller than the input named
+by a usage row: the row describes the body that reached the provider. For
+stream cancellation or a provider response without authoritative input usage,
+the relay's fallback input count is the same post-middleware estimate used for
+the hold.
+
 ## Metrics
 
 `axond.http.*` covers every HTTP request — including ones that never reach a

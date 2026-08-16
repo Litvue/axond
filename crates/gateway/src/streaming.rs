@@ -281,6 +281,7 @@ where
 /// OpenAI-normalized streams may use the supplied handle only while no content
 /// has been emitted, because a second independent completion cannot safely
 /// resume a partially delivered wire.
+#[allow(dead_code)]
 pub fn relay_opened(
     state: AppState,
     ctx: StreamContext,
@@ -356,6 +357,7 @@ pub fn relay_opened_with_state(
 /// Settle a streamed request that never opened a stream (every target failed or
 /// was skipped) as a single upstream-error usage record, so a failed stream
 /// still reconciles exactly one record like the buffered path.
+#[allow(dead_code)]
 pub fn settle_upstream_error(state: AppState, ctx: StreamContext, started: Instant) {
     let mut accounting = Accounting::new(state, ctx, started);
     accounting.settle(Status::UpstreamError);
@@ -830,6 +832,7 @@ struct Accounting {
 }
 
 impl Accounting {
+    #[allow(dead_code)]
     fn new(state: AppState, ctx: StreamContext, started: Instant) -> Self {
         Self::new_with_state(state, ctx, started, MiddlewareStateBag::default())
     }

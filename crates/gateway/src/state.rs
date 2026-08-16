@@ -54,6 +54,7 @@ use crate::desired_state::{
 };
 use crate::desired_state::{ProjectId, RevisionId, SecretRef, TenantId, WorkloadKey};
 use crate::key_material::{self, KeyMaterialError};
+use crate::middleware::MiddlewareChain;
 use crate::policy::PolicyRuntime;
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
@@ -116,6 +117,10 @@ pub struct Inner {
     /// path never reaches the source or the store, and holding this handle is
     /// what makes that structural rather than a rule (ADR 0043).
     pub catalogue: Option<Arc<CatalogStatus>>,
+    /// The content middleware chain for this process. It is empty in the
+    /// shipped posture until typed policy delivery registers middleware; an
+    /// empty chain is byte-neutral and keeps the request path unchanged.
+    pub middleware: MiddlewareChain,
     config: ArcSwap<ConfigSnapshot>,
 }
 
@@ -1547,8 +1552,20 @@ impl AppState {
             status: observability.status,
             revision: observability.revision,
             catalogue: observability.catalogue,
+            middleware: MiddlewareChain::empty(),
             config: ArcSwap::from_pointee(snapshot),
         })))
+    }
+
+    /// Install a test or boot-constructed content chain before the state is
+    /// shared with the router. Runtime policy delivery will replace this
+    /// constructor-only hook with a snapshot-owned chain.
+    #[cfg(test)]
+    pub fn with_middleware_chain(mut self, middleware: MiddlewareChain) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("middleware chain must be installed before AppState is cloned")
+            .middleware = middleware;
+        self
     }
 
     /// The process lifecycle: what readiness reports and what admission checks.
