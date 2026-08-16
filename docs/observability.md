@@ -187,6 +187,8 @@ destination receives by exactly what the refusals in
 | `axond.budget.capacity_denials` | counter | — | In-memory admissions denied because the ledger bound was exhausted. |
 | `axond.budget.namespace_denials` | counter | — | Admissions denied by `namespace_limit_microdollars` rather than by the subject's own cap. Both answer `429`. |
 | `axond.budget.retained_subjects` | gauge | — | In-memory ledgers retained after capacity-pressure pruning; watch against `max_subjects`. |
+| `axond.middleware.capacity_wait` | histogram (ms) | — | Time content middleware waits for one of the bounded blocking-executor slots. Sustained growth means late synchronous invocations are retaining capacity. |
+| `axond.middleware.capacity_timeouts` | counter | — | Requests whose middleware deadline expired while waiting for blocking capacity. Alert on any sustained increase alongside `middleware_unavailable` responses. |
 | `axond.rate_limit.denials` | counter | — | Inbound concurrency admissions rejected. |
 | `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
 | `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |

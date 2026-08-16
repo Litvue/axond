@@ -64,6 +64,8 @@ struct Instruments {
     budget_capacity_denials: Counter<u64>,
     budget_namespace_denials: Counter<u64>,
     budget_retained_subjects: Gauge<u64>,
+    middleware_capacity_wait: Histogram<f64>,
+    middleware_capacity_timeouts: Counter<u64>,
     admission_in_flight: UpDownCounter<i64>,
     admission_rejections: Counter<u64>,
     rate_limit_denials: Counter<u64>,
@@ -333,6 +335,19 @@ impl Instruments {
                     "In-memory budget ledgers retained after capacity-pressure pruning.",
                 )
                 .build(),
+            middleware_capacity_wait: meter
+                .f64_histogram("axond.middleware.capacity_wait")
+                .with_unit("ms")
+                .with_description(
+                    "Time request-path middleware waited for bounded blocking capacity.",
+                )
+                .build(),
+            middleware_capacity_timeouts: meter
+                .u64_counter("axond.middleware.capacity_timeouts")
+                .with_description(
+                    "Middleware invocations whose end-to-end bound expired waiting for capacity.",
+                )
+                .build(),
             admission_in_flight: meter
                 .i64_up_down_counter("axond.admission.in_flight")
                 .with_description(
@@ -410,6 +425,21 @@ impl Instruments {
                 )
                 .build(),
         }
+    }
+}
+
+/// Observe contention for the process-wide blocking-middleware capacity bound.
+/// No middleware or tenant identifier is attached: policy-defined identifiers
+/// would turn one saturation signal into an unbounded-cardinality surface.
+pub(crate) fn record_middleware_capacity_wait(duration_ms: f64, timed_out: bool) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .middleware_capacity_wait
+        .record(duration_ms, &[]);
+    if timed_out {
+        instruments.middleware_capacity_timeouts.add(1, &[]);
     }
 }
 

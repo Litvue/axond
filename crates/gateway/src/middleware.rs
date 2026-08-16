@@ -137,15 +137,26 @@ impl MiddlewareChain {
                 continue;
             }
             let bound = entry.declaration().max_duration;
-            let deadline = tokio::time::Instant::now() + bound;
+            let capacity_started = tokio::time::Instant::now();
+            let deadline = capacity_started + bound;
             let slot =
                 match tokio::time::timeout_at(deadline, Arc::clone(&slots).acquire_owned()).await {
-                    Ok(Ok(slot)) => slot,
+                    Ok(Ok(slot)) => {
+                        crate::telemetry::metrics::record_middleware_capacity_wait(
+                            capacity_started.elapsed().as_secs_f64() * 1_000.0,
+                            false,
+                        );
+                        slot
+                    }
                     Ok(Err(_)) => {
                         self.failure(index, "invocation capacity closed")?;
                         continue;
                     }
                     Err(_) => {
+                        crate::telemetry::metrics::record_middleware_capacity_wait(
+                            capacity_started.elapsed().as_secs_f64() * 1_000.0,
+                            true,
+                        );
                         self.failure(index, "invocation bound exceeded waiting for capacity")?;
                         continue;
                     }
