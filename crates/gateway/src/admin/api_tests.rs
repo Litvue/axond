@@ -1376,7 +1376,7 @@ async fn policy_middleware_is_typed_and_failed_publication_does_not_advance() {
     let mut registered = policy_document();
     registered["resource"]["content_middleware"] = json!([{
         "id": "test.policy-marker",
-        "scopes": ["request"],
+        "scopes": ["request", "response", "stream_event"],
         "failure_posture": "fail_closed",
         "max_duration_milliseconds": 25,
     }]);
@@ -1384,33 +1384,20 @@ async fn policy_middleware_is_typed_and_failed_publication_does_not_advance() {
         .publish("/policies", "registered", &expected, &registered)
         .await;
 
-    for (key, id, scopes) in [
-        (
-            "unknown-middleware",
-            "future.middleware",
-            json!(["request"]),
-        ),
-        (
-            "unsupported-scope",
-            "test.policy-marker",
-            json!(["response"]),
-        ),
-    ] {
-        let mut unavailable = policy_document();
-        unavailable["resource"]["epoch"] = json!(2);
-        unavailable["resource"]["content_middleware"] = json!([{
-            "id": id,
-            "scopes": scopes,
-            "failure_posture": "fail_closed",
-            "max_duration_milliseconds": 25,
-        }]);
-        let (status, body) = deployment
-            .post("/policies", key, &revision, &unavailable)
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["error"]["type"], "validation_failed");
-        assert_eq!(body["error"]["rule"], "content_middleware_unavailable");
-    }
+    let mut unavailable = policy_document();
+    unavailable["resource"]["epoch"] = json!(2);
+    unavailable["resource"]["content_middleware"] = json!([{
+        "id": "future.middleware",
+        "scopes": ["request"],
+        "failure_posture": "fail_closed",
+        "max_duration_milliseconds": 25,
+    }]);
+    let (status, body) = deployment
+        .post("/policies", "unknown-middleware", &revision, &unavailable)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "validation_failed");
+    assert_eq!(body["error"]["rule"], "content_middleware_unavailable");
 
     let mut core_stage = policy_document();
     core_stage["resource"]["epoch"] = json!(2);

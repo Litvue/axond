@@ -155,15 +155,25 @@ delivery mechanism.
 Policy can select and order only the second row. Core-stage identifiers and
 fields such as `core_stages` are rejected while the document is validated.
 
-**Response mutation is refused until its invocation and framing contract are
-implemented.** The first runtime slice rejects every `Response` and
-`StreamEvent` registration. The follow-up may activate response mutation where
-the relay already re-emits (`Framing::OpenAiSse`). On `Native` and `Responses`
-framing it must remain refused with a typed incompatibility unless policy opts
-that route into buffering, because silently re-emitting those streams would
-revoke a documented guarantee for every caller. Buffering costs the
-time-to-first-token the relay exists to protect — an operator's trade to make
-explicitly, per policy, never a default.
+**Response mutation follows the phase the request actually executes.** A
+buffered provider response runs `Response` scopes once in reverse registration
+order. A stream runs `StreamEvent` scopes on decoded data events, also in reverse
+order; terminal provider usage remains gateway-owned and is never mutable.
+OpenAI chat already re-emits decoded events, so an applicable stream mutator can
+run incrementally. `Native` and `Responses` framing remain byte-faithful unless
+the governing policy explicitly selects that route in
+`buffered_response_routes`; without that opt-in the request is refused as
+`middleware_response_incompatible` before permits, reservations, or provider
+dispatch.
+
+The opt-in holds reconstructed output until the upstream terminates
+successfully, then releases the transformed events. Both raw upstream bytes and
+reconstructed output are bounded by the lower of
+`admission.max_stream_bytes` and a 64 MiB hard ceiling; the hard ceiling remains
+when the ordinary stream limit is disabled. Middleware failure releases no held
+content and ends the already-open stream with a wire-native
+`middleware_stream_error`. This buffering cost is never implicit: provider TTFT,
+caller-visible TTFT, and gateway-added buffering duration are separate metrics.
 
 **Every middleware declares a failure posture and runs under bounds.**
 Fail-closed or fail-open is part of the registration, because a guardrail that
@@ -253,7 +263,9 @@ Response-mutating middleware on native framing is refused unless the route is
 present in `buffered_response_routes`. The refusal is typed and explicit rather
 than a quiet no-op, which turns a subtle policy gap into a visible error at the
 cost of an error an operator must then understand. An empty chain remains
-byte-faithful even when the route is selected.
+byte-faithful even when the route is selected. The immutable serving snapshot
+pins both middleware and buffering selection for the request; opting in does not
+alter Responses target or credential affinity, including continuations.
 
 Excluding `Attempt` scope means a middleware cannot shape a body per provider,
 which is the natural place some future compatibility shim would want to live. That

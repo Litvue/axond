@@ -369,6 +369,16 @@ impl MiddlewareChain {
         self.entries.is_empty()
     }
 
+    /// Whether this chain can change output in the phase this request will
+    /// actually execute. A buffered response and a decoded stream are distinct
+    /// scopes; selecting one must not make the other look active.
+    pub fn has_response_mutator(&self, scope: MiddlewareScope) -> bool {
+        self.entries.iter().any(|entry| {
+            let declaration = entry.declaration();
+            declaration.mutates_response && declaration.has_scope(scope)
+        })
+    }
+
     /// Invoke request-scope middleware once, returning the state owner that
     /// must be retained until the response ends.
     pub async fn request(
@@ -606,6 +616,16 @@ struct InvocationCapacity {
     gate: Arc<MiddlewareGate>,
 }
 
+impl Default for MiddlewareExecution {
+    fn default() -> Self {
+        Self::new(
+            MiddlewareChain::empty(),
+            MiddlewareRuntime::default(),
+            MiddlewareStateBag::default(),
+        )
+    }
+}
+
 impl MiddlewareExecution {
     fn new(chain: MiddlewareChain, runtime: MiddlewareRuntime, states: MiddlewareStateBag) -> Self {
         let stranded = vec![false; chain.len()];
@@ -614,6 +634,16 @@ impl MiddlewareExecution {
             runtime,
             states,
             stranded,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_state_bag_for_test(states: MiddlewareStateBag) -> Self {
+        Self {
+            chain: MiddlewareChain::empty(),
+            runtime: MiddlewareRuntime::default(),
+            states,
+            stranded: Vec::new(),
         }
     }
 
@@ -682,9 +712,6 @@ impl MiddlewareExecution {
                     continue;
                 }
             };
-            if let Some(state) = state {
-                self.states.insert(index, state);
-            }
             if matches!(
                 result.as_ref().map(|outcome| outcome.verdict),
                 Ok(MiddlewareVerdict::Continue)
@@ -693,6 +720,22 @@ impl MiddlewareExecution {
                     && candidate.body != response.body))
             {
                 result = Err(MiddlewareError::Failed);
+            }
+            let restore_state = matches!(
+                result.as_ref(),
+                Ok(outcome)
+                    if outcome.verdict == MiddlewareVerdict::Continue
+                        && outcome.state.is_none()
+            );
+            if restore_state {
+                if let Some(state) = state {
+                    self.states.insert(index, state);
+                }
+            } else if state.is_some() {
+                // A failed callback may have partially mutated opaque state.
+                // It cannot be rolled back, so disable this slot rather than
+                // expose that partial mutation to a later response event.
+                self.stranded[index] = true;
             }
             if self.chain.finish(index, result, &mut self.states, false)? {
                 *response = candidate;
@@ -770,9 +813,6 @@ impl MiddlewareExecution {
                     continue;
                 }
             };
-            if let Some(state) = state {
-                self.states.insert(index, state);
-            }
             if matches!(
                 result.as_ref().map(|outcome| outcome.verdict),
                 Ok(MiddlewareVerdict::Continue)
@@ -782,6 +822,19 @@ impl MiddlewareExecution {
             {
                 result = Err(MiddlewareError::Failed);
             }
+            let restore_state = matches!(
+                result.as_ref(),
+                Ok(outcome)
+                    if outcome.verdict == MiddlewareVerdict::Continue
+                        && outcome.state.is_none()
+            );
+            if restore_state {
+                if let Some(state) = state {
+                    self.states.insert(index, state);
+                }
+            } else if state.is_some() {
+                self.stranded[index] = true;
+            }
             if self.chain.finish(index, result, &mut self.states, false)? {
                 *event = candidate;
             }
@@ -789,7 +842,7 @@ impl MiddlewareExecution {
         Ok(())
     }
 
-    async fn acquire(&self, index: usize) -> Result<Option<InvocationCapacity>, GatewayError> {
+    async fn acquire(&mut self, index: usize) -> Result<Option<InvocationCapacity>, GatewayError> {
         let declaration = self.chain.entries[index].declaration();
         let gate = self.runtime.gate(&declaration.id);
         if gate.abandoned.load(Ordering::Acquire) > 0 {
@@ -1376,6 +1429,18 @@ namespace = "alpha"
         assert_eq!(chain.len(), 1);
     }
 
+    #[test]
+    fn response_mutation_is_selected_for_the_executed_scope_only() {
+        let mut declaration =
+            MiddlewareDeclaration::new("response-only", [MiddlewareScope::Response]);
+        declaration.mutates_response = true;
+        let chain =
+            MiddlewareChain::new(vec![Arc::new(Noop { declaration })]).expect("response chain");
+
+        assert!(chain.has_response_mutator(MiddlewareScope::Response));
+        assert!(!chain.has_response_mutator(MiddlewareScope::StreamEvent));
+    }
+
     #[derive(Debug)]
     struct PhaseCounts {
         responses: usize,
@@ -1584,6 +1649,97 @@ namespace = "alpha"
         let original_event = event.clone();
         execution.stream_event(&mut event).await.expect("fail open");
         assert_eq!(event, original_event);
+    }
+
+    struct FailingStatefulOutput {
+        declaration: MiddlewareDeclaration,
+        output_calls: Arc<AtomicUsize>,
+    }
+
+    impl Middleware for FailingStatefulOutput {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            match phase {
+                MiddlewarePhase::Request(_) => Ok(MiddlewareOutcome::continue_with_state(
+                    MiddlewareState::new(0_usize),
+                )),
+                MiddlewarePhase::Response(response) => {
+                    self.output_calls.fetch_add(1, Ordering::SeqCst);
+                    *state
+                        .and_then(|state| state.downcast_mut::<usize>())
+                        .expect("request state") += 1;
+                    response.body["must_not_escape"] = json!(true);
+                    Err(MiddlewareError::Failed)
+                }
+                MiddlewarePhase::StreamEvent(ProviderStreamEvent::Data { data, .. }) => {
+                    self.output_calls.fetch_add(1, Ordering::SeqCst);
+                    data["must_not_escape"] = json!(true);
+                    Err(MiddlewareError::Failed)
+                }
+                MiddlewarePhase::StreamEvent(ProviderStreamEvent::Done(_)) => {
+                    panic!("terminal usage is not dispatched")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_stateful_callback_is_stranded_instead_of_reused_after_fail_open() {
+        let output_calls = Arc::new(AtomicUsize::new(0));
+        let mut declaration = MiddlewareDeclaration::new(
+            "failing-stateful-output",
+            [
+                MiddlewareScope::Request,
+                MiddlewareScope::Response,
+                MiddlewareScope::StreamEvent,
+            ],
+        );
+        declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        declaration.mutates_response = true;
+        let chain = MiddlewareChain::new(vec![Arc::new(FailingStatefulOutput {
+            declaration,
+            output_calls: Arc::clone(&output_calls),
+        })])
+        .expect("stateful output chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain
+            .start_isolated(&mut request)
+            .await
+            .expect("request state");
+        let mut response = ProviderResponse {
+            body: json!({"original": true}),
+            usage: ModelUsage::default(),
+        };
+        execution.response(&mut response).await.expect("fail open");
+        assert_eq!(response.body, json!({"original": true}));
+        assert!(execution.stranded[0]);
+
+        let mut event = ProviderStreamEvent::Data {
+            event: None,
+            data: json!({"original": true}),
+        };
+        execution
+            .stream_event(&mut event)
+            .await
+            .expect("stranded fail-open slot is skipped");
+        assert_eq!(
+            event,
+            ProviderStreamEvent::Data {
+                event: None,
+                data: json!({"original": true}),
+            }
+        );
+        assert_eq!(output_calls.load(Ordering::SeqCst), 1);
     }
 
     struct RefusingOutputMutator {

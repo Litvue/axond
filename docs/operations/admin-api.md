@@ -179,7 +179,11 @@ entry is normalized; list order is execution order:
 are rejected, and absence means neither route opts into response buffering.
 Selecting a route permits applicable response-mutating middleware to replace
 byte-faithful streaming passthrough with bounded buffering. It does not enable
-middleware by itself.
+middleware by itself. The gateway applies the lower of
+`admission.max_stream_bytes` and a 64 MiB hard ceiling to both upstream bytes and
+reconstructed output; the hard ceiling still applies when the configurable
+stream limit is disabled. A mutating policy without the route opt-in is refused
+before provider dispatch as `middleware_response_incompatible`.
 
 The identifier must name middleware compiled into the running binary; the value
 above illustrates the shape rather than naming a shipped implementation. The

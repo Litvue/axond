@@ -39,9 +39,9 @@ use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use gateway_core::{
-    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareStateBag,
-    ModelUsage, NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse,
-    ProviderStreamDecoder, Surface, Usage,
+    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareScope, ModelUsage,
+    NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
+    Surface, Usage,
 };
 use gateway_transport::{
     AuthScheme, Deadline, NativeCall, TimeoutBound, TimeoutKind, TransportError, Upstream,
@@ -55,9 +55,11 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::admission::{AdmissionPermit, DiagnosticCredential, RequestKind};
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
-use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
+use crate::config::{Config, Model, Provider, ProviderKind, ProviderWire, Target};
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
+use crate::desired_state::policy::BufferedResponseRoute;
 use crate::error::GatewayError;
+use crate::middleware::{MiddlewareChain, MiddlewareExecution};
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
 use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
@@ -65,7 +67,7 @@ use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::status::{StatusResponse, StatusScope};
-use crate::streaming::{self, Framing, StreamContext};
+use crate::streaming::{self, Framing, StreamContext, StreamDelivery};
 use crate::telemetry;
 use crate::usage::identity::EventIdentity;
 use crate::usage::{Status, UsageRecord};
@@ -1138,6 +1140,22 @@ impl Route {
         }
     }
 
+    fn stream_delivery(self) -> StreamDelivery {
+        match self {
+            Self::ChatCompletions => StreamDelivery::Reemit,
+            Self::NativeMessages | Self::Responses => StreamDelivery::Passthrough,
+            Self::Embeddings => StreamDelivery::Passthrough,
+        }
+    }
+
+    fn buffered_response_route(self) -> Option<BufferedResponseRoute> {
+        match self {
+            Self::NativeMessages => Some(BufferedResponseRoute::Messages),
+            Self::Responses => Some(BufferedResponseRoute::Responses),
+            Self::ChatCompletions | Self::Embeddings => None,
+        }
+    }
+
     /// Usage from a *native* response, mapped onto the canonical record every
     /// route produces. Wire knowledge lives in `gateway-core`.
     fn native_usage(self, response: &Value) -> ModelUsage {
@@ -1193,6 +1211,46 @@ impl Route {
         }
         wire
     }
+}
+
+/// Decide whether a streamed response is incremental or is held until the
+/// upstream finishes. Only a stream-event mutator can make this streaming
+/// decision; response-only middleware belongs to the non-streaming path.
+fn stream_delivery(
+    cfg: &Config,
+    namespace: &str,
+    route: Route,
+    middleware: &MiddlewareChain,
+) -> Result<StreamDelivery, GatewayError> {
+    let ordinary = route.stream_delivery();
+    if !middleware.has_response_mutator(MiddlewareScope::StreamEvent) {
+        return Ok(ordinary);
+    }
+    let Some(policy_route) = route.buffered_response_route() else {
+        // OpenAI-normalized streaming already re-emits decoded events and does
+        // not need to revoke a byte-faithful contract to invoke middleware.
+        return Ok(ordinary);
+    };
+    let enabled = cfg
+        .namespace(namespace)
+        .and_then(|namespace| namespace.policy.as_ref())
+        .is_some_and(|policy| {
+            policy
+                .body
+                .buffered_response_routes()
+                .contains(&policy_route)
+        });
+    if enabled {
+        return Ok(StreamDelivery::PolicyBuffered);
+    }
+    Err(GatewayError::MiddlewareResponseIncompatible {
+        route: route.label(),
+        framing: match route {
+            Route::NativeMessages => "native",
+            Route::Responses => "responses",
+            Route::ChatCompletions | Route::Embeddings => "re-emitted",
+        },
+    })
 }
 
 /// A route plus the wire headers this request carries upstream, threaded through
@@ -1378,6 +1436,23 @@ async fn serve(
     };
     wire.check_targets(cfg, model, &alias)?;
 
+    #[cfg(not(test))]
+    let middleware = snapshot.middleware(&caller.namespace);
+    // Primitive tests can install a process-local override. Production has no
+    // such field: its chain is always owned by the captured serving snapshot.
+    #[cfg(test)]
+    let middleware = if state.0.middleware.is_empty() {
+        snapshot.middleware(&caller.namespace)
+    } else {
+        &state.0.middleware
+    };
+    // This is a pure snapshot decision and deliberately precedes permits,
+    // reservations, usage identity, and provider dispatch. A missing opt-in is
+    // a typed incompatibility, not work the gateway begins and later abandons.
+    let stream_delivery = streamed
+        .then(|| stream_delivery(cfg, &caller.namespace, route, middleware))
+        .transpose()?;
+
     // The per-request bounds are checked before any dependency work and before
     // admission: they are pure functions of the parsed body, and a request that
     // cannot legally be served should not occupy capacity while it is refused.
@@ -1491,8 +1566,8 @@ async fn serve(
     } else {
         &state.0.middleware
     };
-    let middleware_state = middleware
-        .request(&state.0.middleware_runtime, &mut middleware_request)
+    let mut middleware_execution = middleware
+        .start(&state.0.middleware_runtime, &mut middleware_request)
         .await?;
     let body = middleware_request.body;
     // An empty chain is byte-neutral, so the pre-admission estimate is already
@@ -1554,7 +1629,8 @@ async fn serve(
                 prices: &prices,
                 wire: &wire,
                 identity,
-                middleware_state,
+                middleware_execution,
+                delivery: stream_delivery.expect("streamed request has a delivery posture"),
                 hold: BudgetHold {
                     key: budget_key,
                     reservation,
@@ -1583,7 +1659,8 @@ async fn serve(
     };
     let served = &outcome.served;
     match outcome.result {
-        Ok(response) => {
+        Ok(mut response) => {
+            let middleware_result = middleware_execution.response(&mut response).await;
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
             // Settled first, and not because the record does not matter: the
@@ -1607,7 +1684,11 @@ async fn serve(
                     target_model: &served.model,
                     source: served.source,
                     credential_id: &served.credential_id,
-                    status: Status::Ok,
+                    status: if middleware_result.is_ok() {
+                        Status::Ok
+                    } else {
+                        Status::Rejected
+                    },
                     input_tokens: response.usage.input_tokens,
                     cache_read_tokens: response.usage.cache_read_tokens,
                     cache_write_tokens: response.usage.cache_write_tokens,
@@ -1620,6 +1701,7 @@ async fn serve(
                 },
             )
             .await?;
+            middleware_result?;
             Ok(Json(response.body).into_response())
         }
         Err(err) => {
@@ -1989,7 +2071,8 @@ async fn stream_with_failover(
         prices,
         wire,
         identity,
-        middleware_state,
+        middleware_execution,
+        delivery,
         mut hold,
     } = request;
     let reservation_guard =
@@ -2242,14 +2325,14 @@ async fn stream_with_failover(
                             move |lease| snapshot.credentials.record_success(lease)
                         },
                     );
-                    return Ok(streaming::relay_opened_with_state(
+                    return Ok(streaming::relay_opened_with_middleware(
                         state.clone(),
                         ctx,
                         streaming::OpenedStream { decoder, bytes },
                         started,
                         wire.route.framing(),
                         Some(rotation),
-                        middleware_state,
+                        streaming::StreamMiddleware::new(middleware_execution, delivery),
                     ));
                 }
                 Err(err) if is_credential_exhausted(&err) => {
@@ -2303,11 +2386,11 @@ async fn stream_with_failover(
             ctx.attempts = walk.attempts;
             ctx.rate_limit_permit = hold.permit.take();
             ctx.admission_permit = hold.admission.take();
-            streaming::settle_upstream_error_with_state(
+            streaming::settle_upstream_error_with_middleware(
                 state.clone(),
                 ctx,
                 started,
-                middleware_state,
+                middleware_execution,
             );
         } else {
             reservation_guard.release().await;
@@ -2334,9 +2417,10 @@ struct StreamRequest<'a> {
     /// a credential rotation's — so a stream that rotates, ends, is cancelled, or
     /// never opens all report the same event.
     identity: EventIdentity,
-    /// Request-scope middleware state, moved into the relay's response-lifetime
-    /// accounting owner when a stream opens.
-    middleware_state: MiddlewareStateBag,
+    /// Pinned chain plus request-scope state, moved into the relay's
+    /// response-lifetime accounting owner when a stream opens.
+    middleware_execution: MiddlewareExecution,
+    delivery: StreamDelivery,
     hold: BudgetHold,
 }
 
@@ -2946,10 +3030,13 @@ mod tests {
     use crate::aliases::AliasScope;
     use crate::backends::catalog::ProviderId;
     use crate::budget::NoBudget;
-    use crate::config::{Config, UndurablePolicy};
+    use crate::config::{Config, NamespacePolicy, UndurablePolicy};
     use crate::convergence::status::testing::ManualClock;
     use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
-    use crate::desired_state::fixtures::{approved_pricing_snapshot, revision_id};
+    use crate::desired_state::fixtures::{
+        approved_pricing_snapshot, policy_body, revision_id, tenant_id,
+    };
+    use crate::desired_state::policy::PolicyScope;
     use crate::middleware::MiddlewareChain;
     use crate::pricing::PriceIdentity;
     use crate::principals::PrincipalAuthority;
@@ -2964,6 +3051,7 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use gateway_core::{
         Middleware, MiddlewareDeclaration, MiddlewareOutcome, MiddlewarePhase, MiddlewareResult,
+        ProviderStreamEvent,
     };
     use http_body_util::BodyExt;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -6317,6 +6405,359 @@ targets = [
         declaration: MiddlewareDeclaration,
         padding_bytes: usize,
         output_tokens: Option<u64>,
+    }
+
+    struct StreamMarkerMiddleware {
+        declaration: MiddlewareDeclaration,
+    }
+
+    impl StreamMarkerMiddleware {
+        fn chain() -> MiddlewareChain {
+            let mut declaration =
+                MiddlewareDeclaration::new("test.stream-marker", [MiddlewareScope::StreamEvent]);
+            declaration.mutates_response = true;
+            MiddlewareChain::new(vec![Arc::new(Self { declaration }) as Arc<dyn Middleware>])
+                .expect("stream marker chain")
+        }
+    }
+
+    impl Middleware for StreamMarkerMiddleware {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> MiddlewareResult {
+            if let MiddlewarePhase::StreamEvent(ProviderStreamEvent::Data { data, .. }) = phase {
+                data["middleware_marker"] = json!(true);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    fn enable_buffered_response_routes(
+        config: &mut Config,
+        routes: impl IntoIterator<Item = BufferedResponseRoute>,
+    ) {
+        let body = policy_body(PolicyScope::Tenant(tenant_id(1)), 1)
+            .with_buffered_response_routes(routes)
+            .expect("valid buffered response routes");
+        let generation = body.generation(revision_id(1));
+        config.namespace[0].policy = Some(NamespacePolicy { body, generation });
+    }
+
+    #[test]
+    fn response_mutation_selects_buffering_only_for_explicit_byte_faithful_routes() {
+        let config = test_state().config().config.clone();
+        let chain = StreamMarkerMiddleware::chain();
+
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::NativeMessages, &chain),
+            Err(GatewayError::MiddlewareResponseIncompatible {
+                route: "/v1/messages",
+                framing: "native"
+            })
+        ));
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::Responses, &chain),
+            Err(GatewayError::MiddlewareResponseIncompatible {
+                route: "/v1/responses",
+                framing: "responses"
+            })
+        ));
+        assert_eq!(
+            stream_delivery(&config, "platform", Route::ChatCompletions, &chain).unwrap(),
+            StreamDelivery::Reemit
+        );
+
+        let mut selected = config;
+        enable_buffered_response_routes(
+            &mut selected,
+            [
+                BufferedResponseRoute::Messages,
+                BufferedResponseRoute::Responses,
+            ],
+        );
+        assert_eq!(
+            stream_delivery(&selected, "platform", Route::NativeMessages, &chain).unwrap(),
+            StreamDelivery::PolicyBuffered
+        );
+        assert_eq!(
+            stream_delivery(&selected, "platform", Route::Responses, &chain).unwrap(),
+            StreamDelivery::PolicyBuffered
+        );
+        assert_eq!(
+            stream_delivery(
+                &selected,
+                "platform",
+                Route::NativeMessages,
+                &MiddlewareChain::empty(),
+            )
+            .unwrap(),
+            StreamDelivery::Passthrough,
+            "policy permission alone must not revoke byte-faithful passthrough"
+        );
+    }
+
+    const MUTABLE_NATIVE_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    async fn mutable_native_upstream() -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/messages",
+            post(move || {
+                let served = Arc::clone(&served);
+                async move {
+                    served.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(MUTABLE_NATIVE_STREAM),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind native fixture");
+        let addr = listener.local_addr().expect("native fixture address");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn native_stream_state(base_url: &str, buffered: bool, mutate: bool) -> AppState {
+        let mut config = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "{base_url}"
+
+{GATEWAY_KEY}
+
+[[credential]]
+namespace = "platform"
+provider = "anthropic"
+env = "NATIVE_KEY"
+
+[[model]]
+name = "claude"
+targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#,
+        ))
+        .expect("native stream config");
+        if buffered {
+            enable_buffered_response_routes(&mut config, [BufferedResponseRoute::Messages]);
+        }
+        let state = AppState::new(
+            config,
+            &env_with([("NATIVE_KEY", "native-secret")]),
+            UsageFanout::new(vec![Box::new(CapturingSink::default())]),
+            Box::new(NoBudget),
+        )
+        .expect("native stream state");
+        if mutate {
+            state.with_middleware_chain(StreamMarkerMiddleware::chain())
+        } else {
+            state
+        }
+    }
+
+    fn native_stream_request() -> Request<Body> {
+        authorized("/v1/messages")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude",
+                    "stream": true,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_stream_mutation_is_refused_or_explicitly_buffered_without_implicit_reframing() {
+        let (base_url, hits) = mutable_native_upstream().await;
+
+        let denied = router(native_stream_state(&base_url, false, true))
+            .oneshot(native_stream_request())
+            .await
+            .expect("typed incompatibility response");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        let denied_body = denied.into_body().collect().await.unwrap().to_bytes();
+        let denied_body: Value = serde_json::from_slice(&denied_body).unwrap();
+        assert_eq!(
+            denied_body["error"]["type"],
+            "middleware_response_incompatible"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let passthrough = router(native_stream_state(&base_url, true, false))
+            .oneshot(native_stream_request())
+            .await
+            .expect("policy-only passthrough response");
+        assert_eq!(passthrough.status(), StatusCode::OK);
+        let passthrough = passthrough.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(passthrough.as_ref(), MUTABLE_NATIVE_STREAM.as_bytes());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let buffered = router(native_stream_state(&base_url, true, true))
+            .oneshot(native_stream_request())
+            .await
+            .expect("explicitly buffered response");
+        assert_eq!(buffered.status(), StatusCode::OK);
+        let buffered = buffered.into_body().collect().await.unwrap().to_bytes();
+        let buffered = String::from_utf8(buffered.to_vec()).unwrap();
+        assert!(
+            buffered.contains("\"middleware_marker\":true"),
+            "{buffered}"
+        );
+        assert_ne!(buffered.as_bytes(), MUTABLE_NATIVE_STREAM.as_bytes());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    const MUTABLE_RESPONSES_STREAM: &str = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+    );
+
+    async fn mutable_responses_upstream() -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/responses",
+            post(move || {
+                let served = Arc::clone(&served);
+                async move {
+                    served.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(MUTABLE_RESPONSES_STREAM),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses fixture");
+        let addr = listener.local_addr().expect("Responses fixture address");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn responses_stream_state(url_a: &str, url_b: &str, buffered: bool, mutate: bool) -> AppState {
+        let mut config = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "pa"
+kind = "openai"
+base_url = "{url_a}"
+
+[[provider]]
+id = "pb"
+kind = "openai"
+base_url = "{url_b}"
+
+{GATEWAY_KEY}
+
+[[credential]]
+namespace = "platform"
+provider = "pa"
+env = "RESPONSES_KEY_A"
+
+[[credential]]
+namespace = "platform"
+provider = "pb"
+env = "RESPONSES_KEY_B"
+
+[failover]
+max_attempts = 3
+
+[[model]]
+name = "gpt-4o"
+targets = [
+  {{ provider = "pa", model = "model-a", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
+  {{ provider = "pb", model = "model-b", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
+]
+"#,
+        ))
+        .expect("Responses stream config");
+        if buffered {
+            enable_buffered_response_routes(&mut config, [BufferedResponseRoute::Responses]);
+        }
+        let state = AppState::new(
+            config,
+            &env_with([
+                ("RESPONSES_KEY_A", "responses-a"),
+                ("RESPONSES_KEY_B", "responses-b"),
+            ]),
+            UsageFanout::new(vec![Box::new(CapturingSink::default())]),
+            Box::new(NoBudget),
+        )
+        .expect("Responses stream state");
+        if mutate {
+            state.with_middleware_chain(StreamMarkerMiddleware::chain())
+        } else {
+            state
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_responses_initial_and_continuation_keep_affinity_in_both_buffering_modes() {
+        let (url_a, hits_a) = mutable_responses_upstream().await;
+        let (url_b, hits_b) = mutable_responses_upstream().await;
+
+        let denied_state = responses_stream_state(&url_a, &url_b, false, true);
+        for previous in [None, Some("resp_1")] {
+            let denied = router(denied_state.clone())
+                .oneshot(streaming_responses_request(previous))
+                .await
+                .expect("typed Responses incompatibility");
+            assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+            let body = denied.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "middleware_response_incompatible");
+        }
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+
+        let buffered_state = responses_stream_state(&url_a, &url_b, true, true);
+        for previous in [None, Some("resp_1")] {
+            let buffered = router(buffered_state.clone())
+                .oneshot(streaming_responses_request(previous))
+                .await
+                .expect("buffered Responses stream");
+            assert_eq!(buffered.status(), StatusCode::OK);
+            let body = buffered.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("\"middleware_marker\":true"), "{body}");
+        }
+        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
     }
 
     impl BodyGrowthMiddleware {
