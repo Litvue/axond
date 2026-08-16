@@ -103,14 +103,12 @@ pub enum GatewayError {
     #[allow(dead_code)]
     #[error("middleware is unavailable")]
     MiddlewareUnavailable,
-    /// A policy selected response mutation for a byte-faithful streaming route
-    /// without explicitly opting that route into buffering. Refused before
-    /// provider dispatch so preserving the wire contract never becomes a
-    /// silent no-op.
+    /// A policy selected decoded stream-event middleware for a byte-faithful
+    /// route without explicitly opting that route into buffering. Even a
+    /// non-mutating middleware can refuse, so releasing provider bytes before
+    /// it runs would violate fail-closed policy.
     #[allow(dead_code)]
-    #[error(
-        "response-mutating middleware requires explicit buffering on {route} ({framing} framing)"
-    )]
+    #[error("stream-event middleware requires explicit buffering on {route} ({framing} framing)")]
     MiddlewareResponseIncompatible {
         route: &'static str,
         framing: &'static str,
@@ -472,7 +470,7 @@ mod tests {
             serde_json::json!({
                 "error": {
                     "type": "middleware_response_incompatible",
-                    "message": "response-mutating middleware requires explicit buffering on /v1/responses (responses framing)"
+                    "message": "stream-event middleware requires explicit buffering on /v1/responses (responses framing)"
                 }
             })
         );

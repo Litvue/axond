@@ -1864,7 +1864,10 @@ namespace = "alpha"
             phase: MiddlewarePhase<'_>,
             _state: Option<&mut MiddlewareState>,
         ) -> gateway_core::MiddlewareResult {
-            if matches!(phase, MiddlewarePhase::Response(_)) {
+            if matches!(
+                phase,
+                MiddlewarePhase::Response(_) | MiddlewarePhase::StreamEvent(_)
+            ) {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.maximum.fetch_max(active, Ordering::SeqCst);
@@ -1997,6 +2000,9 @@ namespace = "alpha"
         tokio::time::timeout(Duration::from_secs(1), async {
             while cancelled_gate.abandoned.load(Ordering::Acquire) != 0
                 || active.load(Ordering::Acquire) != 0
+                || cancelled_gate.slots.available_permits()
+                    != MAX_BLOCKING_INVOCATIONS_PER_MIDDLEWARE
+                || runtime.slots.available_permits() != 2
             {
                 tokio::task::yield_now().await;
             }
@@ -2028,6 +2034,121 @@ namespace = "alpha"
         assert_eq!(recovered_response.body["peer"], json!(true));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(peer_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_event_quarantines_and_recovers_without_overlapping_calls() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+
+        let mut declaration =
+            MiddlewareDeclaration::new("cancelled-stream", [MiddlewareScope::StreamEvent]);
+        declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        declaration.max_duration = Duration::from_secs(5);
+        let chain = MiddlewareChain::new(vec![Arc::new(CancellableResponse {
+            declaration,
+            calls: Arc::clone(&calls),
+            active: Arc::clone(&active),
+            maximum: Arc::clone(&maximum),
+            release: Arc::clone(&release),
+        })])
+        .expect("cancellable stream chain");
+        let runtime = MiddlewareRuntime::with_slots(Arc::new(Semaphore::new(1)));
+
+        let mut first_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut first_execution = chain
+            .start(&runtime, &mut first_request)
+            .await
+            .expect("first execution");
+        let first = tokio::spawn(async move {
+            let mut event = ProviderStreamEvent::Data {
+                event: None,
+                data: json!({"delta": "first"}),
+            };
+            first_execution.stream_event(&mut event).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking stream middleware starts");
+
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("stream future is cancelled")
+                .is_cancelled()
+        );
+        let gate = runtime.gate("cancelled-stream");
+        assert_eq!(gate.abandoned.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut second_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut second_execution = chain
+            .start(&runtime, &mut second_request)
+            .await
+            .expect("second execution");
+        let mut second_event = ProviderStreamEvent::Data {
+            event: None,
+            data: json!({"delta": "second"}),
+        };
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            second_execution.stream_event(&mut second_event),
+        )
+        .await
+        .expect("quarantined stream id is skipped without waiting")
+        .expect("fail-open quarantine preserves the stream");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.abandoned.load(Ordering::Acquire) != 0
+                || active.load(Ordering::Acquire) != 0
+                || gate.slots.available_permits() != MAX_BLOCKING_INVOCATIONS_PER_MIDDLEWARE
+                || runtime.slots.available_permits() != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closure exit clears stream quarantine");
+        assert_eq!(
+            gate.slots.available_permits(),
+            MAX_BLOCKING_INVOCATIONS_PER_MIDDLEWARE
+        );
+        assert_eq!(runtime.slots.available_permits(), 1);
+
+        let mut recovered_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut recovered_execution = chain
+            .start(&runtime, &mut recovered_request)
+            .await
+            .expect("recovered execution");
+        let mut recovered_event = ProviderStreamEvent::Data {
+            event: None,
+            data: json!({"delta": "recovered"}),
+        };
+        recovered_execution
+            .stream_event(&mut recovered_event)
+            .await
+            .expect("middleware id is retried after recovery");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
     }
 

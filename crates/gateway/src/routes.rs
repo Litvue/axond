@@ -1223,9 +1223,10 @@ fn stream_delivery(
     middleware: &MiddlewareChain,
 ) -> Result<StreamDelivery, GatewayError> {
     let ordinary = route.stream_delivery();
-    if !middleware.has_response_mutator(MiddlewareScope::StreamEvent) {
+    if !middleware.has_scope(MiddlewareScope::StreamEvent) {
         return Ok(ordinary);
     }
+    let mutates_response = middleware.has_response_mutator(MiddlewareScope::StreamEvent);
     let Some(policy_route) = route.buffered_response_route() else {
         // OpenAI-normalized streaming already re-emits decoded events and does
         // not need to revoke a byte-faithful contract to invoke middleware.
@@ -1241,7 +1242,11 @@ fn stream_delivery(
                 .contains(&policy_route)
         });
     if enabled {
-        return Ok(StreamDelivery::PolicyBuffered);
+        return Ok(if mutates_response {
+            StreamDelivery::PolicyBuffered
+        } else {
+            StreamDelivery::PolicyValidatedPassthrough
+        });
     }
     Err(GatewayError::MiddlewareResponseIncompatible {
         route: route.label(),
@@ -3050,8 +3055,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use gateway_core::{
-        Middleware, MiddlewareDeclaration, MiddlewareOutcome, MiddlewarePhase, MiddlewareResult,
-        ProviderStreamEvent,
+        Middleware, MiddlewareDeclaration, MiddlewareOutcome, MiddlewarePhase, MiddlewareRefusal,
+        MiddlewareResult, ProviderStreamEvent,
     };
     use http_body_util::BodyExt;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -6411,6 +6416,11 @@ targets = [
         declaration: MiddlewareDeclaration,
     }
 
+    struct StreamValidationMiddleware {
+        declaration: MiddlewareDeclaration,
+        refuse_on_text: bool,
+    }
+
     impl StreamMarkerMiddleware {
         fn chain() -> MiddlewareChain {
             let mut declaration =
@@ -6433,6 +6443,41 @@ targets = [
         ) -> MiddlewareResult {
             if let MiddlewarePhase::StreamEvent(ProviderStreamEvent::Data { data, .. }) = phase {
                 data["middleware_marker"] = json!(true);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    impl StreamValidationMiddleware {
+        fn chain(refuse_on_text: bool) -> MiddlewareChain {
+            let declaration = MiddlewareDeclaration::new(
+                "test.stream-validation",
+                [MiddlewareScope::StreamEvent],
+            );
+            MiddlewareChain::new(vec![Arc::new(Self {
+                declaration,
+                refuse_on_text,
+            }) as Arc<dyn Middleware>])
+            .expect("stream validation chain")
+        }
+    }
+
+    impl Middleware for StreamValidationMiddleware {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> MiddlewareResult {
+            if self.refuse_on_text
+                && let MiddlewarePhase::StreamEvent(ProviderStreamEvent::Data { data, .. }) = phase
+                && (data.pointer("/delta/text").and_then(Value::as_str) == Some("hi")
+                    || data.pointer("/delta").and_then(Value::as_str) == Some("hi"))
+            {
+                return Ok(MiddlewareOutcome::refuse(MiddlewareRefusal::Policy));
             }
             Ok(MiddlewareOutcome::continue_without_state())
         }
@@ -6522,9 +6567,19 @@ targets = [
                 let served = Arc::clone(&served);
                 async move {
                     served.fetch_add(1, Ordering::SeqCst);
+                    let split = MUTABLE_NATIVE_STREAM
+                        .find("\"hi\"")
+                        .expect("native fixture contains text delta")
+                        + 2;
+                    let bytes = MUTABLE_NATIVE_STREAM.as_bytes();
                     (
                         [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        Body::from(MUTABLE_NATIVE_STREAM),
+                        Body::from_stream(futures::stream::iter([
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(
+                                &bytes[..split],
+                            )),
+                            Ok(bytes::Bytes::copy_from_slice(&bytes[split..])),
+                        ])),
                     )
                 }
             }),
@@ -6537,7 +6592,11 @@ targets = [
         (format!("http://{addr}"), hits)
     }
 
-    fn native_stream_state(base_url: &str, buffered: bool, mutate: bool) -> AppState {
+    fn native_stream_state(
+        base_url: &str,
+        buffered: bool,
+        middleware: Option<MiddlewareChain>,
+    ) -> AppState {
         let mut config = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -6572,10 +6631,9 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
             Box::new(NoBudget),
         )
         .expect("native stream state");
-        if mutate {
-            state.with_middleware_chain(StreamMarkerMiddleware::chain())
-        } else {
-            state
+        match middleware {
+            Some(chain) => state.with_middleware_chain(chain),
+            None => state,
         }
     }
 
@@ -6597,10 +6655,14 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
     async fn native_stream_mutation_is_refused_or_explicitly_buffered_without_implicit_reframing() {
         let (base_url, hits) = mutable_native_upstream().await;
 
-        let denied = router(native_stream_state(&base_url, false, true))
-            .oneshot(native_stream_request())
-            .await
-            .expect("typed incompatibility response");
+        let denied = router(native_stream_state(
+            &base_url,
+            false,
+            Some(StreamMarkerMiddleware::chain()),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("typed incompatibility response");
         assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
         let denied_body = denied.into_body().collect().await.unwrap().to_bytes();
         let denied_body: Value = serde_json::from_slice(&denied_body).unwrap();
@@ -6610,7 +6672,7 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
-        let passthrough = router(native_stream_state(&base_url, true, false))
+        let passthrough = router(native_stream_state(&base_url, true, None))
             .oneshot(native_stream_request())
             .await
             .expect("policy-only passthrough response");
@@ -6619,10 +6681,14 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         assert_eq!(passthrough.as_ref(), MUTABLE_NATIVE_STREAM.as_bytes());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
-        let buffered = router(native_stream_state(&base_url, true, true))
-            .oneshot(native_stream_request())
-            .await
-            .expect("explicitly buffered response");
+        let buffered = router(native_stream_state(
+            &base_url,
+            true,
+            Some(StreamMarkerMiddleware::chain()),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("explicitly buffered response");
         assert_eq!(buffered.status(), StatusCode::OK);
         let buffered = buffered.into_body().collect().await.unwrap().to_bytes();
         let buffered = String::from_utf8(buffered.to_vec()).unwrap();
@@ -6631,6 +6697,55 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
             "{buffered}"
         );
         assert_ne!(buffered.as_bytes(), MUTABLE_NATIVE_STREAM.as_bytes());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn native_stream_validation_buffers_original_split_bytes_until_every_verdict() {
+        let (base_url, hits) = mutable_native_upstream().await;
+
+        let denied = router(native_stream_state(
+            &base_url,
+            false,
+            Some(StreamValidationMiddleware::chain(false)),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("typed validation incompatibility");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let validated = router(native_stream_state(
+            &base_url,
+            true,
+            Some(StreamValidationMiddleware::chain(false)),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("validated native stream");
+        assert_eq!(validated.status(), StatusCode::OK);
+        let validated = validated.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(validated.as_ref(), MUTABLE_NATIVE_STREAM.as_bytes());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let refused = router(native_stream_state(
+            &base_url,
+            true,
+            Some(StreamValidationMiddleware::chain(true)),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("refused native stream");
+        assert_eq!(refused.status(), StatusCode::OK);
+        let refused = refused.into_body().collect().await.unwrap().to_bytes();
+        let refused = String::from_utf8(refused.to_vec()).unwrap();
+        assert!(refused.contains("middleware_stream_error"), "{refused}");
+        assert!(
+            refused.contains("request refused by middleware: policy"),
+            "{refused}"
+        );
+        assert!(!refused.contains("\"text\":\"hi\""), "{refused}");
+        assert!(!refused.contains("message_start"), "{refused}");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
@@ -6650,9 +6765,19 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
                 let served = Arc::clone(&served);
                 async move {
                     served.fetch_add(1, Ordering::SeqCst);
+                    let split = MUTABLE_RESPONSES_STREAM
+                        .find("\"hi\"")
+                        .expect("Responses fixture contains text delta")
+                        + 2;
+                    let bytes = MUTABLE_RESPONSES_STREAM.as_bytes();
                     (
                         [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        Body::from(MUTABLE_RESPONSES_STREAM),
+                        Body::from_stream(futures::stream::iter([
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(
+                                &bytes[..split],
+                            )),
+                            Ok(bytes::Bytes::copy_from_slice(&bytes[split..])),
+                        ])),
                     )
                 }
             }),
@@ -6665,7 +6790,12 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         (format!("http://{addr}"), hits)
     }
 
-    fn responses_stream_state(url_a: &str, url_b: &str, buffered: bool, mutate: bool) -> AppState {
+    fn responses_stream_state(
+        url_a: &str,
+        url_b: &str,
+        buffered: bool,
+        middleware: Option<MiddlewareChain>,
+    ) -> AppState {
         let mut config = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -6719,11 +6849,64 @@ targets = [
             Box::new(NoBudget),
         )
         .expect("Responses stream state");
-        if mutate {
-            state.with_middleware_chain(StreamMarkerMiddleware::chain())
-        } else {
-            state
+        match middleware {
+            Some(chain) => state.with_middleware_chain(chain),
+            None => state,
         }
+    }
+
+    #[tokio::test]
+    async fn responses_stream_validation_buffers_original_split_bytes_until_every_verdict() {
+        let (url_a, hits_a) = mutable_responses_upstream().await;
+        let (url_b, hits_b) = mutable_responses_upstream().await;
+
+        let denied = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            false,
+            Some(StreamValidationMiddleware::chain(false)),
+        ))
+        .oneshot(streaming_responses_request(None))
+        .await
+        .expect("typed Responses validation incompatibility");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+
+        let validated = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            true,
+            Some(StreamValidationMiddleware::chain(false)),
+        ))
+        .oneshot(streaming_responses_request(None))
+        .await
+        .expect("validated Responses stream");
+        assert_eq!(validated.status(), StatusCode::OK);
+        let validated = validated.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(validated.as_ref(), MUTABLE_RESPONSES_STREAM.as_bytes());
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+
+        let refused = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            true,
+            Some(StreamValidationMiddleware::chain(true)),
+        ))
+        .oneshot(streaming_responses_request(None))
+        .await
+        .expect("refused Responses stream");
+        assert_eq!(refused.status(), StatusCode::OK);
+        let refused = refused.into_body().collect().await.unwrap().to_bytes();
+        let refused = String::from_utf8(refused.to_vec()).unwrap();
+        assert!(refused.contains("middleware_stream_error"), "{refused}");
+        assert!(
+            refused.contains("request refused by middleware: policy"),
+            "{refused}"
+        );
+        assert!(!refused.contains("\"delta\":\"hi\""), "{refused}");
+        assert!(!refused.contains("response.completed"), "{refused}");
+        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -6731,7 +6914,8 @@ targets = [
         let (url_a, hits_a) = mutable_responses_upstream().await;
         let (url_b, hits_b) = mutable_responses_upstream().await;
 
-        let denied_state = responses_stream_state(&url_a, &url_b, false, true);
+        let denied_state =
+            responses_stream_state(&url_a, &url_b, false, Some(StreamMarkerMiddleware::chain()));
         for previous in [None, Some("resp_1")] {
             let denied = router(denied_state.clone())
                 .oneshot(streaming_responses_request(previous))
@@ -6745,7 +6929,8 @@ targets = [
         assert_eq!(hits_a.load(Ordering::SeqCst), 0);
         assert_eq!(hits_b.load(Ordering::SeqCst), 0);
 
-        let buffered_state = responses_stream_state(&url_a, &url_b, true, true);
+        let buffered_state =
+            responses_stream_state(&url_a, &url_b, true, Some(StreamMarkerMiddleware::chain()));
         for previous in [None, Some("resp_1")] {
             let buffered = router(buffered_state.clone())
                 .oneshot(streaming_responses_request(previous))

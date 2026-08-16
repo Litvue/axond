@@ -159,16 +159,20 @@ fields such as `core_stages` are rejected while the document is validated.
 buffered provider response runs `Response` scopes once in reverse registration
 order. A stream runs `StreamEvent` scopes on decoded data events, also in reverse
 order; terminal provider usage remains gateway-owned and is never mutable.
-OpenAI chat already re-emits decoded events, so an applicable stream mutator can
+OpenAI chat already re-emits decoded events, so applicable stream middleware can
 run incrementally. `Native` and `Responses` framing remain byte-faithful unless
 the governing policy explicitly selects that route in
-`buffered_response_routes`; without that opt-in the request is refused as
-`middleware_response_incompatible` before permits, reservations, or provider
-dispatch.
+`buffered_response_routes`; without that opt-in any applicable stream-event
+middleware is refused as `middleware_response_incompatible` before permits,
+reservations, or provider dispatch. This includes non-mutating middleware,
+because it can still refuse and fail-closed policy cannot release bytes before
+that verdict.
 
 The opt-in holds reconstructed output until the upstream terminates
-successfully, then releases the transformed events. Both raw upstream bytes and
-reconstructed output are bounded by the lower of
+successfully, then releases the transformed events. A non-mutating stream chain
+instead releases the provider's original bytes after validation, preserving the
+byte-faithful contract. Both raw upstream bytes and reconstructed output are
+bounded by the lower of
 `admission.max_stream_bytes` and a 64 MiB hard ceiling; the hard ceiling remains
 when the ordinary stream limit is disabled. Middleware failure releases no held
 content and ends the already-open stream with a wire-native
