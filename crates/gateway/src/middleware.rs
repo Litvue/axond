@@ -2331,6 +2331,7 @@ namespace = "alpha"
         .expect("stream-event chain");
         let slots = Arc::new(Semaphore::new(SLOTS));
         let runtime = MiddlewareRuntime::with_slots(Arc::clone(&slots));
+        let gate = runtime.gate("capacity-stream");
         let mut tasks = Vec::with_capacity(EVENTS);
 
         for sequence in 0..EVENTS {
@@ -2378,7 +2379,7 @@ namespace = "alpha"
         assert_eq!(active.load(Ordering::SeqCst), 0);
         assert_eq!(slots.available_permits(), SLOTS);
         assert_eq!(
-            runtime.gate("capacity-stream").slots.available_permits(),
+            gate.slots.available_permits(),
             MAX_BLOCKING_INVOCATIONS_PER_MIDDLEWARE
         );
     }
