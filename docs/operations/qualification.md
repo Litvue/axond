@@ -13,7 +13,7 @@ decomposes into five slices. They landed, and will land, at different depths:
 | `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Two drivers and committed mixes — one stateless, one against a fleet with a durable usage sink — whose smoke tiers run in CI. Neither 12–24 hour tier has been dispatched. |
 | `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `evidenced` | Driver, committed scenarios, and twenty-two executable stages running against real PostgreSQL in two lanes — outage, cold boots, cached process serving, cache refusal, secret rotation, convergence, durable inventory, logical restore, point-in-time recovery, and the durable usage boundary — with a retained GitHub Actions record. A multi-replica fleet baseline remains open. |
 | `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `evidenced` | Committed provider, transport, Redis, and Postgres fault matrix plus a driver; the full pinned-service matrix has a clean retained GitHub Actions record. A second reference tier and integrated fleet evidence remain open. |
-| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver, committed scenarios, reduced and heavy tiers; the local heavy run passed, but no retained record is committed, and mixed-version serving across a migration still needs a stateful multi-replica qualification. |
+| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `evidenced` | Driver, committed scenarios, reduced and heavy tiers, and a retained current-main GitHub Actions run: 9,600 requests across a two-replica rolling replacement and rollback, with no caller or usage loss, no torn stream or `503`, mixed-version traffic, bounded drains, and the real-Postgres forward-schema fence. |
 
 `qualification/packet.toml` is that table as data — question, inputs, lanes,
 retained runs, and what each slice still owes; see
@@ -26,18 +26,19 @@ the manifest it names is a test failure.
 
 ## What the packet may not be read as
 
-- **Not a claim that Axond is production-qualified.** Three of five slices are
-  evidenced and two have a driver with no retained heavy run behind them; no
-  slice has retained a run of a fleet. #156 stays open until every slice
+- **Not a claim that Axond is production-qualified.** Four of five slices are
+  evidenced and endurance has drivers with no retained 12-hour runs behind
+  them. #156 stays open until every slice
   is `evidenced`; `closure.satisfied` in the packet is derived from the slices,
   so it cannot be set by hand.
-- **Not a stateful fleet baseline.** The two capacity records are Tier 0 local
-  runs; the retained fault and recovery records are process-level GitHub
-  Actions runs against pinned Redis/Postgres lanes. None is a multi-replica
-  load or soak measurement. The stateful endurance harness has run its
+- **Not yet a stateful endurance baseline.** The capacity records are Tier 0
+  local runs; the retained fault and recovery records are process-level GitHub
+  Actions runs against pinned Redis/Postgres lanes. Rollout now retains a
+  two-replica load measurement, but its serving replicas are config-only and
+  the control plane supplies the rollback fence. The stateful endurance harness has run its
   ninety-second smoke tier, but the 12–24 hour tiers have not been dispatched.
-- **Not a fleet baseline.** The retained CI records qualify process behavior,
-  not offered load across replicas.
+- **Not a long-soak baseline.** The rollout record qualifies offered load across
+  replicas for under a minute; it says nothing about resource drift over hours.
 
 ## The status ladder
 
@@ -76,14 +77,16 @@ check out.
 | `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `8e2cbb566e82` | `8ba8b96` |
 | `qualification/faults/evidence/full-ci.toml` | full | github-actions | `c7c250314925` | `c18b7a5` |
 | `qualification/recovery/evidence/serving-ci.toml` | serving | github-actions | `4c1789c306b9` | `c18b7a5` |
+| `qualification/rollout/evidence/heavy-ci.toml` | heavy | github-actions | `7595baeda572` | `0aa3ba9` |
 
 The two capacity records were produced on an 8 vCPU cloud VM from a **debug build**, which is what
 `cargo test` builds. They are the first envelope, not a fleet baseline: a release
 build on production-representative hardware will move every number in them, and
 `runner = "local"` is in the record so that caveat travels with the data instead
-of with this paragraph. The CI records are retained process-level fault and
-recovery evidence; their GitHub Actions provenance and Redis/Postgres lanes do
-not make them fleet-load measurements. The contract test requires a locally
+of with this paragraph. The fault and recovery CI records are process-level
+evidence; their GitHub Actions provenance and Redis/Postgres lanes do not make
+them fleet-load measurements. The rollout record is a two-replica load
+measurement and carries its own config-only serving boundary. The contract test requires a locally
 recorded run to be disclosed here by path and by the digest of the binary that
 produced it, so re-running a tier — which rebuilds the binary, and so changes
 the digest — without rewriting this table is a test failure rather than a stale
@@ -177,29 +180,28 @@ checked by the qualification packet test.
   hours can exercise (`max_rss_drift_kib_per_hour` and its neighbours) have no
   run behind them, so the soak tiers are declared bounds rather than measured
   ones.
-- **`recovery`** — a multi-replica fleet baseline: serving through the outage,
-  from a restored cache, and across a recovery, plus rotation and restore under
-  offered load. The retained process/recovery record covers all twenty-two
-  executable stages today; the packet mirrors the manifest's dependency map and
-  is tested against it so future dependencies cannot disappear silently.
-- **`fault`** — a second reference tier and integrated fleet fault evidence. The
-  full provider, transport, Redis, and Postgres matrix now has a clean retained
-  GitHub Actions record.
-- **`rollout`** — a manifest, a driver, and a stateful fleet: two or more
-  replicas behind an ingress, with the artifact-digest, migration, and timeline
-  metadata a rollout has to retain.
-- **All of them** — a second reference tier. Every number retained so far is
-  single-replica.
+- **`recovery`** — complete for its declared recovery slice: the retained record
+  covers all twenty-two real-Postgres stages and the manifest has no active
+  blocker. Stateful load over hours belongs to endurance rather than reopening
+  that process/restore record.
+- **`fault`** — complete for its declared matrix: provider, transport, Redis,
+  and Postgres faults have a clean retained GitHub Actions record.
+- **`rollout`** — complete for its declared heavy tier: the retained two-replica
+  run binds the raw artifact and all twenty verdicts. Stateful duration and
+  repeated runtime changes belong to stateful endurance.
+- **Second reference tier** — rollout now supplies the short fleet-under-load
+  baseline; the stateful 12-hour endurance record remains the long-duration
+  baseline needed beside the single-replica soak.
 
 One question the packet is regularly asked for, and still cannot answer: a
-**stateful fleet qualification baseline**. A stateful replica now compiles
+**stateful fleet endurance baseline**. A stateful replica now compiles
 durable tenant/project principals and serves after a complete snapshot is
 published; without one it keeps readiness and inference fail-closed. The
-single-process evidence belongs to #219, while a profile against multiple
-replicas, offered load, and recovery remains outstanding. That is why #219
-remains open: its twenty-two executable stages run against real PostgreSQL and
-are retained, but no complete multi-replica fleet record is retained. It is also
-why no capacity profile claims stateful serving.
+single-process recovery evidence belongs to the completed #219 slice; the
+rollout record proves short mixed-version fleet load. What remains outstanding
+is the stateful endurance profile against multiple replicas for the committed
+12 hours, including revisions, backend faults, and rolling restarts. That is
+also why no capacity profile claims stateful serving.
 
 ## Related
 

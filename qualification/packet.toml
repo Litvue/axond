@@ -3,10 +3,8 @@
 # #156 asks for reproducible evidence in place of qualitative production claims,
 # and it decomposes into five slices — capacity, provider and backend faults,
 # stateful recovery, multi-replica rollout, and a long soak. Each has landed to a
-# different depth: capacity, fault, and recovery are evidenced with retained
-# runs, while rollout and endurance remain harnessed. The local rollout heavy
-# tier has been exercised, but a run outside the committed evidence set cannot
-# promote that slice. The #158 dependency formerly attached to fault and
+# different depth: capacity, fault, recovery, and rollout are evidenced with
+# retained runs, while endurance remains harnessed. The #158 dependency formerly attached to fault and
 # rollout is retired: the remaining deployment-overlay and preflight work stays
 # on #158, while those qualification questions now have their own evidence
 # paths. That spread is
@@ -131,7 +129,7 @@ retained = ["qualification/faults/evidence/full-ci.toml"]
 [[slice]]
 id = "rollout"
 issue = 220
-status = "harnessed"
+status = "evidenced"
 question = """
 Whether two or more replicas behind an ingress can be replaced without losing \
 a request, a stream, or a usage row: drain on SIGTERM, readiness removal, \
@@ -144,11 +142,7 @@ adr = "docs/adr/0041-rollout-qualification-harness.md"
 reduced_lane = "cargo test --workspace"
 heavy_lane = ".github/workflows/rollout.yml"
 heavy_tier = "heavy"
-retained = []
-outstanding = """
-The heavy tier has now passed locally, but no run of a fleet under load is \
-retained in the packet; mixed-version serving across a migration still needs a \
-stateful replica qualification."""
+retained = ["qualification/rollout/evidence/heavy-ci.toml"]
 
 # What closing #156 requires. `satisfied` is not an opinion: the contract test
 # derives it from the slices above, so it can only become true when every slice

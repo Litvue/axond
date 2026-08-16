@@ -1,0 +1,41 @@
+# A retained rollout qualification run, reduced to workload observations.
+# The raw JSON artifacts remain alongside the workflow result; each
+# observation below binds one workload to its artifact digest and verdicts.
+
+schema_version = 1
+slice = "rollout"
+tier = "heavy"
+runner = "github-actions"
+runner_note = "GitHub Actions ubuntu-latest, heavy two-replica rollout"
+
+[source]
+git_commit = "0aa3ba96e25094810f8e76b549fc2e84a971a818"
+git_dirty = false
+crate_version = "0.3.40"
+
+[binary]
+sha256 = "7595baeda572e9bf6fbc8cd4e302d2c6d977f6c8ce092ee6600a5251c241daed"
+version = "0.3.40"
+cargo_profile = "debug"
+rustc = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+
+[inputs]
+manifest = "qualification/rollout/manifest.toml"
+manifest_sha256 = "d2672ba042a699c25040d91a7746e1be836f7de1884653dc1d1b87982a2ac959"
+fixtures = 0
+
+[hardware]
+os = "linux"
+arch = "x86_64"
+kernel = "6.17.0-1022-azure"
+cpu_model = "AMD EPYC 7763 64-Core Processor"
+cpus = 4
+total_memory_kib = 16373452
+containerized = true
+
+[[observation]]
+id = "rolling-replace"
+artifact_sha256 = "b38fb4d1d4ef2aea2646b4235da069665b5affa879eb2a0c61eeea1c8b615653"
+elapsed_ms = 49180
+verdicts = 20
+passed = true
