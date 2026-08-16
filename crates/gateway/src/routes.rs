@@ -1153,13 +1153,23 @@ impl Route {
     /// Pre-dispatch estimate the budget hold is priced from. Embeddings produce
     /// no completion, so nothing is held for output.
     fn estimate(self, body: &Value) -> Usage {
-        let estimate = estimate_usage(body);
+        self.measure(body).0
+    }
+
+    /// Return the usage estimate together with the serialized byte length that
+    /// produced it. Keeping the two together lets the post-middleware path
+    /// enforce both token and byte ceilings without serializing the body twice.
+    fn measure(self, body: &Value) -> (Usage, usize) {
+        let (estimate, bytes) = estimate_usage(body);
         match self {
-            Self::Embeddings => Usage {
-                output_tokens: 0,
-                ..estimate
-            },
-            _ => estimate,
+            Self::Embeddings => (
+                Usage {
+                    output_tokens: 0,
+                    ..estimate
+                },
+                bytes,
+            ),
+            _ => (estimate, bytes),
         }
     }
 
@@ -1479,7 +1489,10 @@ async fn serve(
     let estimate = if state.0.middleware.is_empty() {
         estimate
     } else {
-        let recomputed = route.estimate(&body);
+        let (recomputed, body_bytes) = route.measure(&body);
+        if body_bytes > limits.max_request_bytes {
+            return Err(GatewayError::RequestTooLarge);
+        }
         check_estimate_bounds(&body, recomputed, limits)?;
         recomputed
     };
@@ -2729,17 +2742,21 @@ fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
 /// (~4 chars/token) plus a reserved output allowance (`max_tokens` when present,
 /// else a default). Priced with a target's `ModelPrice` it becomes the held
 /// estimate, which settlement replaces with the real cost.
-fn estimate_usage(body: &Value) -> Usage {
+fn estimate_usage(body: &Value) -> (Usage, usize) {
     const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1_024;
-    let input_tokens = (serde_json::to_string(body).map(|s| s.len()).unwrap_or(0) / 4) as u64;
+    let body_bytes = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
+    let input_tokens = (body_bytes / 4) as u64;
     let output_tokens = requested_output_tokens(body).unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-    Usage {
-        input_tokens,
-        output_tokens,
-        reasoning_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-    }
+    (
+        Usage {
+            input_tokens,
+            output_tokens,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        },
+        body_bytes,
+    )
 }
 
 /// Apply the request-derived prompt/output ceilings to one estimate. This is
@@ -3064,6 +3081,7 @@ mod tests {
             estimate_usage(
                 &serde_json::json!({"max_tokens": Value::Null, "max_completion_tokens": 500_000})
             )
+            .0
             .output_tokens,
             500_000,
             "the hold prices the allowance the provider will honor"
@@ -6916,6 +6934,28 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             )
             .await
             .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The wire body may fit while request middleware expands the body beyond
+    /// the same configured ceiling. The expanded body is refused before any
+    /// provider dispatch, preserving `max_request_bytes` as an outbound-memory
+    /// invariant as well as an inbound parsing bound.
+    #[tokio::test]
+    async fn middleware_cannot_expand_a_request_past_the_byte_limit() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let state = admitting_state(&base_url, "max_request_bytes = 512", Box::new(NoBudget))
+            .with_middleware_chain(BodyGrowthMiddleware::chain(1_024));
+        let response = router(state)
+            .oneshot(chat_request())
+            .await
+            .expect("typed middleware size refusal");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();

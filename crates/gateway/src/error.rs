@@ -68,8 +68,10 @@ pub enum GatewayError {
     /// operator can tell a saturated replica from one noisy tenant.
     #[error(transparent)]
     Overloaded(#[from] AdmissionRejection),
-    /// The inbound body exceeded `admission.max_request_bytes`. Refused before
-    /// it is buffered, so an oversized request costs no memory.
+    /// The inbound body exceeded `admission.max_request_bytes`, or request
+    /// middleware expanded a valid inbound body beyond the same ceiling. Wire
+    /// oversize is refused before buffering; middleware growth is refused
+    /// before provider dispatch.
     #[error("request body exceeds the configured inbound limit")]
     RequestTooLarge,
     /// The request did not declare a JSON content type. Axum's own extractor

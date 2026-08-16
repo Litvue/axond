@@ -106,6 +106,12 @@ above all, disagree with the attempt that served. Adding it later is an additive
 change to a registration enum; getting it wrong now would be a correctness bug
 in the walk.
 
+Request middleware cannot weaken the admission byte ceiling. The router refuses
+an oversized wire body before buffering, and the request path measures the
+serialized post-middleware body against the same `admission.max_request_bytes`
+limit before provider dispatch. Token, output, caller-cost, and budget checks
+likewise use the post-middleware body.
+
 **A middleware may own state for as long as the response lives.** The primitive
 lets a `Request`-scope middleware return state that is moved into the response's
 ownership: dropped at scope end on a buffered request, and moved into the relay's

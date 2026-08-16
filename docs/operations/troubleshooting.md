@@ -36,7 +36,7 @@ Boot errors name references and identifiers, not secret values.
 | `429 budget_exceeded` | Subject or namespace spend cap cannot admit the estimate. | Budget metrics and namespace-denial metric. |
 | `429 rate_limit_exceeded` | In-flight concurrency cap reached. | Caller concurrency and limiter metrics. |
 | `429 tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. | `axond.admission.in_flight`; whether the tenant's own concurrency, not the replica, is the cause. |
-| `413 request_too_large` / `413 prompt_too_large` | Body over `admission.max_request_bytes`, or estimated input over `admission.max_prompt_tokens`. | The caller's payload size; raise the bound only if the workload genuinely needs it. |
+| `413 request_too_large` / `413 prompt_too_large` | Inbound or post-middleware body over `admission.max_request_bytes`, or estimated input over `admission.max_prompt_tokens`. | The caller's payload size and selected content policy; raise the bound only if the workload genuinely needs it. |
 | `200` + SSE `error` typed `upstream_stream_error` | A stream hit `admission.max_stream_duration_ms` or `admission.max_stream_bytes`; the bounds cannot change a status already sent. | The event's message names the bound; the usage record settles with what was relayed. |
 | `415 unsupported_media_type` | The request did not declare `content-type: application/json`. | The caller's `Content-Type` header. |
 | `400 output_limit_exceeded` | The request asked for more output tokens than `admission.max_output_tokens`. | The request's `max_tokens`/`max_completion_tokens`/`max_output_tokens`. |
