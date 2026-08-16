@@ -54,7 +54,7 @@ committed data and the enum that admits it, as in ADR 0033.
 `soak` is the twelve-hour tier, dispatched from the `Endurance` workflow. They
 differ in duration, concurrency, and which *drift* gates apply — a slope stated
 per hour is noise on a fifteen-second run. Everything that does not depend on
-duration (losses, duplicates, leaks, unexpected statuses, socket balance) is
+duration (losses, surplus identities, duplicates, leaks, unexpected statuses, socket balance) is
 asserted at both tiers.
 
 **A dispatched duration moves the soak tier only.** Both tiers share a test

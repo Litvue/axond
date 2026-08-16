@@ -82,7 +82,7 @@ impl EnduranceResult {
             "{} [{}]: {} offered over {:.1} min ({:.1} req/s), {} segments, \
              p50 {:.1} ms p95 {:.1} ms, ttft p95 {}, peak rss {rss}, \
              rss drift {:.0} KiB/h, sockets drift {:.2}/h, \
-             usage {}/{} ({} duplicate, {} unexpected)",
+             usage {}/{} ({} missing, {} surplus, {} duplicate, {} unexpected status)",
             self.profile.id,
             self.profile.tier,
             self.throughput.offered,
@@ -98,6 +98,8 @@ impl EnduranceResult {
             self.trend.sockets_per_hour.unwrap_or_default(),
             self.reconciliation.records_observed,
             self.reconciliation.expected,
+            self.reconciliation.missing,
+            self.reconciliation.unexpected_records,
             self.reconciliation.duplicates,
             self.reconciliation.unexpected_statuses,
         )
@@ -417,6 +419,10 @@ pub struct Reconciliation {
     pub duplicates: u64,
     /// Expected records that never arrived within the settle deadline.
     pub missing: u64,
+    /// Distinct records beyond the requests known to owe one. This is kept
+    /// separate from duplicates: an extra identity is surplus accounting, not
+    /// a replay of an identity the run already observed.
+    pub unexpected_records: u64,
     /// Records whose status no planned ending can produce.
     pub unexpected_statuses: u64,
     /// Records that arrived without a parseable `request_id`, which would make

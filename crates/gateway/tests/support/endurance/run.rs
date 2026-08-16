@@ -12,6 +12,7 @@
 //! batches and released, and the raw time series goes to a file as it is taken.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,6 +80,16 @@ pub const DURATION_ENV: &str = "AXOND_ENDURANCE_DURATION_MS";
 /// lost. Settlement is detached from the request, so this bounds the *sink*.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The client-side ceiling for one offered request. The gateway is configured
+/// with a sixty-second overall attempt bound; this deliberately sits beyond it
+/// so the gateway owns normal timeout semantics while the harness still has a
+/// finite tail if a transport future fails to observe that bound.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Kept beside the harness ceiling so a regression cannot silently make the
+/// client's watchdog shorter than the server contract it is meant to observe.
+const GATEWAY_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How long the record sink must stay silent after the expected count is
 /// reached before the wait accepts that everything has arrived. The count alone
 /// cannot say so, because it counts duplicates the shards have not been read to
@@ -130,7 +141,7 @@ fn load_lock() -> &'static Mutex<()> {
 }
 
 /// How one offered request ended, judged against what the plan asked for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     /// Served and read to the end, as planned.
     Completed,
@@ -149,13 +160,17 @@ enum Outcome {
     Shed,
     /// Shed by admission: `429`/`503`. Never planned.
     Rejected,
+    /// The harness watchdog expired. This is kept distinct from an ordinary
+    /// transport refusal because the request may already have reached the
+    /// gateway or upstream when its client future was cancelled.
+    TimedOut,
     /// Anything else. This is what a soak exists to find.
     Unplanned,
 }
 
 impl Outcome {
     fn planned(self) -> bool {
-        !matches!(self, Self::Rejected | Self::Unplanned)
+        !matches!(self, Self::Rejected | Self::TimedOut | Self::Unplanned)
     }
 
     /// Whether the request reached an upstream attempt, and so owes exactly one
@@ -277,6 +292,7 @@ pub async fn run_with(
             tx.clone(),
             deadline,
             Duration::from_millis(scale.think_time_ms),
+            ATTEMPT_TIMEOUT,
         )));
     }
     // The driver's own handle would keep the channel open past the last worker.
@@ -416,19 +432,50 @@ async fn worker(
     tx: UnboundedSender<Attempt>,
     deadline: Instant,
     think_time: Duration,
+    attempt_timeout: Duration,
 ) {
     while Instant::now() < deadline {
         let index = next.fetch_add(1, Ordering::Relaxed);
         let planned = plan::planned(index, &tenants, &rotation);
-        let attempt = attempt(&client, &base_url, planned, &gauges).await;
+        let timed_out = planned.clone();
+        let attempt = bounded_attempt(
+            timed_out,
+            attempt_timeout,
+            attempt(&client, &base_url, planned, &gauges),
+        )
+        .await;
         // A closed receiver means the driver has stopped collecting; there is
         // nothing left for this worker to contribute.
         if tx.send(attempt).is_err() {
             return;
         }
         if !think_time.is_zero() {
-            tokio::time::sleep(think_time).await;
+            // The pacing delay belongs to the offered-load window too. A
+            // manifest cannot extend the worker tail by setting it beyond the
+            // run deadline.
+            tokio::time::sleep_until((Instant::now() + think_time).min(deadline).into()).await;
         }
+    }
+}
+
+/// Bound one request without hiding the finding. A timeout is emitted as an
+/// unplanned attempt, so the artifact fails truthfully and is still written;
+/// cancelling the future drops its [`GaugeLease`] and releases both gauges.
+async fn bounded_attempt<F>(plan: Planned, timeout: Duration, future: F) -> Attempt
+where
+    F: Future<Output = Attempt>,
+{
+    let started = Instant::now();
+    match tokio::time::timeout(timeout, future).await {
+        Ok(attempt) => attempt,
+        Err(_) => Attempt {
+            plan,
+            outcome: Outcome::TimedOut,
+            status: None,
+            latency_ms: millis(started.elapsed()),
+            ttft_ms: None,
+            stream_lifetime_ms: None,
+        },
     }
 }
 
@@ -440,8 +487,7 @@ async fn attempt(
     gauges: &Gauges,
 ) -> Attempt {
     let sent_at = Instant::now();
-    gauges.enter();
-    let waiting = &mut true;
+    let mut gauge = GaugeLease::new(gauges);
     let finish = |outcome, status, ttft_ms, stream_lifetime_ms, plan| Attempt {
         plan,
         outcome,
@@ -459,17 +505,13 @@ async fn attempt(
         .await;
     let response = match sent {
         Ok(response) => response,
-        Err(_) => {
-            gauges.leave(waiting);
-            return finish(Outcome::Unplanned, None, None, None, plan);
-        }
+        Err(_) => return finish(Outcome::Unplanned, None, None, None, plan),
     };
     let status = response.status();
     let headers_at = sent_at.elapsed();
 
     if !status.is_success() {
         let refusal = response.text().await.unwrap_or_default();
-        gauges.leave(waiting);
         let code = status.as_u16();
         let outcome = match plan.ending {
             // The planned fault: an upstream that refused reaches the caller as
@@ -491,9 +533,8 @@ async fn attempt(
     }
 
     if !plan.shape.stream {
-        gauges.first_byte(waiting);
+        gauge.first_byte();
         let read = response.bytes().await;
-        gauges.leave(waiting);
         let outcome = match (plan.ending, read.is_ok()) {
             (Ending::Complete, true) => Outcome::Completed,
             _ => Outcome::Unplanned,
@@ -512,7 +553,7 @@ async fn attempt(
             break;
         };
         first_byte.get_or_insert_with(|| sent_at.elapsed());
-        gauges.first_byte(waiting);
+        gauge.first_byte();
         if plan.ending != Ending::Cancelled {
             continue;
         }
@@ -527,7 +568,6 @@ async fn attempt(
     // Dropping the body without draining it is what a closed browser tab looks
     // like, and it is the case that leaks an upstream when it is mishandled.
     drop(stream);
-    gauges.leave(waiting);
     let outcome = match plan.ending {
         Ending::Complete if !torn => Outcome::Completed,
         Ending::Cancelled if cancelled => Outcome::Cancelled,
@@ -628,6 +668,33 @@ impl Gauges {
             self.awaiting_peak
                 .swap(self.awaiting.load(Ordering::Relaxed), Ordering::Relaxed),
         )
+    }
+}
+
+/// One driver's contribution to the live gauges. Tying release to `Drop`
+/// makes timeout cancellation equivalent to every explicit return path.
+struct GaugeLease<'a> {
+    gauges: &'a Gauges,
+    waiting: bool,
+}
+
+impl<'a> GaugeLease<'a> {
+    fn new(gauges: &'a Gauges) -> Self {
+        gauges.enter();
+        Self {
+            gauges,
+            waiting: true,
+        }
+    }
+
+    fn first_byte(&mut self) {
+        self.gauges.first_byte(&mut self.waiting);
+    }
+}
+
+impl Drop for GaugeLease<'_> {
+    fn drop(&mut self) {
+        self.gauges.leave(&mut self.waiting);
     }
 }
 
@@ -814,15 +881,12 @@ impl Aggregate {
                 self.circuit_shed += 1;
             }
             Outcome::Rejected => self.rejected += 1,
+            Outcome::TimedOut => {}
             Outcome::Unplanned => {}
         }
         *self
             .by_response_status
-            .entry(
-                attempt
-                    .status
-                    .map_or_else(|| "transport".to_owned(), |code| code.to_string()),
-            )
+            .entry(response_status(attempt))
             .or_default() += 1;
         if attempt.outcome.settles() {
             self.settling += 1;
@@ -1018,6 +1082,7 @@ fn assemble(
     let resources = resources(&aggregate, &finished, scale, elapsed);
     let trend = trend(&aggregate.segments, scale);
     let tally = aggregate.ledger.tally();
+    let (missing, unexpected_records) = reconciliation_delta(aggregate.settling, tally.distinct);
     EnduranceResult {
         schema_version: RESULT_SCHEMA_VERSION,
         profile: ProfileEcho::new(profile, tier, scale),
@@ -1068,7 +1133,8 @@ fn assemble(
             records_observed: aggregate.records_observed,
             distinct_request_ids: tally.distinct,
             duplicates: tally.duplicates,
-            missing: aggregate.settling.saturating_sub(tally.distinct),
+            missing,
+            unexpected_records,
             unexpected_statuses: aggregate.unexpected_statuses,
             unidentified: aggregate.unidentified,
             by_status: aggregate.by_status.clone(),
@@ -1082,6 +1148,24 @@ fn assemble(
         trend,
         verdicts: Vec::new(),
     }
+}
+
+fn response_status(attempt: &Attempt) -> String {
+    match (attempt.outcome, attempt.status) {
+        (Outcome::TimedOut, _) => "timeout".to_owned(),
+        (_, Some(code)) => code.to_string(),
+        (_, None) => "transport".to_owned(),
+    }
+}
+
+/// Account for both sides of an exact cardinality contract. Keeping the
+/// surplus side explicit prevents `saturating_sub` from turning extra distinct
+/// records into an apparent clean reconciliation.
+fn reconciliation_delta(expected: u64, distinct: u64) -> (u64, u64) {
+    (
+        expected.saturating_sub(distinct),
+        distinct.saturating_sub(expected),
+    )
 }
 
 fn resources(
@@ -1205,6 +1289,11 @@ fn verdicts(result: &EnduranceResult) -> Vec<Verdict> {
             "max_missing_usage_records",
             result.reconciliation.missing as f64,
             thresholds.max_missing_usage_records as f64,
+        ),
+        Verdict::at_most(
+            "max_unexpected_usage_records",
+            result.reconciliation.unexpected_records as f64,
+            thresholds.max_unexpected_usage_records as f64,
         ),
         Verdict::at_most(
             "max_duplicate_usage_records",
@@ -1379,4 +1468,118 @@ fn relative_to_workspace(path: &Path) -> String {
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn planned() -> Planned {
+        Planned {
+            tenant: Tenant {
+                namespace: "timeout-regression",
+                key: "fixture-key".to_owned(),
+                credential_source: "platform",
+            },
+            shape: plan::shapes(Ending::Complete)[0],
+            ending: Ending::Complete,
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_attempt_is_bounded_unplanned_and_releases_gauges() {
+        let gauges = Gauges::default();
+        let plan = planned();
+        let started = Instant::now();
+        let attempt = bounded_attempt(plan.clone(), Duration::from_millis(10), async {
+            let _lease = GaugeLease::new(&gauges);
+            std::future::pending::<Attempt>().await
+        })
+        .await;
+
+        assert_eq!(attempt.outcome, Outcome::TimedOut);
+        assert_eq!(attempt.plan.tenant.namespace, plan.tenant.namespace);
+        assert_eq!(
+            (attempt.status, attempt.ttft_ms, attempt.stream_lifetime_ms),
+            (None, None, None)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a ten-millisecond attempt watchdog did not bound the request"
+        );
+        assert_eq!(gauges.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(gauges.awaiting.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_worker_started_near_deadline_has_a_bounded_truthful_tail() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the timeout fixture binds");
+        let address = listener.local_addr().expect("the fixture has an address");
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("the worker connects");
+            std::future::pending::<()>().await;
+        });
+        let gauges = Arc::new(Gauges::default());
+        let (tx, mut rx) = unbounded_channel();
+        let worker = worker(
+            crate::support::client(),
+            format!("http://{address}"),
+            vec![planned().tenant],
+            Arc::new(vec![Ending::Complete]),
+            Arc::new(AtomicUsize::new(0)),
+            gauges.clone(),
+            tx,
+            Instant::now() + Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("the worker tail is bounded");
+        server.abort();
+        let attempt = rx.try_recv().expect("the timed-out attempt is retained");
+        assert!(
+            rx.try_recv().is_err(),
+            "the worker offered past its deadline"
+        );
+        assert_eq!(attempt.outcome, Outcome::TimedOut);
+        assert_eq!(attempt.status, None);
+        assert_eq!(response_status(&attempt), "timeout");
+        assert_eq!(gauges.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(gauges.awaiting.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cancelling_after_first_byte_releases_each_gauge_once() {
+        let gauges = Gauges::default();
+        let mut lease = GaugeLease::new(&gauges);
+        lease.first_byte();
+        assert_eq!(gauges.in_flight.load(Ordering::Relaxed), 1);
+        assert_eq!(gauges.awaiting.load(Ordering::Relaxed), 0);
+        drop(lease);
+        assert_eq!(gauges.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(gauges.awaiting.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn attempt_watchdog_exceeds_the_committed_gateway_overall_timeout() {
+        assert!(ATTEMPT_TIMEOUT > GATEWAY_OVERALL_TIMEOUT);
+        assert!(TUNING.lines().any(|line| {
+            line.trim()
+                == format!(
+                    "overall_timeout_ms = {}",
+                    GATEWAY_OVERALL_TIMEOUT.as_millis()
+                )
+        }));
+    }
+
+    #[test]
+    fn reconciliation_exposes_both_missing_and_surplus_identities() {
+        assert_eq!(reconciliation_delta(5, 3), (2, 0));
+        assert_eq!(reconciliation_delta(3, 5), (0, 2));
+        assert_eq!(reconciliation_delta(5, 5), (0, 0));
+    }
 }

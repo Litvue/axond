@@ -21,7 +21,7 @@
 # the run was — losses, duplicates, leaks, unplanned errors — is asserted on
 # both tiers.
 
-schema_version = 1
+schema_version = 2
 
 [[profile]]
 id = "mixed-endurance"
@@ -57,6 +57,7 @@ segment_ms = 2500
 min_accepted_fraction = 1.0
 max_unplanned_errors = 0
 max_missing_usage_records = 0
+max_unexpected_usage_records = 0
 max_duplicate_usage_records = 0
 max_unexpected_usage_statuses = 0
 max_leaked_upstream_streams = 0
@@ -77,6 +78,7 @@ segment_ms = 900000
 min_accepted_fraction = 1.0
 max_unplanned_errors = 0
 max_missing_usage_records = 0
+max_unexpected_usage_records = 0
 max_duplicate_usage_records = 0
 max_unexpected_usage_statuses = 0
 max_leaked_upstream_streams = 0

@@ -122,8 +122,9 @@ the runner was:
 - no failure the plan did not ask for (`max_unplanned_errors`), and every
   request the plan says succeeds, did (`min_accepted_fraction`);
 - **exactly one usage record per dispatched request** — none missing
-  (`max_missing_usage_records`), none repeated (`max_duplicate_usage_records`),
-  and every record carrying a status the plan can account for
+  (`max_missing_usage_records`), no surplus distinct identities
+  (`max_unexpected_usage_records`), none repeated
+  (`max_duplicate_usage_records`), and every record carrying a status the plan can account for
   (`max_unexpected_usage_statuses`). Identity is `request_id`;
 - no upstream response body still open once every caller is gone
   (`max_leaked_upstream_streams`);

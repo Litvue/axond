@@ -266,6 +266,8 @@ GENERIC_MANIFESTS = {
 }
 
 RECOVERY_MANIFEST = "qualification/recovery/manifest.toml"
+ENDURANCE_RESULT_SCHEMA_VERSION = 3
+ENDURANCE_SURPLUS_VERDICT = "max_unexpected_usage_records"
 
 
 def recovery_expected_stages(manifest_path: Path) -> dict[str, dict[str, Any]]:
@@ -549,6 +551,45 @@ def check_generic_complete(
     manifest_relative = GENERIC_MANIFESTS[slice_id]
     for result in results:
         workload = generic_id(result, slice_id)
+        verdicts = result.get("verdicts")
+        if not isinstance(verdicts, list) or not verdicts:
+            raise SystemExit(f"{workload}: evidence contains no judged verdicts")
+        if slice_id == "endurance":
+            if result.get("schema_version") != ENDURANCE_RESULT_SCHEMA_VERSION:
+                raise SystemExit(
+                    f"{workload}: unsupported endurance artifact schema "
+                    f"{result.get('schema_version')!r}"
+                )
+            unexpected = result.get("reconciliation", {}).get("unexpected_records")
+            if not isinstance(unexpected, int) or unexpected < 0:
+                raise SystemExit(
+                    f"{workload}: endurance reconciliation has no surplus identity count"
+                )
+            surplus = [
+                verdict
+                for verdict in verdicts
+                if verdict.get("threshold") == ENDURANCE_SURPLUS_VERDICT
+            ]
+            expected_bound = next(
+                row[tier]["thresholds"][ENDURANCE_SURPLUS_VERDICT]
+                for row in manifest["profile"]
+                if row["id"] == workload
+            )
+            if len(surplus) != 1:
+                raise SystemExit(
+                    f"{workload}: endurance evidence did not evaluate the surplus usage gate"
+                )
+            verdict = surplus[0]
+            if (
+                verdict.get("comparison") != "<="
+                or verdict.get("value") != unexpected
+                or verdict.get("bound") != expected_bound
+                or verdict.get("passed") is not (unexpected <= expected_bound)
+                or unexpected > expected_bound
+            ):
+                raise SystemExit(
+                    f"{workload}: the surplus usage verdict does not match reconciliation"
+                )
         environment = result["environment"]
         if environment["manifest"]["path"] != manifest_relative:
             raise SystemExit(
@@ -573,9 +614,6 @@ def check_generic_complete(
                     f"{workload}: the run did not record {name}, so its "
                     "provenance cannot be compared"
                 )
-        verdicts = result.get("verdicts")
-        if not isinstance(verdicts, list) or not verdicts:
-            raise SystemExit(f"{workload}: evidence contains no judged verdicts")
         if any(not verdict.get("passed", False) for verdict in verdicts):
             raise SystemExit(f"{workload}: at least one retained verdict failed")
         elapsed = result.get("run", {}).get("elapsed_ms")
@@ -600,6 +638,15 @@ def check_generic_complete(
                 or run["requested_duration_ms"] <= 0
             ):
                 raise SystemExit(f"{workload}: the requested duration is missing")
+            if slice_id == "endurance" and run["requested_duration_ms"] != profile["duration_ms"]:
+                raise SystemExit(
+                    f"{workload}: requested and offered endurance durations disagree"
+                )
+            if slice_id == "endurance" and elapsed < profile["duration_ms"]:
+                raise SystemExit(
+                    f"{workload}: only {elapsed} ms elapsed during a "
+                    f"{profile['duration_ms']} ms endurance run"
+                )
             if not isinstance(run.get("duration_source"), str) or not run["duration_source"]:
                 raise SystemExit(f"{workload}: the duration source is missing")
 
@@ -692,6 +739,8 @@ def render_generic(
                 f"requested_duration_ms = {run.get('requested_duration_ms', profile['duration_ms'])}",
                 f"duration_source = {toml_string(run['duration_source'])}",
             ]
+            if slice_id == "endurance":
+                lines.append(f"artifact_schema_version = {result['schema_version']}")
     return "\n".join(lines) + "\n"
 
 
@@ -764,6 +813,7 @@ def self_test() -> int:
         }
         endurance_environment["binary"] = {"sha256": "binary", "version": "0.0.0"}
         endurance_result = {
+            "schema_version": ENDURANCE_RESULT_SCHEMA_VERSION,
             "profile": {
                 "id": "mixed-endurance",
                 "tier": "soak",
@@ -771,12 +821,21 @@ def self_test() -> int:
                 "manifest_duration_ms": endurance_duration,
             },
             "run": {
-                "elapsed_ms": 1,
+                "elapsed_ms": endurance_duration - 1,
                 "requested_duration_ms": endurance_duration - 1,
                 "duration_source": "environment",
             },
             "environment": endurance_environment,
-            "verdicts": [{"passed": True}],
+            "reconciliation": {"unexpected_records": 0},
+            "verdicts": [
+                {
+                    "threshold": ENDURANCE_SURPLUS_VERDICT,
+                    "comparison": "<=",
+                    "value": 0,
+                    "bound": 0,
+                    "passed": True,
+                }
+            ],
         }
         endurance_result["_artifact_path"] = str(path)
         rendered = render_generic(
@@ -784,6 +843,68 @@ def self_test() -> int:
         )
         parsed = tomllib.loads(rendered)
         assert parsed["observation"][0]["duration_ms"] == endurance_duration - 1
+        assert (
+            parsed["observation"][0]["artifact_schema_version"]
+            == ENDURANCE_RESULT_SCHEMA_VERSION
+        )
+
+        stale_endurance = dict(endurance_result)
+        stale_endurance["schema_version"] = ENDURANCE_RESULT_SCHEMA_VERSION - 1
+        try:
+            render_generic(
+                [stale_endurance], "endurance", "soak", "local", "stale schema"
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("a stale endurance result schema was accepted")
+
+        ungated_endurance = dict(endurance_result)
+        ungated_endurance["verdicts"] = [{"passed": True}]
+        try:
+            render_generic(
+                [ungated_endurance], "endurance", "soak", "local", "missing gate"
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("an endurance result without the surplus gate was accepted")
+
+        false_pass_endurance = dict(endurance_result)
+        false_pass_endurance["reconciliation"] = {"unexpected_records": 1}
+        false_pass_endurance["verdicts"] = [
+            {
+                "threshold": ENDURANCE_SURPLUS_VERDICT,
+                "comparison": "<=",
+                "value": 1,
+                "bound": 0,
+                "passed": True,
+            }
+        ]
+        try:
+            render_generic(
+                [false_pass_endurance], "endurance", "soak", "local", "false pass"
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("a false passing surplus verdict was accepted")
+
+        short_elapsed_endurance = dict(endurance_result)
+        short_elapsed_endurance["run"] = dict(endurance_result["run"])
+        short_elapsed_endurance["run"]["elapsed_ms"] = endurance_duration - 2
+        try:
+            render_generic(
+                [short_elapsed_endurance],
+                "endurance",
+                "soak",
+                "local",
+                "short elapsed",
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("an endurance result with short elapsed time was accepted")
 
         stateful_manifest = tomllib.loads(
             (ROOT / GENERIC_MANIFESTS["stateful-endurance"]).read_text(encoding="utf-8")
