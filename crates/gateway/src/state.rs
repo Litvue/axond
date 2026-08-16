@@ -54,7 +54,7 @@ use crate::desired_state::{
 };
 use crate::desired_state::{ProjectId, RevisionId, SecretRef, TenantId, WorkloadKey};
 use crate::key_material::{self, KeyMaterialError};
-use crate::middleware::{MiddlewareChain, MiddlewareRuntime};
+use crate::middleware::{MiddlewareChain, MiddlewarePlan, MiddlewarePlanError, MiddlewareRuntime};
 use crate::policy::PolicyRuntime;
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
@@ -117,9 +117,9 @@ pub struct Inner {
     /// path never reaches the source or the store, and holding this handle is
     /// what makes that structural rather than a rule (ADR 0043).
     pub catalogue: Option<Arc<CatalogStatus>>,
-    /// The content middleware chain for this process. It is empty in the
-    /// shipped posture until typed policy delivery registers middleware; an
-    /// empty chain is byte-neutral and keeps the request path unchanged.
+    /// Constructor-only override for primitive tests. Shipped chains live only
+    /// in [`ConfigSnapshot`].
+    #[cfg(test)]
     pub middleware: MiddlewareChain,
     /// Global and per-id blocking capacity for content middleware. This
     /// is process-owned in production and isolated per constructed test state.
@@ -281,6 +281,9 @@ impl ReplicaObservability {
 pub struct ConfigSnapshot {
     pub config: Config,
     pub credentials: Credentials,
+    /// Namespace-scoped content middleware compiled from the same desired-state
+    /// generation as the rest of this serving snapshot.
+    middleware: MiddlewarePlan,
     /// Per-target circuit breaker, keyed by the target's qualified model
     /// (`provider/model`). In-memory and per-replica, consistent with running
     /// stateless by default (ADR 0002); distinct from the per-credential health
@@ -384,6 +387,7 @@ pub(crate) struct CachedProjectIdentity {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CachedPolicy {
     pub(crate) tenant: String,
     pub(crate) project: Option<String>,
@@ -394,6 +398,15 @@ pub(crate) struct CachedPolicy {
     pub(crate) max_in_flight_per_subject: u64,
     pub(crate) lease_ttl_seconds: u64,
     pub(crate) minimum_token_epoch: u64,
+    pub(crate) content_middleware: Vec<CachedContentMiddleware>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedContentMiddleware {
+    pub(crate) id: String,
+    pub(crate) scopes: Vec<gateway_core::MiddlewareScope>,
+    pub(crate) failure_posture: gateway_core::MiddlewareFailurePosture,
+    pub(crate) max_duration_milliseconds: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -510,7 +523,7 @@ impl ConfigSnapshot {
                         tenant: identity.tenant.to_string(),
                         project: identity.project.to_string(),
                     }),
-                    policy: namespace.policy.map(|policy| CachedPolicy {
+                    policy: namespace.policy.as_ref().map(|policy| CachedPolicy {
                         tenant: policy.body.scope().tenant().to_string(),
                         project: policy.body.scope().project().map(|id| id.to_string()),
                         epoch: policy.body.epoch().get(),
@@ -529,6 +542,17 @@ impl ConfigSnapshot {
                             .max_in_flight_per_subject(),
                         lease_ttl_seconds: policy.body.concurrency().lease_ttl_seconds(),
                         minimum_token_epoch: policy.body.revocation().minimum_token_epoch(),
+                        content_middleware: policy
+                            .body
+                            .content_middleware()
+                            .iter()
+                            .map(|registration| CachedContentMiddleware {
+                                id: registration.id().to_owned(),
+                                scopes: registration.scopes().to_vec(),
+                                failure_posture: registration.failure_posture(),
+                                max_duration_milliseconds: registration.max_duration_milliseconds(),
+                            })
+                            .collect(),
                     }),
                 })
                 .collect(),
@@ -748,6 +772,19 @@ fn cached_namespace(namespace: CachedNamespace, revision: RevisionId) -> Result<
                 Some(project) => PolicyScope::Project { tenant, project },
                 None => PolicyScope::Tenant(tenant),
             };
+            let content_middleware = policy
+                .content_middleware
+                .into_iter()
+                .map(|registration| {
+                    crate::desired_state::ContentMiddlewareRegistration::new(
+                        registration.id,
+                        registration.scopes,
+                        registration.failure_posture,
+                        registration.max_duration_milliseconds,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let body = PolicyBody::new(
                 scope,
                 PolicyEpoch::new(policy.epoch).map_err(|error| error.to_string())?,
@@ -760,11 +797,11 @@ fn cached_namespace(namespace: CachedNamespace, revision: RevisionId) -> Result<
                 ConcurrencyPolicy::new(policy.max_in_flight_per_subject, policy.lease_ttl_seconds)
                     .map_err(|error| error.to_string())?,
                 RevocationPolicy::new(policy.minimum_token_epoch),
-            );
-            Ok(NamespacePolicy {
-                body,
-                generation: body.generation(revision),
-            })
+            )
+            .with_content_middleware(content_middleware)
+            .map_err(|error| error.to_string())?;
+            let generation = body.generation(revision);
+            Ok(NamespacePolicy { body, generation })
         })
         .transpose()?;
     Ok(Namespace {
@@ -919,6 +956,8 @@ fn pricing_snapshot(cached: CachedPricing) -> Result<PricingSnapshot, String> {
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
     #[error(transparent)]
+    Middleware(#[from] MiddlewarePlanError),
+    #[error(transparent)]
     Credentials(#[from] CredentialError),
     #[error(
         "gateway_key for namespace `{namespace}` references env var `{env}`, which is unset or empty"
@@ -1053,6 +1092,7 @@ impl ConfigSnapshot {
         allow_keyless_bootstrap: bool,
     ) -> Result<Self, SnapshotError> {
         let gateway_token_epochs = configured_token_epochs(&config);
+        let middleware = MiddlewarePlan::compile(&config)?;
         // The one place both kinds of provider credential become one pool: env
         // references from the boot environment, projected ones from the material
         // this candidate resolved. Neither reaches a store from here.
@@ -1267,6 +1307,7 @@ impl ConfigSnapshot {
         Ok(Self {
             config,
             credentials,
+            middleware,
             target_circuits,
             principals,
             generation,
@@ -1292,6 +1333,12 @@ impl ConfigSnapshot {
     /// of the type rather than a convention.
     pub const fn secrets(&self) -> &ResolvedSecrets {
         &self.secrets
+    }
+
+    /// Content middleware selected by the policy governing `namespace` in this
+    /// exact serving generation.
+    pub(crate) fn middleware(&self, namespace: &str) -> &MiddlewareChain {
+        self.middleware.for_namespace(namespace)
     }
 
     /// The derived availability index this snapshot carries, if it derives one.
@@ -1555,6 +1602,7 @@ impl AppState {
             status: observability.status,
             revision: observability.revision,
             catalogue: observability.catalogue,
+            #[cfg(test)]
             middleware: MiddlewareChain::empty(),
             middleware_runtime: MiddlewareRuntime::default(),
             config: ArcSwap::from_pointee(snapshot),
@@ -1655,7 +1703,12 @@ pub fn adapter_for(kind: ProviderKind) -> Box<dyn ProviderAdapter> {
 mod tests {
     use super::*;
     use crate::availability::{AvailabilityKey, AvailabilityRecord, ScopeRef, TargetRef};
+    use crate::budget::NoBudget;
+    use crate::desired_state::ContentMiddlewareRegistration;
+    use crate::desired_state::fixtures::{policy_body, revision_id, tenant_id};
+    use crate::desired_state::policy::PolicyScope;
     use crate::desired_state::{TenantId, Uuid7};
+    use crate::usage::UsageSink;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -1699,6 +1752,103 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 env = "AXOND_KEY"
 namespace = "platform"
 "#;
+
+    fn middleware_policy(epoch: u64, id: &str) -> NamespacePolicy {
+        let body = policy_body(PolicyScope::Tenant(tenant_id(1)), epoch)
+            .with_content_middleware(vec![
+                ContentMiddlewareRegistration::new(
+                    id,
+                    [gateway_core::MiddlewareScope::Request],
+                    gateway_core::MiddlewareFailurePosture::FailClosed,
+                    25,
+                )
+                .expect("valid registration"),
+            ])
+            .expect("registration attaches");
+        let generation = body.generation(revision_id(epoch));
+        NamespacePolicy { body, generation }
+    }
+
+    #[tokio::test]
+    async fn middleware_policy_hot_reload_rollback_and_rejection_are_snapshot_atomic() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+        let state = AppState::new(
+            config_with(PLATFORM_KEY),
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("base state starts");
+
+        let mut added = config_with(PLATFORM_KEY);
+        added.namespace[0].policy = Some(middleware_policy(1, "test.policy-marker"));
+        state.publish(ConfigSnapshot::build(added, &env, 1).expect("addition compiles"));
+        let held_added = state.config();
+        let mut request = gateway_core::ProviderRequest {
+            model: "alias".to_owned(),
+            body: serde_json::json!({}),
+        };
+        held_added
+            .middleware("platform")
+            .request(&state.0.middleware_runtime, &mut request)
+            .await
+            .expect("added chain runs");
+        assert_eq!(request.body["policy_middleware"], "test.policy-marker");
+
+        let removed = config_with(PLATFORM_KEY);
+        state.publish(ConfigSnapshot::build(removed, &env, 2).expect("removal compiles"));
+        assert!(state.config().middleware("platform").is_empty());
+        assert_eq!(held_added.middleware("platform").len(), 1);
+
+        let mut invalid = config_with(PLATFORM_KEY);
+        invalid.namespace[0].policy = Some(middleware_policy(3, "test.not-compiled"));
+        assert!(matches!(
+            ConfigSnapshot::build(invalid, &env, 3),
+            Err(SnapshotError::Middleware(_))
+        ));
+        assert_eq!(state.config().generation, 2);
+        assert!(state.config().middleware("platform").is_empty());
+
+        let mut rollback = config_with(PLATFORM_KEY);
+        rollback.namespace[0].policy = Some(middleware_policy(4, "test.policy-marker"));
+        state.publish(ConfigSnapshot::build(rollback, &env, 4).expect("rollback compiles"));
+        assert_eq!(state.config().middleware("platform").len(), 1);
+    }
+
+    #[test]
+    fn cached_snapshot_restores_registered_middleware_and_refuses_missing_code() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let mut config = config_with(PLATFORM_KEY);
+        config.namespace[0].policy = Some(middleware_policy(1, "test.policy-marker"));
+        let snapshot = ConfigSnapshot::build(config, &env, 7).expect("snapshot compiles");
+        let revision = revision_id(7);
+
+        let cached = snapshot.cached_serving(revision);
+        let (restored_revision, restored) =
+            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
+                .expect("registered middleware restores");
+        assert_eq!(restored_revision, revision);
+        assert_eq!(restored.middleware("platform").len(), 1);
+
+        let mut unavailable = snapshot.cached_serving(revision);
+        unavailable.namespaces[0]
+            .policy
+            .as_mut()
+            .unwrap()
+            .content_middleware[0]
+            .id = "test.not-compiled".to_owned();
+        let error =
+            match ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, unavailable)
+            {
+                Ok(_) => panic!("cache cannot silently drop unavailable middleware"),
+                Err(error) => error,
+            };
+        assert!(
+            error.contains("not compiled into this axond build"),
+            "{error}"
+        );
+    }
 
     /// The production observation plan, not only the status route's projection,
     /// must mark an enabled importer as configured. Otherwise the component

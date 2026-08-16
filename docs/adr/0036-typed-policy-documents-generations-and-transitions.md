@@ -48,7 +48,7 @@ A tenant's or project's policy is the typed, versioned record
 schema, tenant_id, project_id?, epoch,
 budget_limit_microdollars, namespace_budget_limit_microdollars?,
 reservation_ttl_seconds, max_in_flight_per_subject, lease_ttl_seconds,
-minimum_token_epoch
+minimum_token_epoch, content_middleware?
 ```
 
 - **A document is complete, and nothing is merged.** Reading policy takes one
@@ -84,8 +84,9 @@ minimum_token_epoch
   generation — so a later slice takes the new fence from the new snapshot instead of
   walking the old one forward.
 - **A change is classified by what activating it would require.** `live` (looser
-  limits, longer TTLs, a higher token floor, or a republication that changes
-  nothing), `drain` (tighter caps, shorter TTLs — safe once what was admitted
+  limits, longer TTLs, a higher token floor, an ordered content-middleware
+  registration change, or a republication that changes nothing), `drain`
+  (tighter caps, shorter TTLs — safe once what was admitted
   under the old document has finished), `migration-required` (turning a scope-wide
   cap on or off, which changes the keys a shared ledger composes), and `refused`
   (a document for another scope, changed content that does not advance the epoch,

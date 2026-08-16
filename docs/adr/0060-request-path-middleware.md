@@ -147,6 +147,14 @@ generations and epochs of ADR 0050 — which is what gives a guardrail policy
 namespace scoping, versioning, rollback, and hot reload without a single new
 delivery mechanism.
 
+| Registration path | Stages |
+| --- | --- |
+| Compiled in source | admission, authentication, convergence, request bounds, pricing, rate limit, budget/accounting, provider failover, settlement |
+| Declarative policy | compiled in-process content middleware selected by `content_middleware` only |
+
+Policy can select and order only the second row. Core-stage identifiers and
+fields such as `core_stages` are rejected while the document is validated.
+
 **Response mutation is refused until its invocation and framing contract are
 implemented.** The first runtime slice rejects every `Response` and
 `StreamEvent` registration. The follow-up may activate response mutation where

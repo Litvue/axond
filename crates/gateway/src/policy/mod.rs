@@ -412,7 +412,7 @@ mod tests {
         let runtime = PolicyRuntime::bootstrap(&governed(
             "acme/core",
             NamespacePolicy {
-                body: old,
+                body: old.clone(),
                 generation: held,
             },
         ));

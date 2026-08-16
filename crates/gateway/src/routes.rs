@@ -1481,16 +1481,24 @@ async fn serve(
         model: alias.clone(),
         body,
     };
-    let middleware_state = state
-        .0
-        .middleware
+    #[cfg(not(test))]
+    let middleware = snapshot.middleware(&caller.namespace);
+    // Primitive tests can install a process-local override. Production has no
+    // such field: its chain is always owned by the captured serving snapshot.
+    #[cfg(test)]
+    let middleware = if state.0.middleware.is_empty() {
+        snapshot.middleware(&caller.namespace)
+    } else {
+        &state.0.middleware
+    };
+    let middleware_state = middleware
         .request(&state.0.middleware_runtime, &mut middleware_request)
         .await?;
     let body = middleware_request.body;
     // An empty chain is byte-neutral, so the pre-admission estimate is already
     // authoritative. Avoid serializing every request body a second time in the
     // default posture; only a configured chain can make the estimate differ.
-    let estimate = if state.0.middleware.is_empty() {
+    let estimate = if middleware.is_empty() {
         estimate
     } else {
         let (recomputed, body_bytes) = route.measure(&body);

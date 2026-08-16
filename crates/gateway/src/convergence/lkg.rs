@@ -505,7 +505,10 @@ impl LastKnownGood {
 }
 
 const COMPILED_MAGIC: &[u8] = b"axond.compiled-serving\0";
-const COMPILED_RECORD_VERSION: u8 = 1;
+// Version 2 adds the policy middleware projection. Keep this byte in lockstep
+// with every payload shape change: an older build must reject a newer cache
+// before serde can ignore a guardrail field it does not understand.
+const COMPILED_RECORD_VERSION: u8 = 2;
 
 fn compiled_key(key: &[u8]) -> [u8; 32] {
     let mut context = ring::digest::Context::new(&SHA256);
@@ -1000,6 +1003,26 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         assert!(matches!(
             cache.load_compiled(),
             Err(LastKnownGoodError::CompiledSignature { .. })
+        ));
+        let _ = fs::remove_file(cache.compiled_path());
+    }
+
+    #[test]
+    fn compiled_serving_cache_rejects_an_older_layout_before_deserializing_it() {
+        let (snapshot, _, _) = serving_snapshot();
+        let cache = cache("compiled-serving-old-layout");
+        let mut bytes = cache
+            .encode_compiled(&snapshot, fixtures::revision_id(9))
+            .expect("compiled cache encodes");
+        bytes[COMPILED_MAGIC.len()] = COMPILED_RECORD_VERSION - 1;
+        cache
+            .write_compiled(&bytes)
+            .expect("old-layout fixture writes");
+
+        assert!(matches!(
+            cache.load_compiled(),
+            Err(LastKnownGoodError::CompiledMalformed { detail, .. })
+                if detail == "unsupported layout version 1"
         ));
         let _ = fs::remove_file(cache.compiled_path());
     }

@@ -31,6 +31,7 @@
 
 use std::sync::Arc;
 
+use gateway_core::{MiddlewareFailurePosture, MiddlewareScope};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -39,15 +40,16 @@ use super::service::DesiredStateEdit;
 use crate::backends::catalog::{CatalogContentId, ProviderId};
 use crate::desired_state::{
     Actor, AliasTarget, Approval, ApprovedRate, ApprovedRates, BlobKind, BlobRef, BudgetBound,
-    BudgetPolicy, CatalogOffering, Checksum, ConcurrencyPolicy, Credential, DesiredState,
-    DisplayName, EffectiveInstant, EffectiveInterval, IdentityBody, IdentityKind,
-    InvalidDisplayName, InvalidId, InvalidSlug, InvalidUuid7, ModelAliasBody, ModelEnablementBody,
-    ModelLifecycle, ModelOwner, ObservedPrice, OfferingId, PolicyBody, PolicyEpoch, PolicyScope,
-    PriceBookBody, PriceOrigin, PriceProvenance, PriceRule, PricedTarget, PrincipalId, ProjectBody,
-    ProjectId, ProviderBody, ProviderCredentialBody, ResourceBody, ResourceId, ResourceKind,
-    ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, RevocationPolicy, Role,
-    RulePrecedence, SecretId, SecretLifecycle, SecretOwner, SecretRef, SecretVersion, Slug,
-    Surface, TenantBody, TenantId, TenantLifecycle, ValidationError, WireFamily,
+    BudgetPolicy, CatalogOffering, Checksum, ConcurrencyPolicy, ContentMiddlewareRegistration,
+    Credential, DesiredState, DisplayName, EffectiveInstant, EffectiveInterval, IdentityBody,
+    IdentityKind, InvalidDisplayName, InvalidId, InvalidSlug, InvalidUuid7, ModelAliasBody,
+    ModelEnablementBody, ModelLifecycle, ModelOwner, ObservedPrice, OfferingId, PolicyBody,
+    PolicyEpoch, PolicyScope, PriceBookBody, PriceOrigin, PriceProvenance, PriceRule, PricedTarget,
+    PrincipalId, ProjectBody, ProjectId, ProviderBody, ProviderCredentialBody, ResourceBody,
+    ResourceId, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
+    RevocationPolicy, Role, RulePrecedence, SecretId, SecretLifecycle, SecretOwner, SecretRef,
+    SecretVersion, Slug, Surface, TenantBody, TenantId, TenantLifecycle, ValidationError,
+    WireFamily,
 };
 
 /// What a handler contributes to a mutation: where it applies, and what it does.
@@ -1008,6 +1010,19 @@ pub struct PolicyRequest {
     pub lease_ttl_seconds: u64,
     #[serde(default)]
     pub minimum_token_epoch: u64,
+    /// Ordered content middleware. Core authentication, admission, accounting,
+    /// and routing stages are intentionally not expressible here.
+    #[serde(default)]
+    pub content_middleware: Vec<ContentMiddlewareRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentMiddlewareRequest {
+    pub id: String,
+    pub scopes: Vec<MiddlewareScope>,
+    pub failure_posture: MiddlewareFailurePosture,
+    pub max_duration_milliseconds: u64,
 }
 
 impl AdminResourceRequest for PolicyRequest {
@@ -1057,7 +1072,22 @@ impl AdminResourceRequest for PolicyRequest {
             Some(project) => PolicyScope::Project { tenant, project },
             None => PolicyScope::Tenant(tenant),
         };
-        let body = PolicyBody::new(scope, epoch, budget, concurrency, revocation);
+        let content_middleware = self
+            .content_middleware
+            .into_iter()
+            .map(|registration| {
+                ContentMiddlewareRegistration::new(
+                    registration.id,
+                    registration.scopes,
+                    registration.failure_posture,
+                    registration.max_duration_milliseconds,
+                )
+                .map_err(|error| malformed::<Self>("content_middleware", &error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let body = PolicyBody::new(scope, epoch, budget, concurrency, revocation)
+            .with_content_middleware(content_middleware)
+            .map_err(|error| malformed::<Self>("content_middleware", &error.to_string()))?;
         Ok(ResourcePlan::new(
             scope.resource_scope(),
             move |state: &mut DesiredState| {

@@ -338,9 +338,9 @@ fn carry_policy_forward(candidate: &mut Config, current: &Config) {
         if let Some(published) = governed
             .iter()
             .find(|governed| governed.id == namespace.id)
-            .and_then(|governed| governed.policy)
+            .and_then(|governed| governed.policy.as_ref())
         {
-            namespace.policy = Some(published);
+            namespace.policy = Some(published.clone());
         }
     }
     for governed in governed {
@@ -1946,12 +1946,12 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
             RevocationPolicy::new(1_700_000_000),
         );
         let policy = NamespacePolicy {
-            body,
+            body: body.clone(),
             generation: body.generation(revision_id(1)),
         };
         let mut config = Config::load(file.path()).expect("valid boot config");
         for namespace in &mut config.namespace {
-            namespace.policy = Some(policy);
+            namespace.policy = Some(policy.clone());
         }
         let converged =
             ConfigSnapshot::build(config, &inbound_env(), 7).expect("the boot config compiles");
@@ -2005,7 +2005,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
             RevocationPolicy::new(1_700_000_000),
         );
         let policy = NamespacePolicy {
-            body,
+            body: body.clone(),
             generation: body.generation(revision_id(1)),
         };
         // The shape a converged stateful replica actually serves: the file
@@ -2014,7 +2014,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         let mut projected = config.namespace[0].clone();
         projected.id = "acme-web".to_string();
         projected.default = false;
-        projected.policy = Some(policy);
+        projected.policy = Some(policy.clone());
         config.namespace.push(projected);
         let converged =
             ConfigSnapshot::build(config, &inbound_env(), 7).expect("the boot config compiles");

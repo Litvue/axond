@@ -1839,7 +1839,7 @@ min_iat = 50
             500,
         );
         config.namespace[0].policy = Some(NamespacePolicy {
-            body,
+            body: body.clone(),
             generation: generation(&body, 1),
         });
 
