@@ -169,17 +169,24 @@ preempt synchronous code safely, the timed-out task may continue until it
 returns. A process-wide semaphore remains owned by that task and bounds such
 work to 64 blocking invocations. Healthy callers that encounter the bound wait
 for a permit within their remaining declared deadline; only expiry applies the
-middleware's failure posture. This prevents ordinary concurrency above 64 from
-becoming an immediate refusal while still preventing abandoned work from
-consuming unbounded blocking threads. A refusal inherits the existing refusal
-discipline: a typed error, a stable caller-facing reason that never echoes the
-body, and no usage event when nothing reached a provider.
+middleware's failure posture. If an invocation actually outlives its deadline,
+the process quarantines its blocking-middleware runtime: later invocations apply
+their posture immediately and no more blocking middleware work is scheduled
+until the replica restarts. Rust cannot prove or force termination of the
+abandoned closure, so pretending the slot recovered would trade a bounded outage
+for unbounded stuck threads. This keeps ordinary concurrency above 64 from
+becoming an immediate refusal while preventing one pathological implementation
+from repeatedly consuming the full wait bound. A refusal inherits the existing
+refusal discipline: a typed error, a stable caller-facing reason that never
+echoes the body, and no usage event when nothing reached a provider.
 
 Operators distinguish a slow implementation from provider latency through
 `axond.middleware.capacity_wait` and
 `axond.middleware.capacity_timeouts`. A sustained timeout increase means late
-synchronous invocations are retaining the bounded slots and pushing later
-callers to their own middleware deadlines; it is not an upstream slowdown.
+synchronous invocations are retaining the bounded slots. A warning whose detail
+names a quarantined runtime means later calls are applying their posture without
+waiting; replace or repair the implementation and restart the replica. It is not
+an upstream slowdown.
 
 **Three things are excluded from v1, on purpose.** A middleware may not call a
 model or spend money: a classifier call would be a second chargeable event inside

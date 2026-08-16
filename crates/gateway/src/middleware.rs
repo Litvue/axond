@@ -6,7 +6,10 @@
 //! refusal envelope.  The chain is deliberately not attached to `AppState` yet;
 //! an empty chain is the production default until typed policy delivery lands.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -29,6 +32,14 @@ const MAX_BLOCKING_MIDDLEWARE_INVOCATIONS: usize = 64;
 fn blocking_middleware_slots() -> &'static Arc<Semaphore> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_BLOCKING_MIDDLEWARE_INVOCATIONS)))
+}
+
+/// A synchronous closure cannot be cancelled safely after `spawn_blocking`
+/// starts it. Once one invocation outlives its bound, quarantine this runtime
+/// instead of letting later requests wait behind (or add to) abandoned work.
+fn blocking_middleware_quarantined() -> &'static Arc<AtomicBool> {
+    static QUARANTINED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    QUARANTINED.get_or_init(|| Arc::new(AtomicBool::new(false)))
 }
 
 /// A registered, ordered set of content middleware.
@@ -122,8 +133,12 @@ impl MiddlewareChain {
         &self,
         request: &mut ProviderRequest,
     ) -> Result<MiddlewareStateBag, GatewayError> {
-        self.request_with_slots(request, Arc::clone(blocking_middleware_slots()))
-            .await
+        self.request_with_runtime(
+            request,
+            Arc::clone(blocking_middleware_slots()),
+            Arc::clone(blocking_middleware_quarantined()),
+        )
+        .await
     }
 
     async fn request_with_slots(
@@ -131,9 +146,26 @@ impl MiddlewareChain {
         request: &mut ProviderRequest,
         slots: Arc<Semaphore>,
     ) -> Result<MiddlewareStateBag, GatewayError> {
+        self.request_with_runtime(request, slots, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    async fn request_with_runtime(
+        &self,
+        request: &mut ProviderRequest,
+        slots: Arc<Semaphore>,
+        quarantined: Arc<AtomicBool>,
+    ) -> Result<MiddlewareStateBag, GatewayError> {
         let mut states = MiddlewareStateBag::new(self.len());
         for (index, entry) in self.entries.iter().enumerate() {
             if !entry.declaration().has_scope(MiddlewareScope::Request) {
+                continue;
+            }
+            if quarantined.load(Ordering::Acquire) {
+                self.failure(
+                    index,
+                    "blocking runtime quarantined after an abandoned invocation",
+                )?;
                 continue;
             }
             let bound = entry.declaration().max_duration;
@@ -186,6 +218,7 @@ impl MiddlewareChain {
                     continue;
                 }
                 Err(_) => {
+                    quarantined.store(true, Ordering::Release);
                     self.failure(index, "invocation bound exceeded")?;
                     continue;
                 }
@@ -531,7 +564,9 @@ mod tests {
         };
         let original = request.clone();
         assert!(matches!(
-            chain.request(&mut request).await,
+            chain
+                .request_with_slots(&mut request, Arc::new(Semaphore::new(1)))
+                .await,
             Err(GatewayError::MiddlewareUnavailable)
         ));
         assert_eq!(request, original);
@@ -588,6 +623,54 @@ mod tests {
             chain.request_with_slots(&mut request, slots).await,
             Err(GatewayError::MiddlewareUnavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_invocation_quarantines_later_blocking_work() {
+        struct Slow {
+            declaration: MiddlewareDeclaration,
+        }
+        impl Middleware for Slow {
+            fn declaration(&self) -> &MiddlewareDeclaration {
+                &self.declaration
+            }
+            fn apply(
+                &self,
+                _phase: MiddlewarePhase<'_>,
+                _state: Option<&mut gateway_core::MiddlewareState>,
+            ) -> gateway_core::MiddlewareResult {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(MiddlewareOutcome::continue_without_state())
+            }
+        }
+
+        let mut declaration = MiddlewareDeclaration::new("stuck", [MiddlewareScope::Request]);
+        declaration.max_duration = Duration::from_millis(1);
+        let chain =
+            MiddlewareChain::new(vec![Arc::new(Slow { declaration })]).expect("bounded chain");
+        let slots = Arc::new(Semaphore::new(1));
+        let quarantined = Arc::new(AtomicBool::new(false));
+        let mut first = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+
+        assert!(matches!(
+            chain
+                .request_with_runtime(&mut first, Arc::clone(&slots), Arc::clone(&quarantined),)
+                .await,
+            Err(GatewayError::MiddlewareUnavailable)
+        ));
+        assert!(quarantined.load(Ordering::Acquire));
+
+        let mut second = first.clone();
+        let refusal = tokio::time::timeout(
+            Duration::from_millis(20),
+            chain.request_with_runtime(&mut second, slots, quarantined),
+        )
+        .await
+        .expect("quarantined work must refuse without waiting for the occupied slot");
+        assert!(matches!(refusal, Err(GatewayError::MiddlewareUnavailable)));
     }
 
     #[tokio::test]
