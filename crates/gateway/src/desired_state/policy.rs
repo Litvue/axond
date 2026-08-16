@@ -108,8 +108,10 @@
 //! ([`PolicyError::is_incompatible`]), follow the rules the
 //! [tenancy module](super::tenancy) states for every body schema.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+use gateway_core::{MiddlewareFailurePosture, MiddlewareScope};
 
 use super::canonical::{Canonical, CanonicalValue, Checksum};
 use super::ids::{InvalidId, ProjectId, ResourceId, RevisionId, Slug, TenantId};
@@ -131,6 +133,33 @@ const RESERVATION_TTL_FIELD: &str = "reservation_ttl_seconds";
 const MAX_IN_FLIGHT_FIELD: &str = "max_in_flight_per_subject";
 const LEASE_TTL_FIELD: &str = "lease_ttl_seconds";
 const MINIMUM_TOKEN_EPOCH_FIELD: &str = "minimum_token_epoch";
+const CONTENT_MIDDLEWARE_FIELD: &str = "content_middleware";
+const MIDDLEWARE_ID_FIELD: &str = "id";
+const MIDDLEWARE_SCOPES_FIELD: &str = "scopes";
+const MIDDLEWARE_FAILURE_POSTURE_FIELD: &str = "failure_posture";
+const MIDDLEWARE_MAX_DURATION_FIELD: &str = "max_duration_milliseconds";
+
+const CONTENT_MIDDLEWARE_FIELDS: &[&str] = &[
+    MIDDLEWARE_ID_FIELD,
+    MIDDLEWARE_SCOPES_FIELD,
+    MIDDLEWARE_FAILURE_POSTURE_FIELD,
+    MIDDLEWARE_MAX_DURATION_FIELD,
+];
+const MAX_CONTENT_MIDDLEWARE: usize = 32;
+const MAX_MIDDLEWARE_DURATION_MILLISECONDS: u64 = 1_000;
+const CORE_STAGE_IDS: &[&str] = &[
+    "accounting",
+    "admission",
+    "authentication",
+    "budget",
+    "convergence",
+    "diagnostic-ceiling",
+    "pricing",
+    "provider-failover",
+    "rate-limit",
+    "request-bounds",
+    "settlement",
+];
 
 /// The settings a published document may never name, because the bootstrap file
 /// owns them: which backend enforces policy, how it is reached, how it lays state
@@ -226,6 +255,13 @@ pub enum PolicyError {
         #[source]
         source: InvalidPolicy,
     },
+    #[error("{reference} content middleware registration `{field}` is invalid: {source}")]
+    InvalidMiddleware {
+        reference: ResourceRef,
+        field: String,
+        #[source]
+        source: InvalidContentMiddleware,
+    },
     #[error("{reference} carries {declared}, but its resource identity is {identity}")]
     IdentityMismatch {
         reference: ResourceRef,
@@ -271,7 +307,9 @@ impl PolicyError {
             // policy had one at all is another release's writing, while a marker
             // that is present and unreadable is `DamagedSchema`.
             Self::MissingField { field, .. } => *field == SCHEMA_FIELD,
-            Self::FieldType { .. } | Self::DamagedSchema { .. } => false,
+            Self::FieldType { .. }
+            | Self::DamagedSchema { .. }
+            | Self::InvalidMiddleware { .. } => false,
             Self::FieldRange { .. } => true,
             Self::Kind { .. }
             | Self::NotInline { .. }
@@ -297,6 +335,7 @@ impl PolicyError {
             | Self::FieldType { reference, .. }
             | Self::MalformedId { reference, .. }
             | Self::FieldRange { reference, .. }
+            | Self::InvalidMiddleware { reference, .. }
             | Self::IdentityMismatch { reference, .. }
             | Self::ScopeMismatch { reference, .. } => *reference,
         }
@@ -311,6 +350,152 @@ impl PolicyError {
 pub enum InvalidPolicy {
     #[error("{value} is below the minimum of {min}")]
     TooSmall { value: u64, min: u64 },
+}
+
+/// Why a content-middleware registration is not a bounded, typed declaration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidContentMiddleware {
+    #[error("id must be 1-64 lowercase ASCII letters, digits, `.`, `_`, or `-`")]
+    Id,
+    #[error("at least one scope is required")]
+    NoScope,
+    #[error("scope `{0}` is declared more than once")]
+    DuplicateScope(&'static str),
+    #[error("scope `{0}` is not supported")]
+    Scope(String),
+    #[error("failure posture `{0}` is not supported")]
+    FailurePosture(String),
+    #[error("max_duration_milliseconds must be at least 1")]
+    ZeroBound,
+    #[error("max_duration_milliseconds must not exceed {MAX_MIDDLEWARE_DURATION_MILLISECONDS}")]
+    BoundTooLarge,
+    #[error("`{0}` is a compiled core stage and cannot be registered by policy")]
+    CoreStage(String),
+    #[error("a policy may register at most {MAX_CONTENT_MIDDLEWARE} content middleware")]
+    TooMany,
+    #[error("middleware id `{0}` is registered more than once")]
+    DuplicateId(String),
+}
+
+/// One ordered content-middleware registration in a typed policy document.
+///
+/// The identifier selects a compiled in-process implementation. The document
+/// may select only the content scopes and failure/bound posture exposed here;
+/// core authentication, admission, accounting, and failover stages have no
+/// representation in this type and therefore cannot be reordered or removed by
+/// desired state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentMiddlewareRegistration {
+    id: String,
+    scopes: Vec<MiddlewareScope>,
+    failure_posture: MiddlewareFailurePosture,
+    max_duration_milliseconds: u64,
+}
+
+impl ContentMiddlewareRegistration {
+    pub fn new(
+        id: impl Into<String>,
+        scopes: impl IntoIterator<Item = MiddlewareScope>,
+        failure_posture: MiddlewareFailurePosture,
+        max_duration_milliseconds: u64,
+    ) -> Result<Self, InvalidContentMiddleware> {
+        let id = id.into();
+        if id.is_empty()
+            || id.len() > 64
+            || !id.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+            })
+        {
+            return Err(InvalidContentMiddleware::Id);
+        }
+        if CORE_STAGE_IDS.contains(&id.as_str()) {
+            return Err(InvalidContentMiddleware::CoreStage(id));
+        }
+        let mut scopes = scopes.into_iter().collect::<Vec<_>>();
+        if scopes.is_empty() {
+            return Err(InvalidContentMiddleware::NoScope);
+        }
+        scopes.sort_unstable_by_key(|scope| middleware_scope_rank(*scope));
+        for pair in scopes.windows(2) {
+            if pair[0] == pair[1] {
+                return Err(InvalidContentMiddleware::DuplicateScope(
+                    middleware_scope_name(pair[0]),
+                ));
+            }
+        }
+        if max_duration_milliseconds == 0 {
+            return Err(InvalidContentMiddleware::ZeroBound);
+        }
+        if max_duration_milliseconds > MAX_MIDDLEWARE_DURATION_MILLISECONDS {
+            return Err(InvalidContentMiddleware::BoundTooLarge);
+        }
+        Ok(Self {
+            id,
+            scopes,
+            failure_posture,
+            max_duration_milliseconds,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn scopes(&self) -> &[MiddlewareScope] {
+        &self.scopes
+    }
+
+    pub const fn failure_posture(&self) -> MiddlewareFailurePosture {
+        self.failure_posture
+    }
+
+    pub const fn max_duration_milliseconds(&self) -> u64 {
+        self.max_duration_milliseconds
+    }
+}
+
+fn middleware_scope_rank(scope: MiddlewareScope) -> u8 {
+    match scope {
+        MiddlewareScope::Request => 0,
+        MiddlewareScope::Response => 1,
+        MiddlewareScope::StreamEvent => 2,
+    }
+}
+
+fn middleware_scope_name(scope: MiddlewareScope) -> &'static str {
+    match scope {
+        MiddlewareScope::Request => "request",
+        MiddlewareScope::Response => "response",
+        MiddlewareScope::StreamEvent => "stream_event",
+    }
+}
+
+fn parse_middleware_scope(value: &str) -> Result<MiddlewareScope, InvalidContentMiddleware> {
+    match value {
+        "request" => Ok(MiddlewareScope::Request),
+        "response" => Ok(MiddlewareScope::Response),
+        "stream_event" => Ok(MiddlewareScope::StreamEvent),
+        other => Err(InvalidContentMiddleware::Scope(other.to_owned())),
+    }
+}
+
+fn middleware_failure_posture_name(posture: MiddlewareFailurePosture) -> &'static str {
+    match posture {
+        MiddlewareFailurePosture::FailOpen => "fail_open",
+        MiddlewareFailurePosture::FailClosed => "fail_closed",
+    }
+}
+
+fn parse_middleware_failure_posture(
+    value: &str,
+) -> Result<MiddlewareFailurePosture, InvalidContentMiddleware> {
+    match value {
+        "fail_open" => Ok(MiddlewareFailurePosture::FailOpen),
+        "fail_closed" => Ok(MiddlewareFailurePosture::FailClosed),
+        other => Err(InvalidContentMiddleware::FailurePosture(other.to_owned())),
+    }
 }
 
 /// A policy generation counter an operator advances when a document's content
@@ -681,13 +866,14 @@ impl RevocationPolicy {
 }
 
 /// The complete policy of one tenant or project, as a revision carries it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyBody {
     scope: PolicyScope,
     epoch: PolicyEpoch,
     budget: BudgetPolicy,
     concurrency: ConcurrencyPolicy,
     revocation: RevocationPolicy,
+    content_middleware: Vec<ContentMiddlewareRegistration>,
 }
 
 impl PolicyBody {
@@ -704,9 +890,10 @@ impl PolicyBody {
         MAX_IN_FLIGHT_FIELD,
         LEASE_TTL_FIELD,
         MINIMUM_TOKEN_EPOCH_FIELD,
+        CONTENT_MIDDLEWARE_FIELD,
     ];
 
-    pub const fn new(
+    pub fn new(
         scope: PolicyScope,
         epoch: PolicyEpoch,
         budget: BudgetPolicy,
@@ -719,7 +906,31 @@ impl PolicyBody {
             budget,
             concurrency,
             revocation,
+            content_middleware: Vec::new(),
         }
+    }
+
+    /// Attach the ordered content chain this document selects.
+    ///
+    /// Duplicate ids are refused here rather than left to chain compilation, so
+    /// authored and stored documents have the same identity and ordering rules.
+    pub fn with_content_middleware(
+        mut self,
+        content_middleware: Vec<ContentMiddlewareRegistration>,
+    ) -> Result<Self, InvalidContentMiddleware> {
+        if content_middleware.len() > MAX_CONTENT_MIDDLEWARE {
+            return Err(InvalidContentMiddleware::TooMany);
+        }
+        let mut ids = BTreeSet::new();
+        for registration in &content_middleware {
+            if !ids.insert(registration.id().to_owned()) {
+                return Err(InvalidContentMiddleware::DuplicateId(
+                    registration.id().to_owned(),
+                ));
+            }
+        }
+        self.content_middleware = content_middleware;
+        Ok(self)
     }
 
     pub const fn scope(&self) -> PolicyScope {
@@ -740,6 +951,10 @@ impl PolicyBody {
 
     pub const fn revocation(&self) -> &RevocationPolicy {
         &self.revocation
+    }
+
+    pub fn content_middleware(&self) -> &[ContentMiddlewareRegistration] {
+        &self.content_middleware
     }
 
     /// This document's generation, once the revision that publishes it is known.
@@ -836,12 +1051,20 @@ impl PolicyBody {
                 source,
             )
         })?;
-        Ok(Self {
+        let content_middleware = read_content_middleware(&record)?;
+        Self {
             scope,
             epoch,
             budget,
             concurrency,
             revocation: RevocationPolicy::new(record.integer(MINIMUM_TOKEN_EPOCH_FIELD)?),
+            content_middleware: Vec::new(),
+        }
+        .with_content_middleware(content_middleware)
+        .map_err(|source| PolicyError::InvalidMiddleware {
+            reference: resource.reference,
+            field: CONTENT_MIDDLEWARE_FIELD.to_owned(),
+            source,
         })
     }
 
@@ -919,8 +1142,102 @@ impl Canonical for PolicyBody {
         if let Some(limit) = self.budget.namespace_limit_microdollars {
             fields.push((NAMESPACE_BUDGET_LIMIT_FIELD, CanonicalValue::integer(limit)));
         }
+        if !self.content_middleware.is_empty() {
+            fields.push((
+                CONTENT_MIDDLEWARE_FIELD,
+                CanonicalValue::List(
+                    self.content_middleware
+                        .iter()
+                        .map(|registration| {
+                            CanonicalValue::map([
+                                (
+                                    MIDDLEWARE_ID_FIELD,
+                                    CanonicalValue::string(registration.id()),
+                                ),
+                                (
+                                    MIDDLEWARE_SCOPES_FIELD,
+                                    CanonicalValue::set(registration.scopes().iter().map(
+                                        |scope| {
+                                            CanonicalValue::string(middleware_scope_name(*scope))
+                                        },
+                                    )),
+                                ),
+                                (
+                                    MIDDLEWARE_FAILURE_POSTURE_FIELD,
+                                    CanonicalValue::string(middleware_failure_posture_name(
+                                        registration.failure_posture(),
+                                    )),
+                                ),
+                                (
+                                    MIDDLEWARE_MAX_DURATION_FIELD,
+                                    CanonicalValue::integer(
+                                        registration.max_duration_milliseconds(),
+                                    ),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ));
+        }
         CanonicalValue::map(fields)
     }
+}
+
+fn read_content_middleware(
+    record: &Record<'_, PolicyError>,
+) -> Result<Vec<ContentMiddlewareRegistration>, PolicyError> {
+    let Some(value) = record.optional_value(CONTENT_MIDDLEWARE_FIELD) else {
+        return Ok(Vec::new());
+    };
+    let CanonicalValue::List(values) = value else {
+        return Err(PolicyError::FieldType {
+            reference: record.reference(),
+            field: CONTENT_MIDDLEWARE_FIELD,
+        });
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let entry = record.sub_record(
+                value,
+                CONTENT_MIDDLEWARE_FIELD,
+                POLICY_SCHEMA,
+                CONTENT_MIDDLEWARE_FIELDS,
+            )?;
+            let scopes = entry
+                .string_set(MIDDLEWARE_SCOPES_FIELD)?
+                .into_iter()
+                .map(parse_middleware_scope)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| PolicyError::InvalidMiddleware {
+                    reference: record.reference(),
+                    field: format!("{CONTENT_MIDDLEWARE_FIELD}[{index}].{MIDDLEWARE_SCOPES_FIELD}"),
+                    source,
+                })?;
+            let failure_posture =
+                parse_middleware_failure_posture(entry.string(MIDDLEWARE_FAILURE_POSTURE_FIELD)?)
+                    .map_err(|source| PolicyError::InvalidMiddleware {
+                    reference: record.reference(),
+                    field: format!(
+                        "{CONTENT_MIDDLEWARE_FIELD}[{index}].{MIDDLEWARE_FAILURE_POSTURE_FIELD}"
+                    ),
+                    source,
+                })?;
+            ContentMiddlewareRegistration::new(
+                entry.string(MIDDLEWARE_ID_FIELD)?,
+                scopes,
+                failure_posture,
+                entry.integer(MIDDLEWARE_MAX_DURATION_FIELD)?,
+            )
+            .map_err(|source| PolicyError::InvalidMiddleware {
+                reference: record.reference(),
+                field: format!("{CONTENT_MIDDLEWARE_FIELD}[{index}]"),
+                source,
+            })
+        })
+        .collect()
 }
 
 /// What a policy document states, digested: the scope it governs and every value
@@ -960,6 +1277,20 @@ impl PolicyContent {
             body.revocation.minimum_token_epoch,
         ] {
             bytes.extend_from_slice(&number.to_be_bytes());
+        }
+        bytes.extend_from_slice(&(body.content_middleware.len() as u64).to_be_bytes());
+        for registration in &body.content_middleware {
+            bytes.extend_from_slice(&(registration.id.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(registration.id.as_bytes());
+            bytes.extend_from_slice(&(registration.scopes.len() as u64).to_be_bytes());
+            for scope in &registration.scopes {
+                bytes.push(middleware_scope_rank(*scope));
+            }
+            bytes.push(match registration.failure_posture {
+                MiddlewareFailurePosture::FailOpen => 0,
+                MiddlewareFailurePosture::FailClosed => 1,
+            });
+            bytes.extend_from_slice(&registration.max_duration_milliseconds.to_be_bytes());
         }
         Self(Checksum::of(&bytes))
     }
@@ -1314,6 +1645,9 @@ pub enum TransitionReason {
     TokenFloorRaised,
     /// The token floor fell, which would restore tokens an operator revoked.
     TokenFloorLowered,
+    /// The ordered content chain changed. Existing requests retain the snapshot
+    /// they started under; the new chain binds from the next request.
+    ContentMiddlewareChanged,
 }
 
 impl TransitionReason {
@@ -1336,7 +1670,8 @@ impl TransitionReason {
             | Self::ReservationTtlExtended
             | Self::ConcurrencyRaised
             | Self::LeaseTtlExtended
-            | Self::TokenFloorRaised => TransitionClass::Live,
+            | Self::TokenFloorRaised
+            | Self::ContentMiddlewareChanged => TransitionClass::Live,
         }
     }
 }
@@ -1448,6 +1783,9 @@ impl PolicyTransition {
             TransitionReason::TokenFloorRaised,
             TransitionReason::TokenFloorLowered,
         );
+        if from.content_middleware != to.content_middleware {
+            reasons.push(TransitionReason::ContentMiddlewareChanged);
+        }
         reasons
     }
 
@@ -1579,7 +1917,7 @@ impl PolicySet {
             documents: self
                 .documents
                 .iter()
-                .map(|(scope, document)| (*scope, document.body))
+                .map(|(scope, document)| (*scope, document.body.clone()))
                 .collect(),
         }
     }
@@ -1747,6 +2085,16 @@ mod tests {
         Slug::parse("limits").expect("test slug")
     }
 
+    fn middleware(id: &str) -> ContentMiddlewareRegistration {
+        ContentMiddlewareRegistration::new(
+            id,
+            [MiddlewareScope::Request],
+            MiddlewareFailurePosture::FailClosed,
+            25,
+        )
+        .expect("valid middleware registration")
+    }
+
     fn with_fields(
         resource: &ResourceVersion,
         edit: impl FnOnce(&mut Vec<(String, CanonicalValue)>),
@@ -1765,6 +2113,118 @@ mod tests {
     fn set(fields: &mut Vec<(String, CanonicalValue)>, field: &str, value: CanonicalValue) {
         fields.retain(|(name, _)| name != field);
         fields.push((field.to_owned(), value));
+    }
+
+    #[test]
+    fn content_middleware_round_trips_in_order_and_absence_is_compatible() {
+        let plain = policy_body(tenant_scope(), 1);
+        assert!(
+            PolicyBody::read(&plain.version(slug()))
+                .unwrap()
+                .content_middleware()
+                .is_empty()
+        );
+
+        let body = plain
+            .with_content_middleware(vec![middleware("first"), middleware("second")])
+            .unwrap();
+        let read = PolicyBody::read(&body.version(slug())).expect("typed registration reads");
+        assert_eq!(read, body);
+        assert_eq!(
+            read.content_middleware()
+                .iter()
+                .map(ContentMiddlewareRegistration::id)
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn content_middleware_validation_reserves_core_and_bounds_the_chain() {
+        assert!(matches!(
+            ContentMiddlewareRegistration::new(
+                "authentication",
+                [MiddlewareScope::Request],
+                MiddlewareFailurePosture::FailClosed,
+                25,
+            ),
+            Err(InvalidContentMiddleware::CoreStage(_))
+        ));
+        assert!(matches!(
+            ContentMiddlewareRegistration::new(
+                "content",
+                [MiddlewareScope::Request, MiddlewareScope::Request],
+                MiddlewareFailurePosture::FailClosed,
+                25,
+            ),
+            Err(InvalidContentMiddleware::DuplicateScope("request"))
+        ));
+        assert!(matches!(
+            ContentMiddlewareRegistration::new(
+                "content",
+                [MiddlewareScope::Request],
+                MiddlewareFailurePosture::FailClosed,
+                MAX_MIDDLEWARE_DURATION_MILLISECONDS + 1,
+            ),
+            Err(InvalidContentMiddleware::BoundTooLarge)
+        ));
+        assert!(matches!(
+            policy_body(tenant_scope(), 1).with_content_middleware(
+                (0..=MAX_CONTENT_MIDDLEWARE)
+                    .map(|index| middleware(&format!("content-{index}")))
+                    .collect(),
+            ),
+            Err(InvalidContentMiddleware::TooMany)
+        ));
+    }
+
+    #[test]
+    fn middleware_changes_require_an_epoch_and_are_live_and_rollbackable() {
+        let base = policy_body(tenant_scope(), 4);
+        let same_epoch = base
+            .clone()
+            .with_content_middleware(vec![middleware("first")])
+            .unwrap();
+        assert_eq!(
+            base.transition(&same_epoch).reasons(),
+            &[TransitionReason::EpochNotAdvanced]
+        );
+
+        let added = PolicyBody::new(
+            base.scope(),
+            base.epoch().next(),
+            *base.budget(),
+            *base.concurrency(),
+            *base.revocation(),
+        )
+        .with_content_middleware(vec![middleware("first")])
+        .unwrap();
+        assert_eq!(
+            base.transition(&added).reasons(),
+            &[TransitionReason::ContentMiddlewareChanged]
+        );
+        assert!(base.transition(&added).is_live());
+
+        let removed = PolicyBody::new(
+            added.scope(),
+            added.epoch().next(),
+            *added.budget(),
+            *added.concurrency(),
+            *added.revocation(),
+        );
+        assert!(added.transition(&removed).is_live());
+
+        let rollback = PolicyBody::new(
+            removed.scope(),
+            removed.epoch().next(),
+            *removed.budget(),
+            *removed.concurrency(),
+            *removed.revocation(),
+        )
+        .with_content_middleware(added.content_middleware().to_vec())
+        .unwrap();
+        assert!(removed.transition(&rollback).is_live());
+        assert_eq!(rollback.content(), added.content());
     }
 
     /// A tenant document with one field of the canonical record edited: how a
@@ -2610,7 +3070,7 @@ mod tests {
         };
 
         // Republication with no change to what is enforced.
-        let republished = next(base);
+        let republished = next(base.clone());
         assert_eq!(
             base.transition(&republished),
             PolicyTransition {
@@ -2688,7 +3148,7 @@ mod tests {
             }
         );
         assert_eq!(
-            capped.transition(&next(capped)).class(),
+            capped.transition(&next(capped.clone())).class(),
             TransitionClass::Live,
             "republishing a capped document is not itself a migration"
         );

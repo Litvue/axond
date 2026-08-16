@@ -138,7 +138,7 @@ scope, and slug. Seven schemas exist today:
 | `axond.tenant.v1` | a deployment tenant | `schema`, `tenant_id`, `display_name` |
 | `axond.project.v1` | a tenant-owned project | `schema`, `project_id`, `tenant_id`, `display_name` |
 | `axond.provider-credential.v1` | a tenant's or project's credential for one provider | `schema`, `credential_id`, `tenant_id`, `project_id` (a project's only), `provider_id`, `display_name`, `secret_id`, `secret_version`, `lifecycle` |
-| `axond.policy.v1` | the policy of a tenant or a project | `schema`, `tenant_id`, `project_id` (project documents only), `epoch`, `budget_limit_microdollars`, `namespace_budget_limit_microdollars` (optional), `reservation_ttl_seconds`, `max_in_flight_per_subject`, `lease_ttl_seconds`, `minimum_token_epoch` |
+| `axond.policy.v1` | the policy of a tenant or a project | `schema`, `tenant_id`, `project_id` (project documents only), `epoch`, `budget_limit_microdollars`, `namespace_budget_limit_microdollars` (optional), `reservation_ttl_seconds`, `max_in_flight_per_subject`, `lease_ttl_seconds`, `minimum_token_epoch`, `content_middleware` (optional ordered list) |
 | `axond.model-enablement.v1` | a tenant's or project's permission to use one catalogue offering | `schema`, `enablement_id`, `tenant_id`, `project_id` (a project's only), `offering_id`, `catalog_snapshot`, `wire_family`, `state`, `observed_price` (optional), `approved_price` (optional) |
 | `axond.model-alias.v1` | a project-scoped name for an ordered list of enablements | `schema`, `alias_id`, `tenant_id`, `project_id`, `wire_family`, `state`, `targets` |
 | `axond.price-book.v2` | the deployment's approved price book | `schema`, `catalog_content_id`, `catalog_version`, `currency`, `unit`, `approval`, `rules` |
@@ -294,7 +294,8 @@ revision is stored — so a stored revision that hits one was written out of ban
 
 A policy document is the **complete** policy of one tenant or one project: what it
 may spend, how much it may have in flight, and the token epoch below which a token
-is refused. It is scoped to what it governs and written under that object's
+is refused, plus the ordered content middleware selected for its namespaces. It
+is scoped to what it governs and written under that object's
 identity, so "the policy of project `core`" is one durable resource whose
 successive versions are successive revisions of the same document ([ADR
 0036](../adr/0036-typed-policy-documents-generations-and-transitions.md)).
@@ -327,6 +328,12 @@ successive versions are successive revisions of the same document ([ADR
   under the same epoch, or moving the epoch backwards, is refused rather than
   applied — otherwise two documents would claim one generation and no replica could
   tell a stale writer from a current one.
+- **Content middleware is compiled with the namespace snapshot.** Each entry
+  names an in-process implementation, request/response scope, failure posture,
+  and invocation bound. Unknown implementations or combinations this binary
+  cannot serve reject the candidate whole; the active snapshot remains serving.
+  A project document replaces its tenant document whole, so its chain cannot
+  leak into a sibling namespace.
 - **A change is classified by what activating it would require.** `live` (safe on
   the next request: looser limits, longer TTLs, a higher token floor, or a
   republication that changes nothing), `drain` (safe once what was admitted under

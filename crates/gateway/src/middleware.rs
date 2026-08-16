@@ -3,27 +3,29 @@
 //! `gateway-core` defines the I/O-free contract.  This module owns the parts
 //! that must remain in the gateway: registration validation, fixed chain order,
 //! invocation bounds, failure posture, and mapping to the gateway's stable
-//! refusal envelope.  The chain is deliberately not attached to `AppState` yet;
-//! an empty chain is the production default until typed policy delivery lands.
+//! refusal envelope. Typed policy registration compiles one chain per namespace
+//! into the immutable serving snapshot, so hot reload and rollback use the same
+//! atomic publication path as routing, pricing, and policy limits.
 
-#[cfg(test)]
-use std::time::Duration;
 use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use gateway_core::{
-    Middleware, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed, MiddlewareOutcome,
-    MiddlewarePhase, MiddlewareRefusal, MiddlewareScope, MiddlewareStateBag, MiddlewareVerdict,
-    ProviderRequest,
+    Middleware, MiddlewareDeclaration, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed,
+    MiddlewareOutcome, MiddlewarePhase, MiddlewareRefusal, MiddlewareScope, MiddlewareStateBag,
+    MiddlewareVerdict, ProviderRequest,
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
+use crate::config::Config;
+use crate::desired_state::ContentMiddlewareRegistration;
 use crate::error::GatewayError;
 
 /// Keep abandoned synchronous invocations from consuming Tokio's entire
@@ -140,6 +142,175 @@ pub enum MiddlewareChainError {
     NetworkNeedUnsupported(String),
     #[error("middleware `{id}` declares `{scope}` scope, which is not invoked in v1")]
     ScopeUnsupported { id: String, scope: &'static str },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MiddlewarePolicyError {
+    #[error("content middleware `{id}` is not compiled into this axond build")]
+    Unknown { id: String },
+    #[error("content middleware `{id}` declares unsupported `{scope}` scope")]
+    UnsupportedScope { id: String, scope: &'static str },
+    #[error("compiled declaration for content middleware `{id}` does not match its policy")]
+    DeclarationMismatch { id: String },
+    #[error(transparent)]
+    Chain(#[from] MiddlewareChainError),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("namespace `{namespace}` cannot activate its content middleware: {source}")]
+pub struct MiddlewarePlanError {
+    pub namespace: String,
+    #[source]
+    pub source: MiddlewarePolicyError,
+}
+
+type MiddlewareFactory =
+    fn(&ContentMiddlewareRegistration) -> Result<Arc<dyn Middleware>, MiddlewarePolicyError>;
+
+/// The in-process implementations this binary knows how to materialize.
+///
+/// Policy selects from this registry; it cannot load code, grant I/O, or name a
+/// core request stage. The first production entry is added by #358. Keeping an
+/// empty production registry here makes an early/unknown registration a compile
+/// refusal that leaves the last-known-good snapshot serving.
+struct MiddlewareRegistry {
+    factories: BTreeMap<&'static str, MiddlewareFactory>,
+}
+
+impl MiddlewareRegistry {
+    fn builtins() -> Self {
+        let factories = BTreeMap::new();
+        #[cfg(test)]
+        let mut factories = factories;
+        #[cfg(test)]
+        factories.insert(
+            "test.policy-marker",
+            test_policy_marker as MiddlewareFactory,
+        );
+        Self { factories }
+    }
+
+    fn compile(
+        &self,
+        registrations: &[ContentMiddlewareRegistration],
+    ) -> Result<MiddlewareChain, MiddlewarePolicyError> {
+        let entries = registrations
+            .iter()
+            .map(|registration| {
+                if let Some(scope) = registration
+                    .scopes()
+                    .iter()
+                    .find(|scope| **scope != MiddlewareScope::Request)
+                {
+                    return Err(MiddlewarePolicyError::UnsupportedScope {
+                        id: registration.id().to_owned(),
+                        scope: match scope {
+                            MiddlewareScope::Request => "request",
+                            MiddlewareScope::Response => "response",
+                            MiddlewareScope::StreamEvent => "stream_event",
+                        },
+                    });
+                }
+                let factory = self.factories.get(registration.id()).ok_or_else(|| {
+                    MiddlewarePolicyError::Unknown {
+                        id: registration.id().to_owned(),
+                    }
+                })?;
+                let entry = factory(registration)?;
+                let declaration = entry.declaration();
+                if declaration.id != registration.id()
+                    || declaration.scopes != registration.scopes()
+                    || declaration.failure_posture != registration.failure_posture()
+                    || declaration.max_duration
+                        != Duration::from_millis(registration.max_duration_milliseconds())
+                {
+                    return Err(MiddlewarePolicyError::DeclarationMismatch {
+                        id: registration.id().to_owned(),
+                    });
+                }
+                Ok(entry)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        MiddlewareChain::new(entries).map_err(Into::into)
+    }
+}
+
+/// Every namespace's compiled chain in one serving snapshot.
+#[derive(Clone, Default)]
+pub struct MiddlewarePlan {
+    by_namespace: BTreeMap<String, MiddlewareChain>,
+    empty: MiddlewareChain,
+}
+
+impl MiddlewarePlan {
+    pub fn compile(config: &Config) -> Result<Self, MiddlewarePlanError> {
+        let registry = MiddlewareRegistry::builtins();
+        let mut by_namespace = BTreeMap::new();
+        for namespace in &config.namespace {
+            let Some(policy) = &namespace.policy else {
+                continue;
+            };
+            if policy.body.content_middleware().is_empty() {
+                continue;
+            }
+            let chain = registry
+                .compile(policy.body.content_middleware())
+                .map_err(|source| MiddlewarePlanError {
+                    namespace: namespace.id.clone(),
+                    source,
+                })?;
+            by_namespace.insert(namespace.id.clone(), chain);
+        }
+        Ok(Self {
+            by_namespace,
+            empty: MiddlewareChain::empty(),
+        })
+    }
+
+    pub fn for_namespace(&self, namespace: &str) -> &MiddlewareChain {
+        self.by_namespace.get(namespace).unwrap_or(&self.empty)
+    }
+}
+
+fn declaration(registration: &ContentMiddlewareRegistration) -> MiddlewareDeclaration {
+    let mut declaration =
+        MiddlewareDeclaration::new(registration.id(), registration.scopes().iter().copied());
+    declaration.failure_posture = registration.failure_posture();
+    declaration.max_duration = Duration::from_millis(registration.max_duration_milliseconds());
+    declaration
+}
+
+#[cfg(test)]
+struct PolicyMarker {
+    declaration: MiddlewareDeclaration,
+}
+
+#[cfg(test)]
+impl Middleware for PolicyMarker {
+    fn declaration(&self) -> &MiddlewareDeclaration {
+        &self.declaration
+    }
+
+    fn apply(
+        &self,
+        phase: MiddlewarePhase<'_>,
+        _state: Option<&mut gateway_core::MiddlewareState>,
+    ) -> gateway_core::MiddlewareResult {
+        if let MiddlewarePhase::Request(request) = phase {
+            request.body["policy_middleware"] =
+                serde_json::Value::String(self.declaration.id.clone());
+        }
+        Ok(MiddlewareOutcome::continue_without_state())
+    }
+}
+
+#[cfg(test)]
+fn test_policy_marker(
+    registration: &ContentMiddlewareRegistration,
+) -> Result<Arc<dyn Middleware>, MiddlewarePolicyError> {
+    Ok(Arc::new(PolicyMarker {
+        declaration: declaration(registration),
+    }))
 }
 
 impl MiddlewareChain {
@@ -423,8 +594,43 @@ fn stable_refusal_reason(reason: MiddlewareRefusal) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::NamespacePolicy;
+    use crate::desired_state::fixtures::{policy_body, revision_id, tenant_id};
+    use crate::desired_state::{PolicyEpoch, PolicyScope};
     use gateway_core::{MiddlewareDeclaration, MiddlewareFailurePosture, MiddlewareOutcome};
     use serde_json::json;
+
+    fn registration(
+        id: &str,
+        scopes: impl IntoIterator<Item = MiddlewareScope>,
+    ) -> ContentMiddlewareRegistration {
+        ContentMiddlewareRegistration::new(id, scopes, MiddlewareFailurePosture::FailClosed, 25)
+            .expect("valid registration")
+    }
+
+    fn config_with_registration(registration: ContentMiddlewareRegistration) -> Config {
+        let mut config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "alpha"
+default = true
+
+[[namespace]]
+id = "beta"
+
+[[gateway_key]]
+env = "ALPHA_KEY"
+namespace = "alpha"
+"#,
+        )
+        .expect("valid namespace fixture");
+        let body = policy_body(PolicyScope::Tenant(tenant_id(1)), PolicyEpoch::FIRST.get())
+            .with_content_middleware(vec![registration])
+            .expect("registration attaches");
+        let generation = body.generation(revision_id(1));
+        config.namespace[0].policy = Some(NamespacePolicy { body, generation });
+        config
+    }
 
     struct Noop {
         declaration: MiddlewareDeclaration,
@@ -866,5 +1072,61 @@ mod tests {
                 Err(MiddlewareChainError::ScopeUnsupported { scope, .. }) if scope == expected
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn policy_plan_is_namespace_scoped_and_preserves_empty_siblings() {
+        let config = config_with_registration(registration(
+            "test.policy-marker",
+            [MiddlewareScope::Request],
+        ));
+        let plan = MiddlewarePlan::compile(&config).expect("known registration compiles");
+
+        let mut alpha = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        plan.for_namespace("alpha")
+            .request(&mut alpha)
+            .await
+            .expect("alpha chain runs");
+        assert_eq!(alpha.body["policy_middleware"], "test.policy-marker");
+
+        let mut beta = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        plan.for_namespace("beta")
+            .request(&mut beta)
+            .await
+            .expect("sibling stays empty");
+        assert_eq!(beta.body, json!({}));
+    }
+
+    #[test]
+    fn unactivatable_policy_is_rejected_during_snapshot_compilation() {
+        let unknown = config_with_registration(registration(
+            "test.not-compiled",
+            [MiddlewareScope::Request],
+        ));
+        assert!(matches!(
+            MiddlewarePlan::compile(&unknown),
+            Err(MiddlewarePlanError {
+                source: MiddlewarePolicyError::Unknown { .. },
+                ..
+            })
+        ));
+
+        let unsupported = config_with_registration(registration(
+            "test.policy-marker",
+            [MiddlewareScope::Response],
+        ));
+        assert!(matches!(
+            MiddlewarePlan::compile(&unsupported),
+            Err(MiddlewarePlanError {
+                source: MiddlewarePolicyError::UnsupportedScope { .. },
+                ..
+            })
+        ));
     }
 }

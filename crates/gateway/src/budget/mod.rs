@@ -1044,7 +1044,7 @@ mod tests {
             governed(
                 "acme/core",
                 NamespacePolicy {
-                    body,
+                    body: body.clone(),
                     generation: generation(&body, epoch),
                 },
             )

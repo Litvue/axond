@@ -141,12 +141,46 @@ record, or a state read.
 | `/admin/v1/models` | `POST` | A model enablement and its observed price. |
 | `/admin/v1/aliases` | `POST` | A routing alias and its ordered targets. |
 | `/admin/v1/prices` | `POST` | A deployment PriceBook. Approval records the authenticated actor and effective rates are compiled into the serving snapshot. |
-| `/admin/v1/policies` | `POST` | Budgets, concurrency limits, and token epoch for a scope. |
+| `/admin/v1/policies` | `POST` | Budgets, concurrency limits, token epoch, and ordered content-middleware registrations for a scope. |
 | `/admin/v1/rollback` | `POST` | Republish an earlier revision's complete state as a *new* revision. |
 | `/admin/v1/secrets` | `POST` | Store credential material as a new secret's first version, staged. |
 | `/admin/v1/secrets/rotate` | `POST` | Store material as the *next* version of an existing secret, staged. |
 | `/admin/v1/secrets/lifecycle` | `POST` | Move one version: `active`, `disabled`, `revoked`, `tombstoned`. |
 | `/admin/v1/secrets/{secret}` | `GET` | Every version of one secret, with its state and whether it still resolves. |
+
+`/admin/v1/policies` accepts an optional ordered list. Scope order inside one
+entry is normalized; list order is execution order:
+
+```json
+{
+  "resource": {
+    "tenant": "ten_01J...",
+    "slug": "production-policy",
+    "epoch": 8,
+    "subject_limit_microdollars": 50000000,
+    "namespace_limit_microdollars": 500000000,
+    "reservation_ttl_seconds": 300,
+    "max_in_flight_per_subject": 8,
+    "lease_ttl_seconds": 60,
+    "minimum_token_epoch": 0,
+    "content_middleware": [{
+      "id": "example.redactor",
+      "scopes": ["request"],
+      "failure_posture": "fail_closed",
+      "max_duration_milliseconds": 25
+    }]
+  }
+}
+```
+
+The identifier must name middleware compiled into the running binary; the value
+above illustrates the shape rather than naming a shipped implementation. The
+registration release establishes the registry and supports request scope; the
+first production identifier ships with its middleware implementation. Until
+then, a non-empty list is deliberately unactivatable. An unsupported scope or
+unknown identifier rejects the candidate before publication. Core stages are not
+registrations: `core_stages` and identifiers such as `authentication` are
+validation errors.
 
 The four `secrets` rows are the only place material crosses this boundary, and
 it crosses one way: they take material and answer with a reference, an owner,

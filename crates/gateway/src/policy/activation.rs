@@ -616,7 +616,7 @@ mod tests {
         PolicyView::of(&governed(
             "acme/core",
             NamespacePolicy {
-                body: *document,
+                body: document.clone(),
                 generation: generation(document, revision),
             },
         ))
@@ -793,13 +793,13 @@ mod tests {
     fn a_tenant_document_is_only_withdrawable_when_every_namespace_it_governs_is_gone() {
         let document = body(scope(), 1, 1_000);
         let policy = NamespacePolicy {
-            body: document,
+            body: document.clone(),
             generation: generation(&document, 1),
         };
         let mut both = stateful_config();
         both.namespace.push(crate::policy::view::tests::projected(
             "acme/core",
-            Some(policy),
+            Some(policy.clone()),
         ));
         both.namespace.push(crate::policy::view::tests::projected(
             "acme/edge",
@@ -862,7 +862,7 @@ mod tests {
             PolicyView::of(&governed(
                 "acme/core",
                 NamespacePolicy {
-                    body: *document,
+                    body: document.clone(),
                     generation: generation(document, 2),
                 },
             ))
@@ -901,14 +901,14 @@ mod tests {
             config.namespace.push(crate::policy::view::tests::projected(
                 "acme/edge",
                 Some(NamespacePolicy {
-                    body: projects,
+                    body: projects.clone(),
                     generation: generation(&projects, 2),
                 }),
             ));
             config.namespace.push(crate::policy::view::tests::projected(
                 "acme/core",
                 Some(NamespacePolicy {
-                    body: *core,
+                    body: core.clone(),
                     generation: generation(core, 2),
                 }),
             ));
@@ -946,14 +946,14 @@ mod tests {
             config.namespace.push(crate::policy::view::tests::projected(
                 "acme/edge",
                 Some(NamespacePolicy {
-                    body: *projects,
+                    body: projects.clone(),
                     generation: generation(projects, 2),
                 }),
             ));
             config.namespace.push(crate::policy::view::tests::projected(
                 "acme/core",
                 Some(NamespacePolicy {
-                    body: *core,
+                    body: core.clone(),
                     generation: generation(core, 2),
                 }),
             ));
@@ -999,7 +999,7 @@ mod tests {
         let mut candidate = governed(
             "acme/core",
             NamespacePolicy {
-                body: document,
+                body: document.clone(),
                 generation: generation(&document, 1),
             },
         );
@@ -1047,7 +1047,7 @@ mod tests {
         let mut candidate = governed(
             "acme/core",
             NamespacePolicy {
-                body: document,
+                body: document.clone(),
                 generation: generation(&document, 1),
             },
         );
@@ -1077,7 +1077,7 @@ mod tests {
             PolicyView::of(&governed(
                 "acme/core",
                 NamespacePolicy {
-                    body: *body,
+                    body: body.clone(),
                     generation: generation(body, 2),
                 },
             ))
@@ -1120,7 +1120,7 @@ mod tests {
         both.namespace.push(crate::policy::view::tests::projected(
             "acme/edge",
             Some(NamespacePolicy {
-                body: tenants,
+                body: tenants.clone(),
                 generation: generation(&tenants, 2),
             }),
         ));
@@ -1131,7 +1131,7 @@ mod tests {
                 .push(crate::policy::view::tests::projected(
                     namespace,
                     Some(NamespacePolicy {
-                        body: tenants,
+                        body: tenants.clone(),
                         generation: generation(&tenants, 3),
                     }),
                 ));
@@ -1165,7 +1165,7 @@ mod tests {
         let mut governs_both = governed(
             "acme/core",
             NamespacePolicy {
-                body: held,
+                body: held.clone(),
                 generation: generation(&held, 1),
             },
         );
@@ -1174,7 +1174,7 @@ mod tests {
             .push(crate::policy::view::tests::projected(
                 "acme/edge",
                 Some(NamespacePolicy {
-                    body: held,
+                    body: held.clone(),
                     generation: generation(&held, 1),
                 }),
             ));
@@ -1186,7 +1186,7 @@ mod tests {
         let mut handed_over = governed(
             "acme/core",
             NamespacePolicy {
-                body: cheaper,
+                body: cheaper.clone(),
                 generation: generation(&cheaper, 2),
             },
         );
@@ -1195,7 +1195,7 @@ mod tests {
             .push(crate::policy::view::tests::projected(
                 "acme/edge",
                 Some(NamespacePolicy {
-                    body: narrower,
+                    body: narrower.clone(),
                     generation: generation(&narrower, 2),
                 }),
             ));

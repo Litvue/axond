@@ -163,7 +163,7 @@ impl PolicyView {
                     published
                         .entry(policy.body.scope())
                         .or_insert_with(|| Published {
-                            body: policy.body,
+                            body: policy.body.clone(),
                             generation: policy.generation,
                             namespaces: Vec::new(),
                         })
@@ -388,7 +388,7 @@ dsn_env = "GW_BUDGET_REDIS"
         let view = PolicyView::of(&governed(
             "acme/core",
             NamespacePolicy {
-                body: document,
+                body: document.clone(),
                 generation,
             },
         ));

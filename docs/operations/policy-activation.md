@@ -1,7 +1,8 @@
 # Policy activation
 
 In stateful mode, a tenant's or project's limits — spend cap, reservation TTL,
-concurrency ceiling, lease TTL, token floor — are published as a
+concurrency ceiling, lease TTL, token floor — and its ordered content middleware
+are published as a
 [policy document](../adr/0036-typed-policy-documents-generations-and-transitions.md)
 and take effect on every replica without a redeploy. This page is the operator's
 view of the second half of that: what a replica does with a published document,
@@ -34,6 +35,7 @@ during one.
 | Every projected namespace is governed | A namespace no document governs has **no enforceable cap**, and its requests are denied | publish a tenant-level document as the floor |
 | The budget backend's DSN is **not** the control plane's | The revision journal is not request-path state | compare `[budget] dsn_env` with `[control_plane] dsn_env` |
 | Every replica runs a build that reads `axond.policy.v1` | A build that cannot read the body refuses the whole revision as skew | roll the binary out first |
+| Every `content_middleware` id is compiled into every replica, and every declared scope is supported | An unavailable implementation or unsupported combination cannot become a serving chain | roll the implementation out first; then publish its registration |
 
 ### The control plane is not a hot path
 
@@ -113,7 +115,7 @@ cannot strand a namespace against half-described caps.
 
 | Class | What it covers | What happens |
 | --- | --- | --- |
-| `live` | Looser caps, longer TTLs, a higher token floor, a republication that changes nothing | Activates. New admissions use the new values |
+| `live` | Looser caps, longer TTLs, a higher token floor, any ordered content-middleware add/change/remove, or a republication that changes nothing | Activates. New admissions use the new values and snapshot-owned chain |
 | `drain` | Tighter caps, shorter TTLs | Activates. New admissions use the new values; **what is already admitted keeps its own terms** until it finishes |
 | `migration-required` | Turning a scope-wide cap on or off | Refused. See [Migrating the layout](#migrating-the-layout) |
 | `refused` | A regressed epoch, changed content under an unchanged epoch, another scope's document, a lowered token floor (**including across a handover**), a document these backends cannot enforce, withdrawing a document from a namespace still served, or serving a namespace no document governs | Refused. Nothing changes |
@@ -171,7 +173,7 @@ it.
 ## Rolling back
 
 **Roll back by publishing the old values forward: a new document, a higher epoch,
-yesterday's numbers.** It is classified like any other change (usually a drain,
+yesterday's numbers and middleware list.** It is classified like any other change (usually a drain,
 since it lowers something), and the holds taken under the higher caps finish on
 the terms they were granted.
 

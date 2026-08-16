@@ -504,7 +504,7 @@ pub struct Namespace {
 /// Carried on the namespace rather than resolved per request so that one
 /// compiled snapshot answers "what governs this namespace, under which
 /// generation" without reading desired state on the request path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespacePolicy {
     pub body: PolicyBody,
     pub generation: PolicyGeneration,

@@ -89,12 +89,13 @@ impl<P: RevisionProjection> RevisionProjection for PolicyProjection<P> {
             let Some(document) = policies.effective(scope) else {
                 continue;
             };
+            let generation = document.body.generation(source);
             namespace.policy = Some(NamespacePolicy {
-                body: document.body,
+                body: document.body.clone(),
                 // Stamped with the revision that carried it, so two replicas
                 // compiling this revision name the same generation and a fence
                 // can tell a stale writer from a forked one.
-                generation: document.body.generation(source),
+                generation,
             });
         }
         Ok(config)

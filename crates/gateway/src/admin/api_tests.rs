@@ -1362,6 +1362,68 @@ async fn a_zero_budget_cap_is_refused_against_the_setting_the_caller_wrote() {
     }
 }
 
+#[tokio::test]
+async fn policy_middleware_is_typed_and_failed_publication_does_not_advance() {
+    let deployment = Deployment::new();
+    let expected = deployment
+        .publish(
+            "/tenants",
+            "tenant",
+            EXPECTED_REVISION_EMPTY,
+            &tenant_document(),
+        )
+        .await;
+    let mut registered = policy_document();
+    registered["resource"]["content_middleware"] = json!([{
+        "id": "test.policy-marker",
+        "scopes": ["request"],
+        "failure_posture": "fail_closed",
+        "max_duration_milliseconds": 25,
+    }]);
+    let revision = deployment
+        .publish("/policies", "registered", &expected, &registered)
+        .await;
+
+    let mut core_stage = policy_document();
+    core_stage["resource"]["epoch"] = json!(2);
+    core_stage["resource"]["content_middleware"] = json!([{
+        "id": "authentication",
+        "scopes": ["request"],
+        "failure_posture": "fail_closed",
+        "max_duration_milliseconds": 25,
+    }]);
+    let (status, body) = deployment
+        .post("/policies", "core-stage", &revision, &core_stage)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "admin_request_invalid");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("compiled core stage")
+    );
+
+    let mut reorder = policy_document();
+    reorder["resource"]["epoch"] = json!(2);
+    reorder["resource"]["core_stages"] = json!(["authentication", "admission"]);
+    let (status, body) = deployment
+        .post("/policies", "core-order", &revision, &reorder)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "admin_request_invalid");
+
+    let mut removed = policy_document();
+    removed["resource"]["epoch"] = json!(2);
+    let next = deployment
+        .publish("/policies", "removed", &revision, &removed)
+        .await;
+    assert_ne!(
+        next, revision,
+        "the refused candidates consumed no revision"
+    );
+}
+
 /// Nothing here removes a resource, so the audit trail may not say one was
 /// removed: `delete` is accepted only for a document that retires the resource
 /// through its own lifecycle, and refused for one that leaves it serving.
