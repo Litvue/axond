@@ -784,6 +784,29 @@ impl Relay {
                 }
             }
             Some(Err(err)) => {
+                if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
+                    // The semantic terminal event completed provider work. A
+                    // proxy that times out or loses the transport while closing
+                    // remains operator-visible, but is not an upstream timeout:
+                    // the response was already served successfully.
+                    if let Some(kind) = err.timeout_kind() {
+                        tracing::warn!(
+                            provider = %self.accounting.ctx.target_provider,
+                            model = %self.accounting.ctx.target_model,
+                            timeout = kind.label(),
+                            "byte-faithful upstream timed out while closing after its terminal event"
+                        );
+                    } else {
+                        tracing::warn!(
+                            provider = %self.accounting.ctx.target_provider,
+                            model = %self.accounting.ctx.target_model,
+                            error = %err,
+                            "byte-faithful upstream failed while closing after its terminal event"
+                        );
+                    }
+                    self.phase = Phase::Finished;
+                    return;
+                }
                 // An open stream that goes silent is terminated honestly: bytes
                 // may already be committed downstream, so there is nothing to
                 // retry and no new completion to splice in.
@@ -817,15 +840,7 @@ impl Relay {
                 // In-band and caller-facing, so it is worded the way the
                 // buffered path words it: never with the endpoint `reqwest`
                 // rendered into its message.
-                if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
-                    // The semantic terminal event completed provider work. A
-                    // proxy that never closes (or loses the transport while
-                    // closing) must not turn that completed answer into a
-                    // second, synthetic error on the provider's native wire.
-                    self.phase = Phase::Finished;
-                } else {
-                    self.phase = Phase::Failed(transport_caller_message(&err));
-                }
+                self.phase = Phase::Failed(transport_caller_message(&err));
             }
             None => self.finish_upstream().await,
         }
@@ -2290,31 +2305,39 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
         );
-        let ledger = Arc::new(Ledger::default());
-        let response = relay_opened_with_middleware(
-            state_for("http://127.0.0.1:1", ledger.clone()),
-            context(),
-            OpenedStream {
-                decoder: OpenAiCompatibleAdapter::openai()
-                    .stream_decoder(Surface::Responses)
-                    .expect("Responses decoder"),
-                bytes: futures::stream::iter(vec![
-                    Ok(Bytes::from_static(COMPLETED.as_bytes())),
-                    Err(TransportError::Http(
-                        "proxy held the completed body open".to_owned(),
-                    )),
-                ])
-                .boxed(),
+        let failures = [
+            TransportError::Http("proxy held the completed body open".to_owned()),
+            TransportError::Timeout {
+                kind: gateway_transport::TimeoutKind::StreamIdle,
+                bound: gateway_transport::TimeoutBound::Phase,
+                budget_ms: 10,
             },
-            Instant::now(),
-            Framing::Responses,
-            None,
-            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
-        );
+        ];
+        for failure in failures {
+            let ledger = Arc::new(Ledger::default());
+            let response = relay_opened_with_middleware(
+                state_for("http://127.0.0.1:1", ledger.clone()),
+                context(),
+                OpenedStream {
+                    decoder: OpenAiCompatibleAdapter::openai()
+                        .stream_decoder(Surface::Responses)
+                        .expect("Responses decoder"),
+                    bytes: futures::stream::iter(vec![
+                        Ok(Bytes::from_static(COMPLETED.as_bytes())),
+                        Err(failure),
+                    ])
+                    .boxed(),
+                },
+                Instant::now(),
+                Framing::Responses,
+                None,
+                StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+            );
 
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(body, Bytes::from_static(COMPLETED.as_bytes()));
-        assert_eq!(settled(&ledger).await["status"], "ok");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body, Bytes::from_static(COMPLETED.as_bytes()));
+            assert_eq!(settled(&ledger).await["status"], "ok");
+        }
     }
 
     #[tokio::test]

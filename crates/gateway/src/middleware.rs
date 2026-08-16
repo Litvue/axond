@@ -665,6 +665,7 @@ pub struct MiddlewareExecution {
     runtime: MiddlewareRuntime,
     states: MiddlewareStateBag,
     stranded: Vec<bool>,
+    failure_logged: Vec<bool>,
 }
 
 struct InvocationCapacity {
@@ -688,11 +689,13 @@ impl Default for MiddlewareExecution {
 impl MiddlewareExecution {
     fn new(chain: MiddlewareChain, runtime: MiddlewareRuntime, states: MiddlewareStateBag) -> Self {
         let stranded = vec![false; chain.len()];
+        let failure_logged = vec![false; chain.len()];
         Self {
             chain,
             runtime,
             states,
             stranded,
+            failure_logged,
         }
     }
 
@@ -703,6 +706,7 @@ impl MiddlewareExecution {
             runtime: MiddlewareRuntime::default(),
             states,
             stranded: Vec::new(),
+            failure_logged: Vec::new(),
         }
     }
 
@@ -720,8 +724,7 @@ impl MiddlewareExecution {
                 continue;
             }
             if self.stranded[index] {
-                self.chain
-                    .failure(index, "state unavailable after abandoned invocation")?;
+                self.failure(index, "state unavailable after abandoned invocation")?;
                 continue;
             }
 
@@ -764,13 +767,13 @@ impl MiddlewareExecution {
                 Ok(Ok(invoked)) => invoked,
                 Ok(Err(_)) => {
                     self.stranded[index] = true;
-                    self.chain.failure(index, "invocation task failed")?;
+                    self.failure(index, "invocation task failed")?;
                     continue;
                 }
                 Err(_) => {
                     mark_invocation_abandoned(&invocation_state, &gate);
                     self.stranded[index] = true;
-                    self.chain.failure(index, "invocation bound exceeded")?;
+                    self.failure(index, "invocation bound exceeded")?;
                     continue;
                 }
             };
@@ -799,7 +802,7 @@ impl MiddlewareExecution {
                 // expose that partial mutation to a later response event.
                 self.stranded[index] = true;
             }
-            if self.chain.finish(index, result, &mut self.states, false)? {
+            if self.finish(index, result)? {
                 *response = candidate;
             }
         }
@@ -825,8 +828,7 @@ impl MiddlewareExecution {
                 continue;
             }
             if self.stranded[index] {
-                self.chain
-                    .failure(index, "state unavailable after abandoned invocation")?;
+                self.failure(index, "state unavailable after abandoned invocation")?;
                 continue;
             }
 
@@ -868,13 +870,13 @@ impl MiddlewareExecution {
                 Ok(Ok(invoked)) => invoked,
                 Ok(Err(_)) => {
                     self.stranded[index] = true;
-                    self.chain.failure(index, "invocation task failed")?;
+                    self.failure(index, "invocation task failed")?;
                     continue;
                 }
                 Err(_) => {
                     mark_invocation_abandoned(&invocation_state, &gate);
                     self.stranded[index] = true;
-                    self.chain.failure(index, "invocation bound exceeded")?;
+                    self.failure(index, "invocation bound exceeded")?;
                     continue;
                 }
             };
@@ -900,7 +902,7 @@ impl MiddlewareExecution {
             } else if state.is_some() {
                 self.stranded[index] = true;
             }
-            if self.chain.finish(index, result, &mut self.states, false)? {
+            if self.finish(index, result)? {
                 *event = candidate;
             }
         }
@@ -910,14 +912,14 @@ impl MiddlewareExecution {
     async fn acquire(&mut self, index: usize) -> Result<Option<InvocationCapacity>, GatewayError> {
         let declaration = self.chain.entries[index].declaration();
         let gate = self.runtime.gate(&declaration.id);
+        let bound = declaration.max_duration;
         if gate.abandoned.load(Ordering::Acquire) > 0 {
-            self.chain.failure(
+            self.failure(
                 index,
                 "middleware id quarantined while an abandoned invocation is still running",
             )?;
             return Ok(None);
         }
-        let bound = declaration.max_duration;
         let capacity_started = tokio::time::Instant::now();
         let deadline = capacity_started + bound;
         let middleware_slot = match tokio::time::timeout_at(
@@ -928,8 +930,7 @@ impl MiddlewareExecution {
         {
             Ok(Ok(slot)) => slot,
             Ok(Err(_)) => {
-                self.chain
-                    .failure(index, "middleware invocation capacity closed")?;
+                self.failure(index, "middleware invocation capacity closed")?;
                 return Ok(None);
             }
             Err(_) => {
@@ -937,7 +938,7 @@ impl MiddlewareExecution {
                     capacity_started.elapsed().as_secs_f64() * 1_000.0,
                     true,
                 );
-                self.chain.failure(
+                self.failure(
                     index,
                     "invocation bound exceeded waiting for per-middleware capacity",
                 )?;
@@ -952,8 +953,7 @@ impl MiddlewareExecution {
         {
             Ok(Ok(slot)) => slot,
             Ok(Err(_)) => {
-                self.chain
-                    .failure(index, "process invocation capacity closed")?;
+                self.failure(index, "process invocation capacity closed")?;
                 return Ok(None);
             }
             Err(_) => {
@@ -961,8 +961,7 @@ impl MiddlewareExecution {
                     capacity_started.elapsed().as_secs_f64() * 1_000.0,
                     true,
                 );
-                self.chain
-                    .failure(index, "invocation bound exceeded waiting for capacity")?;
+                self.failure(index, "invocation bound exceeded waiting for capacity")?;
                 return Ok(None);
             }
         };
@@ -973,8 +972,7 @@ impl MiddlewareExecution {
             );
             drop(process_slot);
             drop(middleware_slot);
-            self.chain
-                .failure(index, "invocation bound exhausted waiting for capacity")?;
+            self.failure(index, "invocation bound exhausted waiting for capacity")?;
             return Ok(None);
         }
         crate::telemetry::metrics::record_middleware_capacity_wait(
@@ -988,6 +986,43 @@ impl MiddlewareExecution {
             invocation_state: Arc::new(Mutex::new(InvocationState::Running)),
             gate,
         }))
+    }
+
+    /// Apply one slot's failure posture on every event, but emit its operator
+    /// warning at most once for this response-lifetime execution. Counters keep
+    /// carrying volume; a quarantined fail-open add-on must not turn every chunk
+    /// of one long stream into an identical log line.
+    fn failure(&mut self, index: usize, detail: &'static str) -> Result<bool, GatewayError> {
+        if !self.failure_logged[index] {
+            self.failure_logged[index] = true;
+            return self.chain.failure(index, detail);
+        }
+        match self.chain.entries[index].declaration().failure_posture {
+            MiddlewareFailurePosture::FailOpen => Ok(false),
+            MiddlewareFailurePosture::FailClosed => Err(GatewayError::MiddlewareUnavailable),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        index: usize,
+        result: Result<MiddlewareOutcome, MiddlewareError>,
+    ) -> Result<bool, GatewayError> {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(_) => return self.failure(index, "invocation failed"),
+        };
+        match outcome.verdict {
+            MiddlewareVerdict::Continue => {
+                if outcome.state.is_some() {
+                    return self.failure(index, "state returned outside request scope");
+                }
+                Ok(true)
+            }
+            MiddlewareVerdict::Refuse(reason) => Err(GatewayError::MiddlewareRefused {
+                reason: stable_refusal_reason(reason),
+            }),
+        }
     }
 }
 
@@ -1018,6 +1053,22 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct MiddlewareLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for MiddlewareLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("middleware log")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn registration(
         id: &str,
@@ -2174,6 +2225,58 @@ namespace = "alpha"
             .expect("middleware id is retried after recovery");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn quarantined_stream_addon_warns_once_per_execution() {
+        crate::telemetry::testing::keep_callsites_answerable();
+        let logged = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = Arc::clone(&logged);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || MiddlewareLogWriter(Arc::clone(&sink)))
+            .with_ansi(false)
+            .finish();
+        let _log = tracing::subscriber::set_default(subscriber);
+
+        let mut declaration =
+            MiddlewareDeclaration::new("quarantined-stream", [MiddlewareScope::StreamEvent]);
+        declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        let chain = MiddlewareChain::new(vec![Arc::new(Noop { declaration })])
+            .expect("stream middleware chain");
+        let runtime = MiddlewareRuntime::default();
+        let gate = runtime.gate("quarantined-stream");
+        gate.abandoned.store(1, Ordering::Release);
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain
+            .start(&runtime, &mut request)
+            .await
+            .expect("response-lifetime execution");
+
+        for sequence in 0..4 {
+            let mut event = ProviderStreamEvent::Data {
+                event: None,
+                data: json!({"sequence": sequence}),
+            };
+            execution
+                .stream_event(&mut event)
+                .await
+                .expect("fail-open quarantine preserves every event");
+        }
+
+        let log = String::from_utf8(logged.lock().expect("middleware log").clone())
+            .expect("utf-8 middleware log");
+        assert_eq!(
+            log.matches("content middleware invocation failed").count(),
+            1,
+            "one quarantined add-on must produce one warning per execution: {log}"
+        );
+        assert!(
+            log.contains("quarantined-stream"),
+            "warning names the add-on: {log}"
+        );
     }
 
     #[tokio::test]

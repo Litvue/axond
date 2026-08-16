@@ -261,6 +261,15 @@ for bounded buffering. It neither activates middleware nor changes a request's
 upstream streaming or affinity semantics by itself. Changes are live and bind to
 new requests through the immutable snapshot.
 
+Adding this field changes `PolicyContent` for every document, including one whose
+set is empty. That digest is deliberately process-local activation and drain
+identity: it is neither serialized into a Redis/Postgres key nor compared across
+replicas. Shared budget and rate-limit keys remain namespace/subject plus their
+reservation or lease identity, while each replica enters and exits holds under
+the generation it computed. A mixed-version fleet can therefore compute different
+digests for the same old document without splitting shared enforcement state;
+after rollout, every new process computes the new identity.
+
 ## Consequences
 
 The request path gains a place where content policy belongs, and the two dead
