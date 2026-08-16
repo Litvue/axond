@@ -141,13 +141,7 @@ impl MiddlewareChain {
             let deadline = capacity_started + bound;
             let slot =
                 match tokio::time::timeout_at(deadline, Arc::clone(&slots).acquire_owned()).await {
-                    Ok(Ok(slot)) => {
-                        crate::telemetry::metrics::record_middleware_capacity_wait(
-                            capacity_started.elapsed().as_secs_f64() * 1_000.0,
-                            false,
-                        );
-                        slot
-                    }
+                    Ok(Ok(slot)) => slot,
                     Ok(Err(_)) => {
                         self.failure(index, "invocation capacity closed")?;
                         continue;
@@ -161,6 +155,19 @@ impl MiddlewareChain {
                         continue;
                     }
                 };
+            if invocation_deadline_expired(deadline) {
+                crate::telemetry::metrics::record_middleware_capacity_wait(
+                    capacity_started.elapsed().as_secs_f64() * 1_000.0,
+                    true,
+                );
+                drop(slot);
+                self.failure(index, "invocation bound exhausted waiting for capacity")?;
+                continue;
+            }
+            crate::telemetry::metrics::record_middleware_capacity_wait(
+                capacity_started.elapsed().as_secs_f64() * 1_000.0,
+                false,
+            );
             let mut candidate = request.clone();
             let middleware = Arc::clone(entry);
             let invoked = tokio::time::timeout_at(
@@ -232,6 +239,10 @@ impl MiddlewareChain {
             MiddlewareFailurePosture::FailClosed => Err(GatewayError::MiddlewareUnavailable),
         }
     }
+}
+
+fn invocation_deadline_expired(deadline: tokio::time::Instant) -> bool {
+    tokio::time::Instant::now() >= deadline
 }
 
 fn routing_fields_unchanged(before: &ProviderRequest, after: &ProviderRequest) -> bool {
@@ -570,6 +581,14 @@ mod tests {
         assert!(matches!(
             chain.request_with_slots(&mut request, slots).await,
             Err(GatewayError::MiddlewareUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_deadline_is_detected_before_blocking_work_is_spawned() {
+        assert!(invocation_deadline_expired(tokio::time::Instant::now()));
+        assert!(!invocation_deadline_expired(
+            tokio::time::Instant::now() + Duration::from_secs(1)
         ));
     }
 
