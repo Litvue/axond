@@ -167,6 +167,18 @@ just fuzz config_toml         # one target, a bounded local run
 just fuzz-all                 # every target, the way the scheduled lane does
 ```
 
+On a musl Linux host, `just fuzz` translates the auto-detected host target to
+the matching GNU target because cargo-fuzz's prebuilt installer may otherwise
+fail to link AddressSanitizer. Install that standard library target before the
+first run (replace the example triple if the host architecture differs):
+
+```bash
+rustup target add x86_64-unknown-linux-gnu
+```
+
+An explicit `AXOND_FUZZ_TARGET` is used exactly as supplied, so it can select a
+deliberately installed target without the automatic musl-to-GNU translation.
+
 `just fuzz` copies `seeds/<target>/` into `corpus/<target>/` first, so a local
 run starts where the committed corpus left off.
 

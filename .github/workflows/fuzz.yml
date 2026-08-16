@@ -145,7 +145,11 @@ jobs:
           # -rss_limit_mb and -malloc_limit_mb are the uncontrolled-allocation
           # gate: an input that makes a parser ask for more than 2 GiB, or a
           # single allocation over 1 GiB, is a finding rather than an OOM kill.
-          cargo fuzz run "${{ matrix.target }}" "corpus/${{ matrix.target }}" -- \
+          # cargo-fuzz's prebuilt installer may itself be musl-linked on Linux;
+          # never let that host binary select musl for an AddressSanitizer build.
+          # The runner's GNU target provides the sanitizer runtime.
+          cargo fuzz run --target x86_64-unknown-linux-gnu \
+            "${{ matrix.target }}" "corpus/${{ matrix.target }}" -- \
             -max_total_time="${SECONDS_PER_TARGET}" \
             -max_len=65536 \
             -rss_limit_mb=2048 \

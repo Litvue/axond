@@ -200,11 +200,15 @@ fuzz-lock:
 
 # A bounded coverage-guided run of one target, starting from the committed seeds.
 # Needs a nightly toolchain and cargo-fuzz; the unbounded runs are scheduled in
-# .github/workflows/fuzz.yml.
+# .github/workflows/fuzz.yml. Follow the developer's nightly host by default so
+# this remains usable on macOS and ARM Linux; translate only a musl Linux host
+# to its GNU target because cargo-fuzz's prebuilt installer can otherwise fail
+# to link AddressSanitizer. AXOND_FUZZ_TARGET is an escape hatch for a runner
+# with a deliberately selected Rust target.
 fuzz target seconds="60":
     mkdir -p fuzz/corpus/{{target}}
     cp -n fuzz/seeds/{{target}}/* fuzz/corpus/{{target}}/ || true
-    cd fuzz && cargo +nightly fuzz run {{target}} corpus/{{target}} -- -max_total_time={{seconds}} -max_len=65536 -rss_limit_mb=2048 -malloc_limit_mb=1024 -timeout=25
+    cd fuzz && if [ -n "${AXOND_FUZZ_TARGET:-}" ]; then host_target="$AXOND_FUZZ_TARGET"; else host_target="$(rustc +nightly -vV | sed -n 's/^host: //p')"; case "$host_target" in *-unknown-linux-musl) host_target="${host_target%-musl}-gnu" ;; esac; fi; cargo +nightly fuzz run --target "$host_target" {{target}} corpus/{{target}} -- -max_total_time={{seconds}} -max_len=65536 -rss_limit_mb=2048 -malloc_limit_mb=1024 -timeout=25
 
 # Every fuzz target in turn, the way the scheduled lane runs them.
 fuzz-all seconds="60":
