@@ -57,6 +57,10 @@
         },
         {
           "type": "generic",
+          "path": "deploy/kubernetes/overlays/production-stateful-persistent/statefulset.yaml"
+        },
+        {
+          "type": "generic",
           "path": "docs/deployment/kubernetes.md"
         }
       ]
