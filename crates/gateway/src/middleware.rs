@@ -21,10 +21,10 @@ use gateway_core::MiddlewareDeclaration;
 use gateway_core::{
     Middleware, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed, MiddlewareOutcome,
     MiddlewarePhase, MiddlewareRefusal, MiddlewareScope, MiddlewareStateBag, MiddlewareVerdict,
-    ProviderRequest,
+    ProviderRequest, ProviderResponse, ProviderStreamEvent,
 };
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::Config;
 use crate::desired_state::ContentMiddlewareRegistration;
@@ -122,6 +122,14 @@ impl Drop for InvocationGuard {
     }
 }
 
+fn mark_invocation_abandoned(state: &Arc<Mutex<InvocationState>>, gate: &Arc<MiddlewareGate>) {
+    let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    if matches!(*state, InvocationState::Running) {
+        gate.abandoned.fetch_add(1, Ordering::AcqRel);
+        *state = InvocationState::TimedOut;
+    }
+}
+
 /// A registered, ordered set of content middleware.
 #[derive(Clone, Default)]
 pub struct MiddlewareChain {
@@ -142,16 +150,12 @@ pub enum MiddlewareChainError {
     DuplicateId(String),
     #[error("middleware `{0}` requests network access, which v1 does not provide")]
     NetworkNeedUnsupported(String),
-    #[error("middleware `{id}` declares `{scope}` scope, which is not invoked in v1")]
-    ScopeUnsupported { id: String, scope: &'static str },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MiddlewarePolicyError {
     #[error("content middleware `{id}` is not compiled into this axond build")]
     Unknown { id: String },
-    #[error("content middleware `{id}` declares unsupported `{scope}` scope")]
-    UnsupportedScope { id: String, scope: &'static str },
     #[error("compiled declaration for content middleware `{id}` does not match its policy")]
     DeclarationMismatch { id: String },
     #[error(transparent)]
@@ -199,20 +203,6 @@ impl MiddlewareRegistry {
         let entries = registrations
             .iter()
             .map(|registration| {
-                if let Some(scope) = registration
-                    .scopes()
-                    .iter()
-                    .find(|scope| **scope != MiddlewareScope::Request)
-                {
-                    return Err(MiddlewarePolicyError::UnsupportedScope {
-                        id: registration.id().to_owned(),
-                        scope: match scope {
-                            MiddlewareScope::Request => "request",
-                            MiddlewareScope::Response => "response",
-                            MiddlewareScope::StreamEvent => "stream_event",
-                        },
-                    });
-                }
                 let factory = self.factories.get(registration.id()).ok_or_else(|| {
                     MiddlewarePolicyError::Unknown {
                         id: registration.id().to_owned(),
@@ -361,16 +351,6 @@ impl MiddlewareChain {
                     declaration.id.clone(),
                 ));
             }
-            if let Some(scope) = declaration
-                .scopes
-                .iter()
-                .find(|scope| **scope != MiddlewareScope::Request)
-            {
-                return Err(MiddlewareChainError::ScopeUnsupported {
-                    id: declaration.id.clone(),
-                    scope: middleware_scope_name(*scope),
-                });
-            }
         }
         Ok(Self {
             entries: entries.into(),
@@ -405,6 +385,32 @@ impl MiddlewareChain {
         request: &mut ProviderRequest,
     ) -> Result<MiddlewareStateBag, GatewayError> {
         self.request(&MiddlewareRuntime::default(), request).await
+    }
+
+    /// Start a response-lifetime execution using this exact chain generation.
+    ///
+    /// The returned owner must remain attached to the buffered response or be
+    /// moved into the streaming response body. It is the sole owner of every
+    /// middleware state slot for the request.
+    pub async fn start(
+        &self,
+        runtime: &MiddlewareRuntime,
+        request: &mut ProviderRequest,
+    ) -> Result<MiddlewareExecution, GatewayError> {
+        let states = self.request(runtime, request).await?;
+        Ok(MiddlewareExecution::new(
+            self.clone(),
+            runtime.clone(),
+            states,
+        ))
+    }
+
+    #[cfg(test)]
+    async fn start_isolated(
+        &self,
+        request: &mut ProviderRequest,
+    ) -> Result<MiddlewareExecution, GatewayError> {
+        self.start(&MiddlewareRuntime::default(), request).await
     }
 
     #[cfg(test)]
@@ -518,13 +524,7 @@ impl MiddlewareChain {
                     continue;
                 }
                 Err(_) => {
-                    let mut state = invocation_state
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    if matches!(*state, InvocationState::Running) {
-                        gate.abandoned.fetch_add(1, Ordering::AcqRel);
-                        *state = InvocationState::TimedOut;
-                    }
+                    mark_invocation_abandoned(&invocation_state, &gate);
                     self.failure(index, "invocation bound exceeded")?;
                     continue;
                 }
@@ -572,7 +572,7 @@ impl MiddlewareChain {
 
     fn failure(&self, index: usize, detail: &'static str) -> Result<bool, GatewayError> {
         let declaration = self.entries[index].declaration();
-        tracing::warn!(middleware = %declaration.id, detail, "request middleware invocation failed");
+        tracing::warn!(middleware = %declaration.id, detail, "content middleware invocation failed");
         match declaration.failure_posture {
             MiddlewareFailurePosture::FailOpen => Ok(false),
             MiddlewareFailurePosture::FailClosed => Err(GatewayError::MiddlewareUnavailable),
@@ -584,19 +584,300 @@ fn invocation_deadline_expired(deadline: tokio::time::Instant) -> bool {
     tokio::time::Instant::now() >= deadline
 }
 
+/// Pins one request's middleware chain and owns its response-lifetime state.
+///
+/// Methods take `&mut self`, so two callbacks cannot borrow the state bag at
+/// once. A callback that outlives its bound keeps its state in the abandoned
+/// blocking task; that slot is then permanently stranded in this owner. Later
+/// callbacks skip a fail-open slot or reject through the stable fail-closed
+/// result without spawning concurrent work for the same slot.
+pub struct MiddlewareExecution {
+    chain: MiddlewareChain,
+    runtime: MiddlewareRuntime,
+    states: MiddlewareStateBag,
+    stranded: Vec<bool>,
+}
+
+struct InvocationCapacity {
+    deadline: tokio::time::Instant,
+    process_slot: OwnedSemaphorePermit,
+    middleware_slot: OwnedSemaphorePermit,
+    invocation_state: Arc<Mutex<InvocationState>>,
+    gate: Arc<MiddlewareGate>,
+}
+
+impl MiddlewareExecution {
+    fn new(chain: MiddlewareChain, runtime: MiddlewareRuntime, states: MiddlewareStateBag) -> Self {
+        let stranded = vec![false; chain.len()];
+        Self {
+            chain,
+            runtime,
+            states,
+            stranded,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chain.is_empty()
+    }
+
+    /// Run buffered-response scopes in reverse registration order.
+    pub async fn response(&mut self, response: &mut ProviderResponse) -> Result<(), GatewayError> {
+        for index in (0..self.chain.len()).rev() {
+            if !self.chain.entries[index]
+                .declaration()
+                .has_scope(MiddlewareScope::Response)
+            {
+                continue;
+            }
+            if self.stranded[index] {
+                self.chain
+                    .failure(index, "state unavailable after abandoned invocation")?;
+                continue;
+            }
+
+            let capacity = match self.acquire(index).await? {
+                Some(capacity) => capacity,
+                None => continue,
+            };
+            let InvocationCapacity {
+                deadline,
+                process_slot,
+                middleware_slot,
+                invocation_state,
+                gate,
+            } = capacity;
+            let middleware = Arc::clone(&self.chain.entries[index]);
+            let mut candidate = response.clone();
+            let original_usage = response.usage;
+            let mut state = self.states.take(index);
+            let closure_state = Arc::clone(&invocation_state);
+            let closure_gate = Arc::clone(&gate);
+            let invoked = tokio::time::timeout_at(
+                deadline,
+                tokio::task::spawn_blocking(move || {
+                    let _process_slot = process_slot;
+                    let _middleware_slot = middleware_slot;
+                    let _invocation_guard = InvocationGuard {
+                        state: closure_state,
+                        gate: closure_gate,
+                    };
+                    let result =
+                        middleware.apply(MiddlewarePhase::Response(&mut candidate), state.as_mut());
+                    (candidate, state, result)
+                }),
+            )
+            .await;
+            let (candidate, state, mut result) = match invoked {
+                Ok(Ok(invoked)) => invoked,
+                Ok(Err(_)) => {
+                    self.stranded[index] = true;
+                    self.chain.failure(index, "invocation task failed")?;
+                    continue;
+                }
+                Err(_) => {
+                    mark_invocation_abandoned(&invocation_state, &gate);
+                    self.stranded[index] = true;
+                    self.chain.failure(index, "invocation bound exceeded")?;
+                    continue;
+                }
+            };
+            if let Some(state) = state {
+                self.states.insert(index, state);
+            }
+            if matches!(
+                result.as_ref().map(|outcome| outcome.verdict),
+                Ok(MiddlewareVerdict::Continue)
+            ) && (candidate.usage != original_usage
+                || (!self.chain.entries[index].declaration().mutates_response
+                    && candidate.body != response.body))
+            {
+                result = Err(MiddlewareError::Failed);
+            }
+            if self.chain.finish(index, result, &mut self.states, false)? {
+                *response = candidate;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run decoded stream-event scopes in reverse registration order.
+    ///
+    /// Terminal usage events are gateway-owned and are never handed to content
+    /// middleware. Only decoded data events are transformable.
+    pub async fn stream_event(
+        &mut self,
+        event: &mut ProviderStreamEvent,
+    ) -> Result<(), GatewayError> {
+        if matches!(event, ProviderStreamEvent::Done(_)) {
+            return Ok(());
+        }
+        for index in (0..self.chain.len()).rev() {
+            if !self.chain.entries[index]
+                .declaration()
+                .has_scope(MiddlewareScope::StreamEvent)
+            {
+                continue;
+            }
+            if self.stranded[index] {
+                self.chain
+                    .failure(index, "state unavailable after abandoned invocation")?;
+                continue;
+            }
+
+            let capacity = match self.acquire(index).await? {
+                Some(capacity) => capacity,
+                None => continue,
+            };
+            let InvocationCapacity {
+                deadline,
+                process_slot,
+                middleware_slot,
+                invocation_state,
+                gate,
+            } = capacity;
+            let middleware = Arc::clone(&self.chain.entries[index]);
+            let mut candidate = event.clone();
+            let mut state = self.states.take(index);
+            let closure_state = Arc::clone(&invocation_state);
+            let closure_gate = Arc::clone(&gate);
+            let invoked = tokio::time::timeout_at(
+                deadline,
+                tokio::task::spawn_blocking(move || {
+                    let _process_slot = process_slot;
+                    let _middleware_slot = middleware_slot;
+                    let _invocation_guard = InvocationGuard {
+                        state: closure_state,
+                        gate: closure_gate,
+                    };
+                    let result = middleware
+                        .apply(MiddlewarePhase::StreamEvent(&mut candidate), state.as_mut());
+                    (candidate, state, result)
+                }),
+            )
+            .await;
+            let (candidate, state, mut result) = match invoked {
+                Ok(Ok(invoked)) => invoked,
+                Ok(Err(_)) => {
+                    self.stranded[index] = true;
+                    self.chain.failure(index, "invocation task failed")?;
+                    continue;
+                }
+                Err(_) => {
+                    mark_invocation_abandoned(&invocation_state, &gate);
+                    self.stranded[index] = true;
+                    self.chain.failure(index, "invocation bound exceeded")?;
+                    continue;
+                }
+            };
+            if let Some(state) = state {
+                self.states.insert(index, state);
+            }
+            if matches!(
+                result.as_ref().map(|outcome| outcome.verdict),
+                Ok(MiddlewareVerdict::Continue)
+            ) && (!matches!(&candidate, ProviderStreamEvent::Data { .. })
+                || (!self.chain.entries[index].declaration().mutates_response
+                    && candidate != *event))
+            {
+                result = Err(MiddlewareError::Failed);
+            }
+            if self.chain.finish(index, result, &mut self.states, false)? {
+                *event = candidate;
+            }
+        }
+        Ok(())
+    }
+
+    async fn acquire(&self, index: usize) -> Result<Option<InvocationCapacity>, GatewayError> {
+        let declaration = self.chain.entries[index].declaration();
+        let gate = self.runtime.gate(&declaration.id);
+        if gate.abandoned.load(Ordering::Acquire) > 0 {
+            self.chain.failure(
+                index,
+                "middleware id quarantined while an abandoned invocation is still running",
+            )?;
+            return Ok(None);
+        }
+        let bound = declaration.max_duration;
+        let capacity_started = tokio::time::Instant::now();
+        let deadline = capacity_started + bound;
+        let middleware_slot = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&gate.slots).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(_)) => {
+                self.chain
+                    .failure(index, "middleware invocation capacity closed")?;
+                return Ok(None);
+            }
+            Err(_) => {
+                crate::telemetry::metrics::record_middleware_capacity_wait(
+                    capacity_started.elapsed().as_secs_f64() * 1_000.0,
+                    true,
+                );
+                self.chain.failure(
+                    index,
+                    "invocation bound exceeded waiting for per-middleware capacity",
+                )?;
+                return Ok(None);
+            }
+        };
+        let process_slot = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.runtime.slots).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(_)) => {
+                self.chain
+                    .failure(index, "process invocation capacity closed")?;
+                return Ok(None);
+            }
+            Err(_) => {
+                crate::telemetry::metrics::record_middleware_capacity_wait(
+                    capacity_started.elapsed().as_secs_f64() * 1_000.0,
+                    true,
+                );
+                self.chain
+                    .failure(index, "invocation bound exceeded waiting for capacity")?;
+                return Ok(None);
+            }
+        };
+        if invocation_deadline_expired(deadline) {
+            crate::telemetry::metrics::record_middleware_capacity_wait(
+                capacity_started.elapsed().as_secs_f64() * 1_000.0,
+                true,
+            );
+            drop(process_slot);
+            drop(middleware_slot);
+            self.chain
+                .failure(index, "invocation bound exhausted waiting for capacity")?;
+            return Ok(None);
+        }
+        crate::telemetry::metrics::record_middleware_capacity_wait(
+            capacity_started.elapsed().as_secs_f64() * 1_000.0,
+            false,
+        );
+        Ok(Some(InvocationCapacity {
+            deadline,
+            process_slot,
+            middleware_slot,
+            invocation_state: Arc::new(Mutex::new(InvocationState::Running)),
+            gate,
+        }))
+    }
+}
+
 fn routing_fields_unchanged(before: &ProviderRequest, after: &ProviderRequest) -> bool {
     before.model == after.model
         && before.body.get("model") == after.body.get("model")
         && before.body.get("stream") == after.body.get("stream")
         && before.body.get("previous_response_id") == after.body.get("previous_response_id")
-}
-
-fn middleware_scope_name(scope: MiddlewareScope) -> &'static str {
-    match scope {
-        MiddlewareScope::Request => "request",
-        MiddlewareScope::Response => "response",
-        MiddlewareScope::StreamEvent => "stream_event",
-    }
 }
 
 fn stable_refusal_reason(reason: MiddlewareRefusal) -> &'static str {
@@ -612,8 +893,13 @@ mod tests {
     use crate::config::NamespacePolicy;
     use crate::desired_state::fixtures::{policy_body, revision_id, tenant_id};
     use crate::desired_state::{PolicyEpoch, PolicyScope};
-    use gateway_core::{MiddlewareDeclaration, MiddlewareFailurePosture, MiddlewareOutcome};
+    use gateway_core::{
+        MiddlewareDeclaration, MiddlewareFailurePosture, MiddlewareOutcome, MiddlewareState,
+        ModelUsage,
+    };
     use serde_json::json;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn registration(
         id: &str,
@@ -1076,17 +1362,489 @@ namespace = "alpha"
     }
 
     #[test]
-    fn scopes_without_an_invocation_path_are_rejected_before_activation() {
-        for (scope, expected) in [
-            (MiddlewareScope::Response, "response"),
-            (MiddlewareScope::StreamEvent, "stream_event"),
-        ] {
-            let declaration = MiddlewareDeclaration::new(expected, [scope]);
-            assert!(matches!(
-                MiddlewareChain::new(vec![Arc::new(Noop { declaration })]),
-                Err(MiddlewareChainError::ScopeUnsupported { scope, .. }) if scope == expected
-            ));
+    fn all_implemented_scopes_are_accepted_at_registration() {
+        let declaration = MiddlewareDeclaration::new(
+            "all-scopes",
+            [
+                MiddlewareScope::Request,
+                MiddlewareScope::Response,
+                MiddlewareScope::StreamEvent,
+            ],
+        );
+        let chain = MiddlewareChain::new(vec![Arc::new(Noop { declaration })])
+            .expect("every declared scope has an invocation path");
+        assert_eq!(chain.len(), 1);
+    }
+
+    #[derive(Debug)]
+    struct PhaseCounts {
+        responses: usize,
+        stream_events: usize,
+    }
+
+    struct OrderedStateful {
+        declaration: MiddlewareDeclaration,
+        marker: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Middleware for OrderedStateful {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
         }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            match phase {
+                MiddlewarePhase::Request(_) => {
+                    self.calls
+                        .lock()
+                        .expect("call log")
+                        .push(format!("{}:request", self.marker));
+                    Ok(MiddlewareOutcome::continue_with_state(
+                        MiddlewareState::new(PhaseCounts {
+                            responses: 0,
+                            stream_events: 0,
+                        }),
+                    ))
+                }
+                MiddlewarePhase::Response(response) => {
+                    let counts = state
+                        .and_then(|state| state.downcast_mut::<PhaseCounts>())
+                        .expect("request state is reused for response");
+                    counts.responses += 1;
+                    response.body["order"]
+                        .as_array_mut()
+                        .expect("response order array")
+                        .push(json!(self.marker));
+                    self.calls
+                        .lock()
+                        .expect("call log")
+                        .push(format!("{}:response", self.marker));
+                    Ok(MiddlewareOutcome::continue_without_state())
+                }
+                MiddlewarePhase::StreamEvent(event) => {
+                    let counts = state
+                        .and_then(|state| state.downcast_mut::<PhaseCounts>())
+                        .expect("request state is reused for stream event");
+                    counts.stream_events += 1;
+                    let ProviderStreamEvent::Data { data, .. } = event else {
+                        panic!("terminal usage is not dispatched");
+                    };
+                    data["order"]
+                        .as_array_mut()
+                        .expect("event order array")
+                        .push(json!(self.marker));
+                    self.calls
+                        .lock()
+                        .expect("call log")
+                        .push(format!("{}:stream", self.marker));
+                    Ok(MiddlewareOutcome::continue_without_state())
+                }
+            }
+        }
+    }
+
+    fn ordered_stateful(
+        marker: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+    ) -> Arc<dyn Middleware> {
+        let mut declaration = MiddlewareDeclaration::new(
+            marker,
+            [
+                MiddlewareScope::Request,
+                MiddlewareScope::Response,
+                MiddlewareScope::StreamEvent,
+            ],
+        );
+        declaration.mutates_response = true;
+        Arc::new(OrderedStateful {
+            declaration,
+            marker,
+            calls,
+        })
+    }
+
+    #[tokio::test]
+    async fn execution_pins_state_and_unwinds_response_scopes_in_reverse_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let chain = MiddlewareChain::new(vec![
+            ordered_stateful("first", Arc::clone(&calls)),
+            ordered_stateful("second", Arc::clone(&calls)),
+        ])
+        .expect("stateful chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain
+            .start_isolated(&mut request)
+            .await
+            .expect("request scopes");
+        let mut response = ProviderResponse {
+            body: json!({"order": []}),
+            usage: ModelUsage::default(),
+        };
+        execution
+            .response(&mut response)
+            .await
+            .expect("response scopes");
+        let mut event = ProviderStreamEvent::Data {
+            event: Some("delta".to_owned()),
+            data: json!({"order": []}),
+        };
+        execution
+            .stream_event(&mut event)
+            .await
+            .expect("stream scopes");
+
+        assert_eq!(response.body["order"], json!(["second", "first"]));
+        let ProviderStreamEvent::Data { data, .. } = event else {
+            panic!("data event remains data");
+        };
+        assert_eq!(data["order"], json!(["second", "first"]));
+        assert_eq!(
+            *calls.lock().expect("call log"),
+            vec![
+                "first:request",
+                "second:request",
+                "second:response",
+                "first:response",
+                "second:stream",
+                "first:stream",
+            ]
+        );
+        for index in 0..2 {
+            let counts = execution
+                .states
+                .get_mut(index)
+                .and_then(|state| state.downcast_ref::<PhaseCounts>());
+            let counts = counts.expect("state remains in its original slot");
+            assert_eq!(counts.responses, 1);
+            assert_eq!(counts.stream_events, 1);
+        }
+    }
+
+    struct FailingOutputMutator {
+        declaration: MiddlewareDeclaration,
+    }
+
+    impl Middleware for FailingOutputMutator {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            match phase {
+                MiddlewarePhase::Response(response) => response.body["escaped"] = json!(true),
+                MiddlewarePhase::StreamEvent(ProviderStreamEvent::Data { data, .. }) => {
+                    data["escaped"] = json!(true);
+                }
+                _ => {}
+            }
+            Err(MiddlewareError::Failed)
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_open_response_errors_discard_every_partial_output_mutation() {
+        let mut declaration = MiddlewareDeclaration::new(
+            "optional-output",
+            [MiddlewareScope::Response, MiddlewareScope::StreamEvent],
+        );
+        declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        declaration.mutates_response = true;
+        let chain = MiddlewareChain::new(vec![Arc::new(FailingOutputMutator { declaration })])
+            .expect("output chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain.start_isolated(&mut request).await.expect("execution");
+
+        let mut response = ProviderResponse {
+            body: json!({"original": true}),
+            usage: ModelUsage::default(),
+        };
+        let original_response = response.clone();
+        execution.response(&mut response).await.expect("fail open");
+        assert_eq!(response, original_response);
+
+        let mut event = ProviderStreamEvent::Data {
+            event: None,
+            data: json!({"original": true}),
+        };
+        let original_event = event.clone();
+        execution.stream_event(&mut event).await.expect("fail open");
+        assert_eq!(event, original_event);
+    }
+
+    struct RefusingOutputMutator {
+        declaration: MiddlewareDeclaration,
+    }
+
+    impl Middleware for RefusingOutputMutator {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            if let MiddlewarePhase::Response(response) = phase {
+                response.body["must_not_escape"] = json!(true);
+            }
+            Ok(MiddlewareOutcome::refuse(MiddlewareRefusal::Policy))
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_output_refusal_is_never_weakened_by_fail_open() {
+        let mut declaration =
+            MiddlewareDeclaration::new("output-guard", [MiddlewareScope::Response]);
+        declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        declaration.mutates_response = true;
+        let chain = MiddlewareChain::new(vec![Arc::new(RefusingOutputMutator { declaration })])
+            .expect("output chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain.start_isolated(&mut request).await.expect("execution");
+        let mut response = ProviderResponse {
+            body: json!({"original": true}),
+            usage: ModelUsage::default(),
+        };
+        let original = response.clone();
+
+        assert!(matches!(
+            execution.response(&mut response).await,
+            Err(GatewayError::MiddlewareRefused { reason: "policy" })
+        ));
+        assert_eq!(response, original);
+    }
+
+    struct SlowStatefulOutput {
+        declaration: MiddlewareDeclaration,
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        response_calls: Arc<AtomicUsize>,
+    }
+
+    impl Middleware for SlowStatefulOutput {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            match phase {
+                MiddlewarePhase::Request(_) => Ok(MiddlewareOutcome::continue_with_state(
+                    MiddlewareState::new(0_usize),
+                )),
+                MiddlewarePhase::Response(response) => {
+                    self.response_calls.fetch_add(1, Ordering::SeqCst);
+                    let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.maximum.fetch_max(active, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(50));
+                    *state
+                        .and_then(|state| state.downcast_mut::<usize>())
+                        .expect("request state") += 1;
+                    response.body["late"] = json!(true);
+                    self.active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(MiddlewareOutcome::continue_without_state())
+                }
+                MiddlewarePhase::StreamEvent(_) => Ok(MiddlewareOutcome::continue_without_state()),
+            }
+        }
+    }
+
+    fn slow_stateful_output(
+        posture: MiddlewareFailurePosture,
+    ) -> (Arc<dyn Middleware>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::new(AtomicUsize::new(0));
+        let mut declaration = MiddlewareDeclaration::new(
+            "slow-stateful",
+            [MiddlewareScope::Request, MiddlewareScope::Response],
+        );
+        declaration.failure_posture = posture;
+        declaration.max_duration = Duration::from_millis(5);
+        (
+            Arc::new(SlowStatefulOutput {
+                declaration,
+                active,
+                maximum: Arc::clone(&maximum),
+                response_calls: Arc::clone(&response_calls),
+            }),
+            maximum,
+            response_calls,
+        )
+    }
+
+    #[tokio::test]
+    async fn timed_out_fail_open_state_is_stranded_and_never_invoked_concurrently() {
+        let (entry, maximum, response_calls) =
+            slow_stateful_output(MiddlewareFailurePosture::FailOpen);
+        let chain = MiddlewareChain::new(vec![entry]).expect("slow chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain
+            .start_isolated(&mut request)
+            .await
+            .expect("request state");
+        let mut first = ProviderResponse {
+            body: json!({}),
+            usage: ModelUsage::default(),
+        };
+        execution.response(&mut first).await.expect("fail open");
+        assert_eq!(first.body, json!({}));
+        assert!(execution.stranded[0]);
+
+        let mut second = first.clone();
+        execution
+            .response(&mut second)
+            .await
+            .expect("stranded fail-open slot is disabled");
+        assert_eq!(response_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_fail_closed_state_remains_failed_for_the_response_lifetime() {
+        let (entry, _maximum, response_calls) =
+            slow_stateful_output(MiddlewareFailurePosture::FailClosed);
+        let chain = MiddlewareChain::new(vec![entry]).expect("slow chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain
+            .start_isolated(&mut request)
+            .await
+            .expect("request state");
+        let mut response = ProviderResponse {
+            body: json!({}),
+            usage: ModelUsage::default(),
+        };
+        assert!(matches!(
+            execution.response(&mut response).await,
+            Err(GatewayError::MiddlewareUnavailable)
+        ));
+        assert!(matches!(
+            execution.response(&mut response).await,
+            Err(GatewayError::MiddlewareUnavailable)
+        ));
+        assert_eq!(response_calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    struct UsageMutator {
+        declaration: MiddlewareDeclaration,
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    impl Middleware for UsageMutator {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            match phase {
+                MiddlewarePhase::Response(response) => {
+                    response.body["changed"] = json!(true);
+                    response.usage.output_tokens = 999;
+                }
+                MiddlewarePhase::StreamEvent(event) => {
+                    self.stream_calls.fetch_add(1, Ordering::SeqCst);
+                    *event = ProviderStreamEvent::Done(ModelUsage {
+                        output_tokens: 999,
+                        ..ModelUsage::default()
+                    });
+                }
+                MiddlewarePhase::Request(_) => {}
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_usage_and_terminal_stream_usage_remain_gateway_owned() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let mut declaration = MiddlewareDeclaration::new(
+            "usage-mutator",
+            [MiddlewareScope::Response, MiddlewareScope::StreamEvent],
+        );
+        declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        declaration.mutates_response = true;
+        let chain = MiddlewareChain::new(vec![Arc::new(UsageMutator {
+            declaration,
+            stream_calls: Arc::clone(&stream_calls),
+        })])
+        .expect("output chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain.start_isolated(&mut request).await.expect("execution");
+        let mut response = ProviderResponse {
+            body: json!({"original": true}),
+            usage: ModelUsage {
+                input_tokens: 3,
+                output_tokens: 5,
+                ..ModelUsage::default()
+            },
+        };
+        let original = response.clone();
+        execution
+            .response(&mut response)
+            .await
+            .expect("usage mutation follows fail-open posture");
+        assert_eq!(response, original);
+
+        let mut data = ProviderStreamEvent::Data {
+            event: Some("delta".to_owned()),
+            data: json!({"original": true}),
+        };
+        let original_data = data.clone();
+        execution
+            .stream_event(&mut data)
+            .await
+            .expect("synthetic terminal usage follows fail-open posture");
+        assert_eq!(data, original_data);
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+
+        let usage = ModelUsage {
+            output_tokens: 8,
+            ..ModelUsage::default()
+        };
+        let mut done = ProviderStreamEvent::Done(usage);
+        execution
+            .stream_event(&mut done)
+            .await
+            .expect("terminal event bypasses middleware");
+        assert_eq!(done, ProviderStreamEvent::Done(usage));
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1132,17 +1890,15 @@ namespace = "alpha"
                 ..
             })
         ));
+    }
 
-        let unsupported = config_with_registration(registration(
+    #[test]
+    fn policy_registration_accepts_response_and_stream_event_scopes() {
+        let config = config_with_registration(registration(
             "test.policy-marker",
-            [MiddlewareScope::Response],
+            [MiddlewareScope::Response, MiddlewareScope::StreamEvent],
         ));
-        assert!(matches!(
-            MiddlewarePlan::compile(&unsupported),
-            Err(MiddlewarePlanError {
-                source: MiddlewarePolicyError::UnsupportedScope { .. },
-                ..
-            })
-        ));
+        let plan = MiddlewarePlan::compile(&config).expect("implemented scopes compile");
+        assert_eq!(plan.for_namespace("alpha").len(), 1);
     }
 }

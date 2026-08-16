@@ -540,11 +540,7 @@ pub fn record_upstream_timeout(
 /// Caller-independent provider TTFT. Kept separate from
 /// `axond.request.time_to_first_token`, which includes any explicit
 /// policy-buffering delay before bytes become available downstream.
-pub(crate) fn record_upstream_ttft(
-    target_provider: &str,
-    target_model: &str,
-    duration_ms: f64,
-) {
+pub(crate) fn record_upstream_ttft(target_provider: &str, target_model: &str, duration_ms: f64) {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
     };
