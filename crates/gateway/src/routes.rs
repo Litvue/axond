@@ -1473,8 +1473,16 @@ async fn serve(
     };
     let middleware_state = state.0.middleware.request(&mut middleware_request).await?;
     let body = middleware_request.body;
-    let estimate = route.estimate(&body);
-    check_estimate_bounds(&body, estimate, limits)?;
+    // An empty chain is byte-neutral, so the pre-admission estimate is already
+    // authoritative. Avoid serializing every request body a second time in the
+    // default posture; only a configured chain can make the estimate differ.
+    let estimate = if state.0.middleware.is_empty() {
+        estimate
+    } else {
+        let recomputed = route.estimate(&body);
+        check_estimate_bounds(&body, recomputed, limits)?;
+        recomputed
+    };
 
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate
     // from the post-middleware body before dispatch; settle the hold against the
