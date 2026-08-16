@@ -249,6 +249,7 @@ fn routing_fields_unchanged(before: &ProviderRequest, after: &ProviderRequest) -
     before.model == after.model
         && before.body.get("model") == after.body.get("model")
         && before.body.get("stream") == after.body.get("stream")
+        && before.body.get("previous_response_id") == after.body.get("previous_response_id")
 }
 
 fn middleware_scope_name(scope: MiddlewareScope) -> &'static str {
@@ -417,6 +418,7 @@ mod tests {
                 request.model = "rerouted".to_owned();
                 request.body["model"] = json!("rerouted");
                 request.body["stream"] = json!(false);
+                request.body["previous_response_id"] = json!("rerouted-continuation");
             }
             Ok(MiddlewareOutcome::continue_without_state())
         }
@@ -432,7 +434,11 @@ mod tests {
         .expect("valid chain");
         let mut open_request = ProviderRequest {
             model: "alias".to_owned(),
-            body: json!({"model": "alias", "stream": true}),
+            body: json!({
+                "model": "alias",
+                "stream": true,
+                "previous_response_id": "pinned-continuation",
+            }),
         };
         let open_original = open_request.clone();
         open_chain

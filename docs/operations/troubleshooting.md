@@ -31,6 +31,8 @@ Boot errors name references and identifiers, not secret values.
 | `404 unknown_model` | Alias is absent or unavailable to the caller namespace. | `/v1/models`, credential coverage, alias spelling. |
 | `400 unsupported_wire` | Route and alias provider family differ. | Keep every alias target in one wire family and use the matching route. |
 | `400 bad_request` | Invalid request or query shape. | Error message; repeated/invalid `namespaces` values are rejected deliberately. |
+| `400 middleware_refused` | Request middleware classified the request as invalid before provider dispatch. | Request shape and the namespace's selected content policy. |
+| `403 middleware_refused` | A content-policy guardrail denied the authenticated request before provider dispatch. | The namespace's selected policy; this is not provider or credential health. |
 | `429 budget_exceeded` | Subject or namespace spend cap cannot admit the estimate. | Budget metrics and namespace-denial metric. |
 | `429 rate_limit_exceeded` | In-flight concurrency cap reached. | Caller concurrency and limiter metrics. |
 | `429 tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. | `axond.admission.in_flight`; whether the tenant's own concurrency, not the replica, is the cause. |
@@ -48,6 +50,7 @@ Boot errors name references and identifiers, not secret values.
 | `503 usage_not_durable` | Billing-grade delivery is on and the request's usage event could not be made durable, so the gateway will not report success for a request it cannot bill. | `axond.usage.journal.appends` by outcome, and depth against capacity: a full outbox usually means delivery has stalled, not that appends are too fast — or a retired `consumer` name is still registered and holding retention open ([usage outbox](./usage-outbox.md#when-a-request-is-refused)). |
 | `503 budget_unavailable` | Shared budget backend failed under fail-closed policy. | Redis/Postgres health and latency. |
 | `503 rate_limit_unavailable` | Redis limiter failed under fail-closed policy. | Redis health, invoke saturation, connection recovery. |
+| `503 middleware_unavailable` | Fail-closed middleware failed, exceeded its end-to-end deadline, or timed out waiting for bounded blocking capacity. | Middleware warning logs, `axond.middleware.capacity_wait`, and `axond.middleware.capacity_timeouts`. |
 | `503 revocation_unavailable` | JTI store failed under fail-closed policy. | Redis/Postgres health and configured policy. |
 | `503 continuation_affinity_unavailable` | A request carrying `previous_response_id` cannot safely use its pinned first target or credential. | First-target circuit and first-credential state; retry later. |
 

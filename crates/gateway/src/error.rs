@@ -171,6 +171,10 @@ impl GatewayError {
             Self::RequestTooLarge | Self::PromptTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::OutputLimitExceeded { .. } => StatusCode::BAD_REQUEST,
+            // A policy guardrail denied an authenticated request rather than
+            // finding its shape malformed. Keep invalid-request refusals at 400,
+            // but expose policy denial with the ordinary authorization status.
+            Self::MiddlewareRefused { reason: "policy" } => StatusCode::FORBIDDEN,
             Self::MiddlewareRefused { .. } => StatusCode::BAD_REQUEST,
             Self::MiddlewareUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             // Retryable elsewhere immediately: this replica is leaving, not
@@ -340,6 +344,23 @@ mod tests {
         let unavailable = GatewayError::RateLimitUnavailable;
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.code(), "rate_limit_unavailable");
+    }
+
+    #[test]
+    fn middleware_refusal_distinguishes_policy_from_invalid_input() {
+        let policy = GatewayError::MiddlewareRefused { reason: "policy" };
+        assert_eq!(policy.status(), StatusCode::FORBIDDEN);
+        assert_eq!(policy.code(), "middleware_refused");
+
+        let invalid = GatewayError::MiddlewareRefused {
+            reason: "invalid_request",
+        };
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.code(), "middleware_refused");
+
+        let unavailable = GatewayError::MiddlewareUnavailable;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.code(), "middleware_unavailable");
     }
 
     #[test]
