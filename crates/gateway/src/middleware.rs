@@ -16,10 +16,12 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use gateway_core::MiddlewareDeclaration;
 use gateway_core::{
-    Middleware, MiddlewareDeclaration, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed,
-    MiddlewareOutcome, MiddlewarePhase, MiddlewareRefusal, MiddlewareScope, MiddlewareStateBag,
-    MiddlewareVerdict, ProviderRequest,
+    Middleware, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed, MiddlewareOutcome,
+    MiddlewarePhase, MiddlewareRefusal, MiddlewareScope, MiddlewareStateBag, MiddlewareVerdict,
+    ProviderRequest,
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -284,6 +286,7 @@ impl MiddlewarePlan {
     }
 }
 
+#[cfg(test)]
 fn declaration(registration: &ContentMiddlewareRegistration) -> MiddlewareDeclaration {
     let mut declaration =
         MiddlewareDeclaration::new(registration.id(), registration.scopes().iter().copied());

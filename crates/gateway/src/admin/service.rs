@@ -224,10 +224,14 @@ pub struct AdminService {
 }
 
 impl AdminService {
-    fn validate_compiled_middleware(state: &DesiredState) -> Result<(), AdminError> {
-        for resource in state
+    fn validate_compiled_middleware(
+        before: &DesiredState,
+        after: &DesiredState,
+    ) -> Result<(), AdminError> {
+        for resource in after
             .resources()
             .filter(|resource| resource.reference.kind == ResourceKind::Policy)
+            .filter(|resource| before.get(&resource.reference) != Some(*resource))
         {
             let policy = PolicyBody::read(resource).map_err(ValidationError::from)?;
             validate_content_middleware(policy.content_middleware()).map_err(|error| {
@@ -789,7 +793,7 @@ impl AdminService {
             }
             Err(error) => return Err(error.into()),
         };
-        if let Err(error) = Self::validate_compiled_middleware(&candidate.state) {
+        if let Err(error) = Self::validate_compiled_middleware(current_state, &candidate.state) {
             if !expected.matches(head) {
                 return Err(AdminError::RevisionConflict {
                     expected,
@@ -886,4 +890,50 @@ pub(super) fn log_store(error: ControlPlaneError) -> AdminError {
         );
     }
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway_core::{MiddlewareFailurePosture, MiddlewareScope};
+
+    use super::AdminService;
+    use crate::desired_state::{ContentMiddlewareRegistration, DesiredState, Slug, fixtures};
+
+    fn state_with_unavailable_middleware() -> DesiredState {
+        let registration = ContentMiddlewareRegistration::new(
+            "future.middleware",
+            [MiddlewareScope::Request],
+            MiddlewareFailurePosture::FailClosed,
+            25,
+        )
+        .expect("a typed registration this build has not compiled");
+        let policy = fixtures::tenant_policy_body(1, 1)
+            .with_content_middleware(vec![registration])
+            .expect("one registration is a valid policy")
+            .version(Slug::parse("limits").expect("a policy slug"));
+        let mut state = DesiredState::new();
+        state
+            .insert(fixtures::tenant(1, "acme"))
+            .and_then(|state| state.insert(policy))
+            .expect("the policy belongs to the tenant");
+        state
+    }
+
+    #[test]
+    fn existing_unavailable_middleware_does_not_block_an_unrelated_write() {
+        let before = state_with_unavailable_middleware();
+        let mut after = before.clone();
+        after
+            .insert(fixtures::tenant(2, "beta"))
+            .expect("an unrelated tenant is a valid addition");
+
+        AdminService::validate_compiled_middleware(&before, &after)
+            .expect("only changed policies require this build's compiled middleware");
+
+        let empty = DesiredState::new();
+        assert!(
+            AdminService::validate_compiled_middleware(&empty, &before).is_err(),
+            "publishing the unavailable registration itself must still be refused"
+        );
+    }
 }
