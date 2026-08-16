@@ -307,9 +307,16 @@ impl PolicyError {
             // policy had one at all is another release's writing, while a marker
             // that is present and unreadable is `DamagedSchema`.
             Self::MissingField { field, .. } => *field == SCHEMA_FIELD,
-            Self::FieldType { .. }
-            | Self::DamagedSchema { .. }
-            | Self::InvalidMiddleware { .. } => false,
+            Self::FieldType { .. } | Self::DamagedSchema { .. } => false,
+            Self::InvalidMiddleware { source, .. } => matches!(
+                source,
+                InvalidContentMiddleware::Scope(_)
+                    | InvalidContentMiddleware::FailurePosture(_)
+                    | InvalidContentMiddleware::ZeroBound
+                    | InvalidContentMiddleware::BoundTooLarge
+                    | InvalidContentMiddleware::CoreStage(_)
+                    | InvalidContentMiddleware::TooMany
+            ),
             Self::FieldRange { .. } => true,
             Self::Kind { .. }
             | Self::NotInline { .. }
@@ -2638,6 +2645,39 @@ mod tests {
             source: InvalidPolicy::TooSmall { value: 0, min: 1 },
         };
         assert!(below_a_bound.is_incompatible(), "{below_a_bound}");
+    }
+
+    #[test]
+    fn content_middleware_skew_is_distinguished_from_damaged_registration_state() {
+        let reference = tenant_policy(1, 1).reference;
+        for source in [
+            InvalidContentMiddleware::Scope("future_scope".to_owned()),
+            InvalidContentMiddleware::FailurePosture("future_posture".to_owned()),
+            InvalidContentMiddleware::ZeroBound,
+            InvalidContentMiddleware::BoundTooLarge,
+            InvalidContentMiddleware::CoreStage("future-core-stage".to_owned()),
+            InvalidContentMiddleware::TooMany,
+        ] {
+            let error = PolicyError::InvalidMiddleware {
+                reference,
+                field: CONTENT_MIDDLEWARE_FIELD.to_owned(),
+                source,
+            };
+            assert!(error.is_incompatible(), "{error}");
+        }
+        for source in [
+            InvalidContentMiddleware::Id,
+            InvalidContentMiddleware::NoScope,
+            InvalidContentMiddleware::DuplicateScope("request"),
+            InvalidContentMiddleware::DuplicateId("duplicate".to_owned()),
+        ] {
+            let error = PolicyError::InvalidMiddleware {
+                reference,
+                field: CONTENT_MIDDLEWARE_FIELD.to_owned(),
+                source,
+            };
+            assert!(!error.is_incompatible(), "{error}");
+        }
     }
 
     #[test]

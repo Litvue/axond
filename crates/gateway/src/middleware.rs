@@ -235,6 +235,18 @@ impl MiddlewareRegistry {
     }
 }
 
+/// Validate one policy's registrations against the implementations and scopes
+/// compiled into this binary before an administrative candidate is published.
+/// Snapshot compilation calls the same registry again as a defence-in-depth
+/// check when a revision is hydrated on another replica.
+pub(crate) fn validate_content_middleware(
+    registrations: &[ContentMiddlewareRegistration],
+) -> Result<(), MiddlewarePolicyError> {
+    MiddlewareRegistry::builtins()
+        .compile(registrations)
+        .map(|_| ())
+}
+
 /// Every namespace's compiled chain in one serving snapshot.
 #[derive(Clone, Default)]
 pub struct MiddlewarePlan {

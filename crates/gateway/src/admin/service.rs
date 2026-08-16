@@ -74,9 +74,10 @@ use crate::convergence::{ChangeSignal, RevisionReport};
 use crate::desired_state::models::legacy_alias_allowlist;
 use crate::desired_state::{
     AccessDenial, Actor, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
-    LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
-    Uuid7Generator, ValidationError,
+    LoadedRevision, Mutation, MutationId, PolicyBody, ResourceKind, ResourceScope,
+    RevisionCandidate, RevisionId, Surface, Uuid7Generator, ValidationError,
 };
+use crate::middleware::validate_content_middleware;
 use crate::status::StatusScope;
 
 /// Whether a grant at `granted` may change a resource scoped to `resource`.
@@ -223,6 +224,23 @@ pub struct AdminService {
 }
 
 impl AdminService {
+    fn validate_compiled_middleware(state: &DesiredState) -> Result<(), AdminError> {
+        for resource in state
+            .resources()
+            .filter(|resource| resource.reference.kind == ResourceKind::Policy)
+        {
+            let policy = PolicyBody::read(resource).map_err(ValidationError::from)?;
+            validate_content_middleware(policy.content_middleware()).map_err(|error| {
+                AdminError::ValidationFailed {
+                    rule: "content_middleware_unavailable",
+                    reference: Some(resource.reference),
+                    detail: error.to_string(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     /// The service a stateless deployment runs: every operation is
     /// [`AdminError::StatefulModeRequired`].
     pub fn stateless() -> Self {
@@ -771,6 +789,15 @@ impl AdminService {
             }
             Err(error) => return Err(error.into()),
         };
+        if let Err(error) = Self::validate_compiled_middleware(&candidate.state) {
+            if !expected.matches(head) {
+                return Err(AdminError::RevisionConflict {
+                    expected,
+                    actual: head,
+                });
+            }
+            return Err(error);
+        }
         let diff = SemanticDiff::between(Some(current_state), &candidate.state)?;
         let base = base.map(|id| id.to_string());
 
