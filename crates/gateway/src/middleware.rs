@@ -661,13 +661,15 @@ mod tests {
                 _phase: MiddlewarePhase<'_>,
                 _state: Option<&mut gateway_core::MiddlewareState>,
             ) -> gateway_core::MiddlewareResult {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(500));
                 Ok(MiddlewareOutcome::continue_without_state())
             }
         }
 
         let mut declaration = MiddlewareDeclaration::new("stuck", [MiddlewareScope::Request]);
-        declaration.max_duration = Duration::from_millis(1);
+        // Leave ample executor-scheduling time so this specifically exercises
+        // a closure abandoned after it starts, not the pre-spawn deadline gate.
+        declaration.max_duration = Duration::from_millis(100);
         let chain =
             MiddlewareChain::new(vec![Arc::new(Slow { declaration })]).expect("bounded chain");
         let runtime = MiddlewareRuntime {
