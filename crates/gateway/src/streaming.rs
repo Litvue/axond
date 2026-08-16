@@ -294,8 +294,7 @@ pub fn relay_opened(
     relay_opened_with_state(
         state,
         ctx,
-        decoder,
-        bytes,
+        OpenedStream { decoder, bytes },
         started,
         framing,
         rotation,
@@ -310,13 +309,13 @@ pub fn relay_opened(
 pub fn relay_opened_with_state(
     state: AppState,
     ctx: StreamContext,
-    decoder: Box<dyn ProviderStreamDecoder>,
-    bytes: ByteStream,
+    opened: OpenedStream,
     started: Instant,
     framing: Framing,
     rotation: Option<RotationHandle>,
     middleware_state: MiddlewareStateBag,
 ) -> Response {
+    let OpenedStream { decoder, bytes } = opened;
     // A stream's *total* lifetime, as opposed to the transport's idle bound,
     // which a trickle of keepalives resets forever.
     let limits = state.0.admission.limits();

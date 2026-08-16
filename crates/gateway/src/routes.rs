@@ -2212,8 +2212,7 @@ async fn stream_with_failover(
                     return Ok(streaming::relay_opened_with_state(
                         state.clone(),
                         ctx,
-                        decoder,
-                        bytes,
+                        streaming::OpenedStream { decoder, bytes },
                         started,
                         wire.route.framing(),
                         Some(rotation),
