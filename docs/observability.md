@@ -165,6 +165,7 @@ destination receives by exactly what the refusals in
 | `axond.cost.microdollars` | counter (µUSD) | same | Spend, priced from the target catalogue. |
 | `axond.upstream.errors` | counter | same | Upstream failure rate by target. |
 | `axond.upstream.timeouts` | counter | `axond.target.provider`, `axond.target.model`, `axond.timeout`, `axond.timeout.bound` | Which phase stalled — `connect`, `response_headers`, `buffered_body`, `stream_idle`, or `overall` (nothing was dispatched) — and whether the `phase` bound or the remaining `walk_budget` ended the wait. |
+| `axond.upstream.time_to_first_token` | histogram (ms) | `axond.target.provider`, `axond.target.model` | Provider TTFT measured at the first decoded stream event, before any explicit middleware response buffering. |
 | `axond.upstream.circuit_state` | gauge | `axond.target.provider`, `axond.target.model` | `0` closed, `1` half-open, `2` open. |
 | `axond.usage.records_written` | counter | `axond.usage_sink` | Records a sink acknowledged. In billing-grade mode the delivery worker emits it, for records a destination accepted. |
 | `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. `shutdown` means the termination flush could not write them. Billing-grade mode has no buffer to drop from: a failed write stays journaled, so watch `axond.usage.journal.lost` there instead. |
@@ -189,6 +190,7 @@ destination receives by exactly what the refusals in
 | `axond.budget.retained_subjects` | gauge | — | In-memory ledgers retained after capacity-pressure pruning; watch against `max_subjects`. |
 | `axond.middleware.capacity_wait` | histogram (ms) | — | Time content middleware waits for one of the bounded blocking-executor slots. Sustained growth means late synchronous invocations are retaining capacity. |
 | `axond.middleware.capacity_timeouts` | counter | — | Requests whose middleware deadline expired while waiting for blocking capacity. Alert on any sustained increase alongside `middleware_unavailable` responses. |
+| `axond.middleware.response_buffering_duration` | histogram (ms) | — | Gateway-added delay when an operator explicitly buffers a byte-faithful streaming route so response middleware can run; compare with upstream TTFT to separate policy cost from provider latency. |
 | `axond.rate_limit.denials` | counter | — | Inbound concurrency admissions rejected. |
 | `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
 | `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |

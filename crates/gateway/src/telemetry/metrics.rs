@@ -33,6 +33,7 @@ struct Instruments {
     cost: Counter<u64>,
     upstream_errors: Counter<u64>,
     upstream_timeouts: Counter<u64>,
+    upstream_ttft: Histogram<f64>,
     circuit_state: Gauge<u64>,
     usage_written: Counter<u64>,
     usage_dropped: Counter<u64>,
@@ -66,6 +67,7 @@ struct Instruments {
     budget_retained_subjects: Gauge<u64>,
     middleware_capacity_wait: Histogram<f64>,
     middleware_capacity_timeouts: Counter<u64>,
+    middleware_buffering_duration: Histogram<f64>,
     admission_in_flight: UpDownCounter<i64>,
     admission_rejections: Counter<u64>,
     rate_limit_denials: Counter<u64>,
@@ -150,6 +152,13 @@ impl Instruments {
                 .u64_counter("axond.upstream.timeouts")
                 .with_description(
                     "Upstream attempts that exceeded a transport bound, by target and phase.",
+                )
+                .build(),
+            upstream_ttft: meter
+                .f64_histogram("axond.upstream.time_to_first_token")
+                .with_unit("ms")
+                .with_description(
+                    "Time from dispatch until the first decoded provider stream event.",
                 )
                 .build(),
             circuit_state: meter
@@ -348,6 +357,13 @@ impl Instruments {
                     "Middleware invocations whose end-to-end bound expired waiting for capacity.",
                 )
                 .build(),
+            middleware_buffering_duration: meter
+                .f64_histogram("axond.middleware.response_buffering_duration")
+                .with_unit("ms")
+                .with_description(
+                    "Time spent fully buffering a stream for response-mutating middleware.",
+                )
+                .build(),
             admission_in_flight: meter
                 .i64_up_down_counter("axond.admission.in_flight")
                 .with_description(
@@ -519,6 +535,38 @@ pub fn record_upstream_timeout(
             KeyValue::new("axond.timeout.bound", bound),
         ],
     );
+}
+
+/// Caller-independent provider TTFT. Kept separate from
+/// `axond.request.time_to_first_token`, which includes any explicit
+/// policy-buffering delay before bytes become available downstream.
+pub(crate) fn record_upstream_ttft(
+    target_provider: &str,
+    target_model: &str,
+    duration_ms: f64,
+) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.upstream_ttft.record(
+        duration_ms,
+        &[
+            KeyValue::new("axond.target.provider", target_provider.to_owned()),
+            KeyValue::new("axond.target.model", target_model.to_owned()),
+        ],
+    );
+}
+
+/// Gateway-added latency from an operator's explicit response-buffering
+/// policy. No route or tenant label is needed to distinguish it from provider
+/// TTFT, and keeping it label-free bounds cardinality.
+pub(crate) fn record_middleware_buffering_duration(duration_ms: f64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .middleware_buffering_duration
+        .record(duration_ms, &[]);
 }
 
 /// Usage records a sink durably accepted. Counted by the batching fan-out, so
