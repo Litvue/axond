@@ -101,7 +101,9 @@ pub enum StreamDelivery {
     PolicyBuffered,
     /// Decode and validate the complete stream while holding the provider's
     /// exact chunks, then release those original bytes only after every
-    /// applicable middleware callback approves them.
+    /// applicable middleware callback approves their strict parsed view. The
+    /// parser refuses SSE fields the callback cannot see and ambiguous duplicate
+    /// JSON keys; the caller still receives the provider's lexical byte spelling.
     PolicyValidatedPassthrough,
 }
 
@@ -506,9 +508,10 @@ struct Relay {
     /// buffering. Its elapsed time is the gateway-added buffering cost.
     buffering_started: Option<Instant>,
     buffered_bytes: u64,
-    /// A terminal decoder event has been observed on a policy-buffered stream.
-    /// Such streams continue reading until transport EOF so no later provider
-    /// bytes can bypass middleware and ride out in an already-buffered chunk.
+    /// A terminal decoder event has been observed. Buffered policy streams keep
+    /// validating until transport EOF so no later provider bytes can bypass
+    /// middleware. Byte-faithful passthrough keeps relaying raw chunks until EOF
+    /// but stops interpreting provider extensions after their terminal event.
     terminal_seen: bool,
     accounting: Accounting,
     rotation: Option<RotationHandle>,
@@ -677,6 +680,13 @@ impl Relay {
                     }
                     StreamDelivery::Reemit | StreamDelivery::PolicyBuffered => {}
                 }
+                // The provider's terminal event is semantic, not necessarily
+                // the HTTP body's final byte. Native extensions can follow it,
+                // and a byte-faithful route must continue forwarding them until
+                // transport EOF. They no longer affect decoding or accounting.
+                if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
+                    return;
+                }
                 let text = self.decode_utf8(&chunk);
                 let pushed = match self.sse.as_mut() {
                     Some(sse) if self.delivery == StreamDelivery::PolicyValidatedPassthrough => {
@@ -698,6 +708,11 @@ impl Relay {
                                 Ok(decoded) => {
                                     self.emit(decoded).await;
                                     if !matches!(self.phase, Phase::Streaming) {
+                                        return;
+                                    }
+                                    if self.delivery == StreamDelivery::Passthrough
+                                        && self.terminal_seen
+                                    {
                                         return;
                                     }
                                 }
@@ -885,7 +900,9 @@ impl Relay {
                 }
                 ProviderStreamEvent::Done(usage) => {
                     self.accounting.usage = *usage;
-                    if self.delivery.is_policy_buffered() {
+                    if self.delivery.is_policy_buffered()
+                        || self.delivery == StreamDelivery::Passthrough
+                    {
                         if self.terminal_seen {
                             self.phase = Phase::Failed(
                                 "stream emitted more than one terminal event".to_owned(),
@@ -2090,6 +2107,101 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(record["status"], "client_cancelled");
         assert_eq!(ledger.records.lock().expect("ledger").len(), 1);
         assert_eq!(ledger.settlements().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn byte_faithful_passthrough_relays_tail_bytes_through_transport_eof() {
+        const NATIVE_TERMINAL: &str = concat!(
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        const NATIVE_TAIL: &str = ": provider-extension-after-stop\n\n";
+        const RESPONSES_TERMINAL: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        const RESPONSES_TAIL: &str = concat!(
+            "event: provider.extension\n",
+            "data: {\"type\":\"provider.extension\",\"opaque\":true}\n\n",
+        );
+        let cases: Vec<(
+            Framing,
+            Box<dyn ProviderStreamDecoder>,
+            &'static str,
+            &'static str,
+        )> = vec![
+            (
+                Framing::Native,
+                Box::new(NativeMessagesDecoder::new()),
+                NATIVE_TERMINAL,
+                NATIVE_TAIL,
+            ),
+            (
+                Framing::Responses,
+                OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                RESPONSES_TERMINAL,
+                RESPONSES_TAIL,
+            ),
+        ];
+
+        for (framing, decoder, terminal, tail) in cases {
+            let ledger = Arc::new(Ledger::default());
+            let response = relay_opened_with_middleware(
+                state_for("http://127.0.0.1:1", ledger.clone()),
+                context(),
+                OpenedStream {
+                    decoder,
+                    bytes: futures::stream::iter(vec![
+                        Ok(Bytes::from_static(terminal.as_bytes())),
+                        Ok(Bytes::from_static(tail.as_bytes())),
+                    ])
+                    .boxed(),
+                },
+                Instant::now(),
+                framing,
+                None,
+                StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body, Bytes::from(format!("{terminal}{tail}")));
+            assert_eq!(settled(&ledger).await["status"], "ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_validated_passthrough_rejects_duplicate_json_keys_without_leaking() {
+        const AMBIGUOUS: &str = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"safe\",\"delta\":\"evil-duplicate\"}\n\n",
+        );
+        let ledger = Arc::new(Ledger::default());
+        let response = relay_opened_with_middleware(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from_static(AMBIGUOUS.as_bytes()))])
+                    .boxed(),
+            },
+            Instant::now(),
+            Framing::Responses,
+            None,
+            StreamMiddleware::new(
+                MiddlewareExecution::default(),
+                StreamDelivery::PolicyValidatedPassthrough,
+            ),
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("upstream_stream_error"), "{body}");
+        assert!(body.contains("duplicate JSON object keys"), "{body}");
+        assert!(!body.contains("evil-duplicate"), "{body}");
+        assert_eq!(settled(&ledger).await["status"], "upstream_error");
     }
 
     #[tokio::test]

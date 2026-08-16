@@ -1,3 +1,7 @@
+use std::{collections::BTreeSet, fmt};
+
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
     pub event: Option<String>,
@@ -13,11 +17,14 @@ pub enum StreamParseError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StrictStreamParseError {
     #[error(transparent)]
     Parse(#[from] StreamParseError),
     #[error("SSE block contains fields that cannot be policy-validated")]
     UnvalidatedBlock,
+    #[error("SSE data contains duplicate JSON object keys")]
+    AmbiguousJson,
 }
 
 pub struct SseDecoder {
@@ -49,6 +56,9 @@ impl SseDecoder {
             Err(StrictStreamParseError::Parse(error)) => Err(error),
             Err(StrictStreamParseError::UnvalidatedBlock) => {
                 unreachable!("ordinary SSE decoding does not apply strict validation")
+            }
+            Err(StrictStreamParseError::AmbiguousJson) => {
+                unreachable!("ordinary SSE decoding does not inspect JSON object keys")
             }
         }
     }
@@ -93,6 +103,12 @@ impl SseDecoder {
                 return Err(StrictStreamParseError::UnvalidatedBlock);
             }
             if let Some(event) = parse_event(&block) {
+                if reject_unvalidated_blocks
+                    && event.data.trim() != "[DONE]"
+                    && json_has_duplicate_keys(&event.data)
+                {
+                    return Err(StrictStreamParseError::AmbiguousJson);
+                }
                 events.push(event);
             }
         }
@@ -154,9 +170,9 @@ fn parse_event(block: &str) -> Option<SseEvent> {
             continue;
         }
         if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.trim_start().to_owned());
+            event = Some(value.strip_prefix(' ').unwrap_or(value).to_owned());
         } else if let Some(value) = line.strip_prefix("data:") {
-            data.push(value.trim_start());
+            data.push(value.strip_prefix(' ').unwrap_or(value));
         }
     }
     (!data.is_empty()).then(|| SseEvent {
@@ -188,6 +204,92 @@ fn strict_block_is_valid(block: &str) -> bool {
         }
     }
     data_seen
+}
+
+const DUPLICATE_JSON_KEY: &str = "axond_duplicate_json_key";
+
+/// Whether JSON contains an object key whose first value another parser could
+/// retain while `serde_json::Value` retains its last. Syntax errors are left to
+/// the provider decoder so strict delivery preserves its existing typed error.
+fn json_has_duplicate_keys(data: &str) -> bool {
+    let mut deserializer = serde_json::Deserializer::from_str(data);
+    NoDuplicateKeys
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end())
+        .is_err_and(|error| error.to_string().contains(DUPLICATE_JSON_KEY))
+}
+
+struct NoDuplicateKeys;
+
+impl<'de> DeserializeSeed<'de> for NoDuplicateKeys {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(NoDuplicateKeysVisitor)
+    }
+}
+
+struct NoDuplicateKeysVisitor;
+
+impl<'de> Visitor<'de> for NoDuplicateKeysVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(NoDuplicateKeys)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(de::Error::custom(DUPLICATE_JSON_KEY));
+            }
+            object.next_value_seed(NoDuplicateKeys)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +371,35 @@ mod tests {
                 event: Some("delta".to_owned()),
                 data: "first\nsecond".to_owned(),
             }]
+        );
+    }
+
+    #[test]
+    fn strict_decode_rejects_ambiguous_json_and_keeps_sse_space_semantics() {
+        for data in [
+            r#"{"safe":true,"safe":false}"#,
+            r#"{"nested":{"safe":true,"safe":false}}"#,
+            r#"{"\u0073afe":true,"safe":false}"#,
+        ] {
+            let mut decoder = SseDecoder::default();
+            assert_eq!(
+                decoder.push_strict(&format!("data: {data}\n\n")),
+                Err(StrictStreamParseError::AmbiguousJson)
+            );
+        }
+
+        let mut decoder = SseDecoder::default();
+        assert_eq!(
+            decoder.push("data:  {\"safe\":true}\n\n").unwrap()[0].data,
+            " {\"safe\":true}",
+            "SSE removes at most one space after the field colon"
+        );
+
+        let mut decoder = SseDecoder::default();
+        assert_eq!(
+            decoder.push_strict("data: {not json}\n\n").unwrap()[0].data,
+            "{not json}",
+            "provider decoders retain ownership of ordinary JSON syntax errors"
         );
     }
 

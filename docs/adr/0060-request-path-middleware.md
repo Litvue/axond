@@ -171,7 +171,12 @@ that verdict.
 The opt-in holds reconstructed output until the upstream terminates
 successfully, then releases the transformed events. A non-mutating stream chain
 instead releases the provider's original bytes after validation, preserving the
-byte-faithful contract. Both raw upstream bytes and reconstructed output are
+byte-faithful contract. That verdict is over the gateway's parsed SSE/JSON view,
+not over each lexical byte spelling: strict parsing applies SSE's standard
+one-optional-space and multi-line `data:` normalization, refuses fields that the
+callback cannot see, and rejects duplicate JSON object keys before invoking the
+chain. Client SDKs remain responsible for applying standard SSE and JSON parsing
+to the released provider bytes. Both raw upstream bytes and reconstructed output are
 bounded by the lower of
 `admission.max_stream_bytes` and a 64 MiB hard ceiling; the hard ceiling remains
 when the ordinary stream limit is disabled. Middleware failure releases no held
