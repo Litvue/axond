@@ -294,6 +294,13 @@ impl MiddlewarePlan {
                     namespace: namespace.id.clone(),
                     source,
                 })?;
+            for middleware in chain.response_only_ids() {
+                tracing::warn!(
+                    namespace = %namespace.id,
+                    middleware,
+                    "response-scoped content middleware does not run on streamed requests; declare stream_event scope for streaming coverage"
+                );
+            }
             by_namespace.insert(namespace.id.clone(), chain);
         }
         Ok(Self {
@@ -406,6 +413,19 @@ impl MiddlewareChain {
         self.entries
             .iter()
             .any(|entry| entry.declaration().has_scope(scope))
+    }
+
+    /// Registrations whose output policy covers buffered responses but not
+    /// streams. This is valid phase selection, but it is easy to mistake for a
+    /// fail-closed guardrail over both request shapes, so snapshot compilation
+    /// names every gap to the operator.
+    fn response_only_ids(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(|entry| {
+            let declaration = entry.declaration();
+            (declaration.has_scope(MiddlewareScope::Response)
+                && !declaration.has_scope(MiddlewareScope::StreamEvent))
+            .then_some(declaration.id.as_str())
+        })
     }
 
     /// Whether this chain can change output in the phase this request will
@@ -1484,6 +1504,10 @@ namespace = "alpha"
 
         assert!(chain.has_response_mutator(MiddlewareScope::Response));
         assert!(!chain.has_response_mutator(MiddlewareScope::StreamEvent));
+        assert_eq!(
+            chain.response_only_ids().collect::<Vec<_>>(),
+            ["response-only"]
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use gateway_core::{ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder};
+use gateway_core::{ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder, SseEvent};
 use gateway_transport::{ByteStream, TransportError};
 use opentelemetry::Context;
 use serde_json::{Value, json};
@@ -592,9 +592,10 @@ impl Relay {
                     self.phase = Phase::Ended;
                 }
                 Phase::Finished => {
-                    if self
-                        .deadline
-                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    if self.delivery.is_policy_buffered()
+                        && self
+                            .deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline)
                     {
                         self.fail_stream_duration();
                         continue;
@@ -644,6 +645,15 @@ impl Relay {
                 match tokio::time::timeout_at(deadline.into(), self.bytes.next()).await {
                     Ok(next) => next,
                     Err(_) => {
+                        if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
+                            tracing::warn!(
+                                provider = %self.accounting.ctx.target_provider,
+                                model = %self.accounting.ctx.target_model,
+                                "byte-faithful upstream remained open after its terminal event until the total stream bound"
+                            );
+                            self.phase = Phase::Finished;
+                            return;
+                        }
                         self.fail_stream_duration();
                         return;
                     }
@@ -699,6 +709,9 @@ impl Relay {
                     Ok(events) => {
                         for event in events {
                             if self.delivery.is_policy_buffered() && self.terminal_seen {
+                                if is_terminal_sentinel(&event) {
+                                    continue;
+                                }
                                 self.phase = Phase::Failed(
                                     "stream carried bytes after its terminal event".to_owned(),
                                 );
@@ -804,7 +817,15 @@ impl Relay {
                 // In-band and caller-facing, so it is worded the way the
                 // buffered path words it: never with the endpoint `reqwest`
                 // rendered into its message.
-                self.phase = Phase::Failed(transport_caller_message(&err));
+                if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
+                    // The semantic terminal event completed provider work. A
+                    // proxy that never closes (or loses the transport while
+                    // closing) must not turn that completed answer into a
+                    // second, synthetic error on the provider's native wire.
+                    self.phase = Phase::Finished;
+                } else {
+                    self.phase = Phase::Failed(transport_caller_message(&err));
+                }
             }
             None => self.finish_upstream().await,
         }
@@ -994,6 +1015,15 @@ impl Relay {
         };
         Ok(true)
     }
+}
+
+/// OpenAI-compatible Responses implementations may emit both the semantic
+/// `response.completed` event and the older data-only terminal sentinel. The
+/// latter carries no content for middleware and is the sole event tolerated
+/// after a policy-buffered terminal event; any named or data-bearing extension
+/// still fails closed before buffered bytes are released.
+fn is_terminal_sentinel(event: &SseEvent) -> bool {
+    event.event.is_none() && event.data.trim() == "[DONE]"
 }
 
 /// Generated text in one relayed chunk, across the shapes the adapters emit:
@@ -2168,6 +2198,173 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             assert_eq!(body, Bytes::from(format!("{terminal}{tail}")));
             assert_eq!(settled(&ledger).await["status"], "ok");
         }
+    }
+
+    #[tokio::test]
+    async fn policy_buffered_responses_tolerate_done_after_response_completed() {
+        const COMPLETED: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        const SENTINEL: &str = "data: [DONE]\n\n";
+
+        for delivery in [
+            StreamDelivery::PolicyBuffered,
+            StreamDelivery::PolicyValidatedPassthrough,
+        ] {
+            let ledger = Arc::new(Ledger::default());
+            let response = relay_opened_with_middleware(
+                state_for("http://127.0.0.1:1", ledger.clone()),
+                context(),
+                OpenedStream {
+                    decoder: OpenAiCompatibleAdapter::openai()
+                        .stream_decoder(Surface::Responses)
+                        .expect("Responses decoder"),
+                    bytes: futures::stream::iter(vec![
+                        Ok(Bytes::from_static(COMPLETED.as_bytes())),
+                        Ok(Bytes::from_static(SENTINEL.as_bytes())),
+                    ])
+                    .boxed(),
+                },
+                Instant::now(),
+                Framing::Responses,
+                None,
+                StreamMiddleware::new(MiddlewareExecution::default(), delivery),
+            );
+
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("response.completed"), "{body}");
+            assert!(!body.contains("upstream_stream_error"), "{body}");
+            if delivery == StreamDelivery::PolicyValidatedPassthrough {
+                assert_eq!(body, format!("{COMPLETED}{SENTINEL}"));
+            }
+            assert_eq!(settled(&ledger).await["status"], "ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_faithful_terminal_transport_failure_does_not_retract_completion() {
+        const COMPLETED: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let ledger = Arc::new(Ledger::default());
+        let response = relay_opened_with_middleware(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                bytes: futures::stream::iter(vec![
+                    Ok(Bytes::from_static(COMPLETED.as_bytes())),
+                    Err(TransportError::Http(
+                        "proxy held the completed body open".to_owned(),
+                    )),
+                ])
+                .boxed(),
+            },
+            Instant::now(),
+            Framing::Responses,
+            None,
+            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(COMPLETED.as_bytes()));
+        assert_eq!(settled(&ledger).await["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn byte_faithful_terminal_open_body_ends_cleanly_at_total_bound() {
+        const COMPLETED: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_stream_duration_ms = 30;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("duration-bound state");
+        let bytes = futures::stream::once(async {
+            Ok::<_, TransportError>(Bytes::from_static(COMPLETED.as_bytes()))
+        })
+        .chain(futures::stream::pending())
+        .boxed();
+        let response = relay_opened_with_middleware(
+            state,
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                bytes,
+            },
+            Instant::now(),
+            Framing::Responses,
+            None,
+            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+        );
+
+        let body = tokio::time::timeout(Duration::from_millis(150), response.into_body().collect())
+            .await
+            .expect("total stream bound closes a completed body")
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, Bytes::from_static(COMPLETED.as_bytes()));
+        assert_eq!(settled(&ledger).await["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn incremental_completion_is_not_relabelled_while_the_caller_drains() {
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_stream_duration_ms = 200;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("duration-bound state");
+        let response = relay_opened_with_middleware(
+            state,
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::ChatCompletions)
+                    .expect("chat decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from_static(
+                    OPENAI_STREAM.as_bytes(),
+                ))])
+                .boxed(),
+            },
+            Instant::now(),
+            Framing::OpenAiSse,
+            None,
+            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Reemit),
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        for _ in 0..3 {
+            body.next()
+                .await
+                .expect("decoded data event")
+                .expect("chunk");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut remainder = String::new();
+        while let Some(chunk) = body.next().await {
+            remainder.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert_eq!(remainder, "data: [DONE]\n\n");
+        assert_eq!(settled(&ledger).await["status"], "ok");
     }
 
     #[tokio::test]

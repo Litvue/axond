@@ -159,6 +159,10 @@ fields such as `core_stages` are rejected while the document is validated.
 buffered provider response runs `Response` scopes once in reverse registration
 order. A stream runs `StreamEvent` scopes on decoded data events, also in reverse
 order; terminal provider usage remains gateway-owned and is never mutable.
+`Response` scope alone is therefore intentionally inactive for `stream: true`;
+snapshot compilation warns once with the namespace and middleware id for every
+such registration so an operator cannot mistake phase selection for streaming
+coverage. A guardrail intended to cover both shapes must declare both scopes.
 OpenAI chat already re-emits decoded events, so applicable stream middleware can
 run incrementally. `Native` and `Responses` framing remain byte-faithful unless
 the governing policy explicitly selects that route in
@@ -176,8 +180,10 @@ not over each lexical byte spelling: strict parsing applies SSE's standard
 one-optional-space and multi-line `data:` normalization, refuses fields that the
 callback cannot see, and rejects duplicate JSON object keys before invoking the
 chain. Client SDKs remain responsible for applying standard SSE and JSON parsing
-to the released provider bytes. Both raw upstream bytes and reconstructed output are
-bounded by the lower of
+to the released provider bytes. Refusing unseen fields deliberately includes SSE
+comments, blank heartbeat blocks, `id:`, and `retry:`; operators must qualify a
+provider/proxy's exact stream before enabling validated byte-faithful passthrough.
+Both raw upstream bytes and reconstructed output are bounded by the lower of
 `admission.max_stream_bytes` and a 64 MiB hard ceiling; the hard ceiling remains
 when the ordinary stream limit is disabled. Middleware failure releases no held
 content and ends the already-open stream with a wire-native
