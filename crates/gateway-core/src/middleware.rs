@@ -56,7 +56,8 @@ pub struct MiddlewareDeclaration {
     pub scopes: Vec<MiddlewareScope>,
     pub needs: Vec<MiddlewareNeed>,
     pub failure_posture: MiddlewareFailurePosture,
-    /// Maximum wall-clock duration the gateway permits for one invocation.
+    /// Maximum end-to-end wall-clock duration the gateway permits for one
+    /// invocation, including capacity wait and executor scheduling.
     pub max_duration: Duration,
     /// Whether this middleware may change a response body or stream event.
     /// A response mutator must declare the corresponding response scope.

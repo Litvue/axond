@@ -155,15 +155,19 @@ explicitly, per policy, never a default.
 Fail-closed or fail-open is part of the registration, because a guardrail that
 fails open is not a guardrail and a cache that fails closed is an outage. Each
 request invocation runs in a blocking task against a private request copy under
-an asynchronous timeout. The gateway stops waiting at the declared bound and
-applies the failure posture; a late task cannot mutate the request that proceeds
-to routing. Because Rust cannot preempt synchronous code safely, the timed-out
-task may continue until it returns. A process-wide semaphore remains owned by
-that task and bounds such work to 64 blocking invocations; saturation applies
-the middleware's failure posture without consuming another blocking thread. A
-refusal inherits the existing refusal discipline: a typed error, a stable
-caller-facing reason that never echoes the body, and no usage event when nothing
-reached a provider.
+an asynchronous timeout. The declared bound is end to end: it includes waiting
+for middleware capacity, blocking-executor scheduling, and execution. The
+gateway stops waiting at that deadline and applies the failure posture; a late
+task cannot mutate the request that proceeds to routing. Because Rust cannot
+preempt synchronous code safely, the timed-out task may continue until it
+returns. A process-wide semaphore remains owned by that task and bounds such
+work to 64 blocking invocations. Healthy callers that encounter the bound wait
+for a permit within their remaining declared deadline; only expiry applies the
+middleware's failure posture. This prevents ordinary concurrency above 64 from
+becoming an immediate refusal while still preventing abandoned work from
+consuming unbounded blocking threads. A refusal inherits the existing refusal
+discipline: a typed error, a stable caller-facing reason that never echoes the
+body, and no usage event when nothing reached a provider.
 
 **Three things are excluded from v1, on purpose.** A middleware may not call a
 model or spend money: a classifier call would be a second chargeable event inside

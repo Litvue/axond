@@ -22,8 +22,8 @@ use crate::error::GatewayError;
 
 /// Keep abandoned synchronous invocations from consuming Tokio's entire
 /// process-wide blocking pool. A timed-out task retains its permit until the
-/// middleware actually returns; later calls fail through their declared
-/// posture instead of spawning an unbounded number of blocked threads.
+/// middleware actually returns; later calls wait for a slot within their own
+/// end-to-end invocation bound instead of spawning unbounded blocked threads.
 const MAX_BLOCKING_MIDDLEWARE_INVOCATIONS: usize = 64;
 
 fn blocking_middleware_slots() -> &'static Arc<Semaphore> {
@@ -122,23 +122,38 @@ impl MiddlewareChain {
         &self,
         request: &mut ProviderRequest,
     ) -> Result<MiddlewareStateBag, GatewayError> {
+        self.request_with_slots(request, Arc::clone(blocking_middleware_slots()))
+            .await
+    }
+
+    async fn request_with_slots(
+        &self,
+        request: &mut ProviderRequest,
+        slots: Arc<Semaphore>,
+    ) -> Result<MiddlewareStateBag, GatewayError> {
         let mut states = MiddlewareStateBag::new(self.len());
         for (index, entry) in self.entries.iter().enumerate() {
             if !entry.declaration().has_scope(MiddlewareScope::Request) {
                 continue;
             }
-            let slot = match Arc::clone(blocking_middleware_slots()).try_acquire_owned() {
-                Ok(slot) => slot,
-                Err(_) => {
-                    self.failure(index, "invocation capacity exhausted")?;
-                    continue;
-                }
-            };
+            let bound = entry.declaration().max_duration;
+            let deadline = tokio::time::Instant::now() + bound;
+            let slot =
+                match tokio::time::timeout_at(deadline, Arc::clone(&slots).acquire_owned()).await {
+                    Ok(Ok(slot)) => slot,
+                    Ok(Err(_)) => {
+                        self.failure(index, "invocation capacity closed")?;
+                        continue;
+                    }
+                    Err(_) => {
+                        self.failure(index, "invocation bound exceeded waiting for capacity")?;
+                        continue;
+                    }
+                };
             let mut candidate = request.clone();
             let middleware = Arc::clone(entry);
-            let bound = entry.declaration().max_duration;
-            let invoked = tokio::time::timeout(
-                bound,
+            let invoked = tokio::time::timeout_at(
+                deadline,
                 tokio::task::spawn_blocking(move || {
                     let _slot = slot;
                     let result = middleware.apply(MiddlewarePhase::Request(&mut candidate), None);
@@ -492,6 +507,59 @@ mod tests {
             Err(GatewayError::MiddlewareUnavailable)
         ));
         assert_eq!(request, original);
+    }
+
+    #[tokio::test]
+    async fn healthy_invocation_waits_for_blocking_capacity_within_its_bound() {
+        let mut declaration = MiddlewareDeclaration::new("queued", [MiddlewareScope::Request]);
+        declaration.max_duration = Duration::from_secs(1);
+        let chain = Arc::new(
+            MiddlewareChain::new(vec![Arc::new(Noop { declaration })]).expect("bounded chain"),
+        );
+        let slots = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&slots).acquire_owned().await.expect("test slot");
+        let waiting = tokio::spawn({
+            let chain = Arc::clone(&chain);
+            let slots = Arc::clone(&slots);
+            async move {
+                let mut request = ProviderRequest {
+                    model: "alias".to_owned(),
+                    body: json!({}),
+                };
+                chain.request_with_slots(&mut request, slots).await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "capacity contention must wait instead of refusing immediately"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_millis(250), waiting)
+            .await
+            .expect("queued invocation should complete")
+            .expect("invocation task")
+            .expect("healthy middleware should continue");
+    }
+
+    #[tokio::test]
+    async fn capacity_wait_is_part_of_the_declared_end_to_end_bound() {
+        let mut declaration = MiddlewareDeclaration::new("queued", [MiddlewareScope::Request]);
+        declaration.max_duration = Duration::from_millis(1);
+        let chain =
+            MiddlewareChain::new(vec![Arc::new(Noop { declaration })]).expect("bounded chain");
+        let slots = Arc::new(Semaphore::new(1));
+        let _held = Arc::clone(&slots).acquire_owned().await.expect("test slot");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+
+        assert!(matches!(
+            chain.request_with_slots(&mut request, slots).await,
+            Err(GatewayError::MiddlewareUnavailable)
+        ));
     }
 
     #[test]
