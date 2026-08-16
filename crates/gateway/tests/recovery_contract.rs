@@ -304,6 +304,25 @@ fn a_retired_blocker_says_what_became_of_the_slice() {
         "{} and RETIRED_BLOCKERS disagree about which slices were retired",
         recovery::MANIFEST_RELATIVE
     );
+    let table = contract
+        .split_once("### Slices this harness stopped waiting on")
+        .and_then(|(_, rest)| rest.split_once("\n## Related").map(|(table, _)| table))
+        .expect("recovery contract should contain the retired-dependency table");
+    let page: BTreeSet<u32> = table
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("| #")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|issue| issue.parse().ok())
+        })
+        .collect();
+    assert_eq!(
+        page,
+        committed,
+        "{} and its retired-dependency table disagree about which slices were retired",
+        recovery::CONTRACT_RELATIVE
+    );
     for retired in &manifest.retired_blockers {
         assert!(
             retired.became.len() > 80,

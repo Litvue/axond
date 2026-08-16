@@ -3,10 +3,13 @@
 # #156 asks for reproducible evidence in place of qualitative production claims,
 # and it decomposes into five slices — capacity, provider and backend faults,
 # stateful recovery, multi-replica rollout, and a long soak. Each has landed to a
-# different depth: one is evidenced with retained runs, and four are harnessed
-# with drivers but no heavy *record* retained in the packet. The local fault and
-# rollout heavy tiers have now been exercised, but a run outside the committed
-# evidence set cannot promote a slice. That spread is
+# different depth: capacity, fault, and recovery are evidenced with retained
+# runs, while rollout and endurance remain harnessed. The local rollout heavy
+# tier has been exercised, but a run outside the committed evidence set cannot
+# promote that slice. The #158 dependency formerly attached to fault and
+# rollout is retired: the remaining deployment-overlay and preflight work stays
+# on #158, while those qualification questions now have their own evidence
+# paths. That spread is
 # the whole point of this file. An epic whose children
 # are merged is not an epic whose question is answered, and the difference is
 # only reviewable if it is written down where it cannot rot.
