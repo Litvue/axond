@@ -56,7 +56,7 @@ pub struct MiddlewareDeclaration {
     pub scopes: Vec<MiddlewareScope>,
     pub needs: Vec<MiddlewareNeed>,
     pub failure_posture: MiddlewareFailurePosture,
-    /// Maximum synchronous work the gateway permits for one invocation.
+    /// Maximum wall-clock duration the gateway permits for one invocation.
     pub max_duration: Duration,
     /// Whether this middleware may change a response body or stream event.
     /// A response mutator must declare the corresponding response scope.
@@ -166,6 +166,7 @@ impl MiddlewarePhase<'_> {
 /// caller-facing error and never echoes request content or arbitrary internal
 /// diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MiddlewareRefusal {
     Policy,
     InvalidRequest,
@@ -298,5 +299,17 @@ mod tests {
         let mut declaration = MiddlewareDeclaration::new("bad", [MiddlewareScope::Request]);
         declaration.mutates_response = true;
         assert!(!declaration.has_scope(MiddlewareScope::Response));
+    }
+
+    #[test]
+    fn refusal_reasons_use_the_same_snake_case_as_other_middleware_values() {
+        assert_eq!(
+            serde_json::to_value(MiddlewareRefusal::InvalidRequest).unwrap(),
+            json!("invalid_request")
+        );
+        assert_eq!(
+            serde_json::from_value::<MiddlewareRefusal>(json!("policy")).unwrap(),
+            MiddlewareRefusal::Policy
+        );
     }
 }

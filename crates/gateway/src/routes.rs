@@ -1471,7 +1471,7 @@ async fn serve(
         model: alias.clone(),
         body,
     };
-    let middleware_state = state.0.middleware.request(&mut middleware_request)?;
+    let middleware_state = state.0.middleware.request(&mut middleware_request).await?;
     let body = middleware_request.body;
     let estimate = route.estimate(&body);
     check_estimate_bounds(&body, estimate, limits)?;
@@ -6864,8 +6864,8 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(settled, sent_input_tokens + 1);
     }
 
-    #[test]
-    fn an_empty_chain_keeps_the_two_estimate_passes_identical() {
+    #[tokio::test]
+    async fn an_empty_chain_keeps_the_two_estimate_passes_identical() {
         let body = json!({
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": "hello"}],
@@ -6877,6 +6877,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         };
         let state = MiddlewareChain::empty()
             .request(&mut request)
+            .await
             .expect("empty chain");
         assert_eq!(request.body, body);
         assert_eq!(

@@ -94,14 +94,17 @@ the bounds, and the mapping from a middleware's refusal to a typed
 `GatewayError`. A middleware therefore cannot reach the network, the clock, or a
 credential except through what it is handed.
 
-**Scopes are declared, not inferred.** A middleware registers for `Request`
-(once, on the parsed body, before the failover walk), `Response` (once, on a
-buffered `ProviderResponse`), or `StreamEvent` (per relayed event). `Attempt`
-scope — inside the failover walk, per target — is deliberately **not** in this
-decision: a body mutated differently per attempt would make any request-scoped
-state, a redaction map above all, disagree with the attempt that served. Adding
-it later is an additive change to a registration enum; getting it wrong now
-would be a correctness bug in the walk.
+**Scopes are declared, not inferred.** The contract reserves `Request` (once,
+on the parsed body, before the failover walk), `Response` (once, on a buffered
+`ProviderResponse`), and `StreamEvent` (per relayed event). The first runtime
+slice invokes `Request` only. Registration rejects `Response` and `StreamEvent`
+instead of accepting an inert declaration; those scopes become activatable only
+when their invocation paths land. `Attempt` scope — inside the failover walk,
+per target — is deliberately **not** in this decision: a body mutated
+differently per attempt would make any request-scoped state, a redaction map
+above all, disagree with the attempt that served. Adding it later is an additive
+change to a registration enum; getting it wrong now would be a correctness bug
+in the walk.
 
 **A middleware may own state for as long as the response lives.** The primitive
 lets a `Request`-scope middleware return state that is moved into the response's
@@ -138,22 +141,25 @@ generations and epochs of ADR 0050 — which is what gives a guardrail policy
 namespace scoping, versioning, rollback, and hot reload without a single new
 delivery mechanism.
 
-**Response mutation is refused on byte-faithful framing unless buffering is opted
-into.** A middleware declaring that it rewrites responses is served where the
-relay already re-emits (`Framing::OpenAiSse`). On `Native` and `Responses`
-framing it is refused with a typed error naming the incompatibility, because
-silently re-emitting those streams would revoke a documented guarantee for every
-caller of the route. A policy may instead opt that route into buffering the
-response, which is correct, simple, and costs the time-to-first-token the relay
-exists to protect — an operator's trade to make explicitly, per policy, never a
-default.
+**Response mutation is refused until its invocation and framing contract are
+implemented.** The first runtime slice rejects every `Response` and
+`StreamEvent` registration. The follow-up may activate response mutation where
+the relay already re-emits (`Framing::OpenAiSse`). On `Native` and `Responses`
+framing it must remain refused with a typed incompatibility unless policy opts
+that route into buffering, because silently re-emitting those streams would
+revoke a documented guarantee for every caller. Buffering costs the
+time-to-first-token the relay exists to protect — an operator's trade to make
+explicitly, per policy, never a default.
 
 **Every middleware declares a failure posture and runs under bounds.**
 Fail-closed or fail-open is part of the registration, because a guardrail that
 fails open is not a guardrail and a cache that fails closed is an outage. Each
-scope invocation is bounded in the manner of ADR 0028, and a refusal inherits the
-existing refusal discipline: a typed error, a stable caller-facing reason that
-never echoes the body, and no usage event when nothing reached a provider.
+request invocation runs in a blocking task against a private request copy under
+an asynchronous timeout. The gateway stops waiting at the declared bound and
+applies the failure posture; a late task cannot mutate the request that proceeds
+to routing. A refusal inherits the existing refusal discipline: a typed error,
+a stable caller-facing reason that never echoes the body, and no usage event
+when nothing reached a provider.
 
 **Three things are excluded from v1, on purpose.** A middleware may not call a
 model or spend money: a classifier call would be a second chargeable event inside
