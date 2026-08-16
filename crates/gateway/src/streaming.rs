@@ -871,6 +871,16 @@ impl Relay {
     /// one: `SseDecoder::finish` reports the leftover so the caller gets an
     /// error rather than a `[DONE]` it would read as success.
     async fn finish_upstream(&mut self) {
+        if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
+            // Once the provider's authoritative terminal event has been
+            // observed, later bytes are opaque byte-faithful extensions. The
+            // relay deliberately stops parsing them, so residual SSE or UTF-8
+            // state cannot truthfully be interpreted as truncation at EOF.
+            self.sse.take();
+            self.carry.clear();
+            self.phase = Phase::Finished;
+            return;
+        }
         if let Some(sse) = self.sse.take()
             && let Err(err) = sse.finish()
         {
@@ -2198,6 +2208,37 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             assert_eq!(body, Bytes::from(format!("{terminal}{tail}")));
             assert_eq!(settled(&ledger).await["status"], "ok");
         }
+    }
+
+    #[tokio::test]
+    async fn byte_faithful_terminal_with_incomplete_tail_ends_cleanly_at_eof() {
+        const TERMINAL: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let mut wire = TERMINAL.as_bytes().to_vec();
+        wire.extend_from_slice(b"event: provider.extension\ndata: ");
+        wire.push(0xf0); // first byte of a four-byte UTF-8 sequence
+
+        let ledger = Arc::new(Ledger::default());
+        let response = relay_opened_with_middleware(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from(wire.clone()))]).boxed(),
+            },
+            Instant::now(),
+            Framing::Responses,
+            None,
+            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), wire.as_slice());
+        assert_eq!(settled(&ledger).await["status"], "ok");
     }
 
     #[tokio::test]

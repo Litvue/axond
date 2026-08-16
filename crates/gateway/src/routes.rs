@@ -1102,7 +1102,7 @@ impl Route {
     }
 
     fn streamable(self) -> bool {
-        self != Self::Embeddings
+        self.stream_delivery().is_some()
     }
 
     /// A stored Responses id only resolves on the provider — and under the
@@ -1140,11 +1140,15 @@ impl Route {
         }
     }
 
-    fn stream_delivery(self) -> StreamDelivery {
+    /// The route's ordinary streaming posture. Returning `None` for a
+    /// non-streamable route keeps an embeddings request from ever acquiring a
+    /// byte-faithful delivery posture, even if a future caller accidentally
+    /// asks this helper to compile one.
+    fn stream_delivery(self) -> Option<StreamDelivery> {
         match self {
-            Self::ChatCompletions => StreamDelivery::Reemit,
-            Self::NativeMessages | Self::Responses => StreamDelivery::Passthrough,
-            Self::Embeddings => StreamDelivery::Passthrough,
+            Self::ChatCompletions => Some(StreamDelivery::Reemit),
+            Self::NativeMessages | Self::Responses => Some(StreamDelivery::Passthrough),
+            Self::Embeddings => None,
         }
     }
 
@@ -1222,7 +1226,9 @@ fn stream_delivery(
     route: Route,
     middleware: &MiddlewareChain,
 ) -> Result<StreamDelivery, GatewayError> {
-    let ordinary = route.stream_delivery();
+    let ordinary = route.stream_delivery().ok_or_else(|| {
+        GatewayError::BadRequest(format!("{} does not support streaming", route.label()))
+    })?;
     if !middleware.has_scope(MiddlewareScope::StreamEvent) {
         return Ok(ordinary);
     }
@@ -6747,6 +6753,11 @@ targets = [
             stream_delivery(&config, "platform", Route::ChatCompletions, &chain).unwrap(),
             StreamDelivery::Reemit
         );
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::Embeddings, &chain),
+            Err(GatewayError::BadRequest(message))
+                if message == "/v1/embeddings does not support streaming"
+        ));
 
         let mut selected = config;
         enable_buffered_response_routes(
