@@ -7,7 +7,7 @@
 //! an empty chain is the production default until typed policy delivery lands.
 
 use std::sync::{
-    Arc, OnceLock,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 #[cfg(test)]
@@ -29,17 +29,24 @@ use crate::error::GatewayError;
 /// end-to-end invocation bound instead of spawning unbounded blocked threads.
 const MAX_BLOCKING_MIDDLEWARE_INVOCATIONS: usize = 64;
 
-fn blocking_middleware_slots() -> &'static Arc<Semaphore> {
-    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_BLOCKING_MIDDLEWARE_INVOCATIONS)))
+/// Process-owned execution bounds shared by every chain in one serving state.
+///
+/// Keeping these handles in `AppState` gives production one process-wide bound
+/// while each independently constructed test state receives a fresh quarantine
+/// latch and semaphore.
+#[derive(Clone)]
+pub(crate) struct MiddlewareRuntime {
+    slots: Arc<Semaphore>,
+    quarantined: Arc<AtomicBool>,
 }
 
-/// A synchronous closure cannot be cancelled safely after `spawn_blocking`
-/// starts it. Once one invocation outlives its bound, quarantine this runtime
-/// instead of letting later requests wait behind (or add to) abandoned work.
-fn blocking_middleware_quarantined() -> &'static Arc<AtomicBool> {
-    static QUARANTINED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-    QUARANTINED.get_or_init(|| Arc::new(AtomicBool::new(false)))
+impl Default for MiddlewareRuntime {
+    fn default() -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(MAX_BLOCKING_MIDDLEWARE_INVOCATIONS)),
+            quarantined: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// A registered, ordered set of content middleware.
@@ -131,14 +138,23 @@ impl MiddlewareChain {
     /// must be retained until the response ends.
     pub async fn request(
         &self,
+        runtime: &MiddlewareRuntime,
         request: &mut ProviderRequest,
     ) -> Result<MiddlewareStateBag, GatewayError> {
         self.request_with_runtime(
             request,
-            Arc::clone(blocking_middleware_slots()),
-            Arc::clone(blocking_middleware_quarantined()),
+            Arc::clone(&runtime.slots),
+            Arc::clone(&runtime.quarantined),
         )
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn request_isolated(
+        &self,
+        request: &mut ProviderRequest,
+    ) -> Result<MiddlewareStateBag, GatewayError> {
+        self.request(&MiddlewareRuntime::default(), request).await
     }
 
     async fn request_with_slots(
@@ -371,7 +387,10 @@ mod tests {
             body: json!({"prompt": "unchanged"}),
         };
         let original = request.clone();
-        let states = chain.request(&mut request).await.expect("empty chain");
+        let states = chain
+            .request_isolated(&mut request)
+            .await
+            .expect("empty chain");
         assert_eq!(request, original);
         assert!(states.is_empty());
     }
@@ -389,7 +408,7 @@ mod tests {
             model: "alias".to_owned(),
             body: json!({}),
         };
-        let error = match chain.request(&mut request).await {
+        let error = match chain.request_isolated(&mut request).await {
             Ok(_) => panic!("policy refusal"),
             Err(error) => error,
         };
@@ -429,7 +448,10 @@ mod tests {
             body: json!({}),
         };
         let original = request.clone();
-        chain.request(&mut request).await.expect("fail open");
+        chain
+            .request_isolated(&mut request)
+            .await
+            .expect("fail open");
         assert_eq!(request, original);
     }
 
@@ -475,7 +497,7 @@ mod tests {
         };
         let open_original = open_request.clone();
         open_chain
-            .request(&mut open_request)
+            .request_isolated(&mut open_request)
             .await
             .expect("fail-open routing mutation is discarded");
         assert_eq!(open_request, open_original);
@@ -486,7 +508,7 @@ mod tests {
         .expect("valid chain");
         let mut closed_request = open_original.clone();
         assert!(matches!(
-            closed_chain.request(&mut closed_request).await,
+            closed_chain.request_isolated(&mut closed_request).await,
             Err(GatewayError::MiddlewareUnavailable)
         ));
         assert_eq!(closed_request, open_original);
@@ -524,7 +546,7 @@ mod tests {
         };
         let original = request.clone();
         assert!(matches!(
-            chain.request(&mut request).await,
+            chain.request_isolated(&mut request).await,
             Err(GatewayError::MiddlewareRefused {
                 reason: "invalid_request"
             })
@@ -648,29 +670,38 @@ mod tests {
         declaration.max_duration = Duration::from_millis(1);
         let chain =
             MiddlewareChain::new(vec![Arc::new(Slow { declaration })]).expect("bounded chain");
-        let slots = Arc::new(Semaphore::new(1));
-        let quarantined = Arc::new(AtomicBool::new(false));
+        let runtime = MiddlewareRuntime {
+            slots: Arc::new(Semaphore::new(1)),
+            quarantined: Arc::new(AtomicBool::new(false)),
+        };
         let mut first = ProviderRequest {
             model: "alias".to_owned(),
             body: json!({}),
         };
 
         assert!(matches!(
-            chain
-                .request_with_runtime(&mut first, Arc::clone(&slots), Arc::clone(&quarantined),)
-                .await,
+            chain.request(&runtime, &mut first).await,
             Err(GatewayError::MiddlewareUnavailable)
         ));
-        assert!(quarantined.load(Ordering::Acquire));
+        assert!(runtime.quarantined.load(Ordering::Acquire));
 
         let mut second = first.clone();
         let refusal = tokio::time::timeout(
             Duration::from_millis(20),
-            chain.request_with_runtime(&mut second, slots, quarantined),
+            chain.request(&runtime, &mut second),
         )
         .await
         .expect("quarantined work must refuse without waiting for the occupied slot");
         assert!(matches!(refusal, Err(GatewayError::MiddlewareUnavailable)));
+
+        let healthy = MiddlewareChain::new(vec![Arc::new(Noop {
+            declaration: MiddlewareDeclaration::new("healthy", [MiddlewareScope::Request]),
+        })])
+        .expect("healthy chain");
+        healthy
+            .request_isolated(&mut second)
+            .await
+            .expect("a separately constructed runtime must not inherit quarantine");
     }
 
     #[tokio::test]

@@ -54,7 +54,7 @@ use crate::desired_state::{
 };
 use crate::desired_state::{ProjectId, RevisionId, SecretRef, TenantId, WorkloadKey};
 use crate::key_material::{self, KeyMaterialError};
-use crate::middleware::MiddlewareChain;
+use crate::middleware::{MiddlewareChain, MiddlewareRuntime};
 use crate::policy::PolicyRuntime;
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
@@ -121,6 +121,9 @@ pub struct Inner {
     /// shipped posture until typed policy delivery registers middleware; an
     /// empty chain is byte-neutral and keeps the request path unchanged.
     pub middleware: MiddlewareChain,
+    /// Blocking capacity and the quarantine latch for content middleware. This
+    /// is process-owned in production and isolated per constructed test state.
+    pub middleware_runtime: MiddlewareRuntime,
     config: ArcSwap<ConfigSnapshot>,
 }
 
@@ -1553,6 +1556,7 @@ impl AppState {
             revision: observability.revision,
             catalogue: observability.catalogue,
             middleware: MiddlewareChain::empty(),
+            middleware_runtime: MiddlewareRuntime::default(),
             config: ArcSwap::from_pointee(snapshot),
         })))
     }

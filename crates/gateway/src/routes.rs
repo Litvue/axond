@@ -1481,7 +1481,11 @@ async fn serve(
         model: alias.clone(),
         body,
     };
-    let middleware_state = state.0.middleware.request(&mut middleware_request).await?;
+    let middleware_state = state
+        .0
+        .middleware
+        .request(&state.0.middleware_runtime, &mut middleware_request)
+        .await?;
     let body = middleware_request.body;
     // An empty chain is byte-neutral, so the pre-admission estimate is already
     // authoritative. Avoid serializing every request body a second time in the
@@ -6902,7 +6906,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             body: body.clone(),
         };
         let state = MiddlewareChain::empty()
-            .request(&mut request)
+            .request_isolated(&mut request)
             .await
             .expect("empty chain");
         assert_eq!(request.body, body);
