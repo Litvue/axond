@@ -401,6 +401,12 @@ or `upstream_error`, and `axond.upstream.timeouts{axond.timeout="stream_idle"}`
 is what distinguishes a stalled provider from one that ended early
 ([ADR 0028](./adr/0028-transport-phase-bounds.md)).
 
+Byte-faithful Native and Responses relays may forward provider extension bytes
+after the semantic terminal event, but only for the fixed
+`transport.stream_terminal_grace_ms`. Expiry closes the completed response
+successfully and releases its request, stream, and caller capacity; it is not an
+upstream timeout and does not increment `axond.upstream.timeouts`.
+
 A `504` whose phase is `overall` reports the gateway's own spent failover
 budget, so it is attributed to the request and the target's metrics but does not
 count against the target's circuit breaker; the per-phase bounds do.

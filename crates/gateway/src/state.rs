@@ -83,6 +83,9 @@ pub struct AppState(pub Arc<Inner>);
 
 pub struct Inner {
     pub dispatcher: HttpDispatcher,
+    /// Process-level grace for byte-faithful provider bytes that follow a
+    /// semantic terminal event. Read at boot with the rest of `[transport]`.
+    pub stream_terminal_grace: Duration,
     /// How a terminated request's usage leaves the process. Telemetry-grade by
     /// default; a durable append when a journal is configured.
     pub usage: Arc<UsageDelivery>,
@@ -1597,6 +1600,8 @@ impl AppState {
         // once here: a reload validates a change and reports that it needs a
         // restart rather than swapping the pool under in-flight requests.
         let limits = config.transport.limits();
+        let stream_terminal_grace =
+            Duration::from_millis(config.transport.stream_terminal_grace_ms);
         let admission = AdmissionControl::from_config(&config.admission);
         let snapshot = if config.mode == crate::config::Mode::Stateful {
             ConfigSnapshot::build_bootstrap(config, env, 0)?
@@ -1608,6 +1613,7 @@ impl AppState {
                 build_client(&limits).expect("the upstream HTTP client builds"),
                 limits,
             ),
+            stream_terminal_grace,
             usage,
             budget,
             admission,

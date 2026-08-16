@@ -153,7 +153,10 @@ walk still had time for.
 Two consequences are deliberate and not bugs:
 
 - A slow *productive* stream is never cut off by `failover.overall_timeout_ms`.
-  Only silence longer than `stream_idle_timeout_ms` ends it.
+  Before its semantic terminal event, only silence longer than
+  `stream_idle_timeout_ms` ends it. A byte-faithful Native or Responses body
+  still open after completion closes successfully at
+  `stream_terminal_grace_ms`; trailing extension chunks do not reset that grace.
 - A stream that stalls after bytes were already relayed terminates in band on
   the already-`200` response and is **not** retried; retrying would splice a
   second completion into one answer. The usage record still settles exactly

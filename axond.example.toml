@@ -125,6 +125,10 @@ cooldown_seconds = 30
 # is not a stalled one. Each wait for the NEXT chunk is bounded instead, so a
 # productive stream runs as long as it keeps producing and a silent socket does
 # not hang a caller.
+# After a byte-faithful provider emits its semantic terminal event, the much
+# shorter `stream_terminal_grace_ms` allows already-following extension bytes to
+# flush. It starts once and does not reset; an HTTP body left open after that
+# cannot retain request and stream capacity for the general idle timeout.
 #
 # The byte bounds keep a provider (or something impersonating one) from making
 # the gateway hold an unbounded body in memory. An oversized success body is
@@ -148,6 +152,7 @@ connect_timeout_ms = 5000
 response_header_timeout_ms = 30000
 buffered_body_timeout_ms = 30000
 stream_idle_timeout_ms = 120000
+stream_terminal_grace_ms = 1000
 max_response_bytes = 33554432
 max_error_bytes = 65536
 

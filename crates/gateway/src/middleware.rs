@@ -2279,6 +2279,110 @@ namespace = "alpha"
         );
     }
 
+    struct CapacityMeasuredStreamEvent {
+        declaration: MiddlewareDeclaration,
+        calls: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Middleware for CapacityMeasuredStreamEvent {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            if matches!(phase, MiddlewarePhase::StreamEvent(_)) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.maximum.fetch_max(active, Ordering::SeqCst);
+                while !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_stream_events_use_bounded_parallel_capacity_without_global_serialisation() {
+        const EVENTS: usize = 8;
+        const SLOTS: usize = 2;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut declaration =
+            MiddlewareDeclaration::new("capacity-stream", [MiddlewareScope::StreamEvent]);
+        declaration.max_duration = Duration::from_secs(2);
+        let chain = MiddlewareChain::new(vec![Arc::new(CapacityMeasuredStreamEvent {
+            declaration,
+            calls: Arc::clone(&calls),
+            active: Arc::clone(&active),
+            maximum: Arc::clone(&maximum),
+            release: Arc::clone(&release),
+        })])
+        .expect("stream-event chain");
+        let slots = Arc::new(Semaphore::new(SLOTS));
+        let runtime = MiddlewareRuntime::with_slots(Arc::clone(&slots));
+        let mut tasks = Vec::with_capacity(EVENTS);
+
+        for sequence in 0..EVENTS {
+            let mut request = ProviderRequest {
+                model: "alias".to_owned(),
+                body: json!({}),
+            };
+            let mut execution = chain
+                .start(&runtime, &mut request)
+                .await
+                .expect("independent stream execution");
+            tasks.push(tokio::spawn(async move {
+                let mut event = ProviderStreamEvent::Data {
+                    event: None,
+                    data: json!({"sequence": sequence}),
+                };
+                execution.stream_event(&mut event).await
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) != SLOTS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("two streams occupy the declared process capacity");
+        assert_eq!(calls.load(Ordering::SeqCst), SLOTS);
+        assert_eq!(maximum.load(Ordering::SeqCst), SLOTS);
+        assert_eq!(slots.available_permits(), 0);
+
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for task in tasks {
+                task.await
+                    .expect("stream-event task")
+                    .expect("event is processed within its bound");
+            }
+        })
+        .await
+        .expect("queued stream events drain through bounded capacity");
+
+        assert_eq!(calls.load(Ordering::SeqCst), EVENTS);
+        assert_eq!(maximum.load(Ordering::SeqCst), SLOTS);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(slots.available_permits(), SLOTS);
+        assert_eq!(
+            runtime.gate("capacity-stream").slots.available_permits(),
+            MAX_BLOCKING_INVOCATIONS_PER_MIDDLEWARE
+        );
+    }
+
     #[tokio::test]
     async fn cancelled_fail_closed_stream_event_refuses_until_the_id_recovers() {
         let calls = Arc::new(AtomicUsize::new(0));

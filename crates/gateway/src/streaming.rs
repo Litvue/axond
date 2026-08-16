@@ -375,6 +375,7 @@ pub fn relay_opened_with_middleware(
     let limits = state.0.admission.limits();
     let deadline = limits.max_stream_duration.map(|budget| started + budget);
     let max_bytes = limits.max_stream_bytes;
+    let stream_terminal_grace = state.0.stream_terminal_grace;
     let relay = Relay {
         bytes,
         carry: Vec::new(),
@@ -388,6 +389,8 @@ pub fn relay_opened_with_middleware(
         buffering_started: None,
         buffered_bytes: 0,
         terminal_seen: false,
+        stream_terminal_grace,
+        terminal_deadline: None,
         accounting: Accounting::new_with_middleware(state, ctx, started, middleware_execution),
         rotation,
         queued_downstream: false,
@@ -513,6 +516,10 @@ struct Relay {
     /// middleware. Byte-faithful passthrough keeps relaying raw chunks until EOF
     /// but stops interpreting provider extensions after their terminal event.
     terminal_seen: bool,
+    /// Fixed grace after a byte-faithful semantic terminal event. It does not
+    /// reset when provider extension chunks arrive.
+    stream_terminal_grace: Duration,
+    terminal_deadline: Option<Instant>,
     accounting: Accounting,
     rotation: Option<RotationHandle>,
     queued_downstream: bool,
@@ -640,11 +647,27 @@ impl Relay {
     }
 
     async fn poll_upstream(&mut self) {
-        let next = match self.deadline {
+        let (wait_deadline, terminal_bound) = match (self.deadline, self.terminal_deadline) {
+            (Some(total), Some(terminal)) if terminal <= total => (Some(terminal), true),
+            (Some(total), _) => (Some(total), false),
+            (None, Some(terminal)) => (Some(terminal), true),
+            (None, None) => (None, false),
+        };
+        let next = match wait_deadline {
             Some(deadline) => {
                 match tokio::time::timeout_at(deadline.into(), self.bytes.next()).await {
                     Ok(next) => next,
                     Err(_) => {
+                        if terminal_bound {
+                            tracing::warn!(
+                                provider = %self.accounting.ctx.target_provider,
+                                model = %self.accounting.ctx.target_model,
+                                grace_ms = self.stream_terminal_grace.as_millis(),
+                                "byte-faithful upstream remained open after its terminal event until the post-terminal grace elapsed"
+                            );
+                            self.phase = Phase::Finished;
+                            return;
+                        }
                         if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
                             tracing::warn!(
                                 provider = %self.accounting.ctx.target_provider,
@@ -956,6 +979,10 @@ impl Relay {
                             return;
                         }
                         self.terminal_seen = true;
+                        if self.delivery == StreamDelivery::Passthrough {
+                            self.terminal_deadline =
+                                Some(Instant::now() + self.stream_terminal_grace);
+                        }
                     } else {
                         self.phase = Phase::Finished;
                     }
@@ -2386,6 +2413,71 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     }
 
     #[tokio::test]
+    async fn byte_faithful_terminal_grace_closes_body_and_releases_admission() {
+        const COMPLETED: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_in_flight = 1;
+        config.admission.max_in_flight_streams = 1;
+        config.admission.max_stream_duration_ms = 0;
+        config.transport.stream_terminal_grace_ms = 25;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("terminal-grace state");
+        let mut ctx = context();
+        ctx.admission_permit = Some(
+            state
+                .0
+                .admission
+                .admit("platform", RequestKind::Streamed)
+                .await
+                .expect("completed stream is admitted"),
+        );
+        let bytes = futures::stream::once(async {
+            Ok::<_, TransportError>(Bytes::from_static(COMPLETED.as_bytes()))
+        })
+        .chain(futures::stream::pending())
+        .boxed();
+        let response = relay_opened_with_middleware(
+            state.clone(),
+            ctx,
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                bytes,
+            },
+            Instant::now(),
+            Framing::Responses,
+            None,
+            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+        );
+
+        let body = tokio::time::timeout(Duration::from_millis(150), response.into_body().collect())
+            .await
+            .expect("post-terminal grace closes an otherwise open body")
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, Bytes::from_static(COMPLETED.as_bytes()));
+        assert_eq!(settled(&ledger).await["status"], "ok");
+
+        let replacement = state
+            .0
+            .admission
+            .admit("platform", RequestKind::Streamed)
+            .await
+            .expect("terminal grace returns request and stream capacity");
+        drop(replacement);
+    }
+
+    #[tokio::test]
     async fn incremental_completion_is_not_relabelled_while_the_caller_drains() {
         let ledger = Arc::new(Ledger::default());
         let mut config = single_target_config("http://127.0.0.1:1");
@@ -2976,6 +3068,8 @@ data: [DONE]\n\n",
             buffering_started: None,
             buffered_bytes: 0,
             terminal_seen: false,
+            stream_terminal_grace: Duration::from_secs(1),
+            terminal_deadline: None,
             deadline: None,
             max_bytes: None,
             relayed_bytes: 0,

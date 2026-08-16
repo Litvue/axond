@@ -412,7 +412,9 @@ buffered body, and opening a stream — including a credential rotation's open. 
 in-flight attempt is cancelled when it is spent, so a request cannot outlive the
 budget by having started just inside it. Once a stream is open the budget stops
 applying, because a long answer is not a stalled one: from there
-`transport.stream_idle_timeout_ms` governs each wait for the next chunk.
+`transport.stream_idle_timeout_ms` governs each wait for the next chunk. Once a
+byte-faithful route observes its semantic terminal event,
+`transport.stream_terminal_grace_ms` is the tighter fixed close bound.
 
 ## `[transport]` — per-phase upstream bounds, Tier 0
 
@@ -428,6 +430,7 @@ provider, a silent open socket is a half-dead connection. Every bound must be
 | `response_header_timeout_ms` | integer | `30000` | Bound on waiting for response headers (time to first byte) after dispatch. For a non-streamed call this covers the whole completion — see below. |
 | `buffered_body_timeout_ms` | integer | `30000` | Bound on reading a whole buffered response body once headers arrived. |
 | `stream_idle_timeout_ms` | integer | `120000` | Bound on waiting for the *next* chunk of an already-open stream. Not a stream lifetime: a productive stream may run for as long as it keeps producing. |
+| `stream_terminal_grace_ms` | integer | `1000` | Fixed grace for trailing byte-faithful provider extension bytes after the semantic terminal event. It does not reset on chunks; an earlier silent-body idle timeout can still close the transport first. |
 | `max_response_bytes` | integer | `33554432` | Largest buffered response body that will be read. A larger one is refused as `upstream_body_too_large` rather than buffered. |
 | `max_error_bytes` | integer | `65536` | Largest provider *error* body read for diagnostics. A larger one is truncated, so the provider's own status still reaches the caller. Must not exceed `max_response_bytes`. |
 

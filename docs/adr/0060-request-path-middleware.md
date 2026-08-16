@@ -213,6 +213,17 @@ pathological implementation from consuming more than four blocking workers. A re
 refusal discipline: a typed error, a stable caller-facing reason that never
 echoes the body, and no usage event when nothing reached a provider.
 
+Stream-event scope invokes one synchronous callback for every decoded data
+event. Events within one stream remain serial so state and wire order cannot
+race, while independent streams use the bounded blocking capacity concurrently;
+there is no replica-wide stream-event lock. This deliberately pays one bounded
+dispatch per event instead of batching events and changing mutation or refusal
+boundaries. Before activating a stream-event implementation, operators qualify
+its worst-case event rate and concurrent streams against the 64 replica slots,
+four per-id slots, and its declared end-to-end duration. The deterministic
+capacity test exercises concurrent streams through a saturated runtime and
+proves queued events drain without exceeding either ownership bound.
+
 Operators distinguish a slow implementation from provider latency through
 `axond.middleware.capacity_wait` and
 `axond.middleware.capacity_timeouts`. A sustained timeout increase means late

@@ -795,9 +795,10 @@ impl Default for Failover {
 /// `failover.overall_timeout_ms` stays authoritative for everything before a
 /// response is being usefully consumed — connecting, waiting for headers,
 /// reading a buffered body, and rotating credentials — and the tighter of it and
-/// the phase bound below governs each phase. `stream_idle_timeout_ms` is the one
-/// bound that applies *after* a stream opens, because a long answer is not a
-/// stalled one: only silence between chunks is.
+/// the phase bound below governs each phase. `stream_idle_timeout_ms` applies
+/// after a stream opens, because a long answer is not a stalled one: only
+/// silence between chunks is. After a byte-faithful semantic terminal event,
+/// `stream_terminal_grace_ms` becomes the fixed close bound instead.
 ///
 /// The defaults are therefore deliberately not tighter than the walk budget for
 /// the two bounds that cover *producing* an answer: a non-streamed provider call
@@ -825,6 +826,12 @@ pub struct Transport {
     /// total stream lifetime: it resets on every chunk.
     #[serde(default = "default_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
+    /// How long a byte-faithful stream may keep its HTTP body open after its
+    /// semantic terminal event. The grace preserves trailing provider
+    /// extension bytes without retaining request capacity for the general
+    /// stream-idle bound.
+    #[serde(default = "default_stream_terminal_grace_ms")]
+    pub stream_terminal_grace_ms: u64,
     /// Largest buffered response body that will be read. A larger one is
     /// refused rather than buffered.
     #[serde(default = "default_max_response_bytes")]
@@ -842,6 +849,7 @@ impl Default for Transport {
             response_header_timeout_ms: default_response_header_timeout_ms(),
             buffered_body_timeout_ms: default_buffered_body_timeout_ms(),
             stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
+            stream_terminal_grace_ms: default_stream_terminal_grace_ms(),
             max_response_bytes: default_max_response_bytes(),
             max_error_bytes: default_max_error_bytes(),
         }
@@ -882,6 +890,13 @@ fn default_buffered_body_timeout_ms() -> u64 {
 /// tokens, and cutting that off looks like a gateway bug to a caller.
 fn default_stream_idle_timeout_ms() -> u64 {
     120_000
+}
+
+/// Long enough for a proxy/provider to flush extension bytes already behind a
+/// semantic terminal event, but intentionally far below the ordinary idle
+/// allowance because the answer itself is complete.
+fn default_stream_terminal_grace_ms() -> u64 {
+    1_000
 }
 
 fn default_max_response_bytes() -> u64 {
@@ -2700,6 +2715,10 @@ impl Config {
             (
                 "stream_idle_timeout_ms",
                 self.transport.stream_idle_timeout_ms,
+            ),
+            (
+                "stream_terminal_grace_ms",
+                self.transport.stream_terminal_grace_ms,
             ),
             ("max_response_bytes", self.transport.max_response_bytes),
             ("max_error_bytes", self.transport.max_error_bytes),
@@ -4754,6 +4773,7 @@ dsn_env = "AXOND_BUDGET_REDIS_URL"
         assert_eq!(cfg.transport.response_header_timeout_ms, 30_000);
         assert_eq!(cfg.transport.buffered_body_timeout_ms, 30_000);
         assert_eq!(cfg.transport.stream_idle_timeout_ms, 120_000);
+        assert_eq!(cfg.transport.stream_terminal_grace_ms, 1_000);
         assert_eq!(cfg.transport.max_response_bytes, 32 * 1024 * 1024);
         assert_eq!(cfg.transport.max_error_bytes, 64 * 1024);
 
@@ -4777,6 +4797,7 @@ dsn_env = "AXOND_BUDGET_REDIS_URL"
             "response_header_timeout_ms",
             "buffered_body_timeout_ms",
             "stream_idle_timeout_ms",
+            "stream_terminal_grace_ms",
             "max_response_bytes",
             "max_error_bytes",
         ] {
