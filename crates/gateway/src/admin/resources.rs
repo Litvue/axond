@@ -38,6 +38,7 @@ use serde::de::DeserializeOwned;
 use super::error::AdminError;
 use super::service::DesiredStateEdit;
 use crate::backends::catalog::{CatalogContentId, ProviderId};
+use crate::desired_state::policy::BufferedResponseRoute;
 use crate::desired_state::{
     Actor, AliasTarget, Approval, ApprovedRate, ApprovedRates, BlobKind, BlobRef, BudgetBound,
     BudgetPolicy, CatalogOffering, Checksum, ConcurrencyPolicy, ContentMiddlewareRegistration,
@@ -1014,6 +1015,10 @@ pub struct PolicyRequest {
     /// and routing stages are intentionally not expressible here.
     #[serde(default)]
     pub content_middleware: Vec<ContentMiddlewareRequest>,
+    /// Streaming surfaces where response-mutating middleware may explicitly
+    /// replace byte-faithful passthrough with bounded buffering.
+    #[serde(default)]
+    pub buffered_response_routes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1085,9 +1090,20 @@ impl AdminResourceRequest for PolicyRequest {
                 .map_err(|error| malformed::<Self>("content_middleware", &error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let buffered_response_routes = self
+            .buffered_response_routes
+            .iter()
+            .map(|route| {
+                BufferedResponseRoute::parse(route).map_err(|error| {
+                    malformed::<Self>("buffered_response_routes", &error.to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let body = PolicyBody::new(scope, epoch, budget, concurrency, revocation)
             .with_content_middleware(content_middleware)
-            .map_err(|error| malformed::<Self>("content_middleware", &error.to_string()))?;
+            .map_err(|error| malformed::<Self>("content_middleware", &error.to_string()))?
+            .with_buffered_response_routes(buffered_response_routes)
+            .map_err(|error| malformed::<Self>("buffered_response_routes", &error.to_string()))?;
         Ok(ResourcePlan::new(
             scope.resource_scope(),
             move |state: &mut DesiredState| {
@@ -1453,6 +1469,48 @@ mod tests {
         let body = PriceBookBody::read(resource).expect("the published body is typed");
         assert_eq!(body.approval().approver(), Some(&actor));
         assert_eq!(body.rules().len(), 1);
+    }
+
+    #[test]
+    fn policy_requests_normalize_buffered_routes_and_reject_invalid_sets() {
+        let document = serde_json::json!({
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "slug": "buffered-responses",
+            "epoch": 2,
+            "subject_limit_microdollars": 1_000_000,
+            "reservation_ttl_seconds": 300,
+            "max_in_flight_per_subject": 8,
+            "lease_ttl_seconds": 60,
+            "buffered_response_routes": ["responses", "messages"]
+        });
+        let request: PolicyRequest = serde_json::from_value(document.clone()).unwrap();
+        let plan = request.plan().expect("typed buffering routes are accepted");
+        let mut state = fixtures::state();
+        plan.edit
+            .edit(&mut state, &fixtures::actor())
+            .expect("policy publishes");
+        let scope = PolicyScope::Tenant(fixtures::tenant_id(1));
+        let resource = state
+            .version_of(ResourceKind::Policy, scope.resource_id())
+            .expect("policy resource is present");
+        let body = PolicyBody::read(resource).expect("published policy is typed");
+        assert_eq!(
+            body.buffered_response_routes(),
+            [
+                BufferedResponseRoute::Messages,
+                BufferedResponseRoute::Responses,
+            ]
+        );
+
+        let mut duplicate = document.clone();
+        duplicate["buffered_response_routes"] = serde_json::json!(["messages", "messages"]);
+        let duplicate: PolicyRequest = serde_json::from_value(duplicate).unwrap();
+        assert!(duplicate.plan().is_err());
+
+        let mut unknown = document;
+        unknown["buffered_response_routes"] = serde_json::json!(["chat_completions"]);
+        let unknown: PolicyRequest = serde_json::from_value(unknown).unwrap();
+        assert!(unknown.plan().is_err());
     }
 
     #[test]

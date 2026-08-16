@@ -163,6 +163,7 @@ entry is normalized; list order is execution order:
     "max_in_flight_per_subject": 8,
     "lease_ttl_seconds": 60,
     "minimum_token_epoch": 0,
+    "buffered_response_routes": ["messages", "responses"],
     "content_middleware": [{
       "id": "example.redactor",
       "scopes": ["request"],
@@ -172,6 +173,13 @@ entry is normalized; list order is execution order:
   }
 }
 ```
+
+`buffered_response_routes` is an optional set. The only accepted members are
+`messages` and `responses`; order is normalized, duplicates and unknown values
+are rejected, and absence means neither route opts into response buffering.
+Selecting a route permits applicable response-mutating middleware to replace
+byte-faithful streaming passthrough with bounded buffering. It does not enable
+middleware by itself.
 
 The identifier must name middleware compiled into the running binary; the value
 above illustrates the shape rather than naming a shipped implementation. The

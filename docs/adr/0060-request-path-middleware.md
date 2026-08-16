@@ -228,6 +228,14 @@ documents that register content middleware are delivered by the mechanism ADR
 already runs; a deployment that registers no middleware is unchanged and its tier
 is not raised.
 
+Policy also carries an optional normalized `buffered_response_routes` set. Its
+closed members are `messages` and `responses`; absence is the compatible empty
+set, and duplicates or unknown routes are refused. The setting is permission for
+an applicable response-mutating chain to trade native byte-faithful passthrough
+for bounded buffering. It neither activates middleware nor changes a request's
+upstream streaming or affinity semantics by itself. Changes are live and bind to
+new requests through the immutable snapshot.
+
 ## Consequences
 
 The request path gains a place where content policy belongs, and the two dead
@@ -241,11 +249,11 @@ wire. Anything reasoning about a usage row's input tokens is reasoning about the
 post-middleware body, which is the right answer — that is what was sent — but it
 is a new thing to know when reading a row against a captured request.
 
-Refusing response-mutating middleware on native framing means a tenant can
-configure a policy that is silently inert on `/v1/messages` unless it opts into
-buffering. The refusal is typed and explicit rather than a quiet no-op, which
-turns a subtle policy gap into a visible error at the cost of an error an operator
-must then understand.
+Response-mutating middleware on native framing is refused unless the route is
+present in `buffered_response_routes`. The refusal is typed and explicit rather
+than a quiet no-op, which turns a subtle policy gap into a visible error at the
+cost of an error an operator must then understand. An empty chain remains
+byte-faithful even when the route is selected.
 
 Excluding `Attempt` scope means a middleware cannot shape a body per provider,
 which is the natural place some future compatibility shim would want to live. That

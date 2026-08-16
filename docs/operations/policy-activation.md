@@ -115,12 +115,17 @@ cannot strand a namespace against half-described caps.
 
 | Class | What it covers | What happens |
 | --- | --- | --- |
-| `live` | Looser caps, longer TTLs, a higher token floor, any ordered content-middleware add/change/remove, or a republication that changes nothing | Activates. New admissions use the new values and snapshot-owned chain |
+| `live` | Looser caps, longer TTLs, a higher token floor, any ordered content-middleware add/change/remove, any `buffered_response_routes` change, or a republication that changes nothing | Activates. New admissions use the new values and snapshot-owned chain and buffering selection |
 | `drain` | Tighter caps, shorter TTLs | Activates. New admissions use the new values; **what is already admitted keeps its own terms** until it finishes |
 | `migration-required` | Turning a scope-wide cap on or off | Refused. See [Migrating the layout](#migrating-the-layout) |
 | `refused` | A regressed epoch, changed content under an unchanged epoch, another scope's document, a lowered token floor (**including across a handover**), a document these backends cannot enforce, withdrawing a document from a namespace still served, or serving a namespace no document governs | Refused. Nothing changes |
 
 A publication is as disruptive as its worst field.
+
+`buffered_response_routes` is a normalized optional set containing only
+`messages` and `responses`. Absence is the backward-compatible empty set. A
+change requires an advanced policy epoch and is live: in-flight requests retain
+the snapshot they started under, while new admissions capture the new choice.
 
 ### Handing a namespace between scopes
 
