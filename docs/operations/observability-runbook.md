@@ -442,6 +442,23 @@ trade you make in advance, in config — not a change to make during an incident
 Distinguish it from the tenant's own limits: `429 budget_exceeded` is a spent
 cap, `503 budget_unavailable` is *your* dependency down.
 
+### Middleware blocking capacity is timing out
+
+**Signal.** `axond_middleware_capacity_timeouts` increasing, elevated
+`axond_middleware_capacity_wait`, and middleware warning logs naming the id and
+failure detail. The capacity metrics intentionally carry no policy-defined id
+label, so logs provide the bounded drill-down.
+
+**Alert.** `AxondMiddlewareCapacityTimeouts`.
+
+**First response.** Find the synchronous implementation retaining its four
+per-id slots. A timed-out call keeps both its per-id and global permit until it
+really returns; while it remains abandoned, only that id applies its configured
+failure posture and other middleware continues. Repair the implementation. If
+the abandoned call never returns, restart the affected replica to recover those
+workers. Global saturation at 64 across multiple ids indicates broad executor
+pressure rather than one implementation.
+
 ### Budget or rate-limit capacity is exhausted
 
 **Signal.** `axond_budget_capacity_denials`, `axond_budget_namespace_denials`,

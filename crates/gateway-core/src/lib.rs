@@ -5,6 +5,7 @@ pub mod error;
 pub mod failover;
 pub mod governance;
 pub mod guardrail;
+pub mod middleware;
 pub mod openai;
 pub mod provider;
 pub mod stream;
@@ -26,6 +27,11 @@ pub use governance::{Admission, Governance, GovernanceKey, GovernanceLimits};
 pub use guardrail::{
     Guardrail, GuardrailAction, GuardrailPolicy, GuardrailRequest, GuardrailRule, GuardrailVerdict,
     RegexGuardrail,
+};
+pub use middleware::{
+    Middleware, MiddlewareDeclaration, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed,
+    MiddlewareOutcome, MiddlewarePhase, MiddlewareRefusal, MiddlewareResult, MiddlewareScope,
+    MiddlewareState, MiddlewareStateBag, MiddlewareVerdict,
 };
 pub use openai::{
     OpenAiCompatibleAdapter, OpenAiFlavor, embeddings_usage, normalize_foundry_endpoint,

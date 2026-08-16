@@ -39,9 +39,9 @@ use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use gateway_core::{
-    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, ModelUsage,
-    NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
-    Surface, Usage,
+    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareStateBag,
+    ModelUsage, NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse,
+    ProviderStreamDecoder, Surface, Usage,
 };
 use gateway_transport::{
     AuthScheme, Deadline, NativeCall, TimeoutBound, TimeoutKind, TransportError, Upstream,
@@ -1153,13 +1153,23 @@ impl Route {
     /// Pre-dispatch estimate the budget hold is priced from. Embeddings produce
     /// no completion, so nothing is held for output.
     fn estimate(self, body: &Value) -> Usage {
-        let estimate = estimate_usage(body);
+        self.measure(body).0
+    }
+
+    /// Return the usage estimate together with the serialized byte length that
+    /// produced it. Keeping the two together lets the post-middleware path
+    /// enforce both token and byte ceilings without serializing the body twice.
+    fn measure(self, body: &Value) -> (Usage, usize) {
+        let (estimate, bytes) = estimate_usage(body);
         match self {
-            Self::Embeddings => Usage {
-                output_tokens: 0,
-                ..estimate
-            },
-            _ => estimate,
+            Self::Embeddings => (
+                Usage {
+                    output_tokens: 0,
+                    ..estimate
+                },
+                bytes,
+            ),
+            _ => (estimate, bytes),
         }
     }
 
@@ -1374,20 +1384,7 @@ async fn serve(
     // Neither error repeats any part of the body.
     let estimate = route.estimate(&body);
     let limits = state.0.admission.limits();
-    if let Some(limit_tokens) = limits.max_prompt_tokens
-        && estimate.input_tokens > limit_tokens
-    {
-        return Err(GatewayError::PromptTooLarge { limit_tokens });
-    }
-    if let Some(limit_tokens) = limits.max_output_tokens
-        && let Some(requested_tokens) = requested_output_tokens(&body)
-        && requested_tokens > limit_tokens
-    {
-        return Err(GatewayError::OutputLimitExceeded {
-            requested_tokens,
-            limit_tokens,
-        });
-    }
+    check_estimate_bounds(&body, estimate, limits)?;
 
     // What each target is charged at, resolved once from the snapshot this
     // request is already holding (#147). A price book published while the request
@@ -1475,9 +1472,39 @@ async fn serve(
             }
         })?;
 
+    // Content middleware is deliberately the first work after both permits
+    // are held. It may be expensive, so running it before admission would let
+    // authenticated callers turn it into an amplification surface. The
+    // resulting body is the one sent to the provider and is the only body from
+    // which the authoritative estimate-derived group below is computed.
+    let mut middleware_request = ProviderRequest {
+        model: alias.clone(),
+        body,
+    };
+    let middleware_state = state
+        .0
+        .middleware
+        .request(&state.0.middleware_runtime, &mut middleware_request)
+        .await?;
+    let body = middleware_request.body;
+    // An empty chain is byte-neutral, so the pre-admission estimate is already
+    // authoritative. Avoid serializing every request body a second time in the
+    // default posture; only a configured chain can make the estimate differ.
+    let estimate = if state.0.middleware.is_empty() {
+        estimate
+    } else {
+        let (recomputed, body_bytes) = route.measure(&body);
+        if body_bytes > limits.max_request_bytes {
+            return Err(GatewayError::RequestTooLarge);
+        }
+        check_estimate_bounds(&body, recomputed, limits)?;
+        recomputed
+    };
+
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate
-    // from the first chargeable target's price before dispatch; settle the hold
-    // against the real cost — priced at whichever target actually served — after.
+    // from the post-middleware body before dispatch; settle the hold against the
+    // real cost — priced at whichever target actually served — after. The first
+    // estimate above remains only a cheap pre-admission fail-fast.
     let budget_key = BudgetKey {
         namespace: caller.namespace.clone(),
         subject: caller.subject.clone(),
@@ -1519,6 +1546,7 @@ async fn serve(
                 prices: &prices,
                 wire: &wire,
                 identity,
+                middleware_state,
                 hold: BudgetHold {
                     key: budget_key,
                     reservation,
@@ -1953,6 +1981,7 @@ async fn stream_with_failover(
         prices,
         wire,
         identity,
+        middleware_state,
         mut hold,
     } = request;
     let reservation_guard =
@@ -2205,14 +2234,14 @@ async fn stream_with_failover(
                             move |lease| snapshot.credentials.record_success(lease)
                         },
                     );
-                    return Ok(streaming::relay_opened(
+                    return Ok(streaming::relay_opened_with_state(
                         state.clone(),
                         ctx,
-                        decoder,
-                        bytes,
+                        streaming::OpenedStream { decoder, bytes },
                         started,
                         wire.route.framing(),
                         Some(rotation),
+                        middleware_state,
                     ));
                 }
                 Err(err) if is_credential_exhausted(&err) => {
@@ -2266,7 +2295,12 @@ async fn stream_with_failover(
             ctx.attempts = walk.attempts;
             ctx.rate_limit_permit = hold.permit.take();
             ctx.admission_permit = hold.admission.take();
-            streaming::settle_upstream_error(state.clone(), ctx, started);
+            streaming::settle_upstream_error_with_state(
+                state.clone(),
+                ctx,
+                started,
+                middleware_state,
+            );
         } else {
             reservation_guard.release().await;
         }
@@ -2292,6 +2326,9 @@ struct StreamRequest<'a> {
     /// a credential rotation's — so a stream that rotates, ends, is cancelled, or
     /// never opens all report the same event.
     identity: EventIdentity,
+    /// Request-scope middleware state, moved into the relay's response-lifetime
+    /// accounting owner when a stream opens.
+    middleware_state: MiddlewareStateBag,
     hold: BudgetHold,
 }
 
@@ -2709,17 +2746,47 @@ fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
 /// (~4 chars/token) plus a reserved output allowance (`max_tokens` when present,
 /// else a default). Priced with a target's `ModelPrice` it becomes the held
 /// estimate, which settlement replaces with the real cost.
-fn estimate_usage(body: &Value) -> Usage {
+fn estimate_usage(body: &Value) -> (Usage, usize) {
     const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1_024;
-    let input_tokens = (serde_json::to_string(body).map(|s| s.len()).unwrap_or(0) / 4) as u64;
+    let body_bytes = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
+    let input_tokens = (body_bytes / 4) as u64;
     let output_tokens = requested_output_tokens(body).unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-    Usage {
-        input_tokens,
-        output_tokens,
-        reasoning_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
+    (
+        Usage {
+            input_tokens,
+            output_tokens,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        },
+        body_bytes,
+    )
+}
+
+/// Apply the request-derived prompt/output ceilings to one estimate. This is
+/// called twice by `serve`: once before admission as a cheap fail-fast for the
+/// arriving body, and once after the middleware chain as the authoritative
+/// check for the body that will actually be sent upstream.
+fn check_estimate_bounds(
+    body: &Value,
+    estimate: Usage,
+    limits: crate::admission::AdmissionLimits,
+) -> Result<(), GatewayError> {
+    if let Some(limit_tokens) = limits.max_prompt_tokens
+        && estimate.input_tokens > limit_tokens
+    {
+        return Err(GatewayError::PromptTooLarge { limit_tokens });
     }
+    if let Some(limit_tokens) = limits.max_output_tokens
+        && let Some(requested_tokens) = requested_output_tokens(body)
+        && requested_tokens > limit_tokens
+    {
+        return Err(GatewayError::OutputLimitExceeded {
+            requested_tokens,
+            limit_tokens,
+        });
+    }
+    Ok(())
 }
 
 /// The output allowance a request asked for, in whichever spelling its surface
@@ -2875,6 +2942,7 @@ mod tests {
     use crate::convergence::status::testing::ManualClock;
     use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
     use crate::desired_state::fixtures::{approved_pricing_snapshot, revision_id};
+    use crate::middleware::MiddlewareChain;
     use crate::pricing::PriceIdentity;
     use crate::principals::PrincipalAuthority;
     use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
@@ -2886,6 +2954,9 @@ mod tests {
     use crate::usage::{StdoutSink, UsageDelivery, UsageFanout, UsageSink};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
+    use gateway_core::{
+        Middleware, MiddlewareDeclaration, MiddlewareOutcome, MiddlewarePhase, MiddlewareResult,
+    };
     use http_body_util::BodyExt;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use opentelemetry::trace::TracerProvider as _;
@@ -3014,6 +3085,7 @@ mod tests {
             estimate_usage(
                 &serde_json::json!({"max_tokens": Value::Null, "max_completion_tokens": 500_000})
             )
+            .0
             .output_tokens,
             500_000,
             "the hold prices the allowance the provider will honor"
@@ -6077,6 +6149,27 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         (format!("http://{addr}"), hits)
     }
 
+    /// A provider probe whose reported input usage is derived from the body it
+    /// receives. This makes the settled usage row evidence about the mutated
+    /// request rather than about the pre-middleware fixture.
+    async fn body_measuring_upstream() -> String {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                let input_tokens = serde_json::to_string(&body).unwrap().len() as u64 / 4;
+                Json(json!({
+                    "id": "body-measured",
+                    "choices": [],
+                    "usage": { "prompt_tokens": input_tokens, "completion_tokens": 1 }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
     /// Two targets (`pa/m-a` then `pb/m-b`) behind one alias, sharing one
     /// `AppState` so the per-target circuit persists across requests.
     fn two_target_state(
@@ -6206,6 +6299,86 @@ targets = [
             if let Some(last) = self.0.lock().unwrap().last_mut() {
                 last.1 = actual_microdollars;
             }
+        }
+    }
+
+    /// A request-scope middleware used by #356 tests. It changes only content,
+    /// leaving routing fields alone, and therefore gives the request path a
+    /// deterministic post-middleware body whose estimate can be asserted.
+    struct BodyGrowthMiddleware {
+        declaration: MiddlewareDeclaration,
+        padding_bytes: usize,
+        output_tokens: Option<u64>,
+    }
+
+    impl BodyGrowthMiddleware {
+        fn grow(body: &mut Value, padding_bytes: usize) {
+            body["middleware_padding"] = Value::String("x".repeat(padding_bytes));
+        }
+
+        fn chain(padding_bytes: usize) -> MiddlewareChain {
+            Self::chain_with(padding_bytes, None)
+        }
+
+        fn output_chain(output_tokens: u64) -> MiddlewareChain {
+            Self::chain_with(0, Some(output_tokens))
+        }
+
+        fn chain_with(padding_bytes: usize, output_tokens: Option<u64>) -> MiddlewareChain {
+            let declaration = MiddlewareDeclaration::new(
+                "test.body_growth",
+                [gateway_core::MiddlewareScope::Request],
+            );
+            MiddlewareChain::new(vec![Arc::new(Self {
+                declaration,
+                padding_bytes,
+                output_tokens,
+            }) as Arc<dyn Middleware>])
+            .expect("test middleware chain")
+        }
+    }
+
+    impl Middleware for BodyGrowthMiddleware {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> MiddlewareResult {
+            if let MiddlewarePhase::Request(request) = phase {
+                if self.padding_bytes > 0 {
+                    Self::grow(&mut request.body, self.padding_bytes);
+                }
+                if let Some(output_tokens) = self.output_tokens {
+                    request.body["max_tokens"] = json!(output_tokens);
+                }
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    struct CountingMiddleware {
+        declaration: MiddlewareDeclaration,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Middleware for CountingMiddleware {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> MiddlewareResult {
+            if matches!(phase, MiddlewarePhase::Request(_)) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
         }
     }
 
@@ -6549,6 +6722,201 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn middleware_growth_is_checked_against_the_authoritative_prompt_bound() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = admitting_state(
+            &base_url,
+            "max_prompt_tokens = 64",
+            Box::new(budget.clone()),
+        )
+        .with_middleware_chain(BodyGrowthMiddleware::chain(512));
+
+        let response = router(state)
+            .oneshot(chat_request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "prompt_too_large");
+        assert!(budget.0.lock().unwrap().is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn middleware_growth_is_checked_against_the_authoritative_output_bound() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = admitting_state(
+            &base_url,
+            "max_output_tokens = 16",
+            Box::new(budget.clone()),
+        )
+        .with_middleware_chain(BodyGrowthMiddleware::output_chain(4_096));
+
+        let response = router(state)
+            .oneshot(chat_request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "output_limit_exceeded");
+        assert!(budget.0.lock().unwrap().is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn middleware_does_not_run_before_the_rate_limit_permit_is_held() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let chain = MiddlewareChain::new(vec![Arc::new(CountingMiddleware {
+            declaration: MiddlewareDeclaration::new(
+                "test.counting",
+                [gateway_core::MiddlewareScope::Request],
+            ),
+            calls: Arc::clone(&calls),
+        }) as Arc<dyn Middleware>])
+        .expect("test middleware chain");
+        let budget = RecordingBudget::default();
+        let state = budgeted_state_with_limiter(
+            "http://127.0.0.1:1",
+            Box::new(budget.clone()),
+            Box::new(UnavailableLimiter),
+        )
+        .with_middleware_chain(chain);
+
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_unavailable");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(budget.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn middleware_growth_cannot_bypass_the_request_cost_ceiling() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = budgeted_state(&base_url, Box::new(budget.clone()))
+            .with_middleware_chain(BodyGrowthMiddleware::chain(512));
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "ceiling-caller".to_owned(),
+            authority: PrincipalAuthority::MintedToken,
+            signer_kid: Some("test-kid".to_owned()),
+            scope: None,
+            alias_scope: None,
+            max_request_microdollars: Some(50),
+            can_mint: false,
+            jti: None,
+        };
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "max_tokens": 1
+        });
+
+        let error = serve(
+            state,
+            HeaderMap::new(),
+            body,
+            Route::ChatCompletions,
+            snapshot,
+            caller,
+        )
+        .await
+        .expect_err("post-middleware estimate exceeds the caller ceiling");
+        assert!(matches!(
+            error,
+            GatewayError::RequestCostCeilingExceeded { .. }
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(budget.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn middleware_body_drives_the_budget_hold_and_settled_input_usage() {
+        let base_url = body_measuring_upstream().await;
+        let captured = CapturingSink::default();
+        let budget = RecordingBudget::default();
+        let state = two_target_state_with_budget(
+            &base_url,
+            &base_url,
+            "",
+            captured.clone(),
+            Box::new(budget.clone()),
+        )
+        .with_middleware_chain(BodyGrowthMiddleware::chain(512));
+
+        let original = json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "max_tokens": 1
+        });
+        let response = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(serde_json::to_vec(&original).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut post_middleware = original.clone();
+        BodyGrowthMiddleware::grow(&mut post_middleware, 512);
+        let without_middleware = Route::ChatCompletions.estimate(&original);
+        let with_middleware = Route::ChatCompletions.estimate(&post_middleware);
+        let (reserved, settled) = budget.0.lock().unwrap()[0];
+        assert!(
+            reserved > without_middleware.input_tokens + without_middleware.output_tokens,
+            "the reservation must use the post-middleware body"
+        );
+        assert_eq!(
+            reserved,
+            with_middleware.input_tokens + with_middleware.output_tokens,
+            "configured one-microdollar-per-token pricing makes the hold legible"
+        );
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let mut sent_body = post_middleware;
+        sent_body["model"] = json!("m-a");
+        let sent_input_tokens = serde_json::to_string(&sent_body).unwrap().len() as u64 / 4;
+        assert_eq!(records[0].input_tokens, sent_input_tokens);
+        assert!(records[0].input_tokens > without_middleware.input_tokens);
+        assert_eq!(settled, sent_input_tokens + 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_chain_keeps_the_two_estimate_passes_identical() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 12
+        });
+        let mut request = ProviderRequest {
+            model: "gpt-4o".to_owned(),
+            body: body.clone(),
+        };
+        let state = MiddlewareChain::empty()
+            .request_isolated(&mut request)
+            .await
+            .expect("empty chain");
+        assert_eq!(request.body, body);
+        assert_eq!(
+            Route::ChatCompletions.estimate(&request.body),
+            Route::ChatCompletions.estimate(&body)
+        );
+        assert!(state.is_empty());
+    }
+
     /// The router's own body limit answers before the body is buffered, so an
     /// oversized request is a typed 413 rather than a parse error.
     #[tokio::test]
@@ -6570,6 +6938,28 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             )
             .await
             .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The wire body may fit while request middleware expands the body beyond
+    /// the same configured ceiling. The expanded body is refused before any
+    /// provider dispatch, preserving `max_request_bytes` as an outbound-memory
+    /// invariant as well as an inbound parsing bound.
+    #[tokio::test]
+    async fn middleware_cannot_expand_a_request_past_the_byte_limit() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let state = admitting_state(&base_url, "max_request_bytes = 512", Box::new(NoBudget))
+            .with_middleware_chain(BodyGrowthMiddleware::chain(1_024));
+        let response = router(state)
+            .oneshot(chat_request())
+            .await
+            .expect("typed middleware size refusal");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();

@@ -698,6 +698,18 @@ pub const CATALOG: &[MetricSpec] = &[
         labels: &[],
     },
     MetricSpec {
+        name: "axond.middleware.capacity_wait",
+        kind: InstrumentKind::Histogram,
+        unit: Some("ms"),
+        labels: &[],
+    },
+    MetricSpec {
+        name: "axond.middleware.capacity_timeouts",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[],
+    },
+    MetricSpec {
         name: "axond.admission.in_flight",
         kind: InstrumentKind::UpDownCounter,
         unit: None,

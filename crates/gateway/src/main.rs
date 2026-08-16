@@ -50,6 +50,10 @@ mod desired_state;
 mod error;
 mod key_material;
 mod mint;
+// The request-path middleware primitive (#355). The production chain is empty
+// until typed policy delivery registers content middleware.
+#[allow(dead_code)]
+mod middleware;
 // Operator commands: `axond check preflight`, `axond migrate status`,
 // `axond migrate apply`, and `axond migrate adopt`. Nothing here is on the
 // request path or reachable from `serve`.

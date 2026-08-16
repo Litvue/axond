@@ -217,6 +217,16 @@ groups:
           description: "The replica has no room to track more subjects. Watch axond_budget_retained_subjects against max_subjects; these bounds are per replica by design."
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#budget-or-rate-limit-capacity-is-exhausted"
 
+      - alert: AxondMiddlewareCapacityTimeouts
+        expr: "sum(rate(axond_middleware_capacity_timeouts[5m])) > 0"
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Content middleware is exhausting bounded blocking capacity"
+          description: "Middleware calls are spending their complete invocation deadline waiting for either the global 64-worker ceiling or one middleware id's four-worker ceiling. Use warning logs to identify the id; the metric deliberately has no policy-defined labels."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#middleware-blocking-capacity-is-timing-out"
+
   - name: axond.lifecycle
     interval: 30s
     rules:

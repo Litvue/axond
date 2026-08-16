@@ -464,7 +464,7 @@ many may be in flight at once.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `max_request_bytes` | integer | `2097152` | Largest inbound request body accepted. Enforced by the router before the body is buffered, so an oversized request is refused rather than read. Must be ≥ 1. |
+| `max_request_bytes` | integer | `2097152` | Largest request body accepted. The router refuses an oversized inbound body before buffering; request middleware output is measured again and refused before provider dispatch if expansion crosses the same ceiling. Must be ≥ 1. |
 | `max_prompt_tokens` | integer | `1000000` | Largest estimated input size a request may carry. `0` disables. Only binds below `max_request_bytes` / 4 — see below. |
 | `max_output_tokens` | integer | `200000` | Largest output allowance a request may ask for (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`). Refused, not clamped, so the caller is never silently given a different request than it sent. `0` disables. |
 | `max_in_flight` | integer | `1024` | Concurrent requests this replica admits. `0` disables. |
