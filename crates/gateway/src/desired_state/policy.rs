@@ -1720,17 +1720,23 @@ impl PolicyTransition {
     /// See [`PolicyBody::displaced_by`]: the same field comparison, dropping
     /// only the reasons a handover cannot be judged by.
     ///
-    /// [`TransitionClass::Live`] reasons go, because a value that only loosens
-    /// strands nothing and the two scopes share no history to call it a
-    /// republication of. Everything that constrains the move stays: a drain is
-    /// still a drain when a different scope's document imposes it, and a
-    /// refusing value — a token floor that falls — is still restoring tokens an
-    /// operator revoked, whichever document lowers it.
+    /// Live scalar changes go, because a value that only loosens strands nothing
+    /// and the two scopes share no history to call it a republication of. A
+    /// content-chain replacement stays even though it is live: it is not a
+    /// tightening/loosening axis, and an operator must still be able to see that
+    /// a handover replaced the middleware a namespace executes. Everything that
+    /// constrains the move stays too: a drain is still a drain when a different
+    /// scope's document imposes it, and a refusing value — a token floor that
+    /// falls — is still restoring tokens an operator revoked, whichever document
+    /// lowers it.
     fn displacing(from: &PolicyBody, to: &PolicyBody) -> Self {
         Self::of(
             Self::fields(from, to)
                 .into_iter()
-                .filter(|reason| reason.class() != TransitionClass::Live)
+                .filter(|reason| {
+                    reason.class() != TransitionClass::Live
+                        || *reason == TransitionReason::ContentMiddlewareChanged
+                })
                 .collect(),
         )
     }
@@ -2232,6 +2238,23 @@ mod tests {
         .unwrap();
         assert!(removed.transition(&rollback).is_live());
         assert_eq!(rollback.content(), added.content());
+
+        let project = PolicyBody::new(
+            project_scope(),
+            PolicyEpoch::FIRST,
+            *base.budget(),
+            *base.concurrency(),
+            *base.revocation(),
+        )
+        .with_content_middleware(vec![middleware("project-chain")])
+        .unwrap();
+        let handover = base.displaced_by(&project);
+        assert!(handover.is_live());
+        assert_eq!(
+            handover.reasons(),
+            [TransitionReason::ContentMiddlewareChanged],
+            "a scope handover keeps the operator-visible chain replacement"
+        );
     }
 
     /// A tenant document with one field of the canonical record edited: how a
