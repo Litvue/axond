@@ -122,6 +122,37 @@ impl Drop for InvocationGuard {
     }
 }
 
+/// Marks blocking work as abandoned if its async caller is cancelled while
+/// awaiting the join. The closure-owned [`InvocationGuard`] clears the
+/// quarantine when that work eventually exits.
+struct InvocationCancellationGuard {
+    state: Arc<Mutex<InvocationState>>,
+    gate: Arc<MiddlewareGate>,
+    armed: bool,
+}
+
+impl InvocationCancellationGuard {
+    fn new(state: Arc<Mutex<InvocationState>>, gate: Arc<MiddlewareGate>) -> Self {
+        Self {
+            state,
+            gate,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InvocationCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            mark_invocation_abandoned(&self.state, &self.gate);
+        }
+    }
+}
+
 fn mark_invocation_abandoned(state: &Arc<Mutex<InvocationState>>, gate: &Arc<MiddlewareGate>) {
     let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
     if matches!(*state, InvocationState::Running) {
@@ -367,6 +398,14 @@ impl MiddlewareChain {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whether any registered middleware applies to this execution scope,
+    /// regardless of whether it declares output mutation.
+    pub fn has_scope(&self, scope: MiddlewareScope) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.declaration().has_scope(scope))
     }
 
     /// Whether this chain can change output in the phase this request will
@@ -683,6 +722,8 @@ impl MiddlewareExecution {
             let mut state = self.states.take(index);
             let closure_state = Arc::clone(&invocation_state);
             let closure_gate = Arc::clone(&gate);
+            let mut cancellation_guard =
+                InvocationCancellationGuard::new(Arc::clone(&invocation_state), Arc::clone(&gate));
             let invoked = tokio::time::timeout_at(
                 deadline,
                 tokio::task::spawn_blocking(move || {
@@ -698,6 +739,7 @@ impl MiddlewareExecution {
                 }),
             )
             .await;
+            cancellation_guard.disarm();
             let (candidate, state, mut result) = match invoked {
                 Ok(Ok(invoked)) => invoked,
                 Ok(Err(_)) => {
@@ -784,6 +826,8 @@ impl MiddlewareExecution {
             let mut state = self.states.take(index);
             let closure_state = Arc::clone(&invocation_state);
             let closure_gate = Arc::clone(&gate);
+            let mut cancellation_guard =
+                InvocationCancellationGuard::new(Arc::clone(&invocation_state), Arc::clone(&gate));
             let invoked = tokio::time::timeout_at(
                 deadline,
                 tokio::task::spawn_blocking(move || {
@@ -799,6 +843,7 @@ impl MiddlewareExecution {
                 }),
             )
             .await;
+            cancellation_guard.disarm();
             let (candidate, state, mut result) = match invoked {
                 Ok(Ok(invoked)) => invoked,
                 Ok(Err(_)) => {
@@ -952,7 +997,7 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn registration(
         id: &str,
@@ -1441,6 +1486,18 @@ namespace = "alpha"
         assert!(!chain.has_response_mutator(MiddlewareScope::StreamEvent));
     }
 
+    #[test]
+    fn scope_presence_does_not_require_response_mutation() {
+        let declaration =
+            MiddlewareDeclaration::new("stream-observer", [MiddlewareScope::StreamEvent]);
+        let chain = MiddlewareChain::new(vec![Arc::new(Noop { declaration })])
+            .expect("stream observer chain");
+
+        assert!(chain.has_scope(MiddlewareScope::StreamEvent));
+        assert!(!chain.has_response_mutator(MiddlewareScope::StreamEvent));
+        assert!(!chain.has_scope(MiddlewareScope::Response));
+    }
+
     #[derive(Debug)]
     struct PhaseCounts {
         responses: usize,
@@ -1789,6 +1846,191 @@ namespace = "alpha"
         assert_eq!(response, original);
     }
 
+    struct CancellableResponse {
+        declaration: MiddlewareDeclaration,
+        calls: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Middleware for CancellableResponse {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            if matches!(phase, MiddlewarePhase::Response(_)) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.maximum.fetch_max(active, Ordering::SeqCst);
+                for _ in 0..2_000 {
+                    if self.release.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    struct ResponsePeer {
+        declaration: MiddlewareDeclaration,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Middleware for ResponsePeer {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            if let MiddlewarePhase::Response(response) = phase {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                response.body["peer"] = json!(true);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_response_quarantines_only_its_id_until_blocking_work_exits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let peer_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut peer_declaration =
+            MiddlewareDeclaration::new("response-peer", [MiddlewareScope::Response]);
+        peer_declaration.mutates_response = true;
+        let mut cancelled_declaration =
+            MiddlewareDeclaration::new("cancelled-response", [MiddlewareScope::Response]);
+        cancelled_declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        cancelled_declaration.max_duration = Duration::from_secs(5);
+        let chain = MiddlewareChain::new(vec![
+            Arc::new(ResponsePeer {
+                declaration: peer_declaration,
+                calls: Arc::clone(&peer_calls),
+            }),
+            Arc::new(CancellableResponse {
+                declaration: cancelled_declaration,
+                calls: Arc::clone(&calls),
+                active: Arc::clone(&active),
+                maximum: Arc::clone(&maximum),
+                release: Arc::clone(&release),
+            }),
+        ])
+        .expect("cancellable response chain");
+        let runtime = MiddlewareRuntime::with_slots(Arc::new(Semaphore::new(2)));
+
+        let mut first_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut first_execution = chain
+            .start(&runtime, &mut first_request)
+            .await
+            .expect("first execution");
+        let first = tokio::spawn(async move {
+            let mut response = ProviderResponse {
+                body: json!({}),
+                usage: ModelUsage::default(),
+            };
+            first_execution.response(&mut response).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking response middleware starts");
+
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("response future is cancelled")
+                .is_cancelled()
+        );
+        let cancelled_gate = runtime.gate("cancelled-response");
+        assert_eq!(cancelled_gate.abandoned.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+
+        let mut second_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut second_execution = chain
+            .start(&runtime, &mut second_request)
+            .await
+            .expect("second execution");
+        let mut second_response = ProviderResponse {
+            body: json!({}),
+            usage: ModelUsage::default(),
+        };
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            second_execution.response(&mut second_response),
+        )
+        .await
+        .expect("quarantined id is skipped without waiting")
+        .expect("fail-open quarantine leaves peers available");
+        assert_eq!(second_response.body["peer"], json!(true));
+        assert_eq!(peer_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancelled_gate.abandoned.load(Ordering::Acquire) != 0
+                || active.load(Ordering::Acquire) != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closure exit clears quarantine");
+        assert_eq!(
+            cancelled_gate.slots.available_permits(),
+            MAX_BLOCKING_INVOCATIONS_PER_MIDDLEWARE
+        );
+        assert_eq!(runtime.slots.available_permits(), 2);
+
+        let mut recovered_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut recovered_execution = chain
+            .start(&runtime, &mut recovered_request)
+            .await
+            .expect("recovered execution");
+        let mut recovered_response = ProviderResponse {
+            body: json!({}),
+            usage: ModelUsage::default(),
+        };
+        recovered_execution
+            .response(&mut recovered_response)
+            .await
+            .expect("middleware id is retried after recovery");
+        assert_eq!(recovered_response.body["peer"], json!(true));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(peer_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
     struct SlowStatefulOutput {
         declaration: MiddlewareDeclaration,
         active: Arc<AtomicUsize>,
@@ -1856,12 +2098,13 @@ namespace = "alpha"
         let (entry, maximum, response_calls) =
             slow_stateful_output(MiddlewareFailurePosture::FailOpen);
         let chain = MiddlewareChain::new(vec![entry]).expect("slow chain");
+        let runtime = MiddlewareRuntime::default();
         let mut request = ProviderRequest {
             model: "alias".to_owned(),
             body: json!({}),
         };
         let mut execution = chain
-            .start_isolated(&mut request)
+            .start(&runtime, &mut request)
             .await
             .expect("request state");
         let mut first = ProviderResponse {
@@ -1879,7 +2122,10 @@ namespace = "alpha"
             .expect("stranded fail-open slot is disabled");
         assert_eq!(response_calls.load(Ordering::SeqCst), 1);
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        let gate = runtime.gate("slow-stateful");
+        assert_eq!(gate.abandoned.load(Ordering::Acquire), 1);
         tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(gate.abandoned.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
