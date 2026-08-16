@@ -6,7 +6,7 @@
 //! refusal envelope.  The chain is deliberately not attached to `AppState` yet;
 //! an empty chain is the production default until typed policy delivery lands.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -16,8 +16,20 @@ use gateway_core::{
     ProviderRequest,
 };
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 use crate::error::GatewayError;
+
+/// Keep abandoned synchronous invocations from consuming Tokio's entire
+/// process-wide blocking pool. A timed-out task retains its permit until the
+/// middleware actually returns; later calls fail through their declared
+/// posture instead of spawning an unbounded number of blocked threads.
+const MAX_BLOCKING_MIDDLEWARE_INVOCATIONS: usize = 64;
+
+fn blocking_middleware_slots() -> &'static Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_BLOCKING_MIDDLEWARE_INVOCATIONS)))
+}
 
 /// A registered, ordered set of content middleware.
 #[derive(Clone, Default)]
@@ -115,12 +127,20 @@ impl MiddlewareChain {
             if !entry.declaration().has_scope(MiddlewareScope::Request) {
                 continue;
             }
+            let slot = match Arc::clone(blocking_middleware_slots()).try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    self.failure(index, "invocation capacity exhausted")?;
+                    continue;
+                }
+            };
             let mut candidate = request.clone();
             let middleware = Arc::clone(entry);
             let bound = entry.declaration().max_duration;
             let invoked = tokio::time::timeout(
                 bound,
                 tokio::task::spawn_blocking(move || {
+                    let _slot = slot;
                     let result = middleware.apply(MiddlewarePhase::Request(&mut candidate), None);
                     (candidate, result)
                 }),
@@ -137,7 +157,11 @@ impl MiddlewareChain {
                     continue;
                 }
             };
-            if result.is_ok() && !routing_fields_unchanged(request, &candidate) {
+            let continues = matches!(
+                result.as_ref().map(|outcome| outcome.verdict),
+                Ok(MiddlewareVerdict::Continue)
+            );
+            if continues && !routing_fields_unchanged(request, &candidate) {
                 result = Err(MiddlewareError::Failed);
             }
             if self.finish(index, result, &mut states, true)? {
@@ -390,6 +414,46 @@ mod tests {
             Err(GatewayError::MiddlewareUnavailable)
         ));
         assert_eq!(closed_request, open_original);
+    }
+
+    #[tokio::test]
+    async fn explicit_refusal_survives_routing_mutation_even_when_fail_open() {
+        struct RoutingRefuser {
+            declaration: MiddlewareDeclaration,
+        }
+        impl Middleware for RoutingRefuser {
+            fn declaration(&self) -> &MiddlewareDeclaration {
+                &self.declaration
+            }
+            fn apply(
+                &self,
+                phase: MiddlewarePhase<'_>,
+                _state: Option<&mut gateway_core::MiddlewareState>,
+            ) -> gateway_core::MiddlewareResult {
+                if let MiddlewarePhase::Request(request) = phase {
+                    request.model = "must-not-escape".to_owned();
+                    request.body["stream"] = json!(false);
+                }
+                Ok(MiddlewareOutcome::refuse(MiddlewareRefusal::InvalidRequest))
+            }
+        }
+
+        let mut declaration = MiddlewareDeclaration::new("guard", [MiddlewareScope::Request]);
+        declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        let chain = MiddlewareChain::new(vec![Arc::new(RoutingRefuser { declaration })])
+            .expect("valid chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({"stream": true}),
+        };
+        let original = request.clone();
+        assert!(matches!(
+            chain.request(&mut request).await,
+            Err(GatewayError::MiddlewareRefused {
+                reason: "invalid_request"
+            })
+        ));
+        assert_eq!(request, original);
     }
 
     #[tokio::test]
