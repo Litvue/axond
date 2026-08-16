@@ -389,6 +389,7 @@ pub(crate) struct CachedProjectIdentity {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CachedPolicy {
     pub(crate) tenant: String,
     pub(crate) project: Option<String>,
@@ -399,7 +400,6 @@ pub(crate) struct CachedPolicy {
     pub(crate) max_in_flight_per_subject: u64,
     pub(crate) lease_ttl_seconds: u64,
     pub(crate) minimum_token_epoch: u64,
-    #[serde(default)]
     pub(crate) content_middleware: Vec<CachedContentMiddleware>,
 }
 

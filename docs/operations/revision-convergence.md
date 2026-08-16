@@ -756,7 +756,9 @@ What to know about it operationally:
   refusal names the version skew rather than the cache file: the action is to roll
   the replica forward or repave the volume, not to hunt a disk fault. A cache that
   fails its signature, or holds rows that do not add up, is still reported as the
-  cache's own failure.
+  cache's own failure. The compiled-serving envelope increments its layout byte
+  whenever its payload gains a field, and policy payloads reject unknown keys, so
+  a downgrade cannot silently discard a guardrail registration.
 - **An unwritable cache is a warning, not an outage.** A replica whose disk is
   full keeps serving and logs once; what it loses is the ability to cold-boot
   during an outage.
