@@ -10,6 +10,8 @@ pub enum StreamParseError {
     BufferLimit(usize),
     #[error("stream ended with an incomplete SSE event")]
     Incomplete,
+    #[error("SSE block without a data field cannot be policy-validated")]
+    UnvalidatedBlock,
 }
 
 pub struct SseDecoder {
@@ -36,6 +38,24 @@ impl SseDecoder {
     }
 
     pub fn push(&mut self, chunk: &str) -> Result<Vec<SseEvent>, StreamParseError> {
+        self.push_inner(chunk, false)
+    }
+
+    /// Decode only SSE blocks that can be presented to policy middleware.
+    ///
+    /// Comments and blocks without `data:` are valid SSE, but a byte-faithful
+    /// relay cannot release them after validating only data events: their raw
+    /// bytes would never receive a policy verdict. Strict decoding therefore
+    /// refuses such a block instead of silently discarding it.
+    pub fn push_strict(&mut self, chunk: &str) -> Result<Vec<SseEvent>, StreamParseError> {
+        self.push_inner(chunk, true)
+    }
+
+    fn push_inner(
+        &mut self,
+        chunk: &str,
+        reject_unvalidated_blocks: bool,
+    ) -> Result<Vec<SseEvent>, StreamParseError> {
         self.buffer.push_str(chunk);
         if self.buffer.len() > self.max_buffer_bytes {
             return Err(StreamParseError::BufferLimit(self.max_buffer_bytes));
@@ -57,6 +77,9 @@ impl SseDecoder {
             };
             consumed = end + delimiter_len;
             search = consumed;
+            if reject_unvalidated_blocks && !strict_block_is_valid(&block) {
+                return Err(StreamParseError::UnvalidatedBlock);
+            }
             if let Some(event) = parse_event(&block) {
                 events.push(event);
             }
@@ -130,6 +153,31 @@ fn parse_event(block: &str) -> Option<SseEvent> {
     })
 }
 
+/// Whether every byte-bearing SSE field in a block reaches the policy callback.
+/// `data:` values are joined and exposed, and one `event:` value is exposed as
+/// the event name. Everything else—including comments, metadata, unknown
+/// fields, and a shadowed event name—would disappear in `parse_event` and is
+/// therefore refused by strict byte-faithful validation.
+fn strict_block_is_valid(block: &str) -> bool {
+    let mut event_seen = false;
+    let mut data_seen = false;
+    for line in block.lines() {
+        if line.starts_with(':') {
+            return false;
+        }
+        let Some((field, _)) = line.split_once(':') else {
+            return false;
+        };
+        match field {
+            "data" => data_seen = true,
+            "event" if !event_seen => event_seen = true,
+            "event" | "id" | "retry" => return false,
+            _ => return false,
+        }
+    }
+    data_seen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +229,35 @@ mod tests {
         let mut decoder = SseDecoder::default();
         assert!(decoder.push("data: complete\n\ndata: trunc").unwrap().len() == 1);
         assert_eq!(decoder.finish(), Err(StreamParseError::Incomplete));
+    }
+
+    #[test]
+    fn strict_decode_refuses_blocks_middleware_cannot_validate() {
+        for block in [
+            ": secret comment\n\n",
+            "event: opaque\nid: secret\n\n",
+            ": mixed secret\ndata: {\"safe\":true}\n\n",
+            "event: first\nevent: second\ndata: {\"safe\":true}\n\n",
+            "retry: 1000\ndata: {\"safe\":true}\n\n",
+            "future-field: secret\ndata: {\"safe\":true}\n\n",
+        ] {
+            let mut decoder = SseDecoder::default();
+            assert_eq!(
+                decoder.push_strict(block),
+                Err(StreamParseError::UnvalidatedBlock)
+            );
+        }
+
+        let mut decoder = SseDecoder::default();
+        assert_eq!(
+            decoder
+                .push_strict("event: delta\ndata: first\ndata: second\n\n")
+                .unwrap(),
+            vec![SseEvent {
+                event: Some("delta".to_owned()),
+                data: "first\nsecond".to_owned(),
+            }]
+        );
     }
 
     /// The scan cursor must not skip a delimiter that arrives one byte at a

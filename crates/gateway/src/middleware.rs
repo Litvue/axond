@@ -2152,6 +2152,108 @@ namespace = "alpha"
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn cancelled_fail_closed_stream_event_refuses_until_the_id_recovers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut declaration =
+            MiddlewareDeclaration::new("cancelled-closed", [MiddlewareScope::StreamEvent]);
+        declaration.max_duration = Duration::from_secs(5);
+        let chain = MiddlewareChain::new(vec![Arc::new(CancellableResponse {
+            declaration,
+            calls: Arc::clone(&calls),
+            active: Arc::clone(&active),
+            maximum: Arc::clone(&maximum),
+            release: Arc::clone(&release),
+        })])
+        .expect("fail-closed stream chain");
+        let runtime = MiddlewareRuntime::with_slots(Arc::new(Semaphore::new(1)));
+
+        let mut first_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut first_execution = chain
+            .start(&runtime, &mut first_request)
+            .await
+            .expect("first execution");
+        let first = tokio::spawn(async move {
+            let mut event = ProviderStreamEvent::Data {
+                event: None,
+                data: json!({"delta": "first"}),
+            };
+            first_execution.stream_event(&mut event).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking stream middleware starts");
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("stream future is cancelled")
+                .is_cancelled()
+        );
+        let gate = runtime.gate("cancelled-closed");
+        assert_eq!(gate.abandoned.load(Ordering::Acquire), 1);
+
+        let mut refused_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut refused_execution = chain
+            .start(&runtime, &mut refused_request)
+            .await
+            .expect("refused execution owner");
+        let mut refused_event = ProviderStreamEvent::Data {
+            event: None,
+            data: json!({"delta": "refused"}),
+        };
+        assert!(matches!(
+            refused_execution.stream_event(&mut refused_event).await,
+            Err(GatewayError::MiddlewareUnavailable)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.abandoned.load(Ordering::Acquire) != 0
+                || active.load(Ordering::Acquire) != 0
+                || gate.slots.available_permits() != MAX_BLOCKING_INVOCATIONS_PER_MIDDLEWARE
+                || runtime.slots.available_permits() != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fail-closed id recovers after closure exit");
+
+        let mut recovered_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut recovered_execution = chain
+            .start(&runtime, &mut recovered_request)
+            .await
+            .expect("recovered execution");
+        let mut recovered_event = ProviderStreamEvent::Data {
+            event: None,
+            data: json!({"delta": "recovered"}),
+        };
+        recovered_execution
+            .stream_event(&mut recovered_event)
+            .await
+            .expect("recovered fail-closed id runs again");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
     struct SlowStatefulOutput {
         declaration: MiddlewareDeclaration,
         active: Arc<AtomicUsize>,

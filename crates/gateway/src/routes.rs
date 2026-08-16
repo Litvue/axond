@@ -1665,47 +1665,40 @@ async fn serve(
     let served = &outcome.served;
     match outcome.result {
         Ok(mut response) => {
-            let middleware_result = middleware_execution.response(&mut response).await;
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
-            // Settled first, and not because the record does not matter: the
-            // spend was incurred upstream whether or not the record survives,
-            // and the append that follows is the first await long enough for a
-            // caller to disconnect inside. A handler dropped there would run the
-            // guard's release and hand back the whole estimate instead of the
-            // measured cost, so the charge is made while nothing can cancel it.
-            reservation.settle(cost).await;
-            // Then the record, before the response is acknowledged: in
-            // billing-grade mode this is the durable append, and a request whose
-            // usage is not durable must not be answered `200`. In
-            // telemetry-grade mode the fan-out cannot fail.
-            record_usage(
-                &state,
-                RecordArgs {
-                    identity: &identity,
-                    caller: &caller,
-                    alias: &alias,
-                    target_provider: &served.provider,
-                    target_model: &served.model,
-                    source: served.source,
-                    credential_id: &served.credential_id,
-                    status: if middleware_result.is_ok() {
-                        Status::Ok
-                    } else {
-                        Status::Rejected
-                    },
-                    input_tokens: response.usage.input_tokens,
-                    cache_read_tokens: response.usage.cache_read_tokens,
-                    cache_write_tokens: response.usage.cache_write_tokens,
-                    output_tokens: response.usage.output_tokens,
-                    cost_microdollars: cost,
-                    price: served.price,
-                    latency_ms: outcome.latency_ms,
-                    ttft_ms: outcome.ttft_ms,
-                    attempts: outcome.attempts,
-                },
-            )
-            .await?;
+            // Provider work is already complete before response middleware
+            // starts. Move the known spend and usage into a cancellation owner
+            // first, so a caller disappearing during a blocking callback cannot
+            // turn consumed work back into a released hold and a missing row.
+            let (record, ttft_ms, attempts) = build_record(RecordArgs {
+                identity: &identity,
+                caller: &caller,
+                alias: &alias,
+                target_provider: &served.provider,
+                target_model: &served.model,
+                source: served.source,
+                credential_id: &served.credential_id,
+                status: Status::ClientCancelled,
+                input_tokens: response.usage.input_tokens,
+                cache_read_tokens: response.usage.cache_read_tokens,
+                cache_write_tokens: response.usage.cache_write_tokens,
+                output_tokens: response.usage.output_tokens,
+                cost_microdollars: cost,
+                price: served.price,
+                latency_ms: outcome.latency_ms,
+                ttft_ms: outcome.ttft_ms,
+                attempts: outcome.attempts,
+            });
+            let accounting = reservation.into_response_accounting(record, ttft_ms, attempts);
+            let middleware_result = middleware_execution.response(&mut response).await;
+            accounting
+                .finish(if middleware_result.is_ok() {
+                    Status::Ok
+                } else {
+                    Status::Rejected
+                })
+                .await?;
             middleware_result?;
             Ok(Json(response.body).into_response())
         }
@@ -2463,20 +2456,6 @@ impl BudgetReservation {
         }
     }
 
-    /// Disarm before awaiting so dropping the guard after settlement cannot
-    /// submit a second budget operation.
-    async fn settle(mut self, actual_microdollars: u64) {
-        let reservation = self
-            .reservation
-            .take()
-            .expect("budget reservation guard must be armed");
-        self.state
-            .0
-            .budget
-            .settle(&self.key, &reservation, actual_microdollars)
-            .await;
-    }
-
     /// Disarm before awaiting so the explicit release and the drop fallback
     /// cannot both reconcile the same hold.
     async fn release(mut self) {
@@ -2489,6 +2468,22 @@ impl BudgetReservation {
 
     fn disarm(mut self) {
         self.reservation.take();
+    }
+
+    fn into_response_accounting(
+        mut self,
+        record: UsageRecord,
+        ttft_ms: Option<u64>,
+        attempts: u32,
+    ) -> BufferedResponseAccounting {
+        BufferedResponseAccounting {
+            state: self.state.clone(),
+            key: self.key.clone(),
+            reservation: self.reservation.take(),
+            record: Some(record),
+            ttft_ms,
+            attempts,
+        }
     }
 }
 
@@ -2503,6 +2498,99 @@ impl Drop for BudgetReservation {
             state.0.budget.release(&key, &reservation).await;
         });
     }
+}
+
+/// Owns known provider spend while buffered response middleware runs.
+///
+/// `client_cancelled` is recorded when this owner drops before middleware
+/// produces a terminal outcome. Once middleware has returned, `finish` makes one durable
+/// `ok`/`rejected` decision before any accounting await. That status describes
+/// the request outcome, not an unknowable proof that the peer received the HTTP
+/// response: changing it after an ambiguously acknowledged durable commit would
+/// conflict with the immutable event under the same request identity.
+struct BufferedResponseAccounting {
+    state: AppState,
+    key: BudgetKey,
+    reservation: Option<Reservation>,
+    record: Option<UsageRecord>,
+    ttft_ms: Option<u64>,
+    attempts: u32,
+}
+
+impl BufferedResponseAccounting {
+    async fn finish(mut self, status: Status) -> Result<(), GatewayError> {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("buffered response accounting must own its reservation");
+        let mut record = self
+            .record
+            .take()
+            .expect("buffered response accounting must own its record");
+        record.status = status;
+        let decided = spawn_buffered_response_accounting(
+            self.state.clone(),
+            self.key.clone(),
+            reservation,
+            record,
+            self.ttft_ms,
+            self.attempts,
+        );
+        match decided.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(GatewayError::UsageNotDurable {
+                reason: error.reason,
+            }),
+            Err(_) => Err(GatewayError::UsageNotDurable {
+                reason: "the durable append did not report before the runtime stopped",
+            }),
+        }
+    }
+}
+
+impl Drop for BufferedResponseAccounting {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let mut record = self
+            .record
+            .take()
+            .expect("armed buffered response accounting must own its record");
+        record.status = Status::ClientCancelled;
+        drop(spawn_buffered_response_accounting(
+            self.state.clone(),
+            self.key.clone(),
+            reservation,
+            record,
+            self.ttft_ms,
+            self.attempts,
+        ));
+    }
+}
+
+fn spawn_buffered_response_accounting(
+    state: AppState,
+    key: BudgetKey,
+    reservation: Reservation,
+    record: UsageRecord,
+    ttft_ms: Option<u64>,
+    attempts: u32,
+) -> tokio::sync::oneshot::Receiver<Result<(), crate::usage::NotDurable>> {
+    let (verdict, decided) = tokio::sync::oneshot::channel();
+    streaming::spawn_settlement(async move {
+        state
+            .0
+            .budget
+            .settle(&key, &reservation, record.cost_microdollars)
+            .await;
+        telemetry::record_request(&record, ttft_ms, attempts);
+        let result = state.0.usage.record(&record).await;
+        if let Err(Err(unheard)) = verdict.send(result) {
+            state.0.usage.count_unheard_refusal(&unheard);
+        }
+    });
+    decided
 }
 
 /// Mutable bookkeeping shared by the buffered and streaming failover walks: how
@@ -2925,54 +3013,6 @@ struct RecordArgs<'a> {
     ttft_ms: Option<u64>,
     /// Upstream attempts made; the retry count is one less.
     attempts: u32,
-}
-
-/// Build the record and hand it to usage delivery. The `Err` is billing-grade
-/// only: it means the event is not durable and the configured policy is to
-/// refuse rather than serve.
-async fn record_usage(state: &AppState, args: RecordArgs<'_>) -> Result<(), GatewayError> {
-    let (record, ttft_ms, attempts) = build_record(args);
-    telemetry::record_request(&record, ttft_ms, attempts);
-    // Fan-out delivery is a non-blocking hand-off, so it has no cancellation
-    // window worth detaching for and stays on the handler.
-    if !state.0.usage.appends() {
-        return state.0.usage.record(&record).await.map_err(|error| {
-            GatewayError::UsageNotDurable {
-                reason: error.reason,
-            }
-        });
-    }
-    // The billing-grade append is a database transaction, and hyper drops the
-    // handler future the moment the caller hangs up: a cancelled append would
-    // leave a charge already settled with no record of it anywhere and nothing
-    // counting the loss. Run as a settlement — the same tracking the streamed
-    // path uses, so shutdown waits for it — the append finishes whatever the
-    // connection does, and the handler awaits only the verdict its status code
-    // needs.
-    let (verdict, decided) = tokio::sync::oneshot::channel();
-    let recording = state.clone();
-    crate::streaming::spawn_settlement(async move {
-        // A refusal the handler is still there to receive is not a loss — the
-        // caller is told to retry and its spend is unwound. Once the handler is
-        // gone that answer reaches nobody, so an event that could not be
-        // journaled is a billable fact that no longer exists anywhere and is
-        // counted as one.
-        if let Err(Err(unheard)) = verdict.send(recording.0.usage.record(&record).await) {
-            recording.0.usage.count_unheard_refusal(&unheard);
-        }
-    });
-    match decided.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(GatewayError::UsageNotDurable {
-            reason: error.reason,
-        }),
-        // The settlement went down with the runtime, so nothing is known about
-        // the event; the honest answer is the one that does not claim it is
-        // billable.
-        Err(_) => Err(GatewayError::UsageNotDurable {
-            reason: "the durable append did not report before the runtime stopped",
-        }),
-    }
 }
 
 /// Record where the request is already ending for another reason, so a failure
@@ -6403,6 +6443,44 @@ targets = [
         }
     }
 
+    #[derive(Clone)]
+    struct BlockingSettlementBudget {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        settlements: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for BlockingSettlementBudget {
+        fn name(&self) -> &'static str {
+            "blocking-settlement"
+        }
+
+        async fn reserve(&self, _key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+            Admission::Allowed(Reservation {
+                id: "blocking-settlement".to_owned(),
+                estimate_microdollars: estimated_microdollars,
+                generation: None,
+            })
+        }
+
+        async fn settle(
+            &self,
+            _key: &BudgetKey,
+            _reservation: &Reservation,
+            actual_microdollars: u64,
+        ) {
+            self.settlements
+                .lock()
+                .expect("settlements")
+                .push(actual_microdollars);
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
     /// A request-scope middleware used by #356 tests. It changes only content,
     /// leaving routing fields alone, and therefore gives the request path a
     /// deterministic post-middleware body whose estimate can be asserted.
@@ -6410,6 +6488,12 @@ targets = [
         declaration: MiddlewareDeclaration,
         padding_bytes: usize,
         output_tokens: Option<u64>,
+    }
+
+    struct BlockingResponseMiddleware {
+        declaration: MiddlewareDeclaration,
+        active: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
     }
 
     struct StreamMarkerMiddleware {
@@ -6421,6 +6505,44 @@ targets = [
         refuse_on_text: bool,
     }
 
+    impl BlockingResponseMiddleware {
+        fn chain(active: Arc<AtomicUsize>, release: Arc<AtomicBool>) -> MiddlewareChain {
+            let mut declaration =
+                MiddlewareDeclaration::new("test.blocking-response", [MiddlewareScope::Response]);
+            declaration.max_duration = Duration::from_secs(5);
+            MiddlewareChain::new(vec![Arc::new(Self {
+                declaration,
+                active,
+                release,
+            })])
+            .expect("blocking response chain")
+        }
+    }
+
+    impl Middleware for BlockingResponseMiddleware {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> MiddlewareResult {
+            if matches!(phase, MiddlewarePhase::Response(_)) {
+                self.active.fetch_add(1, Ordering::SeqCst);
+                for _ in 0..2_000 {
+                    if self.release.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
     impl StreamMarkerMiddleware {
         fn chain() -> MiddlewareChain {
             let mut declaration =
@@ -6429,6 +6551,114 @@ targets = [
             MiddlewareChain::new(vec![Arc::new(Self { declaration }) as Arc<dyn Middleware>])
                 .expect("stream marker chain")
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_response_middleware_still_settles_provider_spend_and_usage() {
+        let (base_url, hits) = controllable_upstream(
+            Arc::new(AtomicBool::new(true)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let captured = CapturingSink::default();
+        let budget = RecordingBudget::default();
+        let active = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let state = two_target_state_with_budget(
+            &base_url,
+            &base_url,
+            "",
+            captured.clone(),
+            Box::new(budget.clone()),
+        )
+        .with_middleware_chain(BlockingResponseMiddleware::chain(
+            Arc::clone(&active),
+            Arc::clone(&release),
+        ));
+
+        let request = tokio::spawn(async move { router(state).oneshot(chat_request()).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("response middleware starts after provider success");
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request future is cancelled")
+                .is_cancelled()
+        );
+        release.store(true, Ordering::Release);
+        crate::streaming::await_settlements(Duration::from_secs(2)).await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let records = captured.0.lock().expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, Status::ClientCancelled);
+        assert_eq!(records[0].input_tokens, 10);
+        assert_eq!(records[0].output_tokens, 5);
+        assert_eq!(records[0].cost_microdollars, 15);
+        drop(records);
+        let reservations = budget.0.lock().expect("budget");
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].1, 15);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_settlement_keeps_the_decided_outcome_once() {
+        let (base_url, hits) = controllable_upstream(
+            Arc::new(AtomicBool::new(true)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let captured = CapturingSink::default();
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let settlements = Arc::new(Mutex::new(Vec::new()));
+        let budget = BlockingSettlementBudget {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            settlements: Arc::clone(&settlements),
+        };
+        let state = two_target_state_with_budget(
+            &base_url,
+            &base_url,
+            "",
+            captured.clone(),
+            Box::new(budget),
+        );
+
+        let request = tokio::spawn(async move { router(state).oneshot(chat_request()).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("budget settlement starts after provider success");
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request future is cancelled")
+                .is_cancelled()
+        );
+        release.store(true, Ordering::Release);
+        crate::streaming::await_settlements(Duration::from_secs(2)).await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            settlements.lock().expect("settlements").as_slice(),
+            &[15],
+            "known provider spend is settled exactly once"
+        );
+        let records = captured.0.lock().expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, Status::Ok);
+        assert_eq!(records[0].cost_microdollars, 15);
     }
 
     impl Middleware for StreamMarkerMiddleware {
@@ -8088,15 +8318,17 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
         );
     }
 
-    /// A journal whose append takes long enough for a caller to hang up inside
-    /// it, which is the whole window the cancellation regression is about.
-    struct SlowAppend {
+    /// A journal that durably commits, then withholds the acknowledgement until
+    /// the caller hangs up. This is the ambiguity an immutable usage event must
+    /// handle without retrying the same identity under different content.
+    struct BlockingAppend {
         inner: journal::oracle::InMemoryUsageJournal,
-        append_takes: Duration,
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
-    impl journal::UsageJournal for SlowAppend {
+    impl journal::UsageJournal for BlockingAppend {
         fn name(&self) -> &'static str {
             self.inner.name()
         }
@@ -8113,8 +8345,12 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
             &self,
             event: &journal::UsageEvent,
         ) -> Result<journal::Appended, journal::JournalError> {
-            tokio::time::sleep(self.append_takes).await;
-            self.inner.append(event).await
+            let appended = self.inner.append(event).await?;
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            Ok(appended)
         }
 
         async fn claim(
@@ -8152,41 +8388,59 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
         }
     }
 
-    /// The other half of the billing-grade promise: a caller that hangs up while
-    /// its usage is being appended does not take the record with it. The spend
-    /// was settled before the append, so a cancelled append would charge a
-    /// budget for a request no outbox reader can see — and, because the handler
-    /// is simply dropped, nothing would report it either.
+    /// Once provider and middleware produce a terminal outcome, accounting
+    /// persists that one immutable fact in a tracked task. Losing the durable
+    /// append acknowledgement cannot rewrite it as a contradictory cancellation
+    /// or create a second event; `ok` means the response was eligible to return,
+    /// not that the peer demonstrably received the HTTP body.
     #[tokio::test]
-    async fn a_caller_hanging_up_during_the_append_still_journals_its_usage() {
+    async fn lost_ack_after_durable_append_keeps_one_decided_outcome() {
         let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
-        let outbox = Arc::new(SlowAppend {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let outbox = Arc::new(BlockingAppend {
             inner: journal::oracle::InMemoryUsageJournal::new(),
-            append_takes: Duration::from_millis(200),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
         });
         let state = billing_state(&url, outbox.clone());
 
-        let mut serving = Box::pin(router(state).oneshot(chat_request()));
-        tokio::select! {
-            _ = &mut serving => panic!("the request answered before the append could be cut off"),
-            () = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-        // The caller hangs up: hyper drops the handler future exactly like this.
-        drop(serving);
+        let request = tokio::spawn(async move { router(state).oneshot(chat_request()).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable append starts after provider success");
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request future is cancelled")
+                .is_cancelled()
+        );
+        release.store(true, Ordering::Release);
+        crate::streaming::await_settlements(Duration::from_secs(2)).await;
 
         let consumer = journal::ConsumerId::parse("billing").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let stats = outbox.stats(&consumer).await.unwrap();
-            if stats.pending == 1 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the abandoned request never reached the outbox: {stats:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let claimed = outbox
+            .claim(
+                &consumer,
+                journal::Claim {
+                    max_events: 8,
+                    lease: Duration::from_secs(30),
+                    now: SystemTime::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "the abandoned request reached the outbox");
+        assert_eq!(
+            claimed[0].event.record().status,
+            Status::Ok,
+            "the committed outcome is not contradicted after an ambiguous acknowledgement"
+        );
     }
 
     /// A journal that refuses every append, slowly enough for the caller to
