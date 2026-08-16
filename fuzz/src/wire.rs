@@ -160,9 +160,6 @@ pub fn sse_decode_at_limit(body: &str, cuts: &[u16], max_buffer_bytes: usize) ->
         Some(StreamParseError::Incomplete) => {
             panic!("push reported an incomplete stream, which only finish may")
         }
-        Some(StreamParseError::UnvalidatedBlock) => {
-            panic!("ordinary push applied the policy-only strict block check")
-        }
         None => "pushed",
     });
     classes.push(match limited.finish {
@@ -170,9 +167,6 @@ pub fn sse_decode_at_limit(body: &str, cuts: &[u16], max_buffer_bytes: usize) ->
         Err(StreamParseError::Incomplete) => "incomplete",
         Err(StreamParseError::BufferLimit(limit)) => {
             panic!("finish enforced a buffer limit of {limit}, which is push's job")
-        }
-        Err(StreamParseError::UnvalidatedBlock) => {
-            panic!("finish applied the policy-only strict block check")
         }
     });
     classes

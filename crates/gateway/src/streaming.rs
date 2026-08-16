@@ -680,9 +680,9 @@ impl Relay {
                 let text = self.decode_utf8(&chunk);
                 let pushed = match self.sse.as_mut() {
                     Some(sse) if self.delivery == StreamDelivery::PolicyValidatedPassthrough => {
-                        sse.push_strict(&text)
+                        sse.push_strict(&text).map_err(|error| error.to_string())
                     }
-                    Some(sse) => sse.push(&text),
+                    Some(sse) => sse.push(&text).map_err(|error| error.to_string()),
                     None => Ok(Vec::new()),
                 };
                 match pushed {
@@ -752,7 +752,7 @@ impl Relay {
                             }
                         }
                     }
-                    Err(err) => self.phase = Phase::Failed(err.to_string()),
+                    Err(err) => self.phase = Phase::Failed(err),
                 }
             }
             Some(Err(err)) => {

@@ -10,7 +10,13 @@ pub enum StreamParseError {
     BufferLimit(usize),
     #[error("stream ended with an incomplete SSE event")]
     Incomplete,
-    #[error("SSE block without a data field cannot be policy-validated")]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StrictStreamParseError {
+    #[error(transparent)]
+    Parse(#[from] StreamParseError),
+    #[error("SSE block contains fields that cannot be policy-validated")]
     UnvalidatedBlock,
 }
 
@@ -38,7 +44,13 @@ impl SseDecoder {
     }
 
     pub fn push(&mut self, chunk: &str) -> Result<Vec<SseEvent>, StreamParseError> {
-        self.push_inner(chunk, false)
+        match self.push_inner(chunk, false) {
+            Ok(events) => Ok(events),
+            Err(StrictStreamParseError::Parse(error)) => Err(error),
+            Err(StrictStreamParseError::UnvalidatedBlock) => {
+                unreachable!("ordinary SSE decoding does not apply strict validation")
+            }
+        }
     }
 
     /// Decode only SSE blocks that can be presented to policy middleware.
@@ -47,7 +59,7 @@ impl SseDecoder {
     /// relay cannot release them after validating only data events: their raw
     /// bytes would never receive a policy verdict. Strict decoding therefore
     /// refuses such a block instead of silently discarding it.
-    pub fn push_strict(&mut self, chunk: &str) -> Result<Vec<SseEvent>, StreamParseError> {
+    pub fn push_strict(&mut self, chunk: &str) -> Result<Vec<SseEvent>, StrictStreamParseError> {
         self.push_inner(chunk, true)
     }
 
@@ -55,10 +67,10 @@ impl SseDecoder {
         &mut self,
         chunk: &str,
         reject_unvalidated_blocks: bool,
-    ) -> Result<Vec<SseEvent>, StreamParseError> {
+    ) -> Result<Vec<SseEvent>, StrictStreamParseError> {
         self.buffer.push_str(chunk);
         if self.buffer.len() > self.max_buffer_bytes {
-            return Err(StreamParseError::BufferLimit(self.max_buffer_bytes));
+            return Err(StreamParseError::BufferLimit(self.max_buffer_bytes).into());
         }
         let mut events = Vec::new();
         // Scanning and draining per event would reread and reshuffle the whole
@@ -78,7 +90,7 @@ impl SseDecoder {
             consumed = end + delimiter_len;
             search = consumed;
             if reject_unvalidated_blocks && !strict_block_is_valid(&block) {
-                return Err(StreamParseError::UnvalidatedBlock);
+                return Err(StrictStreamParseError::UnvalidatedBlock);
             }
             if let Some(event) = parse_event(&block) {
                 events.push(event);
@@ -244,7 +256,7 @@ mod tests {
             let mut decoder = SseDecoder::default();
             assert_eq!(
                 decoder.push_strict(block),
-                Err(StreamParseError::UnvalidatedBlock)
+                Err(StrictStreamParseError::UnvalidatedBlock)
             );
         }
 

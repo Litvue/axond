@@ -41,7 +41,7 @@ pub use provider::{
     Capabilities, ModelUsage, ProviderAdapter, ProviderRequest, ProviderResponse,
     ProviderStreamDecoder, ProviderStreamEvent, Surface,
 };
-pub use stream::{SseDecoder, SseEvent, StreamParseError};
+pub use stream::{SseDecoder, SseEvent, StreamParseError, StrictStreamParseError};
 pub use tool_call::{
     AssembledToolCall, ToolCallAssembler, ToolCallAssemblyError, ToolCallFragment,
 };
