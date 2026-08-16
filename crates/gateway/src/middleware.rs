@@ -1096,13 +1096,14 @@ namespace = "alpha"
             [MiddlewareScope::Request],
         ));
         let plan = MiddlewarePlan::compile(&config).expect("known registration compiles");
+        let runtime = MiddlewareRuntime::default();
 
         let mut alpha = ProviderRequest {
             model: "alias".to_owned(),
             body: json!({}),
         };
         plan.for_namespace("alpha")
-            .request(&mut alpha)
+            .request(&runtime, &mut alpha)
             .await
             .expect("alpha chain runs");
         assert_eq!(alpha.body["policy_middleware"], "test.policy-marker");
@@ -1112,7 +1113,7 @@ namespace = "alpha"
             body: json!({}),
         };
         plan.for_namespace("beta")
-            .request(&mut beta)
+            .request(&runtime, &mut beta)
             .await
             .expect("sibling stays empty");
         assert_eq!(beta.body, json!({}));

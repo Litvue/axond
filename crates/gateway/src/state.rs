@@ -54,9 +54,7 @@ use crate::desired_state::{
 };
 use crate::desired_state::{ProjectId, RevisionId, SecretRef, TenantId, WorkloadKey};
 use crate::key_material::{self, KeyMaterialError};
-use crate::middleware::{
-    MiddlewareChain, MiddlewarePlan, MiddlewarePlanError, MiddlewareRuntime,
-};
+use crate::middleware::{MiddlewareChain, MiddlewarePlan, MiddlewarePlanError, MiddlewareRuntime};
 use crate::policy::PolicyRuntime;
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
@@ -1793,7 +1791,7 @@ namespace = "platform"
         };
         held_added
             .middleware("platform")
-            .request(&mut request)
+            .request(&state.0.middleware_runtime, &mut request)
             .await
             .expect("added chain runs");
         assert_eq!(request.body["policy_middleware"], "test.policy-marker");
