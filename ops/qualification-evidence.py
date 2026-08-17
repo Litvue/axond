@@ -349,12 +349,30 @@ def read_memory_kib() -> int | None:
         return None
 
 
+def cpu_model_from(cpuinfo: str) -> str | None:
+    fields: dict[str, str] = {}
+    for line in cpuinfo.splitlines():
+        if ":" not in line:
+            continue
+        key, value = (part.strip() for part in line.split(":", 1))
+        if value and key not in fields:
+            fields[key] = value
+    for preferred in ("model name", "Hardware"):
+        if preferred in fields:
+            return fields[preferred]
+    implementer = fields.get("CPU implementer")
+    part = fields.get("CPU part")
+    if implementer and part:
+        return f"CPU implementer {implementer}, part {part}"
+    return None
+
+
 def read_cpu_model() -> str | None:
     cpuinfo = Path("/proc/cpuinfo")
     if cpuinfo.exists():
-        for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.lower().startswith(("model name", "hardware")):
-                return line.split(":", 1)[1].strip()
+        model = cpu_model_from(cpuinfo.read_text(encoding="utf-8", errors="replace"))
+        if model:
+            return model
     try:
         return shell_output("sysctl", "-n", "machdep.cpu.brand_string")
     except SystemExit:
@@ -746,6 +764,14 @@ def render_generic(
 
 def self_test() -> int:
     """Exercise the generic record's completeness and provenance refusals."""
+    assert cpu_model_from("model name : Example CPU\n") == "Example CPU"
+    assert cpu_model_from("Hardware : Example Board\n") == "Example Board"
+    assert (
+        cpu_model_from("CPU implementer : 0x61\nCPU part : 0x000\n")
+        == "CPU implementer 0x61, part 0x000"
+    )
+    assert cpu_model_from("CPU implementer : 0x61\n") is None
+
     manifest_relative = GENERIC_MANIFESTS["rollout"]
     manifest_bytes = (ROOT / manifest_relative).read_bytes()
     environment = {

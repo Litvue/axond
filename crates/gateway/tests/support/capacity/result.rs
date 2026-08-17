@@ -329,12 +329,68 @@ impl Hardware {
 fn cpu_model() -> Option<String> {
     std::fs::read_to_string("/proc/cpuinfo")
         .ok()
-        .and_then(|info| {
-            info.lines()
-                .find_map(|line| line.strip_prefix("model name")?.split_once(':'))
-                .map(|(_, model)| model.trim().to_owned())
-        })
+        .and_then(|info| cpu_model_from(&info))
         .or_else(|| command_output("sysctl", &["-n", "machdep.cpu.brand_string"]))
+}
+
+fn cpu_model_from(info: &str) -> Option<String> {
+    let fields: Vec<(&str, &str)> = info
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
+
+    for preferred in ["model name", "Hardware"] {
+        if let Some((_, model)) = fields.iter().find(|(key, _)| *key == preferred) {
+            return Some((*model).to_owned());
+        }
+    }
+
+    // AArch64 kernels commonly omit both x86's `model name` and the older
+    // ARM `Hardware` field, especially inside virtualized Docker runtimes.
+    // The implementer/part pair is the kernel-provided CPU identity in that
+    // format. Keep the literal values: translating them to a marketing name
+    // would make the evidence depend on an incomplete lookup table.
+    let field = |wanted: &str| {
+        fields
+            .iter()
+            .find_map(|(key, value)| (*key == wanted).then_some(*value))
+    };
+    let implementer = field("CPU implementer")?;
+    let part = field("CPU part")?;
+    Some(format!("CPU implementer {implementer}, part {part}"))
+}
+
+#[cfg(test)]
+mod cpu_model_tests {
+    use super::cpu_model_from;
+
+    #[test]
+    fn prefers_a_human_model_name() {
+        let info = "model name : Example CPU\nCPU implementer : 0x61\nCPU part : 0x000\n";
+        assert_eq!(cpu_model_from(info).as_deref(), Some("Example CPU"));
+    }
+
+    #[test]
+    fn accepts_the_older_arm_hardware_field() {
+        let info = "Hardware : Example Board\nCPU implementer : 0x41\nCPU part : 0xd03\n";
+        assert_eq!(cpu_model_from(info).as_deref(), Some("Example Board"));
+    }
+
+    #[test]
+    fn records_aarch64_implementer_and_part_when_no_model_is_exposed() {
+        let info = "processor : 0\nCPU implementer : 0x61\nCPU part : 0x000\n";
+        assert_eq!(
+            cpu_model_from(info).as_deref(),
+            Some("CPU implementer 0x61, part 0x000")
+        );
+    }
+
+    #[test]
+    fn refuses_an_incomplete_cpu_identity() {
+        assert_eq!(cpu_model_from("CPU implementer : 0x61\n"), None);
+    }
 }
 
 fn total_memory_kib() -> Option<u64> {

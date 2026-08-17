@@ -114,6 +114,11 @@ seed; the duration the run was actually offered (`run.requested_duration_ms`,
 flag, and the host's CPU, kernel, core count, and memory. **Numbers from
 artifacts whose provenance differs are not comparable.**
 
+CPU identity is the kernel's human-readable model when one is exposed. On
+AArch64 kernels that omit both `model name` and `Hardware`, the artifact records
+the literal `CPU implementer` and `CPU part` pair instead; it does not guess a
+marketing model from a platform-specific lookup table.
+
 ## What fails, and what does not
 
 Hard failures, asserted at both tiers, because none of them depends on how fast
