@@ -287,17 +287,19 @@ def check_gate_coverage(
         for gate in REQUIRED_GATE_NAMES:
             owner = gate_owner(scenario, gate)
             actual = evaluated.get((scenario_id, gate), [])
-            if owner is None and gate_not_applicable(scenario, gate) is None:
-                problems.append(
-                    f"{scenario_id}/{gate}: no designated owner exists; evaluated by "
-                    f"{actual or 'no stage'}"
-                )
-            elif owner is None and actual:
-                problems.append(
-                    f"{scenario_id}/{gate}: gate is explicitly non-applicable but was "
-                    f"evaluated by {actual} in the {runner} lane"
-                )
-            elif actual != [owner]:
+            if owner is None:
+                if gate_not_applicable(scenario, gate) is None:
+                    problems.append(
+                        f"{scenario_id}/{gate}: no designated owner exists; evaluated by "
+                        f"{actual or 'no stage'}"
+                    )
+                elif actual:
+                    problems.append(
+                        f"{scenario_id}/{gate}: gate is explicitly non-applicable but was "
+                        f"evaluated by {actual} in the {runner} lane"
+                    )
+                continue
+            if actual != [owner]:
                 problems.append(
                     f"{scenario_id}/{gate}: expected exactly one evaluation by {owner!r}, "
                     f"got {actual or 'none'} in the {runner} lane"
@@ -1169,6 +1171,61 @@ def self_test() -> int:
         if not check_gate_coverage(coverage_stages, coverage_directory, runner):
             complaints.append(
                 "a non-owner that duplicated a gate: combined coverage accepted it"
+            )
+
+        not_applicable_runner = "stateful-tests"
+        not_applicable_directory = Path(directory) / "not-applicable-coverage"
+        not_applicable_directory.mkdir()
+        not_applicable_stages = [
+            pair
+            for pair in owed(not_applicable_runner)
+            if pair[0]["id"] == "cold-boot-no-cache"
+        ]
+        for coverage_scenario, coverage_stage in not_applicable_stages:
+            coverage_path = not_applicable_directory / (
+                f"{coverage_scenario['id']}.{coverage_stage['id']}.json"
+            )
+            coverage_path.write_text(
+                json.dumps(
+                    artifact(
+                        coverage_scenario,
+                        coverage_stage,
+                        not_applicable_runner,
+                    )
+                ),
+                encoding="utf-8",
+            )
+        not_applicable_problems = check_gate_coverage(
+            not_applicable_stages,
+            not_applicable_directory,
+            not_applicable_runner,
+        )
+        if not_applicable_problems:
+            complaints.append(
+                "complete non-applicable gate deferrals: the checker rejected them: "
+                + "; ".join(not_applicable_problems)
+            )
+
+        forged_path = not_applicable_directory / "cold-boot-no-cache.cold-boot.json"
+        forged_artifact = json.loads(forged_path.read_text(encoding="utf-8"))
+        forged_gate = next(
+            entry
+            for entry in forged_artifact["gates"]
+            if entry["gate"] == "max_data_loss_revisions"
+        )
+        forged_gate.update(
+            observed="0",
+            outcome="met",
+            detail="the synthetic stage improperly evaluated a non-applicable gate",
+        )
+        forged_path.write_text(json.dumps(forged_artifact), encoding="utf-8")
+        if not check_gate_coverage(
+            not_applicable_stages,
+            not_applicable_directory,
+            not_applicable_runner,
+        ):
+            complaints.append(
+                "an evaluated non-applicable gate: combined coverage accepted it"
             )
 
     if complaints:
