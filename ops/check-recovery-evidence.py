@@ -435,6 +435,7 @@ def self_test() -> int:
                 "snapshot_generation_after_cold_boot": 0,
                 "ready_status": 503,
                 "active_revision": None,
+                "loaded_revision": None,
                 "anonymous_models_status": 401,
             },
             "cold-boot-no-cache/readiness": {
@@ -1020,6 +1021,27 @@ def self_test() -> int:
         if not no_cache_problems:
             complaints.append(
                 "a non-null no-cache active_revision: the checker accepted it"
+            )
+
+        nonnull_loaded_no_cache = artifact(
+            no_cache_scenario, no_cache_stage, "stateful-tests"
+        )
+        nonnull_loaded_no_cache["observations"]["loaded_revision"] = "rev-forged"
+        no_cache_path.write_text(
+            json.dumps(nonnull_loaded_no_cache), encoding="utf-8"
+        )
+        no_cache_problems = check(
+            no_cache_scenario,
+            no_cache_stage,
+            Path(directory),
+            "stateful-tests",
+            [],
+            expected_executable_sha256=executable_sha256,
+            expected_executable_path=Path("/workspace/target/release/axond"),
+        )
+        if not no_cache_problems:
+            complaints.append(
+                "a non-null no-cache loaded_revision: the checker accepted it"
             )
 
         durable_scenario, durable_stage = next(

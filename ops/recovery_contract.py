@@ -203,6 +203,7 @@ STAGE_REQUIRED_OBSERVATIONS: dict[str, frozenset[str]] = {
             "snapshot_generation_after_cold_boot",
             "ready_status",
             "active_revision",
+            "loaded_revision",
             "anonymous_models_status",
         }
     ),
@@ -1422,26 +1423,26 @@ def validate_recovery_artifact(
         problems.append("observations is missing or is not an object")
         observations = {}
     contract_key = stage_key(scenario, stage)
-    nullable_observation = (
-        "active_revision"
+    nullable_observations = (
+        frozenset({"active_revision", "loaded_revision"})
         if contract_key == "cold-boot-no-cache/cold-boot"
-        else None
+        else frozenset()
     )
     invalid_observations = sorted(
         key
         for key, value in observations.items()
         if not isinstance(key, str)
         or not key
-        or not _valid_observation(
-            value, allow_null=key == nullable_observation
-        )
+        or not _valid_observation(value, allow_null=key in nullable_observations)
     )
     if invalid_observations:
         problems.append(f"observations are empty or non-scalar: {invalid_observations}")
-    if nullable_observation is not None and observations.get(nullable_observation) is not None:
-        problems.append(
-            "cold-boot-no-cache/cold-boot observation active_revision must be null"
-        )
+    for nullable_observation in sorted(nullable_observations):
+        if observations.get(nullable_observation) is not None:
+            problems.append(
+                "cold-boot-no-cache/cold-boot observation "
+                f"{nullable_observation} must be null"
+            )
 
     verdict_problems = validate_verdicts(
         artifact, scenario, stage, reject_failed=reject_failed
