@@ -232,6 +232,13 @@ change to the lifecycle relation or to what a reference discloses amends it.
 Making secret resolution reachable from the request path changes the availability
 argument and needs an ADR.
 
+[ADR 0061](../adr/0061-authentication-remains-an-outer-boundary.md) owns
+authentication's compiled outer-boundary placement and its ordering before
+convergence, parsing, configurable policy, accounting, and dispatch. Moving or
+making that boundary operator-orderable amends that ADR and must preserve its
+closed-route, fail-closed, immutable-generation, and anonymous-before-
+convergence regression floor.
+
 [ADR 0060](../adr/0060-request-path-middleware.md) owns deterministic
 request-content redaction: key material is resolved only while compiling a
 snapshot, originals and stream carry are request-lifetime state that zeroizes on

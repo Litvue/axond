@@ -72,6 +72,14 @@ event data. It does not gain headers, route metadata, request extensions,
 principal stores, revocation stores, or a way to declare an authentication
 failure posture.
 
+### State tier
+
+Tier 0 (config-only). Stateless static-key and minted-token authentication
+remain in-process. Deployments that already select principal projection or
+revocation backends continue to use those dependencies at their existing tier;
+this decision adds no store, migration, or availability dependency and does not
+raise the tier of any existing deployment.
+
 ### Reconsideration gate
 
 A future design may revisit the outer layer only if it proposes a distinct
