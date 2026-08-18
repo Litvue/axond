@@ -652,21 +652,36 @@ async fn offer(
     drop(stream);
     let ttft = first_byte.map(|ttft| ttft.as_secs_f64() * 1000.0);
     let upstream_failed = stream_has_terminal_error(&relayed);
-    match plan.ending {
-        Ending::Complete if upstream_failed => finish(Outcome::Faulted, ttft),
-        Ending::Complete if !torn => finish(Outcome::Completed, ttft),
-        Ending::Cancelled if cancelled => finish(Outcome::Cancelled, ttft),
-        Ending::Dropped => finish(Outcome::Dropped, ttft),
-        Ending::Faulted if torn || upstream_failed => finish(Outcome::Faulted, ttft),
-        ending => Attempt {
+    let outcome = stream_outcome(plan.ending, cancelled, torn, upstream_failed);
+    match outcome {
+        Outcome::Unplanned => Attempt {
             reason: Some(format!(
                 "a streamed {} request ended {}after {} relayed bytes",
-                ending.as_str(),
+                plan.ending.as_str(),
                 if torn { "torn " } else { "" },
                 relayed.len()
             )),
-            ..finish(Outcome::Unplanned, ttft)
+            ..finish(outcome, ttft)
         },
+        _ => finish(outcome, ttft),
+    }
+}
+
+/// Classify what actually settled a stream. A terminal SSE error overrides an
+/// intended success or caller cancellation; the gateway has already emitted
+/// `upstream_error`, so recording no expected settlement would invent a
+/// surplus usage row during a declared provider outage. Deliberately dropped
+/// and faulted streams retain their planned categories because the terminal
+/// upstream failure is the workload shape those plans asked the fake provider
+/// to produce.
+fn stream_outcome(ending: Ending, cancelled: bool, torn: bool, upstream_failed: bool) -> Outcome {
+    match ending {
+        Ending::Complete | Ending::Cancelled if upstream_failed => Outcome::Faulted,
+        Ending::Complete if !torn => Outcome::Completed,
+        Ending::Cancelled if cancelled => Outcome::Cancelled,
+        Ending::Dropped => Outcome::Dropped,
+        Ending::Faulted if torn || upstream_failed => Outcome::Faulted,
+        _ => Outcome::Unplanned,
     }
 }
 
@@ -2631,5 +2646,31 @@ mod tests {
             "data: {\"choices\":[]}\n\n",
             "data: [DONE]\n\n",
         )));
+    }
+
+    #[test]
+    fn caller_visible_stream_error_replaces_success_and_cancellation_intents() {
+        assert_eq!(
+            stream_outcome(Ending::Complete, false, false, true),
+            Outcome::Faulted
+        );
+        assert_eq!(
+            stream_outcome(Ending::Cancelled, false, false, true),
+            Outcome::Faulted
+        );
+        assert_eq!(
+            stream_outcome(Ending::Dropped, false, false, true),
+            Outcome::Dropped,
+            "the plan deliberately asked its provider to drop this stream"
+        );
+        assert_eq!(
+            stream_outcome(Ending::Faulted, false, false, true),
+            Outcome::Faulted
+        );
+        assert_eq!(
+            stream_outcome(Ending::Cancelled, true, false, false),
+            Outcome::Cancelled,
+            "a caller cancellation without an upstream error stays cancelled"
+        );
     }
 }
