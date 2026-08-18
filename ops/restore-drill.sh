@@ -39,8 +39,9 @@
 # restore boundary.
 #
 # Usage:
-#     ops/restore-drill.sh              # the whole drill, ~2 minutes
-#     AXOND_BIN=target/release/axond ops/restore-drill.sh
+#     ops/restore-drill.sh              # build and run the whole drill, ~2 minutes
+#     AXOND_BIN=target/release/qualification/axond \
+#       AXOND_RECOVERY_EXECUTABLE_SHA256=<sha256> ops/restore-drill.sh
 #
 # Needs Docker and a release `cargo` build. Nothing outside the
 # container is written except a temporary config directory and the evidence.
@@ -205,20 +206,27 @@ psql() {
 command -v openssl >/dev/null 2>&1 || fail "openssl is required for this run's secrets and executable identity"
 
 release_axond_bin="${root}/target/release/axond"
-step "Building axond, the drill's release-profile verifier"
-cargo build -p axond --locked --release --manifest-path "${root}/Cargo.toml"
-[[ -x "$release_axond_bin" ]] || fail "no release axond binary at ${release_axond_bin}"
-
-# AXOND_BIN remains an explicit byte-selection assertion for callers, but it
-# may not redirect a release qualification to an arbitrary executable. Resolve
-# both paths after the build so aliases of target/release/axond are accepted and
-# a debug or copied binary is refused before evidence is opened.
-axond_bin="${AXOND_BIN:-$release_axond_bin}"
+if [[ -n "${AXOND_BIN:-}" ]]; then
+  # CI passes the single producer artifact shared with the stateful lane. A
+  # caller selecting bytes must also supply the producer's expected digest;
+  # otherwise moving an arbitrary executable under target/release would look
+  # like provenance without an upstream identity.
+  [[ "${AXOND_RECOVERY_EXECUTABLE_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "a supplied AXOND_BIN requires AXOND_RECOVERY_EXECUTABLE_SHA256"
+  axond_bin="$AXOND_BIN"
+  step "Using the pre-bound release-profile verifier"
+else
+  step "Building axond, the drill's release-profile verifier"
+  cargo build -p axond --locked --release --manifest-path "${root}/Cargo.toml"
+  axond_bin="$release_axond_bin"
+fi
 [[ -x "$axond_bin" ]] || fail "no axond binary at ${axond_bin}"
 axond_bin="$(cd "$(dirname "$axond_bin")" && pwd -P)/$(basename "$axond_bin")"
-release_axond_bin="$(cd "$(dirname "$release_axond_bin")" && pwd -P)/$(basename "$release_axond_bin")"
-[[ "$axond_bin" == "$release_axond_bin" ]] ||
-  fail "AXOND_BIN must resolve to the cargo --release executable at ${release_axond_bin}"
+release_root="$(cd "${root}/target/release" && pwd -P)"
+case "$axond_bin" in
+  "$release_root"/*) ;;
+  *) fail "AXOND_BIN must resolve beneath the Cargo release directory at ${release_root}" ;;
+esac
 
 recovery_cargo_profile="release"
 recovery_axond_sha256="$(openssl dgst -sha256 -r "$axond_bin" | awk '{print $1}')"

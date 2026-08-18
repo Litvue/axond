@@ -143,7 +143,7 @@ green.
 
 ```sh
 just restore-drill              # builds the current gateway, then runs the drill
-# or, after building target/debug/axond yourself:
+# or, to build the release executable inside the script:
 bash ops/restore-drill.sh
 ```
 
@@ -192,6 +192,13 @@ an earlier run left behind (`--since-unix-ms`), and any artifact carrying a
 string named by `--forbid-env`. CI runs it in
 both lanes before uploading `target/recovery/`, so a lane that produced no
 evidence fails the build instead of uploading nothing.
+
+In CI, a dedicated producer builds the release executable once and publishes a
+checksum alongside it. Both recovery lanes verify and execute separate downloads
+of that immutable artifact. Their retained copies and every process-backed raw
+stage must therefore agree on one SHA-256 identity before the combined recovery
+record can be created; independently rebuilding the same commit is not accepted
+as proof of identical executable bytes.
 
 ## What a run retains
 

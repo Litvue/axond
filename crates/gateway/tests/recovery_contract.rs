@@ -559,7 +559,8 @@ fn restore_drill_binds_evidence_to_the_release_executable_it_runs() {
         .expect("the restore drill is readable");
     for expected in [
         "cargo build -p axond --locked --release",
-        "AXOND_BIN must resolve to the cargo --release executable",
+        "a supplied AXOND_BIN requires AXOND_RECOVERY_EXECUTABLE_SHA256",
+        "AXOND_BIN must resolve beneath the Cargo release directory",
         "export AXOND_RECOVERY_EXECUTED_SHA256=\"$recovery_axond_sha256\"",
         "export AXOND_RECOVERY_EXECUTABLE_PATH=\"$axond_bin\"",
         "export AXOND_RECOVERY_EXECUTION_BOUND=\"true\"",

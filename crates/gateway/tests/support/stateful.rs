@@ -24,7 +24,7 @@ static FIXTURES: AtomicU64 = AtomicU64::new(0);
 /// that lost this many is reporting something other than bad luck.
 const BOOT_ATTEMPTS: usize = 8;
 
-const AXOND_BIN: &str = env!("CARGO_BIN_EXE_axond");
+const CARGO_AXOND_BIN: &str = env!("CARGO_BIN_EXE_axond");
 
 /// The immutable executable identity captured before any process is spawned.
 ///
@@ -41,15 +41,21 @@ static AXOND_EXECUTION: OnceLock<AxondExecution> = OnceLock::new();
 
 fn axond_execution() -> &'static AxondExecution {
     AXOND_EXECUTION.get_or_init(|| {
-        let path = PathBuf::from(AXOND_BIN);
+        // Cargo's executable remains the contributor default. Qualification CI
+        // supplies the one immutable release artifact shared with the restore
+        // lane, so the process evidence names the bytes selected at runtime
+        // rather than an independently linked test-side executable.
+        let path = std::env::var_os("AXOND_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(CARGO_AXOND_BIN));
         assert!(
             path.is_file(),
-            "{}: CARGO_BIN_EXE_axond is not a file",
+            "{}: selected axond executable is not a file",
             path.display()
         );
         assert!(
             path.is_absolute(),
-            "{}: CARGO_BIN_EXE_axond must be an absolute execution identity",
+            "{}: selected axond executable must be an absolute execution identity",
             path.display()
         );
         let cargo_profile = executable_cargo_profile(&path);
@@ -67,7 +73,7 @@ pub fn axond() -> &'static str {
     axond_execution()
         .path
         .to_str()
-        .expect("CARGO_BIN_EXE_axond is valid UTF-8")
+        .expect("the selected axond executable path is valid UTF-8")
 }
 
 /// Write `contents` to a private file and return its path.
@@ -894,7 +900,7 @@ fn executable_cargo_profile(path: &Path) -> &'static str {
             });
     profile.unwrap_or_else(|| {
         panic!(
-            "{}: CARGO_BIN_EXE_axond does not identify a Cargo release/debug profile",
+            "{}: selected axond executable does not identify a Cargo release/debug profile",
             path.display()
         )
     })
