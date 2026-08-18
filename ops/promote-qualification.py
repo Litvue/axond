@@ -511,6 +511,58 @@ def stateful_request_ids_are_subset(request_dir: Path, durable_dir: Path, label:
     return True
 
 
+def stateful_outside_loss_relation(
+    durable_dir: Path, outside_dir: Path, label: str
+) -> bool:
+    """Prove the outside-loss ledger uses the complete durable population.
+
+    Its expected side is the emitted-outside subset; its observed side must be
+    byte-for-byte the whole durable observed set. That makes its missing rows
+    exactly `emitted outside - durable anywhere`, independent of which side of
+    a timestamp boundary PostgreSQL assigned a row that was in fact stored.
+    """
+    for shard in range(STATEFUL_LEDGER_SHARDS):
+        all_expected = set(
+            stateful_shard_rows(
+                durable_dir,
+                "expected-request",
+                shard,
+                16,
+                label,
+                request_ids=True,
+            )
+        )
+        outside_expected = set(
+            stateful_shard_rows(
+                outside_dir,
+                "expected-request",
+                shard,
+                16,
+                label,
+                request_ids=True,
+            )
+        )
+        all_observed = stateful_shard_rows(
+            durable_dir,
+            "observed-request",
+            shard,
+            16,
+            label,
+            request_ids=True,
+        )
+        outside_observed = stateful_shard_rows(
+            outside_dir,
+            "observed-request",
+            shard,
+            16,
+            label,
+            request_ids=True,
+        )
+        if not outside_expected <= all_expected or outside_observed != all_observed:
+            return False
+    return True
+
+
 def hardware_fields(
     hardware: Any, label: str, *, allow_extra: bool = False
 ) -> dict[str, Any]:
@@ -2698,6 +2750,15 @@ def validate_raw_stateful_endurance(
         f"{label}: workload/durable identity relation",
     ):
         fail(f"{label}: workload request identities are not a subset of emitted identities")
+    if not stateful_outside_loss_relation(
+        ledger_directories["durable_identities"],
+        ledger_directories["durable_outside_identities"],
+        f"{label}: outside-loss identity relation",
+    ):
+        fail(
+            f"{label}: outside-loss evidence is not an emitted-outside subset "
+            "paired with the complete durable population"
+        )
 
     durable = usage.get("durable", {})
     if not isinstance(durable, dict):
@@ -2706,7 +2767,9 @@ def validate_raw_stateful_endurance(
         value = usage.get(field)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             fail(f"{label}: raw usage.{field} is missing or malformed")
-    outside_missing = min(outside_tally["missing"], durable_tally["missing"])
+    outside_missing = outside_tally["missing"]
+    if outside_missing > durable_tally["missing"]:
+        fail(f"{label}: outside durable loss exceeds whole-run durable loss")
     exact_summary = {
         "owed": correlation_tally["workload_expected"],
         "emitted": durable_tally["expected_rows"] + usage["unidentified"],
@@ -2722,7 +2785,6 @@ def validate_raw_stateful_endurance(
         "durable_loss_outside_windows": outside_missing,
         "durable_loss_in_window": durable_tally["missing"] - outside_missing,
         "settled_outside_usage_window": outside_tally["expected_distinct"],
-        "durable_outside_usage_window": outside_tally["observed_distinct"],
         "durable_duplicate_rows": durable_tally["observed_duplicates"],
         "durable_unexpected_rows": durable_tally["unexpected"],
     }
@@ -2738,6 +2800,14 @@ def validate_raw_stateful_endurance(
         "distinct"
     ) != durable_tally["observed_distinct"]:
         fail(f"{label}: durable SQL counts do not match retained observed identities")
+    durable_outside = usage.get("durable_outside_usage_window")
+    if (
+        not isinstance(durable_outside, int)
+        or isinstance(durable_outside, bool)
+        or durable_outside < 0
+        or durable_outside > durable_tally["observed_distinct"]
+    ):
+        fail(f"{label}: durable outside-window SQL count is malformed")
     if usage.get("by_status") != dict(correlation_tally["by_status"]):
         fail(f"{label}: usage status summary does not match retained correlations")
     if correlation_tally["status_mismatches"] != usage.get("unexpected_statuses"):
@@ -2959,8 +3029,10 @@ def validate_raw_stateful_endurance(
     durable_counts_mismatch = int(
         durable_tally["observed_rows"] != durable.get("rows")
         or durable_tally["observed_distinct"] != durable.get("distinct")
-        or outside_tally["observed_distinct"]
-        != usage.get("durable_outside_usage_window")
+        or outside_tally["observed_rows"] != durable_tally["observed_rows"]
+        or outside_tally["observed_distinct"] != durable_tally["observed_distinct"]
+        or outside_tally["observed_duplicates"]
+        != durable_tally["observed_duplicates"]
     )
     slo_bound_fields = (
         "min_segments",

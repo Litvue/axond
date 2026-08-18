@@ -777,10 +777,11 @@ fn a_tier_offers_load_alone() {
 }
 
 /// The database outage excuses the rows it lost, and only those. The split is
-/// made on the window both sides can be counted over — records the processes
-/// settled outside it against rows the database holds outside it — so a row
-/// lost at a safe moment is charged to the deployment however many records the
-/// sink reported dropping while the backend was gone.
+/// made on the exact population that answers the question — records the
+/// processes settled outside it against every row the database holds — so a
+/// stored row cannot become fictitious loss at a clock boundary, while a row
+/// truly lost at a safe moment is charged to the deployment however many
+/// records the sink reported dropping while the backend was gone.
 #[test]
 fn a_durable_loss_is_excused_by_when_it_happened() {
     use support::endurance::ledger::IdentityPairTally;
@@ -807,17 +808,18 @@ fn a_durable_loss_is_excused_by_when_it_happened() {
     let clean = split(tally(100, 0, 0), tally(90, 0, 0));
     assert_eq!((clean.total, clean.outside, clean.in_window), (0, 0, 0));
 
-    // Ten lost, and the database holds every record settled outside the
-    // window: the outage accounts for all of them.
+    // Ten lost, and every record settled outside the window is durable
+    // somewhere: the outage accounts for all of them.
     let excused = split(tally(100, 10, 0), tally(90, 0, 0));
     assert_eq!(
         (excused.total, excused.outside, excused.in_window),
         (10, 0, 10)
     );
 
-    // Ten lost, and three of them were settled outside the window. Those three
-    // are the deployment's, whatever the sinks reported losing during the
-    // outage — the old magnitude comparison excused them.
+    // Ten lost, and three outside-settled identities are absent from the whole
+    // durable population. Those three are the deployment's, whatever the sinks
+    // reported losing during the outage — the old magnitude comparison excused
+    // them.
     let mixed = split(tally(100, 10, 0), tally(90, 3, 0));
     assert_eq!((mixed.total, mixed.outside, mixed.in_window), (10, 3, 7));
 

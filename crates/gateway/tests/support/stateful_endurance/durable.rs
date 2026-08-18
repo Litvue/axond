@@ -241,18 +241,24 @@ impl Durable {
     }
 
     /// Stream every durable request identity into the whole-run and
-    /// outside-outage reconciliation ledgers. `query_raw` is deliberate: the
-    /// database may hold millions of rows and the harness must not collect them
-    /// in memory merely to prove their identities.
+    /// outside-loss reconciliation ledgers. The second ledger deliberately
+    /// receives every durable identity too: its expected side contains only
+    /// records emitted outside the outage, so its missing set is the exact set
+    /// difference `emitted outside - durable anywhere`. Comparing it only with
+    /// rows whose `recorded_at` is outside would turn a harmless clock-boundary
+    /// disagreement into fictitious loss.
+    ///
+    /// `query_raw` is deliberate: the database may hold millions of rows and
+    /// the harness must not collect them in memory merely to prove their
+    /// identities.
     pub async fn record_identities(
         &self,
         all: &mut IdentityPairLedger,
-        outside: &mut IdentityPairLedger,
-        outage: Option<(SystemTime, SystemTime)>,
+        outside_loss: &mut IdentityPairLedger,
     ) {
         let client = connect(&self.dsn).await;
         let query = format!(
-            "SELECT request_id, recorded_at FROM {} ORDER BY request_id, recorded_at",
+            "SELECT request_id FROM {} ORDER BY request_id, recorded_at",
             self.qualified_table
         );
         let rows = client
@@ -266,14 +272,11 @@ impl Durable {
         while let Some(row) = rows.next().await {
             let row = row.expect("a durable usage identity row is readable");
             let request_id: String = row.get(0);
-            let recorded_at: SystemTime = row.get(1);
             all.record_observed(&request_id)
                 .expect("PostgreSQL holds a canonical request id");
-            if outage.is_none_or(|(from, to)| recorded_at < from || recorded_at >= to) {
-                outside
-                    .record_observed(&request_id)
-                    .expect("PostgreSQL holds a canonical request id");
-            }
+            outside_loss
+                .record_observed(&request_id)
+                .expect("PostgreSQL holds a canonical request id");
         }
     }
 

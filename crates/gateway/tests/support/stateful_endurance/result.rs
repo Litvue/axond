@@ -348,6 +348,12 @@ pub struct Usage {
     pub durable_duplicate_rows: u64,
     pub durable_unexpected_rows: u64,
     pub durable_identities: DurableIdentityEvidence,
+    /// Exact proof of outside-window loss. The expected side is every record
+    /// emitted outside the widened outage window; the observed side is every
+    /// durable row, wherever its independently stamped `recorded_at` falls.
+    /// Therefore `missing` is exactly `emitted outside - durable anywhere`.
+    /// `unexpected` is the durable in-window population and is diagnostic, not
+    /// surplus durable data (that is gated by [`Self::durable_identities`]).
     pub durable_outside_identities: DurableIdentityEvidence,
     /// What the processes themselves said they dropped, which is how a missing
     /// row is attributed to a declared outage rather than inferred from two

@@ -242,14 +242,20 @@ dropped, how many records they held, why, and whether each fell inside the
 declared window.
 
 Which half of the loss the outage excuses is a question about *which identities
-were emitted when*. PostgreSQL rows are streamed into sharded exact-set ledgers
-for the whole run and for rows whose gateway `recorded_at` falls outside the
-widened outage. Those sets are merged against the emitted request IDs one shard
-at a time. `durable_loss_outside_windows` is the exact outside-set difference;
-the rest of the whole-run set difference is `durable_loss_in_window`. An
-unrelated durable row or duplicate therefore cannot conceal a missing safe-time
-row. The edge is carried one drain interval past the declared close, so a record
-the driver sees a tick late is not read as a safe-time loss.
+were emitted when*. The whole-run ledger pairs every emitted identity with every
+durable identity. The outside-loss ledger pairs only identities emitted outside
+the widened outage with that same complete durable population. Its missing set
+is therefore exactly `emitted outside - durable anywhere`: a row PostgreSQL did
+store cannot become fictitious loss merely because its independent
+`recorded_at` fell on the other side of the boundary. The outside expected set
+must be a subset of the whole emitted set, and the two durable observed sets
+must be byte-for-byte equal; promotion checks both relations. The remainder of
+the whole-run missing set is `durable_loss_in_window`. An unrelated durable row
+or duplicate therefore cannot conceal a missing safe-time row. The edge is
+carried one drain interval past the declared close, so a record the driver sees
+a tick late is not read as a safe-time loss. The separate
+`durable_outside_usage_window` SQL count remains a timestamp diagnostic, not the
+proof that a particular identity was lost.
 
 Being inside the window is not by itself an excuse. `durable_loss_in_window` is
 gated against `sink_drops.records_in_usage_window` — what the processes
@@ -282,7 +288,7 @@ Fields worth knowing:
   delayed — which is how a run shows the fault it declared actually met traffic.
 - `usage.distinct` is what the *workload* settled and `usage.probe_distinct`
   what the driver's own boundary and convergence probes settled. Workload rows
-  are reconciled by exact trace identity and planned ending; probes stay outside
+  are reconciled by exact trace identity and observed ending; probes stay outside
   that correlation so one cannot stand in for a lost workload row. Both are
   included in the exact emitted-to-durable request-ID sets because PostgreSQL
   holds both.

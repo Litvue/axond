@@ -290,7 +290,6 @@ pub async fn run_with(
         .record_identities(
             &mut state.durable_identities,
             &mut state.durable_outside_identities,
-            outage_window,
         )
         .await;
     let distinct_outside_outage = match outage_window {
@@ -471,13 +470,22 @@ impl Outcome {
         }
     }
 
-    /// Whether the request reached an upstream attempt and so owes exactly one
-    /// usage record.
+    /// The settlement a request that reached an upstream owes. This is the
+    /// observed ending rather than the workload's intended ending: a complete
+    /// request interrupted by a declared provider outage owes an
+    /// `upstream_error`, not the `ok` its pre-run plan would have expected.
+    fn settlement(self) -> Option<Ending> {
+        match self {
+            Self::Completed => Some(Ending::Complete),
+            Self::Cancelled => Some(Ending::Cancelled),
+            Self::Dropped => Some(Ending::Dropped),
+            Self::Faulted => Some(Ending::Faulted),
+            Self::Shed | Self::Rejected | Self::Unavailable | Self::Unplanned => None,
+        }
+    }
+
     fn owes_record(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Cancelled | Self::Dropped | Self::Faulted
-        )
+        self.settlement().is_some()
     }
 }
 
@@ -579,11 +587,14 @@ async fn offer(
     if !status.is_success() {
         let code = status.as_u16();
         let refusal = response.text().await.unwrap_or_default();
+        let kind = error_type(&refusal);
         let outcome = match plan.ending {
-            Ending::Faulted if code == 502 => Outcome::Faulted,
+            // Every gateway-generated 502/504 represents an upstream attempt,
+            // regardless of the ending the deterministic workload intended.
+            // That attempt owes one upstream-error usage record.
+            _ if code == 502 || code == 504 => Outcome::Faulted,
             Ending::Faulted
-                if code == 503
-                    && error_type(&refusal).as_deref() == Some("all_provider_circuits_open") =>
+                if code == 503 && kind.as_deref() == Some("all_provider_circuits_open") =>
             {
                 Outcome::Shed
             }
@@ -595,7 +606,7 @@ async fn offer(
             format!(
                 "{} {code} {}",
                 plan.shape.alias,
-                error_type(&refusal).unwrap_or_else(|| "untyped".to_owned())
+                kind.unwrap_or_else(|| "untyped".to_owned())
             ),
         );
     }
@@ -628,11 +639,10 @@ async fn offer(
             break;
         };
         first_byte.get_or_insert_with(|| sent.elapsed());
-        if plan.ending != Ending::Cancelled {
-            continue;
-        }
         relayed.push_str(&String::from_utf8_lossy(&chunk));
-        if crate::support::capacity::run::output_events(&relayed) >= CANCEL_AFTER_EVENTS {
+        if plan.ending == Ending::Cancelled
+            && crate::support::capacity::run::output_events(&relayed) >= CANCEL_AFTER_EVENTS
+        {
             cancelled = true;
             break;
         }
@@ -641,11 +651,13 @@ async fn offer(
     // and it is the case that leaks an upstream when it is mishandled.
     drop(stream);
     let ttft = first_byte.map(|ttft| ttft.as_secs_f64() * 1000.0);
+    let upstream_failed = stream_has_terminal_error(&relayed);
     match plan.ending {
+        Ending::Complete if upstream_failed => finish(Outcome::Faulted, ttft),
         Ending::Complete if !torn => finish(Outcome::Completed, ttft),
         Ending::Cancelled if cancelled => finish(Outcome::Cancelled, ttft),
         Ending::Dropped => finish(Outcome::Dropped, ttft),
-        Ending::Faulted if torn => finish(Outcome::Faulted, ttft),
+        Ending::Faulted if torn || upstream_failed => finish(Outcome::Faulted, ttft),
         ending => Attempt {
             reason: Some(format!(
                 "a streamed {} request ended {}after {} relayed bytes",
@@ -656,6 +668,18 @@ async fn offer(
             ..finish(Outcome::Unplanned, ttft)
         },
     }
+}
+
+/// Whether a successful HTTP stream carried the gateway's caller-visible
+/// terminal upstream failure. Streaming failures are delivered in-band after
+/// the 200 response, so transport status alone cannot classify them.
+fn stream_has_terminal_error(body: &str) -> bool {
+    body.split_inclusive("\n\n").any(|event| {
+        event
+            .lines()
+            .filter_map(|line| line.strip_prefix("event:"))
+            .any(|name| name.trim() == "error")
+    })
 }
 
 fn body(plan: &Planned) -> Value {
@@ -1581,17 +1605,18 @@ impl State {
         } else {
             self.buffered += 1;
         }
-        if attempt.outcome.owes_record() {
+        if let Some(settlement) = attempt.outcome.settlement() {
             self.owed += 1;
             self.correlations
-                .record_expected(attempt.correlation, attempt.ending)
+                .record_expected(attempt.correlation, settlement)
                 .expect("the stateful workload emits a valid trace identity");
         }
         self.latency.record(attempt.latency_ms);
         if let Some(ttft) = attempt.ttft_ms {
             self.ttft.record(ttft);
         }
-        let failed = matches!(attempt.outcome, Outcome::Unplanned | Outcome::Rejected);
+        let failed = matches!(attempt.outcome, Outcome::Unplanned | Outcome::Rejected)
+            || (attempt.outcome == Outcome::Faulted && attempt.ending != Ending::Faulted);
         if failed && self.touched_fault_window(attempt.at, attempt.latency_ms) {
             // Inside a declared window the error is the point of the window.
             self.errors_in_fault_windows += 1;
@@ -2040,6 +2065,10 @@ pub fn offered_after_last_replacement(total_offered: u64, at_replacement: u64) -
 }
 
 /// Split exact whole-run and outside-window request-ID set differences.
+///
+/// `outside` pairs records emitted outside the outage with every durable row,
+/// so its missing set is true loss. A row stored on the other side of the
+/// timestamp boundary is still present and therefore cannot appear missing.
 pub fn reconcile_exact_durable_loss(
     all: &IdentityPairTally,
     outside: &IdentityPairTally,
@@ -2238,8 +2267,11 @@ fn assemble(
             f64::from(u8::from(
                 durable_identity.observed_rows != durable.counts.rows
                     || durable_identity.observed_distinct != durable.counts.distinct
+                    || durable_outside_identity.observed_rows != durable_identity.observed_rows
                     || durable_outside_identity.observed_distinct
-                        != durable.distinct_outside_window,
+                        != durable_identity.observed_distinct
+                    || durable_outside_identity.observed_duplicates
+                        != durable_identity.observed_duplicates,
             )),
             0.0,
         ),
@@ -2571,5 +2603,33 @@ mod tests {
         assert_eq!(classify_usage_status(Some("ok")), Some("complete"));
         assert_eq!(classify_usage_status(Some("mystery-success")), None);
         assert_eq!(classify_usage_status(None), None);
+    }
+
+    #[test]
+    fn actual_upstream_failure_replaces_the_planned_settlement() {
+        assert_eq!(Outcome::Completed.settlement(), Some(Ending::Complete));
+        assert_eq!(Outcome::Cancelled.settlement(), Some(Ending::Cancelled));
+        assert_eq!(Outcome::Dropped.settlement(), Some(Ending::Dropped));
+        assert_eq!(Outcome::Faulted.settlement(), Some(Ending::Faulted));
+        assert_eq!(Outcome::Shed.settlement(), None);
+        assert_eq!(Outcome::Rejected.settlement(), None);
+    }
+
+    #[test]
+    fn caller_visible_stream_error_is_not_a_completed_stream() {
+        assert!(stream_has_terminal_error(concat!(
+            "data: {\"choices\":[]}\n\n",
+            "event: error\n",
+            "data: {\"error\":{\"type\":\"upstream_stream_error\"}}\n\n",
+            "data: [DONE]\n\n",
+        )));
+        assert!(stream_has_terminal_error(concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\"}\n\n",
+        )));
+        assert!(!stream_has_terminal_error(concat!(
+            "data: {\"choices\":[]}\n\n",
+            "data: [DONE]\n\n",
+        )));
     }
 }
