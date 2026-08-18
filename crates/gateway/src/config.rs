@@ -131,6 +131,12 @@ pub struct Config {
     /// Inbound per-caller concurrency enforcement. Defaults to no limit.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Reversible migration gate for the fixed rate-limit and budget stages.
+    /// The default owns both holds in the response-lifetime middleware owner;
+    /// `legacy` restores the previous straight-line ownership without a binary
+    /// rollback.
+    #[serde(default)]
+    pub core_middleware: CoreMiddlewareConfig,
     /// Bounds on what one request may consume, plus the global and per-tenant
     /// admission ceilings that shed load before it reaches a provider.
     #[serde(default)]
@@ -181,7 +187,7 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 28] = [
+const OVERRIDE_KEYS: [&str; 29] = [
     "mode",
     "server",
     "control_plane",
@@ -207,6 +213,7 @@ const OVERRIDE_KEYS: [&str; 28] = [
     "usage_journal",
     "budget",
     "rate_limit",
+    "core_middleware",
     "admission",
     "revocation",
     "catalog",
@@ -1682,6 +1689,25 @@ impl RateLimitBackend {
             Self::Redis => "redis",
         }
     }
+}
+
+/// Which implementation owns the fixed rate-limit and budget stages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoreAccountingMode {
+    /// Previous straight-line ownership in `serve()`. Retained as an operational
+    /// rollback while the middleware-owned path is qualified.
+    Legacy,
+    /// Fixed core middleware stages owned through the response lifetime.
+    #[default]
+    Middleware,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreMiddlewareConfig {
+    #[serde(default)]
+    pub accounting: CoreAccountingMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -4549,6 +4575,32 @@ env = "SIGN"
         assert_eq!(cfg.rate_limit.backend, RateLimitBackend::None);
         assert_eq!(cfg.rate_limit.max_in_flight_per_subject, 16);
         assert_eq!(cfg.rate_limit.max_subjects, 10_000);
+        assert_eq!(
+            cfg.core_middleware.accounting,
+            CoreAccountingMode::Middleware
+        );
+    }
+
+    #[test]
+    fn core_accounting_migration_gate_is_closed_and_typed() {
+        let legacy = Config::from_toml_str(&format!(
+            "{VALID}\n[core_middleware]\naccounting = \"legacy\"\n"
+        ))
+        .expect("legacy rollback mode parses");
+        assert_eq!(
+            legacy.core_middleware.accounting,
+            CoreAccountingMode::Legacy
+        );
+        assert!(
+            Config::from_toml_str(&format!(
+                "{VALID}\n[core_middleware]\naccounting = \"other\"\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            Config::from_toml_str(&format!("{VALID}\n[core_middleware]\nunknown = true\n"))
+                .is_err()
+        );
     }
 
     #[test]

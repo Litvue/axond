@@ -28,9 +28,12 @@ use secrecy::zeroize::Zeroize;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::Config;
 use crate::desired_state::ContentMiddlewareRegistration;
 use crate::error::GatewayError;
+use crate::rate_limit::{RateLimitError, RateLimitKey, RateLimitPermit};
+use crate::state::AppState;
 
 /// Keep abandoned synchronous invocations from consuming Tokio's entire
 /// process-wide blocking pool. A timed-out task retains its permit until the
@@ -707,13 +710,9 @@ impl MiddlewareChain {
         runtime: &MiddlewareRuntime,
         request: &mut ProviderRequest,
     ) -> Result<MiddlewareExecution, GatewayError> {
-        let states = self.request(runtime, request).await?;
-        Ok(MiddlewareExecution::new(
-            self.clone(),
-            runtime.clone(),
-            states,
-            None,
-        ))
+        let mut execution = self.execution(runtime, None);
+        execution.request(request, &[]).await?;
+        Ok(execution)
     }
 
     /// Start one execution while inspecting caller-controlled provider wire
@@ -725,15 +724,25 @@ impl MiddlewareChain {
         protected_values: &[(String, String)],
         surface: MiddlewareSurface,
     ) -> Result<MiddlewareExecution, GatewayError> {
-        let states = self
-            .request_with_runtime(request, runtime, protected_values, Some(surface))
-            .await?;
-        Ok(MiddlewareExecution::new(
+        let mut execution = self.execution(runtime, Some(surface));
+        execution.request(request, protected_values).await?;
+        Ok(execution)
+    }
+
+    /// Create the response-lifetime owner before fixed core middleware runs.
+    /// The rate-limit permit can therefore enter the same owner before content
+    /// callbacks execute, while the exact chain generation remains pinned.
+    pub(crate) fn execution(
+        &self,
+        runtime: &MiddlewareRuntime,
+        surface: Option<MiddlewareSurface>,
+    ) -> MiddlewareExecution {
+        MiddlewareExecution::new(
             self.clone(),
             runtime.clone(),
-            states,
-            Some(surface),
-        ))
+            MiddlewareStateBag::new(self.len()),
+            surface,
+        )
     }
 
     #[cfg(test)]
@@ -949,6 +958,8 @@ pub struct MiddlewareExecution {
     stream_finished: bool,
     stream_finalized: Vec<bool>,
     surface: Option<MiddlewareSurface>,
+    core_rate_limit_permit: Option<RateLimitPermit>,
+    core_budget: Option<CoreBudgetHold>,
 }
 
 struct InvocationCapacity {
@@ -989,6 +1000,8 @@ impl MiddlewareExecution {
             stream_finished: false,
             stream_finalized,
             surface,
+            core_rate_limit_permit: None,
+            core_budget: None,
         }
     }
 
@@ -1003,11 +1016,105 @@ impl MiddlewareExecution {
             stream_finished: false,
             stream_finalized: Vec::new(),
             surface: None,
+            core_rate_limit_permit: None,
+            core_budget: None,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.chain.is_empty()
+    }
+
+    /// Run the pinned configurable request chain into this owner.
+    pub(crate) async fn request(
+        &mut self,
+        request: &mut ProviderRequest,
+        protected_values: &[(String, String)],
+    ) -> Result<(), GatewayError> {
+        self.states = self
+            .chain
+            .request_with_runtime(request, &self.runtime, protected_values, self.surface)
+            .await?;
+        Ok(())
+    }
+
+    /// Fixed core rate-limit middleware. The permit remains in this execution
+    /// until the buffered response body ends or streaming accounting drops.
+    pub(crate) async fn acquire_rate_limit(
+        &mut self,
+        state: &AppState,
+        key: &RateLimitKey,
+    ) -> Result<(), GatewayError> {
+        debug_assert!(self.core_rate_limit_permit.is_none());
+        let permit = state
+            .0
+            .rate_limiter
+            .acquire(key)
+            .await
+            .map_err(|error| match error {
+                RateLimitError::StoreUnavailable => GatewayError::RateLimitUnavailable,
+                RateLimitError::Exceeded | RateLimitError::SubjectCapacityExceeded => {
+                    GatewayError::RateLimitExceeded {
+                        retry_after_seconds: None,
+                    }
+                }
+            })?;
+        self.core_rate_limit_permit = Some(permit);
+        Ok(())
+    }
+
+    /// Fixed core budget middleware. This runs only after content mutation and
+    /// authoritative estimate recomputation. An armed hold releases on drop
+    /// unless an outcome transfers it into terminal accounting first.
+    pub(crate) async fn reserve_budget(
+        &mut self,
+        state: &AppState,
+        key: BudgetKey,
+        estimated_microdollars: u64,
+        estimated_input_tokens: u64,
+        alias: &str,
+    ) -> Result<(), GatewayError> {
+        debug_assert!(self.core_budget.is_none());
+        let reservation = match state.0.budget.reserve(&key, estimated_microdollars).await {
+            Admission::Allowed(reservation) => reservation,
+            Admission::Denied(Denial::Exceeded) => {
+                return Err(GatewayError::BudgetExceeded(alias.to_owned()));
+            }
+            Admission::Denied(Denial::StoreUnavailable) => {
+                return Err(GatewayError::BudgetUnavailable);
+            }
+        };
+        self.core_budget = Some(CoreBudgetHold {
+            state: state.clone(),
+            key,
+            reservation: Some(reservation),
+            estimated_input_tokens,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn core_budget_context(&self) -> Option<(&BudgetKey, &Reservation, u64)> {
+        self.core_budget.as_ref().map(|hold| {
+            (
+                &hold.key,
+                hold.reservation
+                    .as_ref()
+                    .expect("core budget hold is armed"),
+                hold.estimated_input_tokens,
+            )
+        })
+    }
+
+    pub(crate) fn take_core_budget(&mut self) -> Option<CoreBudgetHold> {
+        self.core_budget.take()
+    }
+
+    pub(crate) async fn release_core_budget(&mut self) -> bool {
+        let Some(hold) = self.core_budget.take() else {
+            return false;
+        };
+        hold.release().await;
+        true
     }
 
     /// Whether this pinned execution has any stream-event middleware whose
@@ -1455,6 +1562,51 @@ impl MiddlewareExecution {
                 reason: stable_refusal_reason(reason),
             }),
         }
+    }
+}
+
+/// Gateway-owned state for the fixed budget middleware. It is deliberately not
+/// a `gateway-core` middleware state: core remains I/O-free, while this owner
+/// performs the asynchronous reserve/settle contract at fixed source positions.
+pub(crate) struct CoreBudgetHold {
+    state: AppState,
+    key: BudgetKey,
+    reservation: Option<Reservation>,
+    estimated_input_tokens: u64,
+}
+
+impl CoreBudgetHold {
+    pub(crate) async fn settle(mut self, actual_microdollars: u64) {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("core budget hold must be armed");
+        self.state
+            .0
+            .budget
+            .settle(&self.key, &reservation, actual_microdollars)
+            .await;
+    }
+
+    pub(crate) async fn release(mut self) {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("core budget hold must be armed");
+        self.state.0.budget.release(&self.key, &reservation).await;
+    }
+}
+
+impl Drop for CoreBudgetHold {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let state = self.state.clone();
+        let key = self.key.clone();
+        crate::streaming::spawn_settlement(async move {
+            state.0.budget.release(&key, &reservation).await;
+        });
     }
 }
 
