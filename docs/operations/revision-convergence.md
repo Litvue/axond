@@ -138,7 +138,7 @@ scope, and slug. Seven schemas exist today:
 | `axond.tenant.v1` | a deployment tenant | `schema`, `tenant_id`, `display_name` |
 | `axond.project.v1` | a tenant-owned project | `schema`, `project_id`, `tenant_id`, `display_name` |
 | `axond.provider-credential.v1` | a tenant's or project's credential for one provider | `schema`, `credential_id`, `tenant_id`, `project_id` (a project's only), `provider_id`, `display_name`, `secret_id`, `secret_version`, `lifecycle` |
-| `axond.policy.v1` | the policy of a tenant or a project | `schema`, `tenant_id`, `project_id` (project documents only), `epoch`, `budget_limit_microdollars`, `namespace_budget_limit_microdollars` (optional), `reservation_ttl_seconds`, `max_in_flight_per_subject`, `lease_ttl_seconds`, `minimum_token_epoch`, `content_middleware` (optional ordered list), `buffered_response_routes` (optional normalized set: `messages`, `responses`) |
+| `axond.policy.v1` | the policy of a tenant or a project | `schema`, `tenant_id`, `project_id` (project documents only), `epoch`, `budget_limit_microdollars`, `namespace_budget_limit_microdollars` (optional), `reservation_ttl_seconds`, `max_in_flight_per_subject`, `lease_ttl_seconds`, `minimum_token_epoch`, `content_middleware` (optional ordered list; `axond.redact` carries `guardrail.key_env` and ordered `rules`), `buffered_response_routes` (optional normalized set: `messages`, `responses`) |
 | `axond.model-enablement.v1` | a tenant's or project's permission to use one catalogue offering | `schema`, `enablement_id`, `tenant_id`, `project_id` (a project's only), `offering_id`, `catalog_snapshot`, `wire_family`, `state`, `observed_price` (optional), `approved_price` (optional) |
 | `axond.model-alias.v1` | a project-scoped name for an ordered list of enablements | `schema`, `alias_id`, `tenant_id`, `project_id`, `wire_family`, `state`, `targets` |
 | `axond.price-book.v2` | the deployment's approved price book | `schema`, `catalog_content_id`, `catalog_version`, `currency`, `unit`, `approval`, `rules` |
@@ -332,6 +332,10 @@ successive versions are successive revisions of the same document ([ADR
   names an in-process implementation, request/response scope, failure posture,
   and invocation bound. Unknown implementations or combinations this binary
   cannot serve reject the candidate whole; the active snapshot remains serving.
+  `axond.redact` additionally requires fail-closed posture, valid rules, and a
+  canonical padded-base64 32-byte key resolved from `guardrail.key_env` at
+  compile time. Its compiled key is namespace-separated, so identical content
+  does not produce a cross-namespace correlation token.
   A project document replaces its tenant document whole, so its chain cannot
   leak into a sibling namespace.
 - **A change is classified by what activating it would require.** `live` (safe on
@@ -758,7 +762,20 @@ What to know about it operationally:
   fails its signature, or holds rows that do not add up, is still reported as the
   cache's own failure. The compiled-serving envelope increments its layout byte
   whenever its payload gains a field, and policy payloads reject unknown keys, so
-  a downgrade cannot silently discard a guardrail registration.
+  a downgrade cannot silently discard a guardrail registration. Guardrail key
+  material is not cached; a non-secret namespace-key fingerprint binds the
+  encrypted record to the value that compiled it, and a changed value behind the
+  same `key_env` reference refuses recovery instead of changing placeholder
+  identity under the cached revision.
+
+  The forward edge is equally deliberate for the v0.4.0 guardrail layout: a new
+  binary does not cold-restore a pre-v4 compiled-serving record. Keep the control
+  plane and SecretStore reachable while each upgraded ordinal starts, compiles
+  the admitted revision, and atomically writes its own v4 record; verify that
+  publication before advancing the rollout. Do not replace the whole fleet
+  during a control-plane outage and assume pre-upgrade PVC caches are a recovery
+  path. After every replica has written v4, the ordinary outage/cold-start drill
+  applies again.
 - **An unwritable cache is a warning, not an outage.** A replica whose disk is
   full keeps serving and logs once; what it loses is the ability to cold-boot
   during an outage.

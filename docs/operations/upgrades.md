@@ -12,6 +12,40 @@ deployment unit. Read the release's `CHANGELOG.md` entry before every rollout.
 - Typed error `type` values are more stable than human-readable messages.
 - The complete promise is in the [compatibility contract](../compatibility.md).
 
+## v0.4.0 `gateway-core` API migration
+
+v0.4.0 intentionally removes the unused public `governance` module and its
+`Governance`, `GovernanceKey`, `GovernanceLimits`, and `Admission` exports.
+Admission, rate limiting, and usage accounting are runtime concerns; embedders
+must keep them in their host or use Axond's configured admission and durable
+budget implementations. `DeterministicGuardrail` is a content-policy primitive,
+not a replacement rate limiter.
+
+The legacy inbound-only `Guardrail`, `RegexGuardrail`, `GuardrailPolicy`,
+`GuardrailRequest`, and `GuardrailVerdict` API is also removed. Replace it with
+`DeterministicGuardrail`, declared and invoked through the common `Middleware`
+contract:
+
+1. Build ordered `GuardrailRule` values with `GuardrailAction::Block` or
+   `GuardrailAction::Redact`.
+2. Create a fail-closed `MiddlewareDeclaration` with the request, response, and
+   stream-event scopes needed by the host. Set `mutates_response = true` when
+   any redaction rule can restore caller text into output.
+3. Compile with a namespace-derived 32-byte key. Hosts with an inbound body
+   ceiling should call `DeterministicGuardrail::compile_with_request_limit` and
+   pass that exact serialized whole-request limit; `compile` retains a finite
+   64 MiB fallback for standalone callers.
+4. Import the `Middleware` trait and invoke `apply_for_surface` with the trusted
+   `MiddlewareSurface` selected from the authenticated route. Preserve the
+   request outcome's opaque `MiddlewareState` for response and stream callbacks,
+   and call `finish_stream` after semantic completion and strict EOF.
+
+Do not call the unscoped `apply` compatibility entry point for deterministic
+redaction. It cannot safely infer Chat, Messages, Embeddings, or Responses from
+provider-controlled JSON and therefore fails closed outside core's unit tests.
+Unknown structures and matches in routing/protocol fields now refuse atomically
+instead of being rewritten.
+
 ## Preflight
 
 1. Verify the release artifact, signature, provenance, and SBOM.
@@ -77,6 +111,18 @@ that end before response commitment.
 
 Replica-local circuits and credential health start empty on replacement. Shared
 budgets, rate limits, revocation, and durable usage retain backend state.
+
+The v0.4.0 guardrail release is a state-layout exception to this ordinary
+sequence for replicas that use the persistent compiled-serving cache. Its cache
+payload is layout v4, and neither side of the v3/v4 boundary is cold-restored by
+the other. Keep the control plane and SecretStore reachable while replacing one
+StatefulSet ordinal at a time. For each ordinal, wait for the admitted revision
+to become active and verify a successful v4 last-known-good export on that
+ordinal's PVC before deleting the next Pod. A Ready process whose cache export
+failed may serve traffic, but its PVC is not qualified for outage recovery. Do
+not replace the fleet during a control-plane outage using pre-upgrade caches;
+after every ordinal has exported v4, repeat the documented cold-start outage
+drill before treating the upgraded fleet as recoverable.
 
 This sequence is executed on every change against a fleet of real replicas behind
 a readiness-driven balancer, including the rollback limits below:

@@ -3,7 +3,6 @@ pub mod catalog;
 pub mod circuit;
 pub mod error;
 pub mod failover;
-pub mod governance;
 pub mod guardrail;
 pub mod middleware;
 pub mod openai;
@@ -23,15 +22,13 @@ pub use error::{
     is_rate_limit_payload,
 };
 pub use failover::{FailoverDecision, FailoverPolicy, FailoverTarget};
-pub use governance::{Admission, Governance, GovernanceKey, GovernanceLimits};
 pub use guardrail::{
-    Guardrail, GuardrailAction, GuardrailPolicy, GuardrailRequest, GuardrailRule, GuardrailVerdict,
-    RegexGuardrail,
+    DeterministicGuardrail, GuardrailAction, GuardrailCompileError, GuardrailRule,
 };
 pub use middleware::{
     Middleware, MiddlewareDeclaration, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed,
     MiddlewareOutcome, MiddlewarePhase, MiddlewareRefusal, MiddlewareResult, MiddlewareScope,
-    MiddlewareState, MiddlewareStateBag, MiddlewareVerdict,
+    MiddlewareState, MiddlewareStateBag, MiddlewareSurface, MiddlewareVerdict,
 };
 pub use openai::{
     OpenAiCompatibleAdapter, OpenAiFlavor, embeddings_usage, normalize_foundry_endpoint,

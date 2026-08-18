@@ -26,6 +26,19 @@ pub enum MiddlewareScope {
     StreamEvent,
 }
 
+/// The authenticated HTTP surface whose provider wire is being processed.
+///
+/// This value is selected by the gateway, not inferred from provider JSON. It
+/// lets response-mutating policy bind declassification rules to one wire shape
+/// instead of trusting a provider to identify its own route by payload shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MiddlewareSurface {
+    ChatCompletions,
+    NativeMessages,
+    Embeddings,
+    Responses,
+}
+
 /// The failure policy a middleware declares for an invocation error or bound
 /// breach.  The gateway applies this policy; core does not decide whether a
 /// request should become an HTTP response.
@@ -236,11 +249,60 @@ pub type MiddlewareResult = Result<MiddlewareOutcome, MiddlewareError>;
 pub trait Middleware: Send + Sync {
     fn declaration(&self) -> &MiddlewareDeclaration;
 
+    /// Inspect caller-controlled values that the provider receives outside the
+    /// JSON body, such as wire-version headers. These values are never mutable:
+    /// middleware may allow them, refuse them, or fail, but cannot rewrite a
+    /// protocol control and silently change request semantics. The gateway calls
+    /// this hook as part of `Request` scope only; a middleware that needs this
+    /// inspection must declare that scope.
+    fn inspect_protected_request_values(
+        &self,
+        _values: &[(String, String)],
+    ) -> Result<Option<MiddlewareRefusal>, MiddlewareError> {
+        Ok(None)
+    }
+
+    /// Inspect immutable provider-wire values together with the untouched JSON
+    /// request. The default preserves the value-only compatibility hook;
+    /// middleware that detects cross-channel fragments can override this
+    /// request-aware form without gaining permission to mutate protected data.
+    fn inspect_protected_request(
+        &self,
+        _surface: Option<MiddlewareSurface>,
+        _request: &ProviderRequest,
+        values: &[(String, String)],
+    ) -> Result<Option<MiddlewareRefusal>, MiddlewareError> {
+        self.inspect_protected_request_values(values)
+    }
+
     fn apply(
         &self,
         phase: MiddlewarePhase<'_>,
         state: Option<&mut MiddlewareState>,
     ) -> MiddlewareResult;
+
+    /// Invoke middleware with the gateway-selected HTTP surface when one is
+    /// available. Generic middleware can ignore it; policy that declassifies
+    /// request-local values must reject an absent surface rather than infer one
+    /// from untrusted response JSON.
+    fn apply_for_surface(
+        &self,
+        _surface: Option<MiddlewareSurface>,
+        phase: MiddlewarePhase<'_>,
+        state: Option<&mut MiddlewareState>,
+    ) -> MiddlewareResult {
+        self.apply(phase, state)
+    }
+
+    /// Validate response-lifetime state after a stream reaches semantic
+    /// completion and strict transport EOF.
+    ///
+    /// The callback is deliberately payload-free: terminal usage is accounted
+    /// by the gateway and must not be dispatched through middleware. Existing
+    /// middleware remains source-compatible and needs no finalization work.
+    fn finish_stream(&self, _state: Option<&mut MiddlewareState>) -> Result<(), MiddlewareError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +367,23 @@ mod tests {
         bag.insert(0, state);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(bag);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stream_finalization_is_payload_free_and_source_compatible_by_default() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let middleware = Stateful {
+            declaration: MiddlewareDeclaration::new("test", [MiddlewareScope::Request]),
+            dropped: Arc::clone(&dropped),
+        };
+        let mut state = MiddlewareState::new(DropCounter(Arc::clone(&dropped)));
+
+        middleware
+            .finish_stream(Some(&mut state))
+            .expect("the default finalizer has no work");
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(state);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 

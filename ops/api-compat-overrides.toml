@@ -29,3 +29,9 @@
 #
 # Process, including the required changelog and minor-bump handling:
 # docs/maintainers/releasing.md#public-api-compatibility.
+
+[[break]]
+crate = "gateway-core"
+baseline = "0.3.40"
+justification = "Intentional removal of the legacy governance and guardrail exports; deterministic route-bound request/response middleware replaces them for v0.4.0."
+reviewed_in = "https://github.com/Litvue/axond/pull/370"

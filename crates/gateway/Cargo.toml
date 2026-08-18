@@ -61,6 +61,7 @@ bytes.workspace = true
 clap.workspace = true
 figment.workspace = true
 futures.workspace = true
+http-body = "1"
 jsonwebtoken.workspace = true
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true

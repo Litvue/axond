@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use gateway_core::{MiddlewareFailurePosture, MiddlewareScope};
+use gateway_core::{GuardrailRule, MiddlewareFailurePosture, MiddlewareScope};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -1028,6 +1028,15 @@ pub struct ContentMiddlewareRequest {
     pub scopes: Vec<MiddlewareScope>,
     pub failure_posture: MiddlewareFailurePosture,
     pub max_duration_milliseconds: u64,
+    #[serde(default)]
+    pub guardrail: Option<ContentGuardrailRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentGuardrailRequest {
+    pub key_env: String,
+    pub rules: Vec<GuardrailRule>,
 }
 
 impl AdminResourceRequest for PolicyRequest {
@@ -1081,13 +1090,24 @@ impl AdminResourceRequest for PolicyRequest {
             .content_middleware
             .into_iter()
             .map(|registration| {
-                ContentMiddlewareRegistration::new(
+                let middleware = ContentMiddlewareRegistration::new(
                     registration.id,
                     registration.scopes,
                     registration.failure_posture,
                     registration.max_duration_milliseconds,
                 )
-                .map_err(|error| malformed::<Self>("content_middleware", &error.to_string()))
+                .map_err(|error| malformed::<Self>("content_middleware", &error.to_string()))?;
+                let Some(guardrail) = registration.guardrail else {
+                    return Ok(middleware);
+                };
+                let guardrail = crate::desired_state::policy::ContentGuardrailRegistration::new(
+                    guardrail.key_env,
+                    guardrail.rules,
+                )
+                .map_err(|error| malformed::<Self>("content_middleware", &error.to_string()))?;
+                middleware
+                    .with_guardrail(guardrail)
+                    .map_err(|error| malformed::<Self>("content_middleware", &error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let buffered_response_routes = self

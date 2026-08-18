@@ -408,11 +408,22 @@ pub(crate) struct CachedPolicy {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CachedContentMiddleware {
     pub(crate) id: String,
     pub(crate) scopes: Vec<gateway_core::MiddlewareScope>,
     pub(crate) failure_posture: gateway_core::MiddlewareFailurePosture,
     pub(crate) max_duration_milliseconds: u64,
+    #[serde(default)]
+    pub(crate) guardrail: Option<CachedContentGuardrail>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CachedContentGuardrail {
+    pub(crate) key_env: String,
+    pub(crate) key_fingerprint: String,
+    pub(crate) rules: Vec<gateway_core::GuardrailRule>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -467,6 +478,12 @@ pub(crate) struct CachedSecret {
     /// never be written to the signed desired-state cache or an unencrypted
     /// diagnostic.
     pub(crate) material: String,
+}
+
+impl Drop for CachedSecret {
+    fn drop(&mut self) {
+        self.material.zeroize();
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -557,6 +574,17 @@ impl ConfigSnapshot {
                                 scopes: registration.scopes().to_vec(),
                                 failure_posture: registration.failure_posture(),
                                 max_duration_milliseconds: registration.max_duration_milliseconds(),
+                                guardrail: registration.guardrail().map(|guardrail| {
+                                    CachedContentGuardrail {
+                                        key_env: guardrail.key_env().to_owned(),
+                                        key_fingerprint: self
+                                            .middleware
+                                            .guardrail_key_fingerprint(&namespace.id)
+                                            .expect("a compiled guardrail has a key fingerprint")
+                                            .to_owned(),
+                                        rules: guardrail.rules().to_vec(),
+                                    }
+                                }),
                             })
                             .collect(),
                         buffered_response_routes: policy
@@ -647,6 +675,7 @@ impl ConfigSnapshot {
         env: &HashMap<String, String>,
         cached: CachedServingSnapshot,
     ) -> Result<(RevisionId, Self), String> {
+        verify_cached_guardrail_keys(&cached, env)?;
         let revision = RevisionId::parse(&cached.revision).map_err(|error| error.to_string())?;
         bootstrap.namespace = cached
             .namespaces
@@ -735,11 +764,11 @@ impl ConfigSnapshot {
         let materials = cached
             .secrets
             .into_iter()
-            .map(|secret| {
-                Ok((
-                    SecretRef::parse(&secret.reference).map_err(|error| error.to_string())?,
-                    SecretMaterial::new(secret.material),
-                ))
+            .map(|mut secret| {
+                let reference =
+                    SecretRef::parse(&secret.reference).map_err(|error| error.to_string())?;
+                let material = std::mem::take(&mut secret.material);
+                Ok((reference, SecretMaterial::new(material)))
             })
             .collect::<Result<Vec<_>, String>>()?;
         let secrets = ResolvedSecrets::from_cached(MaterialLedger::new(), materials);
@@ -750,6 +779,36 @@ impl ConfigSnapshot {
         }
         Ok((revision, snapshot))
     }
+}
+
+fn verify_cached_guardrail_keys(
+    cached: &CachedServingSnapshot,
+    env: &HashMap<String, String>,
+) -> Result<(), String> {
+    for namespace in &cached.namespaces {
+        let identity = namespace.project.as_ref().map_or_else(
+            || namespace.id.clone(),
+            |project| format!("{}/{}", project.tenant, project.project),
+        );
+        let Some(policy) = &namespace.policy else {
+            continue;
+        };
+        for registration in &policy.content_middleware {
+            let Some(guardrail) = &registration.guardrail else {
+                continue;
+            };
+            let actual =
+                crate::middleware::guardrail_key_fingerprint(&identity, &guardrail.key_env, env)
+                    .map_err(|error| error.to_string())?;
+            if actual != guardrail.key_fingerprint {
+                return Err(format!(
+                    "cached guardrail key reference `{}` for namespace `{}` resolves to different material",
+                    guardrail.key_env, namespace.id
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl CachedServingSnapshot {
@@ -788,13 +847,25 @@ fn cached_namespace(namespace: CachedNamespace, revision: RevisionId) -> Result<
                 .content_middleware
                 .into_iter()
                 .map(|registration| {
-                    crate::desired_state::ContentMiddlewareRegistration::new(
+                    let middleware = crate::desired_state::ContentMiddlewareRegistration::new(
                         registration.id,
                         registration.scopes,
                         registration.failure_posture,
                         registration.max_duration_milliseconds,
                     )
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                    let Some(guardrail) = registration.guardrail else {
+                        return Ok(middleware);
+                    };
+                    let guardrail =
+                        crate::desired_state::policy::ContentGuardrailRegistration::new(
+                            guardrail.key_env,
+                            guardrail.rules,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    middleware
+                        .with_guardrail(guardrail)
+                        .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let buffered_response_routes = policy
@@ -1111,7 +1182,7 @@ impl ConfigSnapshot {
         allow_keyless_bootstrap: bool,
     ) -> Result<Self, SnapshotError> {
         let gateway_token_epochs = configured_token_epochs(&config);
-        let middleware = MiddlewarePlan::compile(&config)?;
+        let middleware = MiddlewarePlan::compile(&config, env)?;
         // The one place both kinds of provider credential become one pool: env
         // references from the boot environment, projected ones from the material
         // this candidate resolved. Neither reaches a store from here.
@@ -1728,7 +1799,7 @@ mod tests {
     use crate::budget::NoBudget;
     use crate::desired_state::ContentMiddlewareRegistration;
     use crate::desired_state::fixtures::{policy_body, revision_id, tenant_id};
-    use crate::desired_state::policy::PolicyScope;
+    use crate::desired_state::policy::{ContentGuardrailRegistration, PolicyScope};
     use crate::desired_state::{TenantId, Uuid7};
     use crate::usage::UsageSink;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -1792,6 +1863,42 @@ namespace = "platform"
                 BufferedResponseRoute::Messages,
             ])
             .expect("buffering routes attach");
+        let generation = body.generation(revision_id(epoch));
+        NamespacePolicy { body, generation }
+    }
+
+    fn redaction_policy(epoch: u64) -> NamespacePolicy {
+        let registration = ContentMiddlewareRegistration::new(
+            "axond.redact",
+            [
+                gateway_core::MiddlewareScope::Request,
+                gateway_core::MiddlewareScope::Response,
+                gateway_core::MiddlewareScope::StreamEvent,
+            ],
+            gateway_core::MiddlewareFailurePosture::FailClosed,
+            25,
+        )
+        .unwrap()
+        .with_guardrail(
+            ContentGuardrailRegistration::new(
+                "GW_GUARDRAIL_KEY",
+                vec![gateway_core::GuardrailRule {
+                    id: "email".to_owned(),
+                    pattern: r"[a-z]+@example\.com".to_owned(),
+                    action: gateway_core::GuardrailAction::Redact,
+                }],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let body = policy_body(PolicyScope::Tenant(tenant_id(1)), epoch)
+            .with_content_middleware(vec![registration])
+            .unwrap()
+            .with_buffered_response_routes([
+                BufferedResponseRoute::Responses,
+                BufferedResponseRoute::Messages,
+            ])
+            .unwrap();
         let generation = body.generation(revision_id(epoch));
         NamespacePolicy { body, generation }
     }
@@ -1887,6 +1994,117 @@ namespace = "platform"
             error.contains("not compiled into this axond build"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn cached_snapshot_restores_guardrail_rules_and_key_reference() {
+        let env = HashMap::from([
+            ("AXOND_KEY".to_owned(), "platform-secret".to_owned()),
+            ("GW_GUARDRAIL_KEY".to_owned(), STANDARD.encode([7_u8; 32])),
+        ]);
+        let mut config = config_with(PLATFORM_KEY);
+        config.namespace[0].policy = Some(redaction_policy(1));
+        let snapshot = ConfigSnapshot::build(config, &env, 7).expect("guardrail compiles");
+        let revision = revision_id(7);
+        let cached = snapshot.cached_serving(revision);
+        let missing_key_env =
+            HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let error = match ConfigSnapshot::from_cached_serving(
+            config_with(PLATFORM_KEY),
+            &missing_key_env,
+            cached.clone(),
+        ) {
+            Ok(_) => panic!("a cache cannot bypass guardrail key resolution"),
+            Err(error) => error,
+        };
+        assert!(error.contains("GW_GUARDRAIL_KEY"), "{error}");
+        let rotated_env = HashMap::from([
+            ("AXOND_KEY".to_owned(), "platform-secret".to_owned()),
+            ("GW_GUARDRAIL_KEY".to_owned(), STANDARD.encode([8_u8; 32])),
+        ]);
+        let error = match ConfigSnapshot::from_cached_serving(
+            config_with(PLATFORM_KEY),
+            &rotated_env,
+            cached.clone(),
+        ) {
+            Ok(_) => panic!("a cache cannot silently change guardrail key identity"),
+            Err(error) => error,
+        };
+        assert!(error.contains("resolves to different material"), "{error}");
+        let (_, restored) =
+            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
+                .expect("guardrail cache restores");
+        let registration = &restored.config.namespace[0]
+            .policy
+            .as_ref()
+            .unwrap()
+            .body
+            .content_middleware()[0];
+        let guardrail = registration.guardrail().expect("guardrail configuration");
+        assert_eq!(guardrail.key_env(), "GW_GUARDRAIL_KEY");
+        assert_eq!(guardrail.rules()[0].id, "email");
+
+        let mut request = gateway_core::ProviderRequest {
+            model: "alias".to_owned(),
+            body: serde_json::json!({"messages": [{
+                "role": "user",
+                "content": "alice@example.com"
+            }]}),
+        };
+        let mut execution = restored
+            .middleware("platform")
+            .start_with_protected_values(
+                &MiddlewareRuntime::default(),
+                &mut request,
+                &[],
+                gateway_core::MiddlewareSurface::ChatCompletions,
+            )
+            .await
+            .expect("restored guardrail masks");
+        assert_ne!(request.body["messages"][0]["content"], "alice@example.com");
+        let mut response = gateway_core::ProviderResponse {
+            body: serde_json::json!({"choices": [{"message": {
+                "content": request.body["messages"][0]["content"].clone()
+            }}]}),
+            usage: gateway_core::ModelUsage::default(),
+        };
+        execution
+            .response(&mut response)
+            .await
+            .expect("restored guardrail unmasks");
+        assert_eq!(
+            response.body["choices"][0]["message"]["content"],
+            "alice@example.com"
+        );
+    }
+
+    #[test]
+    fn cached_guardrail_records_reject_unknown_nested_fields() {
+        let env = HashMap::from([
+            ("AXOND_KEY".to_owned(), "platform-secret".to_owned()),
+            ("GW_GUARDRAIL_KEY".to_owned(), STANDARD.encode([7_u8; 32])),
+        ]);
+        let mut config = config_with(PLATFORM_KEY);
+        config.namespace[0].policy = Some(redaction_policy(1));
+        let snapshot = ConfigSnapshot::build(config, &env, 7).expect("guardrail compiles");
+        let cached = snapshot.cached_serving(revision_id(7));
+
+        for path in ["middleware", "guardrail"] {
+            let mut value = serde_json::to_value(&cached).expect("cache serializes");
+            let registration = &mut value["namespaces"][0]["policy"]["content_middleware"][0];
+            let object = if path == "middleware" {
+                registration.as_object_mut().expect("middleware record")
+            } else {
+                registration["guardrail"]
+                    .as_object_mut()
+                    .expect("guardrail record")
+            };
+            object.insert("unknown".to_owned(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<CachedServingSnapshot>(value).is_err(),
+                "unknown {path} field was ignored"
+            );
+        }
     }
 
     #[test]

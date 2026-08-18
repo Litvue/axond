@@ -8,7 +8,7 @@
 //! atomic publication path as routing, pricing, and policy limits.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
@@ -16,13 +16,15 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use gateway_core::MiddlewareDeclaration;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gateway_core::{
-    Middleware, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed, MiddlewareOutcome,
-    MiddlewarePhase, MiddlewareRefusal, MiddlewareScope, MiddlewareStateBag, MiddlewareVerdict,
+    DeterministicGuardrail, Middleware, MiddlewareDeclaration, MiddlewareError,
+    MiddlewareFailurePosture, MiddlewareNeed, MiddlewareOutcome, MiddlewarePhase,
+    MiddlewareRefusal, MiddlewareScope, MiddlewareStateBag, MiddlewareSurface, MiddlewareVerdict,
     ProviderRequest, ProviderResponse, ProviderStreamEvent,
 };
+use ring::hmac;
+use secrecy::zeroize::Zeroize;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -86,6 +88,11 @@ impl MiddlewareRuntime {
             slots,
             gates: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abandoned_for_test(&self, id: &str) -> usize {
+        self.gate(id).abandoned.load(Ordering::Acquire)
     }
 }
 
@@ -153,6 +160,36 @@ impl Drop for InvocationCancellationGuard {
     }
 }
 
+/// Permanently marks a response-lifetime state slot unavailable if its owner is
+/// moved into blocking work and the awaiting future is cancelled. The blocking
+/// invocation may still be mutating that opaque state, so it must never be
+/// re-entered even after the id quarantine clears.
+struct StateSlotCancellationGuard<'a> {
+    stranded: &'a mut bool,
+    armed: bool,
+}
+
+impl<'a> StateSlotCancellationGuard<'a> {
+    fn new(stranded: &'a mut bool) -> Self {
+        Self {
+            stranded,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StateSlotCancellationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            *self.stranded = true;
+        }
+    }
+}
+
 fn mark_invocation_abandoned(state: &Arc<Mutex<InvocationState>>, gate: &Arc<MiddlewareGate>) {
     let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
     if matches!(*state, InvocationState::Running) {
@@ -189,6 +226,14 @@ pub enum MiddlewarePolicyError {
     Unknown { id: String },
     #[error("compiled declaration for content middleware `{id}` does not match its policy")]
     DeclarationMismatch { id: String },
+    #[error("content middleware `{id}` has invalid configuration: {detail}")]
+    InvalidConfiguration { id: String, detail: String },
+    #[error("content middleware `{id}` key reference `{env}` is unset or empty")]
+    MissingKey { id: String, env: String },
+    #[error(
+        "content middleware `{id}` key reference `{env}` must contain canonical padded base64 encoding of exactly 32 bytes"
+    )]
+    InvalidKey { id: String, env: String },
     #[error(transparent)]
     Chain(#[from] MiddlewareChainError),
 }
@@ -201,22 +246,30 @@ pub struct MiddlewarePlanError {
     pub source: MiddlewarePolicyError,
 }
 
-type MiddlewareFactory =
-    fn(&ContentMiddlewareRegistration) -> Result<Arc<dyn Middleware>, MiddlewarePolicyError>;
+struct MiddlewareBuildContext<'a> {
+    namespace: &'a str,
+    env: &'a HashMap<String, String>,
+    max_request_bytes: usize,
+}
+
+type MiddlewareFactory = fn(
+    &ContentMiddlewareRegistration,
+    &MiddlewareBuildContext<'_>,
+) -> Result<Arc<dyn Middleware>, MiddlewarePolicyError>;
 
 /// The in-process implementations this binary knows how to materialize.
 ///
 /// Policy selects from this registry; it cannot load code, grant I/O, or name a
-/// core request stage. The first production entry is added by #358. Keeping an
-/// empty production registry here makes an early/unknown registration a compile
-/// refusal that leaves the last-known-good snapshot serving.
+/// core request stage. Unknown or malformed registrations are compile refusals
+/// that leave the last-known-good snapshot serving.
 struct MiddlewareRegistry {
     factories: BTreeMap<&'static str, MiddlewareFactory>,
 }
 
 impl MiddlewareRegistry {
     fn builtins() -> Self {
-        let factories = BTreeMap::new();
+        let factories =
+            BTreeMap::from([("axond.redact", deterministic_guardrail as MiddlewareFactory)]);
         #[cfg(test)]
         let mut factories = factories;
         #[cfg(test)]
@@ -230,7 +283,9 @@ impl MiddlewareRegistry {
     fn compile(
         &self,
         registrations: &[ContentMiddlewareRegistration],
+        context: &MiddlewareBuildContext<'_>,
     ) -> Result<MiddlewareChain, MiddlewarePolicyError> {
+        self.validate(registrations)?;
         let entries = registrations
             .iter()
             .map(|registration| {
@@ -239,7 +294,7 @@ impl MiddlewareRegistry {
                         id: registration.id().to_owned(),
                     }
                 })?;
-                let entry = factory(registration)?;
+                let entry = factory(registration, context)?;
                 let declaration = entry.declaration();
                 if declaration.id != registration.id()
                     || declaration.scopes != registration.scopes()
@@ -256,6 +311,28 @@ impl MiddlewareRegistry {
             .collect::<Result<Vec<_>, _>>()?;
         MiddlewareChain::new(entries).map_err(Into::into)
     }
+
+    fn validate(
+        &self,
+        registrations: &[ContentMiddlewareRegistration],
+    ) -> Result<(), MiddlewarePolicyError> {
+        for registration in registrations {
+            if !self.factories.contains_key(registration.id()) {
+                return Err(MiddlewarePolicyError::Unknown {
+                    id: registration.id().to_owned(),
+                });
+            }
+            if registration.id() == "axond.redact" {
+                validate_deterministic_guardrail(registration)?;
+            } else if registration.guardrail().is_some() {
+                return Err(MiddlewarePolicyError::InvalidConfiguration {
+                    id: registration.id().to_owned(),
+                    detail: "guardrail configuration belongs only to `axond.redact`".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Validate one policy's registrations against the implementations and scopes
@@ -265,22 +342,25 @@ impl MiddlewareRegistry {
 pub(crate) fn validate_content_middleware(
     registrations: &[ContentMiddlewareRegistration],
 ) -> Result<(), MiddlewarePolicyError> {
-    MiddlewareRegistry::builtins()
-        .compile(registrations)
-        .map(|_| ())
+    MiddlewareRegistry::builtins().validate(registrations)
 }
 
 /// Every namespace's compiled chain in one serving snapshot.
 #[derive(Clone, Default)]
 pub struct MiddlewarePlan {
     by_namespace: BTreeMap<String, MiddlewareChain>,
+    guardrail_key_fingerprints: BTreeMap<String, String>,
     empty: MiddlewareChain,
 }
 
 impl MiddlewarePlan {
-    pub fn compile(config: &Config) -> Result<Self, MiddlewarePlanError> {
+    pub fn compile(
+        config: &Config,
+        env: &HashMap<String, String>,
+    ) -> Result<Self, MiddlewarePlanError> {
         let registry = MiddlewareRegistry::builtins();
         let mut by_namespace = BTreeMap::new();
+        let mut guardrail_key_fingerprints = BTreeMap::new();
         for namespace in &config.namespace {
             let Some(policy) = &namespace.policy else {
                 continue;
@@ -288,12 +368,41 @@ impl MiddlewarePlan {
             if policy.body.content_middleware().is_empty() {
                 continue;
             }
+            // Projected namespaces keep a durable identity across an operator
+            // rename. File-declared namespaces have no such identity, so their
+            // configured id is the stable namespace boundary available here.
+            let namespace_identity = namespace.project.as_ref().map_or_else(
+                || namespace.id.clone(),
+                |project| format!("{}/{}", project.tenant, project.project),
+            );
             let chain = registry
-                .compile(policy.body.content_middleware())
+                .compile(
+                    policy.body.content_middleware(),
+                    &MiddlewareBuildContext {
+                        namespace: &namespace_identity,
+                        env,
+                        max_request_bytes: config.admission.max_request_bytes,
+                    },
+                )
                 .map_err(|source| MiddlewarePlanError {
                     namespace: namespace.id.clone(),
                     source,
                 })?;
+            if let Some(guardrail) = policy
+                .body
+                .content_middleware()
+                .iter()
+                .find(|registration| registration.id() == "axond.redact")
+                .and_then(ContentMiddlewareRegistration::guardrail)
+            {
+                let fingerprint =
+                    guardrail_key_fingerprint(&namespace_identity, guardrail.key_env(), env)
+                        .map_err(|source| MiddlewarePlanError {
+                            namespace: namespace.id.clone(),
+                            source,
+                        })?;
+                guardrail_key_fingerprints.insert(namespace.id.clone(), fingerprint);
+            }
             for middleware in chain.response_only_ids() {
                 tracing::warn!(
                     namespace = %namespace.id,
@@ -305,6 +414,7 @@ impl MiddlewarePlan {
         }
         Ok(Self {
             by_namespace,
+            guardrail_key_fingerprints,
             empty: MiddlewareChain::empty(),
         })
     }
@@ -312,15 +422,142 @@ impl MiddlewarePlan {
     pub fn for_namespace(&self, namespace: &str) -> &MiddlewareChain {
         self.by_namespace.get(namespace).unwrap_or(&self.empty)
     }
+
+    pub(crate) fn guardrail_key_fingerprint(&self, namespace: &str) -> Option<&str> {
+        self.guardrail_key_fingerprints
+            .get(namespace)
+            .map(String::as_str)
+    }
 }
 
-#[cfg(test)]
 fn declaration(registration: &ContentMiddlewareRegistration) -> MiddlewareDeclaration {
     let mut declaration =
         MiddlewareDeclaration::new(registration.id(), registration.scopes().iter().copied());
     declaration.failure_posture = registration.failure_posture();
     declaration.max_duration = Duration::from_millis(registration.max_duration_milliseconds());
     declaration
+}
+
+fn validate_deterministic_guardrail(
+    registration: &ContentMiddlewareRegistration,
+) -> Result<(), MiddlewarePolicyError> {
+    if registration.failure_posture() != MiddlewareFailurePosture::FailClosed {
+        return Err(MiddlewarePolicyError::InvalidConfiguration {
+            id: registration.id().to_owned(),
+            detail: "requires failure posture `fail_closed`".to_owned(),
+        });
+    }
+    let required = [
+        MiddlewareScope::Request,
+        MiddlewareScope::Response,
+        MiddlewareScope::StreamEvent,
+    ];
+    if registration.scopes() != required {
+        return Err(MiddlewarePolicyError::InvalidConfiguration {
+            id: registration.id().to_owned(),
+            detail: "requires request, response, and stream_event scopes".to_owned(),
+        });
+    }
+    let guardrail =
+        registration
+            .guardrail()
+            .ok_or_else(|| MiddlewarePolicyError::InvalidConfiguration {
+                id: registration.id().to_owned(),
+                detail: "missing guardrail key reference and rules".to_owned(),
+            })?;
+    let mut declaration = declaration(registration);
+    declaration.mutates_response = guardrail
+        .rules()
+        .iter()
+        .any(|rule| rule.action == gateway_core::GuardrailAction::Redact);
+    DeterministicGuardrail::compile(declaration, &[0; 32], guardrail.rules()).map_err(|error| {
+        MiddlewarePolicyError::InvalidConfiguration {
+            id: registration.id().to_owned(),
+            detail: error.to_string(),
+        }
+    })?;
+    Ok(())
+}
+
+fn deterministic_guardrail(
+    registration: &ContentMiddlewareRegistration,
+    context: &MiddlewareBuildContext<'_>,
+) -> Result<Arc<dyn Middleware>, MiddlewarePolicyError> {
+    validate_deterministic_guardrail(registration)?;
+    let guardrail = registration
+        .guardrail()
+        .expect("validated redaction middleware has guardrail state");
+    let mut namespace_key = resolve_guardrail_key(
+        registration.id(),
+        context.namespace,
+        guardrail.key_env(),
+        context.env,
+    )?;
+    let mut declaration = declaration(registration);
+    declaration.mutates_response = guardrail
+        .rules()
+        .iter()
+        .any(|rule| rule.action == gateway_core::GuardrailAction::Redact);
+    let middleware = DeterministicGuardrail::compile_with_request_limit(
+        declaration,
+        &namespace_key,
+        guardrail.rules(),
+        context.max_request_bytes,
+    );
+    namespace_key.zeroize();
+    let middleware = middleware.map_err(|error| MiddlewarePolicyError::InvalidConfiguration {
+        id: registration.id().to_owned(),
+        detail: error.to_string(),
+    })?;
+    Ok(Arc::new(middleware))
+}
+
+fn resolve_guardrail_key(
+    id: &str,
+    namespace: &str,
+    key_env: &str,
+    env: &HashMap<String, String>,
+) -> Result<[u8; 32], MiddlewarePolicyError> {
+    let encoded = env
+        .get(key_env)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| MiddlewarePolicyError::MissingKey {
+            id: id.to_owned(),
+            env: key_env.to_owned(),
+        })?;
+    let mut decoded = STANDARD
+        .decode(encoded)
+        .map_err(|_| MiddlewarePolicyError::InvalidKey {
+            id: id.to_owned(),
+            env: key_env.to_owned(),
+        })?;
+    if decoded.len() != 32 || STANDARD.encode(&decoded) != *encoded {
+        decoded.zeroize();
+        return Err(MiddlewarePolicyError::InvalidKey {
+            id: id.to_owned(),
+            env: key_env.to_owned(),
+        });
+    }
+    let master = hmac::Key::new(hmac::HMAC_SHA256, &decoded);
+    decoded.zeroize();
+    let mut namespace_context = b"axond.guardrail.namespace.v1\0".to_vec();
+    namespace_context.extend_from_slice(namespace.as_bytes());
+    let tag = hmac::sign(&master, &namespace_context);
+    let mut namespace_key = [0_u8; 32];
+    namespace_key.copy_from_slice(tag.as_ref());
+    Ok(namespace_key)
+}
+
+pub(crate) fn guardrail_key_fingerprint(
+    namespace: &str,
+    key_env: &str,
+    env: &HashMap<String, String>,
+) -> Result<String, MiddlewarePolicyError> {
+    let mut namespace_key = resolve_guardrail_key("axond.redact", namespace, key_env, env)?;
+    let fingerprint_key = hmac::Key::new(hmac::HMAC_SHA256, &namespace_key);
+    namespace_key.zeroize();
+    Ok(STANDARD
+        .encode(hmac::sign(&fingerprint_key, b"axond.guardrail.key-fingerprint.v1\0").as_ref()))
 }
 
 #[cfg(test)]
@@ -350,6 +587,7 @@ impl Middleware for PolicyMarker {
 #[cfg(test)]
 fn test_policy_marker(
     registration: &ContentMiddlewareRegistration,
+    _context: &MiddlewareBuildContext<'_>,
 ) -> Result<Arc<dyn Middleware>, MiddlewarePolicyError> {
     Ok(Arc::new(PolicyMarker {
         declaration: declaration(registration),
@@ -445,7 +683,7 @@ impl MiddlewareChain {
         runtime: &MiddlewareRuntime,
         request: &mut ProviderRequest,
     ) -> Result<MiddlewareStateBag, GatewayError> {
-        self.request_with_runtime(request, runtime).await
+        self.request_with_runtime(request, runtime, &[], None).await
     }
 
     #[cfg(test)]
@@ -460,7 +698,10 @@ impl MiddlewareChain {
     ///
     /// The returned owner must remain attached to the buffered response or be
     /// moved into the streaming response body. It is the sole owner of every
-    /// middleware state slot for the request.
+    /// middleware state slot for the request. This surface-neutral entry point
+    /// is suitable for middleware that does not declassify route-shaped output;
+    /// authenticated HTTP routes use `start_with_protected_values` so a
+    /// declassifying guardrail receives the trusted surface identity.
     pub async fn start(
         &self,
         runtime: &MiddlewareRuntime,
@@ -471,6 +712,27 @@ impl MiddlewareChain {
             self.clone(),
             runtime.clone(),
             states,
+            None,
+        ))
+    }
+
+    /// Start one execution while inspecting caller-controlled provider wire
+    /// values that cannot safely be rewritten as content.
+    pub async fn start_with_protected_values(
+        &self,
+        runtime: &MiddlewareRuntime,
+        request: &mut ProviderRequest,
+        protected_values: &[(String, String)],
+        surface: MiddlewareSurface,
+    ) -> Result<MiddlewareExecution, GatewayError> {
+        let states = self
+            .request_with_runtime(request, runtime, protected_values, Some(surface))
+            .await?;
+        Ok(MiddlewareExecution::new(
+            self.clone(),
+            runtime.clone(),
+            states,
+            Some(surface),
         ))
     }
 
@@ -488,7 +750,7 @@ impl MiddlewareChain {
         request: &mut ProviderRequest,
         slots: Arc<Semaphore>,
     ) -> Result<MiddlewareStateBag, GatewayError> {
-        self.request_with_runtime(request, &MiddlewareRuntime::with_slots(slots))
+        self.request_with_runtime(request, &MiddlewareRuntime::with_slots(slots), &[], None)
             .await
     }
 
@@ -496,6 +758,8 @@ impl MiddlewareChain {
         &self,
         request: &mut ProviderRequest,
         runtime: &MiddlewareRuntime,
+        protected_values: &[(String, String)],
+        surface: Option<MiddlewareSurface>,
     ) -> Result<MiddlewareStateBag, GatewayError> {
         let mut states = MiddlewareStateBag::new(self.len());
         for (index, entry) in self.entries.iter().enumerate() {
@@ -569,9 +833,12 @@ impl MiddlewareChain {
             );
             let mut candidate = request.clone();
             let middleware = Arc::clone(entry);
+            let protected_values = protected_values.to_vec();
             let invocation_state = Arc::new(Mutex::new(InvocationState::Running));
             let closure_state = Arc::clone(&invocation_state);
             let closure_gate = Arc::clone(&gate);
+            let mut cancellation_guard =
+                InvocationCancellationGuard::new(Arc::clone(&invocation_state), Arc::clone(&gate));
             let invoked = tokio::time::timeout_at(
                 deadline,
                 tokio::task::spawn_blocking(move || {
@@ -581,11 +848,24 @@ impl MiddlewareChain {
                         state: closure_state,
                         gate: closure_gate,
                     };
-                    let result = middleware.apply(MiddlewarePhase::Request(&mut candidate), None);
+                    let result = match middleware.inspect_protected_request(
+                        surface,
+                        &candidate,
+                        &protected_values,
+                    ) {
+                        Ok(Some(reason)) => Ok(MiddlewareOutcome::refuse(reason)),
+                        Ok(None) => middleware.apply_for_surface(
+                            surface,
+                            MiddlewarePhase::Request(&mut candidate),
+                            None,
+                        ),
+                        Err(error) => Err(error),
+                    };
                     (candidate, result)
                 }),
             )
             .await;
+            cancellation_guard.disarm();
             let (candidate, mut result) = match invoked {
                 Ok(Ok(invoked)) => invoked,
                 Ok(Err(_)) => {
@@ -666,6 +946,9 @@ pub struct MiddlewareExecution {
     states: MiddlewareStateBag,
     stranded: Vec<bool>,
     failure_logged: Vec<bool>,
+    stream_finished: bool,
+    stream_finalized: Vec<bool>,
+    surface: Option<MiddlewareSurface>,
 }
 
 struct InvocationCapacity {
@@ -682,20 +965,30 @@ impl Default for MiddlewareExecution {
             MiddlewareChain::empty(),
             MiddlewareRuntime::default(),
             MiddlewareStateBag::default(),
+            None,
         )
     }
 }
 
 impl MiddlewareExecution {
-    fn new(chain: MiddlewareChain, runtime: MiddlewareRuntime, states: MiddlewareStateBag) -> Self {
+    fn new(
+        chain: MiddlewareChain,
+        runtime: MiddlewareRuntime,
+        states: MiddlewareStateBag,
+        surface: Option<MiddlewareSurface>,
+    ) -> Self {
         let stranded = vec![false; chain.len()];
         let failure_logged = vec![false; chain.len()];
+        let stream_finalized = vec![false; chain.len()];
         Self {
             chain,
             runtime,
             states,
             stranded,
             failure_logged,
+            stream_finished: false,
+            stream_finalized,
+            surface,
         }
     }
 
@@ -707,11 +1000,28 @@ impl MiddlewareExecution {
             states,
             stranded: Vec::new(),
             failure_logged: Vec::new(),
+            stream_finished: false,
+            stream_finalized: Vec::new(),
+            surface: None,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.chain.is_empty()
+    }
+
+    /// Whether this pinned execution has any stream-event middleware whose
+    /// response-lifetime state must observe strict stream completion.
+    pub fn has_stream_event_scope(&self) -> bool {
+        self.chain.has_scope(MiddlewareScope::StreamEvent)
+    }
+
+    /// Whether this pinned stream execution may change rendered event payloads.
+    /// Validation-only middleware still requires strict finalization, but it must
+    /// not silently turn a disabled ordinary stream-size ceiling back on.
+    pub fn has_stream_event_mutator(&self) -> bool {
+        self.chain
+            .has_response_mutator(MiddlewareScope::StreamEvent)
     }
 
     /// Run buffered-response scopes in reverse registration order.
@@ -740,6 +1050,7 @@ impl MiddlewareExecution {
                 gate,
             } = capacity;
             let middleware = Arc::clone(&self.chain.entries[index]);
+            let surface = self.surface;
             let mut candidate = response.clone();
             let original_usage = response.usage;
             let mut state = self.states.take(index);
@@ -747,22 +1058,32 @@ impl MiddlewareExecution {
             let closure_gate = Arc::clone(&gate);
             let mut cancellation_guard =
                 InvocationCancellationGuard::new(Arc::clone(&invocation_state), Arc::clone(&gate));
-            let invoked = tokio::time::timeout_at(
-                deadline,
-                tokio::task::spawn_blocking(move || {
-                    let _process_slot = process_slot;
-                    let _middleware_slot = middleware_slot;
-                    let _invocation_guard = InvocationGuard {
-                        state: closure_state,
-                        gate: closure_gate,
-                    };
-                    let result =
-                        middleware.apply(MiddlewarePhase::Response(&mut candidate), state.as_mut());
-                    (candidate, state, result)
-                }),
-            )
-            .await;
-            cancellation_guard.disarm();
+            let invoked = {
+                let mut state_guard = StateSlotCancellationGuard::new(&mut self.stranded[index]);
+                let invoked = tokio::time::timeout_at(
+                    deadline,
+                    tokio::task::spawn_blocking(move || {
+                        let _process_slot = process_slot;
+                        let _middleware_slot = middleware_slot;
+                        let _invocation_guard = InvocationGuard {
+                            state: closure_state,
+                            gate: closure_gate,
+                        };
+                        let result = middleware.apply_for_surface(
+                            surface,
+                            MiddlewarePhase::Response(&mut candidate),
+                            state.as_mut(),
+                        );
+                        (candidate, state, result)
+                    }),
+                )
+                .await;
+                cancellation_guard.disarm();
+                if matches!(&invoked, Ok(Ok(_))) {
+                    state_guard.disarm();
+                }
+                invoked
+            };
             let (candidate, state, mut result) = match invoked {
                 Ok(Ok(invoked)) => invoked,
                 Ok(Err(_)) => {
@@ -844,28 +1165,39 @@ impl MiddlewareExecution {
                 gate,
             } = capacity;
             let middleware = Arc::clone(&self.chain.entries[index]);
+            let surface = self.surface;
             let mut candidate = event.clone();
             let mut state = self.states.take(index);
             let closure_state = Arc::clone(&invocation_state);
             let closure_gate = Arc::clone(&gate);
             let mut cancellation_guard =
                 InvocationCancellationGuard::new(Arc::clone(&invocation_state), Arc::clone(&gate));
-            let invoked = tokio::time::timeout_at(
-                deadline,
-                tokio::task::spawn_blocking(move || {
-                    let _process_slot = process_slot;
-                    let _middleware_slot = middleware_slot;
-                    let _invocation_guard = InvocationGuard {
-                        state: closure_state,
-                        gate: closure_gate,
-                    };
-                    let result = middleware
-                        .apply(MiddlewarePhase::StreamEvent(&mut candidate), state.as_mut());
-                    (candidate, state, result)
-                }),
-            )
-            .await;
-            cancellation_guard.disarm();
+            let invoked = {
+                let mut state_guard = StateSlotCancellationGuard::new(&mut self.stranded[index]);
+                let invoked = tokio::time::timeout_at(
+                    deadline,
+                    tokio::task::spawn_blocking(move || {
+                        let _process_slot = process_slot;
+                        let _middleware_slot = middleware_slot;
+                        let _invocation_guard = InvocationGuard {
+                            state: closure_state,
+                            gate: closure_gate,
+                        };
+                        let result = middleware.apply_for_surface(
+                            surface,
+                            MiddlewarePhase::StreamEvent(&mut candidate),
+                            state.as_mut(),
+                        );
+                        (candidate, state, result)
+                    }),
+                )
+                .await;
+                cancellation_guard.disarm();
+                if matches!(&invoked, Ok(Ok(_))) {
+                    state_guard.disarm();
+                }
+                invoked
+            };
             let (candidate, state, mut result) = match invoked {
                 Ok(Ok(invoked)) => invoked,
                 Ok(Err(_)) => {
@@ -904,6 +1236,106 @@ impl MiddlewareExecution {
             }
             if self.finish(index, result)? {
                 *event = candidate;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalize stream-event middleware once, in reverse registration order.
+    ///
+    /// The callback carries no terminal event or usage payload: accounting owns
+    /// terminal usage, while content middleware may only validate and release
+    /// its response-lifetime state. Marking the execution finished before the
+    /// first await prevents cancellation from retrying a partially completed
+    /// reverse chain or double-finalizing state still owned by blocking work.
+    pub async fn finish_stream(&mut self) -> Result<(), GatewayError> {
+        if self.stream_finished {
+            for index in (0..self.chain.len()).rev() {
+                if self.chain.entries[index]
+                    .declaration()
+                    .has_scope(MiddlewareScope::StreamEvent)
+                    && !self.stream_finalized[index]
+                {
+                    self.failure(index, "stream finalizer did not complete")?;
+                }
+            }
+            return Ok(());
+        }
+        self.stream_finished = true;
+
+        for index in (0..self.chain.len()).rev() {
+            if !self.chain.entries[index]
+                .declaration()
+                .has_scope(MiddlewareScope::StreamEvent)
+            {
+                continue;
+            }
+            if self.stranded[index] {
+                self.failure(index, "state unavailable after abandoned invocation")?;
+                continue;
+            }
+
+            let capacity = match self.acquire(index).await? {
+                Some(capacity) => capacity,
+                None => continue,
+            };
+            let InvocationCapacity {
+                deadline,
+                process_slot,
+                middleware_slot,
+                invocation_state,
+                gate,
+            } = capacity;
+            let middleware = Arc::clone(&self.chain.entries[index]);
+            let mut state = self.states.take(index);
+            let closure_state = Arc::clone(&invocation_state);
+            let closure_gate = Arc::clone(&gate);
+            let mut cancellation_guard =
+                InvocationCancellationGuard::new(Arc::clone(&invocation_state), Arc::clone(&gate));
+            let invoked = {
+                let mut state_guard = StateSlotCancellationGuard::new(&mut self.stranded[index]);
+                let invoked = tokio::time::timeout_at(
+                    deadline,
+                    tokio::task::spawn_blocking(move || {
+                        let _process_slot = process_slot;
+                        let _middleware_slot = middleware_slot;
+                        let _invocation_guard = InvocationGuard {
+                            state: closure_state,
+                            gate: closure_gate,
+                        };
+                        let result = middleware.finish_stream(state.as_mut());
+                        (state, result)
+                    }),
+                )
+                .await;
+                cancellation_guard.disarm();
+                if matches!(&invoked, Ok(Ok(_))) {
+                    state_guard.disarm();
+                }
+                invoked
+            };
+            let (state, result) = match invoked {
+                Ok(Ok(invoked)) => invoked,
+                Ok(Err(_)) => {
+                    self.stranded[index] = true;
+                    self.failure(index, "invocation task failed")?;
+                    continue;
+                }
+                Err(_) => {
+                    mark_invocation_abandoned(&invocation_state, &gate);
+                    self.stranded[index] = true;
+                    self.failure(index, "invocation bound exceeded")?;
+                    continue;
+                }
+            };
+            if result.is_err() {
+                self.stranded[index] = true;
+                self.failure(index, "invocation failed")?;
+            } else {
+                if let Some(state) = state {
+                    self.states.insert(index, state);
+                }
+                self.stream_finalized[index] = true;
             }
         }
         Ok(())
@@ -1043,12 +1475,13 @@ fn stable_refusal_reason(reason: MiddlewareRefusal) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NamespacePolicy;
-    use crate::desired_state::fixtures::{policy_body, revision_id, tenant_id};
+    use crate::config::{NamespacePolicy, ProjectIdentity};
+    use crate::desired_state::fixtures::{policy_body, project_id, revision_id, tenant_id};
+    use crate::desired_state::policy::ContentGuardrailRegistration;
     use crate::desired_state::{PolicyEpoch, PolicyScope};
     use gateway_core::{
-        MiddlewareDeclaration, MiddlewareFailurePosture, MiddlewareOutcome, MiddlewareState,
-        ModelUsage,
+        GuardrailAction, GuardrailRule, MiddlewareDeclaration, MiddlewareFailurePosture,
+        MiddlewareOutcome, MiddlewareState, ModelUsage,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -1100,6 +1533,29 @@ namespace = "alpha"
         let generation = body.generation(revision_id(1));
         config.namespace[0].policy = Some(NamespacePolicy { body, generation });
         config
+    }
+
+    fn guardrail_registration() -> ContentMiddlewareRegistration {
+        registration(
+            "axond.redact",
+            [
+                MiddlewareScope::Request,
+                MiddlewareScope::Response,
+                MiddlewareScope::StreamEvent,
+            ],
+        )
+        .with_guardrail(
+            ContentGuardrailRegistration::new(
+                "GW_GUARDRAIL_KEY",
+                vec![GuardrailRule {
+                    id: "email".to_owned(),
+                    pattern: r"[a-z]+@example\.com".to_owned(),
+                    action: GuardrailAction::Redact,
+                }],
+            )
+            .expect("guardrail configuration"),
+        )
+        .expect("guardrail attaches")
     }
 
     struct Noop {
@@ -1941,7 +2397,9 @@ namespace = "alpha"
         ) -> gateway_core::MiddlewareResult {
             if matches!(
                 phase,
-                MiddlewarePhase::Response(_) | MiddlewarePhase::StreamEvent(_)
+                MiddlewarePhase::Request(_)
+                    | MiddlewarePhase::Response(_)
+                    | MiddlewarePhase::StreamEvent(_)
             ) {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1979,6 +2437,99 @@ namespace = "alpha"
             }
             Ok(MiddlewareOutcome::continue_without_state())
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_quarantines_only_its_id_until_blocking_work_exits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+
+        let mut cancelled_declaration =
+            MiddlewareDeclaration::new("cancelled-request", [MiddlewareScope::Request]);
+        cancelled_declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        cancelled_declaration.max_duration = Duration::from_secs(5);
+        let chain = Arc::new(
+            MiddlewareChain::new(vec![
+                Arc::new(CancellableResponse {
+                    declaration: cancelled_declaration,
+                    calls: Arc::clone(&calls),
+                    active: Arc::clone(&active),
+                    maximum: Arc::clone(&maximum),
+                    release: Arc::clone(&release),
+                }),
+                Arc::new(Mutator {
+                    declaration: MiddlewareDeclaration::new(
+                        "request-peer",
+                        [MiddlewareScope::Request],
+                    ),
+                }),
+            ])
+            .expect("request chain"),
+        );
+        let runtime = MiddlewareRuntime::with_slots(Arc::new(Semaphore::new(2)));
+        let cancelled = tokio::spawn({
+            let chain = Arc::clone(&chain);
+            let runtime = runtime.clone();
+            async move {
+                let mut request = ProviderRequest {
+                    model: "alias".to_owned(),
+                    body: json!({}),
+                };
+                chain.request(&runtime, &mut request).await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking request callback starts");
+        cancelled.abort();
+        let join_error = cancelled.await.err().expect("request future is cancelled");
+        assert!(join_error.is_cancelled());
+        let gate = runtime.gate("cancelled-request");
+        assert_eq!(gate.abandoned.load(Ordering::Acquire), 1);
+
+        let mut quarantined = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            chain.request(&runtime, &mut quarantined),
+        )
+        .await
+        .expect("quarantined request id is skipped without waiting")
+        .expect("fail-open quarantine leaves the peer available");
+        assert_eq!(quarantined.body["changed"], json!(true));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(maximum.load(Ordering::Acquire), 1);
+
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.abandoned.load(Ordering::Acquire) != 0 || active.load(Ordering::Acquire) != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking request callback exits and clears quarantine");
+
+        let mut recovered = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        chain
+            .request(&runtime, &mut recovered)
+            .await
+            .expect("request middleware recovers after callback exit");
+        assert_eq!(recovered.body["changed"], json!(true));
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert_eq!(maximum.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
@@ -2612,6 +3163,556 @@ namespace = "alpha"
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
 
+    struct FinalizerProbe {
+        declaration: MiddlewareDeclaration,
+        order: Arc<Mutex<Vec<String>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct FinalizerOwnedState(Arc<AtomicUsize>);
+
+    impl Drop for FinalizerOwnedState {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct StatefulFinalizerProbe {
+        declaration: MiddlewareDeclaration,
+        drops: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Middleware for StatefulFinalizerProbe {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            if matches!(phase, MiddlewarePhase::Request(_)) {
+                return Ok(MiddlewareOutcome::continue_with_state(
+                    MiddlewareState::new(FinalizerOwnedState(Arc::clone(&self.drops))),
+                ));
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+
+        fn finish_stream(
+            &self,
+            state: Option<&mut MiddlewareState>,
+        ) -> Result<(), MiddlewareError> {
+            assert!(
+                state
+                    .and_then(|state| state.downcast_mut::<FinalizerOwnedState>())
+                    .is_some(),
+                "finalizer receives its request-owned state"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct StatefulBlockingFinalizer {
+        declaration: MiddlewareDeclaration,
+        drops: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Middleware for StatefulBlockingFinalizer {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            if matches!(phase, MiddlewarePhase::Request(_)) {
+                return Ok(MiddlewareOutcome::continue_with_state(
+                    MiddlewareState::new(FinalizerOwnedState(Arc::clone(&self.drops))),
+                ));
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+
+        fn finish_stream(
+            &self,
+            state: Option<&mut MiddlewareState>,
+        ) -> Result<(), MiddlewareError> {
+            assert!(
+                state
+                    .and_then(|state| state.downcast_mut::<FinalizerOwnedState>())
+                    .is_some(),
+                "blocking finalizer receives its request-owned state"
+            );
+            self.active.fetch_add(1, Ordering::SeqCst);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Middleware for FinalizerProbe {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            _phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+
+        fn finish_stream(
+            &self,
+            _state: Option<&mut MiddlewareState>,
+        ) -> Result<(), MiddlewareError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.order
+                .lock()
+                .expect("finalizer order")
+                .push(self.declaration.id.clone());
+            Ok(())
+        }
+    }
+
+    struct BlockingFinalizer {
+        declaration: MiddlewareDeclaration,
+        calls: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+    }
+
+    struct BlockingReleaseGuard(Arc<AtomicBool>);
+
+    impl BlockingReleaseGuard {
+        fn new(release: Arc<AtomicBool>) -> Self {
+            Self(release)
+        }
+
+        fn release(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl Drop for BlockingReleaseGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    impl Middleware for BlockingFinalizer {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            _phase: MiddlewarePhase<'_>,
+            _state: Option<&mut MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+
+        fn finish_stream(
+            &self,
+            _state: Option<&mut MiddlewareState>,
+        ) -> Result<(), MiddlewareError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    type BlockingFinalizerFixture = (
+        Arc<dyn Middleware>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+    );
+
+    fn blocking_finalizer(
+        id: &str,
+        posture: MiddlewareFailurePosture,
+        bound: Duration,
+    ) -> BlockingFinalizerFixture {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut declaration = MiddlewareDeclaration::new(id, [MiddlewareScope::StreamEvent]);
+        declaration.failure_posture = posture;
+        declaration.max_duration = bound;
+        (
+            Arc::new(BlockingFinalizer {
+                declaration,
+                calls: Arc::clone(&calls),
+                active: Arc::clone(&active),
+                maximum: Arc::clone(&maximum),
+                release: Arc::clone(&release),
+            }),
+            calls,
+            active,
+            maximum,
+            release,
+        )
+    }
+
+    #[tokio::test]
+    async fn stream_finalizer_defaults_to_noop_and_scope_is_explicit() {
+        let mut empty = MiddlewareExecution::default();
+        assert!(!empty.has_stream_event_scope());
+        empty.finish_stream().await.expect("empty finalizer");
+        empty
+            .finish_stream()
+            .await
+            .expect("empty finalizer is once-only");
+
+        let response_only = Arc::new(Noop {
+            declaration: MiddlewareDeclaration::new(
+                "response-only-finalizer",
+                [MiddlewareScope::Response],
+            ),
+        });
+        let chain = MiddlewareChain::new(vec![response_only]).expect("response-only chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain.start_isolated(&mut request).await.expect("execution");
+        assert!(!execution.has_stream_event_scope());
+        execution
+            .finish_stream()
+            .await
+            .expect("no stream callbacks");
+    }
+
+    #[tokio::test]
+    async fn stream_finalizer_runs_stream_scope_in_reverse_order_at_most_once() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let first = Arc::new(FinalizerProbe {
+            declaration: MiddlewareDeclaration::new("first", [MiddlewareScope::StreamEvent]),
+            order: Arc::clone(&order),
+            calls: Arc::clone(&first_calls),
+        });
+        let response_only = Arc::new(Noop {
+            declaration: MiddlewareDeclaration::new("middle", [MiddlewareScope::Response]),
+        });
+        let second = Arc::new(FinalizerProbe {
+            declaration: MiddlewareDeclaration::new("second", [MiddlewareScope::StreamEvent]),
+            order: Arc::clone(&order),
+            calls: Arc::clone(&second_calls),
+        });
+        let chain = MiddlewareChain::new(vec![first, response_only, second]).expect("finalizers");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain.start_isolated(&mut request).await.expect("execution");
+        assert!(execution.has_stream_event_scope());
+        execution.finish_stream().await.expect("first completion");
+        execution
+            .finish_stream()
+            .await
+            .expect("duplicate completion is inert");
+        assert_eq!(*order.lock().expect("finalizer order"), ["second", "first"]);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_finalization_retains_request_state_until_execution_drops() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entry = Arc::new(StatefulFinalizerProbe {
+            declaration: MiddlewareDeclaration::new(
+                "stateful-finalizer",
+                [MiddlewareScope::Request, MiddlewareScope::StreamEvent],
+            ),
+            drops: Arc::clone(&drops),
+            calls: Arc::clone(&calls),
+        });
+        let chain = MiddlewareChain::new(vec![entry]).expect("stateful finalizer chain");
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain.start_isolated(&mut request).await.expect("execution");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        execution
+            .finish_stream()
+            .await
+            .expect("finalization succeeds");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "successful finalization returns state to the response owner"
+        );
+        drop(execution);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_finalization_drops_request_state_once_after_blocking_work_exits() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let release_guard = BlockingReleaseGuard::new(Arc::clone(&release));
+        let mut declaration = MiddlewareDeclaration::new(
+            "stateful-blocking-finalizer",
+            [MiddlewareScope::Request, MiddlewareScope::StreamEvent],
+        );
+        declaration.max_duration = Duration::from_secs(5);
+        let entry = Arc::new(StatefulBlockingFinalizer {
+            declaration,
+            drops: Arc::clone(&drops),
+            active: Arc::clone(&active),
+            release: Arc::clone(&release),
+        });
+        let chain = MiddlewareChain::new(vec![entry]).expect("blocking stateful finalizer chain");
+        let runtime = MiddlewareRuntime::default();
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain
+            .start(&runtime, &mut request)
+            .await
+            .expect("execution");
+        let mut finishing = Box::pin(execution.finish_stream());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = &mut finishing => panic!("finalizer unexpectedly completed: {result:?}"),
+                _ = async {
+                    while active.load(Ordering::Acquire) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("blocking finalizer becomes active");
+        drop(finishing);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(execution.stranded[0]);
+        let gate = runtime.gate("stateful-blocking-finalizer");
+        assert_eq!(gate.abandoned.load(Ordering::Acquire), 1);
+        release_guard.release();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) != 0
+                || gate.abandoned.load(Ordering::Acquire) != 0
+                || drops.load(Ordering::Acquire) != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abandoned finalizer exits and drops its state");
+        drop(execution);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_stream_finalizers_share_bounded_process_and_id_capacity() {
+        const EXECUTIONS: usize = 6;
+        const SLOTS: usize = 2;
+        let (entry, calls, active, maximum, release) = blocking_finalizer(
+            "bounded-finalizer",
+            MiddlewareFailurePosture::FailClosed,
+            Duration::from_secs(2),
+        );
+        let chain = MiddlewareChain::new(vec![entry]).expect("finalizer chain");
+        let slots = Arc::new(Semaphore::new(SLOTS));
+        let runtime = MiddlewareRuntime::with_slots(Arc::clone(&slots));
+        let mut tasks = Vec::new();
+        for _ in 0..EXECUTIONS {
+            let mut request = ProviderRequest {
+                model: "alias".to_owned(),
+                body: json!({}),
+            };
+            let mut execution = chain
+                .start(&runtime, &mut request)
+                .await
+                .expect("execution");
+            tasks.push(tokio::spawn(async move { execution.finish_stream().await }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) != SLOTS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finalizers occupy bounded process capacity");
+        assert_eq!(calls.load(Ordering::SeqCst), SLOTS);
+        assert_eq!(maximum.load(Ordering::SeqCst), SLOTS);
+        assert_eq!(slots.available_permits(), 0);
+        release.store(true, Ordering::Release);
+        for task in tasks {
+            task.await
+                .expect("finalizer task")
+                .expect("finalizer completes within bound");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), EXECUTIONS);
+        assert_eq!(maximum.load(Ordering::SeqCst), SLOTS);
+        assert_eq!(slots.available_permits(), SLOTS);
+    }
+
+    #[tokio::test]
+    async fn timed_out_finalizer_quarantines_and_never_double_finalizes() {
+        let (entry, calls, active, _maximum, release) = blocking_finalizer(
+            "timed-finalizer",
+            MiddlewareFailurePosture::FailClosed,
+            Duration::from_millis(5),
+        );
+        let chain = MiddlewareChain::new(vec![entry]).expect("finalizer chain");
+        let runtime = MiddlewareRuntime::default();
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain
+            .start(&runtime, &mut request)
+            .await
+            .expect("execution");
+        assert!(matches!(
+            execution.finish_stream().await,
+            Err(GatewayError::MiddlewareUnavailable)
+        ));
+        assert!(execution.stranded[0]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let gate = runtime.gate("timed-finalizer");
+        assert_eq!(gate.abandoned.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            execution.finish_stream().await,
+            Err(GatewayError::MiddlewareUnavailable)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) != 0 || gate.abandoned.load(Ordering::Acquire) != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out finalizer releases quarantine");
+    }
+
+    #[tokio::test]
+    async fn cancelled_finalizer_strands_state_and_quarantined_posture_is_enforced() {
+        let (entry, calls, active, _maximum, release) = blocking_finalizer(
+            "cancelled-finalizer",
+            MiddlewareFailurePosture::FailClosed,
+            Duration::from_secs(5),
+        );
+        let release_guard = BlockingReleaseGuard::new(Arc::clone(&release));
+        let chain = MiddlewareChain::new(vec![entry]).expect("finalizer chain");
+        let runtime = MiddlewareRuntime::default();
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain
+            .start(&runtime, &mut request)
+            .await
+            .expect("execution");
+        let mut finishing = Box::pin(execution.finish_stream());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = &mut finishing => panic!("finalizer unexpectedly completed: {result:?}"),
+                _ = async {
+                    while active.load(Ordering::Acquire) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("blocking finalizer becomes active");
+        drop(finishing);
+        assert!(execution.stranded[0]);
+        let gate = runtime.gate("cancelled-finalizer");
+        assert_eq!(gate.abandoned.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            execution.finish_stream().await,
+            Err(GatewayError::MiddlewareUnavailable)
+        ));
+
+        let mut refused_request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut refused = chain
+            .start(&runtime, &mut refused_request)
+            .await
+            .expect("second execution");
+        assert!(matches!(
+            refused.finish_stream().await,
+            Err(GatewayError::MiddlewareUnavailable)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release_guard.release();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) != 0 || gate.abandoned.load(Ordering::Acquire) != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled finalizer exits and releases quarantine");
+    }
+
+    #[tokio::test]
+    async fn quarantined_fail_open_finalizer_is_skipped() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut declaration =
+            MiddlewareDeclaration::new("optional-finalizer", [MiddlewareScope::StreamEvent]);
+        declaration.failure_posture = MiddlewareFailurePosture::FailOpen;
+        let chain = MiddlewareChain::new(vec![Arc::new(FinalizerProbe {
+            declaration,
+            order: Arc::new(Mutex::new(Vec::new())),
+            calls: Arc::clone(&calls),
+        })])
+        .expect("optional finalizer");
+        let runtime = MiddlewareRuntime::default();
+        let gate = runtime.gate("optional-finalizer");
+        gate.abandoned.store(1, Ordering::Release);
+        let mut request = ProviderRequest {
+            model: "alias".to_owned(),
+            body: json!({}),
+        };
+        let mut execution = chain
+            .start(&runtime, &mut request)
+            .await
+            .expect("execution");
+        execution
+            .finish_stream()
+            .await
+            .expect("fail-open quarantine skips finalizer");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     struct UsageMutator {
         declaration: MiddlewareDeclaration,
         stream_calls: Arc<AtomicUsize>,
@@ -2710,7 +3811,8 @@ namespace = "alpha"
             "test.policy-marker",
             [MiddlewareScope::Request],
         ));
-        let plan = MiddlewarePlan::compile(&config).expect("known registration compiles");
+        let plan =
+            MiddlewarePlan::compile(&config, &HashMap::new()).expect("known registration compiles");
         let runtime = MiddlewareRuntime::default();
 
         let mut alpha = ProviderRequest {
@@ -2741,7 +3843,7 @@ namespace = "alpha"
             [MiddlewareScope::Request],
         ));
         assert!(matches!(
-            MiddlewarePlan::compile(&unknown),
+            MiddlewarePlan::compile(&unknown, &HashMap::new()),
             Err(MiddlewarePlanError {
                 source: MiddlewarePolicyError::Unknown { .. },
                 ..
@@ -2755,7 +3857,227 @@ namespace = "alpha"
             "test.policy-marker",
             [MiddlewareScope::Response, MiddlewareScope::StreamEvent],
         ));
-        let plan = MiddlewarePlan::compile(&config).expect("implemented scopes compile");
+        let plan =
+            MiddlewarePlan::compile(&config, &HashMap::new()).expect("implemented scopes compile");
         assert_eq!(plan.for_namespace("alpha").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn production_guardrail_is_stable_across_replicas_and_renames_and_restores_output() {
+        let mut config = config_with_registration(guardrail_registration());
+        config.namespace[0].project = Some(ProjectIdentity {
+            tenant: tenant_id(1),
+            project: project_id(1),
+        });
+        let body = policy_body(PolicyScope::Tenant(tenant_id(2)), PolicyEpoch::FIRST.get())
+            .with_content_middleware(vec![guardrail_registration()])
+            .expect("registration attaches");
+        let generation = body.generation(revision_id(2));
+        config.namespace[1].policy = Some(NamespacePolicy { body, generation });
+        let env = HashMap::from([("GW_GUARDRAIL_KEY".to_owned(), STANDARD.encode([9_u8; 32]))]);
+        let plan = MiddlewarePlan::compile(&config, &env).expect("guardrail compiles");
+        let independent_plan =
+            MiddlewarePlan::compile(&config, &env).expect("a second replica compiles");
+        let mut renamed = config.clone();
+        renamed.namespace[0].id = "alpha-renamed".to_owned();
+        let renamed_plan =
+            MiddlewarePlan::compile(&renamed, &env).expect("the renamed projection compiles");
+        let runtime = MiddlewareRuntime::default();
+
+        async fn mask(
+            plan: &MiddlewarePlan,
+            runtime: &MiddlewareRuntime,
+            namespace: &str,
+        ) -> (String, ProviderResponse) {
+            let mut request = ProviderRequest {
+                model: "alias".to_owned(),
+                body: json!({"messages": [{
+                    "role": "user",
+                    "content": "alice@example.com"
+                }]}),
+            };
+            let mut execution = plan
+                .for_namespace(namespace)
+                .start_with_protected_values(
+                    runtime,
+                    &mut request,
+                    &[],
+                    MiddlewareSurface::ChatCompletions,
+                )
+                .await
+                .expect("request is masked");
+            let token = request.body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let mut response = ProviderResponse {
+                body: json!({"choices": [{"message": {"content": token}}]}),
+                usage: ModelUsage::default(),
+            };
+            execution
+                .response(&mut response)
+                .await
+                .expect("response is restored");
+            (
+                request.body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                response,
+            )
+        }
+
+        let (alpha_first, alpha_response) = mask(&plan, &runtime, "alpha").await;
+        let (alpha_second, _) = mask(&plan, &runtime, "alpha").await;
+        let (alpha_other_replica, _) = mask(&independent_plan, &runtime, "alpha").await;
+        let (alpha_after_rename, _) = mask(&renamed_plan, &runtime, "alpha-renamed").await;
+        let (beta, beta_response) = mask(&plan, &runtime, "beta").await;
+        assert_eq!(alpha_first, alpha_second);
+        assert_eq!(alpha_first, alpha_other_replica);
+        assert_eq!(alpha_first, alpha_after_rename);
+        assert_ne!(alpha_first, beta);
+        assert_eq!(
+            alpha_response.body["choices"][0]["message"]["content"],
+            "alice@example.com"
+        );
+        assert_eq!(
+            beta_response.body["choices"][0]["message"]["content"],
+            "alice@example.com"
+        );
+        assert!(
+            plan.for_namespace("alpha")
+                .has_response_mutator(MiddlewareScope::Response)
+        );
+        assert!(
+            plan.for_namespace("alpha")
+                .has_response_mutator(MiddlewareScope::StreamEvent)
+        );
+    }
+
+    #[test]
+    fn block_only_guardrail_declares_validation_without_response_mutation() {
+        let registration = registration(
+            "axond.redact",
+            [
+                MiddlewareScope::Request,
+                MiddlewareScope::Response,
+                MiddlewareScope::StreamEvent,
+            ],
+        )
+        .with_guardrail(
+            ContentGuardrailRegistration::new(
+                "GW_GUARDRAIL_KEY",
+                vec![GuardrailRule {
+                    id: "deny".to_owned(),
+                    pattern: "forbidden".to_owned(),
+                    action: GuardrailAction::Block,
+                }],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let config = config_with_registration(registration);
+        let env = HashMap::from([("GW_GUARDRAIL_KEY".to_owned(), STANDARD.encode([9_u8; 32]))]);
+        let plan = MiddlewarePlan::compile(&config, &env).expect("block guardrail compiles");
+        let chain = plan.for_namespace("alpha");
+        assert!(chain.has_scope(MiddlewareScope::StreamEvent));
+        assert!(!chain.has_response_mutator(MiddlewareScope::Response));
+        assert!(!chain.has_response_mutator(MiddlewareScope::StreamEvent));
+    }
+
+    #[test]
+    fn production_guardrail_fails_closed_on_key_rule_and_posture_configuration() {
+        let config = config_with_registration(guardrail_registration());
+        assert!(matches!(
+            MiddlewarePlan::compile(&config, &HashMap::new()),
+            Err(MiddlewarePlanError {
+                source: MiddlewarePolicyError::MissingKey { .. },
+                ..
+            })
+        ));
+        let invalid =
+            HashMap::from([("GW_GUARDRAIL_KEY".to_owned(), "not-key-material".to_owned())]);
+        assert!(matches!(
+            MiddlewarePlan::compile(&config, &invalid),
+            Err(MiddlewarePlanError {
+                source: MiddlewarePolicyError::InvalidKey { .. },
+                ..
+            })
+        ));
+
+        let broad = registration(
+            "axond.redact",
+            [
+                MiddlewareScope::Request,
+                MiddlewareScope::Response,
+                MiddlewareScope::StreamEvent,
+            ],
+        )
+        .with_guardrail(
+            ContentGuardrailRegistration::new(
+                "GW_GUARDRAIL_KEY",
+                vec![GuardrailRule {
+                    id: "empty".to_owned(),
+                    pattern: ".*".to_owned(),
+                    action: GuardrailAction::Redact,
+                }],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_content_middleware(&[broad]),
+            Err(MiddlewarePolicyError::InvalidConfiguration { .. })
+        ));
+
+        let missing_guardrail = registration(
+            "axond.redact",
+            [
+                MiddlewareScope::Request,
+                MiddlewareScope::Response,
+                MiddlewareScope::StreamEvent,
+            ],
+        );
+        assert!(matches!(
+            validate_content_middleware(&[missing_guardrail]),
+            Err(MiddlewarePolicyError::InvalidConfiguration { .. })
+        ));
+
+        let guardrail = guardrail_registration()
+            .guardrail()
+            .expect("guardrail fixture")
+            .clone();
+        let incomplete_scopes = registration(
+            "axond.redact",
+            [MiddlewareScope::Request, MiddlewareScope::Response],
+        )
+        .with_guardrail(guardrail.clone())
+        .unwrap();
+        assert!(matches!(
+            validate_content_middleware(&[incomplete_scopes]),
+            Err(MiddlewarePolicyError::InvalidConfiguration { .. })
+        ));
+
+        let misplaced = registration("test.policy-marker", [MiddlewareScope::Request])
+            .with_guardrail(guardrail)
+            .unwrap();
+        assert!(matches!(
+            validate_content_middleware(&[misplaced]),
+            Err(MiddlewarePolicyError::InvalidConfiguration { .. })
+        ));
+
+        assert_eq!(
+            ContentMiddlewareRegistration::new(
+                "axond.redact",
+                [
+                    MiddlewareScope::Request,
+                    MiddlewareScope::Response,
+                    MiddlewareScope::StreamEvent,
+                ],
+                MiddlewareFailurePosture::FailOpen,
+                25,
+            ),
+            Err(crate::desired_state::InvalidContentMiddleware::RedactionRequiresFailClosed)
+        );
     }
 }

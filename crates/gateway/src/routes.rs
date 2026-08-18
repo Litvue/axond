@@ -25,8 +25,9 @@
 //! is emitted; native streams and partially delivered streams remain terminal.
 
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -39,13 +40,14 @@ use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use gateway_core::{
-    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareScope, ModelUsage,
-    NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
-    Surface, Usage,
+    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareScope,
+    MiddlewareSurface, ModelUsage, NativeMessagesDecoder, ProviderError, ProviderRequest,
+    ProviderResponse, ProviderStreamDecoder, Surface, Usage,
 };
 use gateway_transport::{
     AuthScheme, Deadline, NativeCall, TimeoutBound, TimeoutKind, TransportError, Upstream,
 };
+use http_body::Body as HttpBody;
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1067,6 +1069,38 @@ enum Route {
 }
 
 impl Route {
+    fn middleware_surface(self) -> MiddlewareSurface {
+        match self {
+            Self::ChatCompletions => MiddlewareSurface::ChatCompletions,
+            Self::NativeMessages => MiddlewareSurface::NativeMessages,
+            Self::Embeddings => MiddlewareSurface::Embeddings,
+            Self::Responses => MiddlewareSurface::Responses,
+        }
+    }
+
+    fn validate_routing_controls(self, body: &Value) -> Result<(), GatewayError> {
+        if body.get("stream").is_some_and(|value| !value.is_boolean()) {
+            return Err(GatewayError::BadRequest(
+                "`stream` must be a boolean when present".into(),
+            ));
+        }
+        if body
+            .get("previous_response_id")
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(GatewayError::BadRequest(
+                "`previous_response_id` must be a string or null when present".into(),
+            ));
+        }
+        if body.get("stream").and_then(Value::as_bool) == Some(true) && !self.streamable() {
+            return Err(GatewayError::BadRequest(format!(
+                "{} does not support streaming",
+                self.label()
+            )));
+        }
+        Ok(())
+    }
+
     /// The caller-facing path, for error messages.
     fn label(self) -> &'static str {
         match self {
@@ -1218,8 +1252,10 @@ impl Route {
 }
 
 /// Decide whether a streamed response is incremental or is held until the
-/// upstream finishes. Only a stream-event mutator can make this streaming
-/// decision; response-only middleware belongs to the non-streaming path.
+/// upstream finishes. Any stream-event callback can refuse, so byte-faithful
+/// routes need the opt-in even for validation-only middleware; mutation selects
+/// reconstructed output while validation-only chains retain the original bytes.
+/// Response-only middleware belongs to the non-streaming path.
 fn stream_delivery(
     cfg: &Config,
     namespace: &str,
@@ -1418,6 +1454,8 @@ async fn serve(
 ) -> Result<Response, GatewayError> {
     let cfg = &snapshot.config;
 
+    route.validate_routing_controls(&body)?;
+
     let streamed = route.streamable() && body.get("stream").and_then(Value::as_bool) == Some(true);
 
     let alias = body
@@ -1577,8 +1615,28 @@ async fn serve(
     } else {
         &state.0.middleware
     };
+    let mut protected_values = wire
+        .headers
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), value.clone()))
+        .collect::<Vec<_>>();
+    if let Some(previous_response_id) = middleware_request
+        .body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+    {
+        protected_values.push((
+            "previous_response_id".to_owned(),
+            previous_response_id.to_owned(),
+        ));
+    }
     let mut middleware_execution = middleware
-        .start(&state.0.middleware_runtime, &mut middleware_request)
+        .start_with_protected_values(
+            &state.0.middleware_runtime,
+            &mut middleware_request,
+            &protected_values,
+            route.middleware_surface(),
+        )
         .await?;
     let body = middleware_request.body;
     // An empty chain is byte-neutral, so the pre-admission estimate is already
@@ -1697,7 +1755,19 @@ async fn serve(
                 attempts: outcome.attempts,
             });
             let accounting = reservation.into_response_accounting(record, ttft_ms, attempts);
-            let middleware_result = middleware_execution.response(&mut response).await;
+            let mut middleware_result = middleware_execution.response(&mut response).await;
+            // Upstream buffering enforced the same configured ceiling before
+            // middleware ran. A response mutator can expand that bounded JSON,
+            // so count the exact post-middleware serialization before any body
+            // becomes caller-visible. Counting writes allocate no second body.
+            if middleware_result.is_ok()
+                && !json_fits_response_limit(
+                    &response.body,
+                    state.0.dispatcher.limits().max_response_bytes,
+                )
+            {
+                middleware_result = Err(GatewayError::MiddlewareUnavailable);
+            }
             accounting
                 .finish(if middleware_result.is_ok() {
                     Status::Ok
@@ -1706,7 +1776,10 @@ async fn serve(
                 })
                 .await?;
             middleware_result?;
-            Ok(Json(response.body).into_response())
+            Ok(attach_middleware_owner(
+                Json(response.body).into_response(),
+                middleware_execution,
+            ))
         }
         Err(err) => {
             // The charging policy is "what was actually consumed" (ADR 0010),
@@ -1745,6 +1818,37 @@ async fn serve(
             Err(err.into())
         }
     }
+}
+
+struct BoundedJsonCounter {
+    bytes: u64,
+    limit: u64,
+}
+
+impl std::io::Write for BoundedJsonCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let bytes = u64::try_from(buffer.len())
+            .map_err(|_| std::io::Error::other("serialized response length overflow"))?;
+        let next = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| std::io::Error::other("serialized response length overflow"))?;
+        if next > self.limit {
+            return Err(std::io::Error::other(
+                "serialized response exceeds configured limit",
+            ));
+        }
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_fits_response_limit(body: &Value, limit: u64) -> bool {
+    serde_json::to_writer(BoundedJsonCounter { bytes: 0, limit }, body).is_ok()
 }
 
 /// The target that produced the outcome (served it, or made the last attempt),
@@ -3075,19 +3179,68 @@ fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
     (record, ttft_ms, attempts)
 }
 
+/// Keep request-local content-middleware state alive until the caller finishes
+/// or drops a buffered response body. The handler has already transformed the
+/// JSON value, but the opaque owner follows the same response-lifetime contract
+/// as streamed middleware state and admission capacity.
+fn attach_middleware_owner(response: Response, owner: MiddlewareExecution) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(MiddlewareOwnedBody {
+            inner: body,
+            owner: Some(owner),
+        }),
+    )
+}
+
+/// Frame-transparent body ownership. In particular, wrapping middleware state
+/// must not discard trailers or turn an exact-length JSON body into an
+/// unknown-length stream.
+struct MiddlewareOwnedBody {
+    inner: Body,
+    owner: Option<MiddlewareExecution>,
+}
+
+impl HttpBody for MiddlewareOwnedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let result = Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(result, Poll::Ready(None)) {
+            drop(self.owner.take());
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::aliases::AliasScope;
     use crate::backends::catalog::ProviderId;
     use crate::budget::NoBudget;
-    use crate::config::{Config, NamespacePolicy, UndurablePolicy};
+    use crate::config::{Config, NamespacePolicy, ProjectIdentity, UndurablePolicy};
     use crate::convergence::status::testing::ManualClock;
     use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
     use crate::desired_state::fixtures::{
-        approved_pricing_snapshot, policy_body, revision_id, tenant_id,
+        approved_pricing_snapshot, policy_body, project_id, revision_id, tenant_id,
     };
-    use crate::desired_state::policy::PolicyScope;
+    use crate::desired_state::policy::{
+        ContentGuardrailRegistration, ContentMiddlewareRegistration, PolicyScope,
+    };
     use crate::middleware::MiddlewareChain;
     use crate::pricing::PriceIdentity;
     use crate::principals::PrincipalAuthority;
@@ -3100,9 +3253,12 @@ mod tests {
     use crate::usage::{StdoutSink, UsageDelivery, UsageFanout, UsageSink};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use gateway_core::{
-        Middleware, MiddlewareDeclaration, MiddlewareOutcome, MiddlewarePhase, MiddlewareRefusal,
-        MiddlewareResult, ProviderStreamEvent,
+        DeterministicGuardrail, GuardrailAction, GuardrailRule, Middleware, MiddlewareDeclaration,
+        MiddlewareFailurePosture, MiddlewareOutcome, MiddlewarePhase, MiddlewareRefusal,
+        MiddlewareResult, MiddlewareScope, MiddlewareState, MiddlewareStateBag,
+        ProviderStreamEvent,
     };
     use http_body_util::BodyExt;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -3114,7 +3270,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::sync::oneshot;
+    use tokio::sync::{Notify, oneshot};
     use tower::util::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -6511,6 +6667,89 @@ targets = [
         refuse_on_text: bool,
     }
 
+    struct StreamTextObserver {
+        declaration: MiddlewareDeclaration,
+        observed: Arc<Mutex<Vec<String>>>,
+        release_failure: Arc<Notify>,
+        state_drops: Arc<AtomicUsize>,
+    }
+
+    struct StreamObserverState(Arc<AtomicUsize>);
+
+    impl Drop for StreamObserverState {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_middleware_state_lives_until_response_body_completion_or_drop() {
+        fn owned_response(drops: Arc<AtomicUsize>) -> Response {
+            let mut states = MiddlewareStateBag::new(1);
+            states.insert(
+                0,
+                MiddlewareState::new(StreamObserverState(Arc::clone(&drops))),
+            );
+            attach_middleware_owner(
+                Json(json!({"ok": true})).into_response(),
+                MiddlewareExecution::from_state_bag_for_test(states),
+            )
+        }
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let response = owned_response(Arc::clone(&completed));
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        assert_eq!(response.body().size_hint().exact(), Some(11));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, bytes::Bytes::from_static(br#"{"ok":true}"#));
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let response = owned_response(Arc::clone(&cancelled));
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+        drop(response);
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+
+        let framed = Arc::new(AtomicUsize::new(0));
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-axond-trailer", HeaderValue::from_static("preserved"));
+        let frames = futures::stream::iter([
+            Ok::<_, std::convert::Infallible>(http_body::Frame::data(bytes::Bytes::from_static(
+                b"payload",
+            ))),
+            Ok(http_body::Frame::trailers(trailers)),
+        ]);
+        let mut states = MiddlewareStateBag::new(1);
+        states.insert(
+            0,
+            MiddlewareState::new(StreamObserverState(Arc::clone(&framed))),
+        );
+        let response = attach_middleware_owner(
+            Response::new(Body::new(http_body_util::StreamBody::new(frames))),
+            MiddlewareExecution::from_state_bag_for_test(states),
+        );
+        let mut body = response.into_body();
+        let data = body
+            .frame()
+            .await
+            .expect("data frame")
+            .unwrap()
+            .into_data()
+            .expect("first frame is data");
+        assert_eq!(data, bytes::Bytes::from_static(b"payload"));
+        let trailers = body
+            .frame()
+            .await
+            .expect("trailer frame")
+            .unwrap()
+            .into_trailers()
+            .expect("second frame is trailers");
+        assert_eq!(trailers["x-axond-trailer"], "preserved");
+        assert_eq!(framed.load(Ordering::SeqCst), 0);
+        assert!(body.frame().await.is_none());
+        assert_eq!(framed.load(Ordering::SeqCst), 1);
+    }
+
     impl BlockingResponseMiddleware {
         fn chain(active: Arc<AtomicUsize>, release: Arc<AtomicBool>) -> MiddlewareChain {
             let mut declaration =
@@ -6557,6 +6796,59 @@ targets = [
             MiddlewareChain::new(vec![Arc::new(Self { declaration }) as Arc<dyn Middleware>])
                 .expect("stream marker chain")
         }
+    }
+
+    fn guardrail(action: GuardrailAction, pattern: &str) -> Arc<dyn Middleware> {
+        let mut declaration = MiddlewareDeclaration::new(
+            "axond.redact",
+            [
+                MiddlewareScope::Request,
+                MiddlewareScope::Response,
+                MiddlewareScope::StreamEvent,
+            ],
+        );
+        declaration.failure_posture = MiddlewareFailurePosture::FailClosed;
+        declaration.max_duration = Duration::from_secs(1);
+        declaration.mutates_response = action == GuardrailAction::Redact;
+        let guardrail = DeterministicGuardrail::compile(
+            declaration,
+            &[7_u8; 32],
+            &[GuardrailRule {
+                id: "test-rule".to_owned(),
+                pattern: pattern.to_owned(),
+                action,
+            }],
+        )
+        .expect("test guardrail compiles");
+        Arc::new(guardrail)
+    }
+
+    fn guardrail_chain(action: GuardrailAction, pattern: &str) -> MiddlewareChain {
+        MiddlewareChain::new(vec![guardrail(action, pattern)]).expect("guardrail chain")
+    }
+
+    fn observed_guardrail_chain(
+        pattern: &str,
+        observed: Arc<Mutex<Vec<String>>>,
+        release_failure: Arc<Notify>,
+        state_drops: Arc<AtomicUsize>,
+    ) -> MiddlewareChain {
+        let mut observer_declaration = MiddlewareDeclaration::new(
+            "test.stream-text-observer",
+            [MiddlewareScope::Request, MiddlewareScope::StreamEvent],
+        );
+        observer_declaration.max_duration = Duration::from_secs(1);
+        let observer = Arc::new(StreamTextObserver {
+            declaration: observer_declaration,
+            observed,
+            release_failure,
+            state_drops,
+        }) as Arc<dyn Middleware>;
+        // Stream callbacks run in reverse registration order. Register the
+        // observer first so it sees the event only after axond.redact has
+        // consumed the generated-token prefix into request-local carry.
+        MiddlewareChain::new(vec![observer, guardrail(GuardrailAction::Redact, pattern)])
+            .expect("observed guardrail chain")
     }
 
     #[tokio::test]
@@ -6719,6 +7011,33 @@ targets = [
         }
     }
 
+    impl Middleware for StreamTextObserver {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> MiddlewareResult {
+            if matches!(&phase, MiddlewarePhase::Request(_)) {
+                return Ok(MiddlewareOutcome::continue_with_state(
+                    gateway_core::MiddlewareState::new(StreamObserverState(Arc::clone(
+                        &self.state_drops,
+                    ))),
+                ));
+            }
+            if let MiddlewarePhase::StreamEvent(ProviderStreamEvent::Data { data, .. }) = phase
+                && let Some(text) = data.pointer("/delta/text").and_then(Value::as_str)
+            {
+                self.observed.lock().unwrap().push(text.to_owned());
+                self.release_failure.notify_one();
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
     fn enable_buffered_response_routes(
         config: &mut Config,
         routes: impl IntoIterator<Item = BufferedResponseRoute>,
@@ -6788,11 +7107,136 @@ targets = [
         );
     }
 
+    #[test]
+    fn malformed_routing_controls_are_rejected_before_middleware_or_dispatch() {
+        for body in [
+            json!({"model": "chat", "stream": "alice@example.com"}),
+            json!({
+                "model": "chat",
+                "previous_response_id": {"value": "alice@example.com"}
+            }),
+        ] {
+            let original = body.clone();
+            assert!(matches!(
+                Route::Responses.validate_routing_controls(&body),
+                Err(GatewayError::BadRequest(_))
+            ));
+            assert_eq!(body, original);
+        }
+
+        for body in [
+            json!({"model": "chat"}),
+            json!({"model": "chat", "stream": false}),
+            json!({"model": "chat", "previous_response_id": null}),
+            json!({"model": "chat", "previous_response_id": "resp_1"}),
+        ] {
+            Route::Responses
+                .validate_routing_controls(&body)
+                .expect("valid routing controls");
+        }
+
+        let embeddings_stream = json!({"model": "embed", "stream": true, "input": "hello"});
+        assert!(matches!(
+            Route::Embeddings.validate_routing_controls(&embeddings_stream),
+            Err(GatewayError::BadRequest(message))
+                if message == "/v1/embeddings does not support streaming"
+        ));
+    }
+
+    #[test]
+    fn post_middleware_buffered_response_uses_the_exact_serialized_byte_budget() {
+        let body = json!({
+            "choices": [{"message": {"content": "restored caller text"}}]
+        });
+        let exact = u64::try_from(serde_json::to_vec(&body).unwrap().len()).unwrap();
+        assert!(json_fits_response_limit(&body, exact));
+        assert!(!json_fits_response_limit(&body, exact - 1));
+    }
+
+    #[test]
+    fn deterministic_guardrail_obeys_native_and_responses_buffering_opt_in() {
+        let mut config = test_state().config().config.clone();
+        let chain = guardrail_chain(GuardrailAction::Redact, "secret");
+        let validation_only = guardrail_chain(GuardrailAction::Block, "forbidden");
+        assert_eq!(
+            stream_delivery(
+                &config,
+                "platform",
+                Route::ChatCompletions,
+                &validation_only,
+            )
+            .unwrap(),
+            StreamDelivery::Reemit,
+            "block-only OpenAI middleware remains incremental and nonmutating"
+        );
+        assert_eq!(
+            stream_delivery(&config, "platform", Route::ChatCompletions, &chain).unwrap(),
+            StreamDelivery::Reemit,
+            "mutating OpenAI middleware re-emits decoded events incrementally"
+        );
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::NativeMessages, &chain),
+            Err(GatewayError::MiddlewareResponseIncompatible {
+                route: "/v1/messages",
+                framing: "native"
+            })
+        ));
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::Responses, &chain),
+            Err(GatewayError::MiddlewareResponseIncompatible {
+                route: "/v1/responses",
+                framing: "responses"
+            })
+        ));
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::NativeMessages, &validation_only,),
+            Err(GatewayError::MiddlewareResponseIncompatible {
+                route: "/v1/messages",
+                framing: "native"
+            })
+        ));
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::Responses, &validation_only),
+            Err(GatewayError::MiddlewareResponseIncompatible {
+                route: "/v1/responses",
+                framing: "responses"
+            })
+        ));
+        enable_buffered_response_routes(
+            &mut config,
+            [
+                BufferedResponseRoute::Messages,
+                BufferedResponseRoute::Responses,
+            ],
+        );
+        assert_eq!(
+            stream_delivery(&config, "platform", Route::NativeMessages, &chain).unwrap(),
+            StreamDelivery::PolicyBuffered
+        );
+        assert_eq!(
+            stream_delivery(&config, "platform", Route::Responses, &chain).unwrap(),
+            StreamDelivery::PolicyBuffered
+        );
+
+        assert_eq!(
+            stream_delivery(&config, "platform", Route::NativeMessages, &validation_only,).unwrap(),
+            StreamDelivery::PolicyValidatedPassthrough
+        );
+        assert_eq!(
+            stream_delivery(&config, "platform", Route::Responses, &validation_only,).unwrap(),
+            StreamDelivery::PolicyValidatedPassthrough
+        );
+    }
+
     const MUTABLE_NATIVE_STREAM: &str = concat!(
         "event: message_start\n",
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
         "event: content_block_delta\n",
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
         "event: message_delta\n",
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
         "event: message_stop\n",
@@ -6838,6 +7282,14 @@ targets = [
         buffered: bool,
         middleware: Option<MiddlewareChain>,
     ) -> AppState {
+        native_stream_state_with_sink(base_url, buffered, middleware).0
+    }
+
+    fn native_stream_state_with_sink(
+        base_url: &str,
+        buffered: bool,
+        middleware: Option<MiddlewareChain>,
+    ) -> (AppState, CapturingSink) {
         let mut config = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -6865,17 +7317,19 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         if buffered {
             enable_buffered_response_routes(&mut config, [BufferedResponseRoute::Messages]);
         }
+        let usage = CapturingSink::default();
         let state = AppState::new(
             config,
             &env_with([("NATIVE_KEY", "native-secret")]),
-            UsageFanout::new(vec![Box::new(CapturingSink::default())]),
+            UsageFanout::new(vec![Box::new(usage.clone())]),
             Box::new(NoBudget),
         )
         .expect("native stream state");
-        match middleware {
+        let state = match middleware {
             Some(chain) => state.with_middleware_chain(chain),
             None => state,
-        }
+        };
+        (state, usage)
     }
 
     fn native_stream_request() -> Request<Body> {
@@ -6990,11 +7444,421 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test]
+    async fn native_block_only_guardrail_preserves_validated_provider_bytes_exactly() {
+        let (base_url, hits) = mutable_native_upstream().await;
+
+        let denied = router(native_stream_state(
+            &base_url,
+            false,
+            Some(guardrail_chain(GuardrailAction::Block, "forbidden")),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("block-only native stream requires validation opt-in");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let response = router(native_stream_state(
+            &base_url,
+            true,
+            Some(guardrail_chain(GuardrailAction::Block, "forbidden")),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("validated block-only native stream");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), MUTABLE_NATIVE_STREAM.as_bytes());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    async fn redaction_native_upstream(complete_token: bool) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let upstream_seen = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/messages",
+            post(move |Json(body): Json<Value>| {
+                let upstream_seen = Arc::clone(&upstream_seen);
+                async move {
+                    upstream_seen.lock().unwrap().push(body.clone());
+                    let content = body["messages"][0]["content"]
+                        .as_str()
+                        .expect("masked native prompt");
+                    let cut = content.len() / 2;
+                    let first = format!(
+                        concat!(
+                            "event: message_start\n",
+                            "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_redacted\",\"usage\":{{\"input_tokens\":3}}}}}}\n\n",
+                            "event: content_block_start\n",
+                            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                            "event: content_block_delta\n",
+                            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}\n\n"
+                        ),
+                        serde_json::to_string(&content[..cut]).unwrap(),
+                    );
+                    let second = if complete_token {
+                        format!(
+                            concat!(
+                            "event: content_block_delta\n",
+                            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}\n\n"
+                            ),
+                            serde_json::to_string(&content[cut..]).unwrap(),
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let terminal = concat!(
+                            "event: content_block_stop\n",
+                            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                            "event: message_delta\n",
+                            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                            "event: message_stop\n",
+                            "data: {\"type\":\"message_stop\"}\n\n"
+                    );
+                    let stream = format!("{first}{second}{terminal}");
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(stream),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind native redaction fixture");
+        let addr = listener.local_addr().expect("native redaction address");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    async fn failing_redaction_native_upstream(
+        release_failure: Arc<Notify>,
+    ) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let upstream_seen = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/messages",
+            post(move |Json(body): Json<Value>| {
+                let upstream_seen = Arc::clone(&upstream_seen);
+                let release_failure = Arc::clone(&release_failure);
+                async move {
+                    upstream_seen.lock().unwrap().push(body.clone());
+                    let content = body["messages"][0]["content"]
+                        .as_str()
+                        .expect("masked native prompt");
+                    let cut = content.len() / 2;
+                    let first = format!(
+                        concat!(
+                            "event: message_start\n",
+                            "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_failed\",\"usage\":{{\"input_tokens\":3}}}}}}\n\n",
+                            "event: content_block_start\n",
+                            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                            "event: content_block_delta\n",
+                            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}\n\n"
+                        ),
+                        serde_json::to_string(&content[..cut]).unwrap(),
+                    );
+                    let stream = futures::stream::iter([Ok::<_, std::io::Error>(
+                        bytes::Bytes::from(first),
+                    )])
+                    .chain(futures::stream::once(async move {
+                        // Do not fail the transport until a downstream
+                        // observer proves axond.redact saw the generated-token
+                        // prefix and retained it as carry.
+                        release_failure.notified().await;
+                        Err(std::io::Error::other(
+                            "redaction fixture transport failure",
+                        ))
+                    }));
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing native redaction fixture");
+        let addr = listener
+            .local_addr()
+            .expect("failing native redaction address");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn native_redaction_request(secret: &str) -> Request<Body> {
+        authorized("/v1/messages")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude",
+                    "stream": true,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": secret}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_redaction_requires_opt_in_then_restores_split_output_without_leaking() {
+        const SECRET: &str = "native-secret@example.com";
+        let (base_url, seen) = redaction_native_upstream(true).await;
+
+        let denied = router(native_stream_state(
+            &base_url,
+            false,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        ))
+        .oneshot(native_redaction_request(SECRET))
+        .await
+        .expect("typed native redaction incompatibility");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        let denied = denied.into_body().collect().await.unwrap().to_bytes();
+        let denied: Value = serde_json::from_slice(&denied).unwrap();
+        assert_eq!(denied["error"]["type"], "middleware_response_incompatible");
+        assert!(seen.lock().unwrap().is_empty());
+
+        let restored = router(native_stream_state(
+            &base_url,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        ))
+        .oneshot(native_redaction_request(SECRET))
+        .await
+        .expect("buffered native redaction response");
+        assert_eq!(restored.status(), StatusCode::OK);
+        let restored = restored.into_body().collect().await.unwrap().to_bytes();
+        let restored = String::from_utf8(restored.to_vec()).unwrap();
+        assert!(restored.contains(SECRET), "{restored}");
+        assert!(!restored.contains("[AXOND:"), "{restored}");
+        assert!(!restored.contains("middleware_stream_error"), "{restored}");
+        assert!(restored.contains("event: message_stop"), "{restored}");
+        assert!(
+            restored.contains(r#"data: {"type":"message_stop"}"#),
+            "{restored}"
+        );
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let provider_content = seen[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(!provider_content.contains(SECRET));
+        assert!(provider_content.starts_with("[AXOND:"));
+    }
+
+    #[tokio::test]
+    async fn native_incomplete_redaction_token_fails_before_any_buffered_content_is_released() {
+        const SECRET: &str = "native-incomplete@example.com";
+        let (base_url, seen) = redaction_native_upstream(false).await;
+        let response = router(native_stream_state(
+            &base_url,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        ))
+        .oneshot(native_redaction_request(SECRET))
+        .await
+        .expect("native finalizer refusal");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("middleware_stream_error"), "{body}");
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(!body.contains("[AXOND:"), "{body}");
+        assert!(!body.contains("message_start"), "{body}");
+        assert!(!body.contains("message_stop"), "{body}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_transport_failure_discards_real_redaction_carry_and_buffered_content() {
+        const SECRET: &str = "native-transport@example.com";
+        let release_failure = Arc::new(Notify::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let state_drops = Arc::new(AtomicUsize::new(0));
+        let (base_url, seen) =
+            failing_redaction_native_upstream(Arc::clone(&release_failure)).await;
+        let response = router(native_stream_state(
+            &base_url,
+            true,
+            Some(observed_guardrail_chain(
+                r"[a-z-]+@example\.com",
+                Arc::clone(&observed),
+                release_failure,
+                Arc::clone(&state_drops),
+            )),
+        ))
+        .oneshot(native_redaction_request(SECRET))
+        .await
+        .expect("native transport failure response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+            .await
+            .expect("redaction carry was observed before transport failure")
+            .unwrap()
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("upstream_stream_error"), "{body}");
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(!body.contains("[AXOND:"), "{body}");
+        assert!(!body.contains("message_start"), "{body}");
+        assert!(!body.contains("message_stop"), "{body}");
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[String::new()],
+            "the guardrail must retain the partial generated token as carry"
+        );
+        assert_eq!(
+            state_drops.load(Ordering::SeqCst),
+            1,
+            "transport failure drops response-lifetime middleware state once"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_guardrail_block_refuses_before_dispatch_without_usage_or_echo() {
+        const SECRET: &str = "native-blocked@example.com";
+        let (base_url, seen) = redaction_native_upstream(true).await;
+        let (state, usage) = native_stream_state_with_sink(
+            &base_url,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Block,
+                r"[a-z-]+@example\.com",
+            )),
+        );
+
+        let response = router(state)
+            .oneshot(native_redaction_request(SECRET))
+            .await
+            .expect("native guardrail refusal");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(usage.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_guardrail_refuses_a_match_split_across_header_and_body() {
+        const SECRET: &str = "native-header@example.com";
+        let (base_url, seen) = redaction_native_upstream(true).await;
+        let (state, usage) = native_stream_state_with_sink(
+            &base_url,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        );
+        let mut request = authorized("/v1/messages")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude",
+                    "stream": true,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "@"},
+                        {"type": "text", "text": "example.com"}
+                    ]}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("anthropic-beta", HeaderValue::from_static("native-header"));
+
+        let response = router(state)
+            .oneshot(request)
+            .await
+            .expect("matched wire header refusal");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(usage.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_guardrail_allows_benign_forwarded_wire_headers() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let upstream_seen = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/messages",
+            post(
+                move |headers: axum::http::HeaderMap, Json(_body): Json<Value>| {
+                    let upstream_seen = Arc::clone(&upstream_seen);
+                    async move {
+                        upstream_seen.lock().unwrap().push(
+                            headers
+                                .get("anthropic-beta")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                        );
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from(MUTABLE_NATIVE_STREAM),
+                        )
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind benign native-header fixture");
+        let addr = listener
+            .local_addr()
+            .expect("benign native-header fixture address");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base_url = format!("http://{addr}");
+        let state = native_stream_state(
+            &base_url,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        );
+        let mut request = native_redaction_request("ordinary prompt");
+        request.headers_mut().insert(
+            "anthropic-beta",
+            HeaderValue::from_static("feature-2026-08-17"),
+        );
+
+        let response = router(state)
+            .oneshot(request)
+            .await
+            .expect("benign wire header response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("hi"));
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [Some("feature-2026-08-17".to_owned())]
+        );
+    }
+
     const MUTABLE_RESPONSES_STREAM: &str = concat!(
         "event: response.output_text.delta\n",
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
         "event: response.completed\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
     );
 
     async fn mutable_responses_upstream() -> (String, Arc<AtomicUsize>) {
@@ -7031,12 +7895,85 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         (format!("http://{addr}"), hits)
     }
 
+    async fn redaction_responses_upstream(
+        complete_token: bool,
+    ) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let upstream_seen = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/responses",
+            post(move |Json(body): Json<Value>| {
+                let upstream_seen = Arc::clone(&upstream_seen);
+                async move {
+                    upstream_seen.lock().unwrap().push(body.clone());
+                    let content = body["input"].as_str().expect("masked Responses input");
+                    let cut = content.len() / 2;
+                    let first = format!(
+                        concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {{\"type\":\"response.output_text.delta\",\"item_id\":\"item_0\",\"output_index\":0,\"content_index\":0,\"delta\":{}}}\n\n"
+                        ),
+                        serde_json::to_string(&content[..cut]).unwrap(),
+                    );
+                    let second = if complete_token {
+                        format!(
+                            concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {{\"type\":\"response.output_text.delta\",\"item_id\":\"item_0\",\"output_index\":0,\"content_index\":0,\"delta\":{}}}\n\n"
+                            ),
+                            serde_json::to_string(&content[cut..]).unwrap(),
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let terminal = concat!(
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+                    );
+                    let stream = format!("{first}{second}{terminal}");
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(stream),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses redaction fixture");
+        let addr = listener.local_addr().expect("Responses redaction address");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn responses_redaction_request(
+        secret: &str,
+        previous_response_id: Option<&str>,
+    ) -> Request<Body> {
+        let mut body = json!({"model": "gpt-4o", "input": secret, "stream": true});
+        if let Some(id) = previous_response_id {
+            body["previous_response_id"] = json!(id);
+        }
+        authorized("/v1/responses")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
     fn responses_stream_state(
         url_a: &str,
         url_b: &str,
         buffered: bool,
         middleware: Option<MiddlewareChain>,
     ) -> AppState {
+        responses_stream_state_with_sink(url_a, url_b, buffered, middleware).0
+    }
+
+    fn responses_stream_state_with_sink(
+        url_a: &str,
+        url_b: &str,
+        buffered: bool,
+        middleware: Option<MiddlewareChain>,
+    ) -> (AppState, CapturingSink) {
         let mut config = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -7080,20 +8017,22 @@ targets = [
         if buffered {
             enable_buffered_response_routes(&mut config, [BufferedResponseRoute::Responses]);
         }
+        let usage = CapturingSink::default();
         let state = AppState::new(
             config,
             &env_with([
                 ("RESPONSES_KEY_A", "responses-a"),
                 ("RESPONSES_KEY_B", "responses-b"),
             ]),
-            UsageFanout::new(vec![Box::new(CapturingSink::default())]),
+            UsageFanout::new(vec![Box::new(usage.clone())]),
             Box::new(NoBudget),
         )
         .expect("Responses stream state");
-        match middleware {
+        let state = match middleware {
             Some(chain) => state.with_middleware_chain(chain),
             None => state,
-        }
+        };
+        (state, usage)
     }
 
     #[tokio::test]
@@ -7148,6 +8087,233 @@ targets = [
         assert!(!refused.contains("response.completed"), "{refused}");
         assert_eq!(hits_a.load(Ordering::SeqCst), 2);
         assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn responses_block_only_guardrail_preserves_validated_provider_bytes_exactly() {
+        let (url_a, hits_a) = mutable_responses_upstream().await;
+        let (url_b, hits_b) = mutable_responses_upstream().await;
+
+        let denied = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            false,
+            Some(guardrail_chain(GuardrailAction::Block, "forbidden")),
+        ))
+        .oneshot(streaming_responses_request(None))
+        .await
+        .expect("block-only Responses stream requires validation opt-in");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+
+        let response = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            true,
+            Some(guardrail_chain(GuardrailAction::Block, "forbidden")),
+        ))
+        .oneshot(streaming_responses_request(None))
+        .await
+        .expect("validated block-only Responses stream");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), MUTABLE_RESPONSES_STREAM.as_bytes());
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn responses_redaction_requires_opt_in_restores_split_output_and_keeps_affinity() {
+        const SECRET: &str = "responses-secret@example.com";
+        let (url_a, seen_a) = redaction_responses_upstream(true).await;
+        let (url_b, seen_b) = redaction_responses_upstream(true).await;
+
+        let denied = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            false,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        ))
+        .oneshot(responses_redaction_request(SECRET, None))
+        .await
+        .expect("typed Responses redaction incompatibility");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        let denied = denied.into_body().collect().await.unwrap().to_bytes();
+        let denied: Value = serde_json::from_slice(&denied).unwrap();
+        assert_eq!(denied["error"]["type"], "middleware_response_incompatible");
+        assert!(seen_a.lock().unwrap().is_empty());
+        assert!(seen_b.lock().unwrap().is_empty());
+
+        let state = responses_stream_state(
+            &url_a,
+            &url_b,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        );
+        for previous in [None, Some("resp_1")] {
+            let restored = router(state.clone())
+                .oneshot(responses_redaction_request(SECRET, previous))
+                .await
+                .expect("buffered Responses redaction response");
+            assert_eq!(restored.status(), StatusCode::OK);
+            let restored = restored.into_body().collect().await.unwrap().to_bytes();
+            let restored = String::from_utf8(restored.to_vec()).unwrap();
+            assert!(restored.contains(SECRET), "{restored}");
+            assert!(!restored.contains("[AXOND:"), "{restored}");
+            assert!(!restored.contains("middleware_stream_error"), "{restored}");
+        }
+
+        let seen_a = seen_a.lock().unwrap();
+        assert_eq!(seen_a.len(), 2);
+        assert!(
+            seen_b.lock().unwrap().is_empty(),
+            "affinity moved off target A"
+        );
+        for (index, body) in seen_a.iter().enumerate() {
+            let provider_input = body["input"].as_str().unwrap();
+            assert!(!provider_input.contains(SECRET));
+            assert!(provider_input.starts_with("[AXOND:"));
+            if index == 0 {
+                assert!(body.get("previous_response_id").is_none());
+            } else {
+                assert_eq!(body["previous_response_id"], "resp_1");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_incomplete_redaction_token_fails_before_original_bytes_are_released() {
+        const SECRET: &str = "responses-incomplete@example.com";
+        let (url_a, seen_a) = redaction_responses_upstream(false).await;
+        let (url_b, seen_b) = redaction_responses_upstream(false).await;
+        let response = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        ))
+        .oneshot(responses_redaction_request(SECRET, None))
+        .await
+        .expect("Responses finalizer refusal");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("middleware_stream_error"), "{body}");
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(!body.contains("[AXOND:"), "{body}");
+        assert!(!body.contains("response.output_text.delta"), "{body}");
+        assert!(!body.contains("response.completed"), "{body}");
+        assert_eq!(seen_a.lock().unwrap().len(), 1);
+        assert!(seen_b.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn responses_guardrail_block_refuses_before_dispatch_without_usage_or_echo() {
+        const SECRET: &str = "responses-blocked@example.com";
+        let (url_a, seen_a) = redaction_responses_upstream(true).await;
+        let (url_b, seen_b) = redaction_responses_upstream(true).await;
+        let (state, usage) = responses_stream_state_with_sink(
+            &url_a,
+            &url_b,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Block,
+                r"[a-z-]+@example\.com",
+            )),
+        );
+
+        let response = router(state)
+            .oneshot(responses_redaction_request(SECRET, None))
+            .await
+            .expect("Responses guardrail refusal");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(seen_a.lock().unwrap().is_empty());
+        assert!(seen_b.lock().unwrap().is_empty());
+        assert!(usage.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn responses_guardrail_refuses_a_matched_continuation_id_before_dispatch() {
+        const SECRET: &str = "continuation@example.com";
+        let (url_a, seen_a) = redaction_responses_upstream(true).await;
+        let (url_b, seen_b) = redaction_responses_upstream(true).await;
+        let (state, usage) = responses_stream_state_with_sink(
+            &url_a,
+            &url_b,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        );
+
+        let response = router(state)
+            .oneshot(responses_redaction_request("ordinary input", Some(SECRET)))
+            .await
+            .expect("matched continuation id refusal");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(seen_a.lock().unwrap().is_empty());
+        assert!(seen_b.lock().unwrap().is_empty());
+        assert!(usage.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_responses_controls_never_reach_middleware_or_provider() {
+        const SECRET: &str = "malformed-control@example.com";
+        let (url_a, seen_a) = redaction_responses_upstream(true).await;
+        let (url_b, seen_b) = redaction_responses_upstream(true).await;
+        let (state, usage) = responses_stream_state_with_sink(
+            &url_a,
+            &url_b,
+            true,
+            Some(guardrail_chain(
+                GuardrailAction::Redact,
+                r"[a-z-]+@example\.com",
+            )),
+        );
+
+        for body in [
+            json!({"model": "gpt-4o", "input": "ordinary", "stream": SECRET}),
+            json!({
+                "model": "gpt-4o",
+                "input": "ordinary",
+                "stream": true,
+                "previous_response_id": {"value": SECRET}
+            }),
+        ] {
+            let response = router(state.clone())
+                .oneshot(
+                    authorized("/v1/responses")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .expect("malformed routing control response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(!String::from_utf8_lossy(&response).contains(SECRET));
+        }
+
+        assert!(seen_a.lock().unwrap().is_empty());
+        assert!(seen_b.lock().unwrap().is_empty());
+        assert!(usage.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -7767,6 +8933,323 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records[0].input_tokens, sent_input_tokens);
         assert!(records[0].input_tokens > without_middleware.input_tokens);
         assert_eq!(settled, sent_input_tokens + 1);
+    }
+
+    async fn redaction_echo_upstream() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let upstream_seen = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let upstream_seen = Arc::clone(&upstream_seen);
+                async move {
+                    upstream_seen.lock().unwrap().push(body.clone());
+                    let content = body["messages"][0]["content"]
+                        .as_str()
+                        .expect("masked prompt")
+                        .to_owned();
+                    if body["stream"].as_bool() == Some(true) {
+                        let cut = content.len() / 2;
+                        let first = json!({
+                            "id": "chatcmpl-redacted",
+                            "choices": [{"index": 0, "delta": {"content": &content[..cut]}}]
+                        });
+                        let second = json!({
+                            "id": "chatcmpl-redacted",
+                            "choices": [{"index": 0, "delta": {"content": &content[cut..]}}]
+                        });
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from(format!(
+                                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                                first, second
+                            )),
+                        )
+                            .into_response()
+                    } else {
+                        Json(json!({
+                            "id": "chatcmpl-redacted",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": content}
+                            }],
+                            "usage": {"prompt_tokens": 4, "completion_tokens": 2}
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redaction fixture");
+        let address = listener.local_addr().expect("redaction fixture address");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), seen)
+    }
+
+    fn production_guardrail_state(base_url: &str) -> AppState {
+        let mut config = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "alpha"
+default = true
+
+[[namespace]]
+id = "beta"
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+[[gateway_key]]
+env = "ALPHA_INBOUND"
+namespace = "alpha"
+
+[[gateway_key]]
+env = "BETA_INBOUND"
+namespace = "beta"
+
+[[credential]]
+namespace = "alpha"
+provider = "openai"
+env = "ALPHA_PROVIDER"
+
+[[credential]]
+namespace = "beta"
+provider = "openai"
+env = "BETA_PROVIDER"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#,
+        ))
+        .expect("production guardrail route config");
+
+        for (index, tenant) in [tenant_id(1), tenant_id(2)].into_iter().enumerate() {
+            let registration = ContentMiddlewareRegistration::new(
+                "axond.redact",
+                [
+                    MiddlewareScope::Request,
+                    MiddlewareScope::Response,
+                    MiddlewareScope::StreamEvent,
+                ],
+                MiddlewareFailurePosture::FailClosed,
+                1_000,
+            )
+            .expect("valid production guardrail registration")
+            .with_guardrail(
+                ContentGuardrailRegistration::new(
+                    "GUARDRAIL_KEY",
+                    vec![GuardrailRule {
+                        id: "email".to_owned(),
+                        pattern: r"[a-z]+@example\.com".to_owned(),
+                        action: GuardrailAction::Redact,
+                    }],
+                )
+                .expect("valid production guardrail rules"),
+            )
+            .expect("guardrail configuration attaches");
+            let body = policy_body(PolicyScope::Tenant(tenant), 1)
+                .with_content_middleware(vec![registration])
+                .expect("guardrail policy attaches");
+            let generation = body.generation(revision_id(index as u64 + 1));
+            config.namespace[index].project = Some(ProjectIdentity {
+                tenant,
+                project: project_id(index as u64 + 1),
+            });
+            config.namespace[index].policy = Some(NamespacePolicy { body, generation });
+        }
+
+        let env = HashMap::from([
+            ("ALPHA_INBOUND".to_owned(), "alpha-inbound".to_owned()),
+            ("BETA_INBOUND".to_owned(), "beta-inbound".to_owned()),
+            ("ALPHA_PROVIDER".to_owned(), "sk-alpha".to_owned()),
+            ("BETA_PROVIDER".to_owned(), "sk-beta".to_owned()),
+            ("GUARDRAIL_KEY".to_owned(), STANDARD.encode([9_u8; 32])),
+        ]);
+        AppState::new(
+            config,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .expect("production guardrail route state")
+    }
+
+    fn production_redaction_request(
+        bearer: &str,
+        messages: Vec<Value>,
+        stream: bool,
+    ) -> Request<Body> {
+        Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {bearer}"),
+            )
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-4o",
+                    "messages": messages,
+                    "stream": stream,
+                }))
+                .expect("production redaction request body"),
+            ))
+            .expect("production redaction request")
+    }
+
+    #[tokio::test]
+    async fn compiled_guardrail_policy_masks_real_routes_stably_across_turns_and_namespaces() {
+        const SECRET: &str = "alice@example.com";
+        let (base_url, seen) = redaction_echo_upstream().await;
+        let app = router(production_guardrail_state(&base_url));
+
+        for request in [
+            production_redaction_request(
+                "alpha-inbound",
+                vec![json!({"role": "user", "content": SECRET})],
+                false,
+            ),
+            production_redaction_request(
+                "alpha-inbound",
+                vec![
+                    json!({"role": "user", "content": SECRET}),
+                    json!({"role": "assistant", "content": SECRET}),
+                ],
+                false,
+            ),
+            production_redaction_request(
+                "beta-inbound",
+                vec![json!({"role": "user", "content": SECRET})],
+                false,
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["choices"][0]["message"]["content"], SECRET);
+        }
+
+        let streamed = app
+            .clone()
+            .oneshot(production_redaction_request(
+                "alpha-inbound",
+                vec![json!({"role": "user", "content": SECRET})],
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let streamed = streamed.into_body().collect().await.unwrap().to_bytes();
+        let streamed = String::from_utf8(streamed.to_vec()).unwrap();
+        assert!(streamed.contains(SECRET), "{streamed}");
+        assert!(!streamed.contains("[AXOND:"), "{streamed}");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        let alpha_first = seen[0]["messages"][0]["content"].as_str().unwrap();
+        let alpha_later_user = seen[1]["messages"][0]["content"].as_str().unwrap();
+        let alpha_later_assistant = seen[1]["messages"][1]["content"].as_str().unwrap();
+        let beta = seen[2]["messages"][0]["content"].as_str().unwrap();
+        let alpha_streamed = seen[3]["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(alpha_first, alpha_later_user);
+        assert_eq!(alpha_first, alpha_later_assistant);
+        assert_eq!(alpha_first, alpha_streamed);
+        assert_ne!(alpha_first, beta);
+        for (body, provider_value) in
+            seen.iter()
+                .zip([alpha_first, alpha_later_user, beta, alpha_streamed])
+        {
+            let serialized = serde_json::to_string(body).unwrap();
+            assert!(!serialized.contains(SECRET), "{serialized}");
+            assert!(provider_value.starts_with("[AXOND:"), "{provider_value}");
+            assert!(provider_value.ends_with(']'), "{provider_value}");
+            assert_eq!(provider_value.len(), 30, "{provider_value}");
+            assert!(!provider_value.contains(SECRET), "{provider_value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_redaction_round_trips_buffered_and_split_openai_sse_output() {
+        const SECRET: &str = "alice@example.com";
+        let (base_url, seen) = redaction_echo_upstream().await;
+        let state = budgeted_state(&base_url, Box::new(NoBudget)).with_middleware_chain(
+            guardrail_chain(GuardrailAction::Redact, r"[a-z]+@example\.com"),
+        );
+        let app = router(state);
+        let request = |stream| {
+            authorized("/v1/chat/completions")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "gpt-4o",
+                        "messages": [{"role": "user", "content": SECRET}],
+                        "stream": stream,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+
+        let buffered = app.clone().oneshot(request(false)).await.unwrap();
+        assert_eq!(buffered.status(), StatusCode::OK);
+        let buffered = buffered.into_body().collect().await.unwrap().to_bytes();
+        let buffered: Value = serde_json::from_slice(&buffered).unwrap();
+        assert_eq!(buffered["choices"][0]["message"]["content"], SECRET);
+
+        let streamed = app.oneshot(request(true)).await.unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let streamed = streamed.into_body().collect().await.unwrap().to_bytes();
+        let streamed = String::from_utf8(streamed.to_vec()).unwrap();
+        assert!(streamed.contains(SECRET), "{streamed}");
+        assert!(!streamed.contains("[AXOND:"), "{streamed}");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        let first = seen[0]["messages"][0]["content"].as_str().unwrap();
+        let second = seen[1]["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(first, second, "the placeholder is stable across requests");
+        assert!(!first.contains(SECRET));
+        assert!(first.starts_with("[AXOND:"));
+    }
+
+    #[tokio::test]
+    async fn guardrail_refusal_dispatches_nothing_records_no_usage_and_echoes_no_match() {
+        const MATCHED: &str = "forbidden-secret";
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let captured = CapturingSink::default();
+        let state = two_target_state(&base_url, &base_url, "", captured.clone())
+            .with_middleware_chain(guardrail_chain(GuardrailAction::Block, MATCHED));
+        let response = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "messages": [{"role": "user", "content": MATCHED}],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["type"], "middleware_refused");
+        assert_eq!(
+            body["error"]["message"],
+            "request refused by middleware: policy"
+        );
+        assert!(!text.contains(MATCHED));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(captured.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
