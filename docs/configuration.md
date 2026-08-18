@@ -1010,10 +1010,15 @@ permit drops; if the process or Redis is unavailable, the TTL reclaims it.
 ## `[core_middleware]` — accounting ownership migration gate
 
 The fixed rate-limit and budget stages default to response-lifetime middleware
-ownership. This changes no backend, limit, refusal, or charging policy: the
-permit and reservation are acquired in their existing source order, but are
-stored beside configurable middleware state and follow that owner into a
-buffered response or streaming accounting.
+ownership. The backend, numeric limits, refusal envelope, charging policy, and
+acquisition order do not change. Ownership lifetime does: the permit and
+reservation are stored beside configurable middleware state and follow that
+owner into a buffered response or streaming accounting. In `middleware` mode,
+a buffered response keeps its rate-limit permit until the response body reaches
+EOF or is dropped, rather than releasing it when the handler returns. Slow
+response consumers can therefore occupy a subject's concurrency ceiling longer
+and cause more `429 rate_limited` responses at the same configured limit.
+`legacy` preserves the former buffered permit-release timing.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
