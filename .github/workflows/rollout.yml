@@ -85,14 +85,16 @@ jobs:
             sha256sum --check --strict
           tar -C "$target_dir" -xzf "$target_dir/$asset" axond
           chmod 0755 "$target_dir/axond"
-          test "$($target_dir/axond --version)" = "axond ${RETAINED_RELEASE_VERSION}"
+          test "$("$target_dir/axond" --version)" = "axond ${RETAINED_RELEASE_VERSION}"
           previous_binary_sha256="$(sha256sum "$target_dir/axond" | awk '{print $1}')"
-          echo "AXOND_ROLLOUT_PREVIOUS_BINARY=$target_dir/axond" >> "$GITHUB_ENV"
-          echo "AXOND_ROLLOUT_EXPECTED_PREVIOUS_VERSION=$RETAINED_RELEASE_VERSION" >> "$GITHUB_ENV"
-          echo "AXOND_ROLLOUT_EXPECTED_PREVIOUS_SHA256=$previous_binary_sha256" >> "$GITHUB_ENV"
-          echo "AXOND_ROLLOUT_RETAINED_ARCHIVE_SHA256=$RETAINED_RELEASE_ARCHIVE_SHA256" >> "$GITHUB_ENV"
-          echo "AXOND_ROLLOUT_RETAINED_ARCHIVE=$target_dir/$asset" >> "$GITHUB_ENV"
-          echo "AXOND_ROLLOUT_RETAINED_CHECKSUM=$target_dir/$asset.sha256" >> "$GITHUB_ENV"
+          {
+            echo "AXOND_ROLLOUT_PREVIOUS_BINARY=$target_dir/axond"
+            echo "AXOND_ROLLOUT_EXPECTED_PREVIOUS_VERSION=$RETAINED_RELEASE_VERSION"
+            echo "AXOND_ROLLOUT_EXPECTED_PREVIOUS_SHA256=$previous_binary_sha256"
+            echo "AXOND_ROLLOUT_RETAINED_ARCHIVE_SHA256=$RETAINED_RELEASE_ARCHIVE_SHA256"
+            echo "AXOND_ROLLOUT_RETAINED_ARCHIVE=$target_dir/$asset"
+            echo "AXOND_ROLLOUT_RETAINED_CHECKSUM=$target_dir/$asset.sha256"
+          } >> "$GITHUB_ENV"
       # `--test-threads=1`: the reduced tier lives in the same binary, and two
       # fleets draining at once would measure each other's contention rather
       # than the rollout.

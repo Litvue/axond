@@ -55,10 +55,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from recovery_contract import (
+    CHECK_RECONSTRUCTIONS,
+    GATE_RECONSTRUCTIONS,
     LOWER_SHA256,
     RECOVERY_RESULT_SCHEMA_VERSION,
     REQUIRED_GATE_NAMES,
     deferred_gate_detail,
+    derive_verdict_outcome,
+    gate_owner,
+    reconstruct_required_check,
+    reconstruct_required_gate,
     required_checks,
     required_observations,
     validate_gate_ownership_model,
@@ -1616,12 +1622,12 @@ def self_test() -> int:
             "profile": {
                 "id": "mixed-endurance",
                 "tier": "soak",
-                "duration_ms": endurance_duration - 1,
+                "duration_ms": endurance_duration,
                 "manifest_duration_ms": endurance_duration,
             },
             "run": {
-                "elapsed_ms": endurance_duration - 1,
-                "requested_duration_ms": endurance_duration - 1,
+                "elapsed_ms": endurance_duration,
+                "requested_duration_ms": endurance_duration,
                 "duration_source": "environment",
                 "samples_path": "endurance.samples.jsonl",
             },
@@ -1679,14 +1685,27 @@ def self_test() -> int:
             encoding="utf-8",
         )
         rendered = render_generic(
-            [endurance_result], "endurance", "soak", "local", "short diagnostic soak"
+            [endurance_result], "endurance", "soak", "local", "endurance self-test"
         )
         parsed = tomllib.loads(rendered)
-        assert parsed["observation"][0]["duration_ms"] == endurance_duration - 1
+        assert parsed["observation"][0]["duration_ms"] == endurance_duration
         assert (
             parsed["observation"][0]["artifact_schema_version"]
             == ENDURANCE_RESULT_SCHEMA_VERSION
         )
+
+        short_endurance = copy.deepcopy(endurance_result)
+        short_endurance["profile"]["duration_ms"] = endurance_duration - 1
+        short_endurance["run"]["elapsed_ms"] = endurance_duration - 1
+        short_endurance["run"]["requested_duration_ms"] = endurance_duration - 1
+        try:
+            render_generic(
+                [short_endurance], "endurance", "soak", "local", "short soak"
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("a shortened endurance result was accepted")
 
         stale_endurance = dict(endurance_result)
         stale_endurance["schema_version"] = ENDURANCE_RESULT_SCHEMA_VERSION - 1
@@ -1907,11 +1926,163 @@ def self_test() -> int:
             },
         }
         recovery_results = []
+
+        def satisfy_operand(
+            operand: tuple[str, ...], desired: Any, observations: dict[str, Any]
+        ) -> None:
+            operation, *arguments = operand
+            if operation == "literal":
+                return
+            if operation == "observation":
+                observations[arguments[0]] = desired
+                return
+            if operation in {"all_positive", "positive"}:
+                for key in arguments:
+                    observations[key] = 1 if desired == "true" else 0
+                return
+            if operation in {"canonical_request_id", "canonical_request_id_pair"}:
+                identities = (
+                    "req_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "req_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                )
+                for index, key in enumerate(arguments):
+                    observations[key] = identities[index]
+                return
+            if operation == "distinct":
+                observations[arguments[0]] = (
+                    "req_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                )
+                observations[arguments[1]] = (
+                    "req_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+                )
+                return
+            if operation == "accepted_revision":
+                observations[arguments[0]] = (
+                    "refused" if desired == "refused" else "rev-self-test"
+                )
+                return
+            if operation == "boolean_label":
+                observations[arguments[0]] = desired == arguments[1]
+                return
+            if operation == "positive_label":
+                observations[arguments[0]] = 1 if desired == arguments[1] else 0
+                return
+            if operation == "null_label":
+                observations[arguments[0]] = (
+                    None if desired == arguments[1] else "present"
+                )
+                return
+            if operation == "zero_if_equal_pairs":
+                for index in range(0, len(arguments), 2):
+                    observations[arguments[index]] = "same"
+                    observations[arguments[index + 1]] = "same"
+                return
+            if operation == "zero_if_equal_pairs_and_literal":
+                for index in range(0, len(arguments) - 2, 2):
+                    observations[arguments[index]] = "same"
+                    observations[arguments[index + 1]] = "same"
+                observations[arguments[-2]] = arguments[-1]
+                return
+            if operation.startswith("http_"):
+                if operation == "http_unauthenticated_successes":
+                    observations[arguments[0]] = 200 if desired == "1" else 401
+                else:
+                    success = desired in {"0", "0.0", "serves", "accepted"}
+                    observations[arguments[0]] = 200 if success else 503
+                return
+            raise AssertionError(f"unsupported synthetic recovery operand {operand!r}")
+
+        def default_operand_value(operand: tuple[str, ...]) -> str:
+            operation, *arguments = operand
+            if operation == "literal":
+                return arguments[0]
+            if operation in {
+                "all_positive",
+                "positive",
+                "canonical_request_id",
+                "canonical_request_id_pair",
+                "distinct",
+            }:
+                return "true"
+            if operation == "accepted_revision":
+                return "accepted"
+            if operation in {"boolean_label", "positive_label", "null_label"}:
+                return arguments[1]
+            return "self-test"
+
         with tempfile.TemporaryDirectory() as recovery_directory:
             for key, contract in recovery_expected.items():
                 scenario, stage = key.split("/", 1)
                 contract_scenario = contract["scenario"]
                 contract_stage = contract["stage"]
+                observations = {
+                    name: "self-test"
+                    for name in required_observations(
+                        contract_scenario, contract_stage
+                    )
+                }
+                check_bindings = CHECK_RECONSTRUCTIONS.get(key, {})
+                for check in sorted(required_checks(contract_scenario, contract_stage)):
+                    expected_operand, observed_operand = check_bindings[check]
+                    desired = (
+                        observations[expected_operand[1]]
+                        if expected_operand[0] == "observation"
+                        else default_operand_value(expected_operand)
+                    )
+                    satisfy_operand(expected_operand, desired, observations)
+                    satisfy_operand(observed_operand, desired, observations)
+                gate_bindings = GATE_RECONSTRUCTIONS.get(key, {})
+                for gate, operand in gate_bindings.items():
+                    desired = (
+                        "0"
+                        if gate.startswith("max_")
+                        else str(contract_scenario["gate"][gate])
+                    )
+                    satisfy_operand(operand, desired, observations)
+
+                gates = []
+                for gate in REQUIRED_GATE_NAMES:
+                    bound = str(contract_scenario["gate"][gate])
+                    if gate_owner(contract_scenario, gate) == stage:
+                        observed = reconstruct_required_gate(
+                            contract_scenario, contract_stage, gate, observations
+                        )
+                        outcome = derive_verdict_outcome(
+                            "gate", gate, bound, observed
+                        )
+                        detail = "the synthetic fixture evaluates its owned gate"
+                    else:
+                        observed = "not measured"
+                        outcome = "not_evaluated"
+                        detail = deferred_gate_detail(
+                            gate,
+                            contract_stage["evidence"],
+                            "the synthetic fixture assigns this gate to its owner",
+                        )
+                    gates.append(
+                        {
+                            "gate": gate,
+                            "bound": bound,
+                            "observed": observed,
+                            "outcome": outcome,
+                            "detail": detail,
+                        }
+                    )
+
+                checks = []
+                for check in sorted(required_checks(contract_scenario, contract_stage)):
+                    bound, observed = reconstruct_required_check(
+                        contract_scenario, contract_stage, check, observations
+                    )
+                    checks.append(
+                        {
+                            "gate": check,
+                            "bound": bound,
+                            "observed": observed,
+                            "outcome": "met" if bound == observed else "failed",
+                            "detail": "the synthetic fixture retains the reconstructed check",
+                        }
+                    )
                 result = {
                     "schema_version": 2,
                     "scenario": scenario,
@@ -1930,38 +2101,9 @@ def self_test() -> int:
                         "cargo_profile": "release",
                     },
                     "timeline": [{"at_ms": 0, "event": "complete", "detail": "test"}],
-                    "observations": {
-                        name: "self-test"
-                        for name in required_observations(
-                            contract_scenario, contract_stage
-                        )
-                    },
-                    "gates": [
-                        {
-                            "gate": gate,
-                            "bound": str(contract_scenario["gate"][gate]),
-                            "observed": "not measured",
-                            "outcome": "not_evaluated",
-                            "detail": deferred_gate_detail(
-                                gate,
-                                contract_stage["evidence"],
-                                "the synthetic producer fixture does not evaluate this gate",
-                            ),
-                        }
-                        for gate in REQUIRED_GATE_NAMES
-                    ],
-                    "checks": [
-                        {
-                            "gate": check,
-                            "bound": "self-test",
-                            "observed": "self-test",
-                            "outcome": "met",
-                            "detail": "the synthetic fixture retains the required equality check",
-                        }
-                        for check in sorted(
-                            required_checks(contract_scenario, contract_stage)
-                        )
-                    ],
+                    "observations": observations,
+                    "gates": gates,
+                    "checks": checks,
                 }
                 if contract["driver"] == "stateful-integration":
                     result["run"].update(
