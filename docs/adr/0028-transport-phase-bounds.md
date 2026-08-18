@@ -32,7 +32,8 @@ caller already holds.
 
 A new `[transport]` section configures one finite, validated bound per phase:
 `connect_timeout_ms`, `response_header_timeout_ms`, `buffered_body_timeout_ms`,
-`stream_idle_timeout_ms`, `max_response_bytes`, and `max_error_bytes`. Zero
+`stream_idle_timeout_ms`, `stream_terminal_grace_ms`, `max_response_bytes`, and
+`max_error_bytes`. Zero
 disables nothing — it is rejected, as is an error bound wider than the body
 bound. Defaults are safe rather than generous, and the settings are boot-only
 because `connect_timeout_ms` configures the shared pooled HTTP client; a reload
@@ -52,6 +53,15 @@ by `stream_idle_timeout_ms` instead, which is what actually distinguishes a
 useful stream from a stalled one. A post-byte failure is terminal — the relay
 ends the stream in band and never splices a second attempt onto a response the
 caller has already begun reading.
+
+Byte-faithful Native and Responses wires can legally carry provider extension
+bytes after their semantic terminal event. The gateway therefore keeps relaying
+those raw bytes, but starts a fixed `stream_terminal_grace_ms` deadline when the
+terminal event is decoded. Extension chunks do not reset it. Expiry ends the
+already-completed response successfully, without attributing an upstream
+timeout, so a provider or proxy cannot retain admission, rate-limit, or caller
+capacity for the ordinary idle bound after the answer is complete. The default
+is 1 second; a shorter idle timeout can still close a silent transport first.
 
 Bodies are collected with explicit bounds, and the two bounds mean different
 things. A success body over `max_response_bytes` is refused with a typed error
@@ -85,8 +95,10 @@ exists, so `response_header_timeout_ms` and `buffered_body_timeout_ms` bound the
 model's thinking time rather than liveness; the shipped 30s defaults are not
 tighter than the default 30s walk budget, because a tighter one would refuse
 answers the walk still had time for, and `failover.overall_timeout_ms` keeps them
-finite in practice. Only `stream_idle_timeout_ms` is a true liveness bound, since
-it is the only one that applies while output is already flowing.
+finite in practice. `stream_idle_timeout_ms` is the general in-stream liveness
+bound. Once a byte-faithful answer is semantically complete,
+`stream_terminal_grace_ms` is the fixed bound that prevents trailing extension
+traffic from retaining the response indefinitely.
 
 ### State tier
 
@@ -108,6 +120,7 @@ choices; no existing deployment's tier is raised.
   bound explicitly, and must restart to apply it.
 - A productive stream can outlive `failover.overall_timeout_ms`, so that
   setting is not an upper bound on request duration for streaming traffic;
-  `stream_idle_timeout_ms` is the bound that governs a stream's liveness.
+  `stream_idle_timeout_ms` governs its liveness before semantic completion and
+  `stream_terminal_grace_ms` governs a byte-faithful transport tail afterwards.
 - Every timeout path still settles its budget reservation and releases its rate
   limit permit exactly once, so bounding a phase cannot leak accounting.

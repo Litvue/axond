@@ -3,11 +3,12 @@
 //! The relay decodes the upstream stream with `gateway-core` (`SseDecoder` +
 //! the provider's `ProviderStreamDecoder`) and re-emits OpenAI-shaped chunks,
 //! so a target reaches the caller in the OpenAI chunk shape whichever wire it
-//! spoke upstream. On a native route the same relay forwards the provider's
-//! bytes untouched and decodes only to observe usage ([`Framing`]). Bytes are
-//! forwarded event-by-event as they arrive: nothing buffers a whole response,
-//! and the outbound body inherits the client's backpressure because axum only
-//! polls it as the socket drains.
+//! spoke upstream. On a native route the same relay normally forwards the
+//! provider's bytes untouched and decodes only to observe usage ([`Framing`]).
+//! The explicit policy-buffered posture is the sole exception: it reconstructs
+//! transformed events behind a finite byte bound and releases them only after
+//! successful upstream completion. Incremental postures inherit the client's
+//! backpressure because axum only polls the upstream as the socket drains.
 //!
 //! Accounting is attached to the body, not to the handler: a client that hangs
 //! up mid-stream drops the body, which drops the upstream response (cancelling
@@ -25,9 +26,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use gateway_core::{
-    MiddlewareStateBag, ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder,
-};
+use gateway_core::{ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder, SseEvent};
 use gateway_transport::{ByteStream, TransportError};
 use opentelemetry::Context;
 use serde_json::{Value, json};
@@ -38,6 +37,7 @@ use crate::admission::AdmissionPermit;
 use crate::budget::{BudgetKey, Reservation};
 use crate::credentials::{CredentialLease, CredentialSource};
 use crate::error::transport_caller_message;
+use crate::middleware::MiddlewareExecution;
 use crate::pricing::RequestPrice;
 use crate::rate_limit::RateLimitPermit;
 use crate::state::AppState;
@@ -87,6 +87,49 @@ pub struct StreamContext {
 pub struct OpenedStream {
     pub bytes: ByteStream,
     pub decoder: Box<dyn ProviderStreamDecoder>,
+}
+
+/// How one opened upstream stream reaches the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDelivery {
+    /// Decode and re-emit each event as it arrives.
+    Reemit,
+    /// Forward the provider's exact chunks while decoding only for accounting.
+    Passthrough,
+    /// Decode, transform, and hold the complete reconstructed SSE body until
+    /// the upstream terminates successfully.
+    PolicyBuffered,
+    /// Decode and validate the complete stream while holding the provider's
+    /// exact chunks, then release those original bytes only after every
+    /// applicable middleware callback approves their strict parsed view. The
+    /// parser refuses SSE fields the callback cannot see and ambiguous duplicate
+    /// JSON keys; the caller still receives the provider's lexical byte spelling.
+    PolicyValidatedPassthrough,
+}
+
+impl StreamDelivery {
+    fn is_policy_buffered(self) -> bool {
+        matches!(
+            self,
+            Self::PolicyBuffered | Self::PolicyValidatedPassthrough
+        )
+    }
+}
+
+/// The pinned response transformation and the wire-delivery posture selected
+/// from the same serving snapshot.
+pub struct StreamMiddleware {
+    execution: MiddlewareExecution,
+    delivery: StreamDelivery,
+}
+
+impl StreamMiddleware {
+    pub fn new(execution: MiddlewareExecution, delivery: StreamDelivery) -> Self {
+        Self {
+            execution,
+            delivery,
+        }
+    }
 }
 
 type RotationOpener = Arc<
@@ -291,36 +334,48 @@ pub fn relay_opened(
     framing: Framing,
     rotation: Option<RotationHandle>,
 ) -> Response {
-    relay_opened_with_state(
+    relay_opened_with_middleware(
         state,
         ctx,
         OpenedStream { decoder, bytes },
         started,
         framing,
         rotation,
-        MiddlewareStateBag::default(),
+        StreamMiddleware::new(
+            MiddlewareExecution::default(),
+            if framing.reemits() {
+                StreamDelivery::Reemit
+            } else {
+                StreamDelivery::Passthrough
+            },
+        ),
     )
 }
 
-/// Variant of [`relay_opened`] used by the middleware chain.  The state bag is
+/// Variant of [`relay_opened`] used by the middleware chain. The execution is
 /// moved into `Accounting`, which is owned by the response body and therefore
 /// survives the handler and drops on normal completion, client hangup, or
 /// cancellation together with the existing accounting owner.
-pub fn relay_opened_with_state(
+pub fn relay_opened_with_middleware(
     state: AppState,
     ctx: StreamContext,
     opened: OpenedStream,
     started: Instant,
     framing: Framing,
     rotation: Option<RotationHandle>,
-    middleware_state: MiddlewareStateBag,
+    middleware: StreamMiddleware,
 ) -> Response {
     let OpenedStream { decoder, bytes } = opened;
+    let StreamMiddleware {
+        execution: middleware_execution,
+        delivery,
+    } = middleware;
     // A stream's *total* lifetime, as opposed to the transport's idle bound,
     // which a trickle of keepalives resets forever.
     let limits = state.0.admission.limits();
     let deadline = limits.max_stream_duration.map(|budget| started + budget);
     let max_bytes = limits.max_stream_bytes;
+    let stream_terminal_grace = state.0.stream_terminal_grace;
     let relay = Relay {
         bytes,
         carry: Vec::new(),
@@ -329,7 +384,14 @@ pub fn relay_opened_with_state(
         pending: VecDeque::new(),
         phase: Phase::Streaming,
         framing,
-        accounting: Accounting::new_with_state(state, ctx, started, middleware_state),
+        delivery,
+        buffered: VecDeque::new(),
+        buffering_started: None,
+        buffered_bytes: 0,
+        terminal_seen: false,
+        stream_terminal_grace,
+        terminal_deadline: None,
+        accounting: Accounting::new_with_middleware(state, ctx, started, middleware_execution),
         rotation,
         queued_downstream: false,
         deadline,
@@ -365,13 +427,13 @@ pub fn settle_upstream_error(state: AppState, ctx: StreamContext, started: Insta
 /// Settle a streamed request that never opened a stream while retaining the
 /// same response-lifetime ownership rule for middleware state.
 #[allow(dead_code)]
-pub fn settle_upstream_error_with_state(
+pub fn settle_upstream_error_with_middleware(
     state: AppState,
     ctx: StreamContext,
     started: Instant,
-    #[allow(dead_code)] middleware_state: MiddlewareStateBag,
+    middleware_execution: MiddlewareExecution,
 ) {
-    let mut accounting = Accounting::new_with_state(state, ctx, started, middleware_state);
+    let mut accounting = Accounting::new_with_middleware(state, ctx, started, middleware_execution);
     accounting.settle(Status::UpstreamError);
 }
 
@@ -413,12 +475,22 @@ impl Framing {
             Self::Responses => responses_error_event(message),
         }
     }
+
+    fn middleware_error(self, message: &str) -> Bytes {
+        match self {
+            Self::OpenAiSse => middleware_error_event(message),
+            Self::Native => native_middleware_error_event(message),
+            Self::Responses => responses_middleware_error_event(message),
+        }
+    }
 }
 
 enum Phase {
     Streaming,
     Failed(String),
+    MiddlewareFailed(String),
     Finished,
+    Draining,
     Ended,
 }
 
@@ -432,6 +504,22 @@ struct Relay {
     pending: VecDeque<Bytes>,
     phase: Phase,
     framing: Framing,
+    delivery: StreamDelivery,
+    /// Reconstructed output held privately for explicit policy buffering.
+    buffered: VecDeque<Bytes>,
+    /// When the first decoded event would have become caller-visible without
+    /// buffering. Its elapsed time is the gateway-added buffering cost.
+    buffering_started: Option<Instant>,
+    buffered_bytes: u64,
+    /// A terminal decoder event has been observed. Buffered policy streams keep
+    /// validating until transport EOF so no later provider bytes can bypass
+    /// middleware. Byte-faithful passthrough keeps relaying raw chunks until EOF
+    /// but stops interpreting provider extensions after their terminal event.
+    terminal_seen: bool,
+    /// Fixed grace after a byte-faithful semantic terminal event. It does not
+    /// reset when provider extension chunks arrive.
+    stream_terminal_grace: Duration,
+    terminal_deadline: Option<Instant>,
     accounting: Accounting,
     rotation: Option<RotationHandle>,
     queued_downstream: bool,
@@ -451,28 +539,107 @@ const STREAM_DURATION_EXCEEDED: &str = "stream exceeded the gateway's maximum st
 /// The same, for the relayed-bytes bound.
 const STREAM_BYTES_EXCEEDED: &str = "stream exceeded the gateway's maximum stream size";
 
+/// Policy buffering must remain bounded even when incremental streaming has no
+/// configured byte ceiling. This is also the default stream ceiling, so opting
+/// into buffering never creates a larger in-memory allowance than the shipped
+/// streaming posture.
+const MAX_POLICY_BUFFERED_BYTES: u64 = 64 * 1024 * 1024;
+
+fn effective_stream_byte_limit(delivery: StreamDelivery, configured: Option<u64>) -> Option<u64> {
+    if matches!(
+        delivery,
+        StreamDelivery::PolicyBuffered | StreamDelivery::PolicyValidatedPassthrough
+    ) {
+        Some(
+            configured
+                .unwrap_or(MAX_POLICY_BUFFERED_BYTES)
+                .min(MAX_POLICY_BUFFERED_BYTES),
+        )
+    } else {
+        configured
+    }
+}
+
 impl Relay {
     async fn next_chunk(&mut self) -> Option<Result<Bytes, Infallible>> {
         loop {
-            if let Some(chunk) = self.pending.pop_front() {
-                return Some(Ok(chunk));
+            if !self.pending.is_empty() {
+                if matches!(self.phase, Phase::Draining)
+                    && self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    self.pending.clear();
+                    self.fail_stream_duration();
+                    continue;
+                }
+                return self.pending.pop_front().map(Ok);
             }
             match &self.phase {
                 Phase::Streaming => self.poll_upstream().await,
                 Phase::Failed(message) => {
                     let message = message.clone();
+                    self.buffered.clear();
                     self.pending.push_back(self.framing.error(&message));
                     self.pending.extend(self.framing.done());
                     self.accounting.settle(Status::UpstreamError);
                     self.phase = Phase::Ended;
                 }
+                Phase::MiddlewareFailed(message) => {
+                    let message = message.clone();
+                    self.buffered.clear();
+                    self.pending
+                        .push_back(self.framing.middleware_error(&message));
+                    self.pending.extend(self.framing.done());
+                    self.accounting.settle(if self.queued_downstream {
+                        Status::Partial
+                    } else {
+                        Status::Rejected
+                    });
+                    self.phase = Phase::Ended;
+                }
                 Phase::Finished => {
+                    if self.delivery.is_policy_buffered()
+                        && self
+                            .deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        self.fail_stream_duration();
+                        continue;
+                    }
+                    let policy_buffered = self.delivery.is_policy_buffered();
+                    if policy_buffered {
+                        let buffering_ms = self
+                            .buffering_started
+                            .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1_000.0);
+                        telemetry::metrics::record_middleware_buffering_duration(buffering_ms);
+                        if !self.buffered.is_empty() {
+                            self.accounting.mark_downstream_first_token();
+                        }
+                        self.pending.append(&mut self.buffered);
+                        self.queued_downstream = !self.pending.is_empty();
+                    }
                     self.pending.extend(self.framing.done());
                     if let Some(rotation) = self.rotation.as_ref() {
                         rotation.record_serving_success();
                     }
-                    self.accounting.settle(Status::Ok);
-                    self.phase = Phase::Ended;
+                    if policy_buffered {
+                        self.phase = Phase::Draining;
+                    } else {
+                        self.accounting.settle(Status::Ok);
+                        self.phase = Phase::Ended;
+                    }
+                }
+                Phase::Draining => {
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        self.fail_stream_duration();
+                    } else {
+                        self.accounting.settle(Status::Ok);
+                        self.phase = Phase::Ended;
+                    }
                 }
                 Phase::Ended => return None,
             }
@@ -480,18 +647,37 @@ impl Relay {
     }
 
     async fn poll_upstream(&mut self) {
-        let next = match self.deadline {
+        let (wait_deadline, terminal_bound) = match (self.deadline, self.terminal_deadline) {
+            (Some(total), Some(terminal)) if terminal <= total => (Some(terminal), true),
+            (Some(total), _) => (Some(total), false),
+            (None, Some(terminal)) => (Some(terminal), true),
+            (None, None) => (None, false),
+        };
+        let next = match wait_deadline {
             Some(deadline) => {
                 match tokio::time::timeout_at(deadline.into(), self.bytes.next()).await {
                     Ok(next) => next,
                     Err(_) => {
-                        tracing::warn!(
-                            provider = %self.accounting.ctx.target_provider,
-                            model = %self.accounting.ctx.target_model,
-                            committed = self.queued_downstream,
-                            "open stream exceeded the maximum stream duration"
-                        );
-                        self.phase = Phase::Failed(STREAM_DURATION_EXCEEDED.to_owned());
+                        if terminal_bound {
+                            tracing::warn!(
+                                provider = %self.accounting.ctx.target_provider,
+                                model = %self.accounting.ctx.target_model,
+                                grace_ms = self.stream_terminal_grace.as_millis(),
+                                "byte-faithful upstream remained open after its terminal event until the post-terminal grace elapsed"
+                            );
+                            self.phase = Phase::Finished;
+                            return;
+                        }
+                        if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
+                            tracing::warn!(
+                                provider = %self.accounting.ctx.target_provider,
+                                model = %self.accounting.ctx.target_model,
+                                "byte-faithful upstream remained open after its terminal event until the total stream bound"
+                            );
+                            self.phase = Phase::Finished;
+                            return;
+                        }
+                        self.fail_stream_duration();
                         return;
                     }
                 }
@@ -501,7 +687,8 @@ impl Relay {
         match next {
             Some(Ok(chunk)) => {
                 self.relayed_bytes = self.relayed_bytes.saturating_add(chunk.len() as u64);
-                if self.max_bytes.is_some_and(|max| self.relayed_bytes > max) {
+                let raw_limit = effective_stream_byte_limit(self.delivery, self.max_bytes);
+                if raw_limit.is_some_and(|max| self.relayed_bytes > max) {
                     tracing::warn!(
                         provider = %self.accounting.ctx.target_provider,
                         model = %self.accounting.ctx.target_model,
@@ -513,20 +700,58 @@ impl Relay {
                 }
                 // A native stream is byte-faithful: the provider's own bytes go
                 // out as they arrive, and the decode below only observes usage.
-                if !self.framing.reemits() {
-                    self.queued_downstream = true;
-                    self.pending.push_back(chunk.clone());
+                match self.delivery {
+                    StreamDelivery::Passthrough => {
+                        self.accounting.mark_downstream_first_token();
+                        self.queued_downstream = true;
+                        self.pending.push_back(chunk.clone());
+                    }
+                    StreamDelivery::PolicyValidatedPassthrough => {
+                        self.buffered_bytes =
+                            self.buffered_bytes.saturating_add(chunk.len() as u64);
+                        self.buffered.push_back(chunk.clone());
+                    }
+                    StreamDelivery::Reemit | StreamDelivery::PolicyBuffered => {}
+                }
+                // The provider's terminal event is semantic, not necessarily
+                // the HTTP body's final byte. Native extensions can follow it,
+                // and a byte-faithful route must continue forwarding them until
+                // transport EOF. They no longer affect decoding or accounting.
+                if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
+                    return;
                 }
                 let text = self.decode_utf8(&chunk);
                 let pushed = match self.sse.as_mut() {
-                    Some(sse) => sse.push(&text),
+                    Some(sse) if self.delivery == StreamDelivery::PolicyValidatedPassthrough => {
+                        sse.push_strict(&text).map_err(|error| error.to_string())
+                    }
+                    Some(sse) => sse.push(&text).map_err(|error| error.to_string()),
                     None => Ok(Vec::new()),
                 };
                 match pushed {
                     Ok(events) => {
                         for event in events {
+                            if self.delivery.is_policy_buffered() && self.terminal_seen {
+                                if is_terminal_sentinel(&event) {
+                                    continue;
+                                }
+                                self.phase = Phase::Failed(
+                                    "stream carried bytes after its terminal event".to_owned(),
+                                );
+                                return;
+                            }
                             match self.decoder.decode(event) {
-                                Ok(decoded) => self.emit(decoded),
+                                Ok(decoded) => {
+                                    self.emit(decoded).await;
+                                    if !matches!(self.phase, Phase::Streaming) {
+                                        return;
+                                    }
+                                    if self.delivery == StreamDelivery::Passthrough
+                                        && self.terminal_seen
+                                    {
+                                        return;
+                                    }
+                                }
                                 Err(err)
                                     if err.is_credential_rate_limited()
                                         && self.framing == Framing::OpenAiSse
@@ -578,10 +803,33 @@ impl Relay {
                             }
                         }
                     }
-                    Err(err) => self.phase = Phase::Failed(err.to_string()),
+                    Err(err) => self.phase = Phase::Failed(err),
                 }
             }
             Some(Err(err)) => {
+                if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
+                    // The semantic terminal event completed provider work. A
+                    // proxy that times out or loses the transport while closing
+                    // remains operator-visible, but is not an upstream timeout:
+                    // the response was already served successfully.
+                    if let Some(kind) = err.timeout_kind() {
+                        tracing::warn!(
+                            provider = %self.accounting.ctx.target_provider,
+                            model = %self.accounting.ctx.target_model,
+                            timeout = kind.label(),
+                            "byte-faithful upstream timed out while closing after its terminal event"
+                        );
+                    } else {
+                        tracing::warn!(
+                            provider = %self.accounting.ctx.target_provider,
+                            model = %self.accounting.ctx.target_model,
+                            error = %err,
+                            "byte-faithful upstream failed while closing after its terminal event"
+                        );
+                    }
+                    self.phase = Phase::Finished;
+                    return;
+                }
                 // An open stream that goes silent is terminated honestly: bytes
                 // may already be committed downstream, so there is nothing to
                 // retry and no new completion to splice in.
@@ -617,8 +865,18 @@ impl Relay {
                 // rendered into its message.
                 self.phase = Phase::Failed(transport_caller_message(&err));
             }
-            None => self.finish_upstream(),
+            None => self.finish_upstream().await,
         }
+    }
+
+    fn fail_stream_duration(&mut self) {
+        tracing::warn!(
+            provider = %self.accounting.ctx.target_provider,
+            model = %self.accounting.ctx.target_model,
+            committed = self.queued_downstream,
+            "open stream exceeded the maximum stream duration"
+        );
+        self.phase = Phase::Failed(STREAM_DURATION_EXCEEDED.to_owned());
     }
 
     /// Chunk boundaries fall wherever the socket puts them, so a multi-byte
@@ -650,7 +908,17 @@ impl Relay {
     /// An upstream that ends mid-event is a truncated answer, not a complete
     /// one: `SseDecoder::finish` reports the leftover so the caller gets an
     /// error rather than a `[DONE]` it would read as success.
-    fn finish_upstream(&mut self) {
+    async fn finish_upstream(&mut self) {
+        if self.delivery == StreamDelivery::Passthrough && self.terminal_seen {
+            // Once the provider's authoritative terminal event has been
+            // observed, later bytes are opaque byte-faithful extensions. The
+            // relay deliberately stops parsing them, so residual SSE or UTF-8
+            // state cannot truthfully be interpreted as truncation at EOF.
+            self.sse.take();
+            self.carry.clear();
+            self.phase = Phase::Finished;
+            return;
+        }
         if let Some(sse) = self.sse.take()
             && let Err(err) = sse.finish()
         {
@@ -663,8 +931,10 @@ impl Relay {
         }
         match self.decoder.finish() {
             Ok(decoded) => {
-                self.emit(decoded);
-                self.phase = Phase::Finished;
+                self.emit(decoded).await;
+                if matches!(self.phase, Phase::Streaming) {
+                    self.phase = Phase::Finished;
+                }
             }
             Err(err) => self.phase = Phase::Failed(err.to_string()),
         }
@@ -674,22 +944,103 @@ impl Relay {
     /// authoritative usage; the `[DONE]` sentinel itself is written once, from
     /// the terminal phase, so a provider that ends the connection without one
     /// still gets a well-formed close.
-    fn emit(&mut self, events: Vec<ProviderStreamEvent>) {
-        for event in events {
-            match event {
-                ProviderStreamEvent::Data { event, data } => {
-                    self.accounting.mark_first_token();
-                    self.accounting.count_relayed(&data);
-                    if self.framing.reemits() {
-                        let rendered = data_event(event.as_deref(), &data);
-                        self.queued_downstream = true;
-                        self.pending.push_back(rendered);
+    async fn emit(&mut self, events: Vec<ProviderStreamEvent>) {
+        for mut event in events {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.fail_stream_duration();
+                return;
+            }
+            match &event {
+                ProviderStreamEvent::Data { data, .. } => {
+                    if self.delivery.is_policy_buffered() && self.terminal_seen {
+                        self.phase = Phase::Failed(
+                            "stream carried data after its terminal event".to_owned(),
+                        );
+                        return;
+                    }
+                    self.accounting.mark_upstream_first_token();
+                    self.accounting.count_observed_output(data);
+                    if self.delivery.is_policy_buffered() {
+                        self.buffering_started.get_or_insert_with(Instant::now);
                     }
                 }
                 ProviderStreamEvent::Done(usage) => {
-                    self.accounting.usage = usage;
-                    self.phase = Phase::Finished;
+                    self.accounting.usage = *usage;
+                    if self.delivery.is_policy_buffered()
+                        || self.delivery == StreamDelivery::Passthrough
+                    {
+                        if self.terminal_seen {
+                            self.phase = Phase::Failed(
+                                "stream emitted more than one terminal event".to_owned(),
+                            );
+                            return;
+                        }
+                        self.terminal_seen = true;
+                        if self.delivery == StreamDelivery::Passthrough {
+                            self.terminal_deadline =
+                                Some(Instant::now() + self.stream_terminal_grace);
+                        }
+                    } else {
+                        self.phase = Phase::Finished;
+                    }
+                    continue;
                 }
+            }
+
+            let invoked = match self.deadline {
+                Some(deadline) => tokio::time::timeout_at(
+                    deadline.into(),
+                    self.accounting
+                        .middleware_execution
+                        .stream_event(&mut event),
+                )
+                .await
+                .map_err(|_| ()),
+                None => Ok(self
+                    .accounting
+                    .middleware_execution
+                    .stream_event(&mut event)
+                    .await),
+            };
+            let result = match invoked {
+                Ok(result) => result,
+                Err(()) => {
+                    self.fail_stream_duration();
+                    return;
+                }
+            };
+            if let Err(error) = result {
+                self.phase = Phase::MiddlewareFailed(error.to_string());
+                return;
+            }
+            let ProviderStreamEvent::Data { event, data } = event else {
+                // MiddlewareExecution owns the invariant that terminal usage
+                // is never dispatched and a data event remains a data event.
+                unreachable!("stream middleware changed a data event into terminal usage");
+            };
+            match self.delivery {
+                StreamDelivery::Passthrough => {}
+                StreamDelivery::Reemit => {
+                    let rendered = data_event(event.as_deref(), &data);
+                    self.accounting.mark_downstream_first_token();
+                    self.queued_downstream = true;
+                    self.pending.push_back(rendered);
+                }
+                StreamDelivery::PolicyBuffered => {
+                    let rendered = data_event(event.as_deref(), &data);
+                    self.buffered_bytes = self.buffered_bytes.saturating_add(rendered.len() as u64);
+                    let limit = effective_stream_byte_limit(self.delivery, self.max_bytes)
+                        .expect("policy buffering always has a finite limit");
+                    if self.buffered_bytes > limit {
+                        self.phase = Phase::Failed(STREAM_BYTES_EXCEEDED.to_owned());
+                        return;
+                    }
+                    self.buffered.push_back(rendered);
+                }
+                StreamDelivery::PolicyValidatedPassthrough => {}
             }
         }
     }
@@ -716,6 +1067,15 @@ impl Relay {
         };
         Ok(true)
     }
+}
+
+/// OpenAI-compatible Responses implementations may emit both the semantic
+/// `response.completed` event and the older data-only terminal sentinel. The
+/// latter carries no content for middleware and is the sole event tolerated
+/// after a policy-buffered terminal event; any named or data-bearing extension
+/// still fails closed before buffered bytes are released.
+fn is_terminal_sentinel(event: &SseEvent) -> bool {
+    event.event.is_none() && event.data.trim() == "[DONE]"
 }
 
 /// Generated text in one relayed chunk, across the shapes the adapters emit:
@@ -774,6 +1134,14 @@ fn error_event(message: &str) -> Bytes {
     ))
 }
 
+fn middleware_error_event(message: &str) -> Bytes {
+    let payload = json!({ "error": { "type": "middleware_stream_error", "message": message } });
+    Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
+    ))
+}
+
 /// The provider-native terminal error: an Anthropic-shaped `error` event, which
 /// its SDKs raise on. When the upstream is what failed it has usually sent its
 /// own `error` event already — the SDK stops at the first one, so the duplicate
@@ -782,6 +1150,17 @@ fn native_error_event(message: &str) -> Bytes {
     let payload = json!({
         "type": "error",
         "error": { "type": "upstream_stream_error", "message": message }
+    });
+    Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
+    ))
+}
+
+fn native_middleware_error_event(message: &str) -> Bytes {
+    let payload = json!({
+        "type": "error",
+        "error": { "type": "middleware_stream_error", "message": message }
     });
     Bytes::from(format!(
         "event: error\ndata: {}\n\n",
@@ -801,29 +1180,43 @@ fn responses_error_event(message: &str) -> Bytes {
     ))
 }
 
+fn responses_middleware_error_event(message: &str) -> Bytes {
+    let payload = json!({
+        "type": "error",
+        "code": "middleware_stream_error",
+        "message": message,
+    });
+    Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
+    ))
+}
+
 /// Terminal accounting for one streamed request: exactly one usage record and
 /// exactly one budget settlement, whichever way the stream ends.
 ///
 /// The `Drop` arm is the cancellation path — a dropped body means the client
 /// went away, so the spend accrued up to that point is still charged. A stream
 /// that ends before the provider reports usage is charged its *measured partial*
-/// spend (ADR 0010): the prompt it consumed plus the output it actually relayed,
-/// counted here as it goes. A stream that relayed nothing is charged nothing and
-/// its whole hold is released.
+/// spend (ADR 0010): the prompt it consumed plus decoded provider output observed
+/// before termination. In an incremental posture that output was relayed; in an
+/// explicit buffering posture it may still be held. A stream with no observed
+/// provider output is charged nothing and its whole hold is released.
 struct Accounting {
     state: AppState,
     ctx: StreamContext,
     started: Instant,
     usage: ModelUsage,
-    /// Characters of generated text relayed to the client, which is the only
-    /// measure of output a stream has before the provider's usage arrives.
-    relayed_chars: usize,
+    /// Characters of generated provider text decoded so far, which is the only
+    /// measure of output available before authoritative provider usage arrives.
+    observed_output_chars: usize,
     carried_output_tokens: u64,
-    /// Request-scope middleware state. It is intentionally owned here rather
-    /// than by the handler so cancellation and client hangup retain the same
-    /// response-lifetime drop boundary as budget and admission accounting.
-    #[allow(dead_code)]
-    middleware_state: MiddlewareStateBag,
+    /// The pinned chain generation and request-scope state. It is intentionally
+    /// owned here rather than by the handler so cancellation and client hangup
+    /// retain the same response-lifetime drop boundary as budget and admission
+    /// accounting.
+    middleware_execution: MiddlewareExecution,
+    upstream_ttft_recorded: bool,
     /// Time to the first relayed token, which for a stream is the number a
     /// caller actually feels.
     ttft_ms: Option<u64>,
@@ -833,35 +1226,49 @@ struct Accounting {
 impl Accounting {
     #[allow(dead_code)]
     fn new(state: AppState, ctx: StreamContext, started: Instant) -> Self {
-        Self::new_with_state(state, ctx, started, MiddlewareStateBag::default())
+        Self::new_with_middleware(state, ctx, started, MiddlewareExecution::default())
     }
 
-    fn new_with_state(
+    fn new_with_middleware(
         state: AppState,
         ctx: StreamContext,
         started: Instant,
-        middleware_state: MiddlewareStateBag,
+        middleware_execution: MiddlewareExecution,
     ) -> Self {
         Self {
             state,
             ctx,
             started,
             usage: ModelUsage::default(),
-            relayed_chars: 0,
+            observed_output_chars: 0,
             carried_output_tokens: 0,
-            middleware_state,
+            middleware_execution,
+            upstream_ttft_recorded: false,
             ttft_ms: None,
             settled: false,
         }
     }
 
-    fn mark_first_token(&mut self) {
+    fn mark_upstream_first_token(&mut self) {
+        if !self.upstream_ttft_recorded {
+            self.upstream_ttft_recorded = true;
+            telemetry::metrics::record_upstream_ttft(
+                &self.ctx.target_provider,
+                &self.ctx.target_model,
+                self.started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+    }
+
+    fn mark_downstream_first_token(&mut self) {
         self.ttft_ms
             .get_or_insert_with(|| self.started.elapsed().as_millis() as u64);
     }
 
-    fn count_relayed(&mut self, data: &Value) {
-        self.relayed_chars = self.relayed_chars.saturating_add(relayed_text_len(data));
+    fn count_observed_output(&mut self, data: &Value) {
+        self.observed_output_chars = self
+            .observed_output_chars
+            .saturating_add(relayed_text_len(data));
     }
 
     fn fold_attempt(&mut self) {
@@ -872,17 +1279,17 @@ impl Accounting {
         let output = if self.usage.output_tokens > 0 {
             self.usage.output_tokens
         } else {
-            self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64
+            self.observed_output_chars.div_ceil(CHARS_PER_TOKEN) as u64
         };
         self.carried_output_tokens = self.carried_output_tokens.saturating_add(output);
         self.usage = ModelUsage::default();
-        self.relayed_chars = 0;
+        self.observed_output_chars = 0;
     }
 
     /// The usage the request is charged for. The provider's own numbers win
     /// whenever they arrived; otherwise — a cancelled or broken stream — the
-    /// charge is derived from what was measurably relayed, and a stream that
-    /// produced nothing is charged nothing.
+    /// charge is derived from provider output measurably decoded before the
+    /// failure, and a stream that produced nothing is charged nothing.
     fn chargeable_usage(&self) -> ModelUsage {
         const CHARS_PER_TOKEN: usize = 4;
         if self.carried_output_tokens == 0
@@ -895,7 +1302,7 @@ impl Accounting {
         }
         let has_output = self.carried_output_tokens > 0
             || self.usage.output_tokens > 0
-            || self.relayed_chars > 0;
+            || self.observed_output_chars > 0;
         if !has_output && self.usage.input_tokens == 0 {
             return ModelUsage::default();
         }
@@ -911,7 +1318,7 @@ impl Accounting {
             + if self.usage.output_tokens > 0 {
                 self.usage.output_tokens
             } else {
-                self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64
+                self.observed_output_chars.div_ceil(CHARS_PER_TOKEN) as u64
             };
         usage
     }
@@ -1043,18 +1450,23 @@ mod tests {
     use axum::routing::post;
     use futures::StreamExt;
     use gateway_core::{
-        NativeMessagesDecoder, OpenAiCompatibleAdapter, ProviderAdapter, ProviderError, Surface,
+        Middleware, MiddlewareDeclaration, MiddlewareOutcome, MiddlewarePhase, MiddlewareScope,
+        NativeMessagesDecoder, OpenAiCompatibleAdapter, ProviderAdapter, ProviderError,
+        ProviderRequest, Surface,
     };
+    use http_body_util::BodyExt;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use serde_json::json;
     use tower::util::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
 
+    use crate::admission::{AdmissionRejection, RequestKind};
     use crate::backends::catalog::ProviderId;
     use crate::budget::{Admission, BudgetStore, Denial};
     use crate::config::Config;
     use crate::desired_state::fixtures::approved_pricing_snapshot;
+    use crate::middleware::{MiddlewareChain, MiddlewareRuntime};
     use crate::pricing::PriceIdentity;
     use crate::rate_limit::RateLimiter;
     use crate::routes::router;
@@ -1078,6 +1490,28 @@ mod tests {
     struct LedgerSink(Arc<Ledger>);
 
     struct MiddlewareDropCounter(Arc<AtomicUsize>);
+
+    struct SlowStreamMiddleware {
+        declaration: MiddlewareDeclaration,
+        delay: Duration,
+    }
+
+    impl Middleware for SlowStreamMiddleware {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> gateway_core::MiddlewareResult {
+            if matches!(phase, MiddlewarePhase::StreamEvent(_)) {
+                std::thread::sleep(self.delay);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
 
     impl Drop for MiddlewareDropCounter {
         fn drop(&mut self) {
@@ -1377,14 +1811,18 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     #[tokio::test]
     async fn accounting_owns_middleware_state_until_the_response_owner_drops() {
         let dropped = Arc::new(AtomicUsize::new(0));
-        let mut middleware_state = MiddlewareStateBag::new(1);
+        let mut middleware_state = gateway_core::MiddlewareStateBag::new(1);
         middleware_state.insert(
             0,
             gateway_core::MiddlewareState::new(MiddlewareDropCounter(Arc::clone(&dropped))),
         );
         let state = state_for("http://127.0.0.1:1", Arc::new(Ledger::default()));
-        let accounting =
-            Accounting::new_with_state(state, context(), Instant::now(), middleware_state);
+        let accounting = Accounting::new_with_middleware(
+            state,
+            context(),
+            Instant::now(),
+            MiddlewareExecution::from_state_bag_for_test(middleware_state),
+        );
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(accounting);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -1489,6 +1927,44 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         );
     }
 
+    #[test]
+    fn policy_buffering_keeps_raw_and_reconstructed_streams_under_a_hard_limit() {
+        assert_eq!(
+            effective_stream_byte_limit(StreamDelivery::PolicyBuffered, None),
+            Some(MAX_POLICY_BUFFERED_BYTES)
+        );
+        assert_eq!(
+            effective_stream_byte_limit(
+                StreamDelivery::PolicyBuffered,
+                Some(MAX_POLICY_BUFFERED_BYTES * 2),
+            ),
+            Some(MAX_POLICY_BUFFERED_BYTES)
+        );
+        assert_eq!(
+            effective_stream_byte_limit(StreamDelivery::PolicyBuffered, Some(1_024)),
+            Some(1_024)
+        );
+        assert_eq!(
+            effective_stream_byte_limit(StreamDelivery::PolicyValidatedPassthrough, None),
+            Some(MAX_POLICY_BUFFERED_BYTES)
+        );
+        assert_eq!(
+            effective_stream_byte_limit(
+                StreamDelivery::PolicyValidatedPassthrough,
+                Some(MAX_POLICY_BUFFERED_BYTES * 2),
+            ),
+            Some(MAX_POLICY_BUFFERED_BYTES)
+        );
+        assert_eq!(
+            effective_stream_byte_limit(StreamDelivery::Passthrough, None),
+            None
+        );
+        assert_eq!(
+            effective_stream_byte_limit(StreamDelivery::Reemit, Some(1_024)),
+            Some(1_024)
+        );
+    }
+
     const OPENAI_STREAM: &str = concat!(
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n",
@@ -1535,6 +2011,750 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         // 11 input @ 1 µ$/token + 3 output @ 2 µ$/token.
         assert_eq!(record["cost_microdollars"], 17);
         assert_eq!(ledger.settlements(), vec![17]);
+    }
+
+    #[tokio::test]
+    async fn overall_stream_duration_includes_blocking_middleware_callbacks() {
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_stream_duration_ms = 20;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("duration-bound state");
+
+        let mut declaration =
+            MiddlewareDeclaration::new("test.slow-stream", [MiddlewareScope::StreamEvent]);
+        declaration.max_duration = Duration::from_secs(1);
+        let chain = MiddlewareChain::new(vec![Arc::new(SlowStreamMiddleware {
+            declaration,
+            delay: Duration::from_millis(200),
+        }) as Arc<dyn Middleware>])
+        .expect("slow stream chain");
+        let mut request = ProviderRequest {
+            model: "gpt-4o".to_owned(),
+            body: json!({}),
+        };
+        let execution = chain
+            .start(&MiddlewareRuntime::default(), &mut request)
+            .await
+            .expect("middleware execution");
+        let started = Instant::now();
+        let response = relay_opened_with_middleware(
+            state,
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::ChatCompletions)
+                    .expect("decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from_static(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"blocked\"}}]}\n\ndata: [DONE]\n\n",
+                ))])
+                .boxed(),
+            },
+            started,
+            Framing::OpenAiSse,
+            None,
+            StreamMiddleware::new(execution, StreamDelivery::Reemit),
+        );
+
+        let body = tokio::time::timeout(Duration::from_millis(150), response.into_body().collect())
+            .await
+            .expect("overall duration stops the slow callback")
+            .expect("stream body")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(STREAM_DURATION_EXCEEDED), "{body}");
+        assert!(!body.contains("blocked"), "{body}");
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(settled(&ledger).await["status"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn policy_buffered_partial_drain_settles_cancelled_once_and_releases_admission() {
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_in_flight = 1;
+        config.admission.max_in_flight_streams = 1;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("single-slot state");
+        let mut ctx = context();
+        ctx.admission_permit = Some(
+            state
+                .0
+                .admission
+                .admit("platform", RequestKind::Streamed)
+                .await
+                .expect("first stream is admitted"),
+        );
+        let response = relay_opened_with_middleware(
+            state.clone(),
+            ctx,
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::ChatCompletions)
+                    .expect("decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from_static(
+                    OPENAI_STREAM.as_bytes(),
+                ))])
+                .boxed(),
+            },
+            Instant::now(),
+            Framing::OpenAiSse,
+            None,
+            StreamMiddleware::new(
+                MiddlewareExecution::default(),
+                StreamDelivery::PolicyBuffered,
+            ),
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        let first = body
+            .next()
+            .await
+            .expect("first buffered chunk")
+            .expect("chunk");
+        assert!(!first.is_empty());
+        assert!(ledger.records.lock().expect("ledger").is_empty());
+        assert!(matches!(
+            state
+                .0
+                .admission
+                .admit("platform", RequestKind::Streamed)
+                .await,
+            Err(AdmissionRejection::Global)
+        ));
+
+        drop(body);
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "client_cancelled");
+        assert_eq!(ledger.records.lock().expect("ledger").len(), 1);
+        assert_eq!(ledger.settlements().len(), 1);
+        let replacement = state
+            .0
+            .admission
+            .admit("platform", RequestKind::Streamed)
+            .await
+            .expect("dropping the body releases admission");
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn policy_validated_partial_drain_settles_cancelled_once() {
+        const FIRST: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+        );
+        const LAST: &str = concat!(
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let ledger = Arc::new(Ledger::default());
+        let response = relay_opened_with_middleware(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenedStream {
+                decoder: Box::new(NativeMessagesDecoder::new()),
+                bytes: futures::stream::iter(vec![
+                    Ok(Bytes::from_static(FIRST.as_bytes())),
+                    Ok(Bytes::from_static(LAST.as_bytes())),
+                ])
+                .boxed(),
+            },
+            Instant::now(),
+            Framing::Native,
+            None,
+            StreamMiddleware::new(
+                MiddlewareExecution::default(),
+                StreamDelivery::PolicyValidatedPassthrough,
+            ),
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            body.next().await.expect("first raw chunk").expect("chunk"),
+            Bytes::from_static(FIRST.as_bytes())
+        );
+        assert!(ledger.records.lock().expect("ledger").is_empty());
+        drop(body);
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "client_cancelled");
+        assert_eq!(ledger.records.lock().expect("ledger").len(), 1);
+        assert_eq!(ledger.settlements().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn byte_faithful_passthrough_relays_tail_bytes_through_transport_eof() {
+        const NATIVE_TERMINAL: &str = concat!(
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        const NATIVE_TAIL: &str = ": provider-extension-after-stop\n\n";
+        const RESPONSES_TERMINAL: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        const RESPONSES_TAIL: &str = concat!(
+            "event: provider.extension\n",
+            "data: {\"type\":\"provider.extension\",\"opaque\":true}\n\n",
+        );
+        let cases: Vec<(
+            Framing,
+            Box<dyn ProviderStreamDecoder>,
+            &'static str,
+            &'static str,
+        )> = vec![
+            (
+                Framing::Native,
+                Box::new(NativeMessagesDecoder::new()),
+                NATIVE_TERMINAL,
+                NATIVE_TAIL,
+            ),
+            (
+                Framing::Responses,
+                OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                RESPONSES_TERMINAL,
+                RESPONSES_TAIL,
+            ),
+        ];
+
+        for (framing, decoder, terminal, tail) in cases {
+            let ledger = Arc::new(Ledger::default());
+            let response = relay_opened_with_middleware(
+                state_for("http://127.0.0.1:1", ledger.clone()),
+                context(),
+                OpenedStream {
+                    decoder,
+                    bytes: futures::stream::iter(vec![
+                        Ok(Bytes::from_static(terminal.as_bytes())),
+                        Ok(Bytes::from_static(tail.as_bytes())),
+                    ])
+                    .boxed(),
+                },
+                Instant::now(),
+                framing,
+                None,
+                StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body, Bytes::from(format!("{terminal}{tail}")));
+            assert_eq!(settled(&ledger).await["status"], "ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_faithful_terminal_with_incomplete_tail_ends_cleanly_at_eof() {
+        const TERMINAL: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let mut wire = TERMINAL.as_bytes().to_vec();
+        wire.extend_from_slice(b"event: provider.extension\ndata: ");
+        wire.push(0xf0); // first byte of a four-byte UTF-8 sequence
+
+        let ledger = Arc::new(Ledger::default());
+        let response = relay_opened_with_middleware(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from(wire.clone()))]).boxed(),
+            },
+            Instant::now(),
+            Framing::Responses,
+            None,
+            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), wire.as_slice());
+        assert_eq!(settled(&ledger).await["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn policy_buffered_responses_tolerate_done_after_response_completed() {
+        const COMPLETED: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        const SENTINEL: &str = "data: [DONE]\n\n";
+
+        for delivery in [
+            StreamDelivery::PolicyBuffered,
+            StreamDelivery::PolicyValidatedPassthrough,
+        ] {
+            let ledger = Arc::new(Ledger::default());
+            let response = relay_opened_with_middleware(
+                state_for("http://127.0.0.1:1", ledger.clone()),
+                context(),
+                OpenedStream {
+                    decoder: OpenAiCompatibleAdapter::openai()
+                        .stream_decoder(Surface::Responses)
+                        .expect("Responses decoder"),
+                    bytes: futures::stream::iter(vec![
+                        Ok(Bytes::from_static(COMPLETED.as_bytes())),
+                        Ok(Bytes::from_static(SENTINEL.as_bytes())),
+                    ])
+                    .boxed(),
+                },
+                Instant::now(),
+                Framing::Responses,
+                None,
+                StreamMiddleware::new(MiddlewareExecution::default(), delivery),
+            );
+
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("response.completed"), "{body}");
+            assert!(!body.contains("upstream_stream_error"), "{body}");
+            if delivery == StreamDelivery::PolicyValidatedPassthrough {
+                assert_eq!(body, format!("{COMPLETED}{SENTINEL}"));
+            }
+            assert_eq!(settled(&ledger).await["status"], "ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_faithful_terminal_transport_failure_does_not_retract_completion() {
+        const COMPLETED: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let failures = [
+            TransportError::Http("proxy held the completed body open".to_owned()),
+            TransportError::Timeout {
+                kind: gateway_transport::TimeoutKind::StreamIdle,
+                bound: gateway_transport::TimeoutBound::Phase,
+                budget_ms: 10,
+            },
+        ];
+        for failure in failures {
+            let ledger = Arc::new(Ledger::default());
+            let response = relay_opened_with_middleware(
+                state_for("http://127.0.0.1:1", ledger.clone()),
+                context(),
+                OpenedStream {
+                    decoder: OpenAiCompatibleAdapter::openai()
+                        .stream_decoder(Surface::Responses)
+                        .expect("Responses decoder"),
+                    bytes: futures::stream::iter(vec![
+                        Ok(Bytes::from_static(COMPLETED.as_bytes())),
+                        Err(failure),
+                    ])
+                    .boxed(),
+                },
+                Instant::now(),
+                Framing::Responses,
+                None,
+                StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+            );
+
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body, Bytes::from_static(COMPLETED.as_bytes()));
+            assert_eq!(settled(&ledger).await["status"], "ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_faithful_terminal_open_body_ends_cleanly_at_total_bound() {
+        const COMPLETED: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_stream_duration_ms = 30;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("duration-bound state");
+        let bytes = futures::stream::once(async {
+            Ok::<_, TransportError>(Bytes::from_static(COMPLETED.as_bytes()))
+        })
+        .chain(futures::stream::pending())
+        .boxed();
+        let response = relay_opened_with_middleware(
+            state,
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                bytes,
+            },
+            Instant::now(),
+            Framing::Responses,
+            None,
+            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+        );
+
+        let body = tokio::time::timeout(Duration::from_millis(150), response.into_body().collect())
+            .await
+            .expect("total stream bound closes a completed body")
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, Bytes::from_static(COMPLETED.as_bytes()));
+        assert_eq!(settled(&ledger).await["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn byte_faithful_terminal_grace_closes_body_and_releases_admission() {
+        const COMPLETED: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_in_flight = 1;
+        config.admission.max_in_flight_streams = 1;
+        config.admission.max_stream_duration_ms = 0;
+        config.transport.stream_terminal_grace_ms = 25;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("terminal-grace state");
+        let mut ctx = context();
+        ctx.admission_permit = Some(
+            state
+                .0
+                .admission
+                .admit("platform", RequestKind::Streamed)
+                .await
+                .expect("completed stream is admitted"),
+        );
+        let bytes = futures::stream::once(async {
+            Ok::<_, TransportError>(Bytes::from_static(COMPLETED.as_bytes()))
+        })
+        .chain(futures::stream::pending())
+        .boxed();
+        let response = relay_opened_with_middleware(
+            state.clone(),
+            ctx,
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                bytes,
+            },
+            Instant::now(),
+            Framing::Responses,
+            None,
+            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Passthrough),
+        );
+
+        let body = tokio::time::timeout(Duration::from_millis(150), response.into_body().collect())
+            .await
+            .expect("post-terminal grace closes an otherwise open body")
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, Bytes::from_static(COMPLETED.as_bytes()));
+        assert_eq!(settled(&ledger).await["status"], "ok");
+
+        let replacement = state
+            .0
+            .admission
+            .admit("platform", RequestKind::Streamed)
+            .await
+            .expect("terminal grace returns request and stream capacity");
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn incremental_completion_is_not_relabelled_while_the_caller_drains() {
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_stream_duration_ms = 200;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("duration-bound state");
+        let response = relay_opened_with_middleware(
+            state,
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::ChatCompletions)
+                    .expect("chat decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from_static(
+                    OPENAI_STREAM.as_bytes(),
+                ))])
+                .boxed(),
+            },
+            Instant::now(),
+            Framing::OpenAiSse,
+            None,
+            StreamMiddleware::new(MiddlewareExecution::default(), StreamDelivery::Reemit),
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        for _ in 0..3 {
+            body.next()
+                .await
+                .expect("decoded data event")
+                .expect("chunk");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut remainder = String::new();
+        while let Some(chunk) = body.next().await {
+            remainder.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert_eq!(remainder, "data: [DONE]\n\n");
+        assert_eq!(settled(&ledger).await["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn policy_validated_passthrough_rejects_duplicate_json_keys_without_leaking() {
+        const AMBIGUOUS: &str = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"safe\",\"delta\":\"evil-duplicate\"}\n\n",
+        );
+        let ledger = Arc::new(Ledger::default());
+        let response = relay_opened_with_middleware(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from_static(AMBIGUOUS.as_bytes()))])
+                    .boxed(),
+            },
+            Instant::now(),
+            Framing::Responses,
+            None,
+            StreamMiddleware::new(
+                MiddlewareExecution::default(),
+                StreamDelivery::PolicyValidatedPassthrough,
+            ),
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("upstream_stream_error"), "{body}");
+        assert!(body.contains("duplicate JSON object keys"), "{body}");
+        assert!(!body.contains("evil-duplicate"), "{body}");
+        assert_eq!(settled(&ledger).await["status"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn policy_validated_passthrough_rejects_bytes_after_terminal_events() {
+        const NATIVE_TRAILING: &str = concat!(
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"evil-native\"}}\n\n",
+        );
+        const RESPONSES_TRAILING: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"evil-responses\"}\n\n",
+        );
+        const COMMENT_TRAILING: &str = concat!(
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+            ": evil-comment\n\n",
+        );
+        const NO_DATA_TRAILING: &str = concat!(
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+            "event: opaque\n",
+            "id: evil-no-data\n\n",
+        );
+        const MIXED_TERMINAL_METADATA: &str = concat!(
+            "event: message_stop\n",
+            ": evil-mixed-terminal\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let cases: Vec<(
+            Framing,
+            Box<dyn ProviderStreamDecoder>,
+            &'static str,
+            &'static str,
+        )> = vec![
+            (
+                Framing::Native,
+                Box::new(NativeMessagesDecoder::new()),
+                NATIVE_TRAILING,
+                "evil-native",
+            ),
+            (
+                Framing::Responses,
+                OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::Responses)
+                    .expect("Responses decoder"),
+                RESPONSES_TRAILING,
+                "evil-responses",
+            ),
+            (
+                Framing::Native,
+                Box::new(NativeMessagesDecoder::new()),
+                COMMENT_TRAILING,
+                "evil-comment",
+            ),
+            (
+                Framing::Native,
+                Box::new(NativeMessagesDecoder::new()),
+                NO_DATA_TRAILING,
+                "evil-no-data",
+            ),
+            (
+                Framing::Native,
+                Box::new(NativeMessagesDecoder::new()),
+                MIXED_TERMINAL_METADATA,
+                "evil-mixed-terminal",
+            ),
+        ];
+
+        for (framing, decoder, upstream, forbidden) in cases {
+            let ledger = Arc::new(Ledger::default());
+            let response = relay_opened_with_middleware(
+                state_for("http://127.0.0.1:1", ledger.clone()),
+                context(),
+                OpenedStream {
+                    decoder,
+                    bytes: futures::stream::iter(vec![Ok(Bytes::from_static(upstream.as_bytes()))])
+                        .boxed(),
+                },
+                Instant::now(),
+                framing,
+                None,
+                StreamMiddleware::new(
+                    MiddlewareExecution::default(),
+                    StreamDelivery::PolicyValidatedPassthrough,
+                ),
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("upstream_stream_error"), "{body}");
+            assert!(!body.contains(forbidden), "{body}");
+            assert_eq!(settled(&ledger).await["status"], "upstream_error");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_buffered_drain_stops_at_the_total_stream_deadline() {
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_stream_duration_ms = 30;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("duration-bound state");
+        let response = relay_opened_with_middleware(
+            state,
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::ChatCompletions)
+                    .expect("decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from_static(
+                    OPENAI_STREAM.as_bytes(),
+                ))])
+                .boxed(),
+            },
+            Instant::now(),
+            Framing::OpenAiSse,
+            None,
+            StreamMiddleware::new(
+                MiddlewareExecution::default(),
+                StreamDelivery::PolicyBuffered,
+            ),
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        let first = body
+            .next()
+            .await
+            .expect("first buffered event")
+            .expect("chunk");
+        assert!(String::from_utf8_lossy(&first).contains("hel"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut remainder = String::new();
+        while let Some(chunk) = body.next().await {
+            remainder.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(remainder.contains(STREAM_DURATION_EXCEEDED), "{remainder}");
+        assert!(!remainder.contains("\"content\":\"lo\""), "{remainder}");
+        assert_eq!(settled(&ledger).await["status"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn policy_buffered_final_drain_transition_honors_the_total_deadline() {
+        let ledger = Arc::new(Ledger::default());
+        let mut config = single_target_config("http://127.0.0.1:1");
+        config.admission.max_stream_duration_ms = 30;
+        let state = AppState::new(
+            config,
+            &test_env(),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("duration-bound state");
+        let response = relay_opened_with_middleware(
+            state,
+            context(),
+            OpenedStream {
+                decoder: OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::ChatCompletions)
+                    .expect("decoder"),
+                bytes: futures::stream::iter(vec![Ok(Bytes::from_static(
+                    OPENAI_STREAM.as_bytes(),
+                ))])
+                .boxed(),
+            },
+            Instant::now(),
+            Framing::OpenAiSse,
+            None,
+            StreamMiddleware::new(
+                MiddlewareExecution::default(),
+                StreamDelivery::PolicyBuffered,
+            ),
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        for _ in 0..4 {
+            body.next()
+                .await
+                .expect("all buffered frames precede completion")
+                .expect("chunk");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let remainder = body
+            .next()
+            .await
+            .expect("expired final transition emits a terminal error")
+            .expect("chunk");
+        assert!(
+            String::from_utf8_lossy(&remainder).contains(STREAM_DURATION_EXCEEDED),
+            "{remainder:?}"
+        );
+        while body.next().await.is_some() {}
+        assert_eq!(settled(&ledger).await["status"], "upstream_error");
     }
 
     /// A streamed request settles under the identity the handler minted, not one
@@ -1843,6 +3063,13 @@ data: [DONE]\n\n",
             pending: VecDeque::new(),
             phase: Phase::Streaming,
             framing: Framing::OpenAiSse,
+            delivery: StreamDelivery::Reemit,
+            buffered: VecDeque::new(),
+            buffering_started: None,
+            buffered_bytes: 0,
+            terminal_seen: false,
+            stream_terminal_grace: Duration::from_secs(1),
+            terminal_deadline: None,
             deadline: None,
             max_bytes: None,
             relayed_bytes: 0,

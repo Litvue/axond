@@ -103,6 +103,16 @@ pub enum GatewayError {
     #[allow(dead_code)]
     #[error("middleware is unavailable")]
     MiddlewareUnavailable,
+    /// A policy selected decoded stream-event middleware for a byte-faithful
+    /// route without explicitly opting that route into buffering. Even a
+    /// non-mutating middleware can refuse, so releasing provider bytes before
+    /// it runs would violate fail-closed policy.
+    #[allow(dead_code)]
+    #[error("stream-event middleware requires explicit buffering on {route} ({framing} framing)")]
+    MiddlewareResponseIncompatible {
+        route: &'static str,
+        framing: &'static str,
+    },
     #[error("the gateway is shutting down and is no longer accepting requests")]
     Draining,
     #[error("unauthorized")]
@@ -179,6 +189,7 @@ impl GatewayError {
             Self::MiddlewareRefused { reason: "policy" } => StatusCode::FORBIDDEN,
             Self::MiddlewareRefused { .. } => StatusCode::BAD_REQUEST,
             Self::MiddlewareUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::MiddlewareResponseIncompatible { .. } => StatusCode::BAD_REQUEST,
             // Retryable elsewhere immediately: this replica is leaving, not
             // failing, and readiness has already said so.
             Self::Draining => StatusCode::SERVICE_UNAVAILABLE,
@@ -234,6 +245,7 @@ impl GatewayError {
             Self::OutputLimitExceeded { .. } => "output_limit_exceeded",
             Self::MiddlewareRefused { .. } => "middleware_refused",
             Self::MiddlewareUnavailable => "middleware_unavailable",
+            Self::MiddlewareResponseIncompatible { .. } => "middleware_response_incompatible",
             Self::Draining => "draining",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
@@ -434,6 +446,31 @@ mod tests {
                 "error": {
                     "type": "rate_limited",
                     "message": "inbound concurrency limit exceeded"
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_framing_incompatibility_is_typed_and_bounded() {
+        let response = GatewayError::MiddlewareResponseIncompatible {
+            route: "/v1/responses",
+            framing: "responses",
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "error": {
+                    "type": "middleware_response_incompatible",
+                    "message": "stream-event middleware requires explicit buffering on /v1/responses (responses framing)"
                 }
             })
         );

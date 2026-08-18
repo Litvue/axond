@@ -36,6 +36,8 @@ during one.
 | The budget backend's DSN is **not** the control plane's | The revision journal is not request-path state | compare `[budget] dsn_env` with `[control_plane] dsn_env` |
 | Every replica runs a build that reads `axond.policy.v1` | A build that cannot read the body refuses the whole revision as skew | roll the binary out first |
 | Every `content_middleware` id is compiled into every replica, and every declared scope is supported | An unavailable implementation or unsupported combination cannot become a serving chain | roll the implementation out first; then publish its registration |
+| Every guardrail intended to cover streaming declares `stream_event` as well as `response` | Scopes are execution phases; a response-only registration does not run for `stream: true` | snapshot compilation warns with the namespace and middleware id for every response-only registration; treat it as an intentional exception or add streaming coverage |
+| Each provider and proxy selected for non-mutating buffered `messages` / `responses` routes emits only policy-visible SSE blocks | Preserving original bytes requires fail-closed refusal of comments, blank heartbeat blocks, `id:`, `retry:`, unknown fields, and ambiguous duplicate-key JSON | replay the target's exact wire through qualification before adding it to `buffered_response_routes`; use a mutating/reconstructed stream posture if byte-faithful validation is incompatible |
 
 ### The control plane is not a hot path
 
@@ -115,12 +117,17 @@ cannot strand a namespace against half-described caps.
 
 | Class | What it covers | What happens |
 | --- | --- | --- |
-| `live` | Looser caps, longer TTLs, a higher token floor, any ordered content-middleware add/change/remove, or a republication that changes nothing | Activates. New admissions use the new values and snapshot-owned chain |
+| `live` | Looser caps, longer TTLs, a higher token floor, any ordered content-middleware add/change/remove, any `buffered_response_routes` change, or a republication that changes nothing | Activates. New admissions use the new values and snapshot-owned chain and buffering selection |
 | `drain` | Tighter caps, shorter TTLs | Activates. New admissions use the new values; **what is already admitted keeps its own terms** until it finishes |
 | `migration-required` | Turning a scope-wide cap on or off | Refused. See [Migrating the layout](#migrating-the-layout) |
 | `refused` | A regressed epoch, changed content under an unchanged epoch, another scope's document, a lowered token floor (**including across a handover**), a document these backends cannot enforce, withdrawing a document from a namespace still served, or serving a namespace no document governs | Refused. Nothing changes |
 
 A publication is as disruptive as its worst field.
+
+`buffered_response_routes` is a normalized optional set containing only
+`messages` and `responses`. Absence is the backward-compatible empty set. A
+change requires an advanced policy epoch and is live: in-flight requests retain
+the snapshot they started under, while new admissions capture the new choice.
 
 ### Handing a namespace between scopes
 

@@ -155,15 +155,40 @@ delivery mechanism.
 Policy can select and order only the second row. Core-stage identifiers and
 fields such as `core_stages` are rejected while the document is validated.
 
-**Response mutation is refused until its invocation and framing contract are
-implemented.** The first runtime slice rejects every `Response` and
-`StreamEvent` registration. The follow-up may activate response mutation where
-the relay already re-emits (`Framing::OpenAiSse`). On `Native` and `Responses`
-framing it must remain refused with a typed incompatibility unless policy opts
-that route into buffering, because silently re-emitting those streams would
-revoke a documented guarantee for every caller. Buffering costs the
-time-to-first-token the relay exists to protect — an operator's trade to make
-explicitly, per policy, never a default.
+**Response mutation follows the phase the request actually executes.** A
+buffered provider response runs `Response` scopes once in reverse registration
+order. A stream runs `StreamEvent` scopes on decoded data events, also in reverse
+order; terminal provider usage remains gateway-owned and is never mutable.
+`Response` scope alone is therefore intentionally inactive for `stream: true`;
+snapshot compilation warns once with the namespace and middleware id for every
+such registration so an operator cannot mistake phase selection for streaming
+coverage. A guardrail intended to cover both shapes must declare both scopes.
+OpenAI chat already re-emits decoded events, so applicable stream middleware can
+run incrementally. `Native` and `Responses` framing remain byte-faithful unless
+the governing policy explicitly selects that route in
+`buffered_response_routes`; without that opt-in any applicable stream-event
+middleware is refused as `middleware_response_incompatible` before permits,
+reservations, or provider dispatch. This includes non-mutating middleware,
+because it can still refuse and fail-closed policy cannot release bytes before
+that verdict.
+
+The opt-in holds reconstructed output until the upstream terminates
+successfully, then releases the transformed events. A non-mutating stream chain
+instead releases the provider's original bytes after validation, preserving the
+byte-faithful contract. That verdict is over the gateway's parsed SSE/JSON view,
+not over each lexical byte spelling: strict parsing applies SSE's standard
+one-optional-space and multi-line `data:` normalization, refuses fields that the
+callback cannot see, and rejects duplicate JSON object keys before invoking the
+chain. Client SDKs remain responsible for applying standard SSE and JSON parsing
+to the released provider bytes. Refusing unseen fields deliberately includes SSE
+comments, blank heartbeat blocks, `id:`, and `retry:`; operators must qualify a
+provider/proxy's exact stream before enabling validated byte-faithful passthrough.
+Both raw upstream bytes and reconstructed output are bounded by the lower of
+`admission.max_stream_bytes` and a 64 MiB hard ceiling; the hard ceiling remains
+when the ordinary stream limit is disabled. Middleware failure releases no held
+content and ends the already-open stream with a wire-native
+`middleware_stream_error`. This buffering cost is never implicit: provider TTFT,
+caller-visible TTFT, and gateway-added buffering duration are separate metrics.
 
 **Every middleware declares a failure posture and runs under bounds.**
 Fail-closed or fail-open is part of the registration, because a guardrail that
@@ -187,6 +212,17 @@ concurrency above 64 from becoming an immediate refusal while preventing one
 pathological implementation from consuming more than four blocking workers. A refusal inherits the existing
 refusal discipline: a typed error, a stable caller-facing reason that never
 echoes the body, and no usage event when nothing reached a provider.
+
+Stream-event scope invokes one synchronous callback for every decoded data
+event. Events within one stream remain serial so state and wire order cannot
+race, while independent streams use the bounded blocking capacity concurrently;
+there is no replica-wide stream-event lock. This deliberately pays one bounded
+dispatch per event instead of batching events and changing mutation or refusal
+boundaries. Before activating a stream-event implementation, operators qualify
+its worst-case event rate and concurrent streams against the 64 replica slots,
+four per-id slots, and its declared end-to-end duration. The deterministic
+capacity test exercises concurrent streams through a saturated runtime and
+proves queued events drain without exceeding either ownership bound.
 
 Operators distinguish a slow implementation from provider latency through
 `axond.middleware.capacity_wait` and
@@ -228,6 +264,23 @@ documents that register content middleware are delivered by the mechanism ADR
 already runs; a deployment that registers no middleware is unchanged and its tier
 is not raised.
 
+Policy also carries an optional normalized `buffered_response_routes` set. Its
+closed members are `messages` and `responses`; absence is the compatible empty
+set, and duplicates or unknown routes are refused. The setting is permission for
+an applicable response-mutating chain to trade native byte-faithful passthrough
+for bounded buffering. It neither activates middleware nor changes a request's
+upstream streaming or affinity semantics by itself. Changes are live and bind to
+new requests through the immutable snapshot.
+
+Adding this field changes `PolicyContent` for every document, including one whose
+set is empty. That digest is deliberately process-local activation and drain
+identity: it is neither serialized into a Redis/Postgres key nor compared across
+replicas. Shared budget and rate-limit keys remain namespace/subject plus their
+reservation or lease identity, while each replica enters and exits holds under
+the generation it computed. A mixed-version fleet can therefore compute different
+digests for the same old document without splitting shared enforcement state;
+after rollout, every new process computes the new identity.
+
 ## Consequences
 
 The request path gains a place where content policy belongs, and the two dead
@@ -241,11 +294,13 @@ wire. Anything reasoning about a usage row's input tokens is reasoning about the
 post-middleware body, which is the right answer — that is what was sent — but it
 is a new thing to know when reading a row against a captured request.
 
-Refusing response-mutating middleware on native framing means a tenant can
-configure a policy that is silently inert on `/v1/messages` unless it opts into
-buffering. The refusal is typed and explicit rather than a quiet no-op, which
-turns a subtle policy gap into a visible error at the cost of an error an operator
-must then understand.
+Response-mutating middleware on native framing is refused unless the route is
+present in `buffered_response_routes`. The refusal is typed and explicit rather
+than a quiet no-op, which turns a subtle policy gap into a visible error at the
+cost of an error an operator must then understand. An empty chain remains
+byte-faithful even when the route is selected. The immutable serving snapshot
+pins both middleware and buffering selection for the request; opting in does not
+alter Responses target or credential affinity, including continuations.
 
 Excluding `Attempt` scope means a middleware cannot shape a body per provider,
 which is the natural place some future compatibility shim would want to live. That

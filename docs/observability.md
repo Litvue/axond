@@ -165,6 +165,7 @@ destination receives by exactly what the refusals in
 | `axond.cost.microdollars` | counter (µUSD) | same | Spend, priced from the target catalogue. |
 | `axond.upstream.errors` | counter | same | Upstream failure rate by target. |
 | `axond.upstream.timeouts` | counter | `axond.target.provider`, `axond.target.model`, `axond.timeout`, `axond.timeout.bound` | Which phase stalled — `connect`, `response_headers`, `buffered_body`, `stream_idle`, or `overall` (nothing was dispatched) — and whether the `phase` bound or the remaining `walk_budget` ended the wait. |
+| `axond.upstream.time_to_first_token` | histogram (ms) | `axond.target.provider`, `axond.target.model` | Provider TTFT measured at the first decoded stream event, before any explicit middleware response buffering. |
 | `axond.upstream.circuit_state` | gauge | `axond.target.provider`, `axond.target.model` | `0` closed, `1` half-open, `2` open. |
 | `axond.usage.records_written` | counter | `axond.usage_sink` | Records a sink acknowledged. In billing-grade mode the delivery worker emits it, for records a destination accepted. |
 | `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. `shutdown` means the termination flush could not write them. Billing-grade mode has no buffer to drop from: a failed write stays journaled, so watch `axond.usage.journal.lost` there instead. |
@@ -189,6 +190,7 @@ destination receives by exactly what the refusals in
 | `axond.budget.retained_subjects` | gauge | — | In-memory ledgers retained after capacity-pressure pruning; watch against `max_subjects`. |
 | `axond.middleware.capacity_wait` | histogram (ms) | — | Time content middleware waits for one of the bounded blocking-executor slots. Sustained growth means late synchronous invocations are retaining capacity. |
 | `axond.middleware.capacity_timeouts` | counter | — | Requests whose middleware deadline expired while waiting for blocking capacity. Alert on any sustained increase alongside `middleware_unavailable` responses. |
+| `axond.middleware.response_buffering_duration` | histogram (ms) | — | Gateway-added delay when an operator explicitly buffers a byte-faithful streaming route so response middleware can run; compare with upstream TTFT to separate policy cost from provider latency. |
 | `axond.rate_limit.denials` | counter | — | Inbound concurrency admissions rejected. |
 | `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
 | `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |
@@ -344,6 +346,7 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `503` | `budget_unavailable` | The budget store could not be reached and `on_unavailable = "deny"` (the default). | Fix Redis/Postgres. **Distinguish this from `429`:** `429` is the tenant over budget, `503` is *your* dependency down. |
 | `503` | `rate_limit_unavailable` | The Redis rate-limit store could not be reached and `on_unavailable = "deny"` (the default). | Fix Redis or deliberately choose `on_unavailable = "allow"`. |
 | `503` | `middleware_unavailable` | A fail-closed content middleware invocation failed, exceeded its end-to-end deadline, could not acquire bounded global or per-id blocking capacity before that deadline, or its middleware id is temporarily quarantined while an abandoned invocation remains running. | Check middleware failure logs plus `axond.middleware.capacity_wait` and `axond.middleware.capacity_timeouts`. Other middleware ids remain operational; repair the named implementation, and restart only if its abandoned call never returns. |
+| `400` | `middleware_response_incompatible` | A streaming `/v1/messages` or `/v1/responses` request selected applicable stream-event middleware without explicitly opting that route into buffering. Even non-mutating middleware can refuse, so the gateway will not release byte-faithful content before its verdict. Refused before admission or provider dispatch. | Add the route to the governing policy's `buffered_response_routes` only if callers accept delayed output; mutating chains reconstruct events, while non-mutating chains preserve the original bytes. Otherwise remove the stream middleware. |
 | `503` | `model_not_priced` | Every target the alias could route to is bound to a catalogue offering the serving snapshot has no **approved** price for — the book is a draft, or it does not price the offering. On a route that pins its destination (`/v1/responses`), the pinned target alone decides this: an unpriced pin is refused this way even where a later target of the alias is chargeable. Raised before admission or a rate-limit permit is spent, so a refused request costs nothing. The alias stays listed by `/v1/models`: it is discoverable but not chargeable. | Approve a price book covering the offering, or drop the target's `catalog` binding to charge the configured `price` again. The response body carries a stable, redacted reason ("no price is in force for this model") and never names the price book or its approval state — those are control-plane facts, and they go to the gateway log instead, on the `alias has no approved price` warning ([ADR 0056](./adr/0056-request-path-pricing.md)). |
 | `503` | `draining` | The replica is terminating and has closed admission; `Retry-After: 0`. Expected during a rollout, on the requests that arrive after the readiness drain window. | Nothing on the gateway: the caller (or load balancer) should retry, and another replica should answer. Sustained volume means callers are not honoring readiness — check endpoint removal and `shutdown.drain_grace_ms`. |
 | `503` | `all_provider_circuits_open` | Every target the request could consider has a tripped circuit. That is all of the alias's targets on every route except `/v1/responses`, which considers only its pinned first target — so a Responses request can raise this while the alias's later targets are healthy. | The upstreams are down or the thresholds are too tight; check `axond.upstream.circuit_state`. On `/v1/responses`, read it as *the first target* being down, not the whole alias, and do not alert on it as an alias-wide outage. |
@@ -359,6 +362,7 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `413` | `request_too_large`, `prompt_too_large` | The inbound body exceeded `admission.max_request_bytes` (refused by the router before buffering), request middleware expanded it past that same ceiling (refused before provider dispatch), or the estimated input exceeded `admission.max_prompt_tokens`. | Caller-side or content-policy fix, or raise the bound if the workload needs it. Neither message echoes the request. |
 | `415` | `unsupported_media_type` | The request did not declare `content-type: application/json`. Unchanged in status from earlier releases; only the body is now the typed JSON envelope. | Caller-side fix: send a JSON content type. |
 | `400` | `output_limit_exceeded` | The request asked for more output tokens than `admission.max_output_tokens`. Refused rather than clamped. | Lower the caller's output allowance or raise the ceiling. |
+| `200` + SSE `error` | `middleware_stream_error` | An already-open stream's response middleware failed or exceeded its bound. Policy-buffered content is discarded rather than partially released. | Check middleware failure logs and capacity metrics. The usage row is `rejected` before caller-visible content or `partial` after incremental content. |
 | `503` | `continuation_affinity_unavailable` | A request carrying `previous_response_id` could not use the alias's pinned first target or credential, and continuity forbids substituting another. | Restore the first target/credential; retry later. An *initial* Responses request in the same state reports the ordinary error above instead. |
 
 `/v1/responses` records exactly one upstream attempt per request: it is pinned to
@@ -396,6 +400,12 @@ no second completion is spliced in — the usage record settles once, as `partia
 or `upstream_error`, and `axond.upstream.timeouts{axond.timeout="stream_idle"}`
 is what distinguishes a stalled provider from one that ended early
 ([ADR 0028](./adr/0028-transport-phase-bounds.md)).
+
+Byte-faithful Native and Responses relays may forward provider extension bytes
+after the semantic terminal event, but only for the fixed
+`transport.stream_terminal_grace_ms`. Expiry closes the completed response
+successfully and releases its request, stream, and caller capacity; it is not an
+upstream timeout and does not increment `axond.upstream.timeouts`.
 
 A `504` whose phase is `overall` reports the gateway's own spent failover
 budget, so it is attributed to the request and the target's metrics but does not

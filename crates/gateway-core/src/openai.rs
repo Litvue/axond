@@ -162,10 +162,22 @@ impl ProviderStreamDecoder for OpenAiStreamDecoder {
                 .event
                 .or_else(|| data.get("type").and_then(Value::as_str).map(str::to_owned)),
         };
-        Ok(vec![ProviderStreamEvent::Data {
+        let data_event = ProviderStreamEvent::Data {
             event: event_name,
             data,
-        }])
+        };
+        if self.surface == Surface::Responses
+            && matches!(
+                &data_event,
+                ProviderStreamEvent::Data { event, .. }
+                    if event.as_deref() == Some("response.completed")
+            )
+        {
+            self.done = true;
+            Ok(vec![data_event, ProviderStreamEvent::Done(self.usage)])
+        } else {
+            Ok(vec![data_event])
+        }
     }
 
     fn finish(&mut self) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
@@ -348,7 +360,7 @@ mod tests {
         let mut responses = OpenAiCompatibleAdapter::openai()
             .stream_decoder(Surface::Responses)
             .unwrap();
-        responses
+        let completed = responses
             .decode(SseEvent {
                 event: None,
                 data: json!({
@@ -363,16 +375,22 @@ mod tests {
                 .to_string(),
             })
             .unwrap();
+        assert!(matches!(
+            completed.first(),
+            Some(ProviderStreamEvent::Data { event, .. })
+                if event.as_deref() == Some("response.completed")
+        ));
         assert_eq!(
-            responses.finish().unwrap(),
-            vec![ProviderStreamEvent::Done(ModelUsage {
+            completed.get(1),
+            Some(&ProviderStreamEvent::Done(ModelUsage {
                 input_tokens: 16,
                 output_tokens: 8,
                 reasoning_tokens: 6,
                 cache_read_tokens: 4,
                 cache_write_tokens: 0,
-            })]
+            }))
         );
+        assert!(responses.finish().unwrap().is_empty());
     }
 
     #[test]

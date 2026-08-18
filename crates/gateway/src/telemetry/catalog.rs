@@ -435,6 +435,12 @@ pub const CATALOG: &[MetricSpec] = &[
         ],
     },
     MetricSpec {
+        name: "axond.upstream.time_to_first_token",
+        kind: InstrumentKind::Histogram,
+        unit: Some("ms"),
+        labels: TARGET_LABELS,
+    },
+    MetricSpec {
         name: "axond.upstream.circuit_state",
         kind: InstrumentKind::Gauge,
         unit: None,
@@ -707,6 +713,12 @@ pub const CATALOG: &[MetricSpec] = &[
         name: "axond.middleware.capacity_timeouts",
         kind: InstrumentKind::Counter,
         unit: None,
+        labels: &[],
+    },
+    MetricSpec {
+        name: "axond.middleware.response_buffering_duration",
+        kind: InstrumentKind::Histogram,
+        unit: Some("ms"),
         labels: &[],
     },
     MetricSpec {

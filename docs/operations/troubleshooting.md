@@ -38,6 +38,7 @@ Boot errors name references and identifiers, not secret values.
 | `429 tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. | `axond.admission.in_flight`; whether the tenant's own concurrency, not the replica, is the cause. |
 | `413 request_too_large` / `413 prompt_too_large` | Inbound or post-middleware body over `admission.max_request_bytes`, or estimated input over `admission.max_prompt_tokens`. | The caller's payload size and selected content policy; raise the bound only if the workload genuinely needs it. |
 | `200` + SSE `error` typed `upstream_stream_error` | A stream hit `admission.max_stream_duration_ms` or `admission.max_stream_bytes`; the bounds cannot change a status already sent. | The event's message names the bound; the usage record settles with what was relayed. |
+| `200` + SSE `error` typed `middleware_stream_error` | Response middleware failed after the upstream stream opened. Explicitly buffered content is discarded; incremental content already sent cannot be recalled. | Middleware logs and capacity metrics; usage status distinguishes `rejected` from `partial`. |
 | `415 unsupported_media_type` | The request did not declare `content-type: application/json`. | The caller's `Content-Type` header. |
 | `400 output_limit_exceeded` | The request asked for more output tokens than `admission.max_output_tokens`. | The request's `max_tokens`/`max_completion_tokens`/`max_output_tokens`. |
 | `503 gateway_overloaded` / `503 stream_capacity_exhausted` | The replica is at `admission.max_in_flight` or `max_in_flight_streams`. | `axond.admission.rejections` by resource, replica count, and whether the ceilings match what one process can hold. |
@@ -51,6 +52,7 @@ Boot errors name references and identifiers, not secret values.
 | `503 budget_unavailable` | Shared budget backend failed under fail-closed policy. | Redis/Postgres health and latency. |
 | `503 rate_limit_unavailable` | Redis limiter failed under fail-closed policy. | Redis health, invoke saturation, connection recovery. |
 | `503 middleware_unavailable` | Fail-closed middleware failed, exceeded its end-to-end deadline, timed out waiting for bounded global or per-id blocking capacity, or its id is temporarily quarantined while an abandoned invocation remains running. | Middleware warning logs, `axond.middleware.capacity_wait`, and `axond.middleware.capacity_timeouts`. Other ids continue to run; repair the named implementation, and restart only if its abandoned call never returns. |
+| `400 middleware_response_incompatible` | A byte-faithful streaming route selected stream-event middleware without the route's explicit buffering opt-in. Even a non-mutating callback can refuse, so bytes cannot be released ahead of its verdict. | The governing policy's `buffered_response_routes`; opt in only if delayed output is acceptable. Mutating chains reconstruct events. Non-mutating chains preserve original bytes and therefore fail closed on comments, blank heartbeats, `id:`, `retry:`, unknown SSE fields, duplicate JSON keys, and post-terminal content; qualify the provider/proxy wire first. |
 | `503 revocation_unavailable` | JTI store failed under fail-closed policy. | Redis/Postgres health and configured policy. |
 | `503 continuation_affinity_unavailable` | A request carrying `previous_response_id` cannot safely use its pinned first target or credential. | First-target circuit and first-credential state; retry later. |
 
@@ -151,7 +153,10 @@ walk still had time for.
 Two consequences are deliberate and not bugs:
 
 - A slow *productive* stream is never cut off by `failover.overall_timeout_ms`.
-  Only silence longer than `stream_idle_timeout_ms` ends it.
+  Before its semantic terminal event, only silence longer than
+  `stream_idle_timeout_ms` ends it. A byte-faithful Native or Responses body
+  still open after completion closes successfully at
+  `stream_terminal_grace_ms`; trailing extension chunks do not reset that grace.
 - A stream that stalls after bytes were already relayed terminates in band on
   the already-`200` response and is **not** retried; retrying would splice a
   second completion into one answer. The usage record still settles exactly

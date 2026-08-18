@@ -131,6 +131,19 @@ impl MiddlewareStateBag {
         self.slots.get_mut(index).and_then(Option::as_mut)
     }
 
+    /// Temporarily transfer one slot to the gateway-owned executor.
+    ///
+    /// Response callbacks run on a blocking worker. Moving the state into that
+    /// worker, rather than borrowing it across an await, makes concurrent
+    /// invocation impossible. The gateway replaces the slot only after the
+    /// callback has actually returned.
+    pub fn take(&mut self, index: usize) -> Option<MiddlewareState> {
+        self.slots
+            .get_mut(index)
+            .expect("middleware state index must belong to the chain")
+            .take()
+    }
+
     pub fn len(&self) -> usize {
         self.slots.len()
     }
@@ -311,6 +324,22 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<MiddlewareRefusal>(json!("policy")).unwrap(),
             MiddlewareRefusal::Policy
+        );
+    }
+
+    #[test]
+    fn state_slots_can_be_transferred_without_changing_their_position() {
+        let mut bag = MiddlewareStateBag::new(2);
+        bag.insert(1, MiddlewareState::new(7_u64));
+
+        let state = bag.take(1).expect("state transfers to executor");
+        assert!(bag.get_mut(1).is_none());
+        assert_eq!(state.downcast_ref::<u64>(), Some(&7));
+
+        bag.insert(1, state);
+        assert_eq!(
+            bag.get_mut(1).and_then(|state| state.downcast_ref::<u64>()),
+            Some(&7)
         );
     }
 }

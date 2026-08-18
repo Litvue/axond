@@ -41,6 +41,16 @@ meaning, and how they are allowed to change. The design rationale is
 | `started_at` | `timestamptz` | `recorded_at - latency_ms`. |
 | `recorded_at` | `timestamptz` | When the gateway settled the request. Excludes the sink's own batching delay. |
 
+`status` describes the terminal outcome the gateway observed, not proof that a
+peer received an HTTP body. For buffered requests, `ok` means provider work and
+response middleware completed and the response was eligible to return;
+`rejected` means response middleware refused it. `client_cancelled` means the
+gateway observed cancellation before either terminal outcome. Once the gateway
+starts committing one of those immutable outcomes, losing the durable append
+acknowledgement does not rewrite the same `request_id` with contradictory
+content. Stream statuses continue to describe what the relay observed while it
+owned the response body (`ok`, `client_cancelled`, `partial`, or an error).
+
 The stdout and OTLP sinks carry the same fields, minus `id` and
 `reasoning_tokens`: stdout emits the record as JSON (`snake_case`, `trace_id`
 omitted when absent), and the OTLP sink emits it as an OTel log record with

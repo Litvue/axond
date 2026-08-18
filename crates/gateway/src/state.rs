@@ -43,7 +43,8 @@ use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
 use crate::desired_state::mutation::Actor;
 use crate::desired_state::policy::{
-    BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
+    BudgetPolicy, BufferedResponseRoute, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope,
+    RevocationPolicy,
 };
 use crate::desired_state::pricing::{
     Approval, EffectiveInstant, EffectiveInterval, PricedTarget, PricingSnapshot,
@@ -82,6 +83,9 @@ pub struct AppState(pub Arc<Inner>);
 
 pub struct Inner {
     pub dispatcher: HttpDispatcher,
+    /// Process-level grace for byte-faithful provider bytes that follow a
+    /// semantic terminal event. Read at boot with the rest of `[transport]`.
+    pub stream_terminal_grace: Duration,
     /// How a terminated request's usage leaves the process. Telemetry-grade by
     /// default; a durable append when a journal is configured.
     pub usage: Arc<UsageDelivery>,
@@ -399,6 +403,8 @@ pub(crate) struct CachedPolicy {
     pub(crate) lease_ttl_seconds: u64,
     pub(crate) minimum_token_epoch: u64,
     pub(crate) content_middleware: Vec<CachedContentMiddleware>,
+    #[serde(default)]
+    pub(crate) buffered_response_routes: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -552,6 +558,12 @@ impl ConfigSnapshot {
                                 failure_posture: registration.failure_posture(),
                                 max_duration_milliseconds: registration.max_duration_milliseconds(),
                             })
+                            .collect(),
+                        buffered_response_routes: policy
+                            .body
+                            .buffered_response_routes()
+                            .iter()
+                            .map(|route| route.as_str().to_owned())
                             .collect(),
                     }),
                 })
@@ -785,6 +797,11 @@ fn cached_namespace(namespace: CachedNamespace, revision: RevisionId) -> Result<
                     .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let buffered_response_routes = policy
+                .buffered_response_routes
+                .iter()
+                .map(|route| BufferedResponseRoute::parse(route).map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
             let body = PolicyBody::new(
                 scope,
                 PolicyEpoch::new(policy.epoch).map_err(|error| error.to_string())?,
@@ -799,6 +816,8 @@ fn cached_namespace(namespace: CachedNamespace, revision: RevisionId) -> Result<
                 RevocationPolicy::new(policy.minimum_token_epoch),
             )
             .with_content_middleware(content_middleware)
+            .map_err(|error| error.to_string())?
+            .with_buffered_response_routes(buffered_response_routes)
             .map_err(|error| error.to_string())?;
             let generation = body.generation(revision);
             Ok(NamespacePolicy { body, generation })
@@ -1581,6 +1600,8 @@ impl AppState {
         // once here: a reload validates a change and reports that it needs a
         // restart rather than swapping the pool under in-flight requests.
         let limits = config.transport.limits();
+        let stream_terminal_grace =
+            Duration::from_millis(config.transport.stream_terminal_grace_ms);
         let admission = AdmissionControl::from_config(&config.admission);
         let snapshot = if config.mode == crate::config::Mode::Stateful {
             ConfigSnapshot::build_bootstrap(config, env, 0)?
@@ -1592,6 +1613,7 @@ impl AppState {
                 build_client(&limits).expect("the upstream HTTP client builds"),
                 limits,
             ),
+            stream_terminal_grace,
             usage,
             budget,
             admission,
@@ -1764,7 +1786,12 @@ namespace = "platform"
                 )
                 .expect("valid registration"),
             ])
-            .expect("registration attaches");
+            .expect("registration attaches")
+            .with_buffered_response_routes([
+                BufferedResponseRoute::Responses,
+                BufferedResponseRoute::Messages,
+            ])
+            .expect("buffering routes attach");
         let generation = body.generation(revision_id(epoch));
         NamespacePolicy { body, generation }
     }
@@ -1830,6 +1857,18 @@ namespace = "platform"
                 .expect("registered middleware restores");
         assert_eq!(restored_revision, revision);
         assert_eq!(restored.middleware("platform").len(), 1);
+        assert_eq!(
+            restored.config.namespace[0]
+                .policy
+                .as_ref()
+                .unwrap()
+                .body
+                .buffered_response_routes(),
+            [
+                BufferedResponseRoute::Messages,
+                BufferedResponseRoute::Responses,
+            ]
+        );
 
         let mut unavailable = snapshot.cached_serving(revision);
         unavailable.namespaces[0]
@@ -1848,6 +1887,59 @@ namespace = "platform"
             error.contains("not compiled into this axond build"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn encrypted_cache_round_trips_buffered_routes_and_old_payloads_default_empty() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let mut config = config_with(PLATFORM_KEY);
+        config.namespace[0].policy = Some(middleware_policy(1, "test.policy-marker"));
+        let snapshot = ConfigSnapshot::build(config, &env, 7).expect("snapshot compiles");
+        let revision = revision_id(7);
+        let cache_path = temp_file(b"signed-cache-placeholder");
+        let cache = crate::convergence::LastKnownGood::new(&cache_path, &[0x59; 32])
+            .expect("cache key is valid");
+        let bytes = cache
+            .encode_compiled(&snapshot, revision)
+            .expect("compiled cache encrypts");
+        assert!(
+            !bytes
+                .windows("responses".len())
+                .any(|window| window == b"responses")
+        );
+        cache
+            .write_compiled(&bytes)
+            .expect("encrypted compiled cache writes");
+        let loaded = cache
+            .load_compiled()
+            .expect("encrypted compiled cache authenticates")
+            .expect("compiled cache exists");
+        assert_eq!(
+            loaded.namespaces[0]
+                .policy
+                .as_ref()
+                .unwrap()
+                .buffered_response_routes,
+            ["messages", "responses"]
+        );
+
+        let mut old_payload = serde_json::to_value(snapshot.cached_serving(revision)).unwrap();
+        old_payload["namespaces"][0]["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("buffered_response_routes");
+        let old_payload: CachedServingSnapshot = serde_json::from_value(old_payload).unwrap();
+        assert!(
+            old_payload.namespaces[0]
+                .policy
+                .as_ref()
+                .unwrap()
+                .buffered_response_routes
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_file(cache.compiled_path());
+        let _ = std::fs::remove_file(cache_path);
     }
 
     /// The production observation plan, not only the status route's projection,

@@ -2645,7 +2645,7 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
             .windows(second_material.len())
             .any(|window| window == second_material.as_bytes())
     );
-    assert_eq!(&compiled[..24], b"axond.compiled-serving\0\x02");
+    assert_eq!(&compiled[..24], b"axond.compiled-serving\0\x03");
 
     drop(replica);
     let outage = control_plane.serve_without_control_plane().await;

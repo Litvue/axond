@@ -1,3 +1,7 @@
+use std::{collections::BTreeSet, fmt};
+
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
     pub event: Option<String>,
@@ -10,6 +14,17 @@ pub enum StreamParseError {
     BufferLimit(usize),
     #[error("stream ended with an incomplete SSE event")]
     Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StrictStreamParseError {
+    #[error(transparent)]
+    Parse(#[from] StreamParseError),
+    #[error("SSE block contains fields that cannot be policy-validated")]
+    UnvalidatedBlock,
+    #[error("SSE data contains duplicate JSON object keys")]
+    AmbiguousJson,
 }
 
 pub struct SseDecoder {
@@ -36,9 +51,36 @@ impl SseDecoder {
     }
 
     pub fn push(&mut self, chunk: &str) -> Result<Vec<SseEvent>, StreamParseError> {
+        match self.push_inner(chunk, false) {
+            Ok(events) => Ok(events),
+            Err(StrictStreamParseError::Parse(error)) => Err(error),
+            Err(StrictStreamParseError::UnvalidatedBlock) => {
+                unreachable!("ordinary SSE decoding does not apply strict validation")
+            }
+            Err(StrictStreamParseError::AmbiguousJson) => {
+                unreachable!("ordinary SSE decoding does not inspect JSON object keys")
+            }
+        }
+    }
+
+    /// Decode only SSE blocks that can be presented to policy middleware.
+    ///
+    /// Comments and blocks without `data:` are valid SSE, but a byte-faithful
+    /// relay cannot release them after validating only data events: their raw
+    /// bytes would never receive a policy verdict. Strict decoding therefore
+    /// refuses such a block instead of silently discarding it.
+    pub fn push_strict(&mut self, chunk: &str) -> Result<Vec<SseEvent>, StrictStreamParseError> {
+        self.push_inner(chunk, true)
+    }
+
+    fn push_inner(
+        &mut self,
+        chunk: &str,
+        reject_unvalidated_blocks: bool,
+    ) -> Result<Vec<SseEvent>, StrictStreamParseError> {
         self.buffer.push_str(chunk);
         if self.buffer.len() > self.max_buffer_bytes {
-            return Err(StreamParseError::BufferLimit(self.max_buffer_bytes));
+            return Err(StreamParseError::BufferLimit(self.max_buffer_bytes).into());
         }
         let mut events = Vec::new();
         // Scanning and draining per event would reread and reshuffle the whole
@@ -57,7 +99,16 @@ impl SseDecoder {
             };
             consumed = end + delimiter_len;
             search = consumed;
+            if reject_unvalidated_blocks && !strict_block_is_valid(&block) {
+                return Err(StrictStreamParseError::UnvalidatedBlock);
+            }
             if let Some(event) = parse_event(&block) {
+                if reject_unvalidated_blocks
+                    && event.data.trim() != "[DONE]"
+                    && json_has_duplicate_keys(&event.data)
+                {
+                    return Err(StrictStreamParseError::AmbiguousJson);
+                }
                 events.push(event);
             }
         }
@@ -119,15 +170,126 @@ fn parse_event(block: &str) -> Option<SseEvent> {
             continue;
         }
         if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.trim_start().to_owned());
+            event = Some(value.strip_prefix(' ').unwrap_or(value).to_owned());
         } else if let Some(value) = line.strip_prefix("data:") {
-            data.push(value.trim_start());
+            data.push(value.strip_prefix(' ').unwrap_or(value));
         }
     }
     (!data.is_empty()).then(|| SseEvent {
         event,
         data: data.join("\n"),
     })
+}
+
+/// Whether every byte-bearing SSE field in a block reaches the policy callback.
+/// `data:` values are joined and exposed, and one `event:` value is exposed as
+/// the event name. Everything else—including comments, metadata, unknown
+/// fields, and a shadowed event name—would disappear in `parse_event` and is
+/// therefore refused by strict byte-faithful validation.
+fn strict_block_is_valid(block: &str) -> bool {
+    let mut event_seen = false;
+    let mut data_seen = false;
+    for line in block.lines() {
+        if line.starts_with(':') {
+            return false;
+        }
+        let Some((field, _)) = line.split_once(':') else {
+            return false;
+        };
+        match field {
+            "data" => data_seen = true,
+            "event" if !event_seen => event_seen = true,
+            "event" | "id" | "retry" => return false,
+            _ => return false,
+        }
+    }
+    data_seen
+}
+
+const DUPLICATE_JSON_KEY: &str = "axond_duplicate_json_key";
+
+/// Whether JSON contains an object key whose first value another parser could
+/// retain while `serde_json::Value` retains its last. Syntax errors are left to
+/// the provider decoder so strict delivery preserves its existing typed error.
+fn json_has_duplicate_keys(data: &str) -> bool {
+    let mut deserializer = serde_json::Deserializer::from_str(data);
+    NoDuplicateKeys
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end())
+        .is_err_and(|error| error.to_string().contains(DUPLICATE_JSON_KEY))
+}
+
+struct NoDuplicateKeys;
+
+impl<'de> DeserializeSeed<'de> for NoDuplicateKeys {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(NoDuplicateKeysVisitor)
+    }
+}
+
+struct NoDuplicateKeysVisitor;
+
+impl<'de> Visitor<'de> for NoDuplicateKeysVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(NoDuplicateKeys)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(de::Error::custom(DUPLICATE_JSON_KEY));
+            }
+            object.next_value_seed(NoDuplicateKeys)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +343,64 @@ mod tests {
         let mut decoder = SseDecoder::default();
         assert!(decoder.push("data: complete\n\ndata: trunc").unwrap().len() == 1);
         assert_eq!(decoder.finish(), Err(StreamParseError::Incomplete));
+    }
+
+    #[test]
+    fn strict_decode_refuses_blocks_middleware_cannot_validate() {
+        for block in [
+            ": secret comment\n\n",
+            "event: opaque\nid: secret\n\n",
+            ": mixed secret\ndata: {\"safe\":true}\n\n",
+            "event: first\nevent: second\ndata: {\"safe\":true}\n\n",
+            "retry: 1000\ndata: {\"safe\":true}\n\n",
+            "future-field: secret\ndata: {\"safe\":true}\n\n",
+        ] {
+            let mut decoder = SseDecoder::default();
+            assert_eq!(
+                decoder.push_strict(block),
+                Err(StrictStreamParseError::UnvalidatedBlock)
+            );
+        }
+
+        let mut decoder = SseDecoder::default();
+        assert_eq!(
+            decoder
+                .push_strict("event: delta\ndata: first\ndata: second\n\n")
+                .unwrap(),
+            vec![SseEvent {
+                event: Some("delta".to_owned()),
+                data: "first\nsecond".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn strict_decode_rejects_ambiguous_json_and_keeps_sse_space_semantics() {
+        for data in [
+            r#"{"safe":true,"safe":false}"#,
+            r#"{"nested":{"safe":true,"safe":false}}"#,
+            r#"{"\u0073afe":true,"safe":false}"#,
+        ] {
+            let mut decoder = SseDecoder::default();
+            assert_eq!(
+                decoder.push_strict(&format!("data: {data}\n\n")),
+                Err(StrictStreamParseError::AmbiguousJson)
+            );
+        }
+
+        let mut decoder = SseDecoder::default();
+        assert_eq!(
+            decoder.push("data:  {\"safe\":true}\n\n").unwrap()[0].data,
+            " {\"safe\":true}",
+            "SSE removes at most one space after the field colon"
+        );
+
+        let mut decoder = SseDecoder::default();
+        assert_eq!(
+            decoder.push_strict("data: {not json}\n\n").unwrap()[0].data,
+            "{not json}",
+            "provider decoders retain ownership of ordinary JSON syntax errors"
+        );
     }
 
     /// The scan cursor must not skip a delimiter that arrives one byte at a

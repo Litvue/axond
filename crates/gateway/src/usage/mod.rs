@@ -49,6 +49,13 @@ pub use postgres::{PostgresSink, PostgresSinkSettings, tls_connector, validate_t
 /// exactly one record — including failures, cancellations, and partial
 /// streams — so spend reconciles (delta B6).
 ///
+/// This is the gateway-observed execution outcome, not a delivery receipt.
+/// `Ok` means provider work and response middleware completed and the buffered
+/// response was eligible to return. `ClientCancelled` means cancellation was
+/// observed before that terminal outcome (or before a stream completed). Once
+/// an immutable durable event begins committing, a lost acknowledgement cannot
+/// truthfully rewrite the same request identity under different content.
+///
 /// `Deserialize` as well as `Serialize`, because a journaled record is read back
 /// by the delivery worker that writes it to a sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

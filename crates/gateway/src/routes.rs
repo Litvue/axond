@@ -39,9 +39,9 @@ use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use gateway_core::{
-    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareStateBag,
-    ModelUsage, NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse,
-    ProviderStreamDecoder, Surface, Usage,
+    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareScope, ModelUsage,
+    NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
+    Surface, Usage,
 };
 use gateway_transport::{
     AuthScheme, Deadline, NativeCall, TimeoutBound, TimeoutKind, TransportError, Upstream,
@@ -55,9 +55,11 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::admission::{AdmissionPermit, DiagnosticCredential, RequestKind};
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
-use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
+use crate::config::{Config, Model, Provider, ProviderKind, ProviderWire, Target};
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
+use crate::desired_state::policy::BufferedResponseRoute;
 use crate::error::GatewayError;
+use crate::middleware::{MiddlewareChain, MiddlewareExecution};
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
 use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
@@ -65,7 +67,7 @@ use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::status::{StatusResponse, StatusScope};
-use crate::streaming::{self, Framing, StreamContext};
+use crate::streaming::{self, Framing, StreamContext, StreamDelivery};
 use crate::telemetry;
 use crate::usage::identity::EventIdentity;
 use crate::usage::{Status, UsageRecord};
@@ -1100,7 +1102,7 @@ impl Route {
     }
 
     fn streamable(self) -> bool {
-        self != Self::Embeddings
+        self.stream_delivery().is_some()
     }
 
     /// A stored Responses id only resolves on the provider — and under the
@@ -1135,6 +1137,26 @@ impl Route {
             Self::ChatCompletions => Framing::OpenAiSse,
             Self::NativeMessages | Self::Embeddings => Framing::Native,
             Self::Responses => Framing::Responses,
+        }
+    }
+
+    /// The route's ordinary streaming posture. Returning `None` for a
+    /// non-streamable route keeps an embeddings request from ever acquiring a
+    /// byte-faithful delivery posture, even if a future caller accidentally
+    /// asks this helper to compile one.
+    fn stream_delivery(self) -> Option<StreamDelivery> {
+        match self {
+            Self::ChatCompletions => Some(StreamDelivery::Reemit),
+            Self::NativeMessages | Self::Responses => Some(StreamDelivery::Passthrough),
+            Self::Embeddings => None,
+        }
+    }
+
+    fn buffered_response_route(self) -> Option<BufferedResponseRoute> {
+        match self {
+            Self::NativeMessages => Some(BufferedResponseRoute::Messages),
+            Self::Responses => Some(BufferedResponseRoute::Responses),
+            Self::ChatCompletions | Self::Embeddings => None,
         }
     }
 
@@ -1193,6 +1215,53 @@ impl Route {
         }
         wire
     }
+}
+
+/// Decide whether a streamed response is incremental or is held until the
+/// upstream finishes. Only a stream-event mutator can make this streaming
+/// decision; response-only middleware belongs to the non-streaming path.
+fn stream_delivery(
+    cfg: &Config,
+    namespace: &str,
+    route: Route,
+    middleware: &MiddlewareChain,
+) -> Result<StreamDelivery, GatewayError> {
+    let ordinary = route.stream_delivery().ok_or_else(|| {
+        GatewayError::BadRequest(format!("{} does not support streaming", route.label()))
+    })?;
+    if !middleware.has_scope(MiddlewareScope::StreamEvent) {
+        return Ok(ordinary);
+    }
+    let mutates_response = middleware.has_response_mutator(MiddlewareScope::StreamEvent);
+    let Some(policy_route) = route.buffered_response_route() else {
+        // OpenAI-normalized streaming already re-emits decoded events and does
+        // not need to revoke a byte-faithful contract to invoke middleware.
+        return Ok(ordinary);
+    };
+    let enabled = cfg
+        .namespace(namespace)
+        .and_then(|namespace| namespace.policy.as_ref())
+        .is_some_and(|policy| {
+            policy
+                .body
+                .buffered_response_routes()
+                .contains(&policy_route)
+        });
+    if enabled {
+        return Ok(if mutates_response {
+            StreamDelivery::PolicyBuffered
+        } else {
+            StreamDelivery::PolicyValidatedPassthrough
+        });
+    }
+    Err(GatewayError::MiddlewareResponseIncompatible {
+        route: route.label(),
+        framing: match route {
+            Route::NativeMessages => "native",
+            Route::Responses => "responses",
+            Route::ChatCompletions | Route::Embeddings => "re-emitted",
+        },
+    })
 }
 
 /// A route plus the wire headers this request carries upstream, threaded through
@@ -1378,6 +1447,23 @@ async fn serve(
     };
     wire.check_targets(cfg, model, &alias)?;
 
+    #[cfg(not(test))]
+    let middleware = snapshot.middleware(&caller.namespace);
+    // Primitive tests can install a process-local override. Production has no
+    // such field: its chain is always owned by the captured serving snapshot.
+    #[cfg(test)]
+    let middleware = if state.0.middleware.is_empty() {
+        snapshot.middleware(&caller.namespace)
+    } else {
+        &state.0.middleware
+    };
+    // This is a pure snapshot decision and deliberately precedes permits,
+    // reservations, usage identity, and provider dispatch. A missing opt-in is
+    // a typed incompatibility, not work the gateway begins and later abandons.
+    let stream_delivery = streamed
+        .then(|| stream_delivery(cfg, &caller.namespace, route, middleware))
+        .transpose()?;
+
     // The per-request bounds are checked before any dependency work and before
     // admission: they are pure functions of the parsed body, and a request that
     // cannot legally be served should not occupy capacity while it is refused.
@@ -1491,8 +1577,8 @@ async fn serve(
     } else {
         &state.0.middleware
     };
-    let middleware_state = middleware
-        .request(&state.0.middleware_runtime, &mut middleware_request)
+    let mut middleware_execution = middleware
+        .start(&state.0.middleware_runtime, &mut middleware_request)
         .await?;
     let body = middleware_request.body;
     // An empty chain is byte-neutral, so the pre-admission estimate is already
@@ -1554,7 +1640,8 @@ async fn serve(
                 prices: &prices,
                 wire: &wire,
                 identity,
-                middleware_state,
+                middleware_execution,
+                delivery: stream_delivery.expect("streamed request has a delivery posture"),
                 hold: BudgetHold {
                     key: budget_key,
                     reservation,
@@ -1583,43 +1670,42 @@ async fn serve(
     };
     let served = &outcome.served;
     match outcome.result {
-        Ok(response) => {
+        Ok(mut response) => {
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
-            // Settled first, and not because the record does not matter: the
-            // spend was incurred upstream whether or not the record survives,
-            // and the append that follows is the first await long enough for a
-            // caller to disconnect inside. A handler dropped there would run the
-            // guard's release and hand back the whole estimate instead of the
-            // measured cost, so the charge is made while nothing can cancel it.
-            reservation.settle(cost).await;
-            // Then the record, before the response is acknowledged: in
-            // billing-grade mode this is the durable append, and a request whose
-            // usage is not durable must not be answered `200`. In
-            // telemetry-grade mode the fan-out cannot fail.
-            record_usage(
-                &state,
-                RecordArgs {
-                    identity: &identity,
-                    caller: &caller,
-                    alias: &alias,
-                    target_provider: &served.provider,
-                    target_model: &served.model,
-                    source: served.source,
-                    credential_id: &served.credential_id,
-                    status: Status::Ok,
-                    input_tokens: response.usage.input_tokens,
-                    cache_read_tokens: response.usage.cache_read_tokens,
-                    cache_write_tokens: response.usage.cache_write_tokens,
-                    output_tokens: response.usage.output_tokens,
-                    cost_microdollars: cost,
-                    price: served.price,
-                    latency_ms: outcome.latency_ms,
-                    ttft_ms: outcome.ttft_ms,
-                    attempts: outcome.attempts,
-                },
-            )
-            .await?;
+            // Provider work is already complete before response middleware
+            // starts. Move the known spend and usage into a cancellation owner
+            // first, so a caller disappearing during a blocking callback cannot
+            // turn consumed work back into a released hold and a missing row.
+            let (record, ttft_ms, attempts) = build_record(RecordArgs {
+                identity: &identity,
+                caller: &caller,
+                alias: &alias,
+                target_provider: &served.provider,
+                target_model: &served.model,
+                source: served.source,
+                credential_id: &served.credential_id,
+                status: Status::ClientCancelled,
+                input_tokens: response.usage.input_tokens,
+                cache_read_tokens: response.usage.cache_read_tokens,
+                cache_write_tokens: response.usage.cache_write_tokens,
+                output_tokens: response.usage.output_tokens,
+                cost_microdollars: cost,
+                price: served.price,
+                latency_ms: outcome.latency_ms,
+                ttft_ms: outcome.ttft_ms,
+                attempts: outcome.attempts,
+            });
+            let accounting = reservation.into_response_accounting(record, ttft_ms, attempts);
+            let middleware_result = middleware_execution.response(&mut response).await;
+            accounting
+                .finish(if middleware_result.is_ok() {
+                    Status::Ok
+                } else {
+                    Status::Rejected
+                })
+                .await?;
+            middleware_result?;
             Ok(Json(response.body).into_response())
         }
         Err(err) => {
@@ -1989,7 +2075,8 @@ async fn stream_with_failover(
         prices,
         wire,
         identity,
-        middleware_state,
+        middleware_execution,
+        delivery,
         mut hold,
     } = request;
     let reservation_guard =
@@ -2242,14 +2329,14 @@ async fn stream_with_failover(
                             move |lease| snapshot.credentials.record_success(lease)
                         },
                     );
-                    return Ok(streaming::relay_opened_with_state(
+                    return Ok(streaming::relay_opened_with_middleware(
                         state.clone(),
                         ctx,
                         streaming::OpenedStream { decoder, bytes },
                         started,
                         wire.route.framing(),
                         Some(rotation),
-                        middleware_state,
+                        streaming::StreamMiddleware::new(middleware_execution, delivery),
                     ));
                 }
                 Err(err) if is_credential_exhausted(&err) => {
@@ -2303,11 +2390,11 @@ async fn stream_with_failover(
             ctx.attempts = walk.attempts;
             ctx.rate_limit_permit = hold.permit.take();
             ctx.admission_permit = hold.admission.take();
-            streaming::settle_upstream_error_with_state(
+            streaming::settle_upstream_error_with_middleware(
                 state.clone(),
                 ctx,
                 started,
-                middleware_state,
+                middleware_execution,
             );
         } else {
             reservation_guard.release().await;
@@ -2334,9 +2421,10 @@ struct StreamRequest<'a> {
     /// a credential rotation's — so a stream that rotates, ends, is cancelled, or
     /// never opens all report the same event.
     identity: EventIdentity,
-    /// Request-scope middleware state, moved into the relay's response-lifetime
-    /// accounting owner when a stream opens.
-    middleware_state: MiddlewareStateBag,
+    /// Pinned chain plus request-scope state, moved into the relay's
+    /// response-lifetime accounting owner when a stream opens.
+    middleware_execution: MiddlewareExecution,
+    delivery: StreamDelivery,
     hold: BudgetHold,
 }
 
@@ -2374,20 +2462,6 @@ impl BudgetReservation {
         }
     }
 
-    /// Disarm before awaiting so dropping the guard after settlement cannot
-    /// submit a second budget operation.
-    async fn settle(mut self, actual_microdollars: u64) {
-        let reservation = self
-            .reservation
-            .take()
-            .expect("budget reservation guard must be armed");
-        self.state
-            .0
-            .budget
-            .settle(&self.key, &reservation, actual_microdollars)
-            .await;
-    }
-
     /// Disarm before awaiting so the explicit release and the drop fallback
     /// cannot both reconcile the same hold.
     async fn release(mut self) {
@@ -2400,6 +2474,22 @@ impl BudgetReservation {
 
     fn disarm(mut self) {
         self.reservation.take();
+    }
+
+    fn into_response_accounting(
+        mut self,
+        record: UsageRecord,
+        ttft_ms: Option<u64>,
+        attempts: u32,
+    ) -> BufferedResponseAccounting {
+        BufferedResponseAccounting {
+            state: self.state.clone(),
+            key: self.key.clone(),
+            reservation: self.reservation.take(),
+            record: Some(record),
+            ttft_ms,
+            attempts,
+        }
     }
 }
 
@@ -2414,6 +2504,99 @@ impl Drop for BudgetReservation {
             state.0.budget.release(&key, &reservation).await;
         });
     }
+}
+
+/// Owns known provider spend while buffered response middleware runs.
+///
+/// `client_cancelled` is recorded when this owner drops before middleware
+/// produces a terminal outcome. Once middleware has returned, `finish` makes one durable
+/// `ok`/`rejected` decision before any accounting await. That status describes
+/// the request outcome, not an unknowable proof that the peer received the HTTP
+/// response: changing it after an ambiguously acknowledged durable commit would
+/// conflict with the immutable event under the same request identity.
+struct BufferedResponseAccounting {
+    state: AppState,
+    key: BudgetKey,
+    reservation: Option<Reservation>,
+    record: Option<UsageRecord>,
+    ttft_ms: Option<u64>,
+    attempts: u32,
+}
+
+impl BufferedResponseAccounting {
+    async fn finish(mut self, status: Status) -> Result<(), GatewayError> {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("buffered response accounting must own its reservation");
+        let mut record = self
+            .record
+            .take()
+            .expect("buffered response accounting must own its record");
+        record.status = status;
+        let decided = spawn_buffered_response_accounting(
+            self.state.clone(),
+            self.key.clone(),
+            reservation,
+            record,
+            self.ttft_ms,
+            self.attempts,
+        );
+        match decided.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(GatewayError::UsageNotDurable {
+                reason: error.reason,
+            }),
+            Err(_) => Err(GatewayError::UsageNotDurable {
+                reason: "the durable append did not report before the runtime stopped",
+            }),
+        }
+    }
+}
+
+impl Drop for BufferedResponseAccounting {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let mut record = self
+            .record
+            .take()
+            .expect("armed buffered response accounting must own its record");
+        record.status = Status::ClientCancelled;
+        drop(spawn_buffered_response_accounting(
+            self.state.clone(),
+            self.key.clone(),
+            reservation,
+            record,
+            self.ttft_ms,
+            self.attempts,
+        ));
+    }
+}
+
+fn spawn_buffered_response_accounting(
+    state: AppState,
+    key: BudgetKey,
+    reservation: Reservation,
+    record: UsageRecord,
+    ttft_ms: Option<u64>,
+    attempts: u32,
+) -> tokio::sync::oneshot::Receiver<Result<(), crate::usage::NotDurable>> {
+    let (verdict, decided) = tokio::sync::oneshot::channel();
+    streaming::spawn_settlement(async move {
+        state
+            .0
+            .budget
+            .settle(&key, &reservation, record.cost_microdollars)
+            .await;
+        telemetry::record_request(&record, ttft_ms, attempts);
+        let result = state.0.usage.record(&record).await;
+        if let Err(Err(unheard)) = verdict.send(result) {
+            state.0.usage.count_unheard_refusal(&unheard);
+        }
+    });
+    decided
 }
 
 /// Mutable bookkeeping shared by the buffered and streaming failover walks: how
@@ -2838,54 +3021,6 @@ struct RecordArgs<'a> {
     attempts: u32,
 }
 
-/// Build the record and hand it to usage delivery. The `Err` is billing-grade
-/// only: it means the event is not durable and the configured policy is to
-/// refuse rather than serve.
-async fn record_usage(state: &AppState, args: RecordArgs<'_>) -> Result<(), GatewayError> {
-    let (record, ttft_ms, attempts) = build_record(args);
-    telemetry::record_request(&record, ttft_ms, attempts);
-    // Fan-out delivery is a non-blocking hand-off, so it has no cancellation
-    // window worth detaching for and stays on the handler.
-    if !state.0.usage.appends() {
-        return state.0.usage.record(&record).await.map_err(|error| {
-            GatewayError::UsageNotDurable {
-                reason: error.reason,
-            }
-        });
-    }
-    // The billing-grade append is a database transaction, and hyper drops the
-    // handler future the moment the caller hangs up: a cancelled append would
-    // leave a charge already settled with no record of it anywhere and nothing
-    // counting the loss. Run as a settlement — the same tracking the streamed
-    // path uses, so shutdown waits for it — the append finishes whatever the
-    // connection does, and the handler awaits only the verdict its status code
-    // needs.
-    let (verdict, decided) = tokio::sync::oneshot::channel();
-    let recording = state.clone();
-    crate::streaming::spawn_settlement(async move {
-        // A refusal the handler is still there to receive is not a loss — the
-        // caller is told to retry and its spend is unwound. Once the handler is
-        // gone that answer reaches nobody, so an event that could not be
-        // journaled is a billable fact that no longer exists anywhere and is
-        // counted as one.
-        if let Err(Err(unheard)) = verdict.send(recording.0.usage.record(&record).await) {
-            recording.0.usage.count_unheard_refusal(&unheard);
-        }
-    });
-    match decided.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(GatewayError::UsageNotDurable {
-            reason: error.reason,
-        }),
-        // The settlement went down with the runtime, so nothing is known about
-        // the event; the honest answer is the one that does not claim it is
-        // billable.
-        Err(_) => Err(GatewayError::UsageNotDurable {
-            reason: "the durable append did not report before the runtime stopped",
-        }),
-    }
-}
-
 /// Record where the request is already ending for another reason, so a failure
 /// to journal can only be reported and counted.
 async fn record_usage_terminal(state: &AppState, args: RecordArgs<'_>) {
@@ -2946,10 +3081,13 @@ mod tests {
     use crate::aliases::AliasScope;
     use crate::backends::catalog::ProviderId;
     use crate::budget::NoBudget;
-    use crate::config::{Config, UndurablePolicy};
+    use crate::config::{Config, NamespacePolicy, UndurablePolicy};
     use crate::convergence::status::testing::ManualClock;
     use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
-    use crate::desired_state::fixtures::{approved_pricing_snapshot, revision_id};
+    use crate::desired_state::fixtures::{
+        approved_pricing_snapshot, policy_body, revision_id, tenant_id,
+    };
+    use crate::desired_state::policy::PolicyScope;
     use crate::middleware::MiddlewareChain;
     use crate::pricing::PriceIdentity;
     use crate::principals::PrincipalAuthority;
@@ -2963,7 +3101,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use gateway_core::{
-        Middleware, MiddlewareDeclaration, MiddlewareOutcome, MiddlewarePhase, MiddlewareResult,
+        Middleware, MiddlewareDeclaration, MiddlewareOutcome, MiddlewarePhase, MiddlewareRefusal,
+        MiddlewareResult, ProviderStreamEvent,
     };
     use http_body_util::BodyExt;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -6310,6 +6449,44 @@ targets = [
         }
     }
 
+    #[derive(Clone)]
+    struct BlockingSettlementBudget {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        settlements: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for BlockingSettlementBudget {
+        fn name(&self) -> &'static str {
+            "blocking-settlement"
+        }
+
+        async fn reserve(&self, _key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+            Admission::Allowed(Reservation {
+                id: "blocking-settlement".to_owned(),
+                estimate_microdollars: estimated_microdollars,
+                generation: None,
+            })
+        }
+
+        async fn settle(
+            &self,
+            _key: &BudgetKey,
+            _reservation: &Reservation,
+            actual_microdollars: u64,
+        ) {
+            self.settlements
+                .lock()
+                .expect("settlements")
+                .push(actual_microdollars);
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
     /// A request-scope middleware used by #356 tests. It changes only content,
     /// leaving routing fields alone, and therefore gives the request path a
     /// deterministic post-middleware body whose estimate can be asserted.
@@ -6317,6 +6494,696 @@ targets = [
         declaration: MiddlewareDeclaration,
         padding_bytes: usize,
         output_tokens: Option<u64>,
+    }
+
+    struct BlockingResponseMiddleware {
+        declaration: MiddlewareDeclaration,
+        active: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+    }
+
+    struct StreamMarkerMiddleware {
+        declaration: MiddlewareDeclaration,
+    }
+
+    struct StreamValidationMiddleware {
+        declaration: MiddlewareDeclaration,
+        refuse_on_text: bool,
+    }
+
+    impl BlockingResponseMiddleware {
+        fn chain(active: Arc<AtomicUsize>, release: Arc<AtomicBool>) -> MiddlewareChain {
+            let mut declaration =
+                MiddlewareDeclaration::new("test.blocking-response", [MiddlewareScope::Response]);
+            declaration.max_duration = Duration::from_secs(5);
+            MiddlewareChain::new(vec![Arc::new(Self {
+                declaration,
+                active,
+                release,
+            })])
+            .expect("blocking response chain")
+        }
+    }
+
+    impl Middleware for BlockingResponseMiddleware {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> MiddlewareResult {
+            if matches!(phase, MiddlewarePhase::Response(_)) {
+                self.active.fetch_add(1, Ordering::SeqCst);
+                for _ in 0..2_000 {
+                    if self.release.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    impl StreamMarkerMiddleware {
+        fn chain() -> MiddlewareChain {
+            let mut declaration =
+                MiddlewareDeclaration::new("test.stream-marker", [MiddlewareScope::StreamEvent]);
+            declaration.mutates_response = true;
+            MiddlewareChain::new(vec![Arc::new(Self { declaration }) as Arc<dyn Middleware>])
+                .expect("stream marker chain")
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_response_middleware_still_settles_provider_spend_and_usage() {
+        let (base_url, hits) = controllable_upstream(
+            Arc::new(AtomicBool::new(true)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let captured = CapturingSink::default();
+        let budget = RecordingBudget::default();
+        let active = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let state = two_target_state_with_budget(
+            &base_url,
+            &base_url,
+            "",
+            captured.clone(),
+            Box::new(budget.clone()),
+        )
+        .with_middleware_chain(BlockingResponseMiddleware::chain(
+            Arc::clone(&active),
+            Arc::clone(&release),
+        ));
+
+        let request = tokio::spawn(async move { router(state).oneshot(chat_request()).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("response middleware starts after provider success");
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request future is cancelled")
+                .is_cancelled()
+        );
+        release.store(true, Ordering::Release);
+        crate::streaming::await_settlements(Duration::from_secs(2)).await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let records = captured.0.lock().expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, Status::ClientCancelled);
+        assert_eq!(records[0].input_tokens, 10);
+        assert_eq!(records[0].output_tokens, 5);
+        assert_eq!(records[0].cost_microdollars, 15);
+        drop(records);
+        let reservations = budget.0.lock().expect("budget");
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].1, 15);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_settlement_keeps_the_decided_outcome_once() {
+        let (base_url, hits) = controllable_upstream(
+            Arc::new(AtomicBool::new(true)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let captured = CapturingSink::default();
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let settlements = Arc::new(Mutex::new(Vec::new()));
+        let budget = BlockingSettlementBudget {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            settlements: Arc::clone(&settlements),
+        };
+        let state = two_target_state_with_budget(
+            &base_url,
+            &base_url,
+            "",
+            captured.clone(),
+            Box::new(budget),
+        );
+
+        let request = tokio::spawn(async move { router(state).oneshot(chat_request()).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("budget settlement starts after provider success");
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request future is cancelled")
+                .is_cancelled()
+        );
+        release.store(true, Ordering::Release);
+        crate::streaming::await_settlements(Duration::from_secs(2)).await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            settlements.lock().expect("settlements").as_slice(),
+            &[15],
+            "known provider spend is settled exactly once"
+        );
+        let records = captured.0.lock().expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, Status::Ok);
+        assert_eq!(records[0].cost_microdollars, 15);
+    }
+
+    impl Middleware for StreamMarkerMiddleware {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> MiddlewareResult {
+            if let MiddlewarePhase::StreamEvent(ProviderStreamEvent::Data { data, .. }) = phase {
+                data["middleware_marker"] = json!(true);
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    impl StreamValidationMiddleware {
+        fn chain(refuse_on_text: bool) -> MiddlewareChain {
+            let declaration = MiddlewareDeclaration::new(
+                "test.stream-validation",
+                [MiddlewareScope::StreamEvent],
+            );
+            MiddlewareChain::new(vec![Arc::new(Self {
+                declaration,
+                refuse_on_text,
+            }) as Arc<dyn Middleware>])
+            .expect("stream validation chain")
+        }
+    }
+
+    impl Middleware for StreamValidationMiddleware {
+        fn declaration(&self) -> &MiddlewareDeclaration {
+            &self.declaration
+        }
+
+        fn apply(
+            &self,
+            phase: MiddlewarePhase<'_>,
+            _state: Option<&mut gateway_core::MiddlewareState>,
+        ) -> MiddlewareResult {
+            if self.refuse_on_text
+                && let MiddlewarePhase::StreamEvent(ProviderStreamEvent::Data { data, .. }) = phase
+                && (data.pointer("/delta/text").and_then(Value::as_str) == Some("hi")
+                    || data.pointer("/delta").and_then(Value::as_str) == Some("hi"))
+            {
+                return Ok(MiddlewareOutcome::refuse(MiddlewareRefusal::Policy));
+            }
+            Ok(MiddlewareOutcome::continue_without_state())
+        }
+    }
+
+    fn enable_buffered_response_routes(
+        config: &mut Config,
+        routes: impl IntoIterator<Item = BufferedResponseRoute>,
+    ) {
+        let body = policy_body(PolicyScope::Tenant(tenant_id(1)), 1)
+            .with_buffered_response_routes(routes)
+            .expect("valid buffered response routes");
+        let generation = body.generation(revision_id(1));
+        config.namespace[0].policy = Some(NamespacePolicy { body, generation });
+    }
+
+    #[test]
+    fn response_mutation_selects_buffering_only_for_explicit_byte_faithful_routes() {
+        let config = test_state().config().config.clone();
+        let chain = StreamMarkerMiddleware::chain();
+
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::NativeMessages, &chain),
+            Err(GatewayError::MiddlewareResponseIncompatible {
+                route: "/v1/messages",
+                framing: "native"
+            })
+        ));
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::Responses, &chain),
+            Err(GatewayError::MiddlewareResponseIncompatible {
+                route: "/v1/responses",
+                framing: "responses"
+            })
+        ));
+        assert_eq!(
+            stream_delivery(&config, "platform", Route::ChatCompletions, &chain).unwrap(),
+            StreamDelivery::Reemit
+        );
+        assert!(matches!(
+            stream_delivery(&config, "platform", Route::Embeddings, &chain),
+            Err(GatewayError::BadRequest(message))
+                if message == "/v1/embeddings does not support streaming"
+        ));
+
+        let mut selected = config;
+        enable_buffered_response_routes(
+            &mut selected,
+            [
+                BufferedResponseRoute::Messages,
+                BufferedResponseRoute::Responses,
+            ],
+        );
+        assert_eq!(
+            stream_delivery(&selected, "platform", Route::NativeMessages, &chain).unwrap(),
+            StreamDelivery::PolicyBuffered
+        );
+        assert_eq!(
+            stream_delivery(&selected, "platform", Route::Responses, &chain).unwrap(),
+            StreamDelivery::PolicyBuffered
+        );
+        assert_eq!(
+            stream_delivery(
+                &selected,
+                "platform",
+                Route::NativeMessages,
+                &MiddlewareChain::empty(),
+            )
+            .unwrap(),
+            StreamDelivery::Passthrough,
+            "policy permission alone must not revoke byte-faithful passthrough"
+        );
+    }
+
+    const MUTABLE_NATIVE_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    async fn mutable_native_upstream() -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/messages",
+            post(move || {
+                let served = Arc::clone(&served);
+                async move {
+                    served.fetch_add(1, Ordering::SeqCst);
+                    let split = MUTABLE_NATIVE_STREAM
+                        .find("\"hi\"")
+                        .expect("native fixture contains text delta")
+                        + 2;
+                    let bytes = MUTABLE_NATIVE_STREAM.as_bytes();
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(futures::stream::iter([
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(
+                                &bytes[..split],
+                            )),
+                            Ok(bytes::Bytes::copy_from_slice(&bytes[split..])),
+                        ])),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind native fixture");
+        let addr = listener.local_addr().expect("native fixture address");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn native_stream_state(
+        base_url: &str,
+        buffered: bool,
+        middleware: Option<MiddlewareChain>,
+    ) -> AppState {
+        let mut config = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "{base_url}"
+
+{GATEWAY_KEY}
+
+[[credential]]
+namespace = "platform"
+provider = "anthropic"
+env = "NATIVE_KEY"
+
+[[model]]
+name = "claude"
+targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#,
+        ))
+        .expect("native stream config");
+        if buffered {
+            enable_buffered_response_routes(&mut config, [BufferedResponseRoute::Messages]);
+        }
+        let state = AppState::new(
+            config,
+            &env_with([("NATIVE_KEY", "native-secret")]),
+            UsageFanout::new(vec![Box::new(CapturingSink::default())]),
+            Box::new(NoBudget),
+        )
+        .expect("native stream state");
+        match middleware {
+            Some(chain) => state.with_middleware_chain(chain),
+            None => state,
+        }
+    }
+
+    fn native_stream_request() -> Request<Body> {
+        authorized("/v1/messages")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude",
+                    "stream": true,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_stream_mutation_is_refused_or_explicitly_buffered_without_implicit_reframing() {
+        let (base_url, hits) = mutable_native_upstream().await;
+
+        let denied = router(native_stream_state(
+            &base_url,
+            false,
+            Some(StreamMarkerMiddleware::chain()),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("typed incompatibility response");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        let denied_body = denied.into_body().collect().await.unwrap().to_bytes();
+        let denied_body: Value = serde_json::from_slice(&denied_body).unwrap();
+        assert_eq!(
+            denied_body["error"]["type"],
+            "middleware_response_incompatible"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let passthrough = router(native_stream_state(&base_url, true, None))
+            .oneshot(native_stream_request())
+            .await
+            .expect("policy-only passthrough response");
+        assert_eq!(passthrough.status(), StatusCode::OK);
+        let passthrough = passthrough.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(passthrough.as_ref(), MUTABLE_NATIVE_STREAM.as_bytes());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let buffered = router(native_stream_state(
+            &base_url,
+            true,
+            Some(StreamMarkerMiddleware::chain()),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("explicitly buffered response");
+        assert_eq!(buffered.status(), StatusCode::OK);
+        let buffered = buffered.into_body().collect().await.unwrap().to_bytes();
+        let buffered = String::from_utf8(buffered.to_vec()).unwrap();
+        assert!(
+            buffered.contains("\"middleware_marker\":true"),
+            "{buffered}"
+        );
+        assert_ne!(buffered.as_bytes(), MUTABLE_NATIVE_STREAM.as_bytes());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn native_stream_validation_buffers_original_split_bytes_until_every_verdict() {
+        let (base_url, hits) = mutable_native_upstream().await;
+
+        let denied = router(native_stream_state(
+            &base_url,
+            false,
+            Some(StreamValidationMiddleware::chain(false)),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("typed validation incompatibility");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let validated = router(native_stream_state(
+            &base_url,
+            true,
+            Some(StreamValidationMiddleware::chain(false)),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("validated native stream");
+        assert_eq!(validated.status(), StatusCode::OK);
+        let validated = validated.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(validated.as_ref(), MUTABLE_NATIVE_STREAM.as_bytes());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let refused = router(native_stream_state(
+            &base_url,
+            true,
+            Some(StreamValidationMiddleware::chain(true)),
+        ))
+        .oneshot(native_stream_request())
+        .await
+        .expect("refused native stream");
+        assert_eq!(refused.status(), StatusCode::OK);
+        let refused = refused.into_body().collect().await.unwrap().to_bytes();
+        let refused = String::from_utf8(refused.to_vec()).unwrap();
+        assert!(refused.contains("middleware_stream_error"), "{refused}");
+        assert!(
+            refused.contains("request refused by middleware: policy"),
+            "{refused}"
+        );
+        assert!(!refused.contains("\"text\":\"hi\""), "{refused}");
+        assert!(!refused.contains("message_start"), "{refused}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    const MUTABLE_RESPONSES_STREAM: &str = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+    );
+
+    async fn mutable_responses_upstream() -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/responses",
+            post(move || {
+                let served = Arc::clone(&served);
+                async move {
+                    served.fetch_add(1, Ordering::SeqCst);
+                    let split = MUTABLE_RESPONSES_STREAM
+                        .find("\"hi\"")
+                        .expect("Responses fixture contains text delta")
+                        + 2;
+                    let bytes = MUTABLE_RESPONSES_STREAM.as_bytes();
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(futures::stream::iter([
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(
+                                &bytes[..split],
+                            )),
+                            Ok(bytes::Bytes::copy_from_slice(&bytes[split..])),
+                        ])),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses fixture");
+        let addr = listener.local_addr().expect("Responses fixture address");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn responses_stream_state(
+        url_a: &str,
+        url_b: &str,
+        buffered: bool,
+        middleware: Option<MiddlewareChain>,
+    ) -> AppState {
+        let mut config = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "pa"
+kind = "openai"
+base_url = "{url_a}"
+
+[[provider]]
+id = "pb"
+kind = "openai"
+base_url = "{url_b}"
+
+{GATEWAY_KEY}
+
+[[credential]]
+namespace = "platform"
+provider = "pa"
+env = "RESPONSES_KEY_A"
+
+[[credential]]
+namespace = "platform"
+provider = "pb"
+env = "RESPONSES_KEY_B"
+
+[failover]
+max_attempts = 3
+
+[[model]]
+name = "gpt-4o"
+targets = [
+  {{ provider = "pa", model = "model-a", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
+  {{ provider = "pb", model = "model-b", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
+]
+"#,
+        ))
+        .expect("Responses stream config");
+        if buffered {
+            enable_buffered_response_routes(&mut config, [BufferedResponseRoute::Responses]);
+        }
+        let state = AppState::new(
+            config,
+            &env_with([
+                ("RESPONSES_KEY_A", "responses-a"),
+                ("RESPONSES_KEY_B", "responses-b"),
+            ]),
+            UsageFanout::new(vec![Box::new(CapturingSink::default())]),
+            Box::new(NoBudget),
+        )
+        .expect("Responses stream state");
+        match middleware {
+            Some(chain) => state.with_middleware_chain(chain),
+            None => state,
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_stream_validation_buffers_original_split_bytes_until_every_verdict() {
+        let (url_a, hits_a) = mutable_responses_upstream().await;
+        let (url_b, hits_b) = mutable_responses_upstream().await;
+
+        let denied = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            false,
+            Some(StreamValidationMiddleware::chain(false)),
+        ))
+        .oneshot(streaming_responses_request(None))
+        .await
+        .expect("typed Responses validation incompatibility");
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+
+        let validated = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            true,
+            Some(StreamValidationMiddleware::chain(false)),
+        ))
+        .oneshot(streaming_responses_request(None))
+        .await
+        .expect("validated Responses stream");
+        assert_eq!(validated.status(), StatusCode::OK);
+        let validated = validated.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(validated.as_ref(), MUTABLE_RESPONSES_STREAM.as_bytes());
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+
+        let refused = router(responses_stream_state(
+            &url_a,
+            &url_b,
+            true,
+            Some(StreamValidationMiddleware::chain(true)),
+        ))
+        .oneshot(streaming_responses_request(None))
+        .await
+        .expect("refused Responses stream");
+        assert_eq!(refused.status(), StatusCode::OK);
+        let refused = refused.into_body().collect().await.unwrap().to_bytes();
+        let refused = String::from_utf8(refused.to_vec()).unwrap();
+        assert!(refused.contains("middleware_stream_error"), "{refused}");
+        assert!(
+            refused.contains("request refused by middleware: policy"),
+            "{refused}"
+        );
+        assert!(!refused.contains("\"delta\":\"hi\""), "{refused}");
+        assert!(!refused.contains("response.completed"), "{refused}");
+        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pinned_responses_initial_and_continuation_keep_affinity_in_both_buffering_modes() {
+        let (url_a, hits_a) = mutable_responses_upstream().await;
+        let (url_b, hits_b) = mutable_responses_upstream().await;
+
+        let denied_state =
+            responses_stream_state(&url_a, &url_b, false, Some(StreamMarkerMiddleware::chain()));
+        for previous in [None, Some("resp_1")] {
+            let denied = router(denied_state.clone())
+                .oneshot(streaming_responses_request(previous))
+                .await
+                .expect("typed Responses incompatibility");
+            assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+            let body = denied.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "middleware_response_incompatible");
+        }
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+
+        let buffered_state =
+            responses_stream_state(&url_a, &url_b, true, Some(StreamMarkerMiddleware::chain()));
+        for previous in [None, Some("resp_1")] {
+            let buffered = router(buffered_state.clone())
+                .oneshot(streaming_responses_request(previous))
+                .await
+                .expect("buffered Responses stream");
+            assert_eq!(buffered.status(), StatusCode::OK);
+            let body = buffered.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("\"middleware_marker\":true"), "{body}");
+        }
+        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
     }
 
     impl BodyGrowthMiddleware {
@@ -7462,15 +8329,17 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
         );
     }
 
-    /// A journal whose append takes long enough for a caller to hang up inside
-    /// it, which is the whole window the cancellation regression is about.
-    struct SlowAppend {
+    /// A journal that durably commits, then withholds the acknowledgement until
+    /// the caller hangs up. This is the ambiguity an immutable usage event must
+    /// handle without retrying the same identity under different content.
+    struct BlockingAppend {
         inner: journal::oracle::InMemoryUsageJournal,
-        append_takes: Duration,
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
-    impl journal::UsageJournal for SlowAppend {
+    impl journal::UsageJournal for BlockingAppend {
         fn name(&self) -> &'static str {
             self.inner.name()
         }
@@ -7487,8 +8356,12 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
             &self,
             event: &journal::UsageEvent,
         ) -> Result<journal::Appended, journal::JournalError> {
-            tokio::time::sleep(self.append_takes).await;
-            self.inner.append(event).await
+            let appended = self.inner.append(event).await?;
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            Ok(appended)
         }
 
         async fn claim(
@@ -7526,41 +8399,59 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
         }
     }
 
-    /// The other half of the billing-grade promise: a caller that hangs up while
-    /// its usage is being appended does not take the record with it. The spend
-    /// was settled before the append, so a cancelled append would charge a
-    /// budget for a request no outbox reader can see — and, because the handler
-    /// is simply dropped, nothing would report it either.
+    /// Once provider and middleware produce a terminal outcome, accounting
+    /// persists that one immutable fact in a tracked task. Losing the durable
+    /// append acknowledgement cannot rewrite it as a contradictory cancellation
+    /// or create a second event; `ok` means the response was eligible to return,
+    /// not that the peer demonstrably received the HTTP body.
     #[tokio::test]
-    async fn a_caller_hanging_up_during_the_append_still_journals_its_usage() {
+    async fn lost_ack_after_durable_append_keeps_one_decided_outcome() {
         let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
-        let outbox = Arc::new(SlowAppend {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let outbox = Arc::new(BlockingAppend {
             inner: journal::oracle::InMemoryUsageJournal::new(),
-            append_takes: Duration::from_millis(200),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
         });
         let state = billing_state(&url, outbox.clone());
 
-        let mut serving = Box::pin(router(state).oneshot(chat_request()));
-        tokio::select! {
-            _ = &mut serving => panic!("the request answered before the append could be cut off"),
-            () = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-        // The caller hangs up: hyper drops the handler future exactly like this.
-        drop(serving);
+        let request = tokio::spawn(async move { router(state).oneshot(chat_request()).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable append starts after provider success");
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request future is cancelled")
+                .is_cancelled()
+        );
+        release.store(true, Ordering::Release);
+        crate::streaming::await_settlements(Duration::from_secs(2)).await;
 
         let consumer = journal::ConsumerId::parse("billing").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let stats = outbox.stats(&consumer).await.unwrap();
-            if stats.pending == 1 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the abandoned request never reached the outbox: {stats:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let claimed = outbox
+            .claim(
+                &consumer,
+                journal::Claim {
+                    max_events: 8,
+                    lease: Duration::from_secs(30),
+                    now: SystemTime::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "the abandoned request reached the outbox");
+        assert_eq!(
+            claimed[0].event.record().status,
+            Status::Ok,
+            "the committed outcome is not contradicted after an ambiguous acknowledgement"
+        );
     }
 
     /// A journal that refuses every append, slowly enough for the caller to

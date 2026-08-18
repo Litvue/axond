@@ -22,6 +22,8 @@
 //! | `max_in_flight_per_subject` | the concurrency ceiling per subject |
 //! | `lease_ttl_seconds` | how long an abandoned concurrency lease stays live |
 //! | `minimum_token_epoch` | the mint epoch below which a token is refused |
+//! | `content_middleware` | the optional ordered in-process content chain |
+//! | `buffered_response_routes` | the optional normalized set of streaming surfaces allowed to buffer for response mutation |
 //!
 //! Two rules follow from *complete*, and they are the reason this is a document
 //! rather than a bag of settings:
@@ -134,6 +136,7 @@ const MAX_IN_FLIGHT_FIELD: &str = "max_in_flight_per_subject";
 const LEASE_TTL_FIELD: &str = "lease_ttl_seconds";
 const MINIMUM_TOKEN_EPOCH_FIELD: &str = "minimum_token_epoch";
 const CONTENT_MIDDLEWARE_FIELD: &str = "content_middleware";
+const BUFFERED_RESPONSE_ROUTES_FIELD: &str = "buffered_response_routes";
 const MIDDLEWARE_ID_FIELD: &str = "id";
 const MIDDLEWARE_SCOPES_FIELD: &str = "scopes";
 const MIDDLEWARE_FAILURE_POSTURE_FIELD: &str = "failure_posture";
@@ -262,6 +265,13 @@ pub enum PolicyError {
         #[source]
         source: InvalidContentMiddleware,
     },
+    #[error("{reference} field `{field}` is invalid: {source}")]
+    InvalidBufferedResponseRoutes {
+        reference: ResourceRef,
+        field: &'static str,
+        #[source]
+        source: InvalidBufferedResponseRoutes,
+    },
     #[error("{reference} carries {declared}, but its resource identity is {identity}")]
     IdentityMismatch {
         reference: ResourceRef,
@@ -317,6 +327,9 @@ impl PolicyError {
                     | InvalidContentMiddleware::CoreStage(_)
                     | InvalidContentMiddleware::TooMany
             ),
+            Self::InvalidBufferedResponseRoutes { source, .. } => {
+                matches!(source, InvalidBufferedResponseRoutes::Unsupported(_))
+            }
             Self::FieldRange { .. } => true,
             Self::Kind { .. }
             | Self::NotInline { .. }
@@ -343,6 +356,7 @@ impl PolicyError {
             | Self::MalformedId { reference, .. }
             | Self::FieldRange { reference, .. }
             | Self::InvalidMiddleware { reference, .. }
+            | Self::InvalidBufferedResponseRoutes { reference, .. }
             | Self::IdentityMismatch { reference, .. }
             | Self::ScopeMismatch { reference, .. } => *reference,
         }
@@ -382,6 +396,55 @@ pub enum InvalidContentMiddleware {
     TooMany,
     #[error("middleware id `{0}` is registered more than once")]
     DuplicateId(String),
+}
+
+/// Why a response route cannot be selected for policy-controlled buffering.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidBufferedResponseRoutes {
+    #[error("response route `{0}` is not supported")]
+    Unsupported(String),
+    #[error("response route `{0}` is selected more than once")]
+    Duplicate(&'static str),
+}
+
+/// A streaming API surface whose response may be buffered explicitly by policy.
+///
+/// The closed enum keeps policy from silently accepting a route whose framing
+/// the serving path does not yet know how to reconstruct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BufferedResponseRoute {
+    Messages,
+    Responses,
+}
+
+impl BufferedResponseRoute {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::Responses => "responses",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, InvalidBufferedResponseRoutes> {
+        match value {
+            "messages" => Ok(Self::Messages),
+            "responses" => Ok(Self::Responses),
+            other => Err(InvalidBufferedResponseRoutes::Unsupported(other.to_owned())),
+        }
+    }
+}
+
+fn normalize_buffered_response_routes(
+    routes: impl IntoIterator<Item = BufferedResponseRoute>,
+) -> Result<Vec<BufferedResponseRoute>, InvalidBufferedResponseRoutes> {
+    let mut routes = routes.into_iter().collect::<Vec<_>>();
+    routes.sort_unstable();
+    for pair in routes.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(InvalidBufferedResponseRoutes::Duplicate(pair[0].as_str()));
+        }
+    }
+    Ok(routes)
 }
 
 /// One ordered content-middleware registration in a typed policy document.
@@ -881,6 +944,7 @@ pub struct PolicyBody {
     concurrency: ConcurrencyPolicy,
     revocation: RevocationPolicy,
     content_middleware: Vec<ContentMiddlewareRegistration>,
+    buffered_response_routes: Vec<BufferedResponseRoute>,
 }
 
 impl PolicyBody {
@@ -898,6 +962,7 @@ impl PolicyBody {
         LEASE_TTL_FIELD,
         MINIMUM_TOKEN_EPOCH_FIELD,
         CONTENT_MIDDLEWARE_FIELD,
+        BUFFERED_RESPONSE_ROUTES_FIELD,
     ];
 
     pub fn new(
@@ -914,6 +979,7 @@ impl PolicyBody {
             concurrency,
             revocation,
             content_middleware: Vec::new(),
+            buffered_response_routes: Vec::new(),
         }
     }
 
@@ -940,6 +1006,16 @@ impl PolicyBody {
         Ok(self)
     }
 
+    /// Select streaming surfaces where response-mutating middleware may trade
+    /// byte-for-byte passthrough for bounded response buffering.
+    pub fn with_buffered_response_routes(
+        mut self,
+        routes: impl IntoIterator<Item = BufferedResponseRoute>,
+    ) -> Result<Self, InvalidBufferedResponseRoutes> {
+        self.buffered_response_routes = normalize_buffered_response_routes(routes)?;
+        Ok(self)
+    }
+
     pub const fn scope(&self) -> PolicyScope {
         self.scope
     }
@@ -962,6 +1038,10 @@ impl PolicyBody {
 
     pub fn content_middleware(&self) -> &[ContentMiddlewareRegistration] {
         &self.content_middleware
+    }
+
+    pub fn buffered_response_routes(&self) -> &[BufferedResponseRoute] {
+        &self.buffered_response_routes
     }
 
     /// This document's generation, once the revision that publishes it is known.
@@ -1059,6 +1139,7 @@ impl PolicyBody {
             )
         })?;
         let content_middleware = read_content_middleware(&record)?;
+        let buffered_response_routes = read_buffered_response_routes(&record)?;
         Self {
             scope,
             epoch,
@@ -1066,12 +1147,21 @@ impl PolicyBody {
             concurrency,
             revocation: RevocationPolicy::new(record.integer(MINIMUM_TOKEN_EPOCH_FIELD)?),
             content_middleware: Vec::new(),
+            buffered_response_routes: Vec::new(),
         }
         .with_content_middleware(content_middleware)
         .map_err(|source| PolicyError::InvalidMiddleware {
             reference: resource.reference,
             field: CONTENT_MIDDLEWARE_FIELD.to_owned(),
             source,
+        })
+        .and_then(|body| {
+            body.with_buffered_response_routes(buffered_response_routes)
+                .map_err(|source| PolicyError::InvalidBufferedResponseRoutes {
+                    reference: resource.reference,
+                    field: BUFFERED_RESPONSE_ROUTES_FIELD,
+                    source,
+                })
         })
     }
 
@@ -1187,8 +1277,57 @@ impl Canonical for PolicyBody {
                 ),
             ));
         }
+        if !self.buffered_response_routes.is_empty() {
+            fields.push((
+                BUFFERED_RESPONSE_ROUTES_FIELD,
+                CanonicalValue::set(
+                    self.buffered_response_routes
+                        .iter()
+                        .map(|route| CanonicalValue::string(route.as_str())),
+                ),
+            ));
+        }
         CanonicalValue::map(fields)
     }
+}
+
+fn read_buffered_response_routes(
+    record: &Record<'_, PolicyError>,
+) -> Result<Vec<BufferedResponseRoute>, PolicyError> {
+    let Some(value) = record.optional_value(BUFFERED_RESPONSE_ROUTES_FIELD) else {
+        return Ok(Vec::new());
+    };
+    let CanonicalValue::Set(values) = value else {
+        return Err(PolicyError::FieldType {
+            reference: record.reference(),
+            field: BUFFERED_RESPONSE_ROUTES_FIELD,
+        });
+    };
+    let routes = values
+        .iter()
+        .map(|value| {
+            let CanonicalValue::String(value) = value else {
+                return Err(PolicyError::FieldType {
+                    reference: record.reference(),
+                    field: BUFFERED_RESPONSE_ROUTES_FIELD,
+                });
+            };
+            BufferedResponseRoute::parse(value).map_err(|source| {
+                PolicyError::InvalidBufferedResponseRoutes {
+                    reference: record.reference(),
+                    field: BUFFERED_RESPONSE_ROUTES_FIELD,
+                    source,
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    normalize_buffered_response_routes(routes).map_err(|source| {
+        PolicyError::InvalidBufferedResponseRoutes {
+            reference: record.reference(),
+            field: BUFFERED_RESPONSE_ROUTES_FIELD,
+            source,
+        }
+    })
 }
 
 fn read_content_middleware(
@@ -1298,6 +1437,13 @@ impl PolicyContent {
                 MiddlewareFailurePosture::FailClosed => 1,
             });
             bytes.extend_from_slice(&registration.max_duration_milliseconds.to_be_bytes());
+        }
+        bytes.extend_from_slice(&(body.buffered_response_routes.len() as u64).to_be_bytes());
+        for route in &body.buffered_response_routes {
+            bytes.push(match route {
+                BufferedResponseRoute::Messages => 0,
+                BufferedResponseRoute::Responses => 1,
+            });
         }
         Self(Checksum::of(&bytes))
     }
@@ -1655,6 +1801,9 @@ pub enum TransitionReason {
     /// The ordered content chain changed. Existing requests retain the snapshot
     /// they started under; the new chain binds from the next request.
     ContentMiddlewareChanged,
+    /// The set of streaming surfaces explicitly allowed to buffer for response
+    /// mutation changed. Existing requests retain their captured policy.
+    BufferedResponseRoutesChanged,
 }
 
 impl TransitionReason {
@@ -1678,7 +1827,8 @@ impl TransitionReason {
             | Self::ConcurrencyRaised
             | Self::LeaseTtlExtended
             | Self::TokenFloorRaised
-            | Self::ContentMiddlewareChanged => TransitionClass::Live,
+            | Self::ContentMiddlewareChanged
+            | Self::BufferedResponseRoutesChanged => TransitionClass::Live,
         }
     }
 }
@@ -1791,6 +1941,9 @@ impl PolicyTransition {
         );
         if from.content_middleware != to.content_middleware {
             reasons.push(TransitionReason::ContentMiddlewareChanged);
+        }
+        if from.buffered_response_routes != to.buffered_response_routes {
+            reasons.push(TransitionReason::BufferedResponseRoutesChanged);
         }
         reasons
     }
@@ -2143,6 +2296,94 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
+    }
+
+    #[test]
+    fn buffered_response_routes_are_typed_normalized_and_backward_compatible() {
+        let plain = policy_body(tenant_scope(), 1);
+        let old_content = plain.content();
+        assert!(plain.buffered_response_routes().is_empty());
+        assert!(
+            PolicyBody::read(&plain.version(slug()))
+                .unwrap()
+                .buffered_response_routes()
+                .is_empty()
+        );
+
+        let body = plain
+            .with_buffered_response_routes([
+                BufferedResponseRoute::Responses,
+                BufferedResponseRoute::Messages,
+            ])
+            .unwrap();
+        assert_eq!(
+            body.buffered_response_routes(),
+            [
+                BufferedResponseRoute::Messages,
+                BufferedResponseRoute::Responses,
+            ]
+        );
+        assert_ne!(body.content(), old_content);
+        assert_eq!(
+            PolicyBody::read(&body.version(slug())).expect("typed route set reads"),
+            body
+        );
+    }
+
+    #[test]
+    fn buffered_response_routes_reject_duplicates_and_unknown_values() {
+        assert_eq!(
+            policy_body(tenant_scope(), 1).with_buffered_response_routes([
+                BufferedResponseRoute::Messages,
+                BufferedResponseRoute::Messages,
+            ]),
+            Err(InvalidBufferedResponseRoutes::Duplicate("messages"))
+        );
+
+        let unknown = edited(|fields| {
+            set(
+                fields,
+                BUFFERED_RESPONSE_ROUTES_FIELD,
+                CanonicalValue::set([CanonicalValue::string("chat_completions")]),
+            );
+        });
+        let error = PolicyBody::read(&unknown).expect_err("unknown routes fail closed");
+        assert!(matches!(
+            &error,
+            PolicyError::InvalidBufferedResponseRoutes {
+                source: InvalidBufferedResponseRoutes::Unsupported(route),
+                ..
+            } if route == "chat_completions"
+        ));
+        assert!(error.is_incompatible());
+    }
+
+    #[test]
+    fn buffered_response_route_changes_require_an_epoch_and_activate_live() {
+        let base = policy_body(tenant_scope(), 4);
+        let same_epoch = base
+            .clone()
+            .with_buffered_response_routes([BufferedResponseRoute::Messages])
+            .unwrap();
+        assert_eq!(
+            base.transition(&same_epoch).reasons(),
+            &[TransitionReason::EpochNotAdvanced]
+        );
+
+        let changed = PolicyBody::new(
+            base.scope(),
+            base.epoch().next(),
+            *base.budget(),
+            *base.concurrency(),
+            *base.revocation(),
+        )
+        .with_buffered_response_routes([BufferedResponseRoute::Messages])
+        .unwrap();
+        assert_eq!(
+            base.transition(&changed).reasons(),
+            &[TransitionReason::BufferedResponseRoutesChanged]
+        );
+        assert!(base.transition(&changed).is_live());
     }
 
     #[test]
