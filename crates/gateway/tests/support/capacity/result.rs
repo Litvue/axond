@@ -134,6 +134,8 @@ impl ProfileEcho {
 #[derive(Debug, Clone, Serialize)]
 pub struct RunMeta {
     pub started_at_unix_ms: u128,
+    /// Whole milliseconds, rounding a positive sub-millisecond run up to one
+    /// so a retained record cannot confuse a real run with missing duration.
     pub elapsed_ms: u128,
     /// The harness, so an artifact from an older driver is recognisable.
     pub harness: &'static str,
@@ -170,9 +172,9 @@ pub(crate) fn duration_millis_ceil(duration: Duration) -> u128 {
 
 #[cfg(test)]
 mod run_meta_tests {
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
-    use super::duration_millis_ceil;
+    use super::{RunMeta, duration_millis_ceil};
 
     #[test]
     fn whole_millisecond_artifacts_retain_positive_sub_millisecond_durations() {
@@ -182,6 +184,10 @@ mod run_meta_tests {
         assert_eq!(
             duration_millis_ceil(Duration::from_millis(1) + Duration::from_nanos(1)),
             2
+        );
+        assert_eq!(
+            RunMeta::for_harness("test harness", UNIX_EPOCH, Duration::from_nanos(1)).elapsed_ms,
+            1
         );
     }
 }

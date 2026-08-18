@@ -25,7 +25,6 @@ use super::result::{
     Classification, Cleanup, Deadline, Environment, FaultResult, Finding, Injection, Leakage,
     Outage, Retries, RowEcho, RunMeta, Surface, Telemetry, Timing, UsageOutcome, Verdict,
 };
-use crate::support::capacity::result::duration_millis_ceil;
 use crate::support::gateway::{self, Axond, GATEWAY_KEY, Options, alias};
 use crate::support::upstream::{FakeUpstream, target};
 
@@ -376,7 +375,7 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
             outage,
             timing: Timing {
                 started_at_unix_ms: started_at,
-                elapsed_ms: duration_millis_ceil(elapsed),
+                elapsed_ms: elapsed.as_millis(),
                 first_byte_ms: observed.first_byte_ms,
             },
         },
@@ -394,7 +393,7 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
             bound: wiring.bound.to_owned(),
             bound_ms: wiring.bound_ms,
             wall_clock_ms: row.deadline_ms,
-            elapsed_ms: duration_millis_ceil(elapsed),
+            elapsed_ms: elapsed.as_millis(),
         },
         retries: Retries {
             attempts,
