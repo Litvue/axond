@@ -164,8 +164,13 @@ resolution rather than by convention
   gateway is a shared trust domain for availability (a noisy tenant can consume
   connections) even though credentials are isolated. Per-tenant budgets bound
   the *cost* of that, not the concurrency.
-- **The gateway is not a WAF.** Request bodies are forwarded to the provider
-  essentially untouched; content policy is the provider's.
+- **The gateway is not a semantic WAF.** Without an activated content policy,
+  request bodies remain essentially provider-owned. An explicit `axond.redact`
+  policy may block configured deterministic patterns or replace them with a
+  namespace-separated placeholder before dispatch and restore only values
+  generated during that request. It does not classify intent, call an external
+  judge, or make an unconfigured provider policy into a gateway guarantee; see
+  [ADR 0060](./adr/0060-request-path-middleware.md).
 - **Transport out is TLS** via `rustls` with webpki roots; `sslmode=require`
   turns on TLS to Postgres. Inbound TLS is deliberately not axond's job — put it
   behind an ingress or a service mesh.

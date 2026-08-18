@@ -1375,10 +1375,17 @@ async fn policy_middleware_is_typed_and_failed_publication_does_not_advance() {
         .await;
     let mut registered = policy_document();
     registered["resource"]["content_middleware"] = json!([{
-        "id": "test.policy-marker",
+        "id": "axond.redact",
         "scopes": ["request", "response", "stream_event"],
         "failure_posture": "fail_closed",
         "max_duration_milliseconds": 25,
+        "guardrail": {
+            "key_env": "GW_GUARDRAIL_KEY",
+            "rules": [
+                {"id": "deny", "pattern": "forbidden", "action": "block"},
+                {"id": "email", "pattern": "[a-z]+@example\\.com", "action": "redact"}
+            ]
+        }
     }]);
     let revision = deployment
         .publish("/policies", "registered", &expected, &registered)
@@ -1398,6 +1405,27 @@ async fn policy_middleware_is_typed_and_failed_publication_does_not_advance() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["type"], "validation_failed");
     assert_eq!(body["error"]["rule"], "content_middleware_unavailable");
+
+    let mut fail_open_redaction = registered.clone();
+    fail_open_redaction["resource"]["epoch"] = json!(2);
+    fail_open_redaction["resource"]["content_middleware"][0]["failure_posture"] =
+        json!("fail_open");
+    let (status, body) = deployment
+        .post(
+            "/policies",
+            "fail-open-redaction",
+            &revision,
+            &fail_open_redaction,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "admin_request_invalid");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires failure posture `fail_closed`")
+    );
 
     let mut core_stage = policy_document();
     core_stage["resource"]["epoch"] = json!(2);

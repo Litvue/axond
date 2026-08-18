@@ -134,6 +134,11 @@ struct OpenAiStreamDecoder {
 impl ProviderStreamDecoder for OpenAiStreamDecoder {
     fn decode(&mut self, event: SseEvent) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
         if event.data.trim() == "[DONE]" {
+            if self.surface == Surface::Responses && event.event.is_some() {
+                return Err(ProviderError::invalid_stream(
+                    "Responses [DONE] sentinel must be a data-only SSE event",
+                ));
+            }
             self.done = true;
             return Ok(vec![ProviderStreamEvent::Done(self.usage)]);
         }
@@ -147,6 +152,41 @@ impl ProviderStreamDecoder for OpenAiStreamDecoder {
                 .to_owned();
             return Err(ProviderError::rate_limited_stream(message));
         }
+        let data_type = data.get("type").and_then(Value::as_str);
+        if self.surface == Surface::Responses {
+            let data_type = data_type.ok_or_else(|| {
+                ProviderError::invalid_stream("Responses SSE event is missing data.type")
+            })?;
+            if event
+                .event
+                .as_deref()
+                .is_some_and(|event_name| event_name != data_type)
+            {
+                return Err(ProviderError::invalid_stream(
+                    "Responses SSE event name disagrees with data.type",
+                ));
+            }
+        }
+        let event_name = match self.surface {
+            Surface::ChatCompletions => event.event,
+            Surface::Responses => event.event.or_else(|| data_type.map(str::to_owned)),
+        };
+        let semantic_completed = data_type == Some("response.completed");
+        if semantic_completed {
+            let response = data
+                .get("response")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    ProviderError::invalid_stream(
+                        "response.completed is missing its completed response object",
+                    )
+                })?;
+            if response.get("status").and_then(Value::as_str) != Some("completed") {
+                return Err(ProviderError::invalid_stream(
+                    "response.completed is missing status=completed",
+                ));
+            }
+        }
         let usage = match self.surface {
             Surface::ChatCompletions => data.get("usage"),
             Surface::Responses => data
@@ -156,17 +196,12 @@ impl ProviderStreamDecoder for OpenAiStreamDecoder {
         if let Some(usage) = usage.filter(|usage| usage.is_object()) {
             self.usage = chat_usage(usage);
         }
-        let event_name = match self.surface {
-            Surface::ChatCompletions => event.event,
-            Surface::Responses => event
-                .event
-                .or_else(|| data.get("type").and_then(Value::as_str).map(str::to_owned)),
-        };
         let data_event = ProviderStreamEvent::Data {
             event: event_name,
             data,
         };
         if self.surface == Surface::Responses
+            && semantic_completed
             && matches!(
                 &data_event,
                 ProviderStreamEvent::Data { event, .. }
@@ -365,7 +400,7 @@ mod tests {
                 event: None,
                 data: json!({
                     "type": "response.completed",
-                    "response": { "usage": {
+                    "response": { "status": "completed", "usage": {
                         "input_tokens": 20,
                         "output_tokens": 8,
                         "output_tokens_details": { "reasoning_tokens": 6 },
@@ -412,6 +447,116 @@ mod tests {
             events.as_slice(),
             [ProviderStreamEvent::Data { .. }]
         ));
+    }
+
+    #[test]
+    fn responses_stream_rejects_event_and_payload_type_disagreement() {
+        let mut decoder = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        let error = decoder
+            .decode(SseEvent {
+                event: Some("response.output_text.delta".to_owned()),
+                data: json!({
+                    "type": "response.function_call_arguments.delta",
+                    "delta": "provider-controlled"
+                })
+                .to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut terminal = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        let error = terminal
+            .decode(SseEvent {
+                event: Some("response.completed".to_owned()),
+                data: json!({"type": "response.in_progress"}).to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut malformed = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        let error = malformed
+            .decode(SseEvent {
+                event: Some("response.completed".to_owned()),
+                data: json!({"type": "response.completed"}).to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut missing_type = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        let error = missing_type
+            .decode(SseEvent {
+                event: Some("response.completed".to_owned()),
+                data: json!({"response": {"id": "resp_1"}}).to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut missing_delta_type = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        let error = missing_delta_type
+            .decode(SseEvent {
+                event: Some("response.output_text.delta".to_owned()),
+                data: json!({
+                    "item_id": "item_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "[AXOND:provider-controlled]"
+                })
+                .to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut missing_status = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        let error = missing_status
+            .decode(SseEvent {
+                event: Some("response.completed".to_owned()),
+                data: json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_1"}
+                })
+                .to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+    }
+
+    #[test]
+    fn responses_stream_rejects_named_done_but_preserves_data_only_sentinel() {
+        let mut named = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        let error = named
+            .decode(SseEvent {
+                event: Some("provider.fake".to_owned()),
+                data: "[DONE]".to_owned(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut data_only = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        assert_eq!(
+            data_only
+                .decode(SseEvent {
+                    event: None,
+                    data: "[DONE]".to_owned(),
+                })
+                .unwrap(),
+            vec![ProviderStreamEvent::Done(ModelUsage::default())]
+        );
     }
 
     #[test]

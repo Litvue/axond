@@ -19,11 +19,12 @@ one.
 
 ## Context
 
-Nothing in the gateway can observe or alter the content of a request. Two modules
-in `gateway-core` — `guardrail` and `governance` — describe exactly such a
-feature, are exported from the crate root, and have no call site anywhere in the
-gateway. They date from the initial scaffold and were never wired. The capability
-an operator actually asks for is broader than either: redact before a provider
+Nothing in the gateway could observe or alter the content of a request. Two
+initial-scaffold modules in `gateway-core` — `guardrail` and `governance` —
+described parts of such a feature and had no call site. This decision wires the
+guardrail behavior through the middleware seam and removes the dead governance
+module rather than preserving two competing, unowned policy abstractions. The
+capability an operator actually asks for is broader than either: redact before a provider
 sees a prompt and restore the masking in the answer, refuse a prompt outright,
 inject defaults, filter tool definitions, cache semantically. Writing one of them
 as a bespoke hook would put the seam question off by exactly one feature.
@@ -96,11 +97,10 @@ credential except through what it is handed.
 
 **Scopes are declared, not inferred.** The contract reserves `Request` (once,
 on the parsed body, before the failover walk), `Response` (once, on a buffered
-`ProviderResponse`), and `StreamEvent` (per relayed event). The first runtime
-slice invokes `Request` only. Registration rejects `Response` and `StreamEvent`
-instead of accepting an inert declaration; those scopes become activatable only
-when their invocation paths land. `Attempt` scope — inside the failover walk,
-per target — is deliberately **not** in this decision: a body mutated
+`ProviderResponse`), and `StreamEvent` (per decoded data event, followed by one
+payload-free successful-stream finalizer). All three scopes are operational.
+`Attempt` scope — inside the failover walk, per target — is deliberately **not**
+in this decision: a body mutated
 differently per attempt would make any request-scoped state, a redaction map
 above all, disagree with the attempt that served. Adding it later is an additive
 change to a registration enum; getting it wrong now would be a correctness bug
@@ -159,6 +159,25 @@ fields such as `core_stages` are rejected while the document is validated.
 buffered provider response runs `Response` scopes once in reverse registration
 order. A stream runs `StreamEvent` scopes on decoded data events, also in reverse
 order; terminal provider usage remains gateway-owned and is never mutable.
+Responses completion requires matching SSE/data discriminators, a response
+object, and `status: "completed"`; Native Messages completion requires one
+ordered `message_start`, balanced content-block lifecycles, one or more valid
+`message_delta` events including a concrete terminal stop reason, and then
+`message_stop`. Matched-discriminator extension
+events remain byte-faithful but cannot advance lifecycle state. Native block
+identity binds `text_delta` declassification to a declared `text` block;
+`citations_delta` remains valid on that block but never enters the text
+restoration path. A thinking block must receive exactly one terminal
+`signature_delta` before it closes, with no later block delta. After that
+semantic terminal event, strict SSE/UTF-8 and
+provider-decoder EOF checks run, then the same scopes receive one payload-free
+finalizer in reverse order. Only a successful finalizer permits reconstructed or
+validated buffered bytes and the normal terminal marker to be released.
+Truncation, malformed or post-terminal data, transport failure, timeout,
+cancellation, and client hangup never masquerade as successful finalization. A
+finalizer failure emits the route's
+`middleware_stream_error`; incrementally re-emitted deltas already delivered stay
+delivered, but the error precedes `[DONE]`.
 `Response` scope alone is therefore intentionally inactive for `stream: true`;
 snapshot compilation warns once with the namespace and middleware id for every
 such registration so an operator cannot mistake phase selection for streaming
@@ -214,15 +233,19 @@ refusal discipline: a typed error, a stable caller-facing reason that never
 echoes the body, and no usage event when nothing reached a provider.
 
 Stream-event scope invokes one synchronous callback for every decoded data
-event. Events within one stream remain serial so state and wire order cannot
-race, while independent streams use the bounded blocking capacity concurrently;
-there is no replica-wide stream-event lock. This deliberately pays one bounded
-dispatch per event instead of batching events and changing mutation or refusal
-boundaries. Before activating a stream-event implementation, operators qualify
-its worst-case event rate and concurrent streams against the 64 replica slots,
-four per-id slots, and its declared end-to-end duration. The deterministic
-capacity test exercises concurrent streams through a saturated runtime and
-proves queued events drain without exceeding either ownership bound.
+event plus one successful-stream finalizer. Events and finalization within one
+stream remain serial so state and wire order cannot race, while independent
+streams use the bounded blocking capacity concurrently; there is no replica-wide
+stream-event lock. The finalizer uses the same process and per-id semaphores,
+declared timeout, cancellation guard, quarantine, stranded-state rules, and
+failure posture as an event callback, and is at most once even if terminal phases
+are polled repeatedly. This deliberately pays one bounded dispatch per event
+instead of batching events and changing mutation or refusal boundaries. Before
+activating a stream-event implementation, operators qualify its worst-case event
+rate and concurrent streams against the 64 replica slots, four per-id slots, and
+its declared end-to-end duration. The deterministic capacity test exercises
+concurrent streams through a saturated runtime and proves queued events drain
+without exceeding either ownership bound.
 
 Operators distinguish a slow implementation from provider latency through
 `axond.middleware.capacity_wait` and
@@ -247,12 +270,17 @@ against it — including its multi-turn problem, which is solved by deterministi
 keyed placeholders (`HMAC(namespace_key, secret)` truncated into a stable token)
 rather than a session-scoped mapping table, so a client echoing masked text back
 on the next turn re-masks identically and the gateway stays stateless by default
-([ADR 0002](./0002-stateless-by-default-stateful-by-opt-in.md)). The rate-limit
-permit and budget hold move into the chain next, once the response-lifetime
-ownership has been exercised by real traffic. Authentication moves last, or not at
-all: it is the highest-risk and lowest-payoff member of the set, and uniformity is
-not worth purchasing with a subtle regression in the one stage that must fail
-closed.
+([ADR 0002](./0002-stateless-by-default-stateful-by-opt-in.md)). This stability is
+an intentional disclosure tradeoff: providers see the tokens, equal values in one
+namespace produce equal tokens, and a same-namespace chosen-plaintext oracle can
+identify low-entropy values. Namespace-derived keys prevent comparison across
+namespaces. Operators must use separate namespaces where callers must not share
+equality and must not treat redaction as protection against guessing low-entropy
+secrets. The rate-limit permit and budget hold move into the chain next, once the
+response-lifetime ownership has been exercised by real traffic. Authentication
+moves last, or not at all: it is the highest-risk and lowest-payoff member of the
+set, and uniformity is not worth purchasing with a subtle regression in the one
+stage that must fail closed.
 
 ### State tier
 
@@ -283,10 +311,84 @@ after rollout, every new process computes the new identity.
 
 ## Consequences
 
-The request path gains a place where content policy belongs, and the two dead
-modules in `gateway-core` become either the first middleware or deleted code —
-`RegexGuardrail` is a reasonable inbound matcher and has no notion of the response
-half, so it is a starting point and not the design.
+The request path gains a place where content policy belongs. The old inbound-only
+guardrail scaffold becomes the first production middleware, `axond.redact`:
+block rules refuse before dispatch, while redaction rules replace matches with
+deterministic keyed placeholders and keep the reversible mapping only in the
+request's response-lifetime state. Buffered and stream-event scopes restore only
+placeholders generated by that request, including placeholders split across
+decoded display-text events. Restoration is route-aware and allowlisted to the
+documented Chat, Messages, and Responses display-text fields. Structured tool
+arguments, URL fields, names, identifiers, metadata, and protocol controls never
+receive declassification. Display text itself is an explicit trust boundary: a
+provider can place a token inside Markdown, HTML, a URL-looking substring, or an
+instruction in an otherwise valid display string, and Axond restores it there.
+Callers must treat restored display text as untrusted model output and must not
+auto-fetch, execute, or render it in a privileged context. Preserving useful
+round-trip prose while preventing every semantic relocation inside prose is not
+possible at this JSON boundary; deployments that cannot accept that boundary
+must use block-only policy or disable redaction. Carry is keyed by the provider's
+semantic output identity plus typed structural paths, so distinct choices,
+content blocks, or Responses items cannot combine fragments and object key `"0"`
+cannot alias array index `0`. At successful
+finalization, a strict prefix of a concrete generated placeholder fails closed;
+unrelated AXOND-like text is preserved. Errors and cancellation discard carry
+rather than flushing it, and dropping the response-lifetime owner explicitly
+zeroizes originals and carry. Request-lifetime redaction state fails closed
+above 4,096 distinct original values. Stream restoration likewise retains at
+most 4,096 carry channels, 1 MiB of aggregate carry-key identity, and 64 KiB of
+aggregate carry prefixes; these fixed ceilings bound provider-controlled
+channel cardinality and identity length independently of the rendered-byte
+limit.
+
+The gateway supplies this trusted identity through `MiddlewareSurface` and
+`Middleware::apply_for_surface`; `DeterministicGuardrail` rejects an invocation
+whose surface is absent rather than inferring one from provider-controlled JSON.
+
+Root `model` and `stream` remain routing-owned and are excluded from mutation.
+Direct rewriting is limited to route-specific prompt-bearing fields such as
+message content, instructions, input text, descriptions, and serialized tool
+arguments. Every matching string outside that allowlist—including roles, types,
+reasoning controls, tool names, identifiers, locators, metadata, and future
+fields whose semantics are unknown—refuses atomically instead of silently
+changing provider protocol behavior. Other caller-controlled channels that
+reach the provider but cannot safely be rewritten—JSON member names, root
+`previous_response_id`, and forwarded native wire headers—follow the same
+refusal rule. Protected header/continuation fragments are also checked against
+each other and the untouched body, in both directions, so moving part of a match
+outside JSON cannot bypass policy. Each route canonicalizes both the complete
+provider-wire string sequence and its semantic prompt-text sequence before
+mutation. The first keeps
+URL, file/media, and protocol-control strings in scope; the second keeps text on
+either side of non-text media adjacent. A match crossing either sequence refuses
+rather than allowing structural splitting to bypass policy. Identically named
+nested routing fields are content and remain covered. Malformed `stream` and
+`previous_response_id` controls are rejected before middleware or provider
+dispatch.
+
+This deliberately removes the exported `Governance` scaffold and the legacy
+inbound-only `Guardrail`/`RegexGuardrail` API instead of leaving unused policy
+engines beside the production path. Downstream `gateway-core` users must move
+content inspection to `DeterministicGuardrail` through the `Middleware` contract
+and keep admission/rate-limit governance in the gateway enforcement layer. That
+is an intentional pre-1.0 Rust API break: it requires the reviewed compatibility
+override and a 0.4.0 minor release, not a 0.3.x patch release.
+
+`axond.redact` is valid only with `FailClosed`; both administrative publication
+and snapshot compilation reject any other posture. Durable policy stores regexes
+and a versioned key reference, never key material. A replica derives the
+namespace key before compiling the chain, making placeholders stable for the
+same secret and namespace while separating namespaces. Missing or malformed key references,
+invalid or empty-matching regexes, and non-fail-closed declarations preserve the
+last-known-good serving snapshot by failing compilation. The encrypted compiled
+cache binds that reference to a non-secret fingerprint of the resolved namespace
+key; changing a referenced environment value in place refuses cold recovery.
+Rotation therefore publishes a new policy naming a new environment-variable
+reference, which makes the identity change explicit in the revision.
+The compiled-serving payload moves to layout v4 and is not restored across the
+layout boundary in either direction. During the v0.4.0 rollout, every new
+replica must reach the control plane and SecretStore once, compile the admitted
+revision, and write its v4 cache before its PVC is qualified for outage recovery.
 
 The `serve()` function grows a chain invocation and a second bounds check, and
 the token estimate stops being derivable from the request as it arrived on the

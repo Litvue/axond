@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
@@ -252,10 +252,15 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
     fn decode(&mut self, event: SseEvent) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
         let data: Value = serde_json::from_str(&event.data)
             .map_err(|error| ProviderError::invalid_stream(error.to_string()))?;
-        let kind = event
-            .event
-            .as_deref()
-            .or_else(|| data.get("type").and_then(Value::as_str));
+        let data_type = data.get("type").and_then(Value::as_str);
+        if let (Some(event_name), Some(data_type)) = (event.event.as_deref(), data_type)
+            && event_name != data_type
+        {
+            return Err(ProviderError::invalid_stream(
+                "Anthropic SSE event name disagrees with data.type",
+            ));
+        }
+        let kind = event.event.as_deref().or(data_type);
         match kind {
             Some("message_start") => {
                 merge_anthropic_usage(
@@ -451,6 +456,16 @@ pub fn native_message_usage(response: &Value) -> ModelUsage {
 pub struct NativeMessagesDecoder {
     usage: ModelUsage,
     done: bool,
+    started: bool,
+    message_delta_seen: bool,
+    terminal_delta_seen: bool,
+    seen_content_blocks: BTreeSet<u64>,
+    open_content_blocks: BTreeMap<u64, NativeContentBlockState>,
+}
+
+struct NativeContentBlockState {
+    block_type: String,
+    thinking_signature_seen: bool,
 }
 
 impl NativeMessagesDecoder {
@@ -461,12 +476,22 @@ impl NativeMessagesDecoder {
 
 impl ProviderStreamDecoder for NativeMessagesDecoder {
     fn decode(&mut self, event: SseEvent) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+        if self.done {
+            return Err(ProviderError::invalid_stream(
+                "native Messages event arrived after message_stop",
+            ));
+        }
         let data: Value = serde_json::from_str(&event.data)
             .map_err(|error| ProviderError::invalid_stream(error.to_string()))?;
-        let kind = event
-            .event
-            .clone()
-            .or_else(|| data.get("type").and_then(Value::as_str).map(str::to_owned));
+        let data_type = data.get("type").and_then(Value::as_str);
+        if let (Some(event_name), Some(data_type)) = (event.event.as_deref(), data_type)
+            && event_name != data_type
+        {
+            return Err(ProviderError::invalid_stream(
+                "native Messages SSE event name disagrees with data.type",
+            ));
+        }
+        let kind = event.event.clone().or_else(|| data_type.map(str::to_owned));
         if is_rate_limit_payload(&data) {
             return Err(ProviderError::rate_limited_stream(
                 data.pointer("/error/message")
@@ -476,11 +501,132 @@ impl ProviderStreamDecoder for NativeMessagesDecoder {
             ));
         }
         match kind.as_deref() {
-            Some("message_start") => merge_anthropic_usage(
-                &mut self.usage,
-                data.pointer("/message/usage").unwrap_or(&Value::Null),
-            ),
+            Some("message_start") => {
+                if data_type != Some("message_start")
+                    || self.started
+                    || !data.get("message").is_some_and(Value::is_object)
+                    || data
+                        .pointer("/message/usage")
+                        .is_some_and(|usage| !usage.is_object())
+                {
+                    return Err(ProviderError::invalid_stream(
+                        "invalid or duplicate native Messages message_start",
+                    ));
+                }
+                self.started = true;
+                merge_anthropic_usage(
+                    &mut self.usage,
+                    data.pointer("/message/usage").unwrap_or(&Value::Null),
+                );
+            }
+            Some("content_block_start") => {
+                let index = data.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    ProviderError::invalid_stream(
+                        "native Messages content_block_start is missing index",
+                    )
+                })?;
+                let block_type = data
+                    .pointer("/content_block/type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::invalid_stream(
+                            "native Messages content_block_start is missing block type",
+                        )
+                    })?;
+                if data_type != Some("content_block_start")
+                    || !self.started
+                    || self.message_delta_seen
+                    || !data.get("content_block").is_some_and(Value::is_object)
+                    || !native_block_start_payload_valid(block_type, &data)
+                    || self.seen_content_blocks.contains(&index)
+                {
+                    return Err(ProviderError::invalid_stream(
+                        "native Messages content block started out of sequence",
+                    ));
+                }
+                self.seen_content_blocks.insert(index);
+                self.open_content_blocks.insert(
+                    index,
+                    NativeContentBlockState {
+                        block_type: block_type.to_owned(),
+                        thinking_signature_seen: false,
+                    },
+                );
+            }
+            Some("content_block_delta") => {
+                let index = data.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    ProviderError::invalid_stream(
+                        "native Messages content_block_delta is missing index",
+                    )
+                })?;
+                let delta_type = data
+                    .pointer("/delta/type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::invalid_stream(
+                            "native Messages content_block_delta is missing delta type",
+                        )
+                    })?;
+                let block = self.open_content_blocks.get_mut(&index).ok_or_else(|| {
+                    ProviderError::invalid_stream(
+                        "native Messages content_block_delta targets an unopened block",
+                    )
+                })?;
+                if data_type != Some("content_block_delta")
+                    || !self.started
+                    || self.message_delta_seen
+                    || !data.get("delta").is_some_and(Value::is_object)
+                    || !native_delta_matches_block(&block.block_type, delta_type)
+                    || !native_delta_payload_valid(delta_type, &data)
+                    || (block.block_type == "thinking" && block.thinking_signature_seen)
+                {
+                    return Err(ProviderError::invalid_stream(
+                        "native Messages content block delta arrived out of sequence",
+                    ));
+                }
+                if block.block_type == "thinking" && delta_type == "signature_delta" {
+                    block.thinking_signature_seen = true;
+                }
+            }
+            Some("content_block_stop") => {
+                let index = data.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    ProviderError::invalid_stream(
+                        "native Messages content_block_stop is missing index",
+                    )
+                })?;
+                let block = self.open_content_blocks.remove(&index);
+                if data_type != Some("content_block_stop")
+                    || !self.started
+                    || self.message_delta_seen
+                    || block.is_none()
+                    || block.as_ref().is_some_and(|block| {
+                        block.block_type == "thinking" && !block.thinking_signature_seen
+                    })
+                {
+                    return Err(ProviderError::invalid_stream(
+                        "native Messages content block stopped out of sequence",
+                    ));
+                }
+            }
             Some("message_delta") => {
+                if data_type != Some("message_delta")
+                    || !self.started
+                    || self.terminal_delta_seen
+                    || !self.open_content_blocks.is_empty()
+                    || !data.get("delta").is_some_and(Value::is_object)
+                    || data.get("usage").is_some_and(|usage| !usage.is_object())
+                    || !data
+                        .pointer("/delta/stop_reason")
+                        .is_some_and(|value| value.is_null() || value.is_string())
+                {
+                    return Err(ProviderError::invalid_stream(
+                        "native Messages message_delta arrived out of sequence",
+                    ));
+                }
+                self.message_delta_seen = true;
+                self.terminal_delta_seen |= data
+                    .pointer("/delta/stop_reason")
+                    .is_some_and(Value::is_string);
                 merge_anthropic_usage(&mut self.usage, data.get("usage").unwrap_or(&Value::Null))
             }
             Some("error") => {
@@ -491,9 +637,30 @@ impl ProviderStreamDecoder for NativeMessagesDecoder {
                         .to_owned(),
                 ));
             }
-            _ => {}
+            Some("message_stop") if data_type == Some("message_stop") => {}
+            Some("ping") if event.event.as_deref() == Some("ping") && data_type == Some("ping") => {
+            }
+            Some(extension)
+                if event.event.as_deref() == Some(extension) && data_type == Some(extension) =>
+            {
+                // Anthropic may add event types under its versioning policy.
+                // A fully matched discriminator pair is safe to relay, but it
+                // cannot mutate lifecycle state or establish completion.
+            }
+            Some(_) | None => {
+                return Err(ProviderError::invalid_stream(
+                    "unsupported or discriminator-less native Messages event",
+                ));
+            }
         }
-        let terminal = kind.as_deref() == Some("message_stop");
+        let terminal = kind.as_deref() == Some("message_stop") && data_type == Some("message_stop");
+        if terminal
+            && (!self.started || !self.terminal_delta_seen || !self.open_content_blocks.is_empty())
+        {
+            return Err(ProviderError::invalid_stream(
+                "native Messages message_stop arrived before a complete message sequence",
+            ));
+        }
         let mut events = vec![ProviderStreamEvent::Data { event: kind, data }];
         if terminal && !self.done {
             self.done = true;
@@ -508,6 +675,65 @@ impl ProviderStreamDecoder for NativeMessagesDecoder {
         }
         self.done = true;
         Ok(vec![ProviderStreamEvent::Done(self.usage)])
+    }
+}
+
+fn native_delta_matches_block(block_type: &str, delta_type: &str) -> bool {
+    match block_type {
+        "text" => matches!(delta_type, "text_delta" | "citations_delta"),
+        "tool_use" | "server_tool_use" => delta_type == "input_json_delta",
+        "thinking" => matches!(delta_type, "thinking_delta" | "signature_delta"),
+        "redacted_thinking" | "fallback" => false,
+        // Unknown future non-text blocks may define their own deltas. They are
+        // byte-faithful but can never claim the text declassification channel.
+        _ => delta_type != "text_delta",
+    }
+}
+
+fn native_block_start_payload_valid(block_type: &str, data: &Value) -> bool {
+    match block_type {
+        "text" => data
+            .pointer("/content_block/text")
+            .and_then(Value::as_str)
+            .is_some_and(str::is_empty),
+        "tool_use" | "server_tool_use" => {
+            data.pointer("/content_block/id")
+                .is_some_and(Value::is_string)
+                && data
+                    .pointer("/content_block/name")
+                    .is_some_and(Value::is_string)
+                && data
+                    .pointer("/content_block/input")
+                    .is_some_and(Value::is_object)
+        }
+        "thinking" => {
+            data.pointer("/content_block/thinking")
+                .is_some_and(Value::is_string)
+                && data
+                    .pointer("/content_block/signature")
+                    .is_some_and(Value::is_string)
+        }
+        _ => true,
+    }
+}
+
+fn native_delta_payload_valid(delta_type: &str, data: &Value) -> bool {
+    match delta_type {
+        "text_delta" => data.pointer("/delta/text").is_some_and(Value::is_string),
+        "citations_delta" => data
+            .pointer("/delta/citation")
+            .is_some_and(Value::is_object),
+        "input_json_delta" => data
+            .pointer("/delta/partial_json")
+            .is_some_and(Value::is_string),
+        "thinking_delta" => data
+            .pointer("/delta/thinking")
+            .is_some_and(Value::is_string),
+        "signature_delta" => data
+            .pointer("/delta/signature")
+            .and_then(Value::as_str)
+            .is_some_and(|signature| !signature.is_empty()),
+        _ => true,
     }
 }
 
@@ -1145,7 +1371,7 @@ mod tests {
         let thinking = json!({
             "type": "content_block_start",
             "index": 0,
-            "content_block": { "type": "thinking", "thinking": "why", "signature": "sig-1" }
+            "content_block": { "type": "thinking", "thinking": "why", "signature": "" }
         });
         let upstream = vec![
             json!({ "type": "message_start", "message": { "usage": {
@@ -1154,6 +1380,11 @@ mod tests {
                 "cache_creation_input_tokens": 2
             }}}),
             thinking.clone(),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig-1"}
+            }),
             json!({ "type": "content_block_stop", "index": 0 }),
             json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": {
                 "output_tokens": 9
@@ -1176,6 +1407,7 @@ mod tests {
         // The signed thinking block survives untouched, which is the whole point
         // of serving the native wire rather than translating it.
         assert_eq!(forwarded[1]["content_block"], thinking["content_block"]);
+        assert_eq!(forwarded[2]["delta"]["signature"], "sig-1");
         assert_eq!(
             events.last(),
             Some(&ProviderStreamEvent::Done(ModelUsage {
@@ -1212,5 +1444,440 @@ mod tests {
                 ..ModelUsage::default()
             })]
         );
+    }
+
+    #[test]
+    fn native_stream_rejects_event_and_payload_type_disagreement() {
+        let mut adapted = AnthropicAdapter::new()
+            .stream_decoder(Surface::ChatCompletions)
+            .unwrap();
+        let error = adapted
+            .decode(SseEvent {
+                event: Some("message_stop".to_owned()),
+                data: json!({"type": "content_block_delta"}).to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut decoder = NativeMessagesDecoder::new();
+        let error = decoder
+            .decode(SseEvent {
+                event: Some("content_block_delta".to_owned()),
+                data: json!({
+                    "type": "message_stop",
+                    "delta": {"type": "text_delta", "text": "provider-controlled"}
+                })
+                .to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut terminal = NativeMessagesDecoder::new();
+        let error = terminal
+            .decode(SseEvent {
+                event: Some("message_stop".to_owned()),
+                data: json!({"type": "message_delta"}).to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+    }
+
+    #[test]
+    fn native_stream_rejects_premature_or_incomplete_terminal_sequences() {
+        let mut premature = NativeMessagesDecoder::new();
+        let error = premature
+            .decode(sse(json!({"type": "message_stop"})))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut open_block = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {"usage": {}}}),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        ] {
+            open_block.decode(sse(event)).unwrap();
+        }
+        let error = open_block
+            .decode(sse(json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {}
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut missing_delta = NativeMessagesDecoder::new();
+        missing_delta
+            .decode(sse(json!({
+                "type": "message_start",
+                "message": {"usage": {}}
+            })))
+            .unwrap();
+        let error = missing_delta
+            .decode(sse(json!({"type": "message_stop"})))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut null_stop_reason = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {}}),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": null}
+            }),
+        ] {
+            null_stop_reason.decode(sse(event)).unwrap();
+        }
+        let error = null_stop_reason
+            .decode(sse(json!({"type": "message_stop"})))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut reused_block = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {"usage": {}}}),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            json!({"type": "content_block_stop", "index": 0}),
+        ] {
+            reused_block.decode(sse(event)).unwrap();
+        }
+        let error = reused_block
+            .decode(sse(json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut malformed_block = NativeMessagesDecoder::new();
+        malformed_block
+            .decode(sse(json!({
+                "type": "message_start",
+                "message": {"usage": {}}
+            })))
+            .unwrap();
+        let error = malformed_block
+            .decode(sse(json!({"type": "content_block_start", "index": 0})))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut nonempty_text_start = NativeMessagesDecoder::new();
+        nonempty_text_start
+            .decode(sse(json!({
+                "type": "message_start",
+                "message": {"usage": {}}
+            })))
+            .unwrap();
+        let error = nonempty_text_start
+            .decode(sse(json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "text",
+                    "text": "[AXOND:provider-controlled]"
+                }
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut confused_block = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {"usage": {}}}),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "lookup",
+                    "input": {}
+                }
+            }),
+        ] {
+            confused_block.decode(sse(event)).unwrap();
+        }
+        let error = confused_block
+            .decode(sse(json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "provider-controlled"}
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut unsigned_thinking = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {}}),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "reason"}
+            }),
+        ] {
+            unsigned_thinking.decode(sse(event)).unwrap();
+        }
+        let error = unsigned_thinking
+            .decode(sse(json!({"type": "content_block_stop", "index": 0})))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut malformed_signature = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {}}),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+            }),
+        ] {
+            malformed_signature.decode(sse(event)).unwrap();
+        }
+        let error = malformed_signature
+            .decode(sse(json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta"}
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut post_signature_delta = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {}}),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig-1"}
+            }),
+        ] {
+            post_signature_delta.decode(sse(event)).unwrap();
+        }
+        let error = post_signature_delta
+            .decode(sse(json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "late"}
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut cited_text = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {}}),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        ] {
+            cited_text.decode(sse(event)).unwrap();
+        }
+        assert!(matches!(
+            cited_text
+                .decode(sse(json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "citations_delta",
+                        "citation": {"type": "char_location", "start_char_index": 0}
+                    }
+                })))
+                .unwrap()
+                .as_slice(),
+            [ProviderStreamEvent::Data { .. }]
+        ));
+
+        let mut malformed_delta = NativeMessagesDecoder::new();
+        malformed_delta
+            .decode(sse(json!({
+                "type": "message_start",
+                "message": {"usage": {}}
+            })))
+            .unwrap();
+        let error = malformed_delta
+            .decode(sse(json!({
+                "type": "message_delta",
+                "usage": {}
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut malformed_usage = NativeMessagesDecoder::new();
+        let error = malformed_usage
+            .decode(sse(json!({
+                "type": "message_start",
+                "message": {"usage": 1}
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+        malformed_usage
+            .decode(sse(json!({"type": "message_start", "message": {}})))
+            .unwrap();
+        let error = malformed_usage
+            .decode(sse(json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": []
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+
+        let mut discriminatorless_extension = NativeMessagesDecoder::new();
+        let error = discriminatorless_extension
+            .decode(sse(json!({"type": "provider.future"})))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+        let mut missing_terminal_type = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {"usage": {}}}),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {}
+            }),
+        ] {
+            missing_terminal_type.decode(sse(event)).unwrap();
+        }
+        let error = missing_terminal_type
+            .decode(SseEvent {
+                event: Some("message_stop".to_owned()),
+                data: json!({}).to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+        assert!(matches!(
+            NativeMessagesDecoder::new()
+                .decode(SseEvent {
+                    event: Some("provider.future".to_owned()),
+                    data: json!({"type": "provider.future", "opaque": true}).to_string(),
+                })
+                .unwrap()
+                .as_slice(),
+            [ProviderStreamEvent::Data { .. }]
+        ));
+        assert!(matches!(
+            NativeMessagesDecoder::new()
+                .decode(SseEvent {
+                    event: Some("ping".to_owned()),
+                    data: json!({"type": "ping"}).to_string(),
+                })
+                .unwrap()
+                .as_slice(),
+            [ProviderStreamEvent::Data { .. }]
+        ));
+
+        let mut multiple_deltas = NativeMessagesDecoder::new();
+        let mut events = Vec::new();
+        for event in [
+            json!({"type": "message_start", "message": {}}),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": null}
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 2}
+            }),
+            json!({"type": "message_stop"}),
+        ] {
+            events.extend(multiple_deltas.decode(sse(event)).unwrap());
+        }
+        assert!(matches!(
+            events.last(),
+            Some(&ProviderStreamEvent::Done(ModelUsage {
+                output_tokens: 2,
+                ..
+            }))
+        ));
+
+        let mut post_terminal_delta = NativeMessagesDecoder::new();
+        for event in [
+            json!({"type": "message_start", "message": {}}),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"}
+            }),
+        ] {
+            post_terminal_delta.decode(sse(event)).unwrap();
+        }
+        let error = post_terminal_delta
+            .decode(sse(json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": null}
+            })))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(_)));
+    }
+
+    #[test]
+    fn native_stream_accepts_server_tool_input_json_deltas() {
+        let mut decoder = NativeMessagesDecoder::new();
+        let upstream = [
+            json!({"type": "message_start", "message": {"usage": {}}}),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {}
+                }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{\"query\":\"weather\"}"
+                }
+            }),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 1}
+            }),
+            json!({"type": "message_stop"}),
+        ];
+        let mut events = Vec::new();
+        for event in &upstream {
+            events.extend(decoder.decode(sse(event.clone())).unwrap());
+        }
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderStreamEvent::Data { .. }))
+                .count(),
+            upstream.len()
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Done(ModelUsage {
+                output_tokens: 1,
+                ..
+            }))
+        ));
     }
 }

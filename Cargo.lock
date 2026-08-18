@@ -90,6 +90,7 @@ dependencies = [
  "futures",
  "gateway-core",
  "gateway-transport",
+ "http-body",
  "http-body-util",
  "jsonwebtoken",
  "opentelemetry",
@@ -601,6 +602,9 @@ version = "0.3.40"
 dependencies = [
  "base64",
  "regex",
+ "regex-syntax",
+ "ring",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",

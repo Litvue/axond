@@ -55,6 +55,7 @@ read the maintainer-facing
 - [ ] Backup and restore procedures include schema/layout metadata and have been tested.
 - [ ] The [recovery objectives](../operations/backup-and-recovery.md#objectives) (RPO, RTO) are accepted or explicitly revised, and WAL archiving failures are alerted on.
 - [ ] A restore and a point-in-time recovery have been rehearsed against *your* backups, not only by [the drill](../operations/backup-and-recovery.md#the-drill).
+- [ ] Every persistent stateful ordinal has exported the compiled-serving cache layout required by the deployed release; after a cache-layout change, each ordinal was rebuilt with the control plane and SecretStore reachable before outage recovery was claimed.
 - [ ] Autoscaling does not accidentally multiply an in-memory budget or rate limit.
 - [ ] Per-replica `[admission]` ceilings x replica count is the concurrency the providers and the fleet can actually absorb.
 
@@ -67,6 +68,7 @@ read the maintainer-facing
 - [ ] `shutdown.deadline_ms` reflects how long callers are allowed to hold a stream, since streams open at the deadline are cut.
 - [ ] `axond.usage.records_dropped{axond.drop_reason="shutdown"}` is alerted on: it means records were lost at termination.
 - [ ] Mixed-version restrictions in the release's migration notes are respected.
+- [ ] After a compiled-serving cache-layout migration, the upgraded fleet passed a cold-start outage drill using only the new per-ordinal PVC records.
 
 ## Observability
 

@@ -477,7 +477,7 @@ many may be in flight at once.
 | `queue_capacity` | integer | `0` | Requests that may wait for capacity instead of being refused. `0` refuses immediately. |
 | `queue_wait_ms` | integer | `0` | How long a queued request waits before it is shed. Must be set together with `queue_capacity`, and queueing requires a finite `max_in_flight`. |
 | `max_stream_duration_ms` | integer | `3600000` | Total lifetime of one stream, however productive. Distinct from `transport.stream_idle_timeout_ms`, which bounds silence: this is the bound on a stream that never stops talking. Applies to a stream the caller is draining — see below. `0` disables. |
-| `max_stream_bytes` | integer | `67108864` | Bytes one stream may relay before it is ended. `0` disables. |
+| `max_stream_bytes` | integer | `67108864` | Raw upstream bytes one stream may relay before it is ended. `0` disables this configured ceiling. Reconstructed output from response-mutating middleware, and streams held for policy validation, still have a 64 MiB rendered-output safety ceiling. Ordinary and block-only OpenAI re-emission remains unlimited when this is `0`. |
 
 Except for `max_request_bytes`, `0` means "this ceiling is off".
 

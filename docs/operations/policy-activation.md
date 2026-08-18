@@ -36,6 +36,7 @@ during one.
 | The budget backend's DSN is **not** the control plane's | The revision journal is not request-path state | compare `[budget] dsn_env` with `[control_plane] dsn_env` |
 | Every replica runs a build that reads `axond.policy.v1` | A build that cannot read the body refuses the whole revision as skew | roll the binary out first |
 | Every `content_middleware` id is compiled into every replica, and every declared scope is supported | An unavailable implementation or unsupported combination cannot become a serving chain | roll the implementation out first; then publish its registration |
+| Every `axond.redact` entry is `fail_closed`, has a non-empty ordered rule set, and references a canonical padded-base64 32-byte key available on every replica | A missing key or fail-open redactor could expose caller content; key resolution is a snapshot-compile gate | provision the same secret reference on every replica before publication; compile/preflight the candidate and verify the old snapshot remains active on a negative drill |
 | Every guardrail intended to cover streaming declares `stream_event` as well as `response` | Scopes are execution phases; a response-only registration does not run for `stream: true` | snapshot compilation warns with the namespace and middleware id for every response-only registration; treat it as an intentional exception or add streaming coverage |
 | Each provider and proxy selected for non-mutating buffered `messages` / `responses` routes emits only policy-visible SSE blocks | Preserving original bytes requires fail-closed refusal of comments, blank heartbeat blocks, `id:`, `retry:`, unknown fields, and ambiguous duplicate-key JSON | replay the target's exact wire through qualification before adding it to `buffered_response_routes`; use a mutating/reconstructed stream posture if byte-faithful validation is incompatible |
 
@@ -128,6 +129,12 @@ A publication is as disruptive as its worst field.
 `messages` and `responses`. Absence is the backward-compatible empty set. A
 change requires an advanced policy epoch and is live: in-flight requests retain
 the snapshot they started under, while new admissions capture the new choice.
+
+For `axond.redact`, activating a new key or rule set is also live and
+snapshot-pinned. The compiler resolves the referenced key before cutover; a
+missing/malformed key or invalid guardrail refuses the candidate whole. Keep the
+previous key reference available for the lifetime of in-flight requests and for
+any signed last-known-good cache that may be restored during the rollout.
 
 ### Handing a namespace between scopes
 

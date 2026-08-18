@@ -55,7 +55,7 @@ use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::digest::SHA256;
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
-use secrecy::zeroize::Zeroize;
+use secrecy::zeroize::{Zeroize, Zeroizing};
 
 use crate::desired_state::canonical::CanonicalDecodeError;
 use crate::desired_state::revision::{ManifestEntry, RevisionManifest};
@@ -143,7 +143,7 @@ pub enum LastKnownGoodError {
 pub struct LastKnownGood {
     path: PathBuf,
     key: hmac::Key,
-    aead_key: [u8; 32],
+    aead_key: Zeroizing<[u8; 32]>,
 }
 
 /// Renders the path only: the signing material never reaches a log line.
@@ -167,18 +167,20 @@ impl LastKnownGood {
         if encoded.trim() != encoded {
             return Err(LastKnownGoodError::KeyWhitespace);
         }
-        let decoded = STANDARD
-            .decode(encoded)
-            .map_err(|_| LastKnownGoodError::KeyEncoding)?;
+        let decoded = Zeroizing::new(
+            STANDARD
+                .decode(encoded)
+                .map_err(|_| LastKnownGoodError::KeyEncoding)?,
+        );
         if decoded.len() != ENCODED_KEY_BYTES {
             return Err(LastKnownGoodError::KeyWrongLength {
                 bytes: decoded.len(),
             });
         }
-        if STANDARD.encode(&decoded) != encoded {
+        if STANDARD.encode(decoded.as_slice()) != encoded {
             return Err(LastKnownGoodError::KeyEncoding);
         }
-        Self::new(path, &decoded)
+        Self::new(path, decoded.as_slice())
     }
 
     /// A cache at `path`, authenticated with `key`.
@@ -193,7 +195,7 @@ impl LastKnownGood {
         Ok(Self {
             path: path.into(),
             key: hmac::Key::new(hmac::HMAC_SHA256, key),
-            aead_key: compiled_key(key),
+            aead_key: Zeroizing::new(compiled_key(key)),
         })
     }
 
@@ -239,7 +241,7 @@ impl LastKnownGood {
                 detail: "the operating system could not supply a nonce".to_owned(),
             });
         }
-        let unbound = UnboundKey::new(&aead::AES_256_GCM, &self.aead_key);
+        let unbound = UnboundKey::new(&aead::AES_256_GCM, self.aead_key.as_ref());
         let unbound = match unbound {
             Ok(unbound) => unbound,
             Err(_) => {
@@ -336,11 +338,13 @@ impl LastKnownGood {
                 path: self.compiled_path(),
             }
         })?;
-        let key = LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &self.aead_key).map_err(
-            |_| LastKnownGoodError::CompiledSignature {
-                path: self.compiled_path(),
-            },
-        )?);
+        let key = LessSafeKey::new(
+            UnboundKey::new(&aead::AES_256_GCM, self.aead_key.as_ref()).map_err(|_| {
+                LastKnownGoodError::CompiledSignature {
+                    path: self.compiled_path(),
+                }
+            })?,
+        );
         let mut plaintext = ciphertext.to_vec();
         let decrypted = key
             .open_in_place(
@@ -505,11 +509,12 @@ impl LastKnownGood {
 }
 
 const COMPILED_MAGIC: &[u8] = b"axond.compiled-serving\0";
-// Version 2 added the policy middleware projection; version 3 adds buffered
-// response-route policy. Keep this byte in lockstep with every payload shape
-// change: an older build must reject a newer cache before serde can ignore a
-// guardrail field it does not understand.
-const COMPILED_RECORD_VERSION: u8 = 3;
+// Version 2 added the policy middleware projection; version 3 added buffered
+// response-route policy; version 4 adds deterministic guardrail key references,
+// rules, and a non-secret resolved-key fingerprint. Keep this byte in lockstep
+// with every payload shape change: an older build must reject a newer cache
+// before serde can ignore a field it does not understand.
+const COMPILED_RECORD_VERSION: u8 = 4;
 
 fn compiled_key(key: &[u8]) -> [u8; 32] {
     let mut context = ring::digest::Context::new(&SHA256);

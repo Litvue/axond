@@ -10,11 +10,33 @@ Axond require that reasoning to be re-examined.
 
 - Callers trust Axond with prompts, completions, and an Axond credential.
 - Axond holds provider credentials and injects them only at transport dispatch.
+- When a namespace activates `axond.redact`, its provider receives deterministic
+  placeholders for matched content rather than the original values; restoration
+  state exists only for that request and is never written to telemetry or a
+  durable store.
 - Provider credentials are never returned by `/v1/models`,
   `/v1/credentials`, logs, usage rows, spans, or metrics.
 - Namespace configuration decides which credential pool a caller may use.
 - Redis/Postgres become admission dependencies only for the features explicitly
   configured to use them.
+
+`axond.redact` is deterministic pseudonymization, not protection against guessing
+low-entropy secrets. Providers see its tokens; equal values produce equal tokens
+within a namespace, permitting a same-namespace chosen-plaintext oracle. Derived
+namespace keys prevent cross-namespace comparison. Use separate namespaces where
+caller equality must not be shared. Restoration is bound to the authenticated
+route and limited to its known display-text fields; structured tool arguments,
+URL fields, identifiers, and other control data never receive declassification.
+Display text remains untrusted provider output: a token embedded in Markdown,
+HTML, URL-looking prose, or an instruction inside an allowed display string is
+restored. Clients must not auto-fetch, execute, or render restored model text in
+a privileged context. Use block-only policy or disable redaction if that trust
+boundary is unacceptable. Matches in caller-controlled JSON keys, continuation
+ids, forwarded native wire headers, or the canonical provider-visible text
+sequence across split fields/parts refuse before provider dispatch because those
+channels cannot be safely rewritten. Protected wire fragments are checked
+against each other and the body, so a match split across a header and JSON is
+also refused.
 
 ## Inbound authentication
 
@@ -31,6 +53,9 @@ operator view.
 TOML stores structure and references, never secret values.
 
 - Provider credentials and DSNs use environment-variable references.
+- Deterministic guardrail keys use versioned environment-variable references and
+  canonical padded-base64 32-byte values. Rotate by publishing a policy that
+  names a new reference; do not replace the value behind an existing reference.
 - Static gateway keys and verifier material may use environment references or
   supported mounted files.
 - Ed25519 public/private base64 tolerates surrounding whitespace where

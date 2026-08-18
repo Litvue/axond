@@ -162,8 +162,9 @@ credential resolution in
 `crates/gateway/src/credentials.rs`, header injection and failure description in
 `crates/gateway-transport/src/lib.rs`, a new `expose_secret` call site, a new
 `Debug`/`Display`/`Serialize` derive on a type that can reach one, rotation and
-versioning, and the text of any error, log, span, or metric that could carry a
-value rather than a reference.
+versioning, request-content redaction or restoration in
+`gateway-core::guardrail` and `crates/gateway/src/middleware.rs`, and the text of
+any error, log, span, or metric that could carry a value rather than a reference.
 
 **Regression tests.** Unformattability and reference opacity:
 `material_is_not_debuggable`, `references_are_opaque_and_versioned`, and
@@ -191,6 +192,27 @@ lifecycle: `one_secret_belongs_to_one_owner`,
 `one_version_of_a_secret_is_in_service_and_it_is_not_ambiguous`, and
 `a_revision_is_refused_before_publication_and_again_on_hydration`.
 
+Request-content redaction is held by
+`deterministic_redaction_round_trips_buffered_and_split_openai_sse_output`,
+`production_guardrail_is_stable_across_replicas_and_renames_and_restores_output`,
+`compiled_guardrail_policy_masks_real_routes_stably_across_turns_and_namespaces`,
+and `tokens_are_stable_within_one_namespace_and_separated_between_namespaces`:
+the provider receives a deterministic namespace-separated placeholder while the
+caller receives its original value. Split-output and failure behavior are held
+by `split_placeholder_is_restored_across_stream_events`,
+`split_placeholders_never_cross_provider_semantic_channels`,
+`native_transport_failure_discards_real_redaction_carry_and_buffered_content`,
+`responses_incomplete_redaction_token_fails_before_original_bytes_are_released`,
+`complete_nonterminal_eof_never_impersonates_successful_policy_finalization`,
+and `responses_done_sentinel_cannot_finalize_validated_passthrough_policy`.
+Route binding, unsafe control validation, and discriminator agreement are held
+by `restoration_is_route_bound_and_display_text_is_the_explicit_trust_boundary`,
+`malformed_responses_controls_never_reach_middleware_or_provider`,
+`responses_stream_rejects_event_and_payload_type_disagreement`, and
+`native_stream_rejects_event_and_payload_type_disagreement`.
+Pre-dispatch refusal and non-disclosure are held by
+`guardrail_refusal_dispatches_nothing_records_no_usage_and_echoes_no_match`.
+
 A new `expose_secret` call site is a review item in its own right: the security
 review counts them, so a PR that adds one says why the count changed. Boot- or
 compile-time failures must name the *reference* — the env-var or file name — and
@@ -210,6 +232,28 @@ change to the lifecycle relation or to what a reference discloses amends it.
 Making secret resolution reachable from the request path changes the availability
 argument and needs an ADR.
 
+[ADR 0060](../adr/0060-request-path-middleware.md) owns deterministic
+request-content redaction: key material is resolved only while compiling a
+snapshot, originals and stream carry are request-lifetime state that zeroizes on
+drop, and Native Messages or Responses buffering is explicit and fail closed.
+That state is bounded independently of body size: 4,096 distinct originals,
+4,096 carry channels, 1 MiB of aggregate carry identity, and 64 KiB of carry
+prefixes. Exceeding a bound refuses atomically; it does not release partially
+restored content or retain a partial state update.
+Changing the placeholder format, namespace derivation, routing-field exclusion,
+or restoration/finalization rules amends that ADR and this trigger's regression
+floor. The floor includes malicious token relocation into buffered and streamed
+tool arguments, matches in JSON member names/continuation ids/forwarded wire
+headers, split request fragments across fields or media parts, route-shape
+confusion, semantic stream-channel confusion, SSE event/data discriminator
+disagreement, Responses completion without `status: "completed"`, unbalanced or
+out-of-order Native Messages lifecycles, Native block/delta type confusion,
+malformed routing controls, and a
+Responses `[DONE]` sentinel arriving without `response.completed`. Display text is the documented
+declassification trust boundary: clients must treat restored prose as untrusted
+and never auto-fetch or execute provider-authored Markdown, HTML, URLs, or
+instructions.
+
 **Release impact.** A rotation or wrapping change is an operator procedure
 change: update the [minted-token guide](../minted-token-guide.md) for signer
 material and the [configuration reference](../configuration.md) for references,
@@ -222,6 +266,12 @@ revisions the new build stops reading, and record it in the
 [journal runbook](../operations/control-plane-journal.md) and
 [revision convergence](../operations/revision-convergence.md#resource-body-schemas)
 rather than only in the changelog.
+
+A guardrail key reference or placeholder-format change is also an operator
+procedure change. Document key provisioning and rotation, mixed-version and
+last-known-good behavior, and whether placeholders generated before the upgrade
+remain restorable. A format or namespace-derivation break requires a minor
+release even when no durable schema changes.
 
 ## 4. Catalogue and model entitlement
 

@@ -113,7 +113,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use gateway_core::{MiddlewareFailurePosture, MiddlewareScope};
+use gateway_core::{GuardrailAction, GuardrailRule, MiddlewareFailurePosture, MiddlewareScope};
 
 use super::canonical::{Canonical, CanonicalValue, Checksum};
 use super::ids::{InvalidId, ProjectId, ResourceId, RevisionId, Slug, TenantId};
@@ -141,15 +141,31 @@ const MIDDLEWARE_ID_FIELD: &str = "id";
 const MIDDLEWARE_SCOPES_FIELD: &str = "scopes";
 const MIDDLEWARE_FAILURE_POSTURE_FIELD: &str = "failure_posture";
 const MIDDLEWARE_MAX_DURATION_FIELD: &str = "max_duration_milliseconds";
+const MIDDLEWARE_GUARDRAIL_FIELD: &str = "guardrail";
+const GUARDRAIL_KEY_ENV_FIELD: &str = "key_env";
+const GUARDRAIL_RULES_FIELD: &str = "rules";
+const GUARDRAIL_RULE_ID_FIELD: &str = "id";
+const GUARDRAIL_RULE_PATTERN_FIELD: &str = "pattern";
+const GUARDRAIL_RULE_ACTION_FIELD: &str = "action";
 
 const CONTENT_MIDDLEWARE_FIELDS: &[&str] = &[
     MIDDLEWARE_ID_FIELD,
     MIDDLEWARE_SCOPES_FIELD,
     MIDDLEWARE_FAILURE_POSTURE_FIELD,
     MIDDLEWARE_MAX_DURATION_FIELD,
+    MIDDLEWARE_GUARDRAIL_FIELD,
+];
+const GUARDRAIL_FIELDS: &[&str] = &[GUARDRAIL_KEY_ENV_FIELD, GUARDRAIL_RULES_FIELD];
+const GUARDRAIL_RULE_FIELDS: &[&str] = &[
+    GUARDRAIL_RULE_ID_FIELD,
+    GUARDRAIL_RULE_PATTERN_FIELD,
+    GUARDRAIL_RULE_ACTION_FIELD,
 ];
 const MAX_CONTENT_MIDDLEWARE: usize = 32;
 const MAX_MIDDLEWARE_DURATION_MILLISECONDS: u64 = 1_000;
+const MAX_GUARDRAIL_RULES: usize = 64;
+const MAX_GUARDRAIL_PATTERN_BYTES: usize = 4_096;
+const REDACTION_MIDDLEWARE_ID: &str = "axond.redact";
 const CORE_STAGE_IDS: &[&str] = &[
     "accounting",
     "admission",
@@ -326,6 +342,8 @@ impl PolicyError {
                     | InvalidContentMiddleware::BoundTooLarge
                     | InvalidContentMiddleware::CoreStage(_)
                     | InvalidContentMiddleware::TooMany
+                    | InvalidContentMiddleware::GuardrailTooManyRules
+                    | InvalidContentMiddleware::GuardrailAction(_)
             ),
             Self::InvalidBufferedResponseRoutes { source, .. } => {
                 matches!(source, InvalidBufferedResponseRoutes::Unsupported(_))
@@ -396,6 +414,22 @@ pub enum InvalidContentMiddleware {
     TooMany,
     #[error("middleware id `{0}` is registered more than once")]
     DuplicateId(String),
+    #[error("middleware `axond.redact` requires failure posture `fail_closed`")]
+    RedactionRequiresFailClosed,
+    #[error("guardrail key_env must be a 1-128 byte environment-variable name")]
+    GuardrailKeyEnv,
+    #[error("a guardrail requires at least one rule")]
+    GuardrailNoRules,
+    #[error("a guardrail may declare at most {MAX_GUARDRAIL_RULES} rules")]
+    GuardrailTooManyRules,
+    #[error("guardrail rule id must be 1-64 lowercase ASCII letters, digits, `.`, `_`, or `-`")]
+    GuardrailRuleId,
+    #[error("guardrail rule id `{0}` is declared more than once")]
+    DuplicateGuardrailRule(String),
+    #[error("guardrail rule `{0}` must have a 1-{MAX_GUARDRAIL_PATTERN_BYTES} byte pattern")]
+    GuardrailPattern(String),
+    #[error("guardrail action `{0}` is not supported")]
+    GuardrailAction(String),
 }
 
 /// Why a response route cannot be selected for policy-controlled buffering.
@@ -460,6 +494,7 @@ pub struct ContentMiddlewareRegistration {
     scopes: Vec<MiddlewareScope>,
     failure_posture: MiddlewareFailurePosture,
     max_duration_milliseconds: u64,
+    guardrail: Option<ContentGuardrailRegistration>,
 }
 
 impl ContentMiddlewareRegistration {
@@ -482,6 +517,10 @@ impl ContentMiddlewareRegistration {
         }
         if CORE_STAGE_IDS.contains(&id.as_str()) {
             return Err(InvalidContentMiddleware::CoreStage(id));
+        }
+        if id == REDACTION_MIDDLEWARE_ID && failure_posture != MiddlewareFailurePosture::FailClosed
+        {
+            return Err(InvalidContentMiddleware::RedactionRequiresFailClosed);
         }
         let mut scopes = scopes.into_iter().collect::<Vec<_>>();
         if scopes.is_empty() {
@@ -506,7 +545,16 @@ impl ContentMiddlewareRegistration {
             scopes,
             failure_posture,
             max_duration_milliseconds,
+            guardrail: None,
         })
+    }
+
+    pub fn with_guardrail(
+        mut self,
+        guardrail: ContentGuardrailRegistration,
+    ) -> Result<Self, InvalidContentMiddleware> {
+        self.guardrail = Some(guardrail);
+        Ok(self)
     }
 
     pub fn id(&self) -> &str {
@@ -523,6 +571,89 @@ impl ContentMiddlewareRegistration {
 
     pub const fn max_duration_milliseconds(&self) -> u64 {
         self.max_duration_milliseconds
+    }
+
+    pub const fn guardrail(&self) -> Option<&ContentGuardrailRegistration> {
+        self.guardrail.as_ref()
+    }
+}
+
+/// Secret-reference and ordered rules for the built-in deterministic guardrail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentGuardrailRegistration {
+    key_env: String,
+    rules: Vec<GuardrailRule>,
+}
+
+impl ContentGuardrailRegistration {
+    pub fn new(
+        key_env: impl Into<String>,
+        rules: Vec<GuardrailRule>,
+    ) -> Result<Self, InvalidContentMiddleware> {
+        let key_env = key_env.into();
+        if key_env.is_empty()
+            || key_env.len() > 128
+            || !key_env.bytes().enumerate().all(|(index, byte)| {
+                if index == 0 {
+                    byte.is_ascii_alphabetic() || byte == b'_'
+                } else {
+                    byte.is_ascii_alphanumeric() || byte == b'_'
+                }
+            })
+        {
+            return Err(InvalidContentMiddleware::GuardrailKeyEnv);
+        }
+        if rules.is_empty() {
+            return Err(InvalidContentMiddleware::GuardrailNoRules);
+        }
+        if rules.len() > MAX_GUARDRAIL_RULES {
+            return Err(InvalidContentMiddleware::GuardrailTooManyRules);
+        }
+        let mut ids = BTreeSet::new();
+        for rule in &rules {
+            if rule.id.is_empty()
+                || rule.id.len() > 64
+                || !rule.id.bytes().enumerate().all(|(index, byte)| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+                })
+            {
+                return Err(InvalidContentMiddleware::GuardrailRuleId);
+            }
+            if !ids.insert(rule.id.clone()) {
+                return Err(InvalidContentMiddleware::DuplicateGuardrailRule(
+                    rule.id.clone(),
+                ));
+            }
+            if rule.pattern.is_empty() || rule.pattern.len() > MAX_GUARDRAIL_PATTERN_BYTES {
+                return Err(InvalidContentMiddleware::GuardrailPattern(rule.id.clone()));
+            }
+        }
+        Ok(Self { key_env, rules })
+    }
+
+    pub fn key_env(&self) -> &str {
+        &self.key_env
+    }
+
+    pub fn rules(&self) -> &[GuardrailRule] {
+        &self.rules
+    }
+}
+
+fn guardrail_action_name(action: GuardrailAction) -> &'static str {
+    match action {
+        GuardrailAction::Block => "block",
+        GuardrailAction::Redact => "redact",
+    }
+}
+
+fn parse_guardrail_action(value: &str) -> Result<GuardrailAction, InvalidContentMiddleware> {
+    match value {
+        "block" => Ok(GuardrailAction::Block),
+        "redact" => Ok(GuardrailAction::Redact),
+        other => Err(InvalidContentMiddleware::GuardrailAction(other.to_owned())),
     }
 }
 
@@ -1246,7 +1377,7 @@ impl Canonical for PolicyBody {
                     self.content_middleware
                         .iter()
                         .map(|registration| {
-                            CanonicalValue::map([
+                            let mut fields = vec![
                                 (
                                     MIDDLEWARE_ID_FIELD,
                                     CanonicalValue::string(registration.id()),
@@ -1271,7 +1402,50 @@ impl Canonical for PolicyBody {
                                         registration.max_duration_milliseconds(),
                                     ),
                                 ),
-                            ])
+                            ];
+                            if let Some(guardrail) = registration.guardrail() {
+                                fields.push((
+                                    MIDDLEWARE_GUARDRAIL_FIELD,
+                                    CanonicalValue::map([
+                                        (
+                                            GUARDRAIL_KEY_ENV_FIELD,
+                                            CanonicalValue::string(guardrail.key_env()),
+                                        ),
+                                        (
+                                            GUARDRAIL_RULES_FIELD,
+                                            CanonicalValue::List(
+                                                guardrail
+                                                    .rules()
+                                                    .iter()
+                                                    .map(|rule| {
+                                                        CanonicalValue::map([
+                                                            (
+                                                                GUARDRAIL_RULE_ID_FIELD,
+                                                                CanonicalValue::string(&rule.id),
+                                                            ),
+                                                            (
+                                                                GUARDRAIL_RULE_PATTERN_FIELD,
+                                                                CanonicalValue::string(
+                                                                    &rule.pattern,
+                                                                ),
+                                                            ),
+                                                            (
+                                                                GUARDRAIL_RULE_ACTION_FIELD,
+                                                                CanonicalValue::string(
+                                                                    guardrail_action_name(
+                                                                        rule.action,
+                                                                    ),
+                                                                ),
+                                                            ),
+                                                        ])
+                                                    })
+                                                    .collect(),
+                                            ),
+                                        ),
+                                    ]),
+                                ));
+                            }
+                            CanonicalValue::map(fields)
                         })
                         .collect(),
                 ),
@@ -1371,7 +1545,7 @@ fn read_content_middleware(
                     ),
                     source,
                 })?;
-            ContentMiddlewareRegistration::new(
+            let registration = ContentMiddlewareRegistration::new(
                 entry.string(MIDDLEWARE_ID_FIELD)?,
                 scopes,
                 failure_posture,
@@ -1381,6 +1555,58 @@ fn read_content_middleware(
                 reference: record.reference(),
                 field: format!("{CONTENT_MIDDLEWARE_FIELD}[{index}]"),
                 source,
+            })?;
+            let Some(value) = entry.optional_value(MIDDLEWARE_GUARDRAIL_FIELD) else {
+                return Ok(registration);
+            };
+            let guardrail = entry.sub_record(
+                value,
+                MIDDLEWARE_GUARDRAIL_FIELD,
+                POLICY_SCHEMA,
+                GUARDRAIL_FIELDS,
+            )?;
+            let CanonicalValue::List(rule_values) = guardrail.value(GUARDRAIL_RULES_FIELD)? else {
+                return Err(PolicyError::FieldType {
+                    reference: record.reference(),
+                    field: GUARDRAIL_RULES_FIELD,
+                });
+            };
+            let rules = rule_values
+                .iter()
+                .map(|value| {
+                    let rule = guardrail.sub_record(
+                        value,
+                        GUARDRAIL_RULES_FIELD,
+                        POLICY_SCHEMA,
+                        GUARDRAIL_RULE_FIELDS,
+                    )?;
+                    Ok(GuardrailRule {
+                        id: rule.string(GUARDRAIL_RULE_ID_FIELD)?.to_owned(),
+                        pattern: rule.string(GUARDRAIL_RULE_PATTERN_FIELD)?.to_owned(),
+                        action: parse_guardrail_action(rule.string(GUARDRAIL_RULE_ACTION_FIELD)?)
+                            .map_err(|source| PolicyError::InvalidMiddleware {
+                            reference: record.reference(),
+                            field: GUARDRAIL_RULE_ACTION_FIELD.to_owned(),
+                            source,
+                        })?,
+                    })
+                })
+                .collect::<Result<Vec<_>, PolicyError>>()?;
+            let guardrail = ContentGuardrailRegistration::new(
+                guardrail.string(GUARDRAIL_KEY_ENV_FIELD)?,
+                rules,
+            )
+            .map_err(|source| PolicyError::InvalidMiddleware {
+                reference: record.reference(),
+                field: MIDDLEWARE_GUARDRAIL_FIELD.to_owned(),
+                source,
+            })?;
+            registration.with_guardrail(guardrail).map_err(|source| {
+                PolicyError::InvalidMiddleware {
+                    reference: record.reference(),
+                    field: MIDDLEWARE_GUARDRAIL_FIELD.to_owned(),
+                    source,
+                }
             })
         })
         .collect()
@@ -1437,6 +1663,25 @@ impl PolicyContent {
                 MiddlewareFailurePosture::FailClosed => 1,
             });
             bytes.extend_from_slice(&registration.max_duration_milliseconds.to_be_bytes());
+            match &registration.guardrail {
+                Some(guardrail) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(guardrail.key_env.len() as u64).to_be_bytes());
+                    bytes.extend_from_slice(guardrail.key_env.as_bytes());
+                    bytes.extend_from_slice(&(guardrail.rules.len() as u64).to_be_bytes());
+                    for rule in &guardrail.rules {
+                        for text in [&rule.id, &rule.pattern] {
+                            bytes.extend_from_slice(&(text.len() as u64).to_be_bytes());
+                            bytes.extend_from_slice(text.as_bytes());
+                        }
+                        bytes.push(match rule.action {
+                            GuardrailAction::Block => 0,
+                            GuardrailAction::Redact => 1,
+                        });
+                    }
+                }
+                None => bytes.push(0),
+            }
         }
         bytes.extend_from_slice(&(body.buffered_response_routes.len() as u64).to_be_bytes());
         for route in &body.buffered_response_routes {
@@ -2299,6 +2544,128 @@ mod tests {
     }
 
     #[test]
+    fn guardrail_configuration_round_trips_and_changes_policy_content() {
+        let plain = policy_body(tenant_scope(), 1);
+        let middleware = ContentMiddlewareRegistration::new(
+            REDACTION_MIDDLEWARE_ID,
+            [
+                MiddlewareScope::Request,
+                MiddlewareScope::Response,
+                MiddlewareScope::StreamEvent,
+            ],
+            MiddlewareFailurePosture::FailClosed,
+            25,
+        )
+        .unwrap()
+        .with_guardrail(
+            ContentGuardrailRegistration::new(
+                "GW_GUARDRAIL_KEY",
+                vec![
+                    GuardrailRule {
+                        id: "deny".to_owned(),
+                        pattern: "forbidden".to_owned(),
+                        action: GuardrailAction::Block,
+                    },
+                    GuardrailRule {
+                        id: "email".to_owned(),
+                        pattern: r"[a-z]+@example\.com".to_owned(),
+                        action: GuardrailAction::Redact,
+                    },
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let configured = plain
+            .clone()
+            .with_content_middleware(vec![middleware])
+            .unwrap();
+        assert_ne!(configured.content(), plain.content());
+        let read = PolicyBody::read(&configured.version(slug())).expect("guardrail reads");
+        assert_eq!(read, configured);
+        let guardrail = read.content_middleware()[0]
+            .guardrail()
+            .expect("guardrail configuration");
+        assert_eq!(guardrail.key_env(), "GW_GUARDRAIL_KEY");
+        assert_eq!(guardrail.rules().len(), 2);
+        assert_eq!(guardrail.rules()[1].action, GuardrailAction::Redact);
+    }
+
+    #[test]
+    fn redaction_middleware_requires_fail_closed_posture() {
+        assert_eq!(
+            ContentMiddlewareRegistration::new(
+                REDACTION_MIDDLEWARE_ID,
+                [
+                    MiddlewareScope::Request,
+                    MiddlewareScope::Response,
+                    MiddlewareScope::StreamEvent,
+                ],
+                MiddlewareFailurePosture::FailOpen,
+                25,
+            ),
+            Err(InvalidContentMiddleware::RedactionRequiresFailClosed)
+        );
+    }
+
+    #[test]
+    fn guardrail_registration_rejects_malformed_and_unbounded_configuration() {
+        fn rule(id: &str, pattern: &str) -> GuardrailRule {
+            GuardrailRule {
+                id: id.to_owned(),
+                pattern: pattern.to_owned(),
+                action: GuardrailAction::Redact,
+            }
+        }
+
+        assert_eq!(
+            ContentGuardrailRegistration::new("", vec![rule("email", "secret")]),
+            Err(InvalidContentMiddleware::GuardrailKeyEnv)
+        );
+        assert_eq!(
+            ContentGuardrailRegistration::new("9INVALID", vec![rule("email", "secret")]),
+            Err(InvalidContentMiddleware::GuardrailKeyEnv)
+        );
+        assert_eq!(
+            ContentGuardrailRegistration::new("GW_GUARDRAIL_KEY", Vec::new()),
+            Err(InvalidContentMiddleware::GuardrailNoRules)
+        );
+        assert_eq!(
+            ContentGuardrailRegistration::new(
+                "GW_GUARDRAIL_KEY",
+                (0..=MAX_GUARDRAIL_RULES)
+                    .map(|index| rule(&format!("rule-{index}"), "secret"))
+                    .collect(),
+            ),
+            Err(InvalidContentMiddleware::GuardrailTooManyRules)
+        );
+        assert_eq!(
+            ContentGuardrailRegistration::new("GW_GUARDRAIL_KEY", vec![rule("Email", "secret")],),
+            Err(InvalidContentMiddleware::GuardrailRuleId)
+        );
+        assert_eq!(
+            ContentGuardrailRegistration::new(
+                "GW_GUARDRAIL_KEY",
+                vec![rule("email", "one"), rule("email", "two")],
+            ),
+            Err(InvalidContentMiddleware::DuplicateGuardrailRule(
+                "email".to_owned()
+            ))
+        );
+        for pattern in [String::new(), "x".repeat(MAX_GUARDRAIL_PATTERN_BYTES + 1)] {
+            assert_eq!(
+                ContentGuardrailRegistration::new(
+                    "GW_GUARDRAIL_KEY",
+                    vec![rule("email", &pattern)],
+                ),
+                Err(InvalidContentMiddleware::GuardrailPattern(
+                    "email".to_owned()
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn buffered_response_routes_are_typed_normalized_and_backward_compatible() {
         let plain = policy_body(tenant_scope(), 1);
         let old_content = plain.content();
@@ -2913,6 +3280,8 @@ mod tests {
             InvalidContentMiddleware::BoundTooLarge,
             InvalidContentMiddleware::CoreStage("future-core-stage".to_owned()),
             InvalidContentMiddleware::TooMany,
+            InvalidContentMiddleware::GuardrailTooManyRules,
+            InvalidContentMiddleware::GuardrailAction("future_action".to_owned()),
         ] {
             let error = PolicyError::InvalidMiddleware {
                 reference,
