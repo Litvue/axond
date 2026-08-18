@@ -642,6 +642,42 @@ fn pitr_usage_boundary_records_or_defers_every_gate() {
     }
 }
 
+#[test]
+fn restore_drill_closes_async_usage_and_numeric_reconstruction_races() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let backup = source
+        .find("# Put one settled billing event on the durable side")
+        .expect("the logical-backup usage boundary is present");
+    let restore = source[backup..]
+        .find("stage backup-restore/restore logical_restore")
+        .map(|offset| backup + offset)
+        .expect("the logical restore follows its usage boundary");
+    let boundary = &source[backup..restore];
+    assert_eq!(
+        boundary.matches("wait_for_usage_quiet live 5432").count(),
+        2,
+        "the drill must quiesce prior usage and the fixture before pg_dump"
+    );
+    assert!(
+        source
+            .matches("canonical_seconds \"$survivor_lag_seconds\"")
+            .count()
+            >= 2,
+        "both reconvergence stages must submit the same float spelling their observations retain"
+    );
+    let restored_count = source
+        .find("restored_usage_rows=\"$(usage_count logical_restore 5432)\"")
+        .expect("the restored usage total is captured");
+    let restored_boot = source
+        .find("serve logical_restore \"$logical_http\"")
+        .expect("the restored replica is booted");
+    assert!(
+        restored_count < restored_boot,
+        "backup-boundary totals must be captured before qualification traffic can write to the restore"
+    );
+}
+
 /// Catalogue resources carry the raw blob checksum, and CatalogRequest::plan
 /// accepts only the canonical `sha256:<64 lowercase hex>` spelling. The
 /// content id remains a separate pointer assertion in the restore stages.

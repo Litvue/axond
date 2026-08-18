@@ -512,6 +512,37 @@ wait_for_usage_count() {
   return 1
 }
 
+# Close the asynchronous journal-to-sink tail before declaring a backup
+# boundary. Both durable tables are one row per request identity; equality and
+# a short stable interval prove that no earlier accepted request can arrive
+# between the source count and pg_dump.
+wait_for_usage_quiet() {
+  local database="$1" port="$2" previous="" stable=0 usage outbox snapshot
+  for _ in $(seq 60); do
+    usage="$(usage_count "$database" "$port")"
+    outbox="$(psql "$database" "$port" -c 'SELECT count(*) FROM axond_usage_outbox')"
+    snapshot="${usage}:${outbox}"
+    if [[ "$usage" == "$outbox" && "$snapshot" == "$previous" ]]; then
+      stable=$((stable + 1))
+      if [[ "$stable" -ge 12 ]]; then
+        return 0
+      fi
+    else
+      stable=0
+    fi
+    previous="$snapshot"
+    sleep 0.25
+  done
+  return 1
+}
+
+# recovery-evidence parses second-valued observations as JSON floats. Use the
+# same canonical spelling for the gate value so exact independent
+# reconstruction does not turn numeric equality (0 and 0.0) into a mismatch.
+canonical_seconds() {
+  "$python_bin" -c 'import sys; print(str(float(sys.argv[1])))' "$1"
+}
+
 # What an unauthenticated caller gets from the administrative surface. Two
 # callers, because they fail at different places: no credential at all, and a
 # wrong one.
@@ -698,10 +729,14 @@ live_price_checksum="$(psql live 5432 -c \
 # Put one settled billing event on the durable side of the logical-backup
 # boundary. Counting an empty source and an empty restore would prove only that
 # two databases agree about having no usage history.
+wait_for_usage_quiet live 5432 ||
+  fail "usage journal did not quiesce before the logical-backup fixture"
 backup_usage_baseline="$(usage_count live 5432)"
 backup_usage_baseline_id="$(latest_usage_row_id live 5432)"
 backup_usage_status="$(probe_survivor_chat "${workdir}/usage-before-logical-backup.body")"
 wait_for_usage_count live 5432 "$((backup_usage_baseline + 1))" >/dev/null || true
+wait_for_usage_quiet live 5432 ||
+  fail "logical-backup usage fixture did not settle before the backup boundary"
 backup_usage_new_rows="$(usage_rows_after_id live 5432 "$backup_usage_baseline_id")"
 backup_usage_request_id="$(usage_request_after_id live 5432 "$backup_usage_baseline_id")"
 backup_usage_source_rows="$(usage_identity_count live 5432 axond_usage "$backup_usage_request_id")"
@@ -724,6 +759,12 @@ mark "backed-up" "pg_dump of the live database taken while its replica was servi
 docker exec -u postgres "$container" sh -c \
   'pg_restore -p 5432 -d logical_restore --no-owner /tmp/live.dump'
 restore_seconds="$(awk -v end="$(date +%s.%N)" -v start="$started" 'BEGIN { printf "%.3f", end - start }')"
+# Capture the dump boundary before a restored replica or the survivor can write
+# post-restore qualification traffic into these tables. The later exact-
+# identity checks may run after reconvergence; these total-count checks may not.
+restored_usage_rows="$(usage_count logical_restore 5432)"
+restored_usage_outbox_rows="$(psql logical_restore 5432 -c \
+  'SELECT count(*) FROM axond_usage_outbox')"
 mark "restored" "pg_restore into a database no replica ever wrote"
 observe restore_duration_seconds "$restore_seconds" seconds
 
@@ -871,6 +912,7 @@ survivor_converged="$(printf '%s' "$survivor_report" | jq -r '.converged // fals
 [[ -n "$survivor_converged" ]] || survivor_converged=false
 survivor_active="$(printf '%s' "$survivor_report" | jq -r '.active // "unreadable"' 2>/dev/null || printf 'unreadable')"
 survivor_lag_seconds="$(printf '%s' "$survivor_report" | jq -r '(.lag_ms // -1) / 1000' 2>/dev/null || printf 'unknown')"
+survivor_lag_seconds="$(canonical_seconds "$survivor_lag_seconds" 2>/dev/null || printf 'unknown')"
 survivor_revision_count="$(revision_count 2>/dev/null || printf '%s' -1)"
 survivor_readiness="$(curl -sS -o /dev/null -w '%{http_code}' \
   "${live_endpoint}/readyz" 2>/dev/null || printf '000')"
@@ -1019,9 +1061,6 @@ restored_price_history="$(printf '%s' "$restored_price_body" | jq -c '
     rates: {input: .rates.input, output: .rates.output},
     provenance: {origin: .provenance.origin, citation: (.provenance.citation // null)}
   }] | sort_by([.effective_from, .precedence])' 2>/dev/null || printf 'unreadable')"
-restored_usage_rows="$(usage_count logical_restore 5432)"
-restored_usage_outbox_rows="$(psql logical_restore 5432 -c \
-  'SELECT count(*) FROM axond_usage_outbox')"
 backup_usage_restored_rows="$(usage_identity_count logical_restore 5432 axond_usage "$backup_usage_request_id")"
 backup_usage_restored_outbox_rows="$(usage_identity_count logical_restore 5432 axond_usage_outbox "$backup_usage_request_id")"
 mark "inventory-checked" "the restored secret, catalogue, and approved price-book records were inspected"
@@ -1419,6 +1458,7 @@ survivor_converged="$(printf '%s' "$survivor_report" | jq -r '.converged // fals
 [[ -n "$survivor_converged" ]] || survivor_converged=false
 survivor_active="$(printf '%s' "$survivor_report" | jq -r '.active // "unreadable"' 2>/dev/null || printf 'unreadable')"
 survivor_lag_seconds="$(printf '%s' "$survivor_report" | jq -r '(.lag_ms // -1) / 1000' 2>/dev/null || printf 'unknown')"
+survivor_lag_seconds="$(canonical_seconds "$survivor_lag_seconds" 2>/dev/null || printf 'unknown')"
 survivor_revision_count="$(revision_count 2>/dev/null || printf '%s' -1)"
 survivor_readiness="$(curl -sS -o /dev/null -w '%{http_code}' \
   "${live_endpoint}/readyz" 2>/dev/null || printf '000')"
