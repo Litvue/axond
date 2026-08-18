@@ -1524,6 +1524,7 @@ impl Accounting {
         telemetry::record_streamed(&record, self.ttft_ms);
         let budget_key = self.ctx.budget_key.clone();
         let reservation = self.ctx.reservation.clone();
+        let core_budget = self.middleware_execution.take_core_budget();
         spawn_settlement(async move {
             // The hold first, as on the buffered path: a stream cannot be
             // refused after it has been relayed, so the record cannot change
@@ -1532,7 +1533,11 @@ impl Accounting {
             // outbox and let shutdown's settle share expire with the
             // reservation uncharged. The append is inside this tracked
             // settlement either way, so a caller hanging up does not cancel it.
-            state.0.budget.settle(&budget_key, &reservation, cost).await;
+            if let Some(hold) = core_budget {
+                hold.settle(cost).await;
+            } else {
+                state.0.budget.settle(&budget_key, &reservation, cost).await;
+            }
             state.0.usage.record_terminal(&record).await;
         });
     }
@@ -1943,6 +1948,19 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             Box::new(LedgerBudget(ledger)),
         )
         .expect("state")
+    }
+
+    fn state_for_with_rate_limit(base_url: &str, ledger: Arc<Ledger>) -> AppState {
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(LedgerSink(ledger.clone()))];
+        AppState::new_with_rate_limiter(
+            single_target_config(base_url),
+            &test_env(),
+            UsageFanout::new(sinks),
+            Box::new(LedgerBudget(ledger)),
+            Box::new(crate::rate_limit::InMemoryRateLimiter::new(1, 10)),
+            Box::new(crate::revocation::NoDenylist),
+        )
+        .expect("rate-limited state")
     }
 
     /// The same single-target gateway, with the budget store under test.
@@ -3999,7 +4017,8 @@ data: [DONE]\n\n",
     async fn client_disconnect_settles_the_stream_as_cancelled() {
         let ledger = Arc::new(Ledger::default());
         let base_url = upstream_serving(OPENAI_STREAM).await;
-        let resp = router(state_for(&base_url, ledger.clone()))
+        let state = state_for_with_rate_limit(&base_url, ledger.clone());
+        let resp = router(state.clone())
             .oneshot(stream_request())
             .await
             .expect("response");
@@ -4018,6 +4037,17 @@ data: [DONE]\n\n",
         assert!(record["input_tokens"].as_u64().expect("input") > 0);
         assert!(record["output_tokens"].as_u64().expect("output") > 0);
         assert_eq!(ledger.settlements(), vec![charged]);
+        drop(
+            state
+                .0
+                .rate_limiter
+                .acquire(&crate::rate_limit::RateLimitKey {
+                    namespace: "platform".to_owned(),
+                    subject: "GW_TEST_INBOUND_KEY".to_owned(),
+                })
+                .await
+                .expect("middleware-owned permit was released on client disconnect"),
+        );
     }
 
     #[tokio::test]

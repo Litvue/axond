@@ -607,6 +607,12 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # timeout_ms = 250
 # connect_timeout_ms = 5000
 
+# Fixed rate-limit and budget stages use response-lifetime middleware ownership
+# by default. `legacy` is the temporary operational rollback to the previous
+# straight-line guards; it changes ownership only, never limits or charging.
+# [core_middleware]
+# accounting = "middleware" # middleware (default) | legacy
+
 # Precise single-token revocation is opt-in (Tier 1 Redis or Tier 2 Postgres).
 # [revocation]
 # backend = "redis" # none (default) | redis | postgres

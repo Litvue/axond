@@ -57,11 +57,13 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::admission::{AdmissionPermit, DiagnosticCredential, RequestKind};
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
-use crate::config::{Config, Model, Provider, ProviderKind, ProviderWire, Target};
+use crate::config::{
+    Config, CoreAccountingMode, Model, Provider, ProviderKind, ProviderWire, Target,
+};
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::desired_state::policy::BufferedResponseRoute;
 use crate::error::GatewayError;
-use crate::middleware::{MiddlewareChain, MiddlewareExecution};
+use crate::middleware::{CoreBudgetHold, MiddlewareChain, MiddlewareExecution};
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
 use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
@@ -1573,28 +1575,45 @@ async fn serve(
         )
         .await?;
 
-    // The permit is held for the request's lifetime: buffered paths drop it at
-    // scope end, and a stream moves it into the accounting owner that settles it.
+    // The migration gate retains the previous straight-line owner as an
+    // immediate operational rollback. The default fixed-core path places the
+    // permit directly in MiddlewareExecution, which follows this request into
+    // buffered completion or streaming Accounting.
     let rate_limit_key = RateLimitKey {
         namespace: caller.namespace.clone(),
         subject: caller.subject.clone(),
     };
-    let rate_limit_permit = state
-        .0
-        .rate_limiter
-        .acquire(&rate_limit_key)
-        .await
-        .map_err(|error| match error {
-            crate::rate_limit::RateLimitError::StoreUnavailable => {
-                GatewayError::RateLimitUnavailable
-            }
-            crate::rate_limit::RateLimitError::Exceeded
-            | crate::rate_limit::RateLimitError::SubjectCapacityExceeded => {
-                GatewayError::RateLimitExceeded {
-                    retry_after_seconds: None,
-                }
-            }
-        })?;
+    let accounting_mode = cfg.core_middleware.accounting;
+    let mut middleware_execution = middleware.execution(
+        &state.0.middleware_runtime,
+        Some(route.middleware_surface()),
+    );
+    let mut legacy_rate_limit_permit = match accounting_mode {
+        CoreAccountingMode::Middleware => {
+            middleware_execution
+                .acquire_rate_limit(&state, &rate_limit_key)
+                .await?;
+            None
+        }
+        CoreAccountingMode::Legacy => Some(
+            state
+                .0
+                .rate_limiter
+                .acquire(&rate_limit_key)
+                .await
+                .map_err(|error| match error {
+                    crate::rate_limit::RateLimitError::StoreUnavailable => {
+                        GatewayError::RateLimitUnavailable
+                    }
+                    crate::rate_limit::RateLimitError::Exceeded
+                    | crate::rate_limit::RateLimitError::SubjectCapacityExceeded => {
+                        GatewayError::RateLimitExceeded {
+                            retry_after_seconds: None,
+                        }
+                    }
+                })?,
+        ),
+    };
 
     // Content middleware is deliberately the first work after both permits
     // are held. It may be expensive, so running it before admission would let
@@ -1630,13 +1649,8 @@ async fn serve(
             previous_response_id.to_owned(),
         ));
     }
-    let mut middleware_execution = middleware
-        .start_with_protected_values(
-            &state.0.middleware_runtime,
-            &mut middleware_request,
-            &protected_values,
-            route.middleware_surface(),
-        )
+    middleware_execution
+        .request(&mut middleware_request, &protected_values)
         .await?;
     let body = middleware_request.body;
     // An empty chain is byte-neutral, so the pre-admission estimate is already
@@ -1674,10 +1688,34 @@ async fn serve(
             ceiling_microdollars: ceiling,
         });
     }
-    let reservation = match state.0.budget.reserve(&budget_key, estimated_cost).await {
-        Admission::Allowed(reservation) => reservation,
-        Admission::Denied(Denial::Exceeded) => return Err(GatewayError::BudgetExceeded(alias)),
-        Admission::Denied(Denial::StoreUnavailable) => return Err(GatewayError::BudgetUnavailable),
+    let reservation = match accounting_mode {
+        CoreAccountingMode::Middleware => {
+            middleware_execution
+                .reserve_budget(
+                    &state,
+                    budget_key.clone(),
+                    estimated_cost,
+                    estimate.input_tokens,
+                    &alias,
+                )
+                .await?;
+            middleware_execution
+                .core_budget_context()
+                .expect("fixed budget middleware reserved a hold")
+                .1
+                .clone()
+        }
+        CoreAccountingMode::Legacy => {
+            match state.0.budget.reserve(&budget_key, estimated_cost).await {
+                Admission::Allowed(reservation) => reservation,
+                Admission::Denied(Denial::Exceeded) => {
+                    return Err(GatewayError::BudgetExceeded(alias));
+                }
+                Admission::Denied(Denial::StoreUnavailable) => {
+                    return Err(GatewayError::BudgetUnavailable);
+                }
+            }
+        }
     };
 
     // The request is now admitted and will produce exactly one usage event, so
@@ -1704,7 +1742,7 @@ async fn serve(
                     key: budget_key,
                     reservation,
                     estimated_input_tokens: estimate.input_tokens,
-                    permit: Some(rate_limit_permit),
+                    permit: legacy_rate_limit_permit.take(),
                     admission: Some(admission_permit),
                 },
             },
@@ -1712,7 +1750,8 @@ async fn serve(
         .await;
     }
 
-    let reservation = BudgetReservation::new(state.clone(), budget_key, reservation);
+    let mut reservation_guard = (accounting_mode == CoreAccountingMode::Legacy)
+        .then(|| BudgetReservation::new(state.clone(), budget_key, reservation));
     let outcome = match dispatch_with_failover(
         &state, &snapshot, &caller, model, &prices, &body, &wire,
     )
@@ -1722,7 +1761,13 @@ async fn serve(
         Err(err) => {
             // Nothing reached a provider, so nothing was consumed: the whole
             // estimate goes back rather than lingering until it expires.
-            reservation.release().await;
+            if !middleware_execution.release_core_budget().await {
+                reservation_guard
+                    .take()
+                    .expect("legacy budget guard")
+                    .release()
+                    .await;
+            }
             return Err(err);
         }
     };
@@ -1754,7 +1799,19 @@ async fn serve(
                 ttft_ms: outcome.ttft_ms,
                 attempts: outcome.attempts,
             });
-            let accounting = reservation.into_response_accounting(record, ttft_ms, attempts);
+            let accounting = match middleware_execution.take_core_budget() {
+                Some(hold) => BufferedResponseAccounting::from_core(
+                    state.clone(),
+                    hold,
+                    record,
+                    ttft_ms,
+                    attempts,
+                ),
+                None => reservation_guard
+                    .take()
+                    .expect("legacy budget guard")
+                    .into_response_accounting(record, ttft_ms, attempts),
+            };
             let mut middleware_result = middleware_execution.response(&mut response).await;
             // Upstream buffering enforced the same configured ceiling before
             // middleware ran. A response mutator can expand that bounded JSON,
@@ -1788,7 +1845,13 @@ async fn serve(
             // measure. Spend is therefore genuinely unknowable and charged as
             // zero — the streamed path, which can measure what it relayed,
             // charges its partial spend.
-            reservation.release().await;
+            if !middleware_execution.release_core_budget().await {
+                reservation_guard
+                    .take()
+                    .expect("legacy budget guard")
+                    .release()
+                    .await;
+            }
             // The upstream failure is what the caller is told about, so the
             // record is best-effort here: a `503` about the outbox would hide the
             // provider error that actually ended the request.
@@ -2179,12 +2242,14 @@ async fn stream_with_failover(
         prices,
         wire,
         identity,
-        middleware_execution,
+        mut middleware_execution,
         delivery,
         mut hold,
     } = request;
-    let reservation_guard =
-        BudgetReservation::new(state.clone(), hold.key.clone(), hold.reservation.clone());
+    let mut reservation_guard = middleware_execution
+        .core_budget_context()
+        .is_none()
+        .then(|| BudgetReservation::new(state.clone(), hold.key.clone(), hold.reservation.clone()));
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
@@ -2328,7 +2393,9 @@ async fn stream_with_failover(
             ctx.attempts = target_attempt + 1;
             match opened {
                 Ok((decoder, bytes)) => {
-                    reservation_guard.disarm();
+                    if let Some(guard) = reservation_guard.take() {
+                        guard.disarm();
+                    }
                     telemetry::finish_upstream_attempt(
                         span,
                         telemetry::ATTEMPT_OK,
@@ -2490,7 +2557,9 @@ async fn stream_with_failover(
 
     if let Some(err) = walk.last_error.take() {
         if let Some((mut ctx, started)) = last_ctx {
-            reservation_guard.disarm();
+            if let Some(guard) = reservation_guard.take() {
+                guard.disarm();
+            }
             ctx.attempts = walk.attempts;
             ctx.rate_limit_permit = hold.permit.take();
             ctx.admission_permit = hold.admission.take();
@@ -2501,11 +2570,23 @@ async fn stream_with_failover(
                 middleware_execution,
             );
         } else {
-            reservation_guard.release().await;
+            if !middleware_execution.release_core_budget().await {
+                reservation_guard
+                    .take()
+                    .expect("legacy budget guard")
+                    .release()
+                    .await;
+            }
         }
         return Err(err.into());
     }
-    reservation_guard.release().await;
+    if !middleware_execution.release_core_budget().await {
+        reservation_guard
+            .take()
+            .expect("legacy budget guard")
+            .release()
+            .await;
+    }
     Err(walk.into_error())
 }
 
@@ -2588,8 +2669,13 @@ impl BudgetReservation {
     ) -> BufferedResponseAccounting {
         BufferedResponseAccounting {
             state: self.state.clone(),
-            key: self.key.clone(),
-            reservation: self.reservation.take(),
+            hold: Some(BufferedBudgetHold::Legacy {
+                key: self.key.clone(),
+                reservation: self
+                    .reservation
+                    .take()
+                    .expect("budget reservation guard must be armed"),
+            }),
             record: Some(record),
             ttft_ms,
             attempts,
@@ -2620,19 +2706,42 @@ impl Drop for BudgetReservation {
 /// conflict with the immutable event under the same request identity.
 struct BufferedResponseAccounting {
     state: AppState,
-    key: BudgetKey,
-    reservation: Option<Reservation>,
+    hold: Option<BufferedBudgetHold>,
     record: Option<UsageRecord>,
     ttft_ms: Option<u64>,
     attempts: u32,
 }
 
+enum BufferedBudgetHold {
+    Legacy {
+        key: BudgetKey,
+        reservation: Reservation,
+    },
+    Core(CoreBudgetHold),
+}
+
 impl BufferedResponseAccounting {
+    fn from_core(
+        state: AppState,
+        hold: CoreBudgetHold,
+        record: UsageRecord,
+        ttft_ms: Option<u64>,
+        attempts: u32,
+    ) -> Self {
+        Self {
+            state,
+            hold: Some(BufferedBudgetHold::Core(hold)),
+            record: Some(record),
+            ttft_ms,
+            attempts,
+        }
+    }
+
     async fn finish(mut self, status: Status) -> Result<(), GatewayError> {
-        let reservation = self
-            .reservation
+        let hold = self
+            .hold
             .take()
-            .expect("buffered response accounting must own its reservation");
+            .expect("buffered response accounting must own its budget hold");
         let mut record = self
             .record
             .take()
@@ -2640,8 +2749,7 @@ impl BufferedResponseAccounting {
         record.status = status;
         let decided = spawn_buffered_response_accounting(
             self.state.clone(),
-            self.key.clone(),
-            reservation,
+            hold,
             record,
             self.ttft_ms,
             self.attempts,
@@ -2660,7 +2768,7 @@ impl BufferedResponseAccounting {
 
 impl Drop for BufferedResponseAccounting {
     fn drop(&mut self) {
-        let Some(reservation) = self.reservation.take() else {
+        let Some(hold) = self.hold.take() else {
             return;
         };
         let mut record = self
@@ -2670,8 +2778,7 @@ impl Drop for BufferedResponseAccounting {
         record.status = Status::ClientCancelled;
         drop(spawn_buffered_response_accounting(
             self.state.clone(),
-            self.key.clone(),
-            reservation,
+            hold,
             record,
             self.ttft_ms,
             self.attempts,
@@ -2681,19 +2788,25 @@ impl Drop for BufferedResponseAccounting {
 
 fn spawn_buffered_response_accounting(
     state: AppState,
-    key: BudgetKey,
-    reservation: Reservation,
+    hold: BufferedBudgetHold,
     record: UsageRecord,
     ttft_ms: Option<u64>,
     attempts: u32,
 ) -> tokio::sync::oneshot::Receiver<Result<(), crate::usage::NotDurable>> {
     let (verdict, decided) = tokio::sync::oneshot::channel();
     streaming::spawn_settlement(async move {
-        state
-            .0
-            .budget
-            .settle(&key, &reservation, record.cost_microdollars)
-            .await;
+        match hold {
+            BufferedBudgetHold::Legacy { key, reservation } => {
+                state
+                    .0
+                    .budget
+                    .settle(&key, &reservation, record.cost_microdollars)
+                    .await;
+            }
+            BufferedBudgetHold::Core(hold) => {
+                hold.settle(record.cost_microdollars).await;
+            }
+        }
         telemetry::record_request(&record, ttft_ms, attempts);
         let result = state.0.usage.record(&record).await;
         if let Err(Err(unheard)) = verdict.send(result) {
@@ -8537,8 +8650,29 @@ targets = [
         budget: Box<dyn crate::budget::BudgetStore>,
         rate_limiter: Box<dyn RateLimiter>,
     ) -> AppState {
+        budgeted_state_with_limiter_mode(
+            base_url,
+            budget,
+            rate_limiter,
+            CoreAccountingMode::Middleware,
+        )
+    }
+
+    fn budgeted_state_with_limiter_mode(
+        base_url: &str,
+        budget: Box<dyn crate::budget::BudgetStore>,
+        rate_limiter: Box<dyn RateLimiter>,
+        accounting_mode: CoreAccountingMode,
+    ) -> AppState {
+        let accounting_mode = match accounting_mode {
+            CoreAccountingMode::Legacy => "legacy",
+            CoreAccountingMode::Middleware => "middleware",
+        };
         let cfg = Config::from_toml_str(&format!(
             r#"
+[core_middleware]
+accounting = "{accounting_mode}"
+
 [[namespace]]
 id = "platform"
 default = true
@@ -9355,36 +9489,81 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 
     #[tokio::test]
     async fn unavailable_rate_limit_store_is_a_typed_503_before_budget_reservation() {
-        let budget = RecordingBudget::default();
-        let state = budgeted_state_with_limiter(
-            "http://127.0.0.1:1",
-            Box::new(budget.clone()),
-            Box::new(UnavailableLimiter),
-        );
+        for mode in [CoreAccountingMode::Middleware, CoreAccountingMode::Legacy] {
+            let budget = RecordingBudget::default();
+            let state = budgeted_state_with_limiter_mode(
+                "http://127.0.0.1:1",
+                Box::new(budget.clone()),
+                Box::new(UnavailableLimiter),
+                mode,
+            );
 
-        let response = router(state).oneshot(chat_request()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["type"], "rate_limit_unavailable");
-        assert!(budget.0.lock().unwrap().is_empty());
+            let response = router(state).oneshot(chat_request()).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{mode:?}"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "rate_limit_unavailable", "{mode:?}");
+            assert!(budget.0.lock().unwrap().is_empty(), "{mode:?}");
+        }
     }
 
     #[tokio::test]
     async fn budget_denial_does_not_leave_limiter_saturated() {
-        let limiter = Arc::new(InMemoryRateLimiter::new(1, 10));
-        let state = budgeted_state_with_limiter(
-            "http://127.0.0.1:1",
-            Box::new(RejectingBudget),
-            Box::new(SharedLimiter(Arc::clone(&limiter))),
-        );
-        for _ in 0..2 {
-            let response = router(state.clone()).oneshot(chat_request()).await.unwrap();
-            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-            let bytes = response.into_body().collect().await.unwrap().to_bytes();
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["error"]["type"], "budget_exceeded");
+        for mode in [CoreAccountingMode::Middleware, CoreAccountingMode::Legacy] {
+            let limiter = Arc::new(InMemoryRateLimiter::new(1, 10));
+            let state = budgeted_state_with_limiter_mode(
+                "http://127.0.0.1:1",
+                Box::new(RejectingBudget),
+                Box::new(SharedLimiter(Arc::clone(&limiter))),
+                mode,
+            );
+            for _ in 0..2 {
+                let response = router(state.clone()).oneshot(chat_request()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{mode:?}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"]["type"], "budget_exceeded", "{mode:?}");
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn middleware_owned_limiter_follows_the_buffered_response_body() {
+        let (base_url, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let limiter = Arc::new(InMemoryRateLimiter::new(1, 10));
+        let state = budgeted_state_with_limiter_mode(
+            &base_url,
+            Box::new(NoBudget),
+            Box::new(SharedLimiter(Arc::clone(&limiter))),
+            CoreAccountingMode::Middleware,
+        );
+        let key = RateLimitKey {
+            namespace: "platform".to_owned(),
+            subject: "AXOND_INBOUND_KEY".to_owned(),
+        };
+
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            matches!(
+                limiter.acquire(&key).await,
+                Err(crate::rate_limit::RateLimitError::Exceeded)
+            ),
+            "the response body must still own the request's only permit"
+        );
+
+        drop(response);
+        drop(
+            limiter
+                .acquire(&key)
+                .await
+                .expect("dropping the response body released its permit"),
+        );
     }
 
     #[tokio::test]
@@ -9469,20 +9648,27 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     async fn a_buffered_response_settles_its_measured_cost() {
         let (base_url, _) =
             controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
-        let budget = RecordingBudget::default();
-        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+        for mode in [CoreAccountingMode::Middleware, CoreAccountingMode::Legacy] {
+            let budget = RecordingBudget::default();
+            let state = budgeted_state_with_limiter_mode(
+                &base_url,
+                Box::new(budget.clone()),
+                Box::new(NoLimit),
+                mode,
+            );
 
-        let resp = router(state).oneshot(chat_request()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            let resp = router(state).oneshot(chat_request()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{mode:?}");
 
-        let ledger = budget.0.lock().unwrap();
-        let (estimated, settled) = ledger[0];
-        // 10 input + 5 output tokens at 1 µ$ each.
-        assert_eq!(settled, 15);
-        assert!(
-            estimated > settled,
-            "the estimate should be the conservative ceiling ({estimated} vs {settled})"
-        );
+            let ledger = budget.0.lock().unwrap();
+            let (estimated, settled) = ledger[0];
+            // 10 input + 5 output tokens at 1 µ$ each.
+            assert_eq!(settled, 15, "{mode:?}");
+            assert!(
+                estimated > settled,
+                "the estimate should be the conservative ceiling ({estimated} vs {settled}); {mode:?}"
+            );
+        }
     }
 
     /// A buffered failure reports no usage at all, so the spend is unknowable
@@ -9495,15 +9681,22 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
-        let budget = RecordingBudget::default();
-        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+        for mode in [CoreAccountingMode::Middleware, CoreAccountingMode::Legacy] {
+            let budget = RecordingBudget::default();
+            let state = budgeted_state_with_limiter_mode(
+                &base_url,
+                Box::new(budget.clone()),
+                Box::new(NoLimit),
+                mode,
+            );
 
-        let resp = router(state).oneshot(chat_request()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            let resp = router(state).oneshot(chat_request()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{mode:?}");
 
-        let ledger = budget.0.lock().unwrap();
-        assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger[0].1, 0);
+            let ledger = budget.0.lock().unwrap();
+            assert_eq!(ledger.len(), 1, "{mode:?}");
+            assert_eq!(ledger[0].1, 0, "{mode:?}");
+        }
     }
 
     /// A cancelled buffered handler drops its reservation guard while the
@@ -9511,50 +9704,64 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     /// before the next request can observe the ledger.
     #[tokio::test]
     async fn a_cancelled_buffered_request_releases_its_reservation() {
-        let (started_tx, started_rx) = oneshot::channel();
-        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
-        let upstream = Router::new().route(
-            "/chat/completions",
-            post({
-                let started_tx = started_tx.clone();
-                move || async move {
-                    if let Some(started_tx) = started_tx.lock().unwrap().take() {
-                        let _ = started_tx.send(());
+        for mode in [CoreAccountingMode::Middleware, CoreAccountingMode::Legacy] {
+            let (started_tx, started_rx) = oneshot::channel();
+            let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+            let upstream = Router::new().route(
+                "/chat/completions",
+                post({
+                    let started_tx = started_tx.clone();
+                    move || async move {
+                        if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                            let _ = started_tx.send(());
+                        }
+                        pending::<()>().await;
+                        StatusCode::OK.into_response()
                     }
-                    pending::<()>().await;
-                    StatusCode::OK.into_response()
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-
-        let budget = Arc::new(crate::budget::InMemoryBudget::new(10_000));
-        let state = budgeted_state(
-            &format!("http://{addr}"),
-            Box::new(SharedBudget(budget.clone())),
-        );
-        let request = tokio::spawn(router(state).oneshot(chat_request()));
-        started_rx.await.unwrap();
-        request.abort();
-        assert!(request.await.unwrap_err().is_cancelled());
-
-        let key = BudgetKey {
-            namespace: "platform".to_owned(),
-            subject: "AXOND_INBOUND_KEY".to_owned(),
-        };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let outstanding = budget.outstanding(&key);
-            if outstanding == 0 {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "reservation was not released before timeout; outstanding={outstanding}"
+                }),
             );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+            let budget = Arc::new(crate::budget::InMemoryBudget::new(10_000));
+            let limiter = Arc::new(InMemoryRateLimiter::new(1, 10));
+            let state = budgeted_state_with_limiter_mode(
+                &format!("http://{addr}"),
+                Box::new(SharedBudget(budget.clone())),
+                Box::new(SharedLimiter(Arc::clone(&limiter))),
+                mode,
+            );
+            let request = tokio::spawn(router(state).oneshot(chat_request()));
+            started_rx.await.unwrap();
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled(), "{mode:?}");
+
+            let key = BudgetKey {
+                namespace: "platform".to_owned(),
+                subject: "AXOND_INBOUND_KEY".to_owned(),
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let outstanding = budget.outstanding(&key);
+                if outstanding == 0 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "reservation was not released before timeout; {mode:?}; outstanding={outstanding}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(
+                limiter
+                    .acquire(&RateLimitKey {
+                        namespace: "platform".to_owned(),
+                        subject: "AXOND_INBOUND_KEY".to_owned(),
+                    })
+                    .await
+                    .expect("cancelled request released its rate-limit permit"),
+            );
         }
     }
 

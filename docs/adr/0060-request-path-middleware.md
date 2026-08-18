@@ -276,11 +276,15 @@ namespace produce equal tokens, and a same-namespace chosen-plaintext oracle can
 identify low-entropy values. Namespace-derived keys prevent comparison across
 namespaces. Operators must use separate namespaces where callers must not share
 equality and must not treat redaction as protection against guessing low-entropy
-secrets. The rate-limit permit and budget hold move into the chain next, once the
-response-lifetime ownership has been exercised by real traffic. Authentication
-moves last, or not at all: it is the highest-risk and lowest-payoff member of the
-set, and uniformity is not worth purchasing with a subtle regression in the one
-stage that must fail closed.
+secrets. The rate-limit permit and budget hold then move into the fixed core
+chain: asynchronous acquire, reserve, settle, and release stay gateway-owned,
+while `MiddlewareExecution` owns their handles beside content state and follows
+them to the response body's drop boundary. The rollback setting,
+`[core_middleware] accounting = "legacy"`, retains the previous straight-line
+owners during qualification; both paths keep the same fixed ordering and caller
+contract. Authentication moves last, or not at all: it is the highest-risk and
+lowest-payoff member of the set, and uniformity is not worth purchasing with a
+subtle regression in the one stage that must fail closed.
 
 ### State tier
 
@@ -395,6 +399,16 @@ the token estimate stops being derivable from the request as it arrived on the
 wire. Anything reasoning about a usage row's input tokens is reasoning about the
 post-middleware body, which is the right answer — that is what was sent — but it
 is a new thing to know when reading a row against a captured request.
+
+The fixed rate-limit and budget stages use the same `MiddlewareExecution` owner
+without implementing the synchronous, I/O-free `gateway-core::Middleware`
+trait. Their backend calls remain asynchronous gateway responsibilities at
+compile-time positions: rate limit before content, budget after authoritative
+post-content estimation, and settlement before terminal usage persistence. The
+owner releases a permit synchronously and detaches an unsettled budget release
+on every cancellation/drop path. The temporary `legacy` gate keeps the previous
+guards available without a binary rollback and is required to prove equivalent
+refusals and charges rather than merely make rollback plausible.
 
 Response-mutating middleware on native framing is refused unless the route is
 present in `buffered_response_routes`. The refusal is typed and explicit rather

@@ -1007,6 +1007,29 @@ the map retains only active callers.
 Redis connects and PINGs at boot. A Redis limiter's lease is released when its
 permit drops; if the process or Redis is unavailable, the TTL reclaims it.
 
+## `[core_middleware]` — accounting ownership migration gate
+
+The fixed rate-limit and budget stages default to response-lifetime middleware
+ownership. The backend, numeric limits, refusal envelope, charging policy, and
+acquisition order do not change. Ownership lifetime does: the permit and
+reservation are stored beside configurable middleware state and follow that
+owner into a buffered response or streaming accounting. In `middleware` mode,
+a buffered response keeps its rate-limit permit until the response body reaches
+EOF or is dropped, rather than releasing it when the handler returns. Slow
+response consumers can therefore occupy a subject's concurrency ceiling longer
+and cause more `429 rate_limited` responses at the same configured limit.
+`legacy` preserves the former buffered permit-release timing.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `accounting` | `middleware` \| `legacy` | `middleware` | `middleware` uses the ADR 0060 response-lifetime owner. `legacy` restores the previous straight-line permit and reservation guards as an operational rollback without changing the binary. A reload binds the selection to new requests through their captured snapshot; in-flight requests keep the mode they started with. |
+
+The legacy mode is a migration escape hatch, not a different accounting
+contract. Qualification runs both modes against the same refusal, settlement,
+failure, and cancellation expectations. Operators should return to
+`middleware` after diagnosing a rollback because subsequent fixed-core stages
+build on that ownership model.
+
 ## `[revocation]` — opt-in precise minted-token revocation
 
 Omit this section for Tier 0: no denylist is consulted. Redis is Tier 1 and
