@@ -282,9 +282,12 @@ while `MiddlewareExecution` owns their handles beside content state and follows
 them to the response body's drop boundary. The rollback setting,
 `[core_middleware] accounting = "legacy"`, retains the previous straight-line
 owners during qualification; both paths keep the same fixed ordering and caller
-contract. Authentication moves last, or not at all: it is the highest-risk and
-lowest-payoff member of the set, and uniformity is not worth purchasing with a
-subtle regression in the one stage that must fail closed.
+contract. Authentication does **not** migrate:
+[ADR 0061](./0061-authentication-remains-an-outer-boundary.md) records the
+completed decision to retain it as a compiled outer HTTP boundary. It has no
+response-lifetime hold, needs headers and route capability before body parsing,
+and must remain ahead of convergence and every configurable policy. The
+asymmetry is intentional rather than unfinished migration work.
 
 ### State tier
 
@@ -432,3 +435,8 @@ operator-visible: two registration paths exist, one compiled and one declarative
 and a reader has to know which stages are which. The alternative — one
 reconfigurable chain — was rejected because its failure mode is an unauthenticated
 request path, and no ergonomic gain pays for that.
+
+Authentication remains outside the parsed-content primitive by the explicit
+decision in ADR 0061. The outer Axum layer establishes identity from headers and
+route capability; the inner primitive operates only after that identity is in
+the request extensions. This is the final migration boundary for this ADR.
