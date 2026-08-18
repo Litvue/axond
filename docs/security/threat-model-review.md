@@ -95,9 +95,15 @@ defaults open.
 [ADR 0019](../adr/0019-scoped-route-capabilities.md), and
 [ADR 0022](../adr/0022-opt-in-gateway-token-minting.md) are the accepted
 positions; a change that contradicts one supersedes it in a new ADR rather than
-editing it. Sections 2 and 8 of the security review, and the inbound
-authentication section of the [deployment security model](./deployment-model.md),
-are the statements to re-confirm or amend.
+editing it. [ADR 0061](../adr/0061-authentication-remains-an-outer-boundary.md)
+owns authentication's compiled outer-boundary placement and its ordering before
+convergence, parsing, configurable policy, accounting, and dispatch. Moving or
+making that boundary operator-orderable amends ADR 0061 and must preserve its
+closed-route, fail-closed, immutable-generation, and anonymous-before-
+convergence regression floor. Sections 2 and 8 of the security review, and the
+inbound authentication section of the
+[deployment security model](./deployment-model.md), are the statements to
+re-confirm or amend.
 
 **Release impact.** A claim, scope, or audience change is a token-format change:
 tokens minted before the upgrade must still verify, or the migration note must
