@@ -122,6 +122,38 @@ fn the_committed_manifest_covers_every_workload_with_thresholds() {
                     profile.id
                 );
             }
+            Workload::Queueing => {
+                let ceiling = profile
+                    .max_in_flight
+                    .expect("the queueing workload needs `max_in_flight`");
+                let capacity = profile
+                    .queue_capacity
+                    .expect("the queueing workload needs `queue_capacity`");
+                assert!(
+                    profile.queue_wait_ms.is_some_and(|wait| wait > 0),
+                    "{}: the queueing workload needs a positive `queue_wait_ms`",
+                    profile.id
+                );
+                for tier in [Tier::Reduced, Tier::Heavy] {
+                    assert!(
+                        profile.scale(tier).concurrency as u64 > ceiling + capacity,
+                        "{} [{}]: offered concurrency must overflow both admission and queue",
+                        profile.id,
+                        tier.as_str()
+                    );
+                }
+                assert_eq!(
+                    (thresholds.min_queue_depth, thresholds.max_queue_depth),
+                    (Some(capacity), Some(capacity)),
+                    "{}: the queue must be proved to reach, and never exceed, its bound",
+                    profile.id
+                );
+                assert!(
+                    thresholds.min_rejected_fraction.unwrap_or_default() > 0.0,
+                    "{}: a queueing profile that need not overflow asserts nothing",
+                    profile.id
+                );
+            }
             Workload::BackendLimits => {
                 assert!(
                     profile.upstream_timeout_ms.is_some(),
@@ -682,6 +714,42 @@ fn assert_expected_outcomes(profile: &capacity::Profile, result: &CapacityResult
             assert!(
                 result.occupancy.admission_max_in_flight.is_some(),
                 "{}: a shedding run records the ceiling it booted",
+                profile.id
+            );
+        }
+        Workload::Queueing => {
+            let evidence = result
+                .queue
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: queue telemetry was not captured", profile.id));
+            let capacity = profile.queue_capacity.expect("a queue capacity");
+            let ceiling = profile.max_in_flight.expect("an admission ceiling");
+            assert!(
+                evidence.exact && evidence.observations > 0 && evidence.attributes == 0,
+                "{}: queue histogram is not exact label-free evidence: {evidence:?}",
+                profile.id
+            );
+            assert_eq!(
+                evidence.max_depth,
+                Some(capacity),
+                "{}: the bounded queue did not fill exactly: {evidence:?}",
+                profile.id
+            );
+            assert!(
+                result.throughput.accepted > ceiling,
+                "{}: no request was proved to leave the queue and be served",
+                profile.id
+            );
+            assert_eq!(
+                error_types(&result.outcomes.rejections_by_error_type),
+                vec!["admission_queue_full"],
+                "{}: overflow must be attributed to the queue bound",
+                profile.id
+            );
+            assert_eq!(
+                usage.by_status.get("ok").copied(),
+                Some(result.throughput.accepted + served_probe(result)),
+                "{}: every admitted request must settle as `ok`",
                 profile.id
             );
         }

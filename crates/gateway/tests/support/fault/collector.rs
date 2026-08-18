@@ -17,6 +17,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use bytes::Bytes;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::metrics::v1::metric;
+use prost::Message;
 use tokio::sync::oneshot;
 
 /// One export the collector received.
@@ -24,6 +27,19 @@ use tokio::sync::oneshot;
 pub struct Export {
     pub signal: &'static str,
     pub bytes: Bytes,
+}
+
+/// One decoded OTLP explicit-histogram point.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistogramPoint {
+    pub count: u64,
+    pub sum: Option<f64>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub explicit_bounds: Vec<f64>,
+    pub bucket_counts: Vec<u64>,
+    pub attributes: usize,
+    pub time_unix_nano: u64,
 }
 
 #[derive(Default)]
@@ -94,6 +110,45 @@ impl Collector {
         self.exports()
             .iter()
             .any(|export| contains(&export.bytes, needle.as_bytes()))
+    }
+
+    /// Decode every explicit-histogram point exported under `name`.
+    ///
+    /// Qualification needs the values, bounds, and absence of labels rather
+    /// than only proof that an instrument name occurred in protobuf bytes.
+    pub fn histogram_points(&self, name: &str) -> Result<Vec<HistogramPoint>, String> {
+        let mut found = Vec::new();
+        for export in self.exports().into_iter().filter(|e| e.signal == "metrics") {
+            let request = ExportMetricsServiceRequest::decode(export.bytes)
+                .map_err(|error| format!("invalid OTLP metrics export: {error}"))?;
+            for metric in request
+                .resource_metrics
+                .into_iter()
+                .flat_map(|resource| resource.scope_metrics)
+                .flat_map(|scope| scope.metrics)
+                .filter(|metric| metric.name == name)
+            {
+                let Some(metric::Data::Histogram(histogram)) = metric.data else {
+                    return Err(format!("OTLP metric `{name}` is not an explicit histogram"));
+                };
+                found.extend(
+                    histogram
+                        .data_points
+                        .into_iter()
+                        .map(|point| HistogramPoint {
+                            count: point.count,
+                            sum: point.sum,
+                            min: point.min,
+                            max: point.max,
+                            explicit_bounds: point.explicit_bounds,
+                            bucket_counts: point.bucket_counts,
+                            attributes: point.attributes.len(),
+                            time_unix_nano: point.time_unix_nano,
+                        }),
+                );
+            }
+        }
+        Ok(found)
     }
 }
 

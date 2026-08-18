@@ -722,6 +722,12 @@ pub const CATALOG: &[MetricSpec] = &[
         labels: &[],
     },
     MetricSpec {
+        name: "axond.admission.queue.depth",
+        kind: InstrumentKind::Histogram,
+        unit: None,
+        labels: &[],
+    },
+    MetricSpec {
         name: "axond.admission.in_flight",
         kind: InstrumentKind::UpDownCounter,
         unit: None,
@@ -1072,6 +1078,28 @@ mod tests {
                 rejection.code(),
             )
             .expect("every rejection's error code is catalogued");
+        }
+    }
+
+    #[test]
+    fn admission_queue_depth_is_a_label_free_histogram() {
+        let queue_depth = spec("axond.admission.queue.depth").expect("queue depth is catalogued");
+        assert_eq!(queue_depth.kind, InstrumentKind::Histogram);
+        assert_eq!(queue_depth.unit, None);
+        assert!(queue_depth.labels.is_empty());
+        validate_reference("axond.admission.queue.depth", &[])
+            .expect("the label-free instrument is a valid reference");
+        for forbidden_dimension in [
+            "axond.tenant",
+            "axond.request_id",
+            "axond.subject",
+            "axond.alias",
+            "axond.admission.resource",
+        ] {
+            assert!(
+                validate_reference("axond.admission.queue.depth", &[forbidden_dimension]).is_err(),
+                "queue depth must not acquire `{forbidden_dimension}`"
+            );
         }
     }
 

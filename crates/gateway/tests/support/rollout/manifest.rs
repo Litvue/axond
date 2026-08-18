@@ -18,7 +18,7 @@ pub const MANIFEST_RELATIVE: &str = "qualification/rollout/manifest.toml";
 
 /// The result-artifact schema version. Bumped when a field changes meaning, so
 /// a stored artifact is never reinterpreted under a newer contract.
-pub const RESULT_SCHEMA_VERSION: u32 = 1;
+pub const RESULT_SCHEMA_VERSION: u32 = 3;
 
 /// The manifest schema this harness understands.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -96,6 +96,12 @@ impl ShutdownBounds {
     pub fn budget(&self) -> Duration {
         Duration::from_millis(self.drain_grace_ms + self.deadline_ms + self.flush_timeout_ms)
     }
+
+    /// Caller work must end before accounting flush begins. The flush timeout
+    /// belongs to process exit, not to the stream-cut promise.
+    pub fn stream_budget(&self) -> Duration {
+        Duration::from_millis(self.drain_grace_ms + self.deadline_ms)
+    }
 }
 
 /// The hard failures. Every one is a property of the *fleet* rather than of the
@@ -110,6 +116,7 @@ pub struct Thresholds {
     pub max_readiness_removal_ms: u64,
     pub max_replacement_admission_ms: u64,
     pub max_drain_exit_slack_ms: u64,
+    pub max_stream_cut_observation_slack_ms: u64,
     pub min_mixed_version_requests: u64,
 }
 

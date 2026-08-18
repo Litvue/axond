@@ -31,6 +31,7 @@
 //! the same shape without changing a call site.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -299,7 +300,7 @@ pub struct AdmissionControl {
     limits: AdmissionLimits,
     global: Option<Arc<Semaphore>>,
     streams: Option<Arc<Semaphore>>,
-    queue: Option<Arc<Semaphore>>,
+    queue: Option<Arc<QueueState>>,
     diagnostics: Arc<Semaphore>,
     /// The two partitions of the pre-authentication ceiling, keyed by what the
     /// credential's verification will cost.
@@ -316,7 +317,9 @@ impl AdmissionControl {
             streams: limits
                 .max_in_flight_streams
                 .map(|n| Arc::new(Semaphore::new(n))),
-            queue: limits.queue_capacity.map(|n| Arc::new(Semaphore::new(n))),
+            queue: limits
+                .queue_capacity
+                .map(|capacity| Arc::new(QueueState::new(capacity))),
             diagnostics: Arc::new(Semaphore::new(MAX_IN_FLIGHT_DIAGNOSTICS)),
             authenticating_tokens: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS)),
             authenticating_keys: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTIC_KEYS)),
@@ -441,11 +444,9 @@ impl AdmissionControl {
         let Some(queue) = &self.queue else {
             return Err(reject(AdmissionRejection::Global));
         };
-        let Ok(slot) = Arc::clone(queue).try_acquire_owned() else {
+        let Some(_queued) = queue.try_acquire() else {
             return Err(reject(AdmissionRejection::QueueFull));
         };
-        let _queued = QueuedRequest { _slot: slot };
-        metrics::record_admission_acquired(RESOURCE_QUEUE);
         match tokio::time::timeout(self.limits.queue_wait, Arc::clone(global).acquire_owned()).await
         {
             Ok(Ok(permit)) => Ok(permit),
@@ -454,6 +455,50 @@ impl AdmissionControl {
             Ok(Err(_)) => Err(reject(AdmissionRejection::Global)),
             Err(_) => Err(reject(AdmissionRejection::QueueTimeout)),
         }
+    }
+}
+
+/// The bounded queue's permit authority and exact current depth. A queue slot
+/// is acquired before `current` changes and remains held until after
+/// [`QueuedRequest::drop`] decrements it, so the semaphore remains the bound
+/// while the atomic is an exact observation of the slots currently owned.
+struct QueueState {
+    slots: Arc<Semaphore>,
+    current: AtomicU64,
+    capacity: u64,
+}
+
+impl QueueState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(capacity)),
+            current: AtomicU64::new(0),
+            capacity: u64::try_from(capacity).expect("queue capacity fits in u64"),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<QueuedRequest> {
+        let slot = Arc::clone(&self.slots).try_acquire_owned().ok()?;
+        let previous = self
+            .current
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1).filter(|next| *next <= self.capacity)
+            })
+            .expect("queue depth cannot exceed its semaphore capacity");
+        let depth = previous + 1;
+        metrics::record_admission_queue_acquired(depth);
+        Some(QueuedRequest {
+            state: Arc::clone(self),
+            _slot: slot,
+        })
+    }
+
+    fn release(&self) {
+        self.current
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            })
+            .expect("a queued request releases its depth exactly once");
     }
 }
 
@@ -482,11 +527,13 @@ impl Drop for DiagnosticPermit {
 /// A request waiting for the global ceiling. Exists to keep the queue gauge and
 /// the queue slot symmetric on every exit, including the timeout path.
 struct QueuedRequest {
+    state: Arc<QueueState>,
     _slot: OwnedSemaphorePermit,
 }
 
 impl Drop for QueuedRequest {
     fn drop(&mut self) {
+        self.state.release();
         metrics::record_admission_released(RESOURCE_QUEUE);
     }
 }
@@ -587,6 +634,24 @@ impl Drop for TenantSlot {
 mod tests {
     use super::*;
 
+    fn queue(control: &AdmissionControl) -> &QueueState {
+        control.queue.as_deref().expect("a bounded queue")
+    }
+
+    fn queue_depth(control: &AdmissionControl) -> u64 {
+        queue(control).current.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_queue_depth(control: &AdmissionControl, expected: u64) {
+        for _ in 0..100 {
+            if queue_depth(control) == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queue_depth(control), expected);
+    }
+
     /// The rejection a shed request carried. Permits are not comparable — they
     /// are live capacity — so a test asserts on the error rather than the result.
     fn shed(result: Result<AdmissionPermit, AdmissionRejection>) -> AdmissionRejection {
@@ -639,6 +704,24 @@ mod tests {
             .admit("tenant", RequestKind::Buffered)
             .await
             .expect("capacity returns when the permit drops");
+    }
+
+    #[tokio::test]
+    async fn zero_queue_capacity_keeps_the_immediate_saturation_path() {
+        let control = AdmissionControl::from_config(&AdmissionConfig {
+            max_in_flight: 1,
+            queue_capacity: 0,
+            ..AdmissionConfig::default()
+        });
+        assert!(control.queue.is_none());
+        let _held = control
+            .admit("tenant", RequestKind::Buffered)
+            .await
+            .expect("first request is admitted");
+        assert_eq!(
+            shed(control.admit("tenant", RequestKind::Buffered).await),
+            AdmissionRejection::Global
+        );
     }
 
     #[tokio::test]
@@ -784,12 +867,14 @@ mod tests {
             let control = Arc::clone(&control);
             async move { control.admit("tenant", RequestKind::Buffered).await }
         });
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        wait_for_queue_depth(&control, 1).await;
         drop(held);
-        queued
+        let admitted = queued
             .await
             .expect("task")
             .expect("the queued request is admitted");
+        assert_eq!(queue_depth(&control), 0);
+        drop(admitted);
     }
 
     #[tokio::test(start_paused = true)]
@@ -810,13 +895,14 @@ mod tests {
             AdmissionRejection::QueueTimeout
         );
         assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(queue_depth(&control), 0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_queue_itself_is_bounded() {
+    async fn the_queue_reaches_exact_capacity_and_never_exceeds_it() {
         let control = Arc::new(AdmissionControl::new(AdmissionLimits {
             max_in_flight: Some(1),
-            queue_capacity: Some(1),
+            queue_capacity: Some(3),
             queue_wait: Duration::from_secs(30),
             ..limits()
         }));
@@ -824,16 +910,28 @@ mod tests {
             .admit("tenant", RequestKind::Buffered)
             .await
             .expect("admit");
-        let queued = tokio::spawn({
-            let control = Arc::clone(&control);
-            async move { control.admit("tenant", RequestKind::Buffered).await }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            shed(control.admit("tenant", RequestKind::Buffered).await),
-            AdmissionRejection::QueueFull
-        );
-        queued.abort();
+        let mut queued = Vec::new();
+        for _ in 0..3 {
+            queued.push(tokio::spawn({
+                let control = Arc::clone(&control);
+                async move { control.admit("tenant", RequestKind::Buffered).await }
+            }));
+        }
+        wait_for_queue_depth(&control, 3).await;
+        assert_eq!(queue(&control).slots.available_permits(), 0);
+        for _ in 0..8 {
+            assert_eq!(
+                shed(control.admit("tenant", RequestKind::Buffered).await),
+                AdmissionRejection::QueueFull
+            );
+            assert_eq!(queue_depth(&control), 3, "a refusal cannot grow the queue");
+        }
+        for task in queued {
+            task.abort();
+            let _ = task.await;
+        }
+        assert_eq!(queue_depth(&control), 0);
+        assert_eq!(queue(&control).slots.available_permits(), 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -852,9 +950,10 @@ mod tests {
             let control = Arc::clone(&control);
             async move { control.admit("tenant", RequestKind::Buffered).await }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_queue_depth(&control, 1).await;
         queued.abort();
         let _ = queued.await;
+        assert_eq!(queue_depth(&control), 0);
         // The cancelled waiter released its slot, so the queue admits again
         // rather than staying permanently full.
         // A queue slot the waiter still held would refuse this with `QueueFull`;
@@ -863,6 +962,32 @@ mod tests {
             shed(control.admit("tenant", RequestKind::Buffered).await),
             AdmissionRejection::QueueTimeout
         );
+        assert_eq!(queue_depth(&control), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_polled_admission_future_returns_queue_depth_to_zero() {
+        let control = AdmissionControl::new(AdmissionLimits {
+            max_in_flight: Some(1),
+            queue_capacity: Some(1),
+            queue_wait: Duration::from_secs(30),
+            ..limits()
+        });
+        let _held = control
+            .admit("tenant", RequestKind::Buffered)
+            .await
+            .expect("admit");
+
+        let mut waiting = Box::pin(control.admit("tenant", RequestKind::Buffered));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("queued request unexpectedly completed"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(queue_depth(&control), 1);
+        drop(waiting);
+        assert_eq!(queue_depth(&control), 0);
+        assert_eq!(queue(&control).slots.available_permits(), 1);
     }
 
     #[tokio::test]

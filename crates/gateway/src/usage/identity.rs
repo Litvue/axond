@@ -22,6 +22,8 @@
 use std::fmt;
 use std::sync::LazyLock;
 
+use axum::http::HeaderMap;
+
 use crate::desired_state::ids::{InvalidId, Uuid7, Uuid7Generator};
 
 /// The identity of one accepted usage event.
@@ -104,10 +106,10 @@ pub fn next_request_id() -> RequestId {
 ///   first, so nothing before settlement could refer to the event that a request
 ///   was going to produce. Minting it at acceptance means a credential rotation,
 ///   a retry across targets, and the record itself all name the same event.
-/// - The trace id has to be *readable*. `telemetry::trace_id()` reads the current
-///   span, and a streamed request settles in a detached task where the server
-///   span is no longer current — so it is read in the handler, while the span is
-///   live, and carried.
+/// - The trace id has to be *readable*. `telemetry::request_trace_id()` prefers
+///   the current exported span and otherwise validates the inbound W3C context.
+///   A streamed request settles in a detached task where the server span is no
+///   longer current, so it is read in the handler and carried.
 #[derive(Debug, Clone)]
 pub struct EventIdentity {
     pub request_id: RequestId,
@@ -119,10 +121,10 @@ pub struct EventIdentity {
 impl EventIdentity {
     /// Mint an identity for a request being accepted. Call while the server span
     /// is current.
-    pub fn capture() -> Self {
+    pub fn capture(headers: &HeaderMap) -> Self {
         Self {
             request_id: next_request_id(),
-            trace_id: crate::telemetry::trace_id(),
+            trace_id: crate::telemetry::request_trace_id(headers),
         }
     }
 }

@@ -7,11 +7,11 @@ readiness-driven load balancer. The design and its boundaries are
 envelope the fleet is sized from is
 [capacity qualification](./capacity.md).
 
-This page qualifies the **deployment sequence**, not a second build. A revision
-here is the (binary, config) pair a process was started from; the incoming one
-serves a model alias the outgoing one has never heard of, which is how a
-mixed-version window is proven to be mixed. Nothing here compares two
-compilations.
+The promotable heavy lane qualifies the deployment sequence with two verified
+builds: the retained release executable and the candidate executable. A revision
+is the (binary, config) pair a process was started from; every executable and
+normalised config is recorded by SHA-256. The always-on reduced lane uses the
+candidate for both sides and is explicitly diagnostic, never promotable.
 
 ## What the harness runs
 
@@ -26,17 +26,22 @@ The `rolling-replace` scenario, in order:
    boots. Either failing stops the rollout.
 2. **Steady state.** Two previous-revision replicas are admitted to the balancer
    after their `/readyz` probes pass, and serve a full traffic phase.
-3. **Rolling replacement**, once per outgoing replica: admit a next-revision
+3. **Previous-config compatibility.** Admit the candidate executable with the
+   previous revision's unchanged config, serve traffic, and drain that canary.
+4. **Rolling replacement**, once per outgoing replica: admit a next-revision
    replica, serve a mixed phase, probe the incoming revision's exclusive alias
    against both revisions, pin a buffered request and an unending stream to the
    victim, confirm both reached the upstream, `SIGTERM` the victim, and watch the
    balancer's withdrawal and the child's exit while traffic keeps flowing.
-4. **Rollback.** A previous-revision replica is admitted and a next-revision
-   replica drained — the compatible patch rollback the guide permits — and the
-   older build then serves a phase.
-5. **Fence.** Against a real PostgreSQL, a migrated control plane is given a
-   ledger entry only a newer build could have written, and this build's refusal
-   to serve it is recorded.
+5. **Migration matrix.** On a private PostgreSQL schema, apply and inspect the
+   retained release's migrations, inspect and apply the candidate's migrations,
+   then run the retained binary's status command against the resulting ledger.
+   The exact ledger rows classify the transition as `unchanged` or
+   `forward-only`.
+6. **Rollback.** For `unchanged`, admit the retained binary with its retained
+   config, drain a candidate, and require the retained binary to serve traffic.
+   For `forward-only`, require the retained binary to refuse the candidate layout
+   and do not start it as a replica.
 
 Traffic throughout is buffered and streamed, offered concurrently through the
 balancer, with the replica and revision that served each request recorded from
@@ -55,12 +60,20 @@ Hard failures — all of them environment-independent:
 | `max_readiness_removal_ms` | How long after `SIGTERM` the balancer still considers the replica ready. |
 | `max_replacement_admission_ms` | How long a new replica takes from boot to carrying traffic. |
 | `max_drain_exit_slack_ms` | How far past `drain_grace_ms + deadline_ms + flush_timeout_ms` a termination may run. |
+| `max_stream_cut_observation_slack_ms` | External timing allowance between the harness recording that it will send `SIGTERM` and the process observing it. This does not extend the configured request deadline or termination budget. |
 | `min_mixed_version_requests` | The mixed-version window genuinely served both revisions. |
 
 Also asserted: the pinned buffered request finished after the signal rather than
 being dropped, the pinned stream was cut inside the shutdown deadline and
 accounted for as partial (`client_cancelled`), no upstream stream was left open,
-the operator gate passed, and the rolled-back replica served traffic.
+the operator gate passed, two distinct executable digests served in the heavy
+lane, the candidate served the retained config before candidate-only enablement,
+the real migration matrix completed, the outgoing revision answered the
+candidate-only alias with the exact typed `404 unknown_model` contract, and
+rollback matched its classification. Stream cutoff uses drain grace plus request
+deadline, with only the committed signal-observation allowance applied by the
+external witness; the accounting flush timeout can extend process exit but
+cannot extend caller work.
 
 Throughput and latency are recorded and never asserted, for the reason
 [ADR 0033](../adr/0033-capacity-qualification-harness.md) gives: a shared runner
@@ -88,6 +101,9 @@ kernel, cores, and memory — plus:
 
 No DSN or secret value appears in an artifact; configs name environment
 variables, never their contents.
+The compact observation preserves both executable versions and SHA-256 digests
+and the retained archive digest in addition to binding this raw JSON, so the
+release pin remains reviewable after disposable workflow artifacts expire.
 
 ## Run it
 
@@ -95,13 +111,19 @@ variables, never their contents.
 # The reduced tier. Part of the normal suite, and of CI.
 cargo test --locked --all-features --test rollout -- --nocapture
 
-# The heavy tier. Same driver, manifest, and assertions at a larger scale.
-AXOND_ROLLOUT=1 cargo test --locked --all-features --test rollout -- \
+# The promotable heavy tier. The previous path must be a verified release asset.
+AXOND_ROLLOUT=1 \
+AXOND_ROLLOUT_PREVIOUS_BINARY=/path/to/verified/v0.3.40/axond \
+AXOND_ROLLOUT_EXPECTED_PREVIOUS_VERSION=0.3.40 \
+AXOND_ROLLOUT_EXPECTED_PREVIOUS_SHA256=<extracted-binary-sha256> \
+AXOND_ROLLOUT_RETAINED_ARCHIVE_SHA256=<verified-release-archive-sha256> \
+AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
+  cargo test --release --locked --all-features --test rollout -- \
   --nocapture --test-threads=1
 ```
 
-The forward-only rollback fence needs PostgreSQL and is skipped — recorded in the
-artifact as `evaluated: false` with a reason — when the DSN is unset:
+The reduced diagnostic can attach PostgreSQL to exercise the matrix, but remains
+non-promotable because it does not require distinct binaries:
 
 ```bash
 docker run -d --name axond-test-postgres -e POSTGRES_PASSWORD=axond-ci \
@@ -110,9 +132,11 @@ AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
   cargo test --locked --all-features --test rollout -- --nocapture
 ```
 
-The `Rollout` workflow runs the heavy tier on dispatch and weekly with the
-database attached, and uploads the artifacts; the CI `tests` lane uploads the
-reduced ones.
+The `Rollout` workflow pins v0.3.40's Linux archive digest, verifies its release
+checksum, records the extracted executable digest, runs the release-profile
+heavy tier with PostgreSQL attached, independently promotes the raw artifacts,
+and uploads only the validated compact record. The CI `tests` lane uploads
+non-promotable reduced diagnostics.
 
 ## Reading a failed run
 
@@ -128,6 +152,5 @@ problem.
 - A production load balancer's own behaviour. The fixture is a representative
   readiness-driven proxy — round-robin, one retry onto another member, no outlier
   ejection.
-- A wire-format or binary-level incompatibility between two builds.
 - Stateful serving or revision convergence during a rollout. The fleet is
-  config-only; the control plane appears here only as the rollback fence.
+  config-only; the control plane appears here only in the migration matrix.

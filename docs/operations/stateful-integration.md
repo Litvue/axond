@@ -14,13 +14,14 @@ This page is the integration plan and its acceptance matrix. It exists so that
 "is stateful mode ready?" has a single answer with a reference behind each line,
 rather than a set of merged pull requests nobody has run together.
 
-The current #345 slice is intentionally **fail-closed convergence wiring**. Its
-production projection has no inbound caller-principal source, so stateful
-compilation returns typed `unsupported`, no revision becomes active, and no
-outage-serving or cache-recovery claim is active in this build. The principal-
-projection slice is the explicit dependency that moves IG-03, IG-06, IG-07, and
-the later serving gates from blocked to executable. The shipped Recreate
-Deployment also omits `[convergence]` until durable per-replica storage exists.
+The #345 bootstrap remains intentionally fail-closed until a complete revision
+is active. Durable workload-principal projection now lets a complete revision
+compile into a serving snapshot, and the persistent StatefulSet/PVC overlay can
+retain its signed desired-state and encrypted serving caches across Pod
+replacement. The Recreate Deployment still omits `[convergence]` because it has
+no durable per-replica storage. The remaining boundary is qualification: these
+serving and recovery paths need retained fleet-load, rollout, and long-soak
+evidence before they become a production-readiness claim.
 
 - [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) — the two
   operating modes and what each one owns.
@@ -111,7 +112,7 @@ here without a scenario, or a scenario without a row, fails the suite.
 
 | Gate | #160 release gate | Integration wiring | Depends on | Evidence | Status |
 | --- | --- | --- | --- | --- | --- |
-| IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap reaches its control plane and serves `/admin/v1`; anonymous inference is refused by auth first and authenticated inference remains behind the typed convergence refusal until principal projection exists | | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_serves_administration_and_refuses_inference`, `stateful_boot_refuses_an_unresolved_reference` | wired |
+| IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap reaches its control plane and serves `/admin/v1`; before a complete revision is active, anonymous inference is refused by auth first and an authenticated bootstrap caller remains behind the typed convergence refusal | | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_serves_administration_and_refuses_inference`, `stateful_boot_refuses_an_unresolved_reference` | wired |
 | IG-02 | Postgres-first control plane | Operator preflight, forward-only migration, and the connect a replica performs before it serves | | `preflight_describes_a_stateless_install`, `migrate_prepares_a_control_plane_before_replicas_start` | wired |
 | IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | | `stateful_revision_compiles_rotates_and_recovers` | wired |
 | IG-04 | Provider secrets rotate without redeployment | Resolve every credential a candidate snapshot needs through the SecretStore during compilation, never on the request path | IG-03 | `stateful_revision_compiles_rotates_and_recovers` | wired |
@@ -170,13 +171,13 @@ recovery path; valid OIDC authentication without a projected directory entry
 still has no authority.
 
 IG-11 is furthest out, and the [qualification
-packet](./qualification.md) says why in the terms it owns: capacity is
-`evidenced`, while endurance, rollout, recovery, and fault remain `harnessed`
-until heavy records are retained. Recovery now has twenty-two executable
+packet](./qualification.md) says why in the terms it owns: fault and recovery
+are `evidenced`; capacity, rollout, endurance, and stateful endurance remain
+`harnessed` until current-contract heavy records are retained. Recovery has twenty-two executable
 stages against real Postgres across the in-process and black-box lanes,
-including the durable usage-boundary measurement. The local heavy fault and rollout runs,
-and both endurance smoke runs, are qualification progress but are not yet
-production records. Nothing in this page's status column should be read as
+including the durable usage-boundary measurement. Local heavy runs and both
+endurance smoke lanes are qualification progress but are not current production
+records. Nothing in this page's status column should be read as
 evidence that stateful serving is production-ready.
 
 ## What "wired" requires

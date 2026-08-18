@@ -169,6 +169,7 @@ fn main() -> anyhow::Result<()> {
 fn cli() -> Command {
     Command::new("axond")
         .about("A stateless, self-hosted AI gateway")
+        .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(false)
         .arg_required_else_help(false)
         .subcommand(admin::cli::command())
@@ -1292,5 +1293,17 @@ mod tests {
     fn no_subcommand_is_still_serve() {
         let matches = cli().try_get_matches_from(["axond"]).expect("serve");
         assert!(matches.subcommand().is_none());
+    }
+
+    #[test]
+    fn the_binary_reports_the_version_embedded_in_its_own_bytes() {
+        let version = cli()
+            .try_get_matches_from(["axond", "--version"])
+            .expect_err("version exits after printing");
+        assert_eq!(version.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            version.to_string(),
+            format!("axond {}\n", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

@@ -84,17 +84,25 @@ nothing the driver accumulates may scale with the run:
   every 250 ms — `run.drain_interval_ms`, counted by `run.drains` — regardless
   of segment length, so a fifteen-minute segment retains no more than the
   smoke tier's 2.5-second one;
-- request identities are fingerprinted and appended to sixty-four sharded files
-  under `target/endurance/<tier>/<profile>-fingerprints/` rather than held in a
-  whole-run set. Equal identities share a shard, so the duplicate count is
+- all 128 bits of each request identity are appended to sixty-four sharded files
+  under `target/endurance/<tier>/<profile>-request-identities/` rather than held
+  in a whole-run set. Equal identities share a shard, so the duplicate count is
   exact while only one shard is ever in memory;
-  `reconciliation.fingerprints` records the shard count, the peak shard, and
-  that exactness;
+- deterministic caller trace identities and observed trace/status pairs are
+  likewise spilled under `<profile>-correlations/`; this proves each planned
+  request produced the corresponding usage row with a valid ending rather than
+  merely comparing totals;
+- `reconciliation.request_identities` and `reconciliation.correlations` record
+  each ledger's shard count, peak shard, and exactness;
 - raw gateway output and fake-upstream request bodies are ring-buffered, with
   exact counters kept separately, so bounded history never becomes a miscount.
 
-The fingerprint shards are working files, not evidence: they are rewritten by
-the next run of the same tier and are not uploaded with the artifacts.
+The identity and correlation shards are evidence. The workflow uploads every
+fixed-width shard with the raw result and sample series; the compact record
+binds each complete ledger by canonical SHA-256, file count, and byte count.
+Promotion rejects a missing, extra, renamed, malformed, or summary-inconsistent
+shard and independently rebuilds duplicate, missing, unexpected, and status
+counts from the retained rows.
 
 ## What a run leaves behind
 
@@ -102,6 +110,11 @@ the next run of the same tier and are not uploaded with the artifacts.
 `mixed-endurance.samples.jsonl` beside it is every resource sample the run took,
 written as it went rather than at the end — so a run that is killed at hour
 eleven still has eleven hours of evidence.
+
+The compact record also binds that JSONL file by digest and size. Promotion
+parses it, verifies its monotonic resource observations, rebuilds each segment's
+medians, peaks, and CPU deltas, and recomputes the long-run drift fit before the
+record can enter the production packet.
 
 The result carries the measurements (throughput, latency, TTFT, stream lifetime,
 RSS, CPU, descriptors, sockets, occupancy, per-segment medians, usage-record

@@ -1722,7 +1722,7 @@ async fn serve(
     // its identity is minted here — once, while the server span is still current
     // — and carried to whichever path settles it. A request refused above this
     // line produces no event and therefore needs no identity.
-    let identity = EventIdentity::capture();
+    let identity = EventIdentity::capture(&headers);
 
     if streamed {
         return stream_with_failover(
@@ -11759,6 +11759,93 @@ max_ttl = "15m"
             Arc::new(crate::admin::fakes::FakeAdminAuthenticator::new()),
             Arc::new(crate::admin::fakes::FakeAdminAuthorizer::permissive()),
         )))
+    }
+
+    /// Stateful administration and inference share an HTTP server, not a data
+    /// source. The serving snapshot is the complete request-path dependency:
+    /// once it has been published, an inference request must not consult the
+    /// durable control plane that administration continues to read.
+    #[tokio::test]
+    async fn inference_reads_zero_control_plane_state_on_the_main_route_graph() {
+        const ADMIN_TOKEN: &str = "stateful-admin-token";
+
+        let control_plane = Arc::new(crate::desired_state::oracle::InMemoryControlPlane::new());
+        let counting = Arc::new(crate::admin::fakes::CountingStore::new(control_plane));
+        let administration =
+            crate::admin::router::router(Arc::new(crate::admin::router::AdminApi::new(
+                Arc::new(crate::admin::service::AdminService::stateful(
+                    counting.clone(),
+                )),
+                Arc::new(
+                    crate::admin::fakes::FakeAdminAuthenticator::new().with_human(
+                        ADMIN_TOKEN,
+                        "https://issuer.example",
+                        "stateful-operator",
+                    ),
+                ),
+                Arc::new(crate::admin::fakes::FakeAdminAuthorizer::permissive()),
+            )));
+        let (base_url, upstream_hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+
+        // This is the same composition main serves: the inference router over
+        // its active snapshot, merged with the stateful administrative router.
+        let app = router(test_state_with_base_url(&base_url)).merge(administration);
+        let admin_read = || {
+            Request::get("/admin/v1/state")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {ADMIN_TOKEN}"),
+                )
+                .body(Body::empty())
+                .expect("admin request")
+        };
+
+        let before_admin = counting.calls();
+        let response = app
+            .clone()
+            .oneshot(admin_read())
+            .await
+            .expect("admin response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let after_first_admin = counting.calls();
+        assert!(
+            after_first_admin > before_admin,
+            "an authenticated administrative read did not consult the control plane"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(chat_request())
+            .await
+            .expect("inference response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("complete inference body")
+                .to_bytes(),
+        )
+        .expect("inference JSON");
+        assert_eq!(body["id"], "resp-1", "the serving snapshot dispatched");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counting.calls(),
+            after_first_admin,
+            "authenticated inference consulted the control plane"
+        );
+
+        let response = app
+            .oneshot(admin_read())
+            .await
+            .expect("second admin response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            counting.calls() > after_first_admin,
+            "the second administrative read did not consult the control plane"
+        );
     }
 
     /// A replica that refuses inference because it cannot compile a revision is

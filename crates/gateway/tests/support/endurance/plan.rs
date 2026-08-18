@@ -207,6 +207,48 @@ pub struct Planned {
     pub tenant: Tenant,
     pub shape: Shape,
     pub ending: Ending,
+    /// Caller-controlled W3C trace identity used only to prove that this exact
+    /// planned request produced this exact usage record. The gateway continues
+    /// to mint the billing `request_id` itself.
+    pub correlation: CorrelationId,
+}
+
+/// One run-scoped, deterministic request correlation identity.
+///
+/// The first word domains the manifest seed and the second is the one-based
+/// request index. The mapping is injective and cannot produce W3C's forbidden
+/// all-zero trace id. It is a qualification-driver identity, never a production
+/// trace-id generator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CorrelationId([u8; 16]);
+
+impl CorrelationId {
+    const DOMAIN: u64 = 0x6178_6f6e_642d_656e;
+
+    pub fn new(seed: u64, index: usize) -> Self {
+        let sequence = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .expect("an endurance request index fits a nonzero u64");
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&(seed ^ Self::DOMAIN).to_be_bytes());
+        bytes[8..].copy_from_slice(&sequence.to_be_bytes());
+        Self(bytes)
+    }
+
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+
+    pub fn trace_id(self) -> String {
+        let high = u64::from_be_bytes(self.0[..8].try_into().expect("eight-byte high word"));
+        let low = u64::from_be_bytes(self.0[8..].try_into().expect("eight-byte low word"));
+        format!("{high:016x}{low:016x}")
+    }
+
+    pub fn traceparent(self) -> String {
+        format!("00-{}-0000000000000001-01", self.trace_id())
+    }
 }
 
 /// The ending rotation: one full mix cycle, permuted once with the manifest's
@@ -231,7 +273,7 @@ pub fn rotation(mix: &Mix, seed: u64) -> Vec<Ending> {
 }
 
 /// What request `index` is.
-pub fn planned(index: usize, tenants: &[Tenant], rotation: &[Ending]) -> Planned {
+pub fn planned(index: usize, seed: u64, tenants: &[Tenant], rotation: &[Ending]) -> Planned {
     let ending = rotation[index % rotation.len()];
     let shapes = shapes(ending);
     Planned {
@@ -241,6 +283,7 @@ pub fn planned(index: usize, tenants: &[Tenant], rotation: &[Ending]) -> Planned
         tenant: tenants[index % tenants.len()].clone(),
         shape: shapes[index % shapes.len()],
         ending,
+        correlation: CorrelationId::new(seed, index),
     }
 }
 
@@ -259,5 +302,33 @@ impl SplitMix64 {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn correlations_are_deterministic_injective_and_valid_w3c_ids() {
+        let first = CorrelationId::new(7, 0);
+        let again = CorrelationId::new(7, 0);
+        let next = CorrelationId::new(7, 1);
+        let another_seed = CorrelationId::new(8, 0);
+        assert_eq!(first, again);
+        assert_ne!(first, next);
+        assert_ne!(first, another_seed);
+        assert_ne!(first.bytes(), [0; 16]);
+        assert_eq!(first.trace_id().len(), 32);
+        assert_eq!(first.traceparent().len(), 55);
+        assert!(first.traceparent().starts_with("00-"));
+        assert!(first.traceparent().ends_with("-0000000000000001-01"));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "fits a nonzero u64")]
+    fn correlation_refuses_index_wraparound() {
+        let _ = CorrelationId::new(0, usize::MAX);
     }
 }

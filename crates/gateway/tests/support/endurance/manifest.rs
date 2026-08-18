@@ -18,6 +18,10 @@ pub const MANIFEST_RELATIVE: &str = "qualification/endurance/manifest.toml";
 /// The result-artifact schema version. Bumped when a field changes meaning, so
 /// a stored artifact is never reinterpreted under a newer contract.
 ///
+/// 4: reconciliation pairs each planned request with its usage record by a
+/// full 128-bit W3C trace identity, validates the status for that request, and
+/// observes the complete settlement window before a terminal drain.
+///
 /// 3: reconciliation records and gates distinct usage identities beyond the
 /// requests known to owe a row, so a watchdog expiry cannot hide surplus
 /// accounting behind a saturating missing-record subtraction.
@@ -26,7 +30,7 @@ pub const MANIFEST_RELATIVE: &str = "qualification/endurance/manifest.toml";
 /// one the manifest commits, which moved to `profile.manifest_duration_ms`. A
 /// version-1 artifact of a dispatched run states the manifest's duration
 /// beside that run's numbers, so the two may not be read the same way.
-pub const RESULT_SCHEMA_VERSION: u32 = 3;
+pub const RESULT_SCHEMA_VERSION: u32 = 4;
 
 /// The manifest schema this harness understands.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;

@@ -16,9 +16,9 @@
 # Postgres, cold-booting from the signed cache, converging when it returns — runs
 # today against a real database, and the driver writes its evidence to
 # `target/recovery/`. The serving half is a stage of its own. The black-box
-# stateful integration lane now owns the cached-serving and secret-rotation
-# stages that it directly proves; the in-process recovery driver retains the
-# severable-link stages.
+# stateful integration lane owns every stateful stage that can close release
+# qualification. The in-process recovery driver remains as deeper regression
+# coverage for reconciler internals, but writes only non-promotable diagnostics.
 # A scenario is executable exactly when all of its stages are.
 #
 # `status` is the honest state of that code, per stage: `executable` means a
@@ -31,9 +31,10 @@
 # `runner` names the lane that executes a stage, and only an executable stage
 # has one. Two drivers, because the two halves need different machinery:
 #
-#   * `stateful-tests` — the in-process driver in `qualification::recovery`,
-#     which cuts the TCP path to a real journal. It can sever a link; it cannot
-#     take a base backup or promote a recovered cluster.
+#   * `stateful-tests` — the black-box stateful integration driver, which boots
+#     the release `axond` executable and cuts its TCP path to a real journal. It
+#     can sever a link; it cannot take a base backup or promote a recovered
+#     cluster.
 #   * `restore-drill` — `ops/restore-drill.sh`, which runs a real PostgreSQL with
 #     WAL archiving under Docker, publishes through `axond admin` against a
 #     running replica, and recovers it two ways.
@@ -88,11 +89,12 @@ max_unauthenticated_admin_successes = 0
 id = "journal-outage"
 status = "executable"
 runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 The link to a real Postgres journal is severed under a converged replica: the \
 active revision is retained, an administrative publish fails retryably without \
 writing, and convergence reports `unavailable` while its lag grows."""
-evidence = ["outage_timeline", "revisions", "convergence_lag"]
+evidence = ["outage_timeline", "revisions", "convergence_lag", "revision_loss_boundary"]
 
 [[scenario.stage]]
 id = "serving"
@@ -136,11 +138,12 @@ max_unauthenticated_admin_successes = 0
 id = "cold-boot"
 status = "executable"
 runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 A replica with a cache exported from a real revision boots with the journal \
 unreachable: bootstrap succeeds from the signed cache, the restored revision is \
 the exported one, and the replica reports `source = last-known-good`."""
-evidence = ["outage_timeline", "cold_start", "revisions"]
+evidence = ["outage_timeline", "cold_start", "revisions", "revision_loss_boundary"]
 
 [[scenario.stage]]
 id = "serving"
@@ -150,7 +153,7 @@ driver = "stateful-integration"
 covers = """
 The restored snapshot answering requests, so a cold boot from cache is qualified \
 by traffic rather than by a successful bootstrap alone."""
-evidence = ["serving_behavior", "fail_open_closed"]
+evidence = ["serving_behavior", "fail_open_closed", "audit_auth"]
 
 [[scenario]]
 id = "cold-boot-no-cache"
@@ -172,6 +175,7 @@ max_unauthenticated_admin_successes = 0
 id = "cold-boot"
 status = "executable"
 runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 The same boot with no cache file at all: bootstrap refuses with the unreachable \
 control plane as its reason, and nothing is published — no empty configuration \
@@ -208,6 +212,7 @@ max_unauthenticated_admin_successes = 0
 id = "cold-boot"
 status = "executable"
 runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
 Every way a cache can fail its authentication — an edited record, a foreign \
 signing key, a truncated file — refuses the boot and names the cache, and none \
@@ -247,11 +252,12 @@ max_unauthenticated_admin_successes = 0
 id = "journal-recovery"
 status = "executable"
 runner = "stateful-tests"
+driver = "stateful-integration"
 covers = """
-The link is restored under the replica that survived the outage and the one that \
-booted from cache: administrative writes are accepted again, both converge to \
-the head revision without intervention, and lag returns to zero inside the \
-declared bound."""
+The link is restored under the release process that survived the outage: it \
+loads a revision published while disconnected, accepts the next administrative \
+publication itself, converges to that head without restart, agrees with the \
+direct fleet member, and returns inside the declared lag bound."""
 evidence = ["outage_timeline", "revisions", "convergence_lag", "revision_loss_boundary"]
 
 [[scenario.stage]]
@@ -299,7 +305,7 @@ driver = "stateful-integration"
 covers = """
 Rotating the material behind a credential reference and publishing the revision \
 that carries it, without restarting or redeploying a replica."""
-evidence = ["revisions", "convergence_lag"]
+evidence = ["revisions", "convergence_lag", "revision_loss_boundary"]
 
 [[scenario.stage]]
 id = "serving"
@@ -335,6 +341,7 @@ max_unauthenticated_admin_successes = 0
 id = "restore"
 status = "executable"
 runner = "restore-drill"
+driver = "restore-drill"
 covers = """
 A deployment is built through `axond admin` against a running replica, backed \
 up while that replica administers it, and restored into a database it never \
@@ -350,6 +357,7 @@ evidence = ["outage_timeline", "revisions", "restore_duration", "revision_loss_b
 id = "administration"
 status = "executable"
 runner = "restore-drill"
+driver = "restore-drill"
 covers = """
 The audit trail across the backup and the restore, read back through the \
 authenticated administrative surface of a replica booted on the restored \
@@ -360,6 +368,7 @@ evidence = ["audit_auth"]
 id = "durable-inventory"
 status = "executable"
 runner = "restore-drill"
+driver = "restore-drill"
 covers = """
 The durable state a restore has to bring back beyond the journal and its \
 tenancy: wrapped secret metadata and lifecycle, and the retained imported \
@@ -373,6 +382,7 @@ evidence = ["usage_loss_boundary", "durable_inventory", "pricing_history"]
 id = "reconvergence"
 status = "executable"
 runner = "restore-drill"
+driver = "restore-drill"
 covers = """
 The replicas that kept serving converging onto the restored journal, and the \
 traffic that says they did so without fighting it."""
@@ -403,6 +413,7 @@ max_unauthenticated_admin_successes = 0
 id = "recovery"
 status = "executable"
 runner = "restore-drill"
+driver = "restore-drill"
 covers = """
 A base backup and archived WAL recovered to a target taken between two \
 publications, and the boundary measured in both directions: every revision \
@@ -419,6 +430,7 @@ evidence = ["outage_timeline", "revisions", "restore_duration", "durable_invento
 id = "administration"
 status = "executable"
 runner = "restore-drill"
+driver = "restore-drill"
 covers = """
 The audit trail that survived the recovery target, read back through the \
 authenticated administrative surface of a replica booted on the promoted \
@@ -429,6 +441,7 @@ evidence = ["audit_auth"]
 id = "usage-boundary"
 status = "executable"
 runner = "restore-drill"
+driver = "restore-drill"
 covers = """
 The same boundary measured over usage records and their durable outbox events: \
 the request answered before the recovery target survives under its canonical \
@@ -440,6 +453,7 @@ evidence = ["data_loss_boundary"]
 id = "reconvergence"
 status = "executable"
 runner = "restore-drill"
+driver = "restore-drill"
 covers = """
 Serving across the recovery and converging onto the recovered head, with \
 inference traffic answered by the survivor after it reconnects to the promoted \

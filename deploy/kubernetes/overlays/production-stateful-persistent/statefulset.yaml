@@ -14,9 +14,9 @@ spec:
   serviceName: axond-headless
   replicas: 3
   podManagementPolicy: Parallel
-  # The current stateful process deliberately remains unready until serving
-  # convergence is wired into the main path. Operators therefore opt into
-  # each restart explicitly; the PVC identity survives that replacement.
+  # Operators replace one ordinal at a time only after its signed snapshot and
+  # compiled serving cache have been exported successfully. OnDelete keeps that
+  # recovery boundary explicit, and the PVC identity survives the replacement.
   updateStrategy:
     type: OnDelete
   selector:

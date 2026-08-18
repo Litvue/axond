@@ -782,10 +782,11 @@ fn the_prose_contract_and_the_manifest_agree() {
 }
 
 /// The two lanes write into one evidence directory, and a reader compares the
-/// artifacts in it. That only holds while they agree on the schema: the shell
-/// lane's recorder repeats the version the driver's `EVIDENCE_SCHEMA_VERSION`
-/// declares, and a bump on one side that is not made on the other silently
-/// produces a directory holding two schemas under one version number.
+/// artifacts in it. That only holds while they agree on the schema: both shell
+/// consumers import one shared Python contract, whose version must match the
+/// driver's `EVIDENCE_SCHEMA_VERSION`. A bump on one side that is not made on
+/// the other would silently produce a directory holding two schemas under one
+/// version number.
 #[test]
 fn the_two_lanes_write_the_same_artifact_schema() {
     let root = recovery::workspace_root();
@@ -800,18 +801,27 @@ fn the_two_lanes_write_the_same_artifact_schema() {
         })
         .expect("the driver declares an evidence schema version");
 
+    let shared_path = "ops/recovery_contract.py";
+    let shared =
+        std::fs::read_to_string(root.join(shared_path)).expect("the shared contract is readable");
+    let shared_version = shared
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("RECOVERY_RESULT_SCHEMA_VERSION = ")
+                .and_then(|rest| rest.trim().parse::<u32>().ok())
+        })
+        .expect("the shared contract declares a recovery result schema version");
+    assert_eq!(
+        shared_version, declared,
+        "{shared_path} writes schema {shared_version} and the driver writes {declared}"
+    );
+
     for lane in ["ops/recovery-evidence.py", "ops/check-recovery-evidence.py"] {
         let source = std::fs::read_to_string(root.join(lane)).expect("the lane script is readable");
-        let repeated = source
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("SCHEMA_VERSION = ")
-                    .and_then(|rest| rest.trim().parse::<u32>().ok())
-            })
-            .unwrap_or_else(|| panic!("{lane} declares no SCHEMA_VERSION"));
-        assert_eq!(
-            repeated, declared,
-            "{lane} writes schema {repeated} and the driver writes {declared}"
+        assert!(
+            source.contains("RECOVERY_RESULT_SCHEMA_VERSION,")
+                && source.contains("SCHEMA_VERSION = RECOVERY_RESULT_SCHEMA_VERSION"),
+            "{lane} does not consume the shared recovery schema version"
         );
     }
 }

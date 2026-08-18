@@ -30,10 +30,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+from recovery_contract import (
+    RECOVERY_RESULT_SCHEMA_VERSION,
+    deferred_gate_detail,
+    derive_verdict_outcome,
+    validate_recovery_artifact,
+)
 
 # `tomllib` is standard from 3.11; on the repository's 3.10 ops floor the
 # hash-pinned deploy lockfile supplies `tomli`, the backport it was extracted
@@ -59,7 +68,7 @@ EVIDENCE_DIR = ROOT / "target/recovery"
 # Kept in step with `EVIDENCE_SCHEMA_VERSION` in
 # `crates/gateway/src/qualification/evidence.rs`; the contract test
 # `the_two_lanes_write_the_same_artifact_schema` fails when they drift.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = RECOVERY_RESULT_SCHEMA_VERSION
 RUNNER = "restore-drill"
 
 
@@ -184,6 +193,18 @@ def gate(args: argparse.Namespace) -> int:
     if bound is None:
         raise SystemExit(f"{args.gate} is not a gate field the manifest declares")
     met = args.met == "true"
+    derived = derive_verdict_outcome("gate", args.gate, str(bound), args.observed)
+    claimed = "met" if met else "failed"
+    if derived is None and met:
+        raise SystemExit(
+            f"{args.gate}: cannot derive an outcome from observed {args.observed!r} "
+            f"and bound {bound!r}"
+        )
+    if derived is not None and derived != claimed:
+        raise SystemExit(
+            f"{args.gate}: caller claimed {claimed}, independently derived {derived} "
+            f"from observed {args.observed!r} and bound {bound!r}"
+        )
     append(
         args.log,
         {
@@ -209,7 +230,13 @@ def defer(args: argparse.Namespace) -> int:
         args.log,
         {
             "kind": "gate",
-            **verdict(args.gate, str(bound), "not measured", "not_evaluated", args.why),
+            **verdict(
+                args.gate,
+                str(bound),
+                "not measured",
+                "not_evaluated",
+                deferred_gate_detail(args.gate, start_record["evidence"], args.why),
+            ),
         },
     )
     return 0
@@ -249,6 +276,16 @@ def finish(args: argparse.Namespace) -> int:
     gates = [strip(entry) for entry in entries if entry["kind"] == "gate"]
     checks = [strip(entry) for entry in entries if entry["kind"] == "check"]
 
+    executable_sha256 = os.environ.get("AXOND_RECOVERY_EXECUTABLE_SHA256", "")
+    cargo_profile = os.environ.get("AXOND_RECOVERY_CARGO_PROFILE", "")
+    if re.fullmatch(r"[0-9a-f]{64}", executable_sha256) is None:
+        raise SystemExit(
+            "AXOND_RECOVERY_EXECUTABLE_SHA256 must identify the exact axond bytes "
+            "used by the restore drill"
+        )
+    if cargo_profile != "release":
+        raise SystemExit("AXOND_RECOVERY_CARGO_PROFILE must be 'release'")
+
     artifact = {
         "schema_version": SCHEMA_VERSION,
         "scenario": head["scenario"],
@@ -263,12 +300,28 @@ def finish(args: argparse.Namespace) -> int:
             "control_plane": "postgres",
             "schema": head["schema"],
             "schema_identity": head["schema_identity"],
+            "axond_executable_sha256": executable_sha256,
+            "cargo_profile": cargo_profile,
         },
         "timeline": timeline,
         "observations": observations,
         "gates": gates,
         "checks": checks,
     }
+
+    scenario, stage = manifest_stage(f"{head['scenario']}/{head['stage']}")
+    problems = validate_recovery_artifact(
+        artifact,
+        scenario,
+        stage,
+        require_executable_identity=True,
+        reject_failed=False,
+    )
+    if problems:
+        raise SystemExit(
+            f"{head['scenario']}/{head['stage']}: malformed recovery evidence: "
+            + "; ".join(problems)
+        )
 
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     path = EVIDENCE_DIR / f"{head['scenario']}.{head['stage']}.json"

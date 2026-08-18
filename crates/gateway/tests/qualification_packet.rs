@@ -17,8 +17,589 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use support::packet::{self, EPIC_ISSUE, Runner, Scenario, SliceId, Status};
+use figment::Figment;
+use figment::providers::{Format, Toml};
+use support::capacity::manifest::RESULT_SCHEMA_VERSION as CAPACITY_RESULT_SCHEMA_VERSION;
+use support::endurance::manifest::RESULT_SCHEMA_VERSION as ENDURANCE_RESULT_SCHEMA_VERSION;
+use support::fault::manifest::RESULT_SCHEMA_VERSION as FAULT_RESULT_SCHEMA_VERSION;
+use support::packet::{
+    self, EPIC_ISSUE, PENDING_SOURCE_COMMIT, QUALIFICATION_CANDIDATE_VERSION,
+    ROLLOUT_PREVIOUS_VERSION, Runner, Scenario, SliceId, Status,
+};
 use support::recovery;
+use support::rollout::manifest::RESULT_SCHEMA_VERSION as ROLLOUT_RESULT_SCHEMA_VERSION;
+use support::stateful_endurance::manifest::RESULT_SCHEMA_VERSION as STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION;
+
+const RECOVERY_RESULT_SCHEMA_VERSION: u32 = 2;
+
+fn validate_observation_artifact_schema(
+    slice_id: SliceId,
+    observation: &packet::RecordObservation,
+) -> Result<(), String> {
+    let shared_ledger_claims = [
+        (
+            observation.request_identities_sha256.as_deref(),
+            observation.request_identities_files,
+            observation.request_identities_bytes,
+        ),
+        (
+            observation.correlations_sha256.as_deref(),
+            observation.correlations_files,
+            observation.correlations_bytes,
+        ),
+    ];
+    let stateful_ledger_claims = [
+        (
+            observation.durable_identities_sha256.as_deref(),
+            observation.durable_identities_files,
+            observation.durable_identities_bytes,
+        ),
+        (
+            observation.durable_outside_identities_sha256.as_deref(),
+            observation.durable_outside_identities_files,
+            observation.durable_outside_identities_bytes,
+        ),
+    ];
+    let complete_claim = |(digest, files, bytes): (Option<&str>, Option<u32>, Option<u64>)| {
+        digest.is_some_and(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) && files.is_some_and(|count| count > 0)
+            && bytes.is_some_and(|count| count > 0)
+    };
+    let has_any_shared_claim = shared_ledger_claims
+        .iter()
+        .any(|(digest, files, bytes)| digest.is_some() || files.is_some() || bytes.is_some());
+    let has_any_stateful_claim = stateful_ledger_claims
+        .iter()
+        .any(|(digest, files, bytes)| digest.is_some() || files.is_some() || bytes.is_some());
+    let sample_claim = (
+        observation.samples_sha256.as_deref(),
+        observation.samples_files,
+        observation.samples_bytes,
+    );
+    let has_any_sample_claim =
+        sample_claim.0.is_some() || sample_claim.1.is_some() || sample_claim.2.is_some();
+    if matches!(slice_id, SliceId::Endurance | SliceId::StatefulEndurance) {
+        if !shared_ledger_claims.iter().copied().all(&complete_claim) {
+            return Err(
+                "endurance observations require complete request-identity and correlation digest, file, and byte claims"
+                    .to_owned(),
+            );
+        }
+        if !complete_claim(sample_claim)
+            || (slice_id == SliceId::Endurance && observation.samples_files != Some(1))
+        {
+            return Err(
+                "stateless endurance requires one sample JSONL; stateful endurance requires a non-empty per-incarnation sample set"
+                    .to_owned(),
+            );
+        }
+        if slice_id == SliceId::StatefulEndurance
+            && (!stateful_ledger_claims.iter().copied().all(complete_claim)
+                || observation.request_identities_files != Some(64)
+                || observation.correlations_files != Some(128)
+                || observation.durable_identities_files != Some(128)
+                || observation.durable_outside_identities_files != Some(128))
+        {
+            return Err(
+                "stateful endurance observations require all four fixed-width exact-ledger shard sets"
+                    .to_owned(),
+            );
+        }
+    } else if has_any_shared_claim || has_any_stateful_claim || has_any_sample_claim {
+        return Err(format!(
+            "{} observations must not declare endurance ledger or sample claims",
+            slice_id.as_str()
+        ));
+    }
+    let rollout_digests = [
+        observation.rollout_previous_binary_sha256.as_deref(),
+        observation.rollout_candidate_binary_sha256.as_deref(),
+        observation.rollout_retained_archive_sha256.as_deref(),
+    ];
+    let has_any_rollout_claim = observation.rollout_previous_version.is_some()
+        || observation.rollout_candidate_version.is_some()
+        || rollout_digests.iter().any(|value| value.is_some())
+        || observation.rollout_shared_stateful_revision.is_some()
+        || observation.rollout_shared_alias.is_some()
+        || observation.rollout_previous_serves_shared_alias.is_some()
+        || observation.rollout_candidate_serves_shared_alias.is_some();
+    if slice_id == SliceId::Rollout {
+        let versions_complete = observation.rollout_previous_version.as_deref()
+            == Some(ROLLOUT_PREVIOUS_VERSION)
+            && observation.rollout_candidate_version.as_deref()
+                == Some(QUALIFICATION_CANDIDATE_VERSION);
+        let digests_complete = rollout_digests.iter().all(|value| {
+            value.is_some_and(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        });
+        let identities_distinct = observation.rollout_previous_version
+            != observation.rollout_candidate_version
+            && observation.rollout_previous_binary_sha256
+                != observation.rollout_candidate_binary_sha256;
+        let shared_stateful_serving = observation
+            .rollout_shared_stateful_revision
+            .as_deref()
+            .is_some_and(|revision| !revision.trim().is_empty())
+            && observation.rollout_shared_alias.as_deref() == Some("chat")
+            && observation.rollout_previous_serves_shared_alias == Some(true)
+            && observation.rollout_candidate_serves_shared_alias == Some(true);
+        if !versions_complete
+            || !digests_complete
+            || !identities_distinct
+            || !shared_stateful_serving
+        {
+            return Err(
+                "rollout observations require v0.3.40/v0.4.0 executable identities and both fleets serving the shared durable `chat` alias"
+                    .to_owned(),
+            );
+        }
+    } else if has_any_rollout_claim {
+        return Err(format!(
+            "{} observations must not declare rollout executable claims",
+            slice_id.as_str()
+        ));
+    }
+    match (slice_id, observation.artifact_schema_version) {
+        (SliceId::Endurance, Some(version)) if version == ENDURANCE_RESULT_SCHEMA_VERSION => Ok(()),
+        (SliceId::Endurance, actual) => Err(format!(
+            "endurance observations require artifact schema version \
+             {ENDURANCE_RESULT_SCHEMA_VERSION}, found {actual:?}"
+        )),
+        (SliceId::Fault, Some(version)) if version == FAULT_RESULT_SCHEMA_VERSION => Ok(()),
+        (SliceId::Fault, actual) => Err(format!(
+            "fault observations require artifact schema version \
+             {FAULT_RESULT_SCHEMA_VERSION}, found {actual:?}"
+        )),
+        (SliceId::Rollout, Some(version)) if version == ROLLOUT_RESULT_SCHEMA_VERSION => Ok(()),
+        (SliceId::Rollout, actual) => Err(format!(
+            "rollout observations require artifact schema version \
+             {ROLLOUT_RESULT_SCHEMA_VERSION}, found {actual:?}"
+        )),
+        (SliceId::StatefulEndurance, Some(version))
+            if version == STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION =>
+        {
+            Ok(())
+        }
+        (SliceId::StatefulEndurance, actual) => Err(format!(
+            "stateful endurance observations require artifact schema version \
+             {STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION}, found {actual:?}"
+        )),
+        (_, None) => Ok(()),
+        (_, Some(version)) => Err(format!(
+            "{} observations must not declare artifact schema version {version}",
+            slice_id.as_str()
+        )),
+    }
+}
+
+fn validate_recovery_stage(
+    stage: &packet::RecordStage,
+    record_binary_sha256: &str,
+) -> Result<(), String> {
+    if stage.artifact_schema_version != Some(RECOVERY_RESULT_SCHEMA_VERSION) {
+        return Err(format!(
+            "recovery stages require artifact schema version {RECOVERY_RESULT_SCHEMA_VERSION}, found {:?}",
+            stage.artifact_schema_version
+        ));
+    }
+    let stage_binary = stage
+        .binary_sha256
+        .as_deref()
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| "recovery stages require an exact executable digest".to_owned())?;
+    if stage_binary != record_binary_sha256 {
+        return Err("the recovery stage executable differs from the record binary".to_owned());
+    }
+    match stage.driver.as_deref() {
+        Some("stateful-integration") => {
+            let executed = stage
+                .executed_binary_sha256
+                .as_deref()
+                .filter(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                .ok_or_else(|| {
+                    "process-backed recovery stages require the executed binary digest".to_owned()
+                })?;
+            if executed != record_binary_sha256 || stage.execution_bound != Some(true) {
+                return Err(
+                    "the process-backed recovery stage is not bound to the record binary"
+                        .to_owned(),
+                );
+            }
+        }
+        Some("restore-drill") => {
+            if stage.executed_binary_sha256.is_some() || stage.execution_bound.is_some() {
+                return Err(
+                    "restore-drill stages must not claim process-driver provenance".to_owned(),
+                );
+            }
+        }
+        other => {
+            return Err(format!(
+                "recovery stages require a current manifest driver, found {other:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recovery_driver_name(driver: recovery::Driver) -> &'static str {
+    match driver {
+        recovery::Driver::Qualification => "qualification",
+        recovery::Driver::StatefulIntegration => "stateful-integration",
+        recovery::Driver::RestoreDrill => "restore-drill",
+    }
+}
+
+fn expected_recovery_stages() -> BTreeMap<String, (String, String)> {
+    recovery::load()
+        .scenarios
+        .into_iter()
+        .flat_map(|scenario| {
+            scenario
+                .stages
+                .into_iter()
+                .filter(|stage| stage.status == recovery::Status::Executable)
+                .map(move |stage| {
+                    let runner = stage
+                        .runner
+                        .expect("an executable recovery stage must name its runner");
+                    (
+                        format!("{}/{}", scenario.id, stage.id),
+                        (
+                            runner.as_str().to_owned(),
+                            recovery_driver_name(stage.driver).to_owned(),
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn generated_observation_fixture(
+    artifact_schema_version: Option<u32>,
+) -> packet::RecordObservation {
+    let artifact_schema_version = artifact_schema_version
+        .map(|version| format!("artifact_schema_version = {version}"))
+        .unwrap_or_default();
+    let fixture = format!(
+        r#"
+id = "mixed-endurance"
+{artifact_schema_version}
+artifact_sha256 = "39a7e072cf523642753e09f23db6f29c67f0b78e455efa951c1722d110dfd5d5"
+elapsed_ms = 43200351
+verdicts = 14
+passed = true
+duration_ms = 43200000
+manifest_duration_ms = 43200000
+requested_duration_ms = 43200000
+duration_source = "manifest"
+"#
+    );
+
+    Figment::from(Toml::string(&fixture))
+        .extract()
+        .expect("the generated compact observation fixture should load")
+}
+
+fn generated_endurance_observation_fixture(
+    artifact_schema_version: Option<u32>,
+) -> packet::RecordObservation {
+    let mut observation = generated_observation_fixture(artifact_schema_version);
+    observation.request_identities_sha256 = Some("a".repeat(64));
+    observation.request_identities_files = Some(32);
+    observation.request_identities_bytes = Some(1024);
+    observation.correlations_sha256 = Some("b".repeat(64));
+    observation.correlations_files = Some(32);
+    observation.correlations_bytes = Some(2048);
+    observation.samples_sha256 = Some("c".repeat(64));
+    observation.samples_files = Some(1);
+    observation.samples_bytes = Some(4096);
+    observation
+}
+
+fn generated_stateful_observation_fixture(
+    artifact_schema_version: Option<u32>,
+) -> packet::RecordObservation {
+    let artifact_schema_version = artifact_schema_version
+        .map(|version| format!("artifact_schema_version = {version}"))
+        .unwrap_or_default();
+    let fixture = format!(
+        r#"
+id = "mixed-stateful-endurance"
+{artifact_schema_version}
+artifact_sha256 = "39a7e072cf523642753e09f23db6f29c67f0b78e455efa951c1722d110dfd5d5"
+elapsed_ms = 43200351
+verdicts = 14
+passed = true
+duration_ms = 43200000
+manifest_duration_ms = 43200000
+requested_duration_ms = 43200000
+duration_source = "manifest"
+request_identities_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+request_identities_files = 64
+request_identities_bytes = 1024
+correlations_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+correlations_files = 128
+correlations_bytes = 2048
+samples_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+samples_files = 6
+samples_bytes = 4096
+durable_identities_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+durable_identities_files = 128
+durable_identities_bytes = 2048
+durable_outside_identities_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+durable_outside_identities_files = 128
+durable_outside_identities_bytes = 2048
+"#
+    );
+
+    Figment::from(Toml::string(&fixture))
+        .extract()
+        .expect("the generated compact stateful observation fixture should load")
+}
+
+fn generated_rollout_observation_fixture(
+    artifact_schema_version: Option<u32>,
+) -> packet::RecordObservation {
+    let mut observation = generated_observation_fixture(artifact_schema_version);
+    observation.rollout_previous_version = Some("0.3.40".to_owned());
+    observation.rollout_previous_binary_sha256 = Some("a".repeat(64));
+    observation.rollout_candidate_version = Some("0.4.0".to_owned());
+    observation.rollout_candidate_binary_sha256 = Some("b".repeat(64));
+    observation.rollout_retained_archive_sha256 = Some("c".repeat(64));
+    observation.rollout_shared_stateful_revision = Some("revision-v040".to_owned());
+    observation.rollout_shared_alias = Some("chat".to_owned());
+    observation.rollout_previous_serves_shared_alias = Some(true);
+    observation.rollout_candidate_serves_shared_alias = Some(true);
+    observation
+}
+
+#[test]
+fn generated_endurance_observation_schema_field_loads() {
+    let observation =
+        generated_endurance_observation_fixture(Some(ENDURANCE_RESULT_SCHEMA_VERSION));
+
+    assert_eq!(
+        observation.artifact_schema_version,
+        Some(ENDURANCE_RESULT_SCHEMA_VERSION)
+    );
+    assert!(validate_observation_artifact_schema(SliceId::Endurance, &observation).is_ok());
+}
+
+#[test]
+fn endurance_observations_require_the_current_artifact_schema() {
+    let missing = generated_endurance_observation_fixture(None);
+    assert!(validate_observation_artifact_schema(SliceId::Endurance, &missing).is_err());
+
+    let stale_version = ENDURANCE_RESULT_SCHEMA_VERSION
+        .checked_sub(1)
+        .expect("endurance artifact schemas start above zero");
+    let stale = generated_endurance_observation_fixture(Some(stale_version));
+    assert!(validate_observation_artifact_schema(SliceId::Endurance, &stale).is_err());
+}
+
+#[test]
+fn both_endurance_slices_require_exact_shared_ledgers_and_valid_sample_sets() {
+    for slice_id in [SliceId::Endurance, SliceId::StatefulEndurance] {
+        let current = if slice_id == SliceId::Endurance {
+            generated_endurance_observation_fixture(Some(ENDURANCE_RESULT_SCHEMA_VERSION))
+        } else {
+            generated_stateful_observation_fixture(Some(STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION))
+        };
+        assert!(validate_observation_artifact_schema(slice_id, &current).is_ok());
+
+        let mut missing_requests = current.clone();
+        missing_requests.request_identities_sha256 = None;
+        assert!(validate_observation_artifact_schema(slice_id, &missing_requests).is_err());
+
+        let mut empty_correlations = current.clone();
+        empty_correlations.correlations_bytes = Some(0);
+        assert!(validate_observation_artifact_schema(slice_id, &empty_correlations).is_err());
+
+        let mut missing_samples = current.clone();
+        missing_samples.samples_sha256 = None;
+        assert!(validate_observation_artifact_schema(slice_id, &missing_samples).is_err());
+
+        let mut empty_sample_set = current;
+        empty_sample_set.samples_files = Some(0);
+        assert!(validate_observation_artifact_schema(slice_id, &empty_sample_set).is_err());
+    }
+
+    let mut stateless_multiple_samples =
+        generated_endurance_observation_fixture(Some(ENDURANCE_RESULT_SCHEMA_VERSION));
+    stateless_multiple_samples.samples_files = Some(2);
+    assert!(
+        validate_observation_artifact_schema(SliceId::Endurance, &stateless_multiple_samples)
+            .is_err()
+    );
+
+    let mut stateful_multiple_samples =
+        generated_stateful_observation_fixture(Some(STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION));
+    stateful_multiple_samples.samples_files = Some(8);
+    assert!(
+        validate_observation_artifact_schema(
+            SliceId::StatefulEndurance,
+            &stateful_multiple_samples,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn rollout_observations_require_the_current_artifact_schema() {
+    let current = generated_rollout_observation_fixture(Some(ROLLOUT_RESULT_SCHEMA_VERSION));
+    assert!(validate_observation_artifact_schema(SliceId::Rollout, &current).is_ok());
+
+    let missing = generated_observation_fixture(None);
+    assert!(validate_observation_artifact_schema(SliceId::Rollout, &missing).is_err());
+
+    let stale = generated_rollout_observation_fixture(Some(ROLLOUT_RESULT_SCHEMA_VERSION - 1));
+    assert!(validate_observation_artifact_schema(SliceId::Rollout, &stale).is_err());
+
+    let mut missing_identity = current;
+    missing_identity.rollout_previous_binary_sha256 = None;
+    assert!(validate_observation_artifact_schema(SliceId::Rollout, &missing_identity).is_err());
+}
+
+#[test]
+fn rollout_raw_and_compact_contracts_are_both_schema_three() {
+    assert_eq!(ROLLOUT_RESULT_SCHEMA_VERSION, 3);
+    assert_eq!(packet::ROLLOUT_RECORD_SCHEMA_VERSION, 3);
+}
+
+#[test]
+fn rollout_observations_require_complete_shared_stateful_serving_proof() {
+    let current = generated_rollout_observation_fixture(Some(ROLLOUT_RESULT_SCHEMA_VERSION));
+
+    let mut missing_revision = current.clone();
+    missing_revision.rollout_shared_stateful_revision = None;
+    assert!(validate_observation_artifact_schema(SliceId::Rollout, &missing_revision).is_err());
+
+    let mut wrong_alias = current.clone();
+    wrong_alias.rollout_shared_alias = Some("chat-next-only".to_owned());
+    assert!(validate_observation_artifact_schema(SliceId::Rollout, &wrong_alias).is_err());
+
+    let mut previous_did_not_serve = current.clone();
+    previous_did_not_serve.rollout_previous_serves_shared_alias = Some(false);
+    assert!(
+        validate_observation_artifact_schema(SliceId::Rollout, &previous_did_not_serve).is_err()
+    );
+
+    let mut candidate_did_not_serve = current;
+    candidate_did_not_serve.rollout_candidate_serves_shared_alias = None;
+    assert!(
+        validate_observation_artifact_schema(SliceId::Rollout, &candidate_did_not_serve).is_err()
+    );
+}
+
+#[test]
+fn stateful_endurance_observations_require_the_current_artifact_schema() {
+    let current =
+        generated_stateful_observation_fixture(Some(STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION));
+    assert!(validate_observation_artifact_schema(SliceId::StatefulEndurance, &current).is_ok());
+
+    let missing = generated_stateful_observation_fixture(None);
+    assert!(validate_observation_artifact_schema(SliceId::StatefulEndurance, &missing).is_err());
+
+    let missing_ledgers =
+        generated_observation_fixture(Some(STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION));
+    assert!(
+        validate_observation_artifact_schema(SliceId::StatefulEndurance, &missing_ledgers).is_err()
+    );
+
+    let mut empty_ledger = current;
+    empty_ledger.request_identities_bytes = Some(0);
+    assert!(
+        validate_observation_artifact_schema(SliceId::StatefulEndurance, &empty_ledger).is_err()
+    );
+}
+
+#[test]
+fn slices_without_versioned_raw_contracts_must_omit_the_artifact_schema() {
+    let absent = generated_observation_fixture(None);
+    assert!(validate_observation_artifact_schema(SliceId::Recovery, &absent).is_ok());
+
+    let present = generated_observation_fixture(Some(ENDURANCE_RESULT_SCHEMA_VERSION));
+    assert!(validate_observation_artifact_schema(SliceId::Recovery, &present).is_err());
+
+    let leaked_endurance_claims = generated_endurance_observation_fixture(None);
+    assert!(
+        validate_observation_artifact_schema(SliceId::Recovery, &leaked_endurance_claims).is_err()
+    );
+}
+
+#[test]
+fn fault_observations_require_raw_schema_one() {
+    let current = generated_observation_fixture(Some(FAULT_RESULT_SCHEMA_VERSION));
+    assert!(validate_observation_artifact_schema(SliceId::Fault, &current).is_ok());
+
+    let missing = generated_observation_fixture(None);
+    assert!(validate_observation_artifact_schema(SliceId::Fault, &missing).is_err());
+
+    let stale = generated_observation_fixture(Some(FAULT_RESULT_SCHEMA_VERSION + 1));
+    assert!(validate_observation_artifact_schema(SliceId::Fault, &stale).is_err());
+}
+
+#[test]
+fn evidenced_recovery_stages_require_raw_schema_and_exact_binary_identity() {
+    let binary_sha256 = "a".repeat(64);
+    let mut stage = packet::load_record("qualification/recovery/evidence/serving-ci.toml")
+        .stages
+        .into_iter()
+        .next()
+        .expect("historical recovery fixture has a stage");
+    stage.artifact_schema_version = Some(RECOVERY_RESULT_SCHEMA_VERSION);
+    stage.binary_sha256 = Some(binary_sha256.clone());
+    stage.driver = Some("restore-drill".to_owned());
+    assert!(validate_recovery_stage(&stage, &binary_sha256).is_ok());
+
+    let mut missing_schema = stage.clone();
+    missing_schema.artifact_schema_version = None;
+    assert!(validate_recovery_stage(&missing_schema, &binary_sha256).is_err());
+
+    let mut stale_schema = stage.clone();
+    stale_schema.artifact_schema_version = Some(RECOVERY_RESULT_SCHEMA_VERSION - 1);
+    assert!(validate_recovery_stage(&stale_schema, &binary_sha256).is_err());
+
+    let mut missing_binary = stage.clone();
+    missing_binary.binary_sha256 = None;
+    assert!(validate_recovery_stage(&missing_binary, &binary_sha256).is_err());
+
+    let mut process = stage.clone();
+    process.driver = Some("stateful-integration".to_owned());
+    process.executed_binary_sha256 = Some(binary_sha256.clone());
+    process.execution_bound = Some(true);
+    assert!(validate_recovery_stage(&process, &binary_sha256).is_ok());
+
+    let mut post_stamped = process.clone();
+    post_stamped.executed_binary_sha256 = Some("b".repeat(64));
+    assert!(validate_recovery_stage(&post_stamped, &binary_sha256).is_err());
+
+    let mut unbound = process;
+    unbound.execution_bound = Some(false);
+    assert!(validate_recovery_stage(&unbound, &binary_sha256).is_err());
+
+    stage.binary_sha256 = Some("b".repeat(64));
+    assert!(validate_recovery_stage(&stage, &binary_sha256).is_err());
+}
 
 /// Every slice #156 decomposes into is committed exactly once, owned by a child
 /// issue, and carries the question it exists to answer.
@@ -201,6 +782,37 @@ fn a_slice_cannot_claim_a_rung_it_has_not_reached() {
     }
 }
 
+#[test]
+fn historical_debug_records_are_indexed_but_cannot_promote_a_slice() {
+    let qualification = packet::load();
+    let contract = packet::contract_text();
+
+    for id in [SliceId::Fault, SliceId::Recovery] {
+        let slice = qualification.slice(id);
+        assert_eq!(slice.status, Status::Harnessed);
+        assert!(slice.retained.is_empty());
+        assert_eq!(slice.historical.len(), 1);
+        let historical = &slice.historical[0];
+        assert!(contract.contains(historical));
+
+        let record = packet::load_record(historical);
+        assert_eq!(record.source.crate_version, "0.3.39");
+        assert_eq!(record.binary.version, "0.3.39");
+        assert_eq!(record.binary.cargo_profile, "debug");
+    }
+
+    for slice in &qualification.slices {
+        assert!(
+            slice
+                .historical
+                .iter()
+                .all(|relative| !slice.retained.contains(relative)),
+            "{} lists one record as both active and historical",
+            slice.id.as_str()
+        );
+    }
+}
+
 /// Every retained record, whichever slice retains it, has to be reproducible
 /// from the repository: the manifest it ran is the manifest its slice commits
 /// and still hashes to what the run saw, every workload in that manifest is in
@@ -273,6 +885,18 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
 
                 for profile in &record.profiles {
                     let id = &profile.id;
+                    assert_eq!(
+                        profile.artifact_schema_version,
+                        Some(CAPACITY_RESULT_SCHEMA_VERSION),
+                        "{relative}: {id} does not bind the current raw capacity schema"
+                    );
+                    assert!(
+                        profile.artifact_sha256.as_deref().is_some_and(|digest| {
+                            digest.len() == 64
+                                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        }),
+                        "{relative}: {id} does not bind its raw capacity artifact"
+                    );
                     assert!(
                         profile.verdicts > 0,
                         "{relative}: {id} was measured against no threshold"
@@ -360,7 +984,7 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
                     record.profiles.is_empty() && record.observations.is_empty(),
                     "{relative}: recovery records use stage rows only"
                 );
-                let expected: BTreeMap<String, String> = manifest
+                let expected: BTreeMap<String, (String, String)> = manifest
                     .scenarios
                     .iter()
                     .flat_map(|scenario| {
@@ -371,7 +995,10 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
                             .map(|stage| {
                                 (
                                     format!("{}/{}", scenario.id, stage.id),
-                                    stage.runner.clone().unwrap_or_default(),
+                                    (
+                                        stage.runner.clone().unwrap_or_default(),
+                                        stage.driver.clone().unwrap_or_default(),
+                                    ),
                                 )
                             })
                     })
@@ -389,9 +1016,17 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
                     "{relative}: a recovery stage appears more than once"
                 );
                 for stage in &record.stages {
+                    validate_recovery_stage(stage, &record.binary.sha256)
+                        .unwrap_or_else(|error| panic!("{relative}: {}: {error}", stage.id));
                     assert_eq!(
-                        stage.runner, expected[&stage.id],
+                        stage.runner, expected[&stage.id].0,
                         "{relative}: {} is attributed to the wrong recovery lane",
+                        stage.id
+                    );
+                    assert_eq!(
+                        stage.driver.as_deref(),
+                        Some(expected[&stage.id].1.as_str()),
+                        "{relative}: {} is attributed to the wrong recovery driver",
                         stage.id
                     );
                     assert!(
@@ -422,6 +1057,8 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
                     "{relative}: the record and the manifest disagree about the workloads"
                 );
                 for observation in &record.observations {
+                    validate_observation_artifact_schema(slice.id, observation)
+                        .unwrap_or_else(|error| panic!("{relative}: {}: {error}", observation.id));
                     assert!(
                         !observation.artifact_sha256.is_empty(),
                         "{relative}: {} has no raw artifact digest",
@@ -437,7 +1074,7 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
                         "{relative}: {} is retained as evidence of a failed workload",
                         observation.id
                     );
-                    if slice.id == SliceId::Endurance {
+                    if matches!(slice.id, SliceId::Endurance | SliceId::StatefulEndurance) {
                         let required_duration = manifest
                             .profiles
                             .iter()
@@ -479,9 +1116,14 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
         }
     }
 
-    assert!(
-        checked > 0,
-        "the packet retains no evidence at all, so nothing here checked anything"
+    assert_eq!(
+        checked,
+        packet
+            .slices
+            .iter()
+            .map(|slice| slice.retained.len())
+            .sum::<usize>(),
+        "every active retained record must pass reproducibility validation"
     );
 }
 
@@ -550,30 +1192,474 @@ fn the_recovery_slice_waits_on_exactly_what_its_manifest_waits_on() {
     );
 }
 
+fn qualification_closure_errors<F>(
+    qualification: &packet::Packet,
+    mut load_record: F,
+) -> Vec<String>
+where
+    F: FnMut(&str) -> packet::Record,
+{
+    let mut errors = Vec::new();
+    let cohort = &qualification.cohort;
+
+    if cohort.id.trim().is_empty() {
+        errors.push("the qualification cohort has no id".to_owned());
+    }
+    if cohort.candidate_version != QUALIFICATION_CANDIDATE_VERSION {
+        errors.push(format!(
+            "the qualification cohort candidate is {}, expected {QUALIFICATION_CANDIDATE_VERSION}",
+            cohort.candidate_version
+        ));
+    }
+    if cohort.source_commit == PENDING_SOURCE_COMMIT {
+        errors.push("the qualification cohort source commit is still pending".to_owned());
+    } else if !packet::is_exact_git_commit(&cohort.source_commit) {
+        errors.push("the qualification cohort source is not an exact Git commit".to_owned());
+    }
+
+    for slice in &qualification.slices {
+        let id = slice.id.as_str();
+        if slice.status != Status::Evidenced {
+            errors.push(format!("{id} is not evidenced"));
+        }
+        let Some(heavy_tier) = slice.heavy_tier.as_deref() else {
+            errors.push(format!("{id} has no heavy tier"));
+            continue;
+        };
+        let heavy_records: Vec<(&str, packet::Record)> = slice
+            .retained
+            .iter()
+            .map(|relative| (relative.as_str(), load_record(relative)))
+            .filter(|(_, record)| record.tier == heavy_tier)
+            .collect();
+        if heavy_records.len() != 1 {
+            errors.push(format!(
+                "{id} retains {} {heavy_tier}-tier records; closure requires exactly one",
+                heavy_records.len()
+            ));
+            continue;
+        }
+
+        let (relative, record) = &heavy_records[0];
+        if record.slice_id != slice.id {
+            errors.push(format!("{relative} belongs to another slice"));
+        }
+        if record.binary.cargo_profile != "release" {
+            errors.push(format!("{relative} is not a release-profile record"));
+        }
+        if record.source.git_dirty {
+            errors.push(format!("{relative} was produced from a dirty tree"));
+        }
+        if record.source.git_commit != cohort.source_commit {
+            errors.push(format!("{relative} is outside the frozen source cohort"));
+        }
+        if record.source.crate_version != QUALIFICATION_CANDIDATE_VERSION
+            || record.binary.version != QUALIFICATION_CANDIDATE_VERSION
+        {
+            errors.push(format!(
+                "{relative} is not candidate {QUALIFICATION_CANDIDATE_VERSION} evidence"
+            ));
+        }
+
+        if matches!(slice.id, SliceId::Endurance | SliceId::StatefulEndurance) {
+            if record.observations.is_empty() {
+                errors.push(format!("{relative} has no endurance observations"));
+            }
+            for observation in &record.observations {
+                if let Err(error) = validate_observation_artifact_schema(slice.id, observation) {
+                    errors.push(format!("{relative}: {}: {error}", observation.id));
+                }
+            }
+        } else if slice.id == SliceId::Fault {
+            if record.observations.is_empty() {
+                errors.push(format!("{relative} has no fault observations"));
+            }
+            for observation in &record.observations {
+                if let Err(error) =
+                    validate_observation_artifact_schema(SliceId::Fault, observation)
+                {
+                    errors.push(format!("{relative}: {}: {error}", observation.id));
+                }
+            }
+        } else if slice.id == SliceId::Recovery {
+            let expected = expected_recovery_stages();
+            let mut recorded = BTreeSet::new();
+            for stage in &record.stages {
+                if !recorded.insert(stage.id.as_str()) {
+                    errors.push(format!(
+                        "{relative}: {} appears more than once in the recovery record",
+                        stage.id
+                    ));
+                }
+                if let Err(error) = validate_recovery_stage(stage, &record.binary.sha256) {
+                    errors.push(format!("{relative}: {}: {error}", stage.id));
+                }
+                match expected.get(&stage.id) {
+                    Some((runner, driver)) => {
+                        if &stage.runner != runner {
+                            errors.push(format!(
+                                "{relative}: {} is attributed to runner {}, expected {runner}",
+                                stage.id, stage.runner
+                            ));
+                        }
+                        if stage.driver.as_deref() != Some(driver.as_str()) {
+                            errors.push(format!(
+                                "{relative}: {} is attributed to driver {:?}, expected {driver}",
+                                stage.id, stage.driver
+                            ));
+                        }
+                    }
+                    None => errors.push(format!(
+                        "{relative}: {} is not an executable recovery-manifest stage",
+                        stage.id
+                    )),
+                }
+                if stage.artifact_sha256.is_empty() || stage.elapsed_ms == 0 || stage.verdicts == 0
+                {
+                    errors.push(format!(
+                        "{relative}: {} retains no artifact identity or judged duration",
+                        stage.id
+                    ));
+                }
+                if !stage.passed {
+                    errors.push(format!(
+                        "{relative}: {} is retained as evidence of failed recovery",
+                        stage.id
+                    ));
+                }
+            }
+            for missing in expected.keys().filter(|id| !recorded.contains(id.as_str())) {
+                errors.push(format!(
+                    "{relative}: executable recovery stage {missing} is missing"
+                ));
+            }
+        } else if slice.id == SliceId::Rollout {
+            if record.observations.is_empty() {
+                errors.push(format!("{relative} has no rollout observation"));
+                continue;
+            }
+            let shared_revisions: BTreeSet<&str> = record
+                .observations
+                .iter()
+                .filter_map(|observation| observation.rollout_shared_stateful_revision.as_deref())
+                .collect();
+            if shared_revisions.len() != 1 {
+                errors.push(format!(
+                    "{relative} does not bind one shared durable revision across rollout observations"
+                ));
+            }
+            for observation in &record.observations {
+                if let Err(error) =
+                    validate_observation_artifact_schema(SliceId::Rollout, observation)
+                {
+                    errors.push(format!("{relative}: {}: {error}", observation.id));
+                }
+                if observation.rollout_candidate_binary_sha256.as_deref()
+                    != Some(record.binary.sha256.as_str())
+                {
+                    errors.push(format!(
+                        "{relative}: {} does not bind the candidate executable named by the record",
+                        observation.id
+                    ));
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+fn synthetic_closed_packet() -> (packet::Packet, BTreeMap<String, packet::Record>) {
+    let mut qualification = packet::load();
+    qualification.closure.satisfied = true;
+    qualification.cohort.source_commit = "d".repeat(40);
+
+    let mut base = packet::load_record("qualification/faults/evidence/full-ci.toml");
+    base.source.git_commit = qualification.cohort.source_commit.clone();
+    base.source.git_dirty = false;
+    base.source.crate_version = QUALIFICATION_CANDIDATE_VERSION.to_owned();
+    base.binary.version = QUALIFICATION_CANDIDATE_VERSION.to_owned();
+    base.binary.cargo_profile = "release".to_owned();
+    let recovery_stage = packet::load_record("qualification/recovery/evidence/serving-ci.toml")
+        .stages
+        .into_iter()
+        .next()
+        .expect("historical recovery fixture has a stage");
+
+    let mut records = BTreeMap::new();
+    for slice in &mut qualification.slices {
+        let relative = format!("synthetic/{}.toml", slice.id.as_str());
+        slice.status = Status::Evidenced;
+        slice.outstanding = None;
+        slice.retained = vec![relative.clone()];
+
+        let mut record = base.clone();
+        record.slice_id = slice.id;
+        record.tier = slice
+            .heavy_tier
+            .clone()
+            .expect("every qualification slice has a heavy tier");
+        record.profiles.clear();
+        record.observations.clear();
+        record.stages.clear();
+        match slice.id {
+            SliceId::Endurance => {
+                record
+                    .observations
+                    .push(generated_endurance_observation_fixture(Some(
+                        ENDURANCE_RESULT_SCHEMA_VERSION,
+                    )))
+            }
+            SliceId::StatefulEndurance => {
+                record
+                    .observations
+                    .push(generated_stateful_observation_fixture(Some(
+                        STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION,
+                    )))
+            }
+            SliceId::Fault => record.observations.push(generated_observation_fixture(Some(
+                FAULT_RESULT_SCHEMA_VERSION,
+            ))),
+            SliceId::Recovery => {
+                for (id, (runner, driver)) in expected_recovery_stages() {
+                    let mut stage = recovery_stage.clone();
+                    stage.id = id;
+                    stage.runner = runner;
+                    stage.driver = Some(driver.clone());
+                    stage.artifact_schema_version = Some(RECOVERY_RESULT_SCHEMA_VERSION);
+                    stage.binary_sha256 = Some(record.binary.sha256.clone());
+                    if driver == "stateful-integration" {
+                        stage.executed_binary_sha256 = Some(record.binary.sha256.clone());
+                        stage.execution_bound = Some(true);
+                    } else {
+                        stage.executed_binary_sha256 = None;
+                        stage.execution_bound = None;
+                    }
+                    record.stages.push(stage);
+                }
+            }
+            SliceId::Rollout => {
+                let mut observation =
+                    generated_rollout_observation_fixture(Some(ROLLOUT_RESULT_SCHEMA_VERSION));
+                observation.rollout_candidate_binary_sha256 = Some(record.binary.sha256.clone());
+                record.observations.push(observation);
+            }
+            _ => {}
+        }
+        records.insert(relative, record);
+    }
+
+    (qualification, records)
+}
+
+fn synthetic_closure_errors(
+    qualification: &packet::Packet,
+    records: &BTreeMap<String, packet::Record>,
+) -> Vec<String> {
+    qualification_closure_errors(qualification, |relative| {
+        records
+            .get(relative)
+            .unwrap_or_else(|| panic!("missing synthetic record {relative}"))
+            .clone()
+    })
+}
+
+#[test]
+fn one_clean_release_record_per_slice_from_the_frozen_cohort_can_close() {
+    let (qualification, records) = synthetic_closed_packet();
+    assert!(synthetic_closure_errors(&qualification, &records).is_empty());
+}
+
+#[test]
+fn recovery_closure_requires_the_exact_executable_manifest_stage_set() {
+    let (qualification, records) = synthetic_closed_packet();
+    let recovery = records
+        .get("synthetic/recovery.toml")
+        .expect("recovery fixture");
+    assert_eq!(recovery.stages.len(), expected_recovery_stages().len());
+
+    let mut missing = records.clone();
+    missing
+        .get_mut("synthetic/recovery.toml")
+        .expect("recovery fixture")
+        .stages
+        .pop();
+    assert!(!synthetic_closure_errors(&qualification, &missing).is_empty());
+
+    let mut duplicate = records.clone();
+    let recovery = duplicate
+        .get_mut("synthetic/recovery.toml")
+        .expect("recovery fixture");
+    let repeated = recovery.stages.first().expect("recovery stage").clone();
+    recovery.stages.push(repeated);
+    assert!(!synthetic_closure_errors(&qualification, &duplicate).is_empty());
+
+    let mut misattributed = records.clone();
+    let stage = misattributed
+        .get_mut("synthetic/recovery.toml")
+        .expect("recovery fixture")
+        .stages
+        .first_mut()
+        .expect("recovery stage");
+    stage.runner = "wrong-runner".to_owned();
+    stage.driver = Some("wrong-driver".to_owned());
+    assert!(!synthetic_closure_errors(&qualification, &misattributed).is_empty());
+
+    let mut unqualified = records.clone();
+    let stage = unqualified
+        .get_mut("synthetic/recovery.toml")
+        .expect("recovery fixture")
+        .stages
+        .first_mut()
+        .expect("recovery stage");
+    stage.artifact_sha256.clear();
+    stage.verdicts = 0;
+    stage.passed = false;
+    assert!(!synthetic_closure_errors(&qualification, &unqualified).is_empty());
+}
+
+#[test]
+fn pending_or_mixed_candidate_provenance_cannot_close() {
+    let (mut qualification, mut records) = synthetic_closed_packet();
+    qualification.cohort.source_commit = PENDING_SOURCE_COMMIT.to_owned();
+    assert!(!synthetic_closure_errors(&qualification, &records).is_empty());
+
+    let (qualification, mut dirty_records) = synthetic_closed_packet();
+    dirty_records
+        .get_mut("synthetic/fault.toml")
+        .expect("fault fixture")
+        .source
+        .git_dirty = true;
+    assert!(!synthetic_closure_errors(&qualification, &dirty_records).is_empty());
+
+    let recovery = records
+        .get_mut("synthetic/recovery.toml")
+        .expect("recovery fixture");
+    recovery.binary.cargo_profile = "debug".to_owned();
+    recovery.source.git_commit = "e".repeat(40);
+    recovery.binary.version = "0.3.39".to_owned();
+    assert!(!synthetic_closure_errors(&qualification, &records).is_empty());
+}
+
+#[test]
+fn closure_requires_exactly_one_heavy_record_for_each_slice() {
+    let (mut qualification, records) = synthetic_closed_packet();
+    let capacity = qualification
+        .slices
+        .iter_mut()
+        .find(|slice| slice.id == SliceId::Capacity)
+        .expect("capacity slice");
+    capacity.retained.clear();
+    assert!(!synthetic_closure_errors(&qualification, &records).is_empty());
+}
+
+#[test]
+fn endurance_ledger_and_sample_claims_are_closure_requirements() {
+    let (qualification, records) = synthetic_closed_packet();
+    let mutations: [fn(&mut packet::RecordObservation); 3] = [
+        |observation: &mut packet::RecordObservation| {
+            observation.request_identities_files = None;
+        },
+        |observation: &mut packet::RecordObservation| {
+            observation.correlations_sha256 = None;
+        },
+        |observation: &mut packet::RecordObservation| {
+            observation.samples_bytes = Some(0);
+        },
+    ];
+
+    for relative in [
+        "synthetic/endurance.toml",
+        "synthetic/stateful-endurance.toml",
+    ] {
+        for mutate in mutations {
+            let mut mutated = records.clone();
+            let observation = mutated
+                .get_mut(relative)
+                .unwrap_or_else(|| panic!("missing {relative}"))
+                .observations
+                .first_mut()
+                .expect("endurance observation");
+            mutate(observation);
+            assert!(!synthetic_closure_errors(&qualification, &mutated).is_empty());
+        }
+    }
+}
+
+#[test]
+fn rollout_candidate_identity_and_shared_serving_are_closure_requirements() {
+    let (qualification, records) = synthetic_closed_packet();
+
+    let mutations: [fn(&mut packet::RecordObservation); 6] = [
+        |observation: &mut packet::RecordObservation| {
+            observation.rollout_previous_version = Some("0.3.39".to_owned());
+        },
+        |observation: &mut packet::RecordObservation| {
+            observation.rollout_candidate_version = Some("0.3.41".to_owned());
+        },
+        |observation: &mut packet::RecordObservation| {
+            observation.rollout_shared_stateful_revision = None;
+        },
+        |observation: &mut packet::RecordObservation| {
+            observation.rollout_shared_alias = Some("chat-next-only".to_owned());
+        },
+        |observation: &mut packet::RecordObservation| {
+            observation.rollout_previous_serves_shared_alias = Some(false);
+        },
+        |observation: &mut packet::RecordObservation| {
+            observation.rollout_candidate_serves_shared_alias = Some(false);
+        },
+    ];
+    for mutate in mutations {
+        let mut mutated = records.clone();
+        let observation = mutated
+            .get_mut("synthetic/rollout.toml")
+            .expect("rollout fixture")
+            .observations
+            .first_mut()
+            .expect("rollout observation");
+        mutate(observation);
+        assert!(!synthetic_closure_errors(&qualification, &mutated).is_empty());
+    }
+}
+
 /// Closure is derived from the slices. The flag exists so the packet states its
 /// own conclusion in one place, and this is what stops that conclusion from
-/// being an opinion: #156 is answered when every slice is evidenced, and not
-/// one merge earlier.
+/// being an opinion: #156 is answered only when all six heavy records belong to
+/// the frozen v0.4.0 release cohort.
 #[test]
 fn the_epic_is_closed_by_its_slices_rather_than_by_a_flag() {
     let packet = packet::load();
-
-    let outstanding: Vec<&str> = packet
-        .slices
-        .iter()
-        .filter(|slice| slice.status != Status::Evidenced)
-        .map(|slice| slice.id.as_str())
-        .collect();
+    let errors = qualification_closure_errors(&packet, packet::load_record);
 
     assert_eq!(
         packet.closure.satisfied,
-        outstanding.is_empty(),
-        "closure.satisfied disagrees with the slices; still outstanding: {outstanding:?}"
+        errors.is_empty(),
+        "closure.satisfied disagrees with the v0.4.0 cohort gate: {errors:?}"
     );
     assert_eq!(packet.closure.issue, EPIC_ISSUE);
     assert!(
         !packet.closure.requirement.is_empty(),
         "closure without a requirement is closure by assertion"
+    );
+}
+
+/// Release-please runs this exact test before it can create the v0.4.0 tag.
+/// Earlier versions may keep the release PR current while the candidate is
+/// assembled, but the candidate version itself cannot publish without all six
+/// heavy records from the frozen source cohort.
+#[test]
+fn v0_4_0_release_candidate_requires_closed_production_qualification() {
+    if std::env::var("AXOND_REQUIRE_QUALIFICATION_CLOSURE").as_deref() != Ok("1")
+        || env!("CARGO_PKG_VERSION") != QUALIFICATION_CANDIDATE_VERSION
+    {
+        return;
+    }
+    let packet = packet::load();
+    let errors = qualification_closure_errors(&packet, packet::load_record);
+    assert!(
+        packet.closure.satisfied && errors.is_empty(),
+        "v0.4.0 publication requires a closed production qualification cohort: {errors:?}"
     );
 }
 
@@ -617,6 +1703,16 @@ fn the_packet_and_its_prose_agree() {
     assert!(
         contract.contains(packet::MANIFEST_RELATIVE),
         "{} does not point at the packet it states",
+        packet::CONTRACT_RELATIVE
+    );
+    assert!(
+        contract.contains(&packet.cohort.id)
+            && contract.contains(&packet.cohort.candidate_version)
+            && contract.contains(&format!(
+                "`source_commit` is truthfully `{}`",
+                packet.cohort.source_commit
+            )),
+        "{} does not state the packet's candidate cohort and source state",
         packet::CONTRACT_RELATIVE
     );
 }

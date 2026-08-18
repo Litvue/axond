@@ -1,7 +1,7 @@
 # The production overlay in `mode = "stateful"`: same posture — digest-pinned
 # image, topology spread, default-deny NetworkPolicy, disruption budget, drain
-# window — plus the schema ordering and the three consequences of a replica that
-# serves `/admin/v1` and refuses inference until revision convergence ships. The
+# window — plus schema ordering and the bootstrap posture of a replica that
+# serves `/admin/v1` but refuses inference until it admits a serving revision. The
 # component's own header explains each one; `docs/deployment/kubernetes.md#stateful-mode`
 # has the apply order and what an operator sees afterwards.
 #

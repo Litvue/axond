@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -284,6 +284,22 @@ impl Axond {
         Self::start_with_options(upstream_base_url, Options::new(tuning)).await
     }
 
+    /// Boot a specific `axond` executable with the standard generated config.
+    /// Rollout qualification uses this to put the retained release and the
+    /// candidate build behind the same ingress instead of relabelling one build
+    /// as two revisions.
+    pub async fn start_with_binary(upstream_base_url: &str, tuning: &str, binary: &Path) -> Self {
+        let options = Options::new(tuning);
+        let mut last = String::new();
+        for _ in 0..BOOT_ATTEMPTS {
+            match Self::try_start_binary(upstream_base_url, &options, binary).await {
+                Ok(gateway) => return gateway,
+                Err(output) => last = output,
+            }
+        }
+        panic!("{}", never_served(&last));
+    }
+
     /// Boot with everything a suite may need to vary: the tuning sections, extra
     /// config appended to the generated file, and extra environment the process
     /// resolves its own references from.
@@ -319,7 +335,9 @@ impl Axond {
     ) -> Self {
         let mut last = String::new();
         for _ in 0..BOOT_ATTEMPTS {
-            match Self::try_start_custom(render, env).await {
+            match Self::try_start_custom_binary(render, env, Path::new(env!("CARGO_BIN_EXE_axond")))
+                .await
+            {
                 Ok(gateway) => return gateway,
                 Err(output) => last = output,
             }
@@ -331,12 +349,25 @@ impl Axond {
     /// which on a loopback port usually means someone else won the bind — and
     /// when it means something else, it is the only account of what.
     async fn try_start(upstream_base_url: &str, options: &Options<'_>) -> Result<Self, String> {
+        Self::try_start_binary(
+            upstream_base_url,
+            options,
+            Path::new(env!("CARGO_BIN_EXE_axond")),
+        )
+        .await
+    }
+
+    async fn try_start_binary(
+        upstream_base_url: &str,
+        options: &Options<'_>,
+        binary: &Path,
+    ) -> Result<Self, String> {
         let env: Vec<(String, String)> = options
             .env
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect();
-        Self::try_start_custom(
+        Self::try_start_custom_binary(
             &|addr| {
                 config_toml(
                     addr,
@@ -346,13 +377,15 @@ impl Axond {
                 )
             },
             &env,
+            binary,
         )
         .await
     }
 
-    async fn try_start_custom(
+    async fn try_start_custom_binary(
         render: &dyn Fn(SocketAddr) -> String,
         extra_env: &[(String, String)],
+        binary: &Path,
     ) -> Result<Self, String> {
         // One reservation, used for both the config directory and the boot key:
         // re-reading the counter could hand two concurrent boots the same value,
@@ -366,7 +399,7 @@ impl Axond {
         let config = render(addr);
         std::fs::write(&path, &config).expect("test config is written");
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_axond"));
+        let mut command = Command::new(binary);
         command
             .env("AXOND_CONFIG", &path)
             .env("GW_INBOUND_KEY", GATEWAY_KEY)

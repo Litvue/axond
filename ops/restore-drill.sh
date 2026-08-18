@@ -202,23 +202,29 @@ psql() {
     psql -v ON_ERROR_STOP=1 -qtAX -p "$port" -d "$database" "$@"
 }
 
-axond_bin="${AXOND_BIN:-}"
-if [[ -z "$axond_bin" ]]; then
-  for candidate in "${root}/target/release/axond" "${root}/target/debug/axond"; do
-    [[ -x "$candidate" ]] && axond_bin="$candidate" && break
-  done
-fi
-if [[ -z "$axond_bin" ]]; then
+command -v openssl >/dev/null 2>&1 || fail "openssl is required for this run's secrets and executable identity"
+
+axond_bin="${AXOND_BIN:-${root}/target/release/axond}"
+if [[ ! -x "$axond_bin" && "$axond_bin" == "${root}/target/release/axond" ]]; then
   step "Building axond, the drill's verifier"
-  cargo build -p axond --locked --manifest-path "${root}/Cargo.toml"
-  axond_bin="${root}/target/debug/axond"
+  cargo build -p axond --locked --release --manifest-path "${root}/Cargo.toml"
 fi
 [[ -x "$axond_bin" ]] || fail "no axond binary at ${axond_bin}"
+
+recovery_cargo_profile="release"
+recovery_axond_sha256="$(openssl dgst -sha256 -r "$axond_bin" | awk '{print $1}')"
+[[ "$recovery_axond_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+  fail "the release axond executable produced a malformed SHA-256 digest"
+if [[ -n "${AXOND_RECOVERY_EXECUTABLE_SHA256:-}" &&
+      "$AXOND_RECOVERY_EXECUTABLE_SHA256" != "$recovery_axond_sha256" ]]; then
+  fail "AXOND_RECOVERY_EXECUTABLE_SHA256 does not identify the AXOND_BIN bytes"
+fi
+export AXOND_RECOVERY_EXECUTABLE_SHA256="$recovery_axond_sha256"
+export AXOND_RECOVERY_CARGO_PROFILE="$recovery_cargo_profile"
 
 command -v docker >/dev/null 2>&1 || fail "docker is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required to probe the drill's replicas"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
-command -v openssl >/dev/null 2>&1 || fail "openssl is required for this run's secrets"
 command -v nc >/dev/null 2>&1 || fail "nc is required to probe the loopback qualification helpers"
 
 step "Starting ${image} with WAL archiving"
@@ -450,8 +456,20 @@ usage_count() {
   psql "$1" "$2" -c 'SELECT count(*) FROM axond_usage'
 }
 
-latest_usage_request_id() {
-  psql "$1" "$2" -c 'SELECT request_id FROM axond_usage ORDER BY id DESC LIMIT 1'
+latest_usage_row_id() {
+  psql "$1" "$2" -c 'SELECT coalesce(max(id), 0) FROM axond_usage'
+}
+
+usage_rows_after_id() {
+  local database="$1" port="$2" baseline_id="$3"
+  psql "$database" "$port" -c \
+    "SELECT count(*) FROM axond_usage WHERE id > ${baseline_id}"
+}
+
+usage_request_after_id() {
+  local database="$1" port="$2" baseline_id="$3"
+  psql "$database" "$port" -c \
+    "SELECT CASE WHEN count(*) = 1 THEN min(request_id) ELSE '' END FROM axond_usage WHERE id > ${baseline_id}"
 }
 
 usage_identity_count() {
@@ -664,6 +682,20 @@ live_price_checksum="$(psql live 5432 -c \
   "SELECT content_checksum FROM axond_cp_resource_version \
    WHERE resource_kind = 'price' AND resource_id = 'res_01900000-0000-7000-8000-000000000014' \
    ORDER BY version DESC LIMIT 1")"
+
+# Put one settled billing event on the durable side of the logical-backup
+# boundary. Counting an empty source and an empty restore would prove only that
+# two databases agree about having no usage history.
+backup_usage_baseline="$(usage_count live 5432)"
+backup_usage_baseline_id="$(latest_usage_row_id live 5432)"
+backup_usage_status="$(probe_survivor_chat "${workdir}/usage-before-logical-backup.body")"
+backup_usage_count="$(wait_for_usage_count live 5432 "$((backup_usage_baseline + 1))" || true)"
+backup_usage_new_rows="$(usage_rows_after_id live 5432 "$backup_usage_baseline_id")"
+backup_usage_request_id="$(usage_request_after_id live 5432 "$backup_usage_baseline_id")"
+backup_usage_source_rows="$(usage_identity_count live 5432 axond_usage "$backup_usage_request_id")"
+backup_usage_source_outbox_rows="$(usage_identity_count live 5432 axond_usage_outbox "$backup_usage_request_id")"
+live_usage_rows="$(usage_count live 5432)"
+live_usage_outbox_rows="$(psql live 5432 -c 'SELECT count(*) FROM axond_usage_outbox')"
 psql live 5432 -c 'SELECT pg_switch_wal()' >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -721,14 +753,23 @@ serve logical_restore "$logical_http"
 logical_endpoint="$endpoint"
 mark "replica-booted" "a replica booted on the restored database and opened /admin/v1"
 
-require "the_restored_head_is_the_backed_up_head" "$live_head" "$(head_revision)" \
+restored_head_revision="$(head_revision 2>/dev/null || printf 'unreadable')"
+restored_revision_count="$(revision_count 2>/dev/null || printf '%s' -1)"
+restored_resource_count="$(resource_count 2>/dev/null || printf '%s' -1)"
+restored_head_checksum="$(admin history --limit 1 2>/dev/null | jq -r '.revisions[0].checksum // "unreadable"' 2>/dev/null || printf 'unreadable')"
+observe restored_head_revision "$restored_head_revision"
+observe restored_revision_count "$restored_revision_count" count
+observe restored_resource_count "$restored_resource_count" count
+observe live_head_checksum "$live_checksum"
+observe restored_head_checksum "$restored_head_checksum"
+require "the_restored_head_is_the_backed_up_head" "$live_head" "$restored_head_revision" \
   "the replica reads the deployment the backup was taken from"
-require "the_restored_revision_chain_is_whole" "$live_revisions" "$(revision_count)" \
+require "the_restored_revision_chain_is_whole" "$live_revisions" "$restored_revision_count" \
   "no revision published before the backup was lost"
-require "the_restored_deployment_is_whole" "$live_resources" "$(resource_count)" \
+require "the_restored_deployment_is_whole" "$live_resources" "$restored_resource_count" \
   "tenancy, the provider connection, its credential reference, and the policy all came back"
 require "the_restored_head_checksum_matches" "$live_checksum" \
-  "$(admin history --limit 1 | jq -r '.revisions[0].checksum')" \
+  "$restored_head_checksum" \
   "the state the restored journal hydrates is byte-identical to the backed-up state"
 
 # A restore that reads is half a restore: the journal has to accept the next
@@ -787,10 +828,8 @@ gate admin_writes \
   "$(held a_publication_against_the_restored_head_is_accepted && echo accepted || echo refused)" \
   "$(verdict a_publication_against_the_restored_head_is_accepted)" \
   "a publication against the restored head was accepted by a replica booted on it"
-gate readiness \
-  "$(held the_restored_replica_becomes_ready && echo serves || echo refuses)" \
-  "$(verdict the_restored_replica_becomes_ready)" \
-  "the restored replica's readiness is measured before the reconvergence stage exercises its serving path"
+defer readiness \
+  "the reconvergence stage owns serving readiness; this stage retains the restored replica's preflight probe"
 defer max_serving_error_fraction \
   "this stage offers no inference traffic, so the ceiling is vacuous by contract"
 defer max_convergence_lag_seconds \
@@ -857,7 +896,7 @@ gate readiness \
 defer max_data_loss_revisions \
   "the restore stage owns the durable revision-loss boundary"
 defer admin_writes \
-  "the administration stage reads the recovered audit surface"
+  "the restore stage owns the accepted recovered-journal publication"
 defer max_unauthenticated_admin_successes \
   "the administration stage measures recovered administrative authentication"
 close
@@ -895,10 +934,8 @@ observe unauthenticated_admin_successes "$successes" count
 gate max_unauthenticated_admin_successes "$successes" \
   "$([[ "$successes" == "0" ]] && echo true || echo false)" \
   "a restored control plane does not come back with its administrative surface open"
-gate admin_writes \
-  "$(held the_audit_trail_survives_the_restore && echo accepted || echo refused)" \
-  "$(verdict the_audit_trail_survives_the_restore)" \
-  "the authenticated surface answered the audit read the restore is qualified by"
+defer admin_writes \
+  "the restore stage owns the accepted recovered-journal publication; this stage measures authentication and audit reads"
 defer readiness "this stage reads the administrative surface; it offers no inference traffic"
 defer max_serving_error_fraction "no traffic is offered, so the ceiling is vacuous by contract"
 defer max_convergence_lag_seconds "nothing converges in an audit read"
@@ -970,12 +1007,30 @@ restored_price_history="$(printf '%s' "$restored_price_body" | jq -c '
     rates: {input: .rates.input, output: .rates.output},
     provenance: {origin: .provenance.origin, citation: (.provenance.citation // null)}
   }] | sort_by([.effective_from, .precedence])' 2>/dev/null || printf 'unreadable')"
+restored_usage_rows="$(usage_count logical_restore 5432)"
+restored_usage_outbox_rows="$(psql logical_restore 5432 -c \
+  'SELECT count(*) FROM axond_usage_outbox')"
+backup_usage_restored_rows="$(usage_identity_count logical_restore 5432 axond_usage "$backup_usage_request_id")"
+backup_usage_restored_outbox_rows="$(usage_identity_count logical_restore 5432 axond_usage_outbox "$backup_usage_request_id")"
 mark "inventory-checked" "the restored secret, catalogue, and approved price-book records were inspected"
+observe expected_secret_owner "$tenant"
 observe restored_secret_versions "$secret_versions" count
 observe restored_secret_owner "$secret_owner"
 observe restored_secret_ciphertext_rows "$secret_ciphertext_rows" count
 observe restored_catalog_snapshot_rows "$catalog_snapshot_rows" count
+observe expected_catalog_active_content "$catalog_content"
 observe restored_catalog_active_content "$catalog_active_content"
+observe live_usage_rows "$live_usage_rows" count
+observe restored_usage_rows "$restored_usage_rows" count
+observe live_usage_outbox_rows "$live_usage_outbox_rows" count
+observe restored_usage_outbox_rows "$restored_usage_outbox_rows" count
+observe logical_backup_usage_request_id "$backup_usage_request_id"
+observe logical_backup_usage_status "$backup_usage_status"
+observe logical_backup_new_usage_rows "$backup_usage_new_rows" count
+observe logical_backup_source_usage_identity_rows "$backup_usage_source_rows" count
+observe logical_backup_source_outbox_identity_rows "$backup_usage_source_outbox_rows" count
+observe logical_backup_restored_usage_identity_rows "$backup_usage_restored_rows" count
+observe logical_backup_restored_outbox_identity_rows "$backup_usage_restored_outbox_rows" count
 observe restored_price_book_rows "$price_book_rows" count
 observe live_price_book_checksum "$live_price_checksum"
 observe restored_price_book_checksum "$restored_price_checksum"
@@ -984,6 +1039,7 @@ observe restored_price_book_catalog_version "$restored_price_catalog_version"
 observe restored_price_book_approval_state "$restored_price_approval_state"
 observe restored_price_book_approval_citation "$restored_price_approval_citation"
 observe restored_price_book_rule_count "$restored_price_rule_count" count
+observe expected_price_book_history "$expected_price_history"
 observe restored_price_book_history "$restored_price_history"
 require "the_restored_secret_version_is_active" 1 "$secret_versions" \
   "the credential's exact active version and lifecycle survived the restore"
@@ -996,6 +1052,28 @@ require "the_restored_catalog_snapshot_survives" 1 "$catalog_snapshot_rows" \
 require "the_restored_catalog_active_pointer_survives" "$catalog_content" \
   "$catalog_active_content" \
   "the active catalogue pointer still names the retained content it confirmed"
+require "the_logical_backup_usage_fixture_was_answered" 200 "$backup_usage_status" \
+  "the backup includes a billing event produced by authenticated inference"
+require "the_logical_backup_usage_fixture_is_nonempty" true \
+  "$([[ "$live_usage_rows" -gt 0 && "$live_usage_outbox_rows" -gt 0 ]] && echo true || echo false)" \
+  "the source has both the billing fact and its durable outbox event"
+require "the_logical_backup_usage_fixture_is_exactly_one_new_row" 1 "$backup_usage_new_rows" \
+  "the authenticated request creates one exact billing identity after the baseline boundary"
+require "the_logical_backup_usage_identity_is_canonical" true \
+  "$([[ "$backup_usage_request_id" =~ ^req_[0-9a-f-]{36}$ ]] && echo true || echo false)" \
+  "the backup fixture is bound to its durable UUIDv7-shaped request identity"
+require "the_logical_backup_usage_identity_is_in_the_source" 1 "$backup_usage_source_rows" \
+  "the exact request answered before backup exists once in the source usage sink"
+require "the_logical_backup_usage_outbox_identity_is_in_the_source" 1 "$backup_usage_source_outbox_rows" \
+  "the exact request answered before backup exists once in the durable source outbox"
+require "the_logical_backup_usage_identity_survives" 1 "$backup_usage_restored_rows" \
+  "the logical restore retains the exact request identity created for this backup"
+require "the_logical_backup_usage_outbox_identity_survives" 1 "$backup_usage_restored_outbox_rows" \
+  "the logical restore retains the exact outbox identity created for this backup"
+require "the_restored_usage_rows_match_backup" "$live_usage_rows" "$restored_usage_rows" \
+  "the logical restore retains every billing fact present at the backup boundary"
+require "the_restored_usage_outbox_matches_backup" "$live_usage_outbox_rows" "$restored_usage_outbox_rows" \
+  "the logical restore retains every durable delivery event present at the backup boundary"
 require "the_restored_price_book_survives" 1 "$price_book_rows" \
   "the approved effective-dated price book remains a durable resource body"
 require "the_restored_price_book_checksum_matches" "$live_price_checksum" "$restored_price_checksum" \
@@ -1015,7 +1093,7 @@ require "the_restored_price_history_is_exact" "$expected_price_history" "$restor
 
 defer max_data_loss_revisions "the restore stage owns the revision-loss boundary; this stage checks durable inventory classes"
 defer readiness "the reconvergence stage owns serving after a restore"
-defer admin_writes "the administration stage owns the authenticated restore surface"
+defer admin_writes "the restore stage owns the accepted recovered-journal publication"
 defer max_serving_error_fraction "this stage offers no inference traffic"
 defer max_convergence_lag_seconds "this stage checks durable inventory, not replica convergence"
 defer max_unauthenticated_admin_successes "the administration stage measures administrative authentication"
@@ -1032,9 +1110,11 @@ docker exec -u postgres "$container" \
 pre_target_head="$(head_revision)"
 pre_target_revisions="$(revision_count)"
 pre_target_usage_baseline="$(usage_count live 5432)"
+pre_target_usage_baseline_id="$(latest_usage_row_id live 5432)"
 pre_target_chat_status="$(probe_survivor_chat "${workdir}/usage-before-target.body")"
 pre_target_usage_count="$(wait_for_usage_count live 5432 "$((pre_target_usage_baseline + 1))" || true)"
-pre_target_usage_id="$(latest_usage_request_id live 5432)"
+pre_target_usage_new_rows="$(usage_rows_after_id live 5432 "$pre_target_usage_baseline_id")"
+pre_target_usage_id="$(usage_request_after_id live 5432 "$pre_target_usage_baseline_id")"
 sleep 1
 target="$(psql live 5432 -c 'SELECT now()')"
 sleep 1
@@ -1048,9 +1128,11 @@ EOF
 post_target_head="$(publish policies "${workdir}/policy-after-target.json" \
   drill-after-target "$pre_target_head")"
 post_target_usage_baseline="$(usage_count live 5432)"
+post_target_usage_baseline_id="$(latest_usage_row_id live 5432)"
 post_target_chat_status="$(probe_survivor_chat "${workdir}/usage-after-target.body")"
 post_target_usage_count="$(wait_for_usage_count live 5432 "$((post_target_usage_baseline + 1))" || true)"
-post_target_usage_id="$(latest_usage_request_id live 5432)"
+post_target_usage_new_rows="$(usage_rows_after_id live 5432 "$post_target_usage_baseline_id")"
+post_target_usage_id="$(usage_request_after_id live 5432 "$post_target_usage_baseline_id")"
 
 # The segment holding the post-target write has to reach the archive before the
 # restore reads it, so the switch's own LSN names the file to wait for. An early
@@ -1097,6 +1179,7 @@ for _ in $(seq 60); do
   sleep 1
 done
 restore_seconds="$(awk -v end="$(date +%s.%N)" -v start="$started" 'BEGIN { printf "%.3f", end - start }')"
+observe recovery_in_progress "$in_recovery"
 require "the_recovered_cluster_promotes" f "$in_recovery" \
   "a cluster still in recovery is not a cluster anyone can serve from"
 mark "promoted" "the recovered cluster was promoted at the target"
@@ -1133,6 +1216,7 @@ observe pitr_catalogue_preboot_snapshot_rows "$pitr_catalog_rows" count
 config live "$restored_port" restored.toml "$recovered_http" seed empty false
 recovered_schema="$("$axond_bin" migrate status --config "$drill_config" 2>&1 | tr '\n' ' ')" &&
   recovered_current=current || recovered_current=stale
+observe recovered_schema_status "$recovered_current"
 require "the_recovered_schema_is_current" current "$recovered_current" \
   "a replica refuses a recovered database whose schema it does not recognise: ${recovered_schema}"
 
@@ -1150,10 +1234,14 @@ pitr_secret_owner="$(printf '%s' "$pitr_secret_versions" |
   jq -r '.versions[0].owner // "missing"')"
 mark "durable-inventory-read" "PITR metadata reads for the tenant's secret and pre-boot catalogue snapshot"
 observe pitr_secret_versions "$(printf '%s' "$pitr_secret_versions" | jq '.versions | length')" count
+observe expected_secret_owner "$tenant"
 observe pitr_secret_owner "$pitr_secret_owner"
 observe pitr_secret_lifecycle "$(printf '%s' "$pitr_secret_versions" | jq -r '.versions[0].lifecycle // "missing"')"
+observe expected_pitr_catalogue_content_id "$catalog_content_id"
 observe pitr_catalogue_content_id "$pitr_catalog_content_id"
+observe expected_pitr_catalogue_raw_digest "$catalog_raw_digest"
 observe pitr_catalogue_raw_digest "$pitr_catalog_raw_digest"
+observe expected_pitr_catalogue_raw_bytes "$catalog_raw_bytes" count
 observe pitr_catalogue_raw_bytes "$pitr_catalog_raw_bytes" count
 observe pitr_catalogue_payload_bytes "$pitr_catalog_payload_bytes" count
 observe pitr_catalogue_snapshot_rows "$pitr_catalog_rows" count
@@ -1191,9 +1279,11 @@ require "the_recovered_head_is_the_pre_target_revision" "$pre_target_head" "$rec
 require "nothing_published_before_the_target_is_lost" "$pre_target_revisions" \
   "$recovered_revisions" \
   "the data-loss boundary is measured against the target, and on its safe side it is zero"
+post_target_revision_presence="$(admin history --limit 100 |
+  jq -r --arg r "$post_target_head" 'if any(.revisions[]; .revision == $r) then "present" else "absent" end')"
+observe post_target_revision_presence "$post_target_revision_presence"
 require "the_write_after_the_target_is_not_replayed" absent \
-  "$(admin history --limit 100 |
-    jq -r --arg r "$post_target_head" 'if any(.revisions[]; .revision == $r) then "present" else "absent" end')" \
+  "$post_target_revision_presence" \
   "a recovery that replayed past its target would be useless for the incident it exists for"
 
 # A document the recovered journal has never held, for the same reason the
@@ -1216,8 +1306,9 @@ observe revisions_after_recovery_publication "$recovered_revisions_after_publica
 observe readiness_probe "$(curl -s -o /dev/null -w '%{http_code}' "${recovered_endpoint}/readyz")"
 
 for table in axond_usage axond_budget axond_revocation; do
-  require "the_${table}_schema_is_recovered" 1 \
-    "$(psql live 5433 -c "SELECT count(*) FROM pg_tables WHERE tablename = '${table}'")" \
+  table_count="$(psql live 5433 -c "SELECT count(*) FROM pg_tables WHERE tablename = '${table}'")"
+  observe "recovered_${table}_table_count" "$table_count" count
+  require "the_${table}_schema_is_recovered" 1 "$table_count" \
     "the recovery brings back the whole durable schema, not only the journal's tables"
 done
 
@@ -1257,8 +1348,12 @@ mark "usage-boundary-measured" \
   "the usage rows and outbox events on either side of the PITR target were inspected"
 observe pre_target_usage_request_id "$pre_target_usage_id"
 observe post_target_usage_request_id "$post_target_usage_id"
+observe pre_target_chat_status "$pre_target_chat_status"
+observe post_target_chat_status "$post_target_chat_status"
 observe pre_target_usage_count "$pre_target_usage_count" count
 observe post_target_usage_count "$post_target_usage_count" count
+observe pre_target_new_usage_rows "$pre_target_usage_new_rows" count
+observe post_target_new_usage_rows "$post_target_usage_new_rows" count
 observe recovered_pre_target_usage "$recovered_pre_target_usage" count
 observe recovered_pre_target_outbox "$recovered_pre_target_outbox" count
 observe recovered_post_target_usage "$recovered_post_target_usage" count
@@ -1267,6 +1362,10 @@ require "the_pre_target_usage_request_is_answered" 200 "$pre_target_chat_status"
   "the request whose usage identity is before the target was answered before recovery"
 require "the_post_target_usage_request_is_answered" 200 "$post_target_chat_status" \
   "the request whose usage identity is after the target was answered before recovery"
+require "the_pre_target_usage_request_creates_one_identity" 1 "$pre_target_usage_new_rows" \
+  "the pre-target request is bound to the sole usage row created after its baseline"
+require "the_post_target_usage_request_creates_one_identity" 1 "$post_target_usage_new_rows" \
+  "the post-target request is bound to the sole usage row created after its baseline"
 require "the_usage_request_ids_are_canonical" true \
   "$([[ "$pre_target_usage_id" =~ ^req_[0-9a-f-]{36}$ && "$post_target_usage_id" =~ ^req_[0-9a-f-]{36}$ ]] && echo true || echo false)" \
   "usage identities are UUIDv7-shaped request ids, not process-local counters"
@@ -1344,7 +1443,7 @@ gate readiness \
 defer max_data_loss_revisions \
   "the recovery stage owns the durable revision-loss boundary"
 defer admin_writes \
-  "the administration stage reads the recovered audit surface"
+  "the recovery stage owns the accepted recovered-journal publication"
 defer max_unauthenticated_admin_successes \
   "the administration stage measures recovered administrative authentication"
 close
@@ -1373,11 +1472,8 @@ observe unauthenticated_admin_successes "$successes" count
 gate max_unauthenticated_admin_successes "$successes" \
   "$([[ "$successes" == "0" ]] && echo true || echo false)" \
   "a recovered control plane does not come back with its administrative surface open"
-gate admin_writes \
-  "$(held the_audit_trail_survives_the_recovery the_audit_after_the_target_is_gone &&
-    echo accepted || echo refused)" \
-  "$(verdict the_audit_trail_survives_the_recovery the_audit_after_the_target_is_gone)" \
-  "the authenticated surface answered the audit reads the boundary is measured with"
+defer admin_writes \
+  "the recovery stage owns the accepted recovered-journal publication; this stage measures authentication and audit reads"
 defer readiness "this stage reads the administrative surface; it offers no inference traffic"
 defer max_serving_error_fraction "no traffic is offered, so the ceiling is vacuous by contract"
 defer max_convergence_lag_seconds "nothing converges in an audit read"
@@ -1389,6 +1485,7 @@ step "Checking the lane retained evidence for every stage it owes"
 check_evidence() {
   GW_DRILL_PROVIDER_KEY="$GW_DRILL_PROVIDER_KEY" "$python_bin" "${root}/ops/check-recovery-evidence.py" --runner restore-drill \
     --since-unix-ms "$drill_started_ms" \
+    --executable "$axond_bin" \
     --forbid-env GW_DRILL_BREAKGLASS --forbid-env GW_DRILL_KEK \
     --forbid-env GW_DRILL_PROVIDER_KEY
 }

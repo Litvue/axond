@@ -37,8 +37,53 @@ env:
   SIGNER_IDENTITY: ^https://github\.com/${{ github.repository }}/\.github/workflows/release-please\.yml@(refs/heads/main|refs/tags/v[0-9]+\.[0-9]+\.[0-9]+)$
 
 jobs:
-  release-please:
+  main-ci-success:
+    name: Release preflight CI
     if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Require CI Success for the current main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            conclusion="$(
+              gh api "/repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/check-runs?per_page=100" \
+                --jq '[.check_runs[] | select(.name == "CI Success")]
+                      | sort_by(.started_at // .created_at) | last
+                      | if . == null then "missing"
+                        elif .status != "completed" then "pending"
+                        else (.conclusion // "completed-without-conclusion")
+                        end'
+            )"
+            case "$conclusion" in
+              success)
+                echo "CI Success is green for $COMMIT_SHA"
+                exit 0
+                ;;
+              pending | missing)
+                echo "attempt $attempt: CI Success is $conclusion for $COMMIT_SHA"
+                sleep 30
+                ;;
+              *)
+                echo "CI Success concluded '$conclusion' for $COMMIT_SHA; refusing release maintenance" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "CI Success did not conclude for $COMMIT_SHA within 30 minutes; refusing release maintenance" >&2
+          exit 1
+
+  release-please:
+    needs: main-ci-success
+    if: >-
+      github.event_name == 'push' &&
+      needs['main-ci-success'].result == 'success'
     # release-please force-updates the release branch on every run, so two runs
     # for main in parallel leave one of them pushing the lockfile sync onto a
     # ref the other has already replaced. Scope the queue to this job: only its
@@ -67,6 +112,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
+      - name: Refuse an unqualified v0.4.0 release candidate
+        run: |
+          cargo test -p axond --all-features --locked --test qualification_packet -- \
+            v0_4_0_release_candidate_requires_closed_production_qualification \
+            --exact
+        env:
+          AXOND_REQUIRE_QUALIFICATION_CLOSURE: "1"
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
@@ -294,12 +352,61 @@ jobs:
             echo "crates_publishable=$crates_publishable"
           } >> "$GITHUB_OUTPUT"
 
-  release-binaries:
-    name: Binary ${{ matrix.target }}
+  release-ci-success:
+    name: Released commit CI Success
     needs: release-metadata
     if: >-
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Require CI Success for the released commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ needs['release-metadata'].outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            conclusion="$(
+              gh api "/repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/check-runs?per_page=100" \
+                --jq '[.check_runs[] | select(.name == "CI Success")]
+                      | sort_by(.started_at // .created_at) | last
+                      | if . == null then "missing"
+                        elif .status != "completed" then "pending"
+                        else (.conclusion // "completed-without-conclusion")
+                        end'
+            )"
+            case "$conclusion" in
+              success)
+                echo "CI Success is green for $COMMIT_SHA"
+                exit 0
+                ;;
+              pending | missing)
+                echo "attempt $attempt: CI Success is $conclusion for $COMMIT_SHA"
+                sleep 30
+                ;;
+              *)
+                echo "CI Success concluded '$conclusion' for $COMMIT_SHA; refusing to publish" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "CI Success did not conclude for $COMMIT_SHA within 30 minutes; refusing to publish" >&2
+          exit 1
+
+  release-binaries:
+    name: Binary ${{ matrix.target }}
+    needs:
+      - release-metadata
+      - release-ci-success
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-ci-success'].result == 'success' &&
       needs['release-metadata'].outputs.release_created == 'true'
     strategy:
       fail-fast: false
@@ -446,10 +553,13 @@ jobs:
   # the two digests under the plain `<version>` and `sha-<short>` tags.
   release-image:
     name: Signed OCI image ${{ matrix.platform }}
-    needs: release-metadata
+    needs:
+      - release-metadata
+      - release-ci-success
     if: >-
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
+      needs['release-ci-success'].result == 'success' &&
       needs['release-metadata'].outputs.release_created == 'true'
     strategy:
       fail-fast: false
@@ -576,10 +686,12 @@ jobs:
     name: Multi-architecture image index
     needs:
       - release-metadata
+      - release-ci-success
       - release-image
     if: >-
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
+      needs['release-ci-success'].result == 'success' &&
       needs['release-image'].result == 'success' &&
       needs['release-metadata'].outputs.release_created == 'true'
     runs-on: ubuntu-latest
@@ -622,10 +734,12 @@ jobs:
     name: Index smoke ${{ matrix.platform }}
     needs:
       - release-metadata
+      - release-ci-success
       - release-image-index
     if: >-
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
+      needs['release-ci-success'].result == 'success' &&
       needs['release-image-index'].result == 'success' &&
       needs['release-metadata'].outputs.release_created == 'true'
     strategy:
@@ -681,11 +795,13 @@ jobs:
     name: Promote the multi-architecture index
     needs:
       - release-metadata
+      - release-ci-success
       - release-image-index
       - release-image-index-smoke
     if: >-
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
+      needs['release-ci-success'].result == 'success' &&
       needs['release-image-index'].result == 'success' &&
       needs['release-image-index-smoke'].result == 'success' &&
       needs['release-metadata'].outputs.release_created == 'true'
@@ -757,6 +873,7 @@ jobs:
     name: Release artifacts success
     needs:
       - release-metadata
+      - release-ci-success
       - release-binaries
       - release-image
       - release-image-index
@@ -772,6 +889,7 @@ jobs:
         run: |
           test "${{ needs['release-metadata'].result }}" = success
           test "${{ needs['release-metadata'].outputs.release_created }}" = true
+          test "${{ needs['release-ci-success'].result }}" = success
           test "${{ needs['release-binaries'].result }}" = success
           test "${{ needs['release-image'].result }}" = success
           test "${{ needs['release-image-index'].result }}" = success
@@ -788,10 +906,12 @@ jobs:
     name: crates.io publish
     needs:
       - release-metadata
+      - release-ci-success
       - release-success
     if: >-
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
+      needs['release-ci-success'].result == 'success' &&
       needs['release-success'].result == 'success' &&
       needs['release-metadata'].outputs.crates_publishable == 'true' &&
       needs['release-metadata'].outputs.release_created == 'true'
@@ -807,45 +927,10 @@ jobs:
     environment: crates-io
     permissions:
       contents: read
-      # Reading the tagged commit's check runs, nothing more: this job has no
-      # reason to write to the repository or the release.
-      checks: read
     env:
       RELEASE_TAG: ${{ needs['release-metadata'].outputs.tag_name }}
       RELEASE_VERSION: ${{ needs['release-metadata'].outputs.version }}
     steps:
-      # The artifact lanes above rebuild the tagged commit but do not re-run the
-      # full test matrix, so require the commit's own `CI Success` aggregate
-      # rather than assuming the release PR merged green.
-      - name: Require CI to be green for the released commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-          COMMIT_SHA: ${{ needs['release-metadata'].outputs.commit_sha }}
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 60); do
-            conclusion="$(
-              gh api "/repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/check-runs?per_page=100" \
-                --jq '[.check_runs[] | select(.name == "CI Success")]
-                      | sort_by(.started_at) | last | .conclusion // "pending"'
-            )"
-            case "$conclusion" in
-              success)
-                echo "CI Success is green for $COMMIT_SHA"
-                exit 0
-                ;;
-              pending | null | "")
-                echo "attempt $attempt: CI Success has not concluded for $COMMIT_SHA yet"
-                sleep 30
-                ;;
-              *)
-                echo "CI Success concluded '$conclusion' for $COMMIT_SHA; refusing to publish" >&2
-                exit 1
-                ;;
-            esac
-          done
-          echo "CI Success did not conclude for $COMMIT_SHA within 30 minutes; refusing to publish" >&2
-          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs['release-metadata'].outputs.tag_name }}

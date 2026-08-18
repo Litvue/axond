@@ -4,11 +4,11 @@
 //!
 //! Two rules shape this module.
 //!
-//! **Nothing here holds a row per request.** A twelve-hour run settles millions
-//! of them, and a reconciliation that pulls every `request_id` into the test
-//! process is a memory leak measuring a memory leak. The database counts; the
-//! harness counts; the two counts are compared, bucketed by the wall-clock
-//! windows the driver itself opened and closed.
+//! **Nothing here holds a run's rows in memory.** A twelve-hour run settles
+//! millions. PostgreSQL rows are streamed one at a time into fixed-width,
+//! sharded spill ledgers, then exact identity sets are merged one shard at a
+//! time. Cardinality equality alone cannot prove the durable rows are the rows
+//! the processes emitted.
 //!
 //! **Nothing here writes a DSN anywhere.** The connection string is read from
 //! the environment, passed to the replicas by variable *name*, and never
@@ -18,8 +18,11 @@
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
+use futures::StreamExt;
 use serde::Serialize;
 use tokio_postgres_rustls::MakeRustlsConnect;
+
+use crate::support::endurance::ledger::IdentityPairLedger;
 
 /// The DSN the durable scenarios need, or `None` to skip them. The shared rule:
 /// absent configuration skips, and `AXOND_TEST_REQUIRE_SERVICES=1` turns the
@@ -235,6 +238,43 @@ impl Durable {
             .await
             .expect("the durable usage table can be counted by window");
         row.get::<_, i64>(0).max(0) as u64
+    }
+
+    /// Stream every durable request identity into the whole-run and
+    /// outside-outage reconciliation ledgers. `query_raw` is deliberate: the
+    /// database may hold millions of rows and the harness must not collect them
+    /// in memory merely to prove their identities.
+    pub async fn record_identities(
+        &self,
+        all: &mut IdentityPairLedger,
+        outside: &mut IdentityPairLedger,
+        outage: Option<(SystemTime, SystemTime)>,
+    ) {
+        let client = connect(&self.dsn).await;
+        let query = format!(
+            "SELECT request_id, recorded_at FROM {} ORDER BY request_id, recorded_at",
+            self.qualified_table
+        );
+        let rows = client
+            .query_raw(
+                &query,
+                std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>(),
+            )
+            .await
+            .expect("the durable usage identities can be streamed");
+        tokio::pin!(rows);
+        while let Some(row) = rows.next().await {
+            let row = row.expect("a durable usage identity row is readable");
+            let request_id: String = row.get(0);
+            let recorded_at: SystemTime = row.get(1);
+            all.record_observed(&request_id)
+                .expect("PostgreSQL holds a canonical request id");
+            if outage.is_none_or(|(from, to)| recorded_at < from || recorded_at >= to) {
+                outside
+                    .record_observed(&request_id)
+                    .expect("PostgreSQL holds a canonical request id");
+            }
+        }
     }
 
     /// Wait until the table stops growing, and report how long that took.

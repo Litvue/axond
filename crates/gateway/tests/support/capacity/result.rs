@@ -6,7 +6,7 @@
 //! from another machine, and comparing them anyway is how a capacity claim
 //! becomes folklore.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +31,9 @@ pub struct CapacityResult {
     pub stream_lifetime_ms: Option<Percentiles>,
     pub resources: ResourceReport,
     pub occupancy: Occupancy,
+    /// Decoded OTLP evidence for the queueing profile. Absent on profiles that
+    /// intentionally boot with no queue.
+    pub queue: Option<QueueEvidence>,
     pub outcomes: Outcomes,
     pub usage_records: UsageRecords,
     pub upstream: Upstream,
@@ -104,6 +107,9 @@ pub struct ProfileEcho {
     pub tier: String,
     pub concurrency: usize,
     pub requests: usize,
+    pub max_in_flight: Option<u64>,
+    pub queue_capacity: Option<u64>,
+    pub queue_wait_ms: Option<u64>,
     pub thresholds: Thresholds,
 }
 
@@ -117,6 +123,9 @@ impl ProfileEcho {
             tier: tier.as_str().to_owned(),
             concurrency: scale.concurrency,
             requests: scale.requests,
+            max_in_flight: profile.max_in_flight,
+            queue_capacity: profile.queue_capacity,
+            queue_wait_ms: profile.queue_wait_ms,
             thresholds: profile.thresholds,
         }
     }
@@ -213,7 +222,7 @@ impl Environment {
                 size_bytes: std::fs::metadata(&binary)
                     .map(|m| m.len())
                     .unwrap_or_default(),
-                version: env!("CARGO_PKG_VERSION"),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
             },
             config: ConfigMeta {
                 sha256: manifest::sha256_hex(normalized.as_bytes()),
@@ -236,7 +245,7 @@ pub struct BinaryMeta {
     pub path: String,
     pub sha256: String,
     pub size_bytes: u64,
-    pub version: &'static str,
+    pub version: String,
 }
 
 /// The binary under test, named by hash. Shared with the rollout harness so two
@@ -244,13 +253,37 @@ pub struct BinaryMeta {
 /// same digest.
 pub fn binary_meta() -> BinaryMeta {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_axond"));
+    binary_meta_at(&binary)
+}
+
+/// Identify an arbitrary `axond` executable by its own bytes and reported
+/// version. A rollout may not infer the retained release's version from the
+/// candidate crate that compiled the harness.
+pub fn binary_meta_at(binary: &std::path::Path) -> BinaryMeta {
+    let version_output = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| panic!("{} --version failed to run: {error}", binary.display()));
+    assert!(
+        version_output.status.success(),
+        "{} --version failed: {}{}",
+        binary.display(),
+        String::from_utf8_lossy(&version_output.stdout),
+        String::from_utf8_lossy(&version_output.stderr),
+    );
+    let reported = String::from_utf8_lossy(&version_output.stdout);
+    let version = reported
+        .split_whitespace()
+        .last()
+        .unwrap_or_else(|| panic!("{} --version produced no version", binary.display()))
+        .to_owned();
     BinaryMeta {
         path: binary.display().to_string(),
-        sha256: manifest::sha256_file(&binary),
-        size_bytes: std::fs::metadata(&binary)
+        sha256: manifest::sha256_file(binary),
+        size_bytes: std::fs::metadata(binary)
             .map(|meta| meta.len())
             .unwrap_or_default(),
-        version: env!("CARGO_PKG_VERSION"),
+        version,
     }
 }
 
@@ -349,17 +382,66 @@ fn cpu_model_from(info: &str) -> Option<String> {
 
     // AArch64 kernels commonly omit both x86's `model name` and the older
     // ARM `Hardware` field, especially inside virtualized Docker runtimes.
-    // The implementer/part pair is the kernel-provided CPU identity in that
-    // format. Keep the literal values: translating them to a marketing name
-    // would make the evidence depend on an incomplete lookup table.
-    let field = |wanted: &str| {
-        fields
-            .iter()
-            .find_map(|(key, value)| (*key == wanted).then_some(*value))
-    };
-    let implementer = field("CPU implementer")?;
-    let part = field("CPU part")?;
-    Some(format!("CPU implementer {implementer}, part {part}"))
+    // Each implementer/part pair is a kernel-provided CPU identity in that
+    // format. Keep every distinct literal pair: translating values to a
+    // marketing name would make the evidence depend on an incomplete lookup
+    // table, while retaining only the first pair would hide heterogeneous ARM
+    // systems.
+    let identities = arm_cpu_identities_from(info)?;
+    Some(
+        identities
+            .into_iter()
+            .map(|(implementer, part)| format!("CPU implementer {implementer}, part {part}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+fn arm_cpu_identities_from(info: &str) -> Option<BTreeSet<(String, String)>> {
+    fn finish_record(
+        implementers: &mut Vec<String>,
+        parts: &mut Vec<String>,
+        identities: &mut BTreeSet<(String, String)>,
+    ) -> Option<()> {
+        if implementers.is_empty() && parts.is_empty() {
+            return Some(());
+        }
+        if implementers.len() != 1
+            || parts.len() != 1
+            || implementers[0].is_empty()
+            || parts[0].is_empty()
+        {
+            return None;
+        }
+        identities.insert((implementers.pop()?, parts.pop()?));
+        Some(())
+    }
+
+    let mut identities = BTreeSet::new();
+    let mut implementers = Vec::new();
+    let mut parts = Vec::new();
+
+    for line in info.lines() {
+        if line.trim().is_empty() {
+            finish_record(&mut implementers, &mut parts, &mut identities)?;
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key == "processor" {
+            finish_record(&mut implementers, &mut parts, &mut identities)?;
+        }
+        match key {
+            "CPU implementer" => implementers.push(value.to_owned()),
+            "CPU part" => parts.push(value.to_owned()),
+            _ => {}
+        }
+    }
+    finish_record(&mut implementers, &mut parts, &mut identities)?;
+    (!identities.is_empty()).then_some(identities)
 }
 
 #[cfg(test)]
@@ -368,7 +450,12 @@ mod cpu_model_tests {
 
     #[test]
     fn prefers_a_human_model_name() {
-        let info = "model name : Example CPU\nCPU implementer : 0x61\nCPU part : 0x000\n";
+        let info = concat!(
+            "Hardware : Example Board\n",
+            "model name : Example CPU\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+        );
         assert_eq!(cpu_model_from(info).as_deref(), Some("Example CPU"));
     }
 
@@ -390,6 +477,63 @@ mod cpu_model_tests {
     #[test]
     fn refuses_an_incomplete_cpu_identity() {
         assert_eq!(cpu_model_from("CPU implementer : 0x61\n"), None);
+    }
+
+    #[test]
+    fn records_all_distinct_aarch64_identities_in_lexical_order() {
+        let info = concat!(
+            "processor : 7\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+            "\n",
+            "processor : 3\n",
+            "CPU implementer : 0x41\n",
+            "CPU part : 0xD03\n",
+        );
+        assert_eq!(
+            cpu_model_from(info).as_deref(),
+            Some("CPU implementer 0x41, part 0xD03; CPU implementer 0x61, part 0x000")
+        );
+    }
+
+    #[test]
+    fn deduplicates_homogeneous_aarch64_identities_without_blank_lines() {
+        let info = concat!(
+            "processor : 0\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+            "processor : 1\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+        );
+        assert_eq!(
+            cpu_model_from(info).as_deref(),
+            Some("CPU implementer 0x61, part 0x000")
+        );
+    }
+
+    #[test]
+    fn refuses_any_incomplete_aarch64_processor_identity() {
+        let info = concat!(
+            "processor : 0\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+            "\n",
+            "processor : 1\n",
+            "CPU implementer : 0x41\n",
+        );
+        assert_eq!(cpu_model_from(info), None);
+    }
+
+    #[test]
+    fn refuses_ambiguous_aarch64_processor_identity() {
+        let info = concat!(
+            "processor : 0\n",
+            "CPU implementer : 0x61\n",
+            "CPU implementer : 0x41\n",
+            "CPU part : 0x000\n",
+        );
+        assert_eq!(cpu_model_from(info), None);
     }
 }
 
@@ -541,6 +685,20 @@ pub struct Occupancy {
     /// offered load, so the run measured the process rather than its own
     /// shedding.
     pub admission_max_in_flight: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueEvidence {
+    pub instrument: &'static str,
+    pub points_exported: usize,
+    pub observations: u64,
+    pub min_depth: Option<u64>,
+    pub max_depth: Option<u64>,
+    pub explicit_bounds: Vec<u64>,
+    pub bucket_counts: Vec<u64>,
+    /// Must be zero: queue depth is deliberately label-free.
+    pub attributes: usize,
+    pub exact: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

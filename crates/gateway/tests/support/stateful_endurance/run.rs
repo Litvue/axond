@@ -34,10 +34,12 @@ use super::manifest::{
 };
 use super::result::*;
 use crate::support::capacity::result::{Environment, Percentiles, Verdict};
-use crate::support::endurance::ledger::Ledger;
+use crate::support::endurance::ledger::{
+    CorrelationLedger, CorrelationTally, IdentityPairLedger, IdentityPairTally, Ledger, Tally,
+};
 use crate::support::endurance::manifest::Ending;
 use crate::support::endurance::plan::{self, Planned, Tenant};
-use crate::support::endurance::result::Distribution;
+use crate::support::endurance::result::{CorrelationEvidence, Distribution, IdentityEvidence};
 use crate::support::endurance::sampler::{self, Sampler};
 use crate::support::upstream::FakeUpstream;
 
@@ -72,6 +74,9 @@ const CANCEL_AFTER_EVENTS: usize = 2;
 /// strided sample of them are honest, and a vector of all of them is not
 /// bounded memory.
 const RETAINED_SAMPLES: usize = 20_000;
+/// Separates the driver's probe trace identities from workload trace
+/// identities even when both use the manifest seed and the same sequence.
+const PROBE_CORRELATION_DOMAIN: u64 = 0x7072_6f62_652d_6964;
 
 /// What an operator dispatching a run may vary.
 #[derive(Clone, Copy)]
@@ -166,7 +171,7 @@ pub async fn run_with(
         profile.schedule,
         duration,
         injected,
-        &tenants,
+        profile.seed,
     );
 
     // One client for the workers and the driver alike, as the stateless drivers
@@ -211,6 +216,7 @@ pub async fn run_with(
             rotation.clone(),
             tenants.clone(),
             endings.clone(),
+            profile.seed,
             next.clone(),
             tx.clone(),
             stop_flag.clone(),
@@ -241,13 +247,16 @@ pub async fn run_with(
         stem: dispatch.stem,
         revision: Revision::default(),
         policy_withdrawn: false,
+        probe_index: 0,
     }
     .run(&mut rx)
     .await;
 
     stop_flag.store(true, Ordering::SeqCst);
     for worker in workers {
-        let _ = worker.await;
+        worker
+            .await
+            .expect("a stateful endurance load worker must terminate successfully");
     }
     // Whatever the workers sent between the last drain and their last request.
     while let Ok(attempt) = rx.try_recv() {
@@ -270,15 +279,26 @@ pub async fn run_with(
     // A directly reached database was never taken away, so every row it holds
     // was settled at a moment nothing excuses and the comparison is made over
     // the whole run.
-    let durable_outside = match injected {
+    let outage_window = match injected {
         Injected::EveryDeclaredFault => {
             let (usage_from, usage_to) = profile.schedule.usage_outage_window(duration);
-            durable
-                .distinct_outside(started_at + usage_from, started_at + usage_to)
-                .await
+            Some((started_at + usage_from, started_at + usage_to + DRAIN_EVERY))
         }
-        Injected::UpstreamFaultsOnly => durable_counts.distinct,
+        Injected::UpstreamFaultsOnly => None,
     };
+    durable
+        .record_identities(
+            &mut state.durable_identities,
+            &mut state.durable_outside_identities,
+            outage_window,
+        )
+        .await;
+    let distinct_outside_outage = match outage_window {
+        Some((from, to)) => Some(durable.distinct_outside(from, to).await),
+        None => None,
+    };
+    let durable_outside =
+        durable_distinct_for_verdict(injected, durable_counts.distinct, distinct_outside_outage);
 
     // The samplers are read for the last time before the processes stop: a
     // settled reading is what the process *kept*, and a dead process keeps
@@ -320,6 +340,23 @@ pub async fn run_with(
     let path = result.write(dispatch.stem);
     eprintln!("{}\nartifact: {}", result.summary(), fleet::relative(&path));
     Some(result)
+}
+
+/// Select the durable-row population graded by the verdict.
+///
+/// Only a database outage the harness actually injected may remove rows from
+/// the comparison. A direct database remains available throughout the run, so
+/// its complete durable population is always graded.
+pub fn durable_distinct_for_verdict(
+    injected: Injected,
+    all_distinct: u64,
+    distinct_outside_outage: Option<u64>,
+) -> u64 {
+    match injected {
+        Injected::EveryDeclaredFault => distinct_outside_outage
+            .expect("an injected database outage has an outside-window count"),
+        Injected::UpstreamFaultsOnly => all_distinct,
+    }
 }
 
 /// Only one tier offers load at a time, whatever the harness runs it from and
@@ -393,6 +430,7 @@ struct Attempt {
     at: Duration,
     tenant: &'static str,
     ending: Ending,
+    correlation: [u8; 16],
     streamed: bool,
     outcome: Outcome,
     latency_ms: f64,
@@ -449,6 +487,7 @@ async fn worker(
     rotation: Arc<std::sync::Mutex<Vec<String>>>,
     tenants: Vec<Tenant>,
     endings: Arc<Vec<Ending>>,
+    seed: u64,
     next: Arc<AtomicUsize>,
     tx: UnboundedSender<Attempt>,
     stop: Arc<AtomicBool>,
@@ -466,7 +505,7 @@ async fn worker(
             continue;
         }
         let index = next.fetch_add(1, Ordering::Relaxed);
-        let planned = plan::planned(index, &tenants, &endings);
+        let planned = plan::planned(index, seed, &tenants, &endings);
         let target = {
             let live = rotation.lock().expect("the rotation lock");
             if live.is_empty() {
@@ -481,6 +520,7 @@ async fn worker(
                 at: started.elapsed(),
                 tenant: planned.tenant.namespace,
                 ending: planned.ending,
+                correlation: planned.correlation.bytes(),
                 streamed: planned.shape.stream,
                 outcome: Outcome::Unavailable,
                 latency_ms: 0.0,
@@ -509,6 +549,7 @@ async fn offer(
         at,
         tenant: plan.tenant.namespace,
         ending: plan.ending,
+        correlation: plan.correlation.bytes(),
         streamed: plan.shape.stream,
         outcome,
         latency_ms: sent.elapsed().as_secs_f64() * 1000.0,
@@ -523,6 +564,7 @@ async fn offer(
     let response = client
         .post(format!("{base_url}{}", plan.shape.route))
         .bearer_auth(&plan.tenant.key)
+        .header("traceparent", plan.correlation.traceparent())
         .json(&body(plan))
         .send()
         .await;
@@ -658,26 +700,24 @@ fn error_type(body: &str) -> Option<String> {
     Some(parsed["error"]["type"].as_str()?.to_owned())
 }
 
-/// Whether a usage record was settled by the driver's own probes rather than
-/// by the workload. The boundary probe is the only caller in the probe
-/// namespace and the convergence probe the only caller of the catalogue
-/// revision's alias, neither of which the workload ever offers, so a record
-/// carrying either was asked for by the harness.
-pub fn issued_by_the_driver(record: &Value) -> bool {
-    record["namespace"].as_str() == Some(fleet::PROBE)
-        || record["model"].as_str() == Some(fleet::CATALOGUE_ALIAS)
+/// Whether a usage record carries the run-scoped trace domain reserved for
+/// the driver's probes. Namespace/model labels are untrusted output: using
+/// them here would let an unrelated row masquerade as a probe and escape the
+/// exact workload reconciliation.
+pub fn issued_by_the_driver(record: &Value, probe_trace_high: [u8; 8]) -> bool {
+    let Some(trace_id) = record["trace_id"].as_str() else {
+        return false;
+    };
+    crate::support::endurance::ledger::parse_trace_id(trace_id)
+        .is_ok_and(|identity| identity[..8] == probe_trace_high)
 }
 
 /// Classify a gateway settlement against the committed workload plan.
 ///
-/// `rejected` is a legitimate usage-schema settlement for a refusal. The
-/// stateful plan deliberately opens refusal paths during its declared fault
-/// window, and a gateway may record one of those refusals even though the
-/// current driver usually sees no usage row for it. It is therefore a planned
-/// refusal, not an unknown success. The response-side outcome gate still
-/// catches an admission refusal outside the declared window as an unplanned
-/// error. Anything absent or not produced by a planned ending remains unknown
-/// and fails the qualification gate.
+/// `rejected` is a recognised usage-schema status, but no refusal response in
+/// this qualification owes a row. It is retained in correlation evidence and
+/// separately gated to zero rather than being discarded as malformed. Anything
+/// absent or not produced by a planned ending remains unknown and fails too.
 fn classify_usage_status(status: Option<&str>) -> Option<&'static str> {
     let status = status?;
     if status == "rejected" {
@@ -686,17 +726,6 @@ fn classify_usage_status(status: Option<&str>) -> Option<&'static str> {
     Ending::ALL
         .iter()
         .find_map(|ending| ending.settles(status).then_some(ending.as_str()))
-}
-
-fn fingerprint(id: &str) -> u64 {
-    // FNV-1a: cheap, stable, and only ever used to tell one request id from
-    // another inside one run.
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +760,8 @@ struct Supervisor<'a> {
     /// judges; only a probe served after it is a tenant reaching into another
     /// tenant's pool.
     policy_withdrawn: bool,
+    /// Monotonic sequence for exact probe-to-usage correlation.
+    probe_index: usize,
 }
 
 impl Supervisor<'_> {
@@ -829,11 +860,13 @@ impl Supervisor<'_> {
     /// is a served request, `Some(false)` a typed `no_credential` refusal, and
     /// `None` an answer this run cannot interpret — which is neither evidence
     /// of isolation nor of its absence.
-    async fn probe_serves(&self, base_url: &str, key: &str) -> Option<bool> {
+    async fn probe_serves(&mut self, base_url: &str, key: &str) -> Option<bool> {
+        let correlation = self.next_probe_correlation();
         let response = self
             .client
             .post(format!("{base_url}{}", plan::CHAT))
             .bearer_auth(key)
+            .header("traceparent", correlation.traceparent())
             .timeout(PROBE_TIMEOUT)
             .json(&json!({
                 "model": crate::support::gateway::alias::CHAT,
@@ -843,6 +876,10 @@ impl Supervisor<'_> {
             .await
             .ok()?;
         if response.status().is_success() {
+            self.state
+                .correlations
+                .record_expected(correlation.bytes(), Ending::Complete)
+                .expect("a probe emits a valid trace identity");
             return Some(true);
         }
         let code = response.status().as_u16();
@@ -854,6 +891,18 @@ impl Supervisor<'_> {
             _ if code == 429 || code == 503 => None,
             _ => None,
         }
+    }
+
+    fn next_probe_correlation(&mut self) -> plan::CorrelationId {
+        let correlation = plan::CorrelationId::new(
+            self.profile.seed ^ PROBE_CORRELATION_DOMAIN,
+            self.probe_index,
+        );
+        self.probe_index = self
+            .probe_index
+            .checked_add(1)
+            .expect("a stateful endurance probe sequence fits usize");
+        correlation
     }
 
     async fn event(&mut self, event: Event, now: Duration) {
@@ -975,18 +1024,28 @@ impl Supervisor<'_> {
         None
     }
 
-    async fn serves_alias(&self, base_url: &str, alias: &str) -> bool {
-        self.client
+    async fn serves_alias(&mut self, base_url: &str, alias: &str) -> bool {
+        let correlation = self.next_probe_correlation();
+        let served = self
+            .client
             .post(format!("{base_url}{}", plan::CHAT))
             .bearer_auth(crate::support::gateway::GATEWAY_KEY)
             .timeout(PROBE_TIMEOUT)
+            .header("traceparent", correlation.traceparent())
             .json(&json!({
                 "model": alias,
                 "messages": [{ "role": "user", "content": "convergence probe" }],
             }))
             .send()
             .await
-            .is_ok_and(|response| response.status().is_success())
+            .is_ok_and(|response| response.status().is_success());
+        if served {
+            self.state
+                .correlations
+                .record_expected(correlation.bytes(), Ending::Complete)
+                .expect("a convergence probe emits a valid trace identity");
+        }
+        served
     }
 
     /// Poll until every replica in rotation refuses the probe tenant, or the
@@ -1188,18 +1247,25 @@ struct State {
     latency: Reservoir,
     ttft: Reservoir,
     ledger: Ledger,
+    correlations: CorrelationLedger,
+    /// Every stdout-emitted request identity against every durable PostgreSQL
+    /// row, over the whole run and outside the declared usage outage.
+    durable_identities: IdentityPairLedger,
+    durable_outside_identities: IdentityPairLedger,
     /// The records the driver's own probes settled, kept in their own ledger.
     /// Nothing counted them into `owed`, so leaving them in with the
     /// workload's would let one probe record stand in for a workload record
     /// the deployment lost.
     probe_ledger: Ledger,
+    /// High trace word reserved for probes in this run. Exact correlation still
+    /// proves whether each full trace was actually issued.
+    probe_trace_high: [u8; 8],
     records_observed: u64,
+    unidentified: u64,
+    uncorrelated: u64,
+    refusal_records: u64,
     unexpected_statuses: u64,
     by_status: BTreeMap<String, u64>,
-    /// Records observed outside the usage-backend outage window, which are the
-    /// ones the durable sink is not allowed to lose.
-    emitted_outside_usage_window: u64,
-    emitted_in_usage_window: u64,
     sink_drops: SinkDrops,
     /// The declared usage-backend outage, or `None` when the run never applied
     /// one: a database this harness reaches directly cannot be taken away, so
@@ -1353,8 +1419,9 @@ impl State {
         schedule: super::manifest::Schedule,
         duration: Duration,
         injected: Injected,
-        _tenants: &[Tenant],
+        seed: u64,
     ) -> Self {
+        let probe_identity = plan::CorrelationId::new(seed ^ PROBE_CORRELATION_DOMAIN, 0).bytes();
         Self {
             segment_ms: scale.segment_ms.max(1),
             segments: Vec::new(),
@@ -1373,12 +1440,23 @@ impl State {
             latency: Reservoir::new(),
             ttft: Reservoir::new(),
             ledger: Ledger::create(&dir.join(format!("{stem}-fingerprints"))),
+            correlations: CorrelationLedger::create(&dir.join(format!("{stem}-correlations"))),
+            durable_identities: IdentityPairLedger::create(
+                &dir.join(format!("{stem}-durable-identities")),
+            ),
+            durable_outside_identities: IdentityPairLedger::create(
+                &dir.join(format!("{stem}-durable-outside-identities")),
+            ),
             probe_ledger: Ledger::create(&dir.join(format!("{stem}-probe-fingerprints"))),
+            probe_trace_high: probe_identity[..8]
+                .try_into()
+                .expect("a correlation identity has an eight-byte high word"),
             records_observed: 0,
+            unidentified: 0,
+            uncorrelated: 0,
+            refusal_records: 0,
             unexpected_statuses: 0,
             by_status: BTreeMap::new(),
-            emitted_outside_usage_window: 0,
-            emitted_in_usage_window: 0,
             sink_drops: SinkDrops::default(),
             // Both come from the same decision, so an outage that is not
             // injected cannot go on excusing errors and silence through the
@@ -1505,6 +1583,9 @@ impl State {
         }
         if attempt.outcome.owes_record() {
             self.owed += 1;
+            self.correlations
+                .record_expected(attempt.correlation, attempt.ending)
+                .expect("the stateful workload emits a valid trace identity");
         }
         self.latency.record(attempt.latency_ms);
         if let Some(ttft) = attempt.ttft_ms {
@@ -1548,33 +1629,54 @@ impl State {
         self.records_observed += 1;
         self.open.usage_records += 1;
         self.last_record_at = Some(now);
-        let probe = issued_by_the_driver(record);
+        let probe = issued_by_the_driver(record, self.probe_trace_high);
+        // The driver's drain tick is the emitted side's timestamp. The outage's
+        // closing edge is widened by one tick on the PostgreSQL side too.
+        let in_window = in_usage_window(self.usage_window, now);
         match record["request_id"].as_str() {
-            Some(id) if probe => self.probe_ledger.record(fingerprint(id)),
-            Some(id) => self.ledger.record(fingerprint(id)),
-            None => self.unexpected_statuses += 1,
+            Some(id) => {
+                let recorded = if probe {
+                    self.probe_ledger.record(id)
+                } else {
+                    self.ledger.record(id)
+                };
+                if recorded.is_err() {
+                    self.unidentified += 1;
+                } else {
+                    self.durable_identities
+                        .record_expected(id)
+                        .expect("a previously parsed request id remains valid");
+                    if !in_window {
+                        self.durable_outside_identities
+                            .record_expected(id)
+                            .expect("a previously parsed request id remains valid");
+                    }
+                }
+            }
+            None => {
+                self.unidentified += 1;
+            }
         }
         let raw_status = record["status"].as_str();
         if classify_usage_status(raw_status).is_none() {
             self.unexpected_statuses += 1;
+        }
+        if raw_status == Some("rejected") {
+            self.refusal_records += 1;
+        }
+        match (record["trace_id"].as_str(), raw_status) {
+            (Some(trace_id), Some(status)) => {
+                if self.correlations.record_observed(trace_id, status).is_err() {
+                    self.uncorrelated += 1;
+                }
+            }
+            _ => self.uncorrelated += 1,
         }
         // Keep a visible bucket for malformed rows while never treating the
         // fallback as a successful settlement. The classifier above is the
         // qualification gate; this value is only diagnostic output.
         let status = raw_status.unwrap_or("unknown").to_owned();
         *self.by_status.entry(status).or_default() += 1;
-
-        // Which side of the outage a record was settled on, as the database
-        // will see it. The driver stamps a record with the tick it drained it
-        // on, which is up to one drain interval after the process wrote it, so
-        // the closing edge is carried that far forward: a record the database
-        // records inside the window must not be counted as one this side owed
-        // outside it.
-        if in_usage_window(self.usage_window, now) {
-            self.emitted_in_usage_window += 1;
-        } else {
-            self.emitted_outside_usage_window += 1;
-        }
 
         let namespace = record["namespace"].as_str().unwrap_or("unknown");
         let credential = record["credential_id"].as_str().unwrap_or("unknown");
@@ -1937,32 +2039,18 @@ pub fn offered_after_last_replacement(total_offered: u64, at_replacement: u64) -
     total_offered.saturating_sub(at_replacement)
 }
 
-/// Split the durable loss over the usage-backend outage.
-///
-/// The whole-run loss is a set difference. Which half of it the outage excuses
-/// is a question about *when*, so the outside half is derived from a comparison
-/// of the same window on both sides — what the processes settled outside it
-/// against what the database holds outside it, by the gateway's own
-/// `recorded_at` — and only the remainder is charged to the outage. A drop
-/// reported during the outage can no longer excuse a row lost at a safe moment.
-pub fn reconcile_durable_loss(
-    settled: u64,
-    emitted_outside: u64,
-    duplicates: u64,
-    durable_distinct: u64,
-    durable_outside: u64,
+/// Split exact whole-run and outside-window request-ID set differences.
+pub fn reconcile_exact_durable_loss(
+    all: &IdentityPairTally,
+    outside: &IdentityPairTally,
 ) -> DurableLoss {
-    let total = settled.saturating_sub(durable_distinct);
-    // Every duplicate is charged to the outside bucket, because nothing says
-    // which side of the window a second copy arrived on. Understating what was
-    // settled outside understates the loss rather than inventing one.
-    let settled_outside = emitted_outside.saturating_sub(duplicates);
-    let outside = settled_outside.saturating_sub(durable_outside).min(total);
+    let total = all.missing;
+    let outside_missing = outside.missing.min(total);
     DurableLoss {
         total,
-        outside,
-        in_window: total - outside,
-        settled_outside,
+        outside: outside_missing,
+        in_window: total - outside_missing,
+        settled_outside: outside.expected_distinct,
     }
 }
 
@@ -2036,9 +2124,14 @@ fn assemble(
         latency,
         ttft,
         ledger,
+        correlations,
+        durable_identities,
+        durable_outside_identities,
         probe_ledger,
         records_observed,
-        emitted_outside_usage_window,
+        unidentified,
+        uncorrelated,
+        refusal_records,
         unexpected_statuses,
         by_status,
         sink_drops,
@@ -2053,7 +2146,7 @@ fn assemble(
         timeline,
         ..
     } = state;
-    debug_assert_eq!(
+    assert_eq!(
         drained_offered, total_offered,
         "all dispatched attempts should be drained before assembly"
     );
@@ -2062,21 +2155,40 @@ fn assemble(
         restart.offered_after_last_replacement =
             offered_after_last_replacement(offered, offered_at_last_replacement);
     }
-    let tally = ledger.tally();
-    // The driver's probes settle records of their own. They are reconciled
-    // apart from the workload's — nothing owed them — and rejoined only where
-    // the database is compared, because the database holds them too.
-    let probes = probe_ledger.tally();
-    let settled = tally.distinct + probes.distinct;
-    let duplicates = records_observed.saturating_sub(settled);
-    let missing = owed.saturating_sub(tally.distinct);
-    let loss = reconcile_durable_loss(
-        settled,
-        emitted_outside_usage_window,
-        duplicates,
-        durable.counts.distinct,
-        durable.distinct_outside_window,
-    );
+    let tally = ledger
+        .tally()
+        .expect("the stateful workload identity ledger is readable and complete");
+    // The driver's probes settle records of their own. Their request IDs stay
+    // apart from the workload's, while their successful trace correlations
+    // join the exact expected/observed ledger so no probe can hide a lost or
+    // surplus settlement.
+    let probes = probe_ledger
+        .tally()
+        .expect("the stateful probe identity ledger is readable and complete");
+    // Probe IDs are scratch used to keep the workload tally separate while the
+    // run is live. Promotion derives their exact distinct count from the
+    // retained all-emitted durable set minus the retained workload set, and
+    // rejects any cross-collision. Leaving these unclaimed shards beside the
+    // four evidence ledgers would make the artifact set ambiguous.
+    std::fs::remove_dir_all(&probes.directory)
+        .expect("the stateful probe scratch ledger is removable after tallying");
+    let correlation = correlations
+        .tally()
+        .expect("the stateful trace correlation ledger is readable and complete");
+    let durable_identity = durable_identities
+        .tally()
+        .expect("the whole-run durable identity ledger is readable and complete");
+    let durable_outside_identity = durable_outside_identities
+        .tally()
+        .expect("the outside-window durable identity ledger is readable and complete");
+    // The durable expected ledger sees every valid emitted request ID in one
+    // set, including workload/probe cross-collisions that separate ledgers
+    // could not count. It is therefore the authoritative duplicate tally.
+    let duplicates = durable_identity.expected_duplicates;
+    let missing = correlation.missing;
+    let unexpected_records = correlation.unexpected + uncorrelated;
+    let unexpected_statuses = unexpected_statuses + correlation.status_mismatches;
+    let loss = reconcile_exact_durable_loss(&durable_identity, &durable_outside_identity);
     let trend = trend(&segments, slo);
     let growth = resources
         .iter()
@@ -2111,7 +2223,26 @@ fn assemble(
             duplicates as f64,
             slo.max_duplicate_usage_records as f64,
         ),
+        Verdict::at_most("unexpected_usage_records", unexpected_records as f64, 0.0),
         Verdict::at_most("unexpected_usage_statuses", unexpected_statuses as f64, 0.0),
+        Verdict::at_most("unidentified_usage_records", unidentified as f64, 0.0),
+        Verdict::at_most("uncorrelated_usage_records", uncorrelated as f64, 0.0),
+        Verdict::at_most("refusal_usage_records", refusal_records as f64, 0.0),
+        Verdict::at_most(
+            "durable_usage_unexpected_records",
+            durable_identity.unexpected as f64,
+            0.0,
+        ),
+        Verdict::at_most(
+            "durable_identity_counts_match_sql",
+            f64::from(u8::from(
+                durable_identity.observed_rows != durable.counts.rows
+                    || durable_identity.observed_distinct != durable.counts.distinct
+                    || durable_outside_identity.observed_distinct
+                        != durable.distinct_outside_window,
+            )),
+            0.0,
+        ),
         Verdict::at_most(
             "durable_usage_loss_outside_windows",
             loss.outside as f64,
@@ -2182,16 +2313,20 @@ fn assemble(
         ),
         Verdict::at_least(
             "retiring_replicas_exited_cleanly",
-            f64::from(restart.all_exits_clean),
+            f64::from(u8::from(restart.all_exits_clean)),
             1.0,
         ),
         Verdict::at_least(
             "retiring_replicas_exited_in_bound",
-            f64::from(restart.all_exits_bounded),
+            f64::from(u8::from(restart.all_exits_bounded)),
             1.0,
         ),
         // An abandoned run is not a shorter passing one.
-        Verdict::at_least("terminated_normally", f64::from(stop.is_normal()), 1.0),
+        Verdict::at_least(
+            "terminated_normally",
+            f64::from(u8::from(stop.is_normal())),
+            1.0,
+        ),
     ];
     if let Some(bound) = slo.max_rss_drift_kib_per_hour {
         verdicts.push(Verdict::at_most(
@@ -2272,8 +2407,14 @@ fn assemble(
             probe_distinct: probes.distinct,
             duplicates,
             missing,
+            unexpected_records,
             unexpected_statuses,
+            unidentified,
+            uncorrelated,
+            refusal_records,
             by_status,
+            request_identities: identity_evidence(&tally),
+            correlations: correlation_evidence(&correlation),
             durable: durable.counts,
             durable_lag_ms: durable.settled.lag_ms,
             durable_settled: durable.settled.within_bound,
@@ -2282,12 +2423,53 @@ fn assemble(
             durable_loss_in_window: loss.in_window,
             settled_outside_usage_window: loss.settled_outside,
             durable_outside_usage_window: durable.distinct_outside_window,
-            durable_duplicate_rows: durable.counts.rows.saturating_sub(durable.counts.distinct),
+            durable_duplicate_rows: durable_identity.observed_duplicates,
+            durable_unexpected_rows: durable_identity.unexpected,
+            durable_identities: durable_identity_evidence(&durable_identity),
+            durable_outside_identities: durable_identity_evidence(&durable_outside_identity),
             sink_drops,
         },
         telemetry,
         timeline,
         verdicts,
+    }
+}
+
+fn identity_evidence(tally: &Tally) -> IdentityEvidence {
+    IdentityEvidence {
+        recorded: tally.recorded,
+        shards: tally.shards,
+        peak_shard_rows: tally.peak_shard_rows,
+        exact: tally.exact,
+        path: fleet::relative(&tally.directory),
+    }
+}
+
+fn correlation_evidence(tally: &CorrelationTally) -> CorrelationEvidence {
+    CorrelationEvidence {
+        expected: tally.expected,
+        observed: tally.observed,
+        shards: tally.shards,
+        peak_shard_rows: tally.peak_shard_rows,
+        exact: tally.exact,
+        path: fleet::relative(&tally.directory),
+    }
+}
+
+fn durable_identity_evidence(tally: &IdentityPairTally) -> DurableIdentityEvidence {
+    DurableIdentityEvidence {
+        expected_rows: tally.expected_rows,
+        observed_rows: tally.observed_rows,
+        expected_distinct: tally.expected_distinct,
+        observed_distinct: tally.observed_distinct,
+        expected_duplicates: tally.expected_duplicates,
+        observed_duplicates: tally.observed_duplicates,
+        missing: tally.missing,
+        unexpected: tally.unexpected,
+        shards: tally.shards,
+        peak_shard_rows: tally.peak_shard_rows,
+        exact: tally.exact,
+        path: fleet::relative(&tally.directory),
     }
 }
 
@@ -2361,7 +2543,7 @@ mod tests {
             profile.schedule,
             Duration::from_millis(profile.smoke.duration_ms),
             Injected::EveryDeclaredFault,
-            &[],
+            profile.seed,
         );
 
         state.observe_readiness(false, Duration::from_millis(100));

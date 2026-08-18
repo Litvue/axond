@@ -45,8 +45,10 @@ port-forward as the acceptance checks instead.
   unrecoverable. The shipped Recreate Deployment deliberately has no
   `[convergence]` cache or writable volume: a Pod replacement would discard an
   `emptyDir` cache and make cold-boot outage recovery an untrue promise. A
-  future StatefulSet/PVC deployment must provision its cache key before the
-  ConfigMap that names it.
+  shipped `production-stateful-persistent` StatefulSet/PVC option provisions
+  that durable mount and names its cache key. Supply the key in the Secret
+  before applying that overlay; do not add a disposable cache to this Recreate
+  Deployment.
 
 Resolve and verify the image before applying the overlay. Set
 `RELEASE_VERSION` to the verified release; the resolver updates both production

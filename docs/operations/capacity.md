@@ -31,21 +31,25 @@ upstream over loopback and offers the profile's load at a fixed concurrency:
 | `cancellation` | Streams where every second caller hangs up mid-answer. |
 | `tenants` | Two namespaces served at once, each with its own inbound key and its own credential pool, platform fallback off. |
 | `shedding` | More callers than the replica admits, each holding its slot while the upstream thinks. |
+| `queueing` | More callers than the replica can serve or queue, proving bounded wait, overflow, release, and decoded queue-depth telemetry. |
 | `backend-limits` | One healthy upstream per two that stall — one before response headers, one mid-body. |
 
-The last three profiles answer questions a throughput number cannot. `tenants`
+The last four profiles answer questions a throughput number cannot. `tenants`
 records, per namespace, what it offered, what it was served, what it was
 charged, and how many upstream calls carried *its own* credential — the
 credential itself is never recorded, only whose it was and how often. `shedding`
 boots a ceiling far below the load it offers, so what is measured is the refusal
-rather than the throughput. `backend-limits` boots a short transport bound and
+rather than the throughput. `queueing` adds a bounded queue behind that ceiling,
+decodes the exported `axond.admission.queue.depth` histogram, and requires the
+label-free observed peak to equal the configured queue capacity while queued
+requests are subsequently served and overflow receives `admission_queue_full`.
+`backend-limits` boots a short transport bound and
 then stalls two upstreams out of three: every request has to end on the bound
 the replica declares rather than on the upstream relenting, and once a stalling
 target's circuit trips the rest are refused at once while the healthy target
-keeps serving every request sent to it. Those two — the profiles that boot a
-limit — also offer one more request after the load stops, because a ceiling that
-keeps a permit or a bound that keeps a slot is invisible in every other number
-on this page.
+keeps serving every request sent to it. The profiles that hold a request-path
+limit also offer one more request after the load stops, because a ceiling, queue,
+or upstream bound that keeps a permit or slot is invisible in every other number.
 
 Each run writes `target/capacity/<tier>/<profile>.json`: throughput, latency
 percentiles, TTFT and stream lifetime, RSS, CPU, sockets, occupancy, rejection
@@ -62,7 +66,7 @@ cargo test --locked --all-features --test capacity -- --nocapture
 
 # The heavy tier. Same driver, same manifest, same assertions, larger scale.
 # `--test-threads=1` keeps the two tiers from offering load at the same time.
-AXOND_CAPACITY=1 cargo test --locked --all-features --test capacity -- \
+AXOND_CAPACITY=1 cargo test --release --locked --all-features --test capacity -- \
   --nocapture --test-threads=1
 ```
 
@@ -71,6 +75,13 @@ the artifacts; the CI `tests` lane uploads the reduced ones. To reproduce a
 stored result, check out its `environment.source.git_commit` (with
 `git_dirty: false`), confirm the manifest hash matches, and run the tier its
 `profile.tier` names on comparable hardware.
+
+Capacity artifact schema 2 adds the `queue` block. It is decoded from the
+process's OTLP protobuf after graceful exporter shutdown; an instrument name in
+raw bytes or client-side waiting time is not accepted as queue-depth evidence.
+The generated compact capacity record is schema 2 as well: every profile row
+retains the raw JSON SHA-256 and artifact schema, and promotion requires the
+exact one-to-one raw artifact set instead of trusting the summarized envelope.
 
 ## Initial capacity envelopes
 
@@ -174,6 +185,9 @@ depends on how fast the runner was:
   did not send the request (`max_misattributed_usage_records`),
 - the replica still serving one request after the load stops
   (`max_unserved_after_load`),
+- queued admission exporting an exact, label-free histogram whose peak reaches
+  but does not exceed the committed bound (`queue_telemetry_exact`,
+  `queue_observations`, `min_queue_depth`, and `max_queue_depth`),
 - one usage record per admitted request (`max_missing_usage_records`), with
   cancelled streams settling as `client_cancelled`,
 - no upstream response body still open once every client is gone
@@ -214,12 +228,18 @@ Fields worth knowing:
 - `throughput.closed_loop` is always `true`: the driver holds a concurrency
   rather than pushing an arrival rate, so `offered_rps` is a *result* of service
   time, not an input.
-- `occupancy.awaiting_first_byte_peak` is the driver's view of the queue the
-  replica is holding — the client-side counterpart to
-  `axond.admission.in_flight` (see [observability](../observability.md)). It
-  counts a request until the first byte of its *answer* arrives: response headers
-  for a buffered request, the first relayed chunk for a stream, whose headers can
-  precede its first token by a long way.
+- `occupancy.awaiting_first_byte_peak` is client-side occupancy, not server
+  queue depth. It counts a request until the first byte of its *answer* arrives:
+  response headers for a buffered request, the first relayed chunk for a stream,
+  whose headers can precede its first token by a long way. The server's bounded
+  queue is measured directly by the label-free
+  `axond.admission.queue.depth` histogram; its current and settled depth remain
+  `axond.admission.in_flight{axond.admission.resource="queue"}` (see
+  [observability](../observability.md)).
+- `queue` is the final decoded histogram point for the `queueing` profile,
+  including observation count, exact explicit bounds and buckets, min/max depth,
+  and attribute count. It is absent on profiles that intentionally disable the
+  queue.
 - `resources.*.settled` is sampled when the last client byte arrives, before the
   usage-record settle wait, so idle-time cleanup is not reflected in it. Upstream
   socket cleanup is asserted separately through `upstream.streams_open_at_end`.

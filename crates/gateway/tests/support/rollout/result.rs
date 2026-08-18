@@ -123,6 +123,7 @@ impl ScenarioEcho {
                 deadline_ms: scenario.shutdown.deadline_ms,
                 flush_timeout_ms: scenario.shutdown.flush_timeout_ms,
                 budget_ms: scenario.shutdown.budget().as_millis(),
+                stream_budget_ms: scenario.shutdown.stream_budget().as_millis(),
             },
             thresholds: scenario.thresholds,
         }
@@ -136,6 +137,8 @@ pub struct ShutdownEcho {
     pub flush_timeout_ms: u64,
     /// What the process promises termination costs at most.
     pub budget_ms: u128,
+    /// Drain plus request deadline; usage flushing cannot extend caller work.
+    pub stream_budget_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,10 +147,30 @@ pub struct RunMeta {
     pub elapsed_ms: u128,
     pub harness: &'static str,
     pub harness_version: &'static str,
+    /// `diagnostic` for the always-on reduced lane; `qualification` only when
+    /// the heavy lane used distinct binaries and a real control plane.
+    pub mode: &'static str,
+    pub promotable: bool,
+    /// The independently pinned release asset used as the previous revision.
+    /// Absent only from the always-on same-binary diagnostic lane.
+    pub retained_release: Option<RetainedRelease>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetainedRelease {
+    pub expected_version: String,
+    pub expected_binary_sha256: String,
+    pub archive_sha256: String,
 }
 
 impl RunMeta {
-    pub fn new(started_at: SystemTime, elapsed: Duration) -> Self {
+    pub fn new(
+        started_at: SystemTime,
+        elapsed: Duration,
+        tier: Tier,
+        promotable: bool,
+        retained_release: Option<RetainedRelease>,
+    ) -> Self {
         Self {
             started_at_unix_ms: started_at
                 .duration_since(UNIX_EPOCH)
@@ -156,6 +179,13 @@ impl RunMeta {
             elapsed_ms: elapsed.as_millis(),
             harness: "axond rollout harness",
             harness_version: env!("CARGO_PKG_VERSION"),
+            mode: if tier == Tier::Heavy {
+                "qualification"
+            } else {
+                "diagnostic"
+            },
+            promotable,
+            retained_release,
         }
     }
 }
@@ -183,18 +213,23 @@ impl Environment {
 }
 
 /// What a revision *is*, in artifact terms: a binary and the config it was
-/// started from, both named by hash.
+/// started from, both named by hash, plus the durable revision a stateful
+/// replica projected. The latter is absent only from the reduced stateless
+/// diagnostic.
 #[derive(Debug, Clone, Serialize)]
 pub struct RevisionMeta {
     pub label: String,
     pub binary: BinaryMeta,
     pub config: ConfigMeta,
-    /// Whether the two revisions ran different binaries. A test builds one, so
-    /// this is `false` and the artifact says so rather than implying a
-    /// cross-build rollout it did not perform: what differs between the
-    /// revisions is the served capability set, recorded below.
+    /// Whether this revision's executable digest differs from the retained
+    /// previous release.
     pub distinct_binary: bool,
-    /// Aliases this revision serves that the other does not.
+    /// The immutable Postgres desired-state revision this process projected.
+    /// In a stateful binary rollout all three process revisions intentionally
+    /// name the same value: desired state is global, not per replica.
+    pub desired_state_revision: Option<String>,
+    /// Reduced-only aliases this stateless revision serves that the other does
+    /// not. Empty for all stateful revisions.
     pub exclusive_aliases: Vec<String>,
 }
 
@@ -313,12 +348,20 @@ pub struct MixedVersion {
     /// rotation.
     pub previous_requests: u64,
     pub next_requests: u64,
-    /// The alias only the next revision serves, and what each revision did with
-    /// it while both were serving.
+    /// Reduced-only capability split. Heavy stateful artifacts leave these
+    /// fields empty/false because desired state cannot differ by replica.
     pub exclusive_alias: String,
     pub next_serves_exclusive_alias: bool,
     pub previous_refuses_exclusive_alias: bool,
     pub previous_status_for_exclusive_alias: Option<u16>,
+    pub previous_error_type_for_exclusive_alias: Option<String>,
+    /// Heavy-only shared serving contract. The durable revision and alias are
+    /// probed directly on each binary while exact by-revision traffic proves
+    /// both remain in rotation. Absent in the reduced stateless diagnostic.
+    pub shared_stateful_revision: Option<String>,
+    pub shared_alias: Option<String>,
+    pub previous_serves_shared_alias: bool,
+    pub next_serves_shared_alias: bool,
 }
 
 /// The accounting that makes "nothing was lost" a measurement.
@@ -342,24 +385,42 @@ pub struct LossLedger {
     /// Distinct `request_id`s among them. One terminated request is one event,
     /// so a repeat is the same event recorded twice.
     pub usage_records_distinct: u64,
+    /// The exact caller-side ledger. Each expected event names the replica that
+    /// owed it, the caller-controlled trace identity, and its terminal usage
+    /// status. Keeping the rows in the artifact makes reconciliation durable
+    /// rather than reducing it to a count that cannot be audited later.
+    pub expected_usage_identities: Vec<ExpectedUsageIdentity>,
+    /// The exact sink-side ledger, including the independently minted billing
+    /// identity. Missing fields remain visible as `null` and fail the
+    /// unidentified-row verdict rather than disappearing during parsing.
+    pub observed_usage_identities: Vec<ObservedUsageIdentity>,
+    /// Repeated `(replica, trace_id)` rows. A repeated trace on the same replica
+    /// is the same caller event accounted more than once, even when each row
+    /// carries a freshly minted `request_id`.
+    pub usage_identity_duplicates: u64,
+    /// Repeated billing identities across the fleet.
+    pub usage_record_id_duplicates: u64,
+    /// Expected identities that were present under the right replica and trace
+    /// but settled with the wrong terminal status.
+    pub usage_status_mismatches: u64,
+    /// Rows without a canonical trace id, terminal status, or billing identity.
+    pub usage_records_unidentified: u64,
     /// Caller requests the balancer served, by its own identity for each. A
     /// caller request retried onto a second replica is *one* of these, which is
     /// what makes it the unit usage is accounted by.
     pub caller_requests: u64,
     /// The reconciliation, replica by replica.
     pub per_replica: Vec<ReplicaUsage>,
-    /// Records that belong to a caller request some *other* replica went on to
-    /// answer: a replica abandoned mid-drain settles the work it had started and
-    /// still answers `503`, and the balancer retries the caller elsewhere.
+    /// Legacy diagnostic retained in schema 2. Typed drain refusals happen
+    /// outside the accepted request path, so exact reconciliation requires this
+    /// to remain zero.
     pub usage_records_retry_duplicates: u64,
-    /// Summed over replicas, so a duplicate on one cannot offset a loss on
-    /// another.
+    /// Exact expected identities absent from the observed ledger.
     pub usage_records_missing: u64,
-    /// Records beyond what the caller requests on that replica — and the
-    /// refusals it is entitled to hold a partial record for — explain.
+    /// Observed identities that no exact expected row explains.
     pub usage_records_surplus: u64,
-    /// Refusals the balancer retried elsewhere: the ceiling on how many
-    /// duplicates the run can explain.
+    /// Refusals the balancer retried elsewhere, retained as a routing
+    /// diagnostic and never used to excuse a usage row.
     pub refusals_retried: u64,
     pub usage_by_status: BTreeMap<String, u64>,
     /// Upstream bodies still open once every caller is gone: a leak survives a
@@ -367,10 +428,7 @@ pub struct LossLedger {
     pub upstream_streams_open_at_end: i64,
 }
 
-/// One replica's side of the usage reconciliation. Kept per replica because a
-/// caller request is attempted on a specific replica: the one that answered it
-/// owes exactly one record, and only the one that refused it mid-drain may hold
-/// a partial one.
+/// One replica's side of the exact usage reconciliation.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplicaUsage {
     pub replica: String,
@@ -378,13 +436,32 @@ pub struct ReplicaUsage {
     /// directly to it. One record owed each.
     pub caller_requests_answered: u64,
     pub usage_records: u64,
-    /// Caller requests it refused with `503` while draining and the balancer
-    /// placed elsewhere: the ceiling on the records it may hold beyond what it
-    /// answered.
+    /// Caller requests it refused with `503 draining` and the balancer placed
+    /// elsewhere. Diagnostic only; these do not permit usage rows.
     pub caller_requests_refused_while_draining: u64,
     pub retry_duplicates: u64,
     pub missing: u64,
     pub unexplained_surplus: u64,
+    pub identity_duplicates: u64,
+    pub status_mismatches: u64,
+    pub unidentified: u64,
+}
+
+/// One caller event the rollout driver proves reached a specific replica.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ExpectedUsageIdentity {
+    pub replica: String,
+    pub trace_id: String,
+    pub status: String,
+}
+
+/// One usage event harvested from a specific replica.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ObservedUsageIdentity {
+    pub replica: String,
+    pub trace_id: Option<String>,
+    pub status: Option<String>,
+    pub request_id: Option<String>,
 }
 
 /// The per-phase envelope, recorded and never asserted: a fleet mid-rollout is
@@ -410,6 +487,33 @@ pub struct MigrationEvidence {
     /// Absent Postgres, a stateless install has no schema to migrate and says so
     /// rather than skipping the check.
     pub control_plane: String,
+    /// Commands and ledger versions from a real previous-to-candidate schema
+    /// transition. Heavy qualification requires this to be evaluated.
+    pub matrix: MigrationMatrix,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrationMatrix {
+    pub evaluated: bool,
+    pub skipped_reason: Option<String>,
+    pub previous_apply: Option<CommandRecord>,
+    pub previous_status_before: Option<CommandRecord>,
+    pub candidate_status_before: Option<CommandRecord>,
+    pub candidate_apply: Option<CommandRecord>,
+    pub candidate_status_after: Option<CommandRecord>,
+    pub previous_status_after_candidate: Option<CommandRecord>,
+    pub previous_versions: Vec<MigrationVersion>,
+    pub candidate_versions: Vec<MigrationVersion>,
+    pub candidate_added_versions: Vec<i32>,
+    /// `unchanged`, `forward-only`, or `not-evaluated`.
+    pub classification: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MigrationVersion {
+    pub version: i32,
+    pub name: String,
+    pub checksum: String,
 }
 
 /// One operator command, as an artifact reader can re-run it.
@@ -435,7 +539,8 @@ pub struct RollbackEvidence {
 #[derive(Debug, Clone, Serialize)]
 pub struct PatchRollback {
     pub performed: bool,
-    pub replica: String,
+    pub skipped_reason: Option<String>,
+    pub replica: Option<String>,
     pub answered: u64,
     pub errors: u64,
     /// Whether the rolled-back replica served the traffic the newer one had been
@@ -452,9 +557,17 @@ pub struct Fence {
     /// Why the fence was not evaluated, when it was not: it needs a real
     /// Postgres.
     pub skipped_reason: Option<String>,
+    /// The read-only operator status is retained as corroboration, but refusal
+    /// is decided by the real old-binary cold start below.
     pub status: Option<CommandRecord>,
+    pub cold_start_attempted: bool,
+    pub cold_start_reached_readiness: bool,
+    pub cold_start_exit_code: Option<i32>,
+    pub cold_start_output: Option<String>,
     pub refused: bool,
     pub refusal_names_newer_build: bool,
+    /// Whether the observed migration classification requires refusal.
+    pub expected_refused: bool,
 }
 
 /// One thing that happened, in the order it happened. The timeline is the part

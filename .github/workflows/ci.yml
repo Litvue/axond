@@ -136,7 +136,10 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: endurance-results-smoke
-          path: target/endurance/smoke/*.json
+          path: |
+            target/endurance/smoke/*.json
+            target/endurance/smoke/*.samples.jsonl
+            target/endurance/smoke/**/*.bin
           if-no-files-found: warn
           retention-days: 90
       # Likewise for the reduced rollout scenarios (ADR 0041). This lane has no
@@ -156,7 +159,7 @@ jobs:
       - name: Note the stateless fault lane start
         run: echo "fault_lane_started_ms=$(($(date +%s%N) / 1000000))" >>"$GITHUB_ENV"
       - name: Qualify the provider and transport fault rows
-        run: cargo test -p axond --all-features --locked --test faults -- --test-threads=1
+        run: cargo test -p axond --all-features --locked --release --test faults -- --test-threads=1
         env:
           AXOND_FAULT_MATRIX: "1"
       # A passing test can still leave no artifact if its row set or writer is
@@ -270,20 +273,22 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-targets: false
+      # Build before the artifact-producing tests, then pass the digest of these
+      # exact release bytes into every recovery stage in this lane.
+      - name: Build and bind the recovery provenance binary
+        run: |
+          cargo build -p axond --locked --release
+          digest="$(sha256sum target/release/axond | awk '{print $1}')"
+          test "${#digest}" -eq 64
+          echo "AXOND_RECOVERY_EXECUTABLE_SHA256=$digest" >>"$GITHUB_ENV"
       - name: Note when this lane started
         run: echo "lane_started_ms=$(($(date +%s%N) / 1000000))" >>"$GITHUB_ENV"
-      - run: cargo test -p axond --all-features --locked
+      - run: cargo test -p axond --all-features --locked --release
         env:
+          AXOND_BIN: ${{ github.workspace }}/target/release/axond
           AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
           AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
           AXOND_TEST_REQUIRE_SERVICES: "1"
-      # `cargo test` leaves the gateway binary in the test profile, while the
-      # restore lane records a normal dev-profile build. Rebuild explicitly so
-      # the aggregated recovery record can prove one binary identity across
-      # both lanes instead of comparing two Cargo profiles.
-      - name: Build the recovery provenance binary
-        if: success()
-        run: cargo build -p axond --locked
       # The recovery stages that run today are part of the suite above, and
       # their point is the evidence they retain (ADR 0037). A passing suite that
       # left no artifact is the failure an evidence directory cannot describe on
@@ -296,6 +301,7 @@ jobs:
         run: |
           python3 ops/check-recovery-evidence.py --runner stateful-tests \
             --since-unix-ms "$lane_started_ms" \
+            --executable target/release/axond \
             --forbid-env AXOND_TEST_POSTGRES_DSN \
             --forbid-env AXOND_TEST_REDIS_URL
       # `warn` on the upload: an earlier target failing stops the suite before
@@ -313,7 +319,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: recovery-binary-stateful
-          path: target/debug/axond
+          path: target/release/axond
           if-no-files-found: warn
           retention-days: 90
       # This lane has the control plane the forward-only rollback fence needs, so
@@ -331,7 +337,7 @@ jobs:
       # the step runs the binary alone so an injected latency is the only load
       # the row is measuring.
       - name: Qualify the full fault matrix against Redis and Postgres
-        run: cargo test -p axond --all-features --locked --test faults -- --test-threads=1
+        run: cargo test -p axond --all-features --locked --release --test faults -- --test-threads=1
         env:
           AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
           AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
@@ -364,12 +370,12 @@ jobs:
             --artifacts target/faults \
             --out target/qualification-records/validated-fault-full.toml
       - name: Publish the full fault qualification record
-        if: always()
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qualification-record-fault
-          path: target/qualification-records/fault-full.toml
-          if-no-files-found: warn
+          path: target/qualification-records/validated-fault-full.toml
+          if-no-files-found: error
           retention-days: 90
 
   # Keep the 90-second endurance qualification out of the shared stateful test
@@ -432,6 +438,7 @@ jobs:
           path: |
             target/stateful-endurance/smoke/*.json
             target/stateful-endurance/smoke/*.samples.jsonl
+            target/stateful-endurance/smoke/**/*.bin
           if-no-files-found: warn
           retention-days: 90
 
@@ -805,7 +812,11 @@ jobs:
         with:
           cache-targets: false
       - name: Build the binary the drill verifies restores with
-        run: cargo build -p axond --locked
+        run: |
+          cargo build -p axond --locked --release
+          digest="$(sha256sum target/release/axond | awk '{print $1}')"
+          test "${#digest}" -eq 64
+          echo "AXOND_RECOVERY_EXECUTABLE_SHA256=$digest" >>"$GITHUB_ENV"
       # The lane's Python runs on the floor the contributor flow supports, not on
       # whatever the runner ships, so the recovery scripts are exercised there
       # rather than only on a Python that happens to have `tomllib`.
@@ -823,6 +834,7 @@ jobs:
       - name: Restore a logical dump and recover to a chosen point in time
         env:
           AXOND_PYTHON: ${{ github.workspace }}/target/ops-venv/bin/python
+          AXOND_BIN: ${{ github.workspace }}/target/release/axond
         run: |
           target/ops-venv/bin/python --version
           target/ops-venv/bin/python ops/check-recovery-evidence.py --self-test
@@ -840,7 +852,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: recovery-binary-restore
-          path: target/debug/axond
+          path: target/release/axond
           if-no-files-found: warn
           retention-days: 90
 
@@ -901,12 +913,12 @@ jobs:
             --artifacts target/recovery \
             --out target/qualification-records/validated-recovery-serving.toml
       - name: Publish the complete recovery qualification record
-        if: always()
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qualification-record-recovery
-          path: target/qualification-records/recovery-serving.toml
-          if-no-files-found: warn
+          path: target/qualification-records/validated-recovery-serving.toml
+          if-no-files-found: error
           retention-days: 90
 
   # Whether a rolling update completes is a scheduling outcome, not a manifest
@@ -950,13 +962,13 @@ jobs:
           AXOND_ROLLOUT_IMAGE: axond-ci-rollout
         run: bash ops/rollout-drill.sh
 
-  # A stateful replica boots, serves `/admin/v1`, and refuses inference until
-  # revision convergence ships, so it never reports Ready — and three defaults of
-  # a serving fleet become wrong at once: the upgrade waits for an availability
-  # that never arrives, the Service that would carry `/admin/v1` has no
-  # endpoints, and the disruption budget blocks every eviction. Whether the
-  # overlay's answers work is an API-server outcome rather than a manifest
-  # property, so the drill runs each of the three against a real cluster with the
+  # This drill intentionally seeds no serving revision, so the stateful replica
+  # remains fail-closed and never reports Ready. Three serving-fleet defaults are
+  # therefore wrong for this administrative bootstrap state: an upgrade waits
+  # for availability that cannot arrive, the ordinary Service has no endpoints,
+  # and the disruption budget blocks every eviction. Whether the overlay's
+  # explicit bootstrap answers work is an API-server outcome rather than a
+  # manifest property, so the drill runs each against a real cluster with the
   # counterfactual that keeps the result honest.
   stateful-deploy-drill:
     name: Stateful deploy drill (three nodes)

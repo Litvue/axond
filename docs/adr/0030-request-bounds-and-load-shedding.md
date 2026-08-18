@@ -98,12 +98,14 @@ finite `max_in_flight` — a queue in front of an unbounded ceiling is not a
 control.
 
 Telemetry is deliberately coarse: `axond.admission.in_flight` and
-`axond.admission.rejections`, labelled by a closed vocabulary of resources
-(`request`, `stream`, `tenant`, `queue`) and the stable error type. Tenant and
-subject identity are **not** labels — an admission metric keyed by tenant is an
-unbounded-cardinality metric authored by whoever is attacking, which is the same
-resource-exhaustion bug one level down. For the same reason no bound's message or
-log line echoes a prompt, a body, an output, or a credential.
+`axond.admission.rejections` use a closed vocabulary of resources (`request`,
+`stream`, `tenant`, `queue`) and stable error types. The label-free
+`axond.admission.queue.depth` histogram retains the exact bounded queue peak;
+the queue resource on `in_flight` remains its current and settled depth. Tenant
+and subject identity are **not** labels — an admission metric keyed by tenant is
+an unbounded-cardinality metric authored by whoever is attacking, which is the
+same resource-exhaustion bug one level down. For the same reason no bound's
+message or log line echoes a prompt, a body, an output, or a credential.
 
 ### State tier
 

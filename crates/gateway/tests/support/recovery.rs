@@ -166,6 +166,7 @@ pub enum Driver {
     #[default]
     Qualification,
     StatefulIntegration,
+    RestoreDrill,
 }
 
 /// Which lane executes a stage. Two, because severing a link and promoting a

@@ -404,10 +404,7 @@ pub struct Trend {
     pub last_quarter_rss_kib: Option<u64>,
 }
 
-/// Usage accounting, reconciled both ways. Loss is the failure a throughput
-/// number hides; duplication is the failure a *count* hides, and it is only
-/// visible because every record carries a globally unique `request_id`
-/// (see docs/usage-schema.md).
+/// Usage accounting reconciled by full request and trace identity.
 #[derive(Debug, Clone, Serialize)]
 pub struct Reconciliation {
     /// One per offered request: every terminated request settles a record,
@@ -419,44 +416,43 @@ pub struct Reconciliation {
     pub duplicates: u64,
     /// Expected records that never arrived within the settle deadline.
     pub missing: u64,
-    /// Distinct records beyond the requests known to owe one. This is kept
-    /// separate from duplicates: an extra identity is surplus accounting, not
-    /// a replay of an identity the run already observed.
+    /// Observed rows whose trace identity was not expected, or which could not
+    /// be correlated because their trace/status fields were malformed.
     pub unexpected_records: u64,
-    /// Records whose status no planned ending can produce.
+    /// Correlated rows whose status does not settle their specific planned
+    /// ending, plus malformed/unknown status values.
     pub unexpected_statuses: u64,
     /// Records that arrived without a parseable `request_id`, which would make
     /// the duplicate count meaningless if they were ignored.
     pub unidentified: u64,
+    /// Records without a canonical trace identity and schema-valid status.
+    pub uncorrelated: u64,
     pub by_status: BTreeMap<String, u64>,
     pub by_namespace: BTreeMap<String, u64>,
     pub by_credential_source: BTreeMap<String, u64>,
     /// What the plan said each ending would settle, and how many of each it
     /// offered: the expectation the observed statuses are read against.
     pub planned_status_counts: BTreeMap<String, u64>,
-    /// How the duplicate count above was arrived at.
-    pub fingerprints: Fingerprints,
+    pub request_identities: IdentityEvidence,
+    pub correlations: CorrelationEvidence,
 }
 
-/// The identity ledger duplicate detection was performed against. A run that
-/// reports no duplicates is worth what the method that looked for them is
-/// worth, so the method is part of the evidence: how many identities were
-/// compared, whether the comparison was exact, and how many of them the driver
-/// held in memory at once while comparing.
 #[derive(Debug, Clone, Serialize)]
-pub struct Fingerprints {
-    /// Identified usage records, duplicates included.
+pub struct IdentityEvidence {
     pub recorded: u64,
-    /// How many files the identities were spilled across. Equal identities
-    /// always share a shard, which is what keeps the sharded count exact.
     pub shards: usize,
-    /// The largest shard, and so the most identities held at once: the bound a
-    /// whole-run in-memory set did not have.
-    pub peak_shard_fingerprints: u64,
-    /// Whether every identity was compared against every identity it could
-    /// equal. False would mean the count is a lower bound.
+    pub peak_shard_rows: u64,
     pub exact: bool,
-    /// Where the identities were spilled, relative to the workspace root.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CorrelationEvidence {
+    pub expected: u64,
+    pub observed: u64,
+    pub shards: usize,
+    pub peak_shard_rows: u64,
+    pub exact: bool,
     pub path: String,
 }
 

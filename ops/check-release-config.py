@@ -3,15 +3,15 @@
 
 Usage:
     ops/check-release-config.py              # every check against the committed tree
-    ops/check-release-config.py --self-test  # only the platform-default decision
+    ops/check-release-config.py --self-test  # decision and release-order mutations
 
 The release matrix is only exercised for real at a tag, when a mistake is
 already published and a `latest` tag or a dropped target cannot be taken back.
 So the shape of the release configuration is asserted here on every change,
 without a YAML dependency: the published binary targets, the published image
 platforms, the archive extension per target, the integrity and smoke gates each
-lane must carry, the release-success aggregate, and the absence of any
-`latest`-tag requirement.
+lane must carry, fail-closed commit-CI ordering before every publication, the
+release-success aggregate, and the absence of any `latest`-tag requirement.
 
 The expectations are written out rather than derived from the workflow, so
 removing a supported target or dropping a gate fails this check instead of
@@ -107,6 +107,244 @@ def job_block(text: str, job: str) -> str | None:
         rf"\n  {re.escape(job)}:\n(.*?)(?=\n  [A-Za-z0-9_-]+:\n|\Z)", text, re.DOTALL
     )
     return None if match is None else match.group(1)
+
+
+def job_configuration(block: str) -> str:
+    """The declarative part of a job before its executable steps."""
+    return block.partition("\n    steps:\n")[0]
+
+
+def workflow_jobs(text: str) -> dict[str, str]:
+    """All top-level jobs, preserving their complete bodies."""
+    names = re.findall(r"^  ([A-Za-z0-9_-]+):$", text, re.MULTILINE)
+    return {
+        name: block
+        for name in names
+        if (block := job_block(text, name)) is not None
+    }
+
+
+def check_ci_success_poll(block: str, commit_expression: str, label: str) -> list[str]:
+    """Require an exact-commit, success-only, fail-closed CI Success poll."""
+    failures: list[str] = []
+    required = {
+        "checks: read permission": "      checks: read\n",
+        "exact commit identity": f"COMMIT_SHA: {commit_expression}",
+        "strict shell failure handling": "set -euo pipefail",
+        "exact CI aggregate name": 'select(.name == "CI Success")',
+        "completed-status distinction": 'elif .status != "completed" then "pending"',
+        "missing-check distinction": 'if . == null then "missing"',
+        "success-only terminal arm": '              success)\n',
+        "retry-only pending/missing arm": '              pending | missing)\n',
+        "immediate non-success failure arm": '              *)\n',
+        "bounded timeout refusal": "within 30 minutes",
+    }
+    for description, needle in required.items():
+        if needle not in block:
+            failures.append(f"release-please.yml: {label} lacks {description}")
+
+    retry = re.search(
+        r"\n\s+pending \| missing\)\n(.*?)(?=\n\s+\*\))", block, re.DOTALL
+    )
+    if retry is None or "sleep 30" not in retry.group(1):
+        failures.append(
+            f"release-please.yml: {label} does not retry only missing or pending checks"
+        )
+    elif any(
+        outcome in retry.group(0)
+        for outcome in ("neutral", "skipped", "cancelled", "completed")
+    ):
+        failures.append(
+            f"release-please.yml: {label} retries a completed non-success conclusion"
+        )
+    success = re.search(
+        r"\n\s+success\)\n(.*?)(?=\n\s+pending \| missing\))", block, re.DOTALL
+    )
+    if success is None or "exit 0" not in success.group(1):
+        failures.append(
+            f"release-please.yml: {label} does not terminate successfully on success"
+        )
+    refusal = re.search(
+        r"\n\s+\*\)\n(.*?)(?=\n\s+;;)", block, re.DOTALL
+    )
+    if refusal is None or "exit 1" not in refusal.group(1) or "sleep" in refusal.group(1):
+        failures.append(
+            f"release-please.yml: {label} does not immediately fail a non-success conclusion"
+        )
+    if not re.search(
+        r"done\n\s+echo \"CI Success did not conclude .* within 30 minutes; refusing .*\" >&2\n\s+exit 1",
+        block,
+    ):
+        failures.append(
+            f"release-please.yml: {label} does not fail closed after its polling timeout"
+        )
+
+    # `set -e` makes an API error in the unguarded command substitution fatal.
+    # An `||` fallback would turn an authorization/outage failure into a retry
+    # and eventually obscure the actual refusal reason.
+    api_line = re.search(r"^\s+gh api .+$", block, re.MULTILINE)
+    if api_line is None:
+        failures.append(f"release-please.yml: {label} does not query check runs")
+    elif "||" in api_line.group(0):
+        failures.append(
+            f"release-please.yml: {label} masks a check-runs API failure"
+        )
+    return failures
+
+
+def check_release_ordering(text: str) -> list[str]:
+    """Prove release maintenance and publication follow exact-commit CI success."""
+    failures: list[str] = []
+    jobs = workflow_jobs(text)
+    main_gate = jobs.get("main-ci-success")
+    release_gate = jobs.get("release-ci-success")
+    release_please = jobs.get("release-please")
+
+    if main_gate is None:
+        failures.append("release-please.yml: main-ci-success job not found")
+    else:
+        failures.extend(
+            check_ci_success_poll(main_gate, "${{ github.sha }}", "main-ci-success")
+        )
+        config = job_configuration(main_gate)
+        if "if: github.event_name == 'push'" not in config:
+            failures.append(
+                "release-please.yml: main-ci-success is not bound to main pushes"
+            )
+
+    if release_gate is None:
+        failures.append("release-please.yml: release-ci-success job not found")
+    else:
+        failures.extend(
+            check_ci_success_poll(
+                release_gate,
+                "${{ needs['release-metadata'].outputs.commit_sha }}",
+                "release-ci-success",
+            )
+        )
+        config = job_configuration(release_gate)
+        for needle, description in (
+            ("needs: release-metadata", "direct release-metadata dependency"),
+            (
+                "needs['release-metadata'].result == 'success'",
+                "successful metadata condition",
+            ),
+            (
+                "needs['release-metadata'].outputs.release_created == 'true'",
+                "release-created condition",
+            ),
+        ):
+            if needle not in config:
+                failures.append(
+                    f"release-please.yml: release-ci-success lacks {description}"
+                )
+
+    if release_please is None:
+        failures.append("release-please.yml: release-please job not found")
+    else:
+        config = job_configuration(release_please)
+        for needle, description in (
+            ("needs: main-ci-success", "direct main-ci-success dependency"),
+            ("github.event_name == 'push'", "push maintenance condition"),
+            (
+                "needs['main-ci-success'].result == 'success'",
+                "successful main-CI condition",
+            ),
+        ):
+            if needle not in config:
+                failures.append(
+                    f"release-please.yml: release-please lacks {description}"
+                )
+        if "release_created" in config.partition("    concurrency:")[0]:
+            failures.append(
+                "release-please.yml: release-please maintenance is limited to a "
+                "created release instead of every green main push"
+            )
+
+    publishing_jobs = (
+        "release-binaries",
+        "release-image",
+        "release-image-index",
+        "release-image-index-promote",
+        "release-crates",
+    )
+    for job in publishing_jobs:
+        block = jobs.get(job)
+        if block is None:
+            failures.append(f"release-please.yml: {job} job not found")
+            continue
+        config = job_configuration(block)
+        if "      - release-ci-success\n" not in config:
+            failures.append(
+                f"release-please.yml: {job} does not directly need release-ci-success"
+            )
+        if "needs['release-ci-success'].result == 'success'" not in config:
+            failures.append(
+                f"release-please.yml: {job} does not require successful release-ci-success"
+            )
+
+    aggregate = jobs.get("release-success")
+    if aggregate is None:
+        failures.append("release-please.yml: release-success job not found")
+    else:
+        config = job_configuration(aggregate)
+        if "      - release-ci-success\n" not in config:
+            failures.append(
+                "release-please.yml: release-success does not directly need release-ci-success"
+            )
+        if 'test "${{ needs[\'release-ci-success\'].result }}" = success' not in aggregate:
+            failures.append(
+                "release-please.yml: release-success does not aggregate release-ci-success"
+            )
+
+    crates = jobs.get("release-crates")
+    if crates is not None:
+        if "checks: read" in crates:
+            failures.append(
+                "release-please.yml: release-crates retains the obsolete crates-only checks permission"
+            )
+        if "check-runs?" in crates or "Require CI to be green" in crates:
+            failures.append(
+                "release-please.yml: release-crates retains the obsolete crates-only CI poll"
+            )
+
+    publication_primitives = {
+        "release-please action": "googleapis/release-please-action@",
+        "GitHub release creation": "gh release create",
+        "GitHub release upload": "gh release upload",
+        "image build publication": "docker/build-push-action@",
+        "image-index publication": "run: bash ops/publish-image-index.sh",
+        "keyless signing": "cosign sign",
+        "GitHub attestation": "actions/attest@",
+        "registry attestation": "push-to-registry: true",
+        "crates publication script": "run: bash ops/publish-crates.sh",
+        "direct crates publication": "cargo publish",
+    }
+    for job, block in jobs.items():
+        primitives = [
+            description
+            for description, needle in publication_primitives.items()
+            if needle in block
+        ]
+        if not primitives:
+            continue
+        config = job_configuration(block)
+        if job == "release-please":
+            gated = (
+                "needs: main-ci-success" in config
+                and "needs['main-ci-success'].result == 'success'" in config
+            )
+        else:
+            gated = (
+                "      - release-ci-success\n" in config
+                and "needs['release-ci-success'].result == 'success'" in config
+            )
+        if not gated:
+            failures.append(
+                f"release-please.yml: {job} contains ungated publication primitive(s): "
+                + ", ".join(primitives)
+            )
+    return failures
 
 
 def check_binary_matrix(text: str) -> list[str]:
@@ -758,7 +996,7 @@ def check_platform_transition_guidance() -> list[str]:
 
 
 def self_test() -> int:
-    """Prove the platform-default decision, not only that the tree passes today.
+    """Prove decisions and rejection paths, not only that the tree passes today.
 
     The decision is what the post-release cleanup got wrong once: the pinned tag
     is compared against the *last amd64-only release*, so the constant trails the
@@ -821,12 +1059,136 @@ def self_test() -> int:
     ) != []
     assert check_cosign_format_lane(signed, "jobs:\n  fmt:\n    steps: []\n") != []
 
+    # Release ordering is security policy, so prove the checker rejects each
+    # bypass class rather than merely confirming that today's workflow happens
+    # to contain the expected job names.
+    ordered = workflow_text()
+    assert check_release_ordering(ordered) == []
+
+    def replace_in_job(source: str, job: str, old: str, new: str) -> str:
+        block = job_block(source, job)
+        assert block is not None, f"release-order fixture lacks {job}"
+        assert old in block, f"release-order fixture lacks {old!r} in {job}"
+        return source.replace(block, block.replace(old, new, 1), 1)
+
+    def rejected(candidate: str, label: str) -> None:
+        assert check_release_ordering(candidate), (
+            f"release-order checker accepted mutation: {label}"
+        )
+
+    rejected(
+        replace_in_job(ordered, "release-please", "    needs: main-ci-success\n", ""),
+        "release-please lost its main CI dependency",
+    )
+    rejected(
+        replace_in_job(
+            ordered,
+            "release-please",
+            "needs['main-ci-success'].result == 'success'",
+            "always()",
+        ),
+        "release-please ignored the main CI result",
+    )
+    rejected(
+        replace_in_job(
+            ordered,
+            "main-ci-success",
+            "COMMIT_SHA: ${{ github.sha }}",
+            "COMMIT_SHA: ${{ github.ref }}",
+        ),
+        "main preflight checked a ref instead of github.sha",
+    )
+    for outcome in ("neutral", "skipped", "cancelled", "completed"):
+        rejected(
+            replace_in_job(
+                ordered,
+                "main-ci-success",
+                "              success)\n",
+                f"              success | {outcome})\n",
+            ),
+            f"main preflight accepted non-success outcome {outcome}",
+        )
+    rejected(
+        replace_in_job(
+            ordered,
+            "release-ci-success",
+            "COMMIT_SHA: ${{ needs['release-metadata'].outputs.commit_sha }}",
+            "COMMIT_SHA: ${{ github.sha }}",
+        ),
+        "repair preflight checked the workflow SHA instead of the tag commit",
+    )
+    rejected(
+        replace_in_job(
+            ordered, "release-binaries", "      - release-ci-success\n", ""
+        ),
+        "publishing job lost its direct release CI dependency",
+    )
+    rejected(
+        replace_in_job(
+            ordered,
+            "release-binaries",
+            "      needs['release-ci-success'].result == 'success' &&\n",
+            "",
+        ),
+        "publishing job ignored the release CI result",
+    )
+    release_gate_removed = re.sub(
+        r"\n  release-ci-success:\n.*?(?=\n  release-binaries:\n)",
+        "",
+        ordered,
+        count=1,
+        flags=re.DOTALL,
+    )
+    assert release_gate_removed != ordered
+    release_gate_removed = replace_in_job(
+        release_gate_removed,
+        "release-crates",
+        "    steps:\n",
+        "    steps:\n"
+        "      - name: Crates-only CI check\n"
+        "        run: gh api check-runs?ref=tag\n",
+    )
+    rejected(release_gate_removed, "CI was checked only inside release-crates")
+    rejected(
+        ordered
+        + "\n  rogue-publisher:\n"
+        + "    runs-on: ubuntu-latest\n"
+        + "    steps:\n"
+        + "      - run: gh release upload v9.9.9 payload\n",
+        "a publication primitive moved into an ungated job",
+    )
+    rejected(
+        replace_in_job(
+            ordered, "release-success", "      - release-ci-success\n", ""
+        ),
+        "release-success lost the CI gate dependency",
+    )
+    rejected(
+        replace_in_job(
+            ordered,
+            "release-success",
+            '          test "${{ needs[\'release-ci-success\'].result }}" = success\n',
+            "",
+        ),
+        "release-success stopped aggregating the CI gate",
+    )
+    rejected(
+        replace_in_job(
+            ordered,
+            "release-please",
+            "      needs['main-ci-success'].result == 'success'\n",
+            "      needs['main-ci-success'].result == 'success' &&\n"
+            "      needs['release-please'].outputs.release_created == 'true'\n",
+        ),
+        "release-please maintenance was limited to release-created runs",
+    )
+
     # The committed constant is deliberately not asserted here: it legitimately
     # moves if the quickstart is ever pinned back onto a newer amd64-only release,
     # and a tree where it disagrees with the pinned tag is already reported by
     # check_compose_platform as a readable failure rather than a traceback.
 
-    print("check-release-config: platform-default self-test passed")
+    print("check-release-config: decision and release-order self-tests passed")
     return 0
 
 
@@ -847,6 +1209,7 @@ def main(argv: list[str]) -> int:
     failures.extend(check_binary_gates(text))
     failures.extend(check_image_matrix(text))
     failures.extend(check_image_gates(text))
+    failures.extend(check_release_ordering(text))
     failures.extend(check_release_success(text))
     failures.extend(check_cosign_pin(text))
     failures.extend(

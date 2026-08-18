@@ -284,6 +284,7 @@ fn the_complete_recovery_record_is_required_by_ci() {
         "name: recovery-binary-stateful",
         "name: recovery-binary-restore",
         "run: cargo build -p axond --locked",
+        "AXOND_BIN: ${{ github.workspace }}/target/release/axond",
         "--slice recovery --tier serving",
         "name: qualification-record-recovery",
         "      - recovery-record",
@@ -294,6 +295,10 @@ fn the_complete_recovery_record_is_required_by_ci() {
             "the CI workflow no longer requires the complete recovery record component {required:?}"
         );
     }
+    assert!(
+        !workflow.contains("Bind stateful recovery artifacts to the release executable"),
+        "process provenance must be written by the process artifact producer, not stamped by CI"
+    );
 }
 
 /// The recovery manifest's process-level stages are owned by this black-box
@@ -304,14 +309,41 @@ fn the_complete_recovery_record_is_required_by_ci() {
 fn process_recovery_stages_are_owned_by_the_stateful_integration_lane() {
     let manifest = support::recovery::load();
     let expected = [
+        "control-plane-outage/journal-outage",
         "control-plane-outage/serving",
         "control-plane-outage/administration",
+        "cold-boot-valid-cache/cold-boot",
         "cold-boot-valid-cache/serving",
+        "cold-boot-no-cache/cold-boot",
+        "cold-boot-no-cache/readiness",
+        "cold-boot-invalid-cache/cold-boot",
+        "cold-boot-invalid-cache/readiness",
+        "recovery-convergence/journal-recovery",
         "recovery-convergence/serving",
         "recovery-convergence/administration",
         "secret-rotation/rotation",
         "secret-rotation/serving",
     ];
+    let expected_set: BTreeSet<String> = expected.iter().map(|key| (*key).to_owned()).collect();
+    let actual_set: BTreeSet<String> = manifest
+        .scenarios
+        .iter()
+        .flat_map(|scenario| {
+            scenario
+                .stages
+                .iter()
+                .filter(|stage| {
+                    stage.status == support::recovery::Status::Executable
+                        && stage.runner == Some(support::recovery::Runner::StatefulTests)
+                        && stage.driver == support::recovery::Driver::StatefulIntegration
+                })
+                .map(|stage| format!("{}/{}", scenario.id, stage.id))
+        })
+        .collect();
+    assert_eq!(
+        actual_set, expected_set,
+        "the black-box registry must own every and only stateful recovery stage"
+    );
     for key in expected {
         let (scenario_id, stage_id) = key.split_once('/').expect("a recovery stage key");
         let scenario = manifest
@@ -526,6 +558,82 @@ async fn wait_for_convergence(
         assert!(
             Instant::now() < deadline,
             "replica did not reach revision {revision} from {source}:\n{}",
+            replica.output()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait until a running replica reports the control-plane cut through its own
+/// cached convergence projection. Unlike `/state`, this endpoint deliberately
+/// does not read Postgres, so the observation is available during the outage it
+/// describes.
+async fn wait_for_convergence_rejection(
+    replica: &stateful::Replica,
+    http: &reqwest::Client,
+    active: &str,
+    reason: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = replica
+            .breakglass(
+                http.get(replica.admin_url("/convergence")),
+                "recovery: observe the process-local outage report",
+            )
+            .send()
+            .await
+            .expect("an outage convergence response");
+        if response.status() == 200 {
+            let body: serde_json::Value =
+                response.json().await.expect("an outage convergence body");
+            if body["active"] == active
+                && body["last_rejection"] == reason
+                && body["consecutive_failures"].as_u64().unwrap_or_default() > 0
+            {
+                return body;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica did not report {reason} while retaining revision {active}:\n{}",
+            replica.output()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait until a cold release process reports that it is reconciling but has no
+/// active snapshot. This distinguishes a fail-closed boot from a process that
+/// never started or from an empty snapshot presented as serving state.
+async fn wait_for_unready_convergence(
+    replica: &stateful::Replica,
+    http: &reqwest::Client,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = replica
+            .breakglass(
+                http.get(replica.admin_url("/convergence")),
+                "recovery: observe the fail-closed cold boot",
+            )
+            .send()
+            .await
+            .expect("an unready convergence response");
+        if response.status() == 200 {
+            let body: serde_json::Value =
+                response.json().await.expect("an unready convergence body");
+            if body["reconciling"] == true
+                && body["active"].is_null()
+                && body["last_rejection"].is_string()
+                && body["consecutive_failures"].as_u64().unwrap_or_default() > 0
+            {
+                return body;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cold process did not report a fail-closed convergence state:\n{}",
             replica.output()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1499,7 +1607,7 @@ async fn an_oidc_principal_is_authorized_against_the_active_directory() {
 /// unavailable from the encrypted compiled-serving cache.
 #[tokio::test]
 async fn stateful_revision_compiles_rotates_and_recovers() {
-    let Some(control_plane) = ControlPlane::create().await else {
+    let Some(mut control_plane) = ControlPlane::create().await else {
         eprintln!(
             "SKIPPED without AXOND_TEST_POSTGRES_DSN: the live stateful revision scenario is proven by CI's required Stateful tests lane"
         );
@@ -1935,6 +2043,12 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
     let outage_write_status = outage_write.status().as_u16();
     let outage_write_body = outage_write.text().await.expect("the outage mutation body");
     assert_eq!(outage_write_status, 503, "{outage_write_body}");
+    let outage_write_error: serde_json::Value =
+        serde_json::from_str(&outage_write_body).expect("the outage mutation uses a typed error");
+    assert_eq!(
+        outage_write_error["error"]["type"], "control_plane_unavailable",
+        "{outage_write_error}"
+    );
 
     let outage_chat = http
         .post(faulted.url("/v1/chat/completions"))
@@ -1948,10 +2062,128 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         .expect("the cached snapshot serves during the outage");
     let outage_chat_status = outage_chat.status().as_u16();
     assert_eq!(outage_chat_status, 200, "{}", faulted.output());
+    let outage_ready = http
+        .get(faulted.url("/readyz"))
+        .send()
+        .await
+        .expect("the outage readiness response");
+    let outage_ready_status = outage_ready.status().as_u16();
+    assert_eq!(outage_ready_status, 200, "{}", faulted.output());
+    let outage_convergence =
+        wait_for_convergence_rejection(&faulted, &http, &revision, "unavailable").await;
+    assert_eq!(
+        outage_convergence["source"], "control-plane",
+        "{outage_convergence}"
+    );
     let outage_chat_status_text = outage_chat_status.to_string();
     let outage_state_status_text = outage_state_status.to_string();
     let outage_write_status_text = outage_write_status.to_string();
     let anonymous_state_status_text = anonymous_state_status.to_string();
+
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "control-plane-outage",
+        "journal-outage",
+        "control_plane_outage",
+        &[
+            "outage_timeline",
+            "revisions",
+            "convergence_lag",
+            "revision_loss_boundary",
+        ],
+        &[
+            (
+                "revision-converged",
+                "the process served the published revision before the cut",
+            ),
+            (
+                "postgres-connections-severed",
+                "the TCP fault proxy dropped the process's live Postgres connections",
+            ),
+            (
+                "convergence-rejected",
+                "the process-local convergence endpoint reported the unavailable journal",
+            ),
+            (
+                "mutation-refused",
+                "the process refused an administrative mutation while the journal was unavailable",
+            ),
+        ],
+        &[
+            ("revision", serde_json::json!(revision.clone())),
+            (
+                "active_revision",
+                serde_json::json!(outage_convergence["active"].clone()),
+            ),
+            (
+                "loaded_revision",
+                serde_json::json!(outage_convergence["loaded"].clone()),
+            ),
+            (
+                "snapshot_source",
+                serde_json::json!(outage_convergence["source"].clone()),
+            ),
+            (
+                "convergence_rejection_reason",
+                serde_json::json!(outage_convergence["last_rejection"].clone()),
+            ),
+            (
+                "consecutive_convergence_failures",
+                serde_json::json!(outage_convergence["consecutive_failures"].clone()),
+            ),
+            (
+                "convergence_lag_ms",
+                serde_json::json!(outage_convergence["lag_ms"].clone()),
+            ),
+            (
+                "proxy_severed_connections",
+                serde_json::json!(postgres_proxy.severed()),
+            ),
+            ("admin_write_status", serde_json::json!(outage_write_status)),
+            (
+                "admin_write_error",
+                serde_json::json!(outage_write_error["error"]["type"].clone()),
+            ),
+        ],
+        &[
+            (
+                "max_data_loss_revisions",
+                "0",
+                "0",
+                "the active revision remained the exact pre-cut revision while the journal was unavailable",
+            ),
+            (
+                "admin_writes",
+                "unavailable",
+                "unavailable",
+                "the release process returned the typed control-plane-unavailable refusal",
+            ),
+        ],
+        &[
+            (
+                "active_revision_survives_the_cut",
+                &revision,
+                outage_convergence["active"].as_str().unwrap_or("missing"),
+                "the process retained its active serving revision across the TCP cut",
+            ),
+            (
+                "convergence_reports_unavailable",
+                "unavailable",
+                outage_convergence["last_rejection"]
+                    .as_str()
+                    .unwrap_or("missing"),
+                "the process reported the failed reconnect rather than going silent",
+            ),
+            (
+                "administrative_write_is_typed",
+                "control_plane_unavailable",
+                outage_write_error["error"]["type"]
+                    .as_str()
+                    .unwrap_or("missing"),
+                "the administrative mutation exposed the retryable dependency category",
+            ),
+        ],
+    );
 
     support::stateful::write_recovery_artifact(
         &control_plane,
@@ -1984,13 +2216,22 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
                 serde_json::json!(postgres_proxy.severed()),
             ),
             ("inference_status", serde_json::json!(outage_chat_status)),
+            ("ready_status", serde_json::json!(outage_ready_status)),
         ],
-        &[(
-            "max_serving_error_fraction",
-            "0.0",
-            "0.0",
-            "the cached snapshot answered the offered outage request",
-        )],
+        &[
+            (
+                "max_serving_error_fraction",
+                "0.0",
+                "0.0",
+                "the cached snapshot answered the offered outage request",
+            ),
+            (
+                "readiness",
+                "serves",
+                "serves",
+                "the outage replica remained ready while its complete active snapshot served",
+            ),
+        ],
         &[
             (
                 "inference_remains_available",
@@ -2040,7 +2281,12 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
             ("authenticated_state_body", serde_json::json!("redacted")),
             ("mutation_body", serde_json::json!("redacted")),
         ],
-        &[],
+        &[(
+            "max_unauthenticated_admin_successes",
+            "0",
+            "0",
+            "the anonymous administrative probe was rejected before outage state was disclosed",
+        )],
         &[
             (
                 "authenticated_administration_refused",
@@ -2063,18 +2309,42 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         ],
     );
 
-    let recovery_revision = publish_resource(
+    let unseen_revision = publish_resource(
         &replica,
         &http,
         "/aliases",
         "ig-219-recovery-alias",
         &revision,
+        outage_document.clone(),
+    )
+    .await;
+    let recovery_started = Instant::now();
+    postgres_proxy.set(Mode::Pass);
+    let unseen_convergence =
+        wait_for_convergence(&faulted, &http, &unseen_revision, "control-plane").await;
+    let recovery_revision = publish_resource(
+        &faulted,
+        &http,
+        "/aliases",
+        "ig-219-post-recovery-alias",
+        &unseen_revision,
         outage_document,
     )
     .await;
-    postgres_proxy.set(Mode::Pass);
+    let post_recovery_write_accepted = recovery_revision != unseen_revision;
+    assert!(
+        post_recovery_write_accepted,
+        "the post-recovery publication must advance the unseen revision"
+    );
     let recovered_convergence =
         wait_for_convergence(&faulted, &http, &recovery_revision, "control-plane").await;
+    let direct_recovered_convergence =
+        wait_for_convergence(&replica, &http, &recovery_revision, "control-plane").await;
+    let recovery_elapsed = recovery_started.elapsed();
+    assert!(
+        recovery_elapsed <= Duration::from_secs(60),
+        "the release process exceeded the recovery convergence bound: {recovery_elapsed:?}"
+    );
     let recovered_chat = http
         .post(faulted.url("/v1/chat/completions"))
         .bearer_auth(&workload_key)
@@ -2088,6 +2358,26 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
     let recovered_chat_status = recovered_chat.status().as_u16();
     assert_eq!(recovered_chat_status, 200, "{}", faulted.output());
     let recovered_chat_status_text = recovered_chat_status.to_string();
+    let recovered_ready = http
+        .get(faulted.url("/readyz"))
+        .send()
+        .await
+        .expect("the recovered readiness response");
+    let recovered_ready_status = recovered_ready.status().as_u16();
+    assert_eq!(recovered_ready_status, 200, "{}", faulted.output());
+
+    let anonymous_recovered_audit = http
+        .get(faulted.admin_url(&format!("/audit/{recovery_revision}")))
+        .send()
+        .await
+        .expect("the anonymous recovered audit response");
+    let anonymous_recovered_audit_status = anonymous_recovered_audit.status().as_u16();
+    assert_eq!(
+        anonymous_recovered_audit_status,
+        401,
+        "{}",
+        faulted.output()
+    );
 
     let recovered_audit = faulted
         .breakglass(
@@ -2108,6 +2398,169 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         "recovery audit attribution survives: {recovered_audit}"
     );
     let recovered_audit_status_text = recovered_audit_status.to_string();
+
+    let recovered_history = faulted
+        .breakglass(
+            http.get(faulted.admin_url("/history?limit=100")),
+            "#219: verify the recovered revision chain",
+        )
+        .send()
+        .await
+        .expect("the recovered history response");
+    assert_eq!(recovered_history.status(), 200, "{}", faulted.output());
+    let recovered_history: serde_json::Value = recovered_history
+        .json()
+        .await
+        .expect("the recovered history body");
+    let recovered_revisions = recovered_history["revisions"]
+        .as_array()
+        .expect("recovered history carries revisions");
+    let recovered_history_contains_required_revisions =
+        [&revision, &unseen_revision, &recovery_revision]
+            .into_iter()
+            .all(|expected| {
+                recovered_revisions
+                    .iter()
+                    .any(|entry| entry["revision"] == expected.as_str())
+            });
+    assert!(
+        recovered_history_contains_required_revisions,
+        "the recovered process history lost a revision that brackets the outage: {recovered_history}"
+    );
+    let recovery_elapsed_seconds = format!("{:.3}", recovery_elapsed.as_secs_f64());
+
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "recovery-convergence",
+        "journal-recovery",
+        "recovery_convergence",
+        &[
+            "outage_timeline",
+            "revisions",
+            "convergence_lag",
+            "revision_loss_boundary",
+        ],
+        &[
+            (
+                "journal-returned",
+                "the TCP fault proxy resumed forwarding on the process's unchanged DSN",
+            ),
+            (
+                "unseen-revision-loaded",
+                "the running process loaded the revision published while it was disconnected",
+            ),
+            (
+                "post-recovery-write-accepted",
+                "the recovered process accepted an administrative publication",
+            ),
+            (
+                "head-converged",
+                "the same process activated the post-recovery head without a restart",
+            ),
+        ],
+        &[
+            ("outage_revision", serde_json::json!(revision.clone())),
+            (
+                "unseen_revision",
+                serde_json::json!(unseen_revision.clone()),
+            ),
+            (
+                "loaded_unseen_revision",
+                serde_json::json!(unseen_convergence["active"].clone()),
+            ),
+            (
+                "recovered_head_revision",
+                serde_json::json!(recovery_revision.clone()),
+            ),
+            (
+                "active_revision",
+                serde_json::json!(recovered_convergence["active"].clone()),
+            ),
+            (
+                "snapshot_source",
+                serde_json::json!(recovered_convergence["source"].clone()),
+            ),
+            (
+                "converged",
+                serde_json::json!(recovered_convergence["converged"].clone()),
+            ),
+            (
+                "direct_replica_active_revision",
+                serde_json::json!(direct_recovered_convergence["active"].clone()),
+            ),
+            ("fleet_members", serde_json::json!(2)),
+            (
+                "residual_lag_ms",
+                serde_json::json!(recovered_convergence["lag_ms"].clone()),
+            ),
+            (
+                "recovery_seconds",
+                serde_json::json!(recovery_elapsed_seconds.clone()),
+            ),
+            (
+                "recovered_history_revisions",
+                serde_json::json!(recovered_revisions.len()),
+            ),
+            (
+                "recovered_history_contains_required_revisions",
+                serde_json::json!(recovered_history_contains_required_revisions),
+            ),
+            (
+                "post_recovery_write_accepted",
+                serde_json::json!(post_recovery_write_accepted),
+            ),
+        ],
+        &[
+            (
+                "max_convergence_lag_seconds",
+                "60",
+                &recovery_elapsed_seconds,
+                "the release process loaded the unseen revision, accepted a write, and converged to its head inside the bound",
+            ),
+            (
+                "admin_writes",
+                "accepted",
+                "accepted",
+                "the recovered release process accepted the post-recovery publication",
+            ),
+            (
+                "max_data_loss_revisions",
+                "0",
+                "0",
+                "process-level history retained the pre-outage, outage-window, and recovered-head revisions",
+            ),
+        ],
+        &[
+            (
+                "unseen_revision_loaded",
+                &unseen_revision,
+                unseen_convergence["active"].as_str().unwrap_or("missing"),
+                "the revision published across the cut was observed before the post-recovery write",
+            ),
+            (
+                "recovered_head_active",
+                &recovery_revision,
+                recovered_convergence["active"]
+                    .as_str()
+                    .unwrap_or("missing"),
+                "the same process activated the administrative write it accepted after recovery",
+            ),
+            (
+                "fleet_reaches_one_head",
+                &recovery_revision,
+                direct_recovered_convergence["active"]
+                    .as_str()
+                    .unwrap_or("missing"),
+                "the direct and recovered release processes agreed on the post-recovery head",
+            ),
+            (
+                "recovered_history_is_whole",
+                "three-required-revisions",
+                "three-required-revisions",
+                "the process administrative history exposed every revision that brackets the outage",
+            ),
+        ],
+    );
 
     support::stateful::write_recovery_artifact(
         &control_plane,
@@ -2140,13 +2593,22 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
                 serde_json::json!(recovered_convergence["converged"].clone()),
             ),
             ("chat_status", serde_json::json!(recovered_chat_status)),
+            ("ready_status", serde_json::json!(recovered_ready_status)),
         ],
-        &[(
-            "max_serving_error_fraction",
-            "0.0",
-            "0.0",
-            "the recovered snapshot answered the offered request",
-        )],
+        &[
+            (
+                "max_serving_error_fraction",
+                "0.0",
+                "0.0",
+                "the recovered snapshot answered the offered request",
+            ),
+            (
+                "readiness",
+                "serves",
+                "serves",
+                "the recovered process reported ready after activating the recovered head",
+            ),
+        ],
         &[
             (
                 "recovered_revision_loaded",
@@ -2185,8 +2647,17 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
                 "actor",
                 serde_json::json!(recovered_audit["events"][0]["actor"]["kind"].clone()),
             ),
+            (
+                "anonymous_admin_status",
+                serde_json::json!(anonymous_recovered_audit_status),
+            ),
         ],
-        &[],
+        &[(
+            "max_unauthenticated_admin_successes",
+            "0",
+            "0",
+            "the recovered audit route rejected its anonymous probe",
+        )],
         &[
             (
                 "recovered_audit_is_readable",
@@ -2439,6 +2910,28 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
     )
     .await;
 
+    let pre_rotation_revision = revision.clone();
+    let replica_endpoint_before_rotation = replica.admin_url("/convergence");
+    let pre_rotation_identity = replica
+        .breakglass(
+            http.get(&replica_endpoint_before_rotation),
+            "recovery: bind the pre-rotation process identity",
+        )
+        .send()
+        .await
+        .expect("the pre-rotation authenticated convergence response");
+    let pre_rotation_identity_status = pre_rotation_identity.status().as_u16();
+    assert_eq!(pre_rotation_identity_status, 200, "{}", replica.output());
+    let pre_rotation_identity: serde_json::Value = pre_rotation_identity
+        .json()
+        .await
+        .expect("the pre-rotation convergence body");
+    assert_eq!(
+        pre_rotation_identity["active"].as_str(),
+        Some(pre_rotation_revision.as_str()),
+        "the identity boundary must observe the revision served before rotation"
+    );
+    let rotation_started = Instant::now();
     let rotated = replica
         .breakglass(
             http.post(replica.admin_url("/secrets/rotate"))
@@ -2496,6 +2989,78 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
     .await;
     let convergence = wait_for_convergence(&replica, &http, &revision, "control-plane").await;
     assert_eq!(convergence["converged"], true, "{convergence}");
+    let rotation_elapsed = rotation_started.elapsed();
+    assert!(
+        rotation_elapsed <= Duration::from_secs(60),
+        "the secret rotation exceeded the convergence bound: {rotation_elapsed:?}"
+    );
+    let publication_accepted = revision != pre_rotation_revision;
+    assert!(
+        publication_accepted,
+        "the credential rotation publication must advance the revision"
+    );
+    let rotated_revision_published = convergence["active"].as_str() == Some(revision.as_str());
+    assert!(
+        rotated_revision_published,
+        "the running replica did not activate the rotated revision: {convergence}"
+    );
+    let rotation_history = replica
+        .breakglass(
+            http.get(replica.admin_url("/history?limit=100")),
+            "recovery: retain the secret-rotation revision boundary",
+        )
+        .send()
+        .await
+        .expect("the rotation history response");
+    assert_eq!(rotation_history.status(), 200, "{}", replica.output());
+    let rotation_history: serde_json::Value = rotation_history
+        .json()
+        .await
+        .expect("the rotation history body");
+    let rotation_history_contains_required_revisions =
+        [pre_rotation_revision.as_str(), revision.as_str()]
+            .into_iter()
+            .all(|expected| {
+                rotation_history["revisions"]
+                    .as_array()
+                    .is_some_and(|entries| {
+                        entries.iter().any(|entry| entry["revision"] == expected)
+                    })
+            });
+    assert!(
+        rotation_history_contains_required_revisions,
+        "the rotation history lost a revision boundary: {rotation_history}"
+    );
+    let replica_endpoint_after_rotation = replica.admin_url("/convergence");
+    let post_rotation_identity = replica
+        .breakglass(
+            http.get(&replica_endpoint_after_rotation),
+            "recovery: bind the post-rotation process identity",
+        )
+        .send()
+        .await
+        .expect("the post-rotation authenticated convergence response");
+    let post_rotation_identity_status = post_rotation_identity.status().as_u16();
+    assert_eq!(post_rotation_identity_status, 200, "{}", replica.output());
+    let post_rotation_identity: serde_json::Value = post_rotation_identity
+        .json()
+        .await
+        .expect("the post-rotation convergence body");
+    assert_eq!(
+        post_rotation_identity["active"].as_str(),
+        Some(revision.as_str()),
+        "the identity boundary must observe the revision served after rotation"
+    );
+    let same_replica_before_and_after_rotation = replica_endpoint_before_rotation
+        == replica_endpoint_after_rotation
+        && pre_rotation_identity_status == 200
+        && post_rotation_identity_status == 200
+        && pre_rotation_identity["active"].as_str() == Some(pre_rotation_revision.as_str())
+        && post_rotation_identity["active"].as_str() == Some(revision.as_str());
+    assert!(
+        same_replica_before_and_after_rotation,
+        "rotation must complete through the same live Replica-owned child boundary"
+    );
     let chat = http
         .post(replica.url("/v1/chat/completions"))
         .bearer_auth(&workload_key)
@@ -2506,15 +3071,31 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         .send()
         .await
         .expect("a rotated inference response");
-    assert_eq!(chat.status(), 200, "{}", replica.output());
+    let rotated_chat_status = chat.status().as_u16();
+    assert_eq!(rotated_chat_status, 200, "{}", replica.output());
     let rotated_request = upstream.state.last_request();
-    assert_eq!(
+    let rotated_material_authenticated_upstream =
         support::upstream::credential_digest(
-            rotated_request.authorization.as_deref().unwrap_or_default()
-        ),
-        support::upstream::credential_digest(&second_material),
+            rotated_request.authorization.as_deref().unwrap_or_default(),
+        ) == support::upstream::credential_digest(&second_material);
+    assert!(
+        rotated_material_authenticated_upstream,
         "the rotated revision resolved the new secret during compilation"
     );
+    let rotated_ready = http
+        .get(replica.url("/readyz"))
+        .send()
+        .await
+        .expect("the rotated readiness response");
+    let rotated_ready_status = rotated_ready.status().as_u16();
+    assert_eq!(rotated_ready_status, 200, "{}", replica.output());
+    let anonymous_rotation_audit = http
+        .get(replica.admin_url(&format!("/audit/{revision}")))
+        .send()
+        .await
+        .expect("the anonymous rotated audit response");
+    let anonymous_rotation_audit_status = anonymous_rotation_audit.status().as_u16();
+    assert_eq!(anonymous_rotation_audit_status, 401, "{}", replica.output());
     let rotation_audit = replica
         .breakglass(
             http.get(replica.admin_url(&format!("/audit/{revision}"))),
@@ -2523,7 +3104,8 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         .send()
         .await
         .expect("a rotated revision audit response");
-    assert_eq!(rotation_audit.status(), 200, "{}", replica.output());
+    let rotation_audit_status = rotation_audit.status().as_u16();
+    assert_eq!(rotation_audit_status, 200, "{}", replica.output());
     let rotation_audit: serde_json::Value = rotation_audit
         .json()
         .await
@@ -2532,12 +3114,17 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         rotation_audit["events"][0]["actor"]["kind"], "breakglass",
         "the rotated revision audit retains authenticated attribution: {rotation_audit}"
     );
+    let rotation_audit_actor = rotation_audit["events"][0]["actor"]["kind"]
+        .as_str()
+        .expect("the rotated revision audit actor is textual")
+        .to_owned();
+    let rotation_elapsed_seconds = format!("{:.3}", rotation_elapsed.as_secs_f64());
     support::stateful::write_recovery_artifact(
         &control_plane,
         "secret-rotation",
         "rotation",
         "secret_rotation",
-        &["revisions", "convergence_lag"],
+        &["revisions", "convergence_lag", "revision_loss_boundary"],
         &[
             (
                 "secret-activated",
@@ -2559,19 +3146,70 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
                 "converged",
                 serde_json::json!(convergence["converged"].clone()),
             ),
+            (
+                "rotation_seconds",
+                serde_json::json!(rotation_elapsed_seconds.clone()),
+            ),
+            (
+                "active_revision",
+                serde_json::json!(convergence["active"].clone()),
+            ),
+            (
+                "publication_accepted",
+                serde_json::json!(publication_accepted),
+            ),
+            (
+                "rotated_revision_published",
+                serde_json::json!(rotated_revision_published),
+            ),
+            (
+                "rotation_history_contains_required_revisions",
+                serde_json::json!(rotation_history_contains_required_revisions),
+            ),
+            (
+                "same_replica_before_and_after_rotation",
+                serde_json::json!(same_replica_before_and_after_rotation),
+            ),
         ],
-        &[],
+        &[
+            (
+                "max_convergence_lag_seconds",
+                "60",
+                &rotation_elapsed_seconds,
+                "the live replica activated the rotated credential revision inside the bound",
+            ),
+            (
+                "max_data_loss_revisions",
+                "0",
+                "0",
+                "the active revision exactly matched the accepted rotation publication",
+            ),
+            (
+                "admin_writes",
+                "accepted",
+                "accepted",
+                "the authenticated credential publication advanced the revision",
+            ),
+        ],
         &[
             (
                 "rotated_revision_published",
                 "true",
-                "true",
+                if rotated_revision_published {
+                    "true"
+                } else {
+                    "false"
+                },
                 "the successor credential reference was part of the published revision",
             ),
             (
                 "no_restart",
                 "true",
-                "true",
+                if same_replica_before_and_after_rotation {
+                    "true"
+                } else {
+                    "false"
+                },
                 "the same replica served before and after the rotation",
             ),
         ],
@@ -2593,30 +3231,58 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
             ),
         ],
         &[
-            ("chat_status", serde_json::json!(200)),
-            ("audit_status", serde_json::json!(200)),
+            ("chat_status", serde_json::json!(rotated_chat_status)),
+            ("audit_status", serde_json::json!(rotation_audit_status)),
             (
                 "credential",
                 serde_json::json!("rotated-provider-reference"),
             ),
+            ("ready_status", serde_json::json!(rotated_ready_status)),
+            (
+                "anonymous_admin_status",
+                serde_json::json!(anonymous_rotation_audit_status),
+            ),
+            (
+                "rotated_material_authenticated_upstream",
+                serde_json::json!(rotated_material_authenticated_upstream),
+            ),
+            ("audit_actor", serde_json::json!(rotation_audit_actor)),
         ],
-        &[(
-            "max_serving_error_fraction",
-            "0.0",
-            "0.0",
-            "the rotated request was answered successfully",
-        )],
+        &[
+            (
+                "max_serving_error_fraction",
+                "0.0",
+                "0.0",
+                "the rotated request was answered successfully",
+            ),
+            (
+                "readiness",
+                "serves",
+                "serves",
+                "the same live replica remained ready after activating the rotated revision",
+            ),
+            (
+                "max_unauthenticated_admin_successes",
+                "0",
+                "0",
+                "the rotated revision audit rejected its anonymous probe",
+            ),
+        ],
         &[
             (
                 "rotated_material_authenticated_upstream",
                 "true",
-                "true",
+                if rotated_material_authenticated_upstream {
+                    "true"
+                } else {
+                    "false"
+                },
                 "the fake upstream observed the successor credential digest",
             ),
             (
                 "authenticated_audit_attribution",
                 "breakglass",
-                "breakglass",
+                &rotation_audit_actor,
                 "the rotated publication audit event retained its authenticated actor",
             ),
         ],
@@ -2661,7 +3327,8 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         .send()
         .await
         .expect("outage readiness response");
-    assert_eq!(ready.status(), 200, "{}", outage.output());
+    let ready_status = ready.status().as_u16();
+    assert_eq!(ready_status, 200, "{}", outage.output());
     let outage_convergence =
         wait_for_convergence(&outage, &http, &revision, "last-known-good").await;
     assert_eq!(
@@ -2674,13 +3341,15 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         .send()
         .await
         .expect("outage model discovery response");
-    assert_eq!(outage_models.status(), 200, "{}", outage.output());
+    let outage_models_status = outage_models.status().as_u16();
+    assert_eq!(outage_models_status, 200, "{}", outage.output());
     let anonymous = http
         .get(outage.url("/v1/models"))
         .send()
         .await
         .expect("anonymous outage response");
-    assert_eq!(anonymous.status(), 401, "{}", outage.output());
+    let anonymous_models_status = anonymous.status().as_u16();
+    assert_eq!(anonymous_models_status, 401, "{}", outage.output());
     let outage_chat = http
         .post(outage.url("/v1/chat/completions"))
         .bearer_auth(&workload_key)
@@ -2691,7 +3360,8 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         .send()
         .await
         .expect("outage inference response");
-    assert_eq!(outage_chat.status(), 200, "{}", outage.output());
+    let outage_chat_status = outage_chat.status().as_u16();
+    assert_eq!(outage_chat_status, 200, "{}", outage.output());
     let catalogue = outage
         .breakglass(
             http.get(outage.admin_url(&format!("/catalogue?tenant={INTEGRATION_TENANT}"))),
@@ -2700,13 +3370,134 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
         .send()
         .await
         .expect("outage catalogue response");
-    assert_eq!(catalogue.status(), 503, "{}", outage.output());
+    let catalogue_status = catalogue.status().as_u16();
+    assert_eq!(catalogue_status, 503, "{}", outage.output());
+    let admin_mutation = outage
+        .breakglass(
+            http.post(outage.admin_url("/aliases"))
+                .header("idempotency-key", "ig-valid-cache-outage-write")
+                .header("x-axond-expected-revision", &revision)
+                .json(&serde_json::json!({
+                    "summary": "probe a cached cold-boot mutation",
+                    "mutation": "update",
+                    "resource": {
+                        "alias": INTEGRATION_ALIAS,
+                        "tenant": INTEGRATION_TENANT,
+                        "project": INTEGRATION_PROJECT,
+                        "slug": INTEGRATION_ALIAS_SLUG,
+                        "wire_family": "openai-chat",
+                        "state": "enabled",
+                        "targets": [{ "enablement": INTEGRATION_ENABLEMENT }],
+                    },
+                })),
+            "recovery: refuse a cached cold-boot mutation without the control plane",
+        )
+        .send()
+        .await
+        .expect("cached cold-boot mutation response");
+    let admin_mutation_status = admin_mutation.status().as_u16();
+    assert_eq!(admin_mutation_status, 503, "{}", outage.output());
+    let anonymous_admin = http
+        .get(outage.admin_url(&format!("/catalogue?tenant={INTEGRATION_TENANT}")))
+        .send()
+        .await
+        .expect("anonymous cached cold-boot administration response");
+    let anonymous_admin_status = anonymous_admin.status().as_u16();
+    assert_eq!(anonymous_admin_status, 401, "{}", outage.output());
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "cold-boot-valid-cache",
+        "cold-boot",
+        "cold_boot_valid_cache",
+        &[
+            "outage_timeline",
+            "cold_start",
+            "revisions",
+            "revision_loss_boundary",
+        ],
+        &[
+            (
+                "cache-exported",
+                "the warm release process exported the authenticated desired-state and compiled-serving records",
+            ),
+            (
+                "warm-process-stopped",
+                "the process that produced the cache exited before the recovery boot",
+            ),
+            (
+                "cold-process-started",
+                "a new release process started with Postgres unreachable on its first attempt",
+            ),
+            (
+                "cache-restored",
+                "the new process reported restoration from the compiled serving cache",
+            ),
+        ],
+        &[
+            (
+                "boot_note",
+                serde_json::json!(
+                    "a new release process started with Postgres unreachable and restored caches exported by the stopped warm process"
+                ),
+            ),
+            ("cold_start_outcome", serde_json::json!("restored")),
+            ("cached_revision", serde_json::json!(revision.clone())),
+            ("restored_revision", serde_json::json!(revision.clone())),
+            (
+                "active_revision",
+                serde_json::json!(outage_convergence["active"].clone()),
+            ),
+            (
+                "loaded_revision",
+                serde_json::json!(outage_convergence["loaded"].clone()),
+            ),
+            (
+                "snapshot_source",
+                serde_json::json!(outage_convergence["source"].clone()),
+            ),
+            ("ready_status", serde_json::json!(ready_status)),
+        ],
+        &[
+            (
+                "max_data_loss_revisions",
+                "0",
+                "0",
+                "the cold process activated the exact revision carried by the authenticated cache",
+            ),
+            (
+                "readiness",
+                "serves",
+                "serves",
+                "the cold release process became ready from the authenticated cache while Postgres was unreachable",
+            ),
+        ],
+        &[
+            (
+                "restored_revision_is_cached_revision",
+                &revision,
+                outage_convergence["active"].as_str().unwrap_or("missing"),
+                "the new process activated the exact revision the warm process exported",
+            ),
+            (
+                "snapshot_source_is_last_known_good",
+                "last-known-good",
+                outage_convergence["source"].as_str().unwrap_or("missing"),
+                "the process did not claim the unavailable control plane as its source",
+            ),
+            (
+                "cold_process_is_ready",
+                "200",
+                "200",
+                "readiness followed the restored compiled serving snapshot",
+            ),
+        ],
+    );
     support::stateful::write_recovery_artifact(
         &control_plane,
         "cold-boot-valid-cache",
         "serving",
         "cold_boot_valid_cache",
-        &["serving_behavior", "fail_open_closed"],
+        &["serving_behavior", "fail_open_closed", "audit_auth"],
         &[
             (
                 "cache-restored",
@@ -2727,11 +3518,25 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
             ),
         ],
         &[
-            ("ready_status", serde_json::json!(200)),
-            ("models_status", serde_json::json!(200)),
-            ("chat_status", serde_json::json!(200)),
-            ("anonymous_models_status", serde_json::json!(401)),
-            ("admin_catalogue_status", serde_json::json!(503)),
+            ("ready_status", serde_json::json!(ready_status)),
+            ("models_status", serde_json::json!(outage_models_status)),
+            ("chat_status", serde_json::json!(outage_chat_status)),
+            (
+                "anonymous_models_status",
+                serde_json::json!(anonymous_models_status),
+            ),
+            (
+                "admin_catalogue_status",
+                serde_json::json!(catalogue_status),
+            ),
+            (
+                "admin_mutation_status",
+                serde_json::json!(admin_mutation_status),
+            ),
+            (
+                "anonymous_admin_status",
+                serde_json::json!(anonymous_admin_status),
+            ),
             (
                 "source",
                 serde_json::json!(outage_convergence["source"].clone()),
@@ -2741,12 +3546,26 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
                 serde_json::json!(outage_convergence["converged"].clone()),
             ),
         ],
-        &[(
-            "max_serving_error_fraction",
-            "0.0",
-            "0.0",
-            "the cached inference request was answered successfully",
-        )],
+        &[
+            (
+                "max_serving_error_fraction",
+                "0.0",
+                "0.0",
+                "the cached inference request was answered successfully",
+            ),
+            (
+                "admin_writes",
+                "unavailable",
+                "unavailable",
+                "the authenticated mutation reached the unavailable control-plane boundary and was refused",
+            ),
+            (
+                "max_unauthenticated_admin_successes",
+                "0",
+                "0",
+                "the anonymous administrative probe was rejected while cached serving continued",
+            ),
+        ],
         &[
             (
                 "readiness_serves_cached_snapshot",
@@ -2770,6 +3589,195 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
     );
 
     drop(outage);
+
+    // Exercise every authentication failure the manifest names against caches
+    // produced by the warm release process above. Each variant starts a fresh
+    // release process with Postgres unreachable; a library-level cache parser
+    // result cannot satisfy this stage.
+    let original_cache_key = control_plane
+        .env
+        .get(stateful::CACHE_KEY_ENV)
+        .expect("the fixture carries its cache authentication key")
+        .clone();
+    let foreign_cache_key = {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        STANDARD.encode([29_u8; 32])
+    };
+    let mut refused_variants = 0_u64;
+    let mut edited_record_refused = false;
+    let mut truncated_file_refused = false;
+    let mut foreign_signing_key_refused = false;
+    let mut invalid_cache_ready_statuses = Vec::new();
+    for variant in ["edited-record", "truncated-file", "foreign-signing-key"] {
+        let mut candidate_signed = signed.clone();
+        let mut candidate_compiled = compiled.clone();
+        match variant {
+            "edited-record" => {
+                let signed_tail = candidate_signed
+                    .last_mut()
+                    .expect("the authentic signed cache is nonempty");
+                *signed_tail ^= 0x01;
+                let compiled_tail = candidate_compiled
+                    .last_mut()
+                    .expect("the authentic compiled cache is nonempty");
+                *compiled_tail ^= 0x01;
+            }
+            "truncated-file" => {
+                candidate_signed.truncate(candidate_signed.len() / 2);
+                candidate_compiled.truncate(candidate_compiled.len() / 2);
+            }
+            "foreign-signing-key" => {
+                control_plane
+                    .env
+                    .insert(stateful::CACHE_KEY_ENV, foreign_cache_key.clone());
+            }
+            _ => unreachable!("the invalid-cache variants are fixed"),
+        }
+        std::fs::write(&control_plane.cache_path, &candidate_signed)
+            .expect("write the invalid signed cache variant");
+        std::fs::write(
+            control_plane.cache_path.with_extension("serving"),
+            &candidate_compiled,
+        )
+        .expect("write the invalid compiled cache variant");
+
+        let invalid = control_plane.serve_without_control_plane_unready().await;
+        let invalid_ready = http
+            .get(invalid.url("/readyz"))
+            .send()
+            .await
+            .expect("invalid-cache readiness response");
+        let invalid_ready_status = invalid_ready.status().as_u16();
+        assert_eq!(invalid_ready_status, 503, "{}", invalid.output());
+        invalid_cache_ready_statuses.push(invalid_ready_status);
+        let invalid_convergence = wait_for_unready_convergence(&invalid, &http).await;
+        let variant_refused = invalid_ready_status == 503
+            && invalid_convergence["active"].is_null()
+            && invalid.output().to_ascii_lowercase().contains("cache");
+        assert!(variant_refused, "{variant} was not refused fail-closed");
+        match variant {
+            "edited-record" => edited_record_refused = variant_refused,
+            "truncated-file" => truncated_file_refused = variant_refused,
+            "foreign-signing-key" => foreign_signing_key_refused = variant_refused,
+            _ => unreachable!("the invalid-cache variants are fixed"),
+        }
+        refused_variants += 1;
+        drop(invalid);
+        control_plane
+            .env
+            .insert(stateful::CACHE_KEY_ENV, original_cache_key.clone());
+    }
+    std::fs::write(&control_plane.cache_path, &signed)
+        .expect("restore the authentic signed cache after refusal variants");
+    std::fs::write(
+        control_plane.cache_path.with_extension("serving"),
+        &compiled,
+    )
+    .expect("restore the authentic compiled cache after refusal variants");
+    assert_eq!(refused_variants, 3);
+    assert!(
+        invalid_cache_ready_statuses.len() == 3
+            && invalid_cache_ready_statuses
+                .iter()
+                .all(|status| *status == 503),
+        "every invalid-cache process must retain a 503 readiness refusal"
+    );
+    let invalid_cache_ready_status = invalid_cache_ready_statuses[0];
+
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "cold-boot-invalid-cache",
+        "cold-boot",
+        "cold_boot_invalid_cache",
+        &["outage_timeline", "cold_start"],
+        &[
+            (
+                "authentic-cache-exported",
+                "the warm release process exported both authenticated cache records",
+            ),
+            (
+                "edited-record-refused",
+                "a new release process refused bit-edited signed and compiled cache records",
+            ),
+            (
+                "truncated-file-refused",
+                "a new release process refused truncated signed and compiled cache records",
+            ),
+            (
+                "foreign-signing-key-refused",
+                "a new release process refused authentic records under a foreign cache key",
+            ),
+        ],
+        &[
+            (
+                "boot_note",
+                serde_json::json!(
+                    "three new release processes started with Postgres unreachable against edited, truncated, or foreign-key cache records"
+                ),
+            ),
+            ("cold_start_outcome", serde_json::json!("refused")),
+            (
+                "ready_status",
+                serde_json::json!(invalid_cache_ready_status),
+            ),
+            ("unauthentic_cache_variants_offered", serde_json::json!(3)),
+            (
+                "unauthentic_cache_variants_refused",
+                serde_json::json!(refused_variants),
+            ),
+            (
+                "edited_record_refused",
+                serde_json::json!(edited_record_refused),
+            ),
+            (
+                "truncated_file_refused",
+                serde_json::json!(truncated_file_refused),
+            ),
+            (
+                "foreign_signing_key_refused",
+                serde_json::json!(foreign_signing_key_refused),
+            ),
+            ("active_revisions_published", serde_json::json!(0)),
+        ],
+        &[(
+            "readiness",
+            "refuses",
+            "refuses",
+            "all three cold release processes remained unready and published no active revision",
+        )],
+        &[
+            (
+                "edited_record_refused",
+                "refused",
+                if edited_record_refused {
+                    "refused"
+                } else {
+                    "accepted"
+                },
+                "editing authentic cache bytes could not create serving state",
+            ),
+            (
+                "truncated_file_refused",
+                "refused",
+                if truncated_file_refused {
+                    "refused"
+                } else {
+                    "accepted"
+                },
+                "truncating authentic cache bytes could not create serving state",
+            ),
+            (
+                "foreign_signing_key_refused",
+                "refused",
+                if foreign_signing_key_refused {
+                    "refused"
+                } else {
+                    "accepted"
+                },
+                "authentic bytes under a foreign key could not create serving state",
+            ),
+        ],
+    );
 
     let recovered = control_plane.serve().await;
     let recovered_convergence =
@@ -2821,10 +3829,122 @@ async fn cold_boot_cache_refusals_are_ready_only_when_authenticated_and_projecte
         .send()
         .await
         .expect("no-cache inference response");
-    assert_eq!(no_cache_ready.status(), 503, "{}", no_cache.output());
-    assert_eq!(no_cache_admin.status(), 503, "{}", no_cache.output());
-    assert_eq!(no_cache_anon_admin.status(), 401, "{}", no_cache.output());
-    assert_eq!(no_cache_models.status(), 401, "{}", no_cache.output());
+    let refusal_mutation = serde_json::json!({
+        "summary": "probe a fail-closed cold-boot mutation",
+        "mutation": "create",
+        "resource": {
+            "tenant": "ten_019ff9e0-0000-7000-8000-000000000099",
+            "slug": "recovery-refusal-probe",
+            "display_name": "Recovery refusal probe",
+        },
+    });
+    let no_cache_mutation = no_cache
+        .breakglass(
+            http.post(no_cache.admin_url("/tenants"))
+                .header("idempotency-key", "recovery-no-cache-write")
+                .header("x-axond-expected-revision", "empty")
+                .json(&refusal_mutation),
+            "recovery: refuse a no-cache administrative mutation",
+        )
+        .send()
+        .await
+        .expect("no-cache mutation response");
+    let no_cache_ready_status = no_cache_ready.status().as_u16();
+    let no_cache_admin_status = no_cache_admin.status().as_u16();
+    let no_cache_anon_admin_status = no_cache_anon_admin.status().as_u16();
+    let no_cache_models_status = no_cache_models.status().as_u16();
+    let no_cache_mutation_status = no_cache_mutation.status().as_u16();
+    assert_eq!(no_cache_ready_status, 503, "{}", no_cache.output());
+    assert_eq!(no_cache_admin_status, 503, "{}", no_cache.output());
+    assert_eq!(no_cache_anon_admin_status, 401, "{}", no_cache.output());
+    assert_eq!(no_cache_models_status, 401, "{}", no_cache.output());
+    assert_eq!(no_cache_mutation_status, 503, "{}", no_cache.output());
+    let no_cache_convergence = wait_for_unready_convergence(&no_cache, &http).await;
+    support::stateful::write_recovery_artifact(
+        &control_plane,
+        "cold-boot-no-cache",
+        "cold-boot",
+        "cold_boot_no_cache",
+        &["outage_timeline", "cold_start"],
+        &[
+            (
+                "cold-process-started",
+                "the release process opened its diagnostic surface with Postgres unreachable",
+            ),
+            (
+                "cache-absent",
+                "the fixture removed both cache records before the process started",
+            ),
+            (
+                "bootstrap-refused",
+                "the process retained no active revision and kept readiness closed",
+            ),
+        ],
+        &[
+            (
+                "boot_note",
+                serde_json::json!(
+                    "a new release process started with Postgres unreachable and no signed or compiled serving cache"
+                ),
+            ),
+            ("cold_start_outcome", serde_json::json!("refused")),
+            (
+                "refusal",
+                serde_json::json!(no_cache_convergence["last_rejection"].clone()),
+            ),
+            (
+                "snapshot_generation_after_cold_boot",
+                serde_json::json!(no_cache_convergence["generation"].clone()),
+            ),
+            ("ready_status", serde_json::json!(no_cache_ready_status)),
+            (
+                "anonymous_models_status",
+                serde_json::json!(no_cache_models_status),
+            ),
+            (
+                "active_revision",
+                serde_json::json!(no_cache_convergence["active"].clone()),
+            ),
+            (
+                "loaded_revision",
+                serde_json::json!(no_cache_convergence["loaded"].clone()),
+            ),
+            (
+                "convergence_rejection_reason",
+                serde_json::json!(no_cache_convergence["last_rejection"].clone()),
+            ),
+            (
+                "consecutive_convergence_failures",
+                serde_json::json!(no_cache_convergence["consecutive_failures"].clone()),
+            ),
+        ],
+        &[(
+            "readiness",
+            "refuses",
+            "refuses",
+            "the cacheless release process opened diagnostics but never published a serving snapshot",
+        )],
+        &[
+            (
+                "no_active_revision",
+                "none",
+                "none",
+                "the process convergence projection retained no active revision",
+            ),
+            (
+                "readiness_refuses_without_cache",
+                "503",
+                "503",
+                "the process did not present an empty configuration as ready",
+            ),
+            (
+                "authentication_remains_first",
+                "401",
+                "401",
+                "anonymous inference was refused before convergence state was disclosed",
+            ),
+        ],
+    );
     support::stateful::write_recovery_artifact(
         &control_plane,
         "cold-boot-no-cache",
@@ -2842,12 +3962,38 @@ async fn cold_boot_cache_refusals_are_ready_only_when_authenticated_and_projecte
             ),
         ],
         &[
-            ("ready_status", serde_json::json!(503)),
-            ("admin_state_status", serde_json::json!(503)),
-            ("anonymous_admin_status", serde_json::json!(401)),
-            ("anonymous_models_status", serde_json::json!(401)),
+            ("ready_status", serde_json::json!(no_cache_ready_status)),
+            (
+                "admin_state_status",
+                serde_json::json!(no_cache_admin_status),
+            ),
+            (
+                "anonymous_admin_status",
+                serde_json::json!(no_cache_anon_admin_status),
+            ),
+            (
+                "admin_mutation_status",
+                serde_json::json!(no_cache_mutation_status),
+            ),
+            (
+                "anonymous_models_status",
+                serde_json::json!(no_cache_models_status),
+            ),
         ],
-        &[],
+        &[
+            (
+                "admin_writes",
+                "unavailable",
+                "unavailable",
+                "the authenticated administrative probe reached the unavailable control-plane boundary",
+            ),
+            (
+                "max_unauthenticated_admin_successes",
+                "0",
+                "0",
+                "the anonymous administrative probe was rejected before state disclosure",
+            ),
+        ],
         &[
             (
                 "readiness_refuses_without_cache",
@@ -2902,15 +4048,27 @@ async fn cold_boot_cache_refusals_are_ready_only_when_authenticated_and_projecte
         .send()
         .await
         .expect("invalid-cache inference response");
-    assert_eq!(invalid_ready.status(), 503, "{}", invalid_cache.output());
-    assert_eq!(invalid_admin.status(), 503, "{}", invalid_cache.output());
-    assert_eq!(
-        invalid_anon_admin.status(),
-        401,
-        "{}",
-        invalid_cache.output()
-    );
-    assert_eq!(invalid_models.status(), 401, "{}", invalid_cache.output());
+    let invalid_mutation = invalid_cache
+        .breakglass(
+            http.post(invalid_cache.admin_url("/tenants"))
+                .header("idempotency-key", "recovery-invalid-cache-write")
+                .header("x-axond-expected-revision", "empty")
+                .json(&refusal_mutation),
+            "recovery: refuse an invalid-cache administrative mutation",
+        )
+        .send()
+        .await
+        .expect("invalid-cache mutation response");
+    let invalid_ready_status = invalid_ready.status().as_u16();
+    let invalid_admin_status = invalid_admin.status().as_u16();
+    let invalid_anon_admin_status = invalid_anon_admin.status().as_u16();
+    let invalid_models_status = invalid_models.status().as_u16();
+    let invalid_mutation_status = invalid_mutation.status().as_u16();
+    assert_eq!(invalid_ready_status, 503, "{}", invalid_cache.output());
+    assert_eq!(invalid_admin_status, 503, "{}", invalid_cache.output());
+    assert_eq!(invalid_anon_admin_status, 401, "{}", invalid_cache.output());
+    assert_eq!(invalid_models_status, 401, "{}", invalid_cache.output());
+    assert_eq!(invalid_mutation_status, 503, "{}", invalid_cache.output());
     support::stateful::write_recovery_artifact(
         &control_plane,
         "cold-boot-invalid-cache",
@@ -2928,12 +4086,38 @@ async fn cold_boot_cache_refusals_are_ready_only_when_authenticated_and_projecte
             ),
         ],
         &[
-            ("ready_status", serde_json::json!(503)),
-            ("admin_state_status", serde_json::json!(503)),
-            ("anonymous_admin_status", serde_json::json!(401)),
-            ("anonymous_models_status", serde_json::json!(401)),
+            ("ready_status", serde_json::json!(invalid_ready_status)),
+            (
+                "admin_state_status",
+                serde_json::json!(invalid_admin_status),
+            ),
+            (
+                "anonymous_admin_status",
+                serde_json::json!(invalid_anon_admin_status),
+            ),
+            (
+                "admin_mutation_status",
+                serde_json::json!(invalid_mutation_status),
+            ),
+            (
+                "anonymous_models_status",
+                serde_json::json!(invalid_models_status),
+            ),
         ],
-        &[],
+        &[
+            (
+                "admin_writes",
+                "unavailable",
+                "unavailable",
+                "the authenticated administrative probe reached the unavailable control-plane boundary",
+            ),
+            (
+                "max_unauthenticated_admin_successes",
+                "0",
+                "0",
+                "the anonymous administrative probe was rejected after cache authentication failed",
+            ),
+        ],
         &[
             (
                 "readiness_refuses_with_invalid_cache",

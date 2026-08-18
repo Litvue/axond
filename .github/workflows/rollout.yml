@@ -1,9 +1,8 @@
 name: Rollout
 
-# The heavy rollout scenarios: the same driver, manifest, and assertions the
-# `CI` workflow runs at the reduced scale, offered at a scale that wants a runner
-# to itself (ADR 0041). The result artifacts are uploaded so a drain bound or a
-# rollback decision can be read from evidence rather than from memory.
+# The heavy rollout scenarios run the verified retained release and the checked
+# out candidate as distinct executables. The reduced CI lane remains a
+# same-binary diagnostic; only this lane can emit promotable rollout evidence.
 #
 # Unlike the CI lane, this one attaches a control plane, so the forward-only
 # rollback fence is evaluated rather than recorded as skipped.
@@ -20,6 +19,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  GH_TOKEN: ${{ github.token }}
+  # The production qualification candidate is v0.4.0. Its direct retained
+  # predecessor is v0.3.40, the first published release that can project and
+  # serve durable workload principals. Keep both pins explicit: the lane must
+  # fail instead of silently substituting a different release lineage.
+  EXPECTED_CANDIDATE_VERSION: 0.4.0
+  RETAINED_RELEASE_VERSION: 0.3.40
+  RETAINED_RELEASE_ARCHIVE_SHA256: 2080e5cdf52b74913c5cecc443d8c05e6348f2b3138c67fd28d5fc909e40bddb
 
 jobs:
   rollout:
@@ -46,17 +53,67 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-targets: false
+      - name: Fetch and verify the retained release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate_version="$(cargo metadata --locked --no-deps --format-version 1 | \
+            jq -r '.packages[] | select(.name == "axond") | .version')"
+          test "$candidate_version" = "$EXPECTED_CANDIDATE_VERSION"
+          published_versions="$(gh api "repos/${GITHUB_REPOSITORY}/releases" \
+            --paginate \
+            --jq '.[] | select(.published_at != null and .draft == false and .prerelease == false) | .tag_name' | \
+            sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p')"
+          direct_previous="$(
+            { printf '%s\n' "$published_versions"; printf '%s\n' "$candidate_version"; } | \
+              sort -Vu | \
+              awk -v candidate="$candidate_version" \
+                '$0 == candidate { print previous; exit } { previous = $0 }'
+          )"
+          test "$direct_previous" = "$RETAINED_RELEASE_VERSION"
+          target_dir="$PWD/target/rollout-binaries/previous"
+          mkdir -p "$target_dir"
+          asset="axond-${RETAINED_RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          base="https://github.com/Litvue/axond/releases/download/v${RETAINED_RELEASE_VERSION}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$target_dir/$asset" "$base/$asset"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$target_dir/$asset.sha256" "$base/$asset.sha256"
+          test "$(awk '{print $1}' "$target_dir/$asset.sha256")" = \
+            "$RETAINED_RELEASE_ARCHIVE_SHA256"
+          echo "$RETAINED_RELEASE_ARCHIVE_SHA256  $target_dir/$asset" | \
+            sha256sum --check --strict
+          tar -C "$target_dir" -xzf "$target_dir/$asset" axond
+          chmod 0755 "$target_dir/axond"
+          test "$($target_dir/axond --version)" = "axond ${RETAINED_RELEASE_VERSION}"
+          previous_binary_sha256="$(sha256sum "$target_dir/axond" | awk '{print $1}')"
+          echo "AXOND_ROLLOUT_PREVIOUS_BINARY=$target_dir/axond" >> "$GITHUB_ENV"
+          echo "AXOND_ROLLOUT_EXPECTED_PREVIOUS_VERSION=$RETAINED_RELEASE_VERSION" >> "$GITHUB_ENV"
+          echo "AXOND_ROLLOUT_EXPECTED_PREVIOUS_SHA256=$previous_binary_sha256" >> "$GITHUB_ENV"
+          echo "AXOND_ROLLOUT_RETAINED_ARCHIVE_SHA256=$RETAINED_RELEASE_ARCHIVE_SHA256" >> "$GITHUB_ENV"
+          echo "AXOND_ROLLOUT_RETAINED_ARCHIVE=$target_dir/$asset" >> "$GITHUB_ENV"
+          echo "AXOND_ROLLOUT_RETAINED_CHECKSUM=$target_dir/$asset.sha256" >> "$GITHUB_ENV"
       # `--test-threads=1`: the reduced tier lives in the same binary, and two
       # fleets draining at once would measure each other's contention rather
       # than the rollout.
       - name: Run the committed rollout scenarios
         run: |
-          cargo test --locked --all-features --test rollout -- \
+          cargo test --release --locked --all-features --test rollout -- \
             --nocapture --test-threads=1
         env:
           AXOND_ROLLOUT: '1'
           AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
           AXOND_TEST_REQUIRE_SERVICES: '1'
+      - name: Retain the exact candidate executable and verified predecessor archive
+        if: success()
+        run: |
+          retained=target/rollout/heavy/retained
+          candidate=target/release/axond
+          test -x "$candidate"
+          mkdir -p "$retained/candidate"
+          cp "$candidate" "$retained/candidate/axond"
+          cp "$AXOND_ROLLOUT_RETAINED_ARCHIVE" "$retained/"
+          cp "$AXOND_ROLLOUT_RETAINED_CHECKSUM" "$retained/"
       - name: Build the heavy rollout qualification record
         if: success()
         run: |
@@ -78,14 +135,14 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rollout-results
-          path: target/rollout/**/*.json
+          path: target/rollout/heavy
           if-no-files-found: error
           retention-days: 90
       - name: Publish the heavy rollout qualification record
-        if: always()
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qualification-record-rollout
-          path: target/qualification-records/rollout-heavy.toml
-          if-no-files-found: warn
+          path: target/qualification-records/validated-rollout-heavy.toml
+          if-no-files-found: error
           retention-days: 90

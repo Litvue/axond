@@ -45,12 +45,10 @@ rule as the all-namespaces credential view: a scope-less static
 reason codes, exact observation ages, and the revision summary, while every other
 caller sees only the components its own requests depend on, with reasons coarsened
 to `unavailable`, ages floored to whole seconds, and no revision summary. The
-summary is `null` on every replica this release ships: nothing constructs a
-convergence reconciler yet
-([#142](https://github.com/Litvue/axond/issues/142)), so an operator's view
-carries the field and
-no data until that slice hands the status page the same handle the
-administrative surface reads. Which
+summary is `null` only when the replica has no convergence reconciler. Stateful
+mode constructs one and reports desired, loaded, and active revisions plus its
+source and lag; stateless mode has no control-plane revision lifecycle and keeps
+the field `null`. Which
 components are enabled is a deployment property, so a replica with no durable
 dependency answers `200` with every component `disabled` rather than `404`. A
 replica observes the dependencies it opened — the control plane on the connection
@@ -401,14 +399,14 @@ version 2 transition.
   schedule.
 - **The stateful control plane.** `mode = "stateful"` bootstrap configuration
   parses and validates ([ADR 0027]), and a stateful process boots and serves
-  authenticated `/admin/v1`. The current production projection has no inbound
-  caller-principal source, so the process is not Ready and serves no inference:
-  anonymous inference is `401 unauthorized`, while an authenticated request
-  reaches `503 inference_unavailable` from the convergence gate. This lane is
-  fail-closed convergence wiring, not an outage-serving release; the principal
-  projection and durable cache-storage slices must land before that claim can
-  change. Neither `/admin/v1` nor the stateful bootstrap surface is under the
-  `0.x` config or HTTP promise until convergence exists; a stateless deployment
+  authenticated `/admin/v1`. A complete durable revision now projects inbound
+  workload principals and can publish a serving snapshot; before one is active,
+  anonymous inference is `401 unauthorized` and an authenticated bootstrap
+  caller reaches `503 inference_unavailable`. The persistent StatefulSet/PVC
+  option can retain signed recovery caches, but neither that path nor stateful
+  fleet serving is a production-readiness promise until the current rollout and
+  endurance qualifications are retained. Neither `/admin/v1` nor the stateful
+  bootstrap surface is under the `0.x` config or HTTP promise; a stateless deployment
   answers every `/admin/v1` resource path with `501 stateful_mode_required`, with
   `GET /admin/v1/status` the one exception — it is a replica diagnostic rather
   than a control-plane resource, so it answers in either mode. See

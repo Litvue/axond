@@ -172,6 +172,37 @@ max_rss_growth_kib = 262144
 max_unserved_after_load = 0
 
 [[profile]]
+id = "queueing"
+workload = "queueing"
+description = """
+More callers than the replica can serve or queue, against a slow successful \
+upstream. The bounded queue must fill exactly, admit queued work as request \
+capacity returns, refuse only overflow, export its exact depth histogram, and \
+return every permit after the storm."""
+max_in_flight = 8
+queue_capacity = 16
+queue_wait_ms = 5000
+
+[profile.reduced]
+concurrency = 64
+requests = 640
+
+[profile.heavy]
+concurrency = 512
+requests = 20000
+
+[profile.thresholds]
+min_accepted = 24
+min_rejected_fraction = 0.5
+max_errors = 0
+max_missing_usage_records = 0
+max_leaked_upstream_streams = 0
+max_rss_growth_kib = 262144
+max_unserved_after_load = 0
+min_queue_depth = 16
+max_queue_depth = 16
+
+[[profile]]
 id = "backend-limits"
 workload = "backend_limits"
 description = """

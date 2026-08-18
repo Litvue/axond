@@ -79,7 +79,8 @@ bounded scrollback, then charges missing rows against them:
 `max_durable_usage_loss_outside_windows = 0`, and loss inside the window is
 allowed only as far as the processes reported dropping
 (`durable_usage_loss_in_window`). Which half a lost row falls in is decided by
-when it settled, on a window both sides can be counted over; how much of the
+whether its exact request identity belongs to the whole-run and outside-window
+set differences; how much of the
 in-window half is forgiven is decided by the reported drop counts. One reported
 drop is an account of the records it named, not of every row the run is
 missing.
@@ -107,6 +108,13 @@ qualification whose stateful half quietly did not happen is worse than no run.
 the effective duration, the manifest duration, and which was used — the same
 rule and the same reason as ADR 0040, under its own variable
 (`AXOND_STATEFUL_ENDURANCE_DURATION_MS`).
+
+**Exactness must survive artifact retention.** The caller trace ledger and both
+emitted-to-PostgreSQL request-ID ledgers spill full 128-bit identities into
+fixed-width shards. A compact record carries a canonical SHA-256, file count,
+and byte count for every shard directory. Promotion re-hashes the retained
+files and refuses missing, extra, renamed, or changed shards; an `exact = true`
+path label by itself is not evidence.
 
 ### State tier
 

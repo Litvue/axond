@@ -13,7 +13,6 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -25,12 +24,12 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use super::ledger::{Ledger, Tally};
+use super::ledger::{CorrelationLedger, CorrelationTally, Ledger, Tally};
 use super::manifest::{Ending, Profile, RESULT_SCHEMA_VERSION, Scale, Tier};
 use super::plan::{self, KEY_DIR_PLACEHOLDER, Planned, Tenant};
 use super::result::{
-    Distribution, EnduranceResult, Fingerprints, Occupancy, ProfileEcho, Reconciliation, Resources,
-    RunMeta, Segment, Span, Throughput, Trend, Upstream, Workload,
+    CorrelationEvidence, Distribution, EnduranceResult, IdentityEvidence, Occupancy, ProfileEcho,
+    Reconciliation, Resources, RunMeta, Segment, Span, Throughput, Trend, Upstream, Workload,
 };
 use super::sampler::{Finished, Sample, Sampler, USER_HZ};
 use crate::support::capacity::result::{Environment, Percentiles, Verdict};
@@ -89,12 +88,6 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(75);
 /// Kept beside the harness ceiling so a regression cannot silently make the
 /// client's watchdog shorter than the server contract it is meant to observe.
 const GATEWAY_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How long the record sink must stay silent after the expected count is
-/// reached before the wait accepts that everything has arrived. The count alone
-/// cannot say so, because it counts duplicates the shards have not been read to
-/// find yet.
-const SETTLE_QUIET: Duration = Duration::from_millis(500);
 
 /// How long an upstream body may stay open once every client is gone.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -260,7 +253,10 @@ pub async fn run_with(
     let samples_path =
         EnduranceResult::directory(tier).join(format!("{}.samples.jsonl", dispatch.stem));
     let ledger = Ledger::create(
-        &EnduranceResult::directory(tier).join(format!("{}-fingerprints", dispatch.stem)),
+        &EnduranceResult::directory(tier).join(format!("{}-request-identities", dispatch.stem)),
+    );
+    let correlations = CorrelationLedger::create(
+        &EnduranceResult::directory(tier).join(format!("{}-correlations", dispatch.stem)),
     );
     let sampler = Sampler::start(
         gateway.pid(),
@@ -287,6 +283,7 @@ pub async fn run_with(
             gateway.base_url.clone(),
             tenants.clone(),
             rotation.clone(),
+            profile.seed,
             next.clone(),
             gauges.clone(),
             tx.clone(),
@@ -298,7 +295,7 @@ pub async fn run_with(
     // The driver's own handle would keep the channel open past the last worker.
     drop(tx);
 
-    let mut aggregate = Aggregate::new(scale.segment_ms, ledger);
+    let mut aggregate = Aggregate::new(scale.segment_ms, ledger, correlations);
     // Close each segment on its boundary while the load continues, so a run
     // that is killed at hour eleven has already summarised eleven hours.
     let segment = Duration::from_millis(scale.segment_ms);
@@ -339,8 +336,7 @@ pub async fn run_with(
 
     // Everything after the load: records still settling, upstream bodies still
     // closing, and the memory the process gives back once it is idle.
-    let expected_records = aggregate.settling;
-    await_usage_records(&gateway, &mut aggregate, expected_records).await;
+    await_usage_records(&gateway, &mut aggregate).await;
     let leaked = await_closed_upstreams(&upstream).await;
     tokio::time::sleep(QUIESCE).await;
     let finished = sampler.finish();
@@ -427,6 +423,7 @@ async fn worker(
     base_url: String,
     tenants: Vec<Tenant>,
     rotation: Arc<Vec<Ending>>,
+    seed: u64,
     next: Arc<AtomicUsize>,
     gauges: Arc<Gauges>,
     tx: UnboundedSender<Attempt>,
@@ -436,7 +433,7 @@ async fn worker(
 ) {
     while Instant::now() < deadline {
         let index = next.fetch_add(1, Ordering::Relaxed);
-        let planned = plan::planned(index, &tenants, &rotation);
+        let planned = plan::planned(index, seed, &tenants, &rotation);
         let timed_out = planned.clone();
         let attempt = bounded_attempt(
             timed_out,
@@ -500,6 +497,7 @@ async fn attempt(
     let sent = client
         .post(format!("{base_url}{}", plan.shape.route))
         .bearer_auth(&plan.tenant.key)
+        .header("traceparent", plan.correlation.traceparent())
         .json(&body(&plan))
         .send()
         .await;
@@ -723,13 +721,15 @@ struct Aggregate {
     ttft: Reservoir,
     lifetime: Reservoir,
     planned_status_counts: BTreeMap<String, u64>,
-    /// Request-id fingerprints, spilled to disk rather than held: identity over
-    /// a twelve-hour run is millions of ids, and a set of them is the growth
-    /// this harness exists to detect.
+    /// Full request identities, spilled to disk rather than held in memory.
     ledger: Ledger,
+    /// Planned trace identities paired with the trace and status on every
+    /// observed usage record.
+    correlations: CorrelationLedger,
     records_observed: u64,
     unidentified: u64,
-    unexpected_statuses: u64,
+    uncorrelated: u64,
+    invalid_statuses: u64,
     by_status: BTreeMap<String, u64>,
     by_namespace: BTreeMap<String, u64>,
     by_credential_source: BTreeMap<String, u64>,
@@ -766,7 +766,7 @@ struct OpenSegment {
 }
 
 impl Aggregate {
-    fn new(segment_ms: u64, ledger: Ledger) -> Self {
+    fn new(segment_ms: u64, ledger: Ledger, correlations: CorrelationLedger) -> Self {
         Self {
             segment_ms,
             segments: Vec::new(),
@@ -791,9 +791,11 @@ impl Aggregate {
             lifetime: Reservoir::new(),
             planned_status_counts: BTreeMap::new(),
             ledger,
+            correlations,
             records_observed: 0,
             unidentified: 0,
-            unexpected_statuses: 0,
+            uncorrelated: 0,
+            invalid_statuses: 0,
             by_status: BTreeMap::new(),
             by_namespace: BTreeMap::new(),
             by_credential_source: BTreeMap::new(),
@@ -890,6 +892,9 @@ impl Aggregate {
             .or_default() += 1;
         if attempt.outcome.settles() {
             self.settling += 1;
+            self.correlations
+                .record_expected(attempt.plan.correlation.bytes(), ending)
+                .expect("a planned endurance trace identity is valid");
             *self
                 .planned_status_counts
                 .entry(ending.usage_status().to_owned())
@@ -920,24 +925,37 @@ impl Aggregate {
         self.open.samples.extend_from_slice(samples);
     }
 
-    /// Reconcile one usage record. Identity is `request_id`, which is globally
-    /// unique, so a repeat is a duplicate rather than a coincidence; the ids
-    /// themselves are fingerprinted and spilled to the ledger, because a
-    /// twelve-hour run settles more of them than the harness may hold.
+    /// Reconcile one usage record. `request_id` proves duplicate identity;
+    /// `trace_id` pairs this row with the exact caller request and expected
+    /// ending. Both retain all 128 bits in bounded spill ledgers.
     fn absorb_record(&mut self, record: &Value) {
         self.records_observed += 1;
         self.open.usage_records += 1;
         match record["request_id"].as_str() {
-            Some(id) => self.ledger.record(fingerprint(id)),
-            None => self.unidentified += 1,
+            Some(id) if self.ledger.record(id).is_ok() => {}
+            Some(_) | None => self.unidentified += 1,
         }
-        let status = record["status"].as_str().unwrap_or("unknown").to_owned();
-        if !Ending::ALL
-            .iter()
-            .any(|ending| ending.settles(status.as_str()))
-        {
-            self.unexpected_statuses += 1;
+        let raw_status = record["status"].as_str();
+        match (record["trace_id"].as_str(), raw_status) {
+            (Some(trace_id), Some(status)) => {
+                if let Err(error) = self.correlations.record_observed(trace_id, status) {
+                    self.uncorrelated += 1;
+                    if matches!(
+                        error,
+                        super::ledger::ObservedCorrelationError::UnknownStatus
+                    ) {
+                        self.invalid_statuses += 1;
+                    }
+                }
+            }
+            (_, status) => {
+                self.uncorrelated += 1;
+                if status.is_none() {
+                    self.invalid_statuses += 1;
+                }
+            }
         }
+        let status = raw_status.unwrap_or("unknown").to_owned();
         *self.by_status.entry(status).or_default() += 1;
         *self
             .by_namespace
@@ -1009,15 +1027,6 @@ fn median(values: impl Iterator<Item = u64>) -> Option<u64> {
     Some(values[values.len() / 2])
 }
 
-/// A 64-bit fingerprint of a request id. Duplicate detection needs identity,
-/// not the id itself, and holding millions of UUIDs as strings to prove nothing
-/// was duplicated would be its own unbounded growth.
-fn fingerprint(id: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    id.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// A bounded sample of a distribution. Every value while under the cap, then
 /// every second, then every fourth: the retained values stay spread over the
 /// whole run instead of describing only its first minutes.
@@ -1081,8 +1090,34 @@ fn assemble(
     let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
     let resources = resources(&aggregate, &finished, scale, elapsed);
     let trend = trend(&aggregate.segments, scale);
-    let tally = aggregate.ledger.tally();
-    let (missing, unexpected_records) = reconciliation_delta(aggregate.settling, tally.distinct);
+    let tally = aggregate
+        .ledger
+        .tally()
+        .expect("the request identity ledger is readable and complete");
+    let correlation = aggregate
+        .correlations
+        .tally()
+        .expect("the correlation ledger is readable and complete");
+    assert_eq!(
+        aggregate.settling, correlation.expected,
+        "every settling attempt enters correlation reconciliation"
+    );
+    assert_eq!(
+        aggregate
+            .records_observed
+            .saturating_sub(aggregate.uncorrelated),
+        correlation.observed,
+        "every correlatable usage row enters correlation reconciliation"
+    );
+    assert_eq!(
+        aggregate
+            .records_observed
+            .saturating_sub(aggregate.unidentified),
+        tally.recorded,
+        "every identified usage row enters request identity reconciliation"
+    );
+    let unexpected_records = correlation.unexpected + aggregate.uncorrelated;
+    let unexpected_statuses = correlation.status_mismatches + aggregate.invalid_statuses;
     EnduranceResult {
         schema_version: RESULT_SCHEMA_VERSION,
         profile: ProfileEcho::new(profile, tier, scale),
@@ -1133,15 +1168,17 @@ fn assemble(
             records_observed: aggregate.records_observed,
             distinct_request_ids: tally.distinct,
             duplicates: tally.duplicates,
-            missing,
+            missing: correlation.missing,
             unexpected_records,
-            unexpected_statuses: aggregate.unexpected_statuses,
+            unexpected_statuses,
             unidentified: aggregate.unidentified,
+            uncorrelated: aggregate.uncorrelated,
             by_status: aggregate.by_status.clone(),
             by_namespace: aggregate.by_namespace.clone(),
             by_credential_source: aggregate.by_credential_source.clone(),
             planned_status_counts: aggregate.planned_status_counts.clone(),
-            fingerprints: fingerprints(&tally),
+            request_identities: identity_evidence(&tally),
+            correlations: correlation_evidence(&correlation),
         },
         upstream,
         segments: aggregate.segments,
@@ -1156,16 +1193,6 @@ fn response_status(attempt: &Attempt) -> String {
         (_, Some(code)) => code.to_string(),
         (_, None) => "transport".to_owned(),
     }
-}
-
-/// Account for both sides of an exact cardinality contract. Keeping the
-/// surplus side explicit prevents `saturating_sub` from turning extra distinct
-/// records into an apparent clean reconciliation.
-fn reconciliation_delta(expected: u64, distinct: u64) -> (u64, u64) {
-    (
-        expected.saturating_sub(distinct),
-        distinct.saturating_sub(expected),
-    )
 }
 
 fn resources(
@@ -1402,35 +1429,32 @@ fn drift_verdicts(result: &EnduranceResult) -> Vec<Verdict> {
     .collect()
 }
 
-/// Drain usage records until every offered request has settled one, or the
-/// settle deadline passes. A shortfall is recorded rather than panicked on: the
-/// artifact is the evidence, and the threshold is what fails the run.
-async fn await_usage_records(gateway: &Axond, aggregate: &mut Aggregate, expected: u64) {
-    let deadline = Instant::now() + SETTLE_TIMEOUT;
-    let mut quiet_since = None;
-    loop {
-        let before = aggregate.ledger.recorded();
+/// Drain usage records for the complete committed settlement window. There is
+/// no authoritative sink-flush barrier while the process is serving, so an
+/// expected cardinality followed by a short quiet period cannot prove that a
+/// delayed duplicate or surplus record will not arrive. A final drain at the
+/// deadline closes the race between the last poll and grading.
+async fn await_usage_records(gateway: &Axond, aggregate: &mut Aggregate) {
+    await_settlement(SETTLE_TIMEOUT, || {
         for record in gateway.drain_usage_records() {
             aggregate.absorb_record(&record);
         }
-        if aggregate.ledger.recorded() > before {
-            quiet_since = None;
+    })
+    .await;
+}
+
+async fn await_settlement(settlement: Duration, mut drain: impl FnMut()) {
+    const POLL: Duration = Duration::from_millis(20);
+    let deadline = tokio::time::Instant::now() + settlement;
+    loop {
+        drain();
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
         }
-        // The count reached, and then nothing further for a while. Only the
-        // shards know how many of those records were distinct, so a run whose
-        // records repeat would be given up on early if the count alone ended
-        // the wait — and the records still in flight would then be reported as
-        // lost, on top of the duplicate that was the real fault.
-        if aggregate.ledger.recorded() >= expected
-            && quiet_since.get_or_insert_with(Instant::now).elapsed() >= SETTLE_QUIET
-        {
-            return;
-        }
-        if Instant::now() >= deadline {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep_until((now + POLL).min(deadline)).await;
     }
+    drain();
 }
 
 /// Upstream response bodies still open once every client is gone.
@@ -1445,15 +1469,23 @@ async fn await_closed_upstreams(upstream: &FakeUpstream) -> i64 {
     }
 }
 
-/// How duplicate detection was done, kept beside the count it produced: a
-/// reconciliation that says nothing was duplicated is only worth as much as
-/// the method that looked.
-fn fingerprints(tally: &Tally) -> Fingerprints {
-    Fingerprints {
+fn identity_evidence(tally: &Tally) -> IdentityEvidence {
+    IdentityEvidence {
         recorded: tally.recorded,
         shards: tally.shards,
-        peak_shard_fingerprints: tally.peak_shard_fingerprints,
-        exact: true,
+        peak_shard_rows: tally.peak_shard_rows,
+        exact: tally.exact,
+        path: relative_to_workspace(&tally.directory),
+    }
+}
+
+fn correlation_evidence(tally: &CorrelationTally) -> CorrelationEvidence {
+    CorrelationEvidence {
+        expected: tally.expected,
+        observed: tally.observed,
+        shards: tally.shards,
+        peak_shard_rows: tally.peak_shard_rows,
+        exact: tally.exact,
         path: relative_to_workspace(&tally.directory),
     }
 }
@@ -1483,6 +1515,7 @@ mod tests {
             },
             shape: plan::shapes(Ending::Complete)[0],
             ending: Ending::Complete,
+            correlation: plan::CorrelationId::new(1, 0),
         }
     }
 
@@ -1528,6 +1561,7 @@ mod tests {
             format!("http://{address}"),
             vec![planned().tenant],
             Arc::new(vec![Ending::Complete]),
+            1,
             Arc::new(AtomicUsize::new(0)),
             gauges.clone(),
             tx,
@@ -1577,9 +1611,37 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_exposes_both_missing_and_surplus_identities() {
-        assert_eq!(reconciliation_delta(5, 3), (2, 0));
-        assert_eq!(reconciliation_delta(3, 5), (0, 2));
-        assert_eq!(reconciliation_delta(5, 5), (0, 0));
+    fn the_production_settlement_window_remains_two_minutes() {
+        assert_eq!(SETTLE_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settlement_waits_the_full_window_and_performs_a_terminal_drain() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let wait = tokio::spawn(async move {
+            await_settlement(Duration::from_secs(2), || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            })
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "an old 500 ms quiet exit returned early"
+        );
+
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        wait.await.expect("the settlement helper completes");
+        assert!(
+            calls.load(Ordering::Relaxed) >= 3,
+            "initial, deadline, and terminal drains are all required"
+        );
     }
 }

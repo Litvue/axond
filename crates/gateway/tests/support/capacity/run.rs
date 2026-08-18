@@ -22,8 +22,10 @@ use super::manifest::{Profile, RESULT_SCHEMA_VERSION, Tier, Workload};
 use super::probe::{ResourceReport, Sampler};
 use super::result::{
     CapacityResult, Deadlines, Environment, Occupancy, Outcomes, Percentiles, ProfileEcho,
-    Recovery, RunMeta, Tenancy, TenantCounts, Throughput, Upstream, UsageRecords, Verdict,
+    QueueEvidence, Recovery, RunMeta, Tenancy, TenantCounts, Throughput, Upstream, UsageRecords,
+    Verdict,
 };
+use crate::support::fault::collector::Collector;
 use crate::support::gateway::{
     ANTHROPIC_SECONDARY_ENV, Axond, GATEWAY_KEY, OPENAI_SECONDARY_ENV, alias, config_toml,
 };
@@ -96,10 +98,8 @@ pub fn tuning() -> &'static str {
     TUNING
 }
 
-/// The admission queue the profiles are served with. Queueing is a separate
-/// question from capacity — a queue converts shedding into latency the caller
-/// cannot see — so it is off, and recorded as off.
-const QUEUE_CAPACITY: u64 = 0;
+const QUEUE_DEPTH_INSTRUMENT: &str = "axond.admission.queue.depth";
+const QUEUE_DEPTH_BOUNDS: [u64; 11] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
 
 /// How far past the bound the replica declares a request may still end before
 /// it counts as having outlived it. The bound is the gateway's own promise, so
@@ -413,7 +413,7 @@ fn shape_for(workload: Workload, index: usize) -> Shape {
         // holds its slot for a known time and the ceiling is reached by the
         // offered concurrency rather than by how slow the runner happened to
         // be.
-        Workload::Shedding => Shape::buffered(CHAT, alias::CHAT_LATE_HEADERS),
+        Workload::Shedding | Workload::Queueing => Shape::buffered(CHAT, alias::CHAT_LATE_HEADERS),
         Workload::Streaming | Workload::Cancellation => Shape::streamed(CHAT, alias::CHAT_SLOW),
         Workload::Mixed => MIXED_ROTATION[index % MIXED_ROTATION.len()],
         Workload::ResponseSize => SIZE_ROTATION[index % SIZE_ROTATION.len()],
@@ -581,6 +581,31 @@ fn deployment(profile: &Profile) -> (String, Vec<(String, String)>) {
                 Vec::new(),
             )
         }
+        Workload::Queueing => {
+            let ceiling = profile
+                .max_in_flight
+                .expect("a queueing profile declares its request ceiling");
+            let capacity = profile
+                .queue_capacity
+                .expect("a queueing profile declares its queue capacity");
+            let wait = profile
+                .queue_wait_ms
+                .expect("a queueing profile declares its queue wait bound");
+            let tuning = retuned(
+                &retuned(
+                    &retuned(
+                        &retuned(TUNING, "max_in_flight", ceiling),
+                        "max_in_flight_streams",
+                        ceiling,
+                    ),
+                    "queue_capacity",
+                    capacity,
+                ),
+                "queue_wait_ms",
+                wait,
+            );
+            (tuning, Vec::new())
+        }
         Workload::BackendLimits => {
             let bound = profile
                 .upstream_timeout_ms
@@ -602,10 +627,29 @@ fn deployment(profile: &Profile) -> (String, Vec<(String, String)>) {
 pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> CapacityResult {
     let _offering = load_lock().lock().await;
     let scale = *profile.scale(tier);
-    let (tuning, extra_env) = deployment(profile);
+    let collector = if profile.workload == Workload::Queueing {
+        Some(Collector::start().await)
+    } else {
+        None
+    };
+    let (tuning, mut extra_env) = deployment(profile);
+    if let Some(collector) = collector.as_ref() {
+        extra_env.extend([
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_owned(),
+                collector.endpoint.clone(),
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_PROTOCOL".to_owned(),
+                "http/protobuf".to_owned(),
+            ),
+            ("OTEL_METRIC_EXPORT_INTERVAL".to_owned(), "1000".to_owned()),
+            ("OTEL_BSP_SCHEDULE_DELAY".to_owned(), "200".to_owned()),
+        ]);
+    }
     let upstream = FakeUpstream::start().await;
     let upstream_base = upstream.base_url.clone();
-    let gateway = Axond::start_custom(
+    let mut gateway = Axond::start_custom(
         &|addr| config_toml(addr, &upstream_base, &tuning, ""),
         &extra_env,
     )
@@ -690,6 +734,19 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Capacity
     let expected_records = accepted + failed_settlements(profile.workload, failed) + served_probe;
     let observed = await_usage_records(&gateway, expected_records).await;
     let leaked = await_closed_upstreams(&upstream).await;
+    let queue = if let Some(collector) = collector.as_ref() {
+        gateway.terminate();
+        let exit = gateway.await_exit(Duration::from_secs(30)).await;
+        assert!(
+            exit.is_some_and(|status| status.success()),
+            "the queueing replica did not flush telemetry and exit cleanly: {exit:?}"
+        );
+        gateway.settle_output(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Some(queue_evidence(collector))
+    } else {
+        None
+    };
     let tenancy = (profile.workload == Workload::Tenants).then(|| {
         let dispatches = upstream.state.dispatches();
         // An upstream call the tally never saw is one the isolation counts
@@ -750,9 +807,10 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Capacity
             offered_concurrency: scale.concurrency,
             in_flight_peak: gauges.in_flight_peak.load(Ordering::Relaxed),
             awaiting_first_byte_peak: gauges.awaiting_peak.load(Ordering::Relaxed),
-            admission_queue_capacity: QUEUE_CAPACITY,
+            admission_queue_capacity: profile.queue_capacity.unwrap_or(0),
             admission_max_in_flight: profile.max_in_flight,
         },
+        queue,
         outcomes: Outcomes {
             by_status: tally(attempts.iter().filter_map(|a| a.status.map(u64::from))),
             rejections_by_error_type: error_types(&attempts, Outcome::Rejected),
@@ -782,6 +840,44 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Capacity
     };
     let verdicts = verdicts(&result);
     CapacityResult { verdicts, ..result }
+}
+
+fn queue_evidence(collector: &Collector) -> QueueEvidence {
+    let points = collector
+        .histogram_points(QUEUE_DEPTH_INSTRUMENT)
+        .unwrap_or_else(|error| panic!("cannot decode queue depth evidence: {error}"));
+    let latest = points
+        .iter()
+        .max_by_key(|point| point.time_unix_nano)
+        .expect("the queueing profile exports a queue-depth histogram point");
+    let explicit_bounds: Vec<u64> = latest
+        .explicit_bounds
+        .iter()
+        .map(|value| exact_u64(*value).expect("queue histogram bounds are exact integers"))
+        .collect();
+    let min_depth = latest.min.and_then(exact_u64);
+    let max_depth = latest.max.and_then(exact_u64);
+    let exact = explicit_bounds == QUEUE_DEPTH_BOUNDS
+        && latest.attributes == 0
+        && latest.bucket_counts.iter().sum::<u64>() == latest.count
+        && min_depth.is_some()
+        && max_depth.is_some();
+    QueueEvidence {
+        instrument: QUEUE_DEPTH_INSTRUMENT,
+        points_exported: points.len(),
+        observations: latest.count,
+        min_depth,
+        max_depth,
+        explicit_bounds,
+        bucket_counts: latest.bucket_counts.clone(),
+        attributes: latest.attributes,
+        exact,
+    }
+}
+
+fn exact_u64(value: f64) -> Option<u64> {
+    (value.is_finite() && value >= 0.0 && value <= u64::MAX as f64 && value.fract() == 0.0)
+        .then_some(value as u64)
 }
 
 /// Whether a request the replica dispatched and then ended on its own bound
@@ -1018,6 +1114,41 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
         .into_iter()
         .flatten(),
     );
+    if result.profile.queue_capacity.is_some() {
+        let evidence = result.queue.as_ref();
+        verdicts.push(Verdict::at_least(
+            "queue_telemetry_exact",
+            f64::from(u8::from(evidence.is_some_and(|queue| queue.exact))),
+            1.0,
+        ));
+        verdicts.push(Verdict::at_least(
+            "queue_observations",
+            evidence.map_or(0, |queue| queue.observations) as f64,
+            1.0,
+        ));
+    }
+    if let Some(bound) = thresholds.min_queue_depth {
+        verdicts.push(Verdict::at_least(
+            "min_queue_depth",
+            result
+                .queue
+                .as_ref()
+                .and_then(|queue| queue.max_depth)
+                .map_or(f64::NEG_INFINITY, |depth| depth as f64),
+            bound as f64,
+        ));
+    }
+    if let Some(bound) = thresholds.max_queue_depth {
+        verdicts.push(Verdict::at_most(
+            "max_queue_depth",
+            result
+                .queue
+                .as_ref()
+                .and_then(|queue| queue.max_depth)
+                .map_or(f64::INFINITY, |depth| depth as f64),
+            bound as f64,
+        ));
+    }
     verdicts
 }
 
