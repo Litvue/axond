@@ -553,6 +553,24 @@ fn restore_drill_owns_restore_stages_and_reads_catalogue_before_recovered_boot()
     );
 }
 
+#[test]
+fn restore_drill_binds_evidence_to_the_release_executable_it_runs() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    for expected in [
+        "cargo build -p axond --locked --release",
+        "AXOND_BIN must resolve to the cargo --release executable",
+        "export AXOND_RECOVERY_EXECUTED_SHA256=\"$recovery_axond_sha256\"",
+        "export AXOND_RECOVERY_EXECUTABLE_PATH=\"$axond_bin\"",
+        "export AXOND_RECOVERY_EXECUTION_BOUND=\"true\"",
+    ] {
+        assert!(
+            source.contains(expected),
+            "restore evidence lost its release/execution binding: {expected}"
+        );
+    }
+}
+
 /// A durable-inventory artifact states every gate field, even though this
 /// inventory-only stage defers all six rather than pretending to measure them.
 #[test]

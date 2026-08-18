@@ -41,6 +41,7 @@ use serde_json::{Value, json};
 use crate::support::capacity::manifest::sha256_hex;
 use crate::support::capacity::result::{
     BinaryMeta, ConfigMeta, Percentiles, Verdict, binary_meta_at,
+    binary_meta_at_with_version_fallback,
 };
 use crate::support::gateway::{self, GATEWAY_KEY, alias};
 
@@ -140,7 +141,13 @@ impl Binaries {
                 path.display()
             );
         }
-        let previous_meta = binary_meta_at(&previous);
+        let expected_previous_version = (tier == Tier::Heavy).then(|| {
+            std::env::var(EXPECTED_PREVIOUS_VERSION_ENV).unwrap_or_else(|_| {
+                panic!("heavy rollout qualification requires {EXPECTED_PREVIOUS_VERSION_ENV}")
+            })
+        });
+        let previous_meta =
+            binary_meta_at_with_version_fallback(&previous, expected_previous_version.as_deref());
         let candidate_meta = binary_meta_at(&candidate);
         let distinct = previous_meta.sha256 != candidate_meta.sha256;
         let retained_release = (tier == Tier::Heavy).then(|| {
@@ -148,7 +155,9 @@ impl Binaries {
                 std::env::var(name)
                     .unwrap_or_else(|_| panic!("heavy rollout qualification requires {name}"))
             };
-            let expected_version = required(EXPECTED_PREVIOUS_VERSION_ENV);
+            let expected_version = expected_previous_version
+                .clone()
+                .expect("the heavy tier loaded its expected predecessor version");
             let expected_binary_sha256 = required(EXPECTED_PREVIOUS_SHA256_ENV);
             let archive_sha256 = required(RETAINED_ARCHIVE_SHA256_ENV);
             for (name, digest) in [
@@ -1513,7 +1522,13 @@ fn scrub_urls(text: &str) -> String {
 /// Every executable/config pair used by the rollout, named by byte digest.
 fn revisions(fleet: &Fleet, binaries: &Binaries) -> Vec<RevisionMeta> {
     let bind: SocketAddr = GATE_BIND.parse().expect("the gate address parses");
-    let previous_binary = binary_meta_at(&binaries.previous);
+    let previous_binary = binary_meta_at_with_version_fallback(
+        &binaries.previous,
+        binaries
+            .retained_release
+            .as_ref()
+            .map(|release| release.expected_version.as_str()),
+    );
     let candidate_binary = binary_meta_at(&binaries.candidate);
     let desired_state_revision = fleet.desired_state_revision().map(ToOwned::to_owned);
     [

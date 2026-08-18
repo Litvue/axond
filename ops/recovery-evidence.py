@@ -278,6 +278,9 @@ def finish(args: argparse.Namespace) -> int:
 
     executable_sha256 = os.environ.get("AXOND_RECOVERY_EXECUTABLE_SHA256", "")
     cargo_profile = os.environ.get("AXOND_RECOVERY_CARGO_PROFILE", "")
+    executed_sha256 = os.environ.get("AXOND_RECOVERY_EXECUTED_SHA256", "")
+    executable_path = os.environ.get("AXOND_RECOVERY_EXECUTABLE_PATH", "")
+    execution_bound = os.environ.get("AXOND_RECOVERY_EXECUTION_BOUND", "")
     if re.fullmatch(r"[0-9a-f]{64}", executable_sha256) is None:
         raise SystemExit(
             "AXOND_RECOVERY_EXECUTABLE_SHA256 must identify the exact axond bytes "
@@ -285,6 +288,18 @@ def finish(args: argparse.Namespace) -> int:
         )
     if cargo_profile != "release":
         raise SystemExit("AXOND_RECOVERY_CARGO_PROFILE must be 'release'")
+    if executed_sha256 != executable_sha256:
+        raise SystemExit(
+            "AXOND_RECOVERY_EXECUTED_SHA256 must match the exact retained executable"
+        )
+    if not Path(executable_path).is_absolute() or "release" not in Path(
+        executable_path
+    ).parts:
+        raise SystemExit(
+            "AXOND_RECOVERY_EXECUTABLE_PATH must identify an absolute release-profile path"
+        )
+    if execution_bound != "true":
+        raise SystemExit("AXOND_RECOVERY_EXECUTION_BOUND must be 'true'")
 
     artifact = {
         "schema_version": SCHEMA_VERSION,
@@ -302,6 +317,9 @@ def finish(args: argparse.Namespace) -> int:
             "schema_identity": head["schema_identity"],
             "axond_executable_sha256": executable_sha256,
             "cargo_profile": cargo_profile,
+            "axond_executed_sha256": executed_sha256,
+            "axond_executable_path": executable_path,
+            "axond_execution_bound": True,
         },
         "timeline": timeline,
         "observations": observations,

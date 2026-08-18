@@ -732,7 +732,7 @@ def validate_raw_recovery(
     )
     if raw_binary != record_binary or stage_binary != record_binary:
         fail(f"{label}: recovery stage does not identify the retained executable")
-    if stage.get("driver") == "stateful-integration":
+    if stage.get("driver") in RECOVERY_DRIVERS:
         executed_binary = sha256_digest(
             run.get("axond_executed_sha256"),
             f"{label}: process-executed recovery binary",
@@ -846,7 +846,7 @@ def validate_compact_recovery(
         if stage_binary != record_binary:
             fail(f"{stage_id}: compact recovery binary does not match the record")
 
-        if driver == "stateful-integration":
+        if driver in RECOVERY_DRIVERS:
             executed_binary = sha256_digest(
                 row.get("executed_binary_sha256"),
                 f"{stage_id}: compact process-executed recovery binary",
@@ -4666,7 +4666,7 @@ def self_test() -> int:
                 "verdicts": 1,
                 "passed": True,
             }
-            if stage["driver"] == "stateful-integration":
+            if stage["driver"] in RECOVERY_DRIVERS:
                 row.update(
                     executed_binary_sha256=recovery_binary,
                     execution_bound=True,
@@ -4741,14 +4741,11 @@ def self_test() -> int:
         "process recovery stage missing executable identity",
         lambda: validate(missing_process_identity),
     )
-    restore_process_identity = copy.deepcopy(recovery_record)
-    restore_process_identity["stage"][restore_index].update(
-        executed_binary_sha256=recovery_binary,
-        execution_bound=True,
-    )
+    missing_restore_identity = copy.deepcopy(recovery_record)
+    del missing_restore_identity["stage"][restore_index]["executed_binary_sha256"]
     expect_refusal(
-        "restore recovery stage with process identity",
-        lambda: validate(restore_process_identity),
+        "restore recovery stage missing executable identity",
+        lambda: validate(missing_restore_identity),
     )
     duplicate_recovery = copy.deepcopy(recovery_record)
     duplicate_recovery["stage"].append(copy.deepcopy(duplicate_recovery["stage"][0]))
@@ -6181,7 +6178,7 @@ def self_test() -> int:
             "gates": recovery_gates,
             "checks": recovery_checks,
         }
-        if recovery_stage.get("driver") == "stateful-integration":
+        if recovery_stage.get("driver") in RECOVERY_DRIVERS:
             raw_recovery["run"].update(
                 {
                     "axond_executed_sha256": "a" * 64,
@@ -6216,7 +6213,7 @@ def self_test() -> int:
                 }
             ],
         }
-        if recovery_stage.get("driver") == "stateful-integration":
+        if recovery_stage.get("driver") in RECOVERY_DRIVERS:
             compact["stage"][0].update(
                 {
                     "executed_binary_sha256": "a" * 64,

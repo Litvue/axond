@@ -2105,7 +2105,7 @@ def self_test() -> int:
                     "gates": gates,
                     "checks": checks,
                 }
-                if contract["driver"] == "stateful-integration":
+                if contract["driver"] in {"stateful-integration", "restore-drill"}:
                     result["run"].update(
                         {
                             "axond_executed_sha256": "b" * 64,

@@ -40,9 +40,9 @@
 #
 # Usage:
 #     ops/restore-drill.sh              # the whole drill, ~2 minutes
-#     AXOND_BIN=/path/to/axond ops/restore-drill.sh
+#     AXOND_BIN=target/release/axond ops/restore-drill.sh
 #
-# Needs Docker and a `cargo` build (or `AXOND_BIN`). Nothing outside the
+# Needs Docker and a release `cargo` build. Nothing outside the
 # container is written except a temporary config directory and the evidence.
 set -euo pipefail
 
@@ -204,12 +204,21 @@ psql() {
 
 command -v openssl >/dev/null 2>&1 || fail "openssl is required for this run's secrets and executable identity"
 
-axond_bin="${AXOND_BIN:-${root}/target/release/axond}"
-if [[ ! -x "$axond_bin" && "$axond_bin" == "${root}/target/release/axond" ]]; then
-  step "Building axond, the drill's verifier"
-  cargo build -p axond --locked --release --manifest-path "${root}/Cargo.toml"
-fi
+release_axond_bin="${root}/target/release/axond"
+step "Building axond, the drill's release-profile verifier"
+cargo build -p axond --locked --release --manifest-path "${root}/Cargo.toml"
+[[ -x "$release_axond_bin" ]] || fail "no release axond binary at ${release_axond_bin}"
+
+# AXOND_BIN remains an explicit byte-selection assertion for callers, but it
+# may not redirect a release qualification to an arbitrary executable. Resolve
+# both paths after the build so aliases of target/release/axond are accepted and
+# a debug or copied binary is refused before evidence is opened.
+axond_bin="${AXOND_BIN:-$release_axond_bin}"
 [[ -x "$axond_bin" ]] || fail "no axond binary at ${axond_bin}"
+axond_bin="$(cd "$(dirname "$axond_bin")" && pwd -P)/$(basename "$axond_bin")"
+release_axond_bin="$(cd "$(dirname "$release_axond_bin")" && pwd -P)/$(basename "$release_axond_bin")"
+[[ "$axond_bin" == "$release_axond_bin" ]] ||
+  fail "AXOND_BIN must resolve to the cargo --release executable at ${release_axond_bin}"
 
 recovery_cargo_profile="release"
 recovery_axond_sha256="$(openssl dgst -sha256 -r "$axond_bin" | awk '{print $1}')"
@@ -221,6 +230,9 @@ if [[ -n "${AXOND_RECOVERY_EXECUTABLE_SHA256:-}" &&
 fi
 export AXOND_RECOVERY_EXECUTABLE_SHA256="$recovery_axond_sha256"
 export AXOND_RECOVERY_CARGO_PROFILE="$recovery_cargo_profile"
+export AXOND_RECOVERY_EXECUTED_SHA256="$recovery_axond_sha256"
+export AXOND_RECOVERY_EXECUTABLE_PATH="$axond_bin"
+export AXOND_RECOVERY_EXECUTION_BOUND="true"
 
 command -v docker >/dev/null 2>&1 || fail "docker is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required to probe the drill's replicas"

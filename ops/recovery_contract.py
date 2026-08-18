@@ -1351,7 +1351,7 @@ def validate_recovery_artifact(
             )
         if run.get("cargo_profile") != RELEASE_CARGO_PROFILE:
             problems.append("run.cargo_profile must be 'release'")
-        if stage.get("driver") == "stateful-integration":
+        if stage.get("driver") in {"stateful-integration", "restore-drill"}:
             executed_digest = run.get("axond_executed_sha256")
             if (
                 not isinstance(executed_digest, str)

@@ -78,6 +78,12 @@ Freeze the cohort in this order:
    the frozen object that produced the candidate binaries.
 5. Merge the release PR only after the pre-tag publication test is green.
 
+The `axond-qualification` self-hosted runner label is also a provisioning
+contract: it names a Linux x86_64 host with a running Docker Engine capable of
+starting GitHub Actions service containers. Stateful endurance uses a pinned
+PostgreSQL service, which GitHub creates before the first job step; a host with
+the label but without Docker is misconfigured and cannot produce evidence.
+
 ## Retained evidence
 
 A run's full artifacts (`target/<slice>/**/*.json`) are complete and

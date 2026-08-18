@@ -108,6 +108,10 @@ jobs:
 
   stateful-endurance:
     name: Stateful mixed-workload endurance
+    # Provisioning contract for this label: Linux x86_64 with a running Docker
+    # Engine. GitHub creates service containers before any step can preflight
+    # them, so attaching axond-qualification without Docker is a runner
+    # configuration error, not an unevaluated soak.
     runs-on: [self-hosted, linux, x64, axond-qualification]
     timeout-minutes: 840
     services:

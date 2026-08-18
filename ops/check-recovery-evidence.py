@@ -594,7 +594,7 @@ def self_test() -> int:
             "axond_executable_sha256": executable_sha256,
             "cargo_profile": RELEASE_CARGO_PROFILE,
         }
-        if contract_stage.get("driver") == "stateful-integration":
+        if contract_stage.get("driver") in {"stateful-integration", "restore-drill"}:
             run.update(
                 {
                     "axond_executed_sha256": executable_sha256,

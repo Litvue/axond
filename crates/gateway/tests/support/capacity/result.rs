@@ -260,23 +260,41 @@ pub fn binary_meta() -> BinaryMeta {
 /// version. A rollout may not infer the retained release's version from the
 /// candidate crate that compiled the harness.
 pub fn binary_meta_at(binary: &std::path::Path) -> BinaryMeta {
+    binary_meta_at_with_version_fallback(binary, None)
+}
+
+/// Identify an arbitrary executable, accepting a pinned external version only
+/// when a legacy binary cannot self-report it.
+///
+/// The fallback is safe only when the caller separately authenticates the
+/// bytes. The heavy rollout does that with the published archive checksum and
+/// then compares this function's binary digest with the extracted executable.
+/// Candidate binaries never receive a fallback.
+pub fn binary_meta_at_with_version_fallback(
+    binary: &std::path::Path,
+    pinned_legacy_version: Option<&str>,
+) -> BinaryMeta {
     let version_output = std::process::Command::new(binary)
         .arg("--version")
         .output()
         .unwrap_or_else(|error| panic!("{} --version failed to run: {error}", binary.display()));
-    assert!(
-        version_output.status.success(),
-        "{} --version failed: {}{}",
-        binary.display(),
-        String::from_utf8_lossy(&version_output.stdout),
-        String::from_utf8_lossy(&version_output.stderr),
-    );
-    let reported = String::from_utf8_lossy(&version_output.stdout);
-    let version = reported
-        .split_whitespace()
-        .last()
-        .unwrap_or_else(|| panic!("{} --version produced no version", binary.display()))
-        .to_owned();
+    let version = if version_output.status.success() {
+        let reported = String::from_utf8_lossy(&version_output.stdout);
+        reported
+            .split_whitespace()
+            .last()
+            .unwrap_or_else(|| panic!("{} --version produced no version", binary.display()))
+            .to_owned()
+    } else if let Some(version) = pinned_legacy_version {
+        version.to_owned()
+    } else {
+        panic!(
+            "{} --version failed: {}{}",
+            binary.display(),
+            String::from_utf8_lossy(&version_output.stdout),
+            String::from_utf8_lossy(&version_output.stderr),
+        );
+    };
     BinaryMeta {
         path: binary.display().to_string(),
         sha256: manifest::sha256_file(binary),
@@ -284,6 +302,34 @@ pub fn binary_meta_at(binary: &std::path::Path) -> BinaryMeta {
             .map(|meta| meta.len())
             .unwrap_or_default(),
         version,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod binary_meta_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn a_checksum_pinned_legacy_binary_may_lack_version_self_report() {
+        let directory =
+            std::env::temp_dir().join(format!("axond-legacy-binary-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the test directory is writable");
+        let binary = directory.join("axond-v0.3.40");
+        std::fs::write(&binary, "#!/bin/sh\nexit 2\n").expect("the test executable is written");
+        let mut permissions = std::fs::metadata(&binary)
+            .expect("the test executable exists")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("the test executable is runnable");
+
+        let metadata = binary_meta_at_with_version_fallback(&binary, Some("0.3.40"));
+        assert_eq!(metadata.version, "0.3.40");
+        assert_eq!(metadata.path, binary.display().to_string());
+        assert_eq!(metadata.sha256.len(), 64);
+
+        std::fs::remove_dir_all(directory).expect("the test directory is removable");
     }
 }
 

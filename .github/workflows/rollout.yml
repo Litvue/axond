@@ -29,8 +29,34 @@ env:
   RETAINED_RELEASE_ARCHIVE_SHA256: 2080e5cdf52b74913c5cecc443d8c05e6348f2b3138c67fd28d5fc909e40bddb
 
 jobs:
+  candidate:
+    name: Candidate freeze guard
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.version.outputs.ready }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: version
+        name: Check whether the v0.4.0 candidate is frozen
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate_version="$(sed -n 's/^version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)"
+          test -n "$candidate_version"
+          if [[ "$candidate_version" == "$EXPECTED_CANDIDATE_VERSION" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping scheduled rollout until the frozen $EXPECTED_CANDIDATE_VERSION candidate exists (workspace is $candidate_version)"
+          else
+            echo "manual rollout requires candidate $EXPECTED_CANDIDATE_VERSION; workspace is $candidate_version" >&2
+            exit 1
+          fi
+
   rollout:
     name: Heavy rollout scenarios
+    needs: candidate
+    if: needs.candidate.outputs.ready == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     services:
@@ -85,7 +111,10 @@ jobs:
             sha256sum --check --strict
           tar -C "$target_dir" -xzf "$target_dir/$asset" axond
           chmod 0755 "$target_dir/axond"
-          test "$("$target_dir/axond" --version)" = "axond ${RETAINED_RELEASE_VERSION}"
+          # v0.3.40 predates the CLI's --version flag. The pinned release tag,
+          # archive name, published checksum, and archive digest authenticate
+          # its version and bytes; the harness uses that pinned version only as
+          # a legacy fallback while retaining the extracted binary's own digest.
           previous_binary_sha256="$(sha256sum "$target_dir/axond" | awk '{print $1}')"
           {
             echo "AXOND_ROLLOUT_PREVIOUS_BINARY=$target_dir/axond"
