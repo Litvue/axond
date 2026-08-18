@@ -689,7 +689,7 @@ live_price_checksum="$(psql live 5432 -c \
 backup_usage_baseline="$(usage_count live 5432)"
 backup_usage_baseline_id="$(latest_usage_row_id live 5432)"
 backup_usage_status="$(probe_survivor_chat "${workdir}/usage-before-logical-backup.body")"
-backup_usage_count="$(wait_for_usage_count live 5432 "$((backup_usage_baseline + 1))" || true)"
+wait_for_usage_count live 5432 "$((backup_usage_baseline + 1))" >/dev/null || true
 backup_usage_new_rows="$(usage_rows_after_id live 5432 "$backup_usage_baseline_id")"
 backup_usage_request_id="$(usage_request_after_id live 5432 "$backup_usage_baseline_id")"
 backup_usage_source_rows="$(usage_identity_count live 5432 axond_usage "$backup_usage_request_id")"
