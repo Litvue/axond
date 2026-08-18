@@ -154,10 +154,35 @@ impl RunMeta {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
-            elapsed_ms: elapsed.as_millis(),
+            elapsed_ms: duration_millis_ceil(elapsed),
             harness,
             harness_version: env!("CARGO_PKG_VERSION"),
         }
+    }
+}
+
+/// Preserve a positive measured duration when an artifact's unit is whole
+/// milliseconds. `Duration::as_millis` truncates, which would make a real
+/// sub-millisecond run indistinguishable from a run with no elapsed time.
+pub(crate) fn duration_millis_ceil(duration: Duration) -> u128 {
+    duration.as_nanos().div_ceil(1_000_000)
+}
+
+#[cfg(test)]
+mod run_meta_tests {
+    use std::time::Duration;
+
+    use super::duration_millis_ceil;
+
+    #[test]
+    fn whole_millisecond_artifacts_retain_positive_sub_millisecond_durations() {
+        assert_eq!(duration_millis_ceil(Duration::ZERO), 0);
+        assert_eq!(duration_millis_ceil(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_millis_ceil(Duration::from_millis(1)), 1);
+        assert_eq!(
+            duration_millis_ceil(Duration::from_millis(1) + Duration::from_nanos(1)),
+            2
+        );
     }
 }
 
