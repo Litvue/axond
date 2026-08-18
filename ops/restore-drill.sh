@@ -1395,6 +1395,7 @@ require "the_post_target_usage_outbox_event_is_not_replayed" 0 "$recovered_post_
 defer readiness "this stage reads recovered usage tables; the reconvergence stage owns serving"
 defer max_serving_error_fraction "usage inspection offers no inference traffic"
 defer max_convergence_lag_seconds "usage inspection does not converge a replica"
+defer max_data_loss_revisions "the recovery stage owns the revision-loss boundary; this stage checks the usage boundary"
 defer admin_writes "the recovery stage owns recovered-journal writes"
 defer max_unauthenticated_admin_successes "the administration stage measures control-plane authentication"
 close

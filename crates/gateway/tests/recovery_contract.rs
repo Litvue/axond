@@ -612,6 +612,36 @@ fn durable_inventory_records_all_gate_fields_and_setup_failures() {
     );
 }
 
+/// The usage-boundary stage owns PITR usage observations, not revision loss,
+/// but every recovery artifact must still state an explicit decision for all
+/// six scenario gates. Omitting a deferral makes the drill fail at `close`.
+#[test]
+fn pitr_usage_boundary_records_or_defers_every_gate() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let start = source
+        .find("stage point-in-time-recovery/usage-boundary live")
+        .expect("the PITR usage-boundary stage is driven");
+    let end = source[start..]
+        .find("stage point-in-time-recovery/reconvergence live")
+        .map(|offset| start + offset)
+        .expect("the PITR usage-boundary stage has a bounded body");
+    let stage = &source[start..end];
+    for gate in [
+        "readiness",
+        "max_serving_error_fraction",
+        "max_convergence_lag_seconds",
+        "max_data_loss_revisions",
+        "admin_writes",
+        "max_unauthenticated_admin_successes",
+    ] {
+        assert!(
+            stage.contains(&format!("defer {gate}")) || stage.contains(&format!("gate {gate}")),
+            "PITR usage-boundary must record or defer {gate}"
+        );
+    }
+}
+
 /// Catalogue resources carry the raw blob checksum, and CatalogRequest::plan
 /// accepts only the canonical `sha256:<64 lowercase hex>` spelling. The
 /// content id remains a separate pointer assertion in the restore stages.
