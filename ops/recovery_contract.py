@@ -423,6 +423,15 @@ STAGE_REQUIRED_OBSERVATIONS: dict[str, frozenset[str]] = {
     ),
 }
 
+# A missing value and a missing observation are different claims. Cacheless
+# cold boot must retain both revision fields and prove that neither hydrated nor
+# active state exists, so these keys are required above and explicitly null.
+STAGE_REQUIRED_NULL_OBSERVATIONS: dict[str, frozenset[str]] = {
+    "cold-boot-no-cache/cold-boot": frozenset(
+        {"active_revision", "loaded_revision"}
+    ),
+}
+
 
 # These stages carry especially important multi-field boundaries.  Requiring the
 # named equality checks prevents a producer from retaining plausible-looking
@@ -1423,10 +1432,8 @@ def validate_recovery_artifact(
         problems.append("observations is missing or is not an object")
         observations = {}
     contract_key = stage_key(scenario, stage)
-    nullable_observations = (
-        frozenset({"active_revision", "loaded_revision"})
-        if contract_key == "cold-boot-no-cache/cold-boot"
-        else frozenset()
+    nullable_observations = STAGE_REQUIRED_NULL_OBSERVATIONS.get(
+        contract_key, frozenset()
     )
     invalid_observations = sorted(
         key
@@ -1571,6 +1578,7 @@ __all__ = [
     "RELEASE_CARGO_PROFILE",
     "REQUIRED_GATE_NAMES",
     "STAGE_REQUIRED_CHECKS",
+    "STAGE_REQUIRED_NULL_OBSERVATIONS",
     "STAGE_REQUIRED_OBSERVATIONS",
     "CHECK_RECONSTRUCTIONS",
     "VERDICT_FIELDS",

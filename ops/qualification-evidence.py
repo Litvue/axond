@@ -60,6 +60,7 @@ from recovery_contract import (
     LOWER_SHA256,
     RECOVERY_RESULT_SCHEMA_VERSION,
     REQUIRED_GATE_NAMES,
+    STAGE_REQUIRED_NULL_OBSERVATIONS,
     deferred_gate_detail,
     derive_verdict_outcome,
     gate_owner,
@@ -2021,6 +2022,10 @@ def self_test() -> int:
                         contract_scenario, contract_stage
                     )
                 }
+                for name in STAGE_REQUIRED_NULL_OBSERVATIONS.get(
+                    key, frozenset()
+                ):
+                    observations[name] = None
                 check_bindings = CHECK_RECONSTRUCTIONS.get(key, {})
                 for check in sorted(required_checks(contract_scenario, contract_stage)):
                     expected_operand, observed_operand = check_bindings[check]
