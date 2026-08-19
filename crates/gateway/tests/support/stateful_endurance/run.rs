@@ -131,9 +131,9 @@ pub async fn run_with(
     scale.duration_ms = duration.as_millis() as u64;
 
     let upstream = FakeUpstream::start().await;
-    let upstream_gate = Gate::start(authority(&upstream.base_url)).await;
+    let upstream_gate = Arc::new(Gate::start(authority(&upstream.base_url)).await);
     let durable = Durable::create(&dsn, dispatch.stem).await;
-    let usage_gate = Gate::start(&durable.backend_authority()).await;
+    let usage_gate = Arc::new(Gate::start(&durable.backend_authority()).await);
     let (replica_dsn, reach) = durable.replica_dsn(&usage_gate.authority());
 
     let deployment = Deployment {
@@ -236,43 +236,47 @@ pub async fn run_with(
     // time, but none of them may silently broaden a fault window. The
     // supervisor consumes the exact actuation timestamps and still owns all
     // artifact state.
-    let supervise = async {
-        let stop = Supervisor {
-            profile,
-            slo,
+    // A spawned runtime task, rather than another future joined into the
+    // supervisor's task, keeps synchronous ledger or fleet work in one
+    // supervisor poll from delaying a due gate edge.
+    let gate_task = tokio::spawn(
+        FaultGateScheduler {
+            schedule: profile.schedule,
             duration,
             started,
-            deadline: deadline.clone(),
-            fleet: &mut fleet,
-            client: &client,
-            rotation: &rotation,
-            offered: &next,
-            state: &mut state,
-            probe: &probe_tenant,
-            sample_interval,
-            dir: &dir,
-            stem: dispatch.stem,
-            revision: Revision::default(),
-            policy_withdrawn: false,
-            probe_index: 0,
+            upstream_gate: upstream_gate.clone(),
+            usage_gate: usage_gate.clone(),
+            reach,
+            tx: gate_tx,
+            cancel: gate_cancel_rx,
         }
-        .run(&mut rx, &mut gate_rx)
-        .await;
-        let _ = gate_cancel_tx.send(true);
-        stop
-    };
-    let schedule_gates = FaultGateScheduler {
+        .run(),
+    );
+    let stop = Supervisor {
         profile,
+        slo,
         duration,
         started,
-        upstream_gate: &upstream_gate,
-        usage_gate: &usage_gate,
-        reach,
-        tx: gate_tx,
-        cancel: gate_cancel_rx,
+        deadline: deadline.clone(),
+        fleet: &mut fleet,
+        client: &client,
+        rotation: &rotation,
+        offered: &next,
+        state: &mut state,
+        probe: &probe_tenant,
+        sample_interval,
+        dir: &dir,
+        stem: dispatch.stem,
+        revision: Revision::default(),
+        policy_withdrawn: false,
+        probe_index: 0,
     }
-    .run();
-    let (stop, ()) = tokio::join!(supervise, schedule_gates);
+    .run(&mut rx, &mut gate_rx)
+    .await;
+    let _ = gate_cancel_tx.send(true);
+    gate_task
+        .await
+        .expect("the independent fault-gate scheduler must terminate successfully");
 
     stop_flag.store(true, Ordering::SeqCst);
     for worker in workers {
@@ -821,25 +825,33 @@ struct AppliedGateEvent {
     late_by_ms: u64,
 }
 
-/// Everything the independent fault-gate timer owns or borrows for one run.
-struct FaultGateScheduler<'a> {
-    profile: &'a Profile,
+impl AppliedGateEvent {
+    /// Only a transition that changed a gate can have widened a measured fault
+    /// window. A remote usage backend is deliberately left untouched, so its
+    /// scheduled no-op remains diagnostic rather than invalidating the run.
+    fn missed_dispatch_bound(self, slack_ms: u64) -> bool {
+        self.applied && self.late_by_ms > slack_ms
+    }
+}
+
+/// Everything the independent fault-gate runtime task owns for one run.
+struct FaultGateScheduler {
+    schedule: super::manifest::Schedule,
     duration: Duration,
     started: Instant,
-    upstream_gate: &'a Gate,
-    usage_gate: &'a Gate,
+    upstream_gate: Arc<Gate>,
+    usage_gate: Arc<Gate>,
     reach: Reach,
     tx: UnboundedSender<AppliedGateEvent>,
     cancel: watch::Receiver<bool>,
 }
 
-impl FaultGateScheduler<'_> {
+impl FaultGateScheduler {
     /// Apply fault gates from a timer that does not await fleet convergence or
     /// probes. The supervisor remains the sole writer of evidence state; this
     /// task sends exact actuation observations back in schedule order.
     async fn run(mut self) {
         for scheduled in self
-            .profile
             .schedule
             .resolve(self.duration)
             .into_iter()
@@ -862,7 +874,7 @@ impl FaultGateScheduler<'_> {
             let (counts, applied) = match scheduled.event {
                 Event::UpstreamLatencyBegins => {
                     self.upstream_gate
-                        .set(Mode::Latency(self.profile.schedule.upstream_latency_ms));
+                        .set(Mode::Latency(self.schedule.upstream_latency_ms));
                     (self.upstream_gate.counts(), true)
                 }
                 Event::UpstreamLatencyEnds | Event::UpstreamOutageEnds => {
@@ -1062,7 +1074,7 @@ impl Supervisor<'_> {
                 _ => unreachable!("the gate scheduler emits only gate transitions"),
             }
 
-            if applied.late_by_ms > self.profile.schedule.event_dispatch_slack_ms {
+            if applied.missed_dispatch_bound(self.profile.schedule.event_dispatch_slack_ms) {
                 late = Some((applied.event, applied.observed_at, applied.late_by_ms));
             }
         }
@@ -2863,6 +2875,38 @@ fn readiness_gap_ms(since: Duration, ended: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skipped_remote_database_edge_cannot_fail_the_dispatch_bound() {
+        let counts = GateCounts {
+            accepted: 0,
+            refused: 0,
+            cut: 0,
+            delayed: 0,
+        };
+        let skipped = AppliedGateEvent {
+            event: Event::UsageBackendOutageBegins,
+            observed_at: Duration::from_secs(1),
+            counts,
+            applied: false,
+            late_by_ms: u64::MAX,
+        };
+        assert!(!skipped.missed_dispatch_bound(250));
+
+        let applied = AppliedGateEvent {
+            applied: true,
+            late_by_ms: 251,
+            ..skipped
+        };
+        assert!(applied.missed_dispatch_bound(250));
+        assert!(
+            !AppliedGateEvent {
+                late_by_ms: 250,
+                ..applied
+            }
+            .missed_dispatch_bound(250)
+        );
+    }
 
     #[test]
     fn concurrent_endings_use_the_committed_opening_and_observed_close() {
