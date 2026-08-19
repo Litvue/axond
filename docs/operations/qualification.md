@@ -14,7 +14,7 @@ decomposes into six slices. They landed, and will land, at different depths:
 | `stateful-endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Multi-replica driver for revisions, backend faults, tenant isolation, durable accounting, and rolling restarts. Its smoke lane is harness validation; no 12-hour record binds all five exact ledgers and the per-incarnation sample JSONL set. |
 | `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver and twenty-two executable real-Postgres stages exist. The historical v0.3.39 debug record remains indexed for audit, but a release-profile v0.4.0 cohort rerun with raw schema 2, per-stage executable digests, and process-bound executed-binary identity is pending. |
 | `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `harnessed` | The provider, transport, Redis, and Postgres matrix is complete. Its historical v0.3.39 debug record remains indexed for audit, but raw-schema-1 release evidence from the v0.4.0 cohort is pending. |
-| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver and committed reduced/heavy scenarios now require published v0.3.40 and candidate v0.4.0 serving one shared durable revision and alias through the real-Postgres migration/rollback matrix. No raw/compact schema-3 record is retained. |
+| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver and committed reduced/heavy scenarios now require published v0.3.40 and candidate v0.4.0 serving one shared durable revision and alias through the real-Postgres migration/rollback matrix. A loopback OTLP receiver preserves exact caller traces for the retained executable. No raw/compact schema-4 record is retained. |
 
 `qualification/packet.toml` is that table as data — question, inputs, lanes,
 retained runs, and what each slice still owes; see
@@ -198,12 +198,18 @@ cannot be promoted from a TOML file alone: its claimed artifact digests must
 match the complete raw-artifact directory from the same run.
 Rollout observations also retain the previous and candidate executable versions
 and digests plus the checksum-pinned release archive digest, so that provenance
-survives the raw workflow artifact's retention window. Raw rollout schema 3 and
-compact rollout record schema 3 additionally preserve the shared durable
-revision, the `chat` alias, and successful serving probes from both v0.3.40 and
-v0.4.0. Fault observations bind raw artifact schema 1. Recovery stage rows bind
-raw artifact schema 2 and the exact executable digest, which must equal the
-record's release binary digest.
+survives the raw workflow artifact's retention window. Raw rollout schema 4 and
+compact rollout record schema 4 additionally preserve the shared durable
+revision, the `chat` alias, successful serving probes from both v0.3.40 and
+v0.4.0, and the per-replica exact caller-trace/OTLP witness, including the
+separate reasoned ledger for typed-drain refusals that owe no usage row, the
+exact ingress attempt behind every promotable drain exemption, and a settled
+exporter snapshot. Reduced raw diagnostics may also record capability refusals,
+but those are not accepted into a promotable compact record. Fault observations
+bind raw artifact schema 1. Recovery stage rows bind raw artifact schema 2 and
+the exact executable digest, which must equal the record's release binary
+digest. The compact rollout row retains the OTLP caller-trace set's SHA-256 and
+cardinality after the raw artifact's workflow-retention window.
 
 Promotion refuses dirty provenance, stale manifest hashes, wrong heavy tiers,
 partial workload sets, failed verdicts, and an endurance or stateful-endurance
@@ -250,9 +256,11 @@ checked by the qualification packet test.
 - **`fault`** — re-run the complete provider, transport, Redis, and Postgres
   matrix from the frozen v0.4.0 source in release profile, retaining raw schema
   1 on every compact observation.
-- **`rollout`** — a release-profile raw/compact schema-3 run using published
+- **`rollout`** — a release-profile raw/compact schema-4 run using published
   v0.3.40 and cohort v0.4.0 as distinct binaries, proving both serve one shared
-  durable revision and `chat` alias through the migration and rollback ledger.
+  durable revision and `chat` alias through the migration and rollback ledger,
+  with every exact caller trace exported through its replica-dedicated receiver
+  and every non-usage trace explicitly justified.
 - **Second reference tier** — rollout must supply the short fleet-under-load
   baseline; stateful endurance must supply the long-duration baseline.
 

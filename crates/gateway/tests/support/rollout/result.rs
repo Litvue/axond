@@ -385,6 +385,17 @@ pub struct LossLedger {
     /// Distinct `request_id`s among them. One terminated request is one event,
     /// so a repeat is the same event recorded twice.
     pub usage_records_distinct: u64,
+    /// How every replica's usage rows were reconciled, including the
+    /// qualification-only trace-context instrumentation used by v0.3.40.
+    pub usage_reconciliation: UsageReconciliation,
+    /// Exact ingress attempts that received a typed drain refusal, including
+    /// the replica that later answered the same caller trace. This is the raw
+    /// source from which promotion reconstructs non-usage OTLP exemptions.
+    pub draining_refusal_attempts: Vec<DrainingRefusalAttempt>,
+    /// Exact ingress attempts that ended in an untyped 503 or transport
+    /// failure. These explain matching surplus spans diagnostically but never
+    /// exempt them from exact reconciliation.
+    pub failed_ingress_attempts: Vec<FailedIngressAttempt>,
     /// The exact caller-side ledger. Each expected event names the replica that
     /// owed it, the caller-controlled trace identity, and its terminal usage
     /// status. Keeping the rows in the artifact makes reconciliation durable
@@ -432,6 +443,9 @@ pub struct LossLedger {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplicaUsage {
     pub replica: String,
+    /// Always `exact_trace`; serialized per replica so promotion can reject a
+    /// future weaker mode rather than silently reinterpreting it.
+    pub reconciliation: String,
     /// Caller requests this replica answered, plus the ones the harness pinned
     /// directly to it. One record owed each.
     pub caller_requests_answered: u64,
@@ -445,6 +459,76 @@ pub struct ReplicaUsage {
     pub identity_duplicates: u64,
     pub status_mismatches: u64,
     pub unidentified: u64,
+}
+
+/// The disclosed strength and scope of usage reconciliation in this run.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageReconciliation {
+    pub mode: String,
+    pub exact_trace_replicas: Vec<String>,
+    /// v0.3.40 reads the active OpenTelemetry span to populate `trace_id`, so
+    /// the harness installs a loopback OTLP/HTTP receiver for every replica.
+    pub retained_trace_context: String,
+    /// Trace batches received from the instrumented fleet.
+    pub otlp_trace_exports: u64,
+    /// Process identities found in exported trace resources. A passing run
+    /// requires this set to equal `exact_trace_replicas`.
+    pub otlp_trace_export_replicas: Vec<String>,
+    /// Caller traces that legitimately do not owe a usage row, with the reason
+    /// made explicit. The harness reconstructs the complete expected OTLP set
+    /// as `expected_usage_identities` plus these rows. Promotion accepts only
+    /// drain-refusal rows derived from `draining_refusal_attempts`; reduced
+    /// diagnostics may also disclose their expected capability refusal.
+    pub expected_non_usage_trace_identities: Vec<ExpectedNonUsageTraceIdentity>,
+    /// Exact caller traces decoded from replica-dedicated OTLP receivers. This
+    /// is retained raw so promotion can compare it directly with the complete
+    /// expected trace ledger instead of trusting a derived count.
+    pub otlp_trace_identities: Vec<TraceExportIdentity>,
+    /// Exported caller identities outside the expected ledger, partitioned by
+    /// an exact failed ingress attempt when one exists. Every row still counts
+    /// in `otlp_trace_export_identity_mismatches`.
+    pub unexpected_otlp_trace_identities: Vec<UnexpectedTraceIdentity>,
+    /// Bounded settlement, decoding, or receiver-ownership failures. The
+    /// partial identity set remains in this artifact for diagnosis, but any
+    /// non-empty value fails the exact trace mismatch verdict and promotion.
+    pub otlp_trace_collection_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct TraceExportIdentity {
+    pub replica: String,
+    pub trace_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ExpectedNonUsageTraceIdentity {
+    pub replica: String,
+    pub trace_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct DrainingRefusalAttempt {
+    pub caller_id: u64,
+    pub trace_id: String,
+    pub refused_replica: String,
+    pub accepted_replica: Option<String>,
+    pub accepted_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct FailedIngressAttempt {
+    pub caller_id: u64,
+    pub trace_id: String,
+    pub replica: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct UnexpectedTraceIdentity {
+    pub replica: String,
+    pub trace_id: String,
+    pub reason: String,
 }
 
 /// One caller event the rollout driver proves reached a specific replica.

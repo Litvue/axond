@@ -16,12 +16,13 @@
 //! lost. They are taken from the process' stdout the moment it exits and kept
 //! with the fleet, so the loss ledger covers replicas that no longer exist.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::support::fault::collector::Collector;
 use crate::support::gateway::{Axond, alias};
 use crate::support::upstream::{FakeUpstream, target};
 
@@ -43,6 +44,12 @@ pub const NEXT_ONLY_ALIAS: &str = "chat-next-only";
 /// process is gone. Generous: it is only ever waited out when a reader thread
 /// is starved, and the alternative is a phantom lost usage record.
 const OUTPUT_SETTLE: Duration = Duration::from_secs(5);
+/// Five batch-processor intervals after the last rollout trace. The harness
+/// configures a 200 ms OTLP schedule, so no caller-domain span activity for
+/// this window is a settled exporter snapshot rather than the first expected
+/// subset. Duplicate caller spans reset the window; readiness spans do not.
+const TRACE_QUIESCENCE: Duration = Duration::from_secs(1);
+const ROLLOUT_TRACE_DOMAIN_PREFIX: &str = "61786f6e642d726f";
 
 /// Stateless failover bounds. Stateful mode rejects failover settings in its
 /// bootstrap TOML and the current desired-state schema has no deployment-wide
@@ -175,6 +182,9 @@ pub struct Replica {
     pub id: String,
     pub revision: Revision,
     pub process: Process,
+    /// Dedicated to this process, so no other replica can satisfy its trace
+    /// witness through a shared receiver.
+    pub collector: Collector,
 }
 
 impl Replica {
@@ -189,6 +199,7 @@ pub struct Retired {
     pub id: String,
     pub revision: Revision,
     pub usage_records: Vec<Value>,
+    pub collector: Collector,
 }
 
 pub struct Fleet {
@@ -200,6 +211,103 @@ pub struct Fleet {
     retired: Vec<Retired>,
     stateful: Option<StatefulDeployment>,
     started: usize,
+}
+
+#[derive(Debug)]
+pub struct TraceWitnessSnapshot {
+    pub exports: u64,
+    pub identities: BTreeSet<(String, String)>,
+    pub collection_errors: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct TraceIdentityDelta {
+    identities: BTreeSet<(String, String)>,
+    caller_spans_seen: u64,
+    collection_errors: Vec<String>,
+}
+
+struct TraceCollectors<'a> {
+    collectors: Vec<(&'a str, &'a Collector)>,
+}
+
+impl TraceCollectors<'_> {
+    fn identity_delta(&self) -> TraceIdentityDelta {
+        let mut delta = TraceIdentityDelta::default();
+        for (replica, collector) in &self.collectors {
+            let observed = match collector.trace_identity_delta(replica) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    delta
+                        .collection_errors
+                        .push(format!("OTLP receiver for `{replica}`: {error}"));
+                    delta.identities.extend(
+                        collector
+                            .cached_trace_ids_for_instance(replica)
+                            .into_iter()
+                            .filter(|trace_id| trace_id.starts_with(ROLLOUT_TRACE_DOMAIN_PREFIX))
+                            .map(|trace_id| ((*replica).to_owned(), trace_id)),
+                    );
+                    continue;
+                }
+            };
+            for (trace_id, occurrences) in observed
+                .occurrences
+                .into_iter()
+                .filter(|(trace_id, _)| trace_id.starts_with(ROLLOUT_TRACE_DOMAIN_PREFIX))
+            {
+                match delta.caller_spans_seen.checked_add(occurrences) {
+                    Some(total) => delta.caller_spans_seen = total,
+                    None => {
+                        delta.caller_spans_seen = u64::MAX;
+                        delta
+                            .collection_errors
+                            .push("rollout caller-span count overflowed u64".to_owned());
+                    }
+                }
+                delta.identities.insert(((*replica).to_owned(), trace_id));
+            }
+        }
+        delta
+    }
+
+    /// Complete caller-domain trace identities already decoded by every
+    /// replica-dedicated collector. A settlement starts from this durable
+    /// snapshot, then uses deltas only to detect subsequent activity.
+    fn identity_snapshot(&self) -> TraceIdentityDelta {
+        let mut snapshot = TraceIdentityDelta::default();
+        for (replica, collector) in &self.collectors {
+            if let Err(error) = collector.trace_identity_delta(replica) {
+                snapshot
+                    .collection_errors
+                    .push(format!("OTLP receiver for `{replica}`: {error}"));
+            }
+            snapshot.identities.extend(
+                collector
+                    .cached_trace_ids_for_instance(replica)
+                    .into_iter()
+                    .filter(|trace_id| trace_id.starts_with(ROLLOUT_TRACE_DOMAIN_PREFIX))
+                    .map(|trace_id| ((*replica).to_owned(), trace_id)),
+            );
+        }
+        snapshot
+    }
+
+    async fn settle(
+        &self,
+        expected: &BTreeSet<(String, String)>,
+        within: Duration,
+        quiescence: Duration,
+    ) -> TraceWitnessSnapshot {
+        // The caller's bound covers the initial full-cache read as well as all
+        // incremental observations and the final quiescence window.
+        let deadline = Instant::now() + within;
+        let initial = self.identity_snapshot();
+        settle_identity_set(expected, initial, within, quiescence, deadline, || {
+            self.identity_delta()
+        })
+        .await
+    }
 }
 
 impl Fleet {
@@ -295,23 +403,48 @@ impl Fleet {
         } else {
             &self.candidate_binary
         };
-        let process = match &self.stateful {
-            Some(deployment) => {
-                Process::Stateful(deployment.start_replica(binary, self.shutdown).await)
-            }
-            None => Process::Stateless(
-                Axond::start_with_binary(
-                    &self.upstream.base_url,
-                    &revision.stateless_tuning(self.shutdown),
-                    binary,
-                )
-                .await,
+        let collector = Collector::start().await;
+        let telemetry_env = vec![
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_owned(),
+                collector.endpoint.clone(),
             ),
+            (
+                "OTEL_EXPORTER_OTLP_PROTOCOL".to_owned(),
+                "http/protobuf".to_owned(),
+            ),
+            ("OTEL_BSP_SCHEDULE_DELAY".to_owned(), "200".to_owned()),
+            ("OTEL_METRIC_EXPORT_INTERVAL".to_owned(), "1000".to_owned()),
+            ("RUST_LOG".to_owned(), "warn,axond=info".to_owned()),
+            ("AXOND_INSTANCE_ID".to_owned(), id.clone()),
+        ];
+        let process = match &self.stateful {
+            Some(deployment) => Process::Stateful(
+                deployment
+                    .start_replica(binary, self.shutdown, &telemetry_env)
+                    .await,
+            ),
+            None => {
+                let env = telemetry_env
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect::<Vec<_>>();
+                Process::Stateless(
+                    Axond::start_with_binary_and_env(
+                        &self.upstream.base_url,
+                        &revision.stateless_tuning(self.shutdown),
+                        binary,
+                        &env,
+                    )
+                    .await,
+                )
+            }
         };
         self.replicas.push(Replica {
             id,
             revision,
             process,
+            collector,
         });
         self.replicas.last().expect("the replica was pushed")
     }
@@ -372,6 +505,7 @@ impl Fleet {
             id: replica.id.clone(),
             revision: replica.revision,
             usage_records: usage_records.clone(),
+            collector: replica.collector,
         });
         Drained {
             id: replica.id,
@@ -416,6 +550,138 @@ impl Fleet {
     pub fn retired(&self) -> &[Retired] {
         &self.retired
     }
+
+    /// Total trace batches received across the replica-dedicated collectors.
+    pub fn trace_exports(&self) -> u64 {
+        self.collectors()
+            .map(|(_, collector)| {
+                collector
+                    .counts()
+                    .get("traces")
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .sum()
+    }
+
+    /// Settle the complete caller-domain trace set. Once every expected trace
+    /// has arrived, the set must remain unchanged for several configured batch
+    /// intervals; the returned snapshot is the one serialized and judged.
+    /// Unrelated readiness and startup spans neither satisfy nor delay it.
+    pub async fn settle_trace_identities(
+        &self,
+        expected: &BTreeSet<(String, String)>,
+        within: Duration,
+    ) -> TraceWitnessSnapshot {
+        let collectors = TraceCollectors {
+            collectors: self.collectors().collect(),
+        };
+        let mut snapshot = collectors.settle(expected, within, TRACE_QUIESCENCE).await;
+        snapshot.exports = self.trace_exports();
+        snapshot
+    }
+
+    fn collectors(&self) -> impl Iterator<Item = (&str, &Collector)> {
+        self.replicas
+            .iter()
+            .map(|replica| (replica.id.as_str(), &replica.collector))
+            .chain(
+                self.retired
+                    .iter()
+                    .map(|replica| (replica.id.as_str(), &replica.collector)),
+            )
+    }
+}
+
+async fn settle_identity_set<F>(
+    expected: &BTreeSet<(String, String)>,
+    initial: TraceIdentityDelta,
+    within: Duration,
+    quiescence: Duration,
+    deadline: Instant,
+    mut observe: F,
+) -> TraceWitnessSnapshot
+where
+    F: FnMut() -> TraceIdentityDelta,
+{
+    let mut identities = initial.identities;
+    if !initial.collection_errors.is_empty() {
+        return TraceWitnessSnapshot {
+            exports: 0,
+            identities,
+            collection_errors: initial.collection_errors,
+        };
+    }
+    let mut unchanged_since = Instant::now();
+    loop {
+        if Instant::now() >= deadline {
+            return TraceWitnessSnapshot {
+                exports: 0,
+                collection_errors: vec![trace_settlement_timeout(
+                    expected,
+                    &identities,
+                    within,
+                    quiescence,
+                )],
+                identities,
+            };
+        }
+        let delta = observe();
+        // Timestamp after decoding: activity discovered during an observation
+        // earns the complete configured quiet period rather than a backdated
+        // fraction of it.
+        let now = Instant::now();
+        if delta.caller_spans_seen > 0 {
+            unchanged_since = now;
+        }
+        identities.extend(delta.identities);
+        if !delta.collection_errors.is_empty() {
+            return TraceWitnessSnapshot {
+                exports: 0,
+                identities,
+                collection_errors: delta.collection_errors,
+            };
+        }
+        if now >= deadline {
+            return TraceWitnessSnapshot {
+                exports: 0,
+                collection_errors: vec![trace_settlement_timeout(
+                    expected,
+                    &identities,
+                    within,
+                    quiescence,
+                )],
+                identities,
+            };
+        }
+        if expected.is_subset(&identities) && now.duration_since(unchanged_since) >= quiescence {
+            return TraceWitnessSnapshot {
+                exports: 0,
+                identities,
+                collection_errors: Vec::new(),
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(20).min(deadline.saturating_duration_since(now)))
+            .await;
+    }
+}
+
+fn trace_settlement_timeout(
+    expected: &BTreeSet<(String, String)>,
+    identities: &BTreeSet<(String, String)>,
+    within: Duration,
+    quiescence: Duration,
+) -> String {
+    let missing = expected.difference(identities).count();
+    if missing > 0 {
+        format!(
+            "caller-domain trace evidence timed out after {within:?} with {missing} expected identities still missing"
+        )
+    } else {
+        format!(
+            "caller-domain trace evidence did not remain quiet for {quiescence:?} within {within:?}"
+        )
+    }
 }
 
 /// What one replica's termination cost, and what it flushed on the way out.
@@ -447,6 +713,14 @@ pub mod pinned {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use prost::Message;
+
     use super::*;
 
     const SHUTDOWN: ShutdownBounds = ShutdownBounds {
@@ -498,5 +772,305 @@ flush_timeout_ms = 300
                  output_microdollars_per_million = 10000000 }} }} ]\n"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_retains_an_extra_identity_that_arrives_late() {
+        let expected_identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1"),
+        );
+        let extra_identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}2"),
+        );
+        let expected = [expected_identity.clone()].into_iter().collect();
+        let observed = Arc::new(Mutex::new(TraceIdentityDelta {
+            identities: [expected_identity].into_iter().collect(),
+            caller_spans_seen: 1,
+            collection_errors: Vec::new(),
+        }));
+        let delayed = observed.clone();
+        let expected_extra = extra_identity.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let mut delta = delayed.lock().expect("trace test lock");
+            delta.identities.insert(expected_extra);
+            delta.caller_spans_seen += 1;
+        });
+
+        let snapshot = settle_identity_set(
+            &expected,
+            TraceIdentityDelta::default(),
+            Duration::from_millis(250),
+            Duration::from_millis(80),
+            Instant::now() + Duration::from_millis(250),
+            || std::mem::take(&mut *observed.lock().expect("trace test lock")),
+        )
+        .await;
+
+        assert!(snapshot.collection_errors.is_empty());
+        assert_eq!(
+            snapshot.identities,
+            [
+                (
+                    "previous-0".to_owned(),
+                    format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1")
+                ),
+                extra_identity,
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_resets_for_duplicate_caller_activity_before_a_late_extra() {
+        let expected_identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1"),
+        );
+        let extra_identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}2"),
+        );
+        let expected = [expected_identity.clone()].into_iter().collect();
+        let observed = Arc::new(Mutex::new(TraceIdentityDelta {
+            identities: [expected_identity].into_iter().collect(),
+            caller_spans_seen: 1,
+            collection_errors: Vec::new(),
+        }));
+        let delayed = observed.clone();
+        let expected_extra = extra_identity.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            delayed.lock().expect("trace test lock").caller_spans_seen += 1;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let mut observed = delayed.lock().expect("trace test lock");
+            observed.identities.insert(expected_extra);
+            observed.caller_spans_seen += 1;
+        });
+
+        let snapshot = settle_identity_set(
+            &expected,
+            TraceIdentityDelta::default(),
+            Duration::from_millis(250),
+            Duration::from_millis(70),
+            Instant::now() + Duration::from_millis(250),
+            || std::mem::take(&mut *observed.lock().expect("trace test lock")),
+        )
+        .await;
+
+        assert!(snapshot.collection_errors.is_empty());
+        assert!(snapshot.identities.contains(&extra_identity));
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_reports_an_incomplete_timeout() {
+        let expected = [(
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1"),
+        )]
+        .into_iter()
+        .collect();
+
+        let snapshot = settle_identity_set(
+            &expected,
+            TraceIdentityDelta::default(),
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+            Instant::now() + Duration::from_millis(30),
+            TraceIdentityDelta::default,
+        )
+        .await;
+
+        assert!(snapshot.identities.is_empty());
+        assert_eq!(snapshot.collection_errors.len(), 1);
+        assert!(snapshot.collection_errors[0].contains("1 expected identities still missing"));
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_grants_quiescence_after_observation_finishes() {
+        let identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1"),
+        );
+        let expected = [identity.clone()].into_iter().collect();
+        let mut first = true;
+        let started = Instant::now();
+
+        let snapshot = settle_identity_set(
+            &expected,
+            TraceIdentityDelta::default(),
+            Duration::from_millis(160),
+            Duration::from_millis(40),
+            started + Duration::from_millis(160),
+            || {
+                if first {
+                    first = false;
+                    std::thread::sleep(Duration::from_millis(30));
+                    TraceIdentityDelta {
+                        identities: [identity.clone()].into_iter().collect(),
+                        caller_spans_seen: 1,
+                        collection_errors: Vec::new(),
+                    }
+                } else {
+                    TraceIdentityDelta::default()
+                }
+            },
+        )
+        .await;
+
+        assert!(snapshot.collection_errors.is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(65));
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_cannot_succeed_after_its_deadline() {
+        let identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1"),
+        );
+        let expected = [identity.clone()].into_iter().collect();
+        let started = Instant::now();
+
+        let snapshot = settle_identity_set(
+            &expected,
+            TraceIdentityDelta::default(),
+            Duration::from_millis(20),
+            Duration::ZERO,
+            started + Duration::from_millis(20),
+            || {
+                std::thread::sleep(Duration::from_millis(30));
+                TraceIdentityDelta {
+                    identities: [identity.clone()].into_iter().collect(),
+                    caller_spans_seen: 1,
+                    collection_errors: Vec::new(),
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(snapshot.collection_errors.len(), 1);
+        assert!(snapshot.collection_errors[0].contains("did not remain quiet"));
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_reuses_the_collector_cache_and_retains_a_late_delta() {
+        let collector = Collector::start().await;
+        send_trace(&collector.endpoint, 1).await;
+        let first_identity = ("previous-0".to_owned(), trace_id(1));
+        let expected = [first_identity.clone()].into_iter().collect();
+        let collectors = TraceCollectors {
+            collectors: vec![("previous-0", &collector)],
+        };
+
+        let first = collectors
+            .settle(
+                &expected,
+                Duration::from_millis(150),
+                Duration::from_millis(15),
+            )
+            .await;
+        assert!(first.collection_errors.is_empty());
+        assert_eq!(first.identities, expected);
+
+        let endpoint = collector.endpoint.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            send_trace(&endpoint, 2).await;
+        });
+        let second = collectors
+            .settle(
+                &expected,
+                Duration::from_millis(300),
+                Duration::from_millis(60),
+            )
+            .await;
+        assert!(second.collection_errors.is_empty());
+        let both = [first_identity, ("previous-0".to_owned(), trace_id(2))]
+            .into_iter()
+            .collect();
+        assert_eq!(second.identities, both);
+
+        let third = collectors
+            .settle(
+                &expected,
+                Duration::from_millis(150),
+                Duration::from_millis(15),
+            )
+            .await;
+        assert!(third.collection_errors.is_empty());
+        assert_eq!(third.identities, both);
+    }
+
+    #[tokio::test]
+    async fn trace_collection_error_retains_the_partial_collector_witness() {
+        let collector = Collector::start().await;
+        send_trace(&collector.endpoint, 1).await;
+        send_trace_bytes(&collector.endpoint, vec![1]).await;
+        let expected = [("previous-0".to_owned(), trace_id(1))]
+            .into_iter()
+            .collect();
+        let collectors = TraceCollectors {
+            collectors: vec![("previous-0", &collector)],
+        };
+
+        let snapshot = collectors
+            .settle(
+                &expected,
+                Duration::from_millis(150),
+                Duration::from_millis(15),
+            )
+            .await;
+
+        assert_eq!(snapshot.identities, expected);
+        assert_eq!(snapshot.collection_errors.len(), 1);
+        assert!(snapshot.collection_errors[0].contains("malformed trace id"));
+    }
+
+    fn trace_id(sequence: u8) -> String {
+        format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}{sequence:016x}")
+    }
+
+    async fn send_trace(endpoint: &str, sequence: u8) {
+        let mut trace = [0; 16];
+        trace[..8].copy_from_slice(b"axond-ro");
+        trace[15] = sequence;
+        send_trace_bytes(endpoint, trace.to_vec()).await;
+    }
+
+    async fn send_trace_bytes(endpoint: &str, trace_id: Vec<u8>) {
+        let body = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.instance.id".to_owned(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("previous-0".to_owned())),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    ..Resource::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id,
+                        ..Span::default()
+                    }],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            }],
+        }
+        .encode_to_vec();
+        let response = reqwest::Client::new()
+            .post(format!("{endpoint}/v1/traces"))
+            .header("content-type", "application/x-protobuf")
+            .body(body)
+            .send()
+            .await
+            .expect("the trace export reaches the test collector");
+        assert!(response.status().is_success());
     }
 }

@@ -520,12 +520,14 @@ mod artifact_redaction {
 /// In this binary rather than beside the harness, for the reason the withdrawal
 /// rules above give.
 mod usage_accounting {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use serde_json::{Value, json};
 
-    use super::support::rollout::result::{ExpectedUsageIdentity, ReplicaUsage};
-    use super::support::rollout::run::reconcile;
+    use super::support::rollout::result::{
+        ExpectedUsageIdentity, FailedIngressAttempt, ReplicaUsage, UnexpectedTraceIdentity,
+    };
+    use super::support::rollout::run::{classify_unexpected_trace_identities, reconcile};
 
     fn trace(sequence: u64) -> String {
         format!("61786f6e642d726f{sequence:016x}")
@@ -546,6 +548,14 @@ mod usage_accounting {
     fn observed(sequence: u64, status: &str, request_sequence: u64) -> Value {
         json!({
             "trace_id": trace(sequence),
+            "status": status,
+            "request_id": request_id(request_sequence),
+        })
+    }
+
+    fn untraced(status: &str, request_sequence: u64) -> Value {
+        json!({
+            "trace_id": null,
             "status": status,
             "request_id": request_id(request_sequence),
         })
@@ -712,5 +722,266 @@ mod usage_accounting {
         assert_eq!(ledger.unexpected, 1);
         assert_eq!(ledger.unidentified, 1);
         assert_eq!(ledger.request_ids_distinct, 0);
+    }
+
+    #[test]
+    fn an_untraced_row_from_any_replica_fails_closed() {
+        let ledger = reconcile(
+            &[expected("previous-0", 1, "ok")],
+            &records(vec![("previous-0", vec![untraced("ok", 1)])]),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(ledger.missing, 1);
+        assert_eq!(ledger.unexpected, 1);
+        assert_eq!(ledger.unidentified, 1);
+    }
+
+    #[test]
+    fn an_idle_replica_remains_in_the_exact_trace_scope() {
+        let ledger = reconcile(
+            &[],
+            &records(vec![("previous-0", Vec::new())]),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(ledger.exact_trace_replicas, ["previous-0"]);
+        assert_eq!(row(&ledger.per_replica, "previous-0").usage_records, 0);
+    }
+
+    #[test]
+    fn failed_attempts_attribute_surplus_traces_without_exempting_them() {
+        let expected = BTreeSet::new();
+        let observed = [
+            ("previous-0".to_owned(), trace(1)),
+            ("previous-1".to_owned(), trace(2)),
+            ("next-0".to_owned(), trace(3)),
+        ]
+        .into_iter()
+        .collect();
+        let failed = [
+            FailedIngressAttempt {
+                caller_id: 1,
+                trace_id: trace(1),
+                replica: "previous-0".to_owned(),
+                reason: "transport_failure".to_owned(),
+            },
+            FailedIngressAttempt {
+                caller_id: 2,
+                trace_id: trace(2),
+                replica: "previous-1".to_owned(),
+                reason: "untyped_503".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            classify_unexpected_trace_identities(&expected, &observed, &failed),
+            [
+                UnexpectedTraceIdentity {
+                    replica: "next-0".to_owned(),
+                    trace_id: trace(3),
+                    reason: "unattributed".to_owned(),
+                },
+                UnexpectedTraceIdentity {
+                    replica: "previous-0".to_owned(),
+                    trace_id: trace(1),
+                    reason: "transport_failure".to_owned(),
+                },
+                UnexpectedTraceIdentity {
+                    replica: "previous-1".to_owned(),
+                    trace_id: trace(2),
+                    reason: "untyped_503".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_attempt_without_an_export_does_not_create_a_missing_trace() {
+        let failed = [FailedIngressAttempt {
+            caller_id: 1,
+            trace_id: trace(1),
+            replica: "previous-0".to_owned(),
+            reason: "transport_failure".to_owned(),
+        }];
+
+        assert!(
+            classify_unexpected_trace_identities(&BTreeSet::new(), &BTreeSet::new(), &failed,)
+                .is_empty()
+        );
+    }
+}
+
+/// The OTLP witness has one receiver per process. These tests exercise the
+/// decoder through its HTTP boundary so a resource cannot claim another
+/// replica or satisfy the gate with an unrelated process identity.
+mod otlp_witness {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use prost::Message;
+
+    use super::support::fault::collector::Collector;
+
+    const TRACE: &str = "61786f6e642d726f0000000000000001";
+
+    fn trace_bytes(sequence: u8) -> [u8; 16] {
+        let mut trace = [0; 16];
+        trace[..8].copy_from_slice(b"axond-ro");
+        trace[15] = sequence;
+        trace
+    }
+
+    fn resource_spans(instance: &str, trace: &[u8]) -> ResourceSpans {
+        ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.instance.id".to_owned(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(instance.to_owned())),
+                    }),
+                    ..KeyValue::default()
+                }],
+                ..Resource::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: trace.to_vec(),
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }
+    }
+
+    async fn send(collector: &Collector, resources: Vec<ResourceSpans>) {
+        let body = ExportTraceServiceRequest {
+            resource_spans: resources,
+        }
+        .encode_to_vec();
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/traces", collector.endpoint))
+            .header("content-type", "application/x-protobuf")
+            .body(body)
+            .send()
+            .await
+            .expect("the trace export reaches the receiver");
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn a_dedicated_receiver_retains_every_rollout_caller_trace() {
+        let collector = Collector::start().await;
+        send(
+            &collector,
+            vec![
+                resource_spans("previous-0", &trace_bytes(1)),
+                resource_spans("previous-0", &trace_bytes(2)),
+            ],
+        )
+        .await;
+
+        let first = [
+            TRACE.to_owned(),
+            "61786f6e642d726f0000000000000002".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            collector
+                .trace_ids_for_instance("previous-0")
+                .expect("the witness decodes"),
+            first
+        );
+        assert_eq!(
+            collector.trace_exports_decoded_for_instance("previous-0"),
+            1
+        );
+
+        // A settlement poll with no new export reuses the decoded witness.
+        assert_eq!(
+            collector
+                .trace_ids_for_instance("previous-0")
+                .expect("the cached witness remains valid"),
+            first
+        );
+        assert_eq!(
+            collector.trace_exports_decoded_for_instance("previous-0"),
+            1
+        );
+
+        send(
+            &collector,
+            vec![resource_spans("previous-0", &trace_bytes(3))],
+        )
+        .await;
+        let mut with_late_export = first;
+        with_late_export.insert("61786f6e642d726f0000000000000003".to_owned());
+        assert_eq!(
+            collector
+                .trace_ids_for_instance("previous-0")
+                .expect("only the late export is decoded"),
+            with_late_export
+        );
+        assert_eq!(
+            collector.trace_exports_decoded_for_instance("previous-0"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn one_receiver_cannot_claim_a_second_replica() {
+        let collector = Collector::start().await;
+        let trace = trace_bytes(1);
+        send(&collector, vec![resource_spans("previous-0", &trace)]).await;
+        assert_eq!(
+            collector
+                .trace_ids_for_instance("previous-0")
+                .expect("the first owner is valid"),
+            [TRACE.to_owned()].into_iter().collect()
+        );
+
+        // A foreign owner arriving after an earlier successful observation is
+        // still decoded and permanently fails the dedicated receiver.
+        send(&collector, vec![resource_spans("previous-1", &trace)]).await;
+
+        assert!(collector.trace_ids_for_instance("previous-0").is_err());
+        assert!(collector.trace_ids_for_instance("previous-0").is_err());
+        assert_eq!(
+            collector.trace_exports_decoded_for_instance("previous-0"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_foreign_resource_still_invalidates_the_receiver() {
+        let collector = Collector::start().await;
+        let mut foreign = resource_spans("previous-1", &trace_bytes(1));
+        foreign.scope_spans.clear();
+        send(&collector, vec![foreign]).await;
+
+        assert!(collector.trace_ids_for_instance("previous-0").is_err());
+        assert!(collector.trace_ids_for_instance("previous-0").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_late_malformed_trace_permanently_fails_the_cached_witness() {
+        let collector = Collector::start().await;
+        send(
+            &collector,
+            vec![resource_spans("previous-0", &trace_bytes(1))],
+        )
+        .await;
+        assert!(collector.trace_ids_for_instance("previous-0").is_ok());
+
+        send(&collector, vec![resource_spans("previous-0", &[1])]).await;
+        assert!(collector.trace_ids_for_instance("previous-0").is_err());
+        assert!(collector.trace_ids_for_instance("previous-0").is_err());
+        assert_eq!(
+            collector.trace_exports_decoded_for_instance("previous-0"),
+            2
+        );
     }
 }

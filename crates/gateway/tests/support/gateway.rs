@@ -289,7 +289,19 @@ impl Axond {
     /// candidate build behind the same ingress instead of relabelling one build
     /// as two revisions.
     pub async fn start_with_binary(upstream_base_url: &str, tuning: &str, binary: &Path) -> Self {
-        let options = Options::new(tuning);
+        Self::start_with_binary_and_env(upstream_base_url, tuning, binary, &[]).await
+    }
+
+    /// Boot a specific executable with explicit process environment. Rollout
+    /// qualification uses this to install its loopback OTLP receiver for both
+    /// retained and candidate replicas.
+    pub async fn start_with_binary_and_env(
+        upstream_base_url: &str,
+        tuning: &str,
+        binary: &Path,
+        env: &[(&str, &str)],
+    ) -> Self {
+        let options = Options::new(tuning).with_env(env);
         let mut last = String::new();
         for _ in 0..BOOT_ATTEMPTS {
             match Self::try_start_binary(upstream_base_url, &options, binary).await {

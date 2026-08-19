@@ -46,16 +46,18 @@ use crate::support::capacity::result::{
 use crate::support::gateway::{self, GATEWAY_KEY, alias};
 
 use super::fleet::{
-    COMPATIBILITY, Drained, Fleet, NEXT, NEXT_ONLY_ALIAS, PREVIOUS, Revision, pinned,
+    COMPATIBILITY, Drained, Fleet, NEXT, NEXT_ONLY_ALIAS, PREVIOUS, Revision, TraceWitnessSnapshot,
+    pinned,
 };
 use super::ingress::{Forward, Ingress, REPLICA_HEADER, REVISION_HEADER};
 use super::manifest::{RESULT_SCHEMA_VERSION, Scale, Scenario, Tier};
 use super::result::{
-    CapacityEnvelope, CommandRecord, DrainRecord, Environment, Event, ExpectedUsageIdentity, Fence,
-    InFlight, LossLedger, MigrationEvidence, MigrationMatrix, MigrationVersion, MixedVersion,
+    CapacityEnvelope, CommandRecord, DrainRecord, DrainingRefusalAttempt, Environment, Event,
+    ExpectedNonUsageTraceIdentity, ExpectedUsageIdentity, FailedIngressAttempt, Fence, InFlight,
+    LossLedger, MigrationEvidence, MigrationMatrix, MigrationVersion, MixedVersion,
     ObservedUsageIdentity, PatchRollback, PhaseTraffic, ReplicaRecord, ReplicaUsage,
     RetainedRelease, RevisionMeta, RollbackEvidence, RolloutResult, RunMeta, ScenarioEcho,
-    StreamCut,
+    StreamCut, TraceExportIdentity, UnexpectedTraceIdentity, UsageReconciliation,
 };
 use super::stateful::{
     BUFFERED_PROMPT, MigrationTarget as StatefulMigrationTarget, SLOW_PROMPT, STALLED_PROMPT,
@@ -85,6 +87,9 @@ const PREVIOUS_BINARY_ENV: &str = "AXOND_ROLLOUT_PREVIOUS_BINARY";
 const EXPECTED_PREVIOUS_VERSION_ENV: &str = "AXOND_ROLLOUT_EXPECTED_PREVIOUS_VERSION";
 const EXPECTED_PREVIOUS_SHA256_ENV: &str = "AXOND_ROLLOUT_EXPECTED_PREVIOUS_SHA256";
 const RETAINED_ARCHIVE_SHA256_ENV: &str = "AXOND_ROLLOUT_RETAINED_ARCHIVE_SHA256";
+
+const EXACT_TRACE_RECONCILIATION: &str = "exact_trace";
+const RETAINED_TRACE_CONTEXT: &str = "loopback_otlp_http";
 
 /// Run-scoped caller correlation. The high word domains rollout traffic and the
 /// low word is a monotonically allocated, one-based request sequence. It is a
@@ -294,11 +299,16 @@ pub async fn run(scenario: &Scenario, tier: Tier, manifest_text: &str) -> Rollou
 
     // Everything is quiet now, so the accounting can settle.
     let records = await_exact_usage_records(&harness, Duration::from_secs(10)).await;
+    let expected_trace_identities = harness.expected_otlp_trace_identities();
+    let trace_witness = harness
+        .fleet
+        .settle_trace_identities(&expected_trace_identities, Duration::from_secs(5))
+        .await;
     let elapsed = started.elapsed();
 
     let mixed = mixed.expect("the rollout has at least one mixed-version window");
     let revisions = revisions(&harness.fleet, &binaries);
-    let loss = ledger(&harness, &records);
+    let loss = ledger(&harness, &records, &trace_witness);
     let capacity = envelope(&harness.traffic);
     let fleet_records = fleet_records(&harness, &drains);
     let rollback = RollbackEvidence {
@@ -366,6 +376,9 @@ struct Harness {
     /// identity are derived from requests the driver proved reached a replica,
     /// never from records that happened to turn up later.
     expected_usage: Vec<ExpectedUsageIdentity>,
+    /// Direct caller traces that deliberately do not owe usage rows. Retried
+    /// drain refusals are reconstructed from the ingress attempt ledger.
+    expected_non_usage_traces: Vec<ExpectedNonUsageTraceIdentity>,
     /// Monotonic run-scoped source for caller trace identities.
     next_correlation: u64,
     mixed_probe: Option<MixedVersion>,
@@ -414,6 +427,7 @@ impl Harness {
             timeline: Timeline::new(started),
             traffic: Vec::new(),
             expected_usage: Vec::new(),
+            expected_non_usage_traces: Vec::new(),
             next_correlation: 1,
             mixed_probe: None,
             admissions: BTreeMap::new(),
@@ -440,6 +454,99 @@ impl Harness {
             trace_id: correlation.trace_id(),
             status: status.to_owned(),
         });
+    }
+
+    fn expect_non_usage_trace(&mut self, replica: &str, correlation: CorrelationId, reason: &str) {
+        self.expected_non_usage_traces
+            .push(ExpectedNonUsageTraceIdentity {
+                replica: replica.to_owned(),
+                trace_id: correlation.trace_id(),
+                reason: reason.to_owned(),
+            });
+    }
+
+    fn expected_non_usage_trace_identities(&self) -> Vec<ExpectedNonUsageTraceIdentity> {
+        let mut identities = self.expected_non_usage_traces.clone();
+        for attempt in self.draining_refusal_attempts() {
+            identities.push(ExpectedNonUsageTraceIdentity {
+                replica: attempt.refused_replica,
+                trace_id: attempt.trace_id,
+                reason: "draining_refusal".to_owned(),
+            });
+        }
+        identities.sort();
+        identities
+    }
+
+    fn draining_refusal_attempts(&self) -> Vec<DrainingRefusalAttempt> {
+        let mut attempts = Vec::new();
+        for caller in self.ingress.state.callers() {
+            let Some(trace_id) = caller.trace_id.as_ref() else {
+                continue;
+            };
+            let answered = caller.answered_by();
+            for refused in caller
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.refused_while_draining)
+            {
+                attempts.push(DrainingRefusalAttempt {
+                    caller_id: caller.id,
+                    trace_id: trace_id.clone(),
+                    refused_replica: refused.replica.clone(),
+                    accepted_replica: answered.map(|attempt| attempt.replica.clone()),
+                    accepted_status: answered.and_then(|attempt| attempt.status),
+                });
+            }
+        }
+        attempts.sort();
+        attempts
+    }
+
+    fn failed_ingress_attempts(&self) -> Vec<FailedIngressAttempt> {
+        let mut attempts = Vec::new();
+        for caller in self.ingress.state.callers() {
+            let Some(trace_id) = caller.trace_id.as_ref() else {
+                continue;
+            };
+            for attempt in &caller.attempts {
+                let reason = if attempt.refused_while_draining {
+                    continue;
+                } else if attempt.status.is_none() {
+                    "transport_failure"
+                } else if attempt.status == Some(503) {
+                    "untyped_503"
+                } else {
+                    continue;
+                };
+                attempts.push(FailedIngressAttempt {
+                    caller_id: caller.id,
+                    trace_id: trace_id.clone(),
+                    replica: attempt.replica.clone(),
+                    reason: reason.to_owned(),
+                });
+            }
+        }
+        attempts.sort();
+        attempts
+    }
+
+    fn expected_otlp_trace_identities(&self) -> BTreeSet<(String, String)> {
+        // A transport failure can leave a server span behind without a usage
+        // row. Do not silently excuse it here: the exact trace mismatch and
+        // exact trace verdict must fail, preserving the failed attempt's real
+        // attribution instead of laundering it as successful accounting. The
+        // caller may still succeed after a transport retry, so availability is
+        // judged independently.
+        self.expected_usage
+            .iter()
+            .map(|identity| (identity.replica.clone(), identity.trace_id.clone()))
+            .chain(
+                self.expected_non_usage_trace_identities()
+                    .into_iter()
+                    .map(|identity| (identity.replica, identity.trace_id)),
+            )
+            .collect()
     }
 
     /// Apply the retained layout and publish its complete desired state before
@@ -914,9 +1021,13 @@ impl Harness {
         // reaches a provider and therefore has no usage record to expect.
         if (200..300).contains(&on_next) {
             self.expect_usage(&next_id, next_correlation, "ok");
+        } else {
+            self.expect_non_usage_trace(&next_id, next_correlation, "capability_refusal");
         }
         if (200..300).contains(&on_previous) {
             self.expect_usage(&previous_id, previous_correlation, "ok");
+        } else {
+            self.expect_non_usage_trace(&previous_id, previous_correlation, "capability_refusal");
         }
         let phase = self
             .traffic
@@ -1600,7 +1711,11 @@ fn fleet_records(harness: &Harness, drains: &[DrainRecord]) -> Vec<ReplicaRecord
         .collect()
 }
 
-fn ledger(harness: &Harness, records: &[Value]) -> LossLedger {
+fn ledger(
+    harness: &Harness,
+    records: &[Value],
+    trace_witness: &TraceWitnessSnapshot,
+) -> LossLedger {
     let mut by_status: BTreeMap<String, u64> = BTreeMap::new();
     for record in records {
         let status = record["status"].as_str().unwrap_or("unknown").to_owned();
@@ -1618,6 +1733,48 @@ fn ledger(harness: &Harness, records: &[Value]) -> LossLedger {
         &harness.fleet.usage_records_by_replica(),
         &refusals,
     );
+    let trace_exports = trace_witness.exports;
+    let trace_identities = trace_witness.identities.iter().cloned().collect::<Vec<_>>();
+    let trace_export_replicas = trace_identities
+        .iter()
+        .map(|(replica, _)| replica.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let otlp_trace_identities = trace_identities
+        .into_iter()
+        .map(|(replica, trace_id)| TraceExportIdentity { replica, trace_id })
+        .collect();
+    let expected_non_usage_trace_identities = harness.expected_non_usage_trace_identities();
+    let draining_refusal_attempts = harness.draining_refusal_attempts();
+    let failed_ingress_attempts = harness.failed_ingress_attempts();
+    let expected_trace_identities = reconciliation
+        .expected
+        .iter()
+        .map(|identity| (identity.replica.clone(), identity.trace_id.clone()))
+        .chain(
+            expected_non_usage_trace_identities
+                .iter()
+                .map(|identity| (identity.replica.clone(), identity.trace_id.clone())),
+        )
+        .collect();
+    let observed_trace_identities = trace_witness.identities.clone();
+    let unexpected_otlp_trace_identities = classify_unexpected_trace_identities(
+        &expected_trace_identities,
+        &observed_trace_identities,
+        &failed_ingress_attempts,
+    );
+    let usage_reconciliation = UsageReconciliation {
+        mode: EXACT_TRACE_RECONCILIATION.to_owned(),
+        exact_trace_replicas: reconciliation.exact_trace_replicas.clone(),
+        retained_trace_context: RETAINED_TRACE_CONTEXT.to_owned(),
+        otlp_trace_exports: trace_exports,
+        otlp_trace_export_replicas: trace_export_replicas,
+        expected_non_usage_trace_identities,
+        otlp_trace_identities,
+        unexpected_otlp_trace_identities,
+        otlp_trace_collection_errors: trace_witness.collection_errors.clone(),
+    };
     LossLedger {
         caller_requests: callers.len() as u64,
         usage_records_missing: reconciliation.missing,
@@ -1638,6 +1795,9 @@ fn ledger(harness: &Harness, records: &[Value]) -> LossLedger {
         usage_records_expected: harness.expected_usage.len() as u64,
         usage_records_observed: records.len() as u64,
         usage_records_distinct: reconciliation.request_ids_distinct,
+        usage_reconciliation,
+        draining_refusal_attempts,
+        failed_ingress_attempts,
         // A typed drain refusal happens outside the accepted request path and
         // owes no usage row. It remains a routing diagnostic, never a credit
         // that can excuse an otherwise unexpected record.
@@ -1646,6 +1806,33 @@ fn ledger(harness: &Harness, records: &[Value]) -> LossLedger {
         usage_by_status: by_status,
         upstream_streams_open_at_end: harness.fleet.upstream.state.open_streams(),
     }
+}
+
+pub fn classify_unexpected_trace_identities(
+    expected: &BTreeSet<(String, String)>,
+    observed: &BTreeSet<(String, String)>,
+    failed_attempts: &[FailedIngressAttempt],
+) -> Vec<UnexpectedTraceIdentity> {
+    let reasons = failed_attempts
+        .iter()
+        .map(|attempt| {
+            (
+                (attempt.replica.clone(), attempt.trace_id.clone()),
+                attempt.reason.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    observed
+        .difference(expected)
+        .map(|(replica, trace_id)| UnexpectedTraceIdentity {
+            replica: replica.clone(),
+            trace_id: trace_id.clone(),
+            reason: reasons
+                .get(&(replica.clone(), trace_id.clone()))
+                .cloned()
+                .unwrap_or_else(|| "unattributed".to_owned()),
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -1660,6 +1847,7 @@ pub struct ReconciledUsage {
     pub request_ids_distinct: u64,
     pub status_mismatches: u64,
     pub unidentified: u64,
+    pub exact_trace_replicas: Vec<String>,
 }
 
 #[derive(Default)]
@@ -1700,7 +1888,15 @@ pub fn reconcile(
         .collect();
     observed.sort();
 
-    let mut replicas: BTreeMap<String, ReplicaReconciliation> = BTreeMap::new();
+    // The map itself is the fleet scope and deliberately includes replicas
+    // with zero rows. Seeding it first prevents an idle process from vanishing
+    // from the exact-trace disclosure and OTLP identity gate.
+    let mut replicas: BTreeMap<String, ReplicaReconciliation> = records
+        .keys()
+        .chain(refusals.keys())
+        .cloned()
+        .map(|replica| (replica, ReplicaReconciliation::default()))
+        .collect();
     let mut expected_by_identity: BTreeMap<(String, String), String> = BTreeMap::new();
     for row in &expected {
         let metrics = replicas.entry(row.replica.clone()).or_default();
@@ -1776,6 +1972,7 @@ pub fn reconcile(
     let per_replica = replicas
         .into_iter()
         .map(|(replica, metrics)| ReplicaUsage {
+            reconciliation: EXACT_TRACE_RECONCILIATION.to_owned(),
             caller_requests_answered: metrics.expected,
             usage_records: metrics.observed,
             caller_requests_refused_while_draining: refusals
@@ -1799,6 +1996,11 @@ pub fn reconcile(
         unidentified: per_replica.iter().map(|row| row.unidentified).sum(),
         request_id_duplicates,
         request_ids_distinct: request_ids.len() as u64,
+        exact_trace_replicas: per_replica
+            .iter()
+            .filter(|row| row.reconciliation == EXACT_TRACE_RECONCILIATION)
+            .map(|row| row.replica.clone())
+            .collect(),
         expected,
         observed,
         per_replica,
@@ -1935,6 +2137,48 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
         Verdict::at_most(
             "duplicate_usage_record_ids",
             result.loss.usage_record_id_duplicates as f64,
+            0.0,
+        ),
+        Verdict::at_least(
+            "otlp_trace_context_exported",
+            result
+                .loss
+                .usage_reconciliation
+                .otlp_trace_export_replicas
+                .len() as f64,
+            result.loss.usage_reconciliation.exact_trace_replicas.len() as f64,
+        ),
+        Verdict::at_most(
+            "otlp_trace_export_identity_mismatches",
+            (result
+                .loss
+                .expected_usage_identities
+                .iter()
+                .map(|identity| (&identity.replica, &identity.trace_id))
+                .chain(
+                    result
+                        .loss
+                        .usage_reconciliation
+                        .expected_non_usage_trace_identities
+                        .iter()
+                        .map(|identity| (&identity.replica, &identity.trace_id)),
+                )
+                .collect::<BTreeSet<_>>()
+                .symmetric_difference(
+                    &result
+                        .loss
+                        .usage_reconciliation
+                        .otlp_trace_identities
+                        .iter()
+                        .map(|identity| (&identity.replica, &identity.trace_id))
+                        .collect::<BTreeSet<_>>(),
+                )
+                .count()
+                + result
+                    .loss
+                    .usage_reconciliation
+                    .otlp_trace_collection_errors
+                    .len()) as f64,
             0.0,
         ),
         // Every drain must have been *observed* to leave rotation. A drain with

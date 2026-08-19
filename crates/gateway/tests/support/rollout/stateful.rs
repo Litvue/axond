@@ -139,11 +139,18 @@ impl Deployment {
         &self.workload_key
     }
 
-    pub async fn start_replica(&self, binary: &Path, shutdown: ShutdownBounds) -> Process {
+    pub async fn start_replica(
+        &self,
+        binary: &Path,
+        shutdown: ShutdownBounds,
+        extra_env: &[(String, String)],
+    ) -> Process {
+        let mut env = self.env.clone();
+        env.extend_from_slice(extra_env);
         Process::start(
             binary,
             &|bind| self.config(bind, shutdown),
-            &self.env,
+            &env,
             Boot::Ready(self.workload_key.clone()),
         )
         .await

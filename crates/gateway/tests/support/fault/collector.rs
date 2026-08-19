@@ -8,7 +8,7 @@
 //! provider URL appears, which is the leakage check on the one surface an
 //! operator forwards off the box.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +18,8 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use bytes::Bytes;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::any_value;
 use opentelemetry_proto::tonic::metrics::v1::metric;
 use prost::Message;
 use tokio::sync::oneshot;
@@ -45,6 +47,20 @@ pub struct HistogramPoint {
 #[derive(Default)]
 struct CollectorState {
     exports: Mutex<Vec<Export>>,
+    trace_identity_caches: Mutex<BTreeMap<String, TraceIdentityCache>>,
+}
+
+#[derive(Default)]
+struct TraceIdentityCache {
+    exports_seen: usize,
+    trace_exports_decoded: usize,
+    trace_id_occurrences: BTreeMap<String, u64>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TraceIdentityDelta {
+    pub occurrences: BTreeMap<String, u64>,
 }
 
 pub struct Collector {
@@ -96,6 +112,130 @@ impl Collector {
 
     pub fn bytes(&self) -> u64 {
         self.exports().iter().map(|e| e.bytes.len() as u64).sum()
+    }
+
+    /// Distinct trace ids exported by one expected process identity.
+    ///
+    /// Rollout gives every replica a dedicated receiver. Any resource in that
+    /// receiver carrying a different or missing `service.instance.id` is an
+    /// invalid witness rather than evidence another process may borrow.
+    pub fn trace_ids_for_instance(
+        &self,
+        expected_instance: &str,
+    ) -> Result<BTreeSet<String>, String> {
+        self.trace_identity_delta(expected_instance)?;
+        Ok(self.cached_trace_ids_for_instance(expected_instance))
+    }
+
+    /// Every successfully decoded trace id retained so far, including the
+    /// partial prefix of a later export that made the receiver fail closed.
+    /// Callers must separately retain any decode/ownership error; this method
+    /// exposes diagnostic state, not a successful witness by itself.
+    pub fn cached_trace_ids_for_instance(&self, expected_instance: &str) -> BTreeSet<String> {
+        let caches = self
+            .state
+            .trace_identity_caches
+            .lock()
+            .expect("collector trace cache lock");
+        caches
+            .get(expected_instance)
+            .map(|cache| cache.trace_id_occurrences.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn trace_identity_delta(
+        &self,
+        expected_instance: &str,
+    ) -> Result<TraceIdentityDelta, String> {
+        // Settlement polls this method several times while exporters flush.
+        // Decode only exports that arrived since the last observation instead
+        // of repeatedly cloning and decoding the complete retained corpus.
+        let mut caches = self
+            .state
+            .trace_identity_caches
+            .lock()
+            .expect("collector trace cache lock");
+        let cache = caches.entry(expected_instance.to_owned()).or_default();
+        if let Some(error) = &cache.error {
+            return Err(error.clone());
+        }
+        let exports = self.state.exports.lock().expect("collector lock");
+        let mut delta = TraceIdentityDelta::default();
+        for export in exports
+            .iter()
+            .skip(cache.exports_seen)
+            .filter(|export| export.signal == "traces")
+        {
+            cache.trace_exports_decoded += 1;
+            let request = match ExportTraceServiceRequest::decode(export.bytes.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let error = format!("invalid OTLP trace export: {error}");
+                    cache.error = Some(error.clone());
+                    return Err(error);
+                }
+            };
+            for resource_spans in request.resource_spans {
+                let spans = resource_spans
+                    .scope_spans
+                    .into_iter()
+                    .flat_map(|scope| scope.spans)
+                    .collect::<Vec<_>>();
+                let Some(resource) = resource_spans.resource else {
+                    let error =
+                        format!("OTLP trace export for `{expected_instance}` has no resource");
+                    cache.error = Some(error.clone());
+                    return Err(error);
+                };
+                let instances = resource
+                    .attributes
+                    .into_iter()
+                    .filter(|attribute| attribute.key == "service.instance.id")
+                    .filter_map(|attribute| attribute.value)
+                    .filter_map(|value| value.value)
+                    .filter_map(|value| match value {
+                        any_value::Value::StringValue(instance) => Some(instance),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if instances != [expected_instance] {
+                    let error = format!(
+                        "OTLP trace receiver for `{expected_instance}` observed resource identities {instances:?}"
+                    );
+                    cache.error = Some(error.clone());
+                    return Err(error);
+                }
+                if spans.is_empty() {
+                    continue;
+                }
+                for span in spans {
+                    let Some(trace_id) = canonical_trace_id(&span.trace_id) else {
+                        let error = format!(
+                            "OTLP trace receiver for `{expected_instance}` observed a malformed trace id"
+                        );
+                        cache.error = Some(error.clone());
+                        return Err(error);
+                    };
+                    *cache
+                        .trace_id_occurrences
+                        .entry(trace_id.clone())
+                        .or_default() += 1;
+                    *delta.occurrences.entry(trace_id).or_default() += 1;
+                }
+            }
+        }
+        cache.exports_seen = exports.len();
+        Ok(delta)
+    }
+
+    #[cfg(test)]
+    pub fn trace_exports_decoded_for_instance(&self, expected_instance: &str) -> usize {
+        self.state
+            .trace_identity_caches
+            .lock()
+            .expect("collector trace cache lock")
+            .get(expected_instance)
+            .map_or(0, |cache| cache.trace_exports_decoded)
     }
 
     /// Whether `needle` appears in any exported payload of `signal`.
@@ -166,6 +306,19 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+fn canonical_trace_id(bytes: &[u8]) -> Option<String> {
+    if bytes.len() != 16 || bytes.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(32);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Some(encoded)
 }
 
 type Accepted = (StatusCode, [(&'static str, &'static str); 1], Bytes);

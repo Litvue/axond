@@ -28,7 +28,7 @@ pub const CONTRACT_RELATIVE: &str = "docs/operations/qualification.md";
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const GENERIC_RECORD_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_RECORD_SCHEMA_VERSION: u32 = 2;
-pub const ROLLOUT_RECORD_SCHEMA_VERSION: u32 = 3;
+pub const ROLLOUT_RECORD_SCHEMA_VERSION: u32 = 4;
 
 pub const QUALIFICATION_CANDIDATE_VERSION: &str = "0.4.0";
 pub const ROLLOUT_PREVIOUS_VERSION: &str = "0.3.40";
@@ -482,7 +482,7 @@ pub struct RecordObservation {
     pub durable_outside_identities_files: Option<u32>,
     #[serde(default)]
     pub durable_outside_identities_bytes: Option<u64>,
-    /// Rollout schema 3 preserves both serving executable identities, the
+    /// Rollout schema 4 preserves both serving executable identities, the
     /// checksum-pinned retained archive, and the shared durable serving proof
     /// after disposable raw artifacts expire.
     #[serde(default)]
@@ -503,6 +503,22 @@ pub struct RecordObservation {
     pub rollout_previous_serves_shared_alias: Option<bool>,
     #[serde(default)]
     pub rollout_candidate_serves_shared_alias: Option<bool>,
+    /// The exact usage-reconciliation instrumentation retained after the raw
+    /// rollout artifact expires.
+    #[serde(default)]
+    pub rollout_usage_reconciliation: Option<String>,
+    #[serde(default)]
+    pub rollout_exact_trace_replicas: Option<u32>,
+    #[serde(default)]
+    pub rollout_retained_trace_context: Option<String>,
+    #[serde(default)]
+    pub rollout_otlp_trace_exports: Option<u64>,
+    #[serde(default)]
+    pub rollout_otlp_trace_export_replicas: Option<u32>,
+    #[serde(default)]
+    pub rollout_otlp_trace_identities: Option<u64>,
+    #[serde(default)]
+    pub rollout_otlp_trace_identities_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

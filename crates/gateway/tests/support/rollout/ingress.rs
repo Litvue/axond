@@ -226,6 +226,10 @@ pub struct Attempt {
 #[derive(Debug, Clone, Serialize)]
 pub struct CallerRequest {
     pub id: u64,
+    /// Caller-controlled trace identity forwarded unchanged to every retry.
+    /// The rollout harness uses it to account for typed drain-refusal spans,
+    /// which are exported but intentionally do not create usage rows.
+    pub trace_id: Option<String>,
     pub attempts: Vec<Attempt>,
 }
 
@@ -514,6 +518,12 @@ async fn proxy(State(state): State<Arc<IngressState>>, request: Request) -> Resp
 
     let mut caller = CallerRequest {
         id: state.next_caller.fetch_add(1, Ordering::SeqCst),
+        trace_id: parts
+            .headers
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split('-').nth(1))
+            .map(ToOwned::to_owned),
         attempts: Vec::new(),
     };
     let mut refused = Vec::new();

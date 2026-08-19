@@ -47,6 +47,29 @@ Traffic throughout is buffered and streamed, offered concurrently through the
 balancer, with the replica and revision that served each request recorded from
 the response headers the balancer stamps.
 
+The harness also starts a dedicated loopback OTLP/HTTP receiver for every
+replica. This is required for the retained v0.3.40 executable:
+that release copied an inbound W3C trace into a usage row only while an
+OpenTelemetry provider was active. The receiver lets the qualification keep the
+strong contract—every retained and candidate row is joined to the exact caller
+trace—rather than weakening loss detection to a count. A passing artifact names
+every exact-trace replica and records every exact caller trace decoded by that
+replica's receiver. A receiver refuses a different process identity, and the
+promoter requires the exported trace set to equal the complete caller trace
+ledger: usage-bearing requests plus explicitly reasoned capability and typed
+drain refusals that deliberately owe no usage row. The harness waits for
+caller-domain activity to remain quiet across five exporter intervals and
+judges that exact settled snapshot. A duplicate span resets the window, and any
+delayed extra decoded during that bounded five-interval drain is included and
+fails the exact-set gate; the claim does not extend to hypothetical exporter
+activity after the configured quiet window. A timeout, malformed export, or
+receiver-owner error retains the partial witness and reason in the artifact and
+fails the same gate.
+Typed drain exemptions retain the exact ingress attempt and the replica that
+subsequently accepted the same trace. Untyped 503 and transport-failure attempts
+are retained separately to attribute matching surplus spans without exempting
+them.
+
 ## What a run gates on
 
 Hard failures — all of them environment-independent:
@@ -57,6 +80,8 @@ Hard failures — all of them environment-independent:
 | `max_request_loss` / `max_unavailable_responses` | Every offered request is answered; no `503` during a replacement. |
 | `max_usage_record_loss` | One usage record per request, all flushed before the process exits. A record left behind by a refusal the balancer retried is discounted before the comparison, so a duplicate cannot fill a lost record's place. |
 | `unexplained_usage_record_surplus` / `duplicate_usage_record_ids` | No record beyond what a caller request explains, and no `request_id` recorded twice. |
+| `otlp_trace_context_exported` | Every replica-dedicated receiver observed at least one caller-domain trace, proving the qualification instrumentation was exercised by the full fleet. Readiness-only batches cannot satisfy this gate. |
+| `otlp_trace_export_identity_mismatches` | The settled exact caller traces decoded by the replica-dedicated receivers equal the complete caller trace ledger. Usage-bearing identities and exact retried drain-attempt evidence are disclosed separately, so neither a missing trace, substituted exemption, delayed arrival, nor unexplained extra trace can hide. A span from an untyped `503` or transport failure remains a mismatch even when a transport retry later succeeds; it is never converted into a passing exemption. |
 | `max_readiness_removal_ms` | How long after `SIGTERM` the balancer still considers the replica ready. |
 | `max_replacement_admission_ms` | How long a new replica takes from boot to carrying traffic. |
 | `max_drain_exit_slack_ms` | How far past `drain_grace_ms + deadline_ms + flush_timeout_ms` a termination may run. |
@@ -94,7 +119,8 @@ kernel, cores, and memory — plus:
   after withdrawal, the pinned buffered request's status, the pinned stream's cut
   time and relayed bytes, and usage records flushed.
 - `mixed_version` — the capability probe and the request counts per revision.
-- `loss` — the offered/answered ledger and usage records by status.
+- `loss` — the offered/answered ledger, exact caller/sink identities, usage
+  records by status, and the loopback OTLP trace-context witness.
 - `migration` / `rollback` — the operator commands as an operator saw them, and
   both rollback decisions.
 - `timeline` — every rollout event in the order it happened.
@@ -152,5 +178,7 @@ problem.
 - A production load balancer's own behaviour. The fixture is a representative
   readiness-driven proxy — round-robin, one retry onto another member, no outlier
   ejection.
-- Stateful serving or revision convergence during a rollout. The fleet is
-  config-only; the control plane appears here only in the migration matrix.
+- Arbitrary control-plane mutation or convergence while a rollout is in
+  progress. The heavy lane does qualify both binaries against one shared,
+  durable serving revision; mutation drills remain part of the separate
+  stateful endurance and recovery slices.

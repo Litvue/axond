@@ -124,6 +124,35 @@ that it carries the loss ledger, the per-phase traffic split by replica, the
 drain records, the mixed-version evidence, the migration and rollback evidence,
 and a chronological timeline of every rollout event.
 
+**Usage loss is reconciled by exact caller trace identity at every revision.**
+The retained v0.3.40 executable only copies inbound W3C trace context into its
+usage row when an OpenTelemetry provider is active. The qualification topology
+therefore gives every replica its own loopback OTLP/HTTP receiver. This is test
+instrumentation, not a production dependency: it preserves the same exact
+`(replica, trace_id, status)` join across the retained and candidate binaries.
+The artifact records the complete exact-trace replica set, the number of
+received trace batches, the replicas whose dedicated receiver decoded a
+caller-domain trace, and every such trace. Readiness-only batches cannot prove
+replica coverage. A receiver rejects a resource whose `service.instance.id`
+does not name its owner. Promotion independently requires the exported
+caller-trace set to equal the complete caller trace ledger and reconstructs
+every sink join from the raw ledgers. Usage-bearing traces remain separate from
+a canonical,
+reasoned list of expected typed-drain refusals that deliberately owe no usage
+row. Reduced raw diagnostics can additionally expose capability refusals, but
+they are not promotable. Promotable drain exemptions are independently reconstructed
+from the retained ingress attempt, including the refusing replica and the
+replica that accepted the same caller trace. Caller-domain export activity must
+remain quiet for five configured batch intervals before that exact snapshot is
+serialized and judged; a duplicate caller span resets the window while an
+unrelated readiness span does not. An unlisted or delayed extra decoded during
+that bounded drain still fails; this is not an unbounded claim about activity
+after the configured quiet window. A timeout, malformed export, or receiver
+ownership error is serialized with the partial witness and fails the same
+identity gate instead of aborting before diagnostics are written. A count-only
+or status-multiset fallback is not an accepted proof
+because it can hide one lost event behind an unrelated row.
+
 **Only environment-independent properties are hard failures.** The gates are:
 nothing routed to a withdrawn replica, every offered request answered, no `503`,
 one usage record per caller request with none lost — reconciled replica by
@@ -159,6 +188,10 @@ hard refusal, not a skipped passing gate.
 - The mixed-version claim is proven by both executable digest and observable
   capability, while the compatibility phase proves the candidate can consume the
   retained config before candidate-only configuration is enabled.
+- The loopback OTLP receiver is part of the qualification topology so a retained
+  revision cannot silently weaken exact usage-loss reconciliation. Production
+  deployments remain free to configure their own collector or leave telemetry
+  export disabled.
 - PostgreSQL and a distinct retained binary are promotion prerequisites; their
   absence cannot be represented as a successful heavy result.
 - A rollout run boots several processes and drains them at their real deadlines,
