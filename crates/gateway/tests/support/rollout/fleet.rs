@@ -501,6 +501,23 @@ impl Fleet {
         })
     }
 
+    /// Complete caller-domain trace identities already decoded by every
+    /// replica-dedicated collector. A settlement starts from this durable
+    /// snapshot, then uses deltas only to detect subsequent activity.
+    fn trace_identity_snapshot(&self) -> Result<BTreeSet<(String, String)>, String> {
+        let mut identities = BTreeSet::new();
+        for (replica, collector) in self.collectors() {
+            identities.extend(
+                collector
+                    .trace_ids_for_instance(replica)?
+                    .into_iter()
+                    .filter(|trace_id| trace_id.starts_with(ROLLOUT_TRACE_DOMAIN_PREFIX))
+                    .map(|trace_id| (replica.to_owned(), trace_id)),
+            );
+        }
+        Ok(identities)
+    }
+
     /// Settle the complete caller-domain trace set. Once every expected trace
     /// has arrived, the set must remain unchanged for several configured batch
     /// intervals; the returned snapshot is the one serialized and judged.
@@ -510,7 +527,8 @@ impl Fleet {
         expected: &BTreeSet<(String, String)>,
         within: Duration,
     ) -> Result<TraceWitnessSnapshot, String> {
-        let mut snapshot = settle_identity_set(expected, within, TRACE_QUIESCENCE, || {
+        let initial = self.trace_identity_snapshot()?;
+        let mut snapshot = settle_identity_set(expected, initial, within, TRACE_QUIESCENCE, || {
             self.trace_identity_delta()
         })
         .await?;
@@ -532,6 +550,7 @@ impl Fleet {
 
 async fn settle_identity_set<F>(
     expected: &BTreeSet<(String, String)>,
+    initial: BTreeSet<(String, String)>,
     within: Duration,
     quiescence: Duration,
     mut observe: F,
@@ -540,7 +559,7 @@ where
     F: FnMut() -> Result<TraceIdentityDelta, String>,
 {
     let deadline = Instant::now() + within;
-    let mut identities = BTreeSet::new();
+    let mut identities = initial;
     let mut unchanged_since = Instant::now();
     loop {
         let now = Instant::now();
@@ -681,6 +700,7 @@ flush_timeout_ms = 300
 
         let snapshot = settle_identity_set(
             &expected,
+            BTreeSet::new(),
             Duration::from_millis(250),
             Duration::from_millis(80),
             || {
@@ -734,6 +754,7 @@ flush_timeout_ms = 300
 
         let snapshot = settle_identity_set(
             &expected,
+            BTreeSet::new(),
             Duration::from_millis(250),
             Duration::from_millis(70),
             || {
@@ -759,6 +780,7 @@ flush_timeout_ms = 300
 
         let error = settle_identity_set(
             &expected,
+            BTreeSet::new(),
             Duration::from_millis(30),
             Duration::from_millis(10),
             || Ok(TraceIdentityDelta::default()),
@@ -767,5 +789,40 @@ flush_timeout_ms = 300
         .expect_err("an incomplete witness times out explicitly");
 
         assert!(error.contains("1 expected identities still missing"));
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_can_reuse_a_durable_snapshot() {
+        let identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1"),
+        );
+        let expected = [identity.clone()].into_iter().collect();
+        let mut observed = TraceIdentityDelta {
+            identities: [identity].into_iter().collect(),
+            caller_spans_seen: 1,
+        };
+
+        let first = settle_identity_set(
+            &expected,
+            BTreeSet::new(),
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            || Ok(std::mem::take(&mut observed)),
+        )
+        .await
+        .expect("the first settlement observes the incremental identity");
+
+        let second = settle_identity_set(
+            &expected,
+            first.identities.clone(),
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            || Ok(TraceIdentityDelta::default()),
+        )
+        .await
+        .expect("the second settlement reuses the durable identity snapshot");
+
+        assert_eq!(second.identities, first.identities);
     }
 }
