@@ -34,7 +34,7 @@ described a different CPU than the one the numbers came from.
 Commit two schema families, both read by `deny_unknown_fields`. Packet manifest
 schema 2 adds a frozen release-candidate cohort. Compact records evolve per
 slice: generic records remain schema 1, capacity is schema 2, and rollout is
-schema 3 because it retains both executable identities and durable shared-state
+schema 4 because it retains both executable identities and durable shared-state
 serving proof.
 
 **The packet** (`qualification/packet.toml`) states each slice's depth on a
@@ -80,7 +80,7 @@ row per executable manifest stage, raw artifact schema 2, the digest of its raw
 stage artifact, and the exact executable digest; active evidence requires that
 stage digest to equal the record's release binary. Historical rows may omit the
 new optional fields because they are indexed as history rather than retained as
-closure evidence. Rollout raw and compact schema 3 preserve published v0.3.40,
+closure evidence. Rollout raw and compact schema 4 preserve published v0.3.40,
 candidate v0.4.0, one shared durable revision and `chat` alias, and successful
 serving probes from both fleets.
 
