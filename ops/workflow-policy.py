@@ -271,10 +271,10 @@ def check_musl_installer(text: str, relative: str) -> list[str]:
                 "ops/install-musl-tools.sh path"
             )
         timeout = re.search(r"^\s*timeout-minutes:\s*(\d+)\s*$", block, re.MULTILINE)
-        if not timeout or not 1 <= int(timeout.group(1)) <= 25:
+        if not timeout or int(timeout.group(1)) != 25:
             failures.append(
-                f"{relative}:{number}: musl install needs an outer timeout-minutes "
-                "of at most 25"
+                f"{relative}:{number}: musl install needs the reviewed 25-minute "
+                "outer timeout that its inner-budget self-test targets"
             )
         if re.search(r"^\s*continue-on-error:\s*true\s*$", block, re.MULTILINE):
             failures.append(
@@ -438,7 +438,7 @@ def self_test() -> list[str]:
         "    steps:\n"
         "      - name: Install musl tools\n"
         "        if: matrix.musl\n"
-        "        timeout-minutes: 20\n"
+        "        timeout-minutes: 25\n"
         "        run: bash ops/install-musl-tools.sh\n"
     )
     good_release_musl = (
@@ -472,7 +472,13 @@ def self_test() -> list[str]:
             "a missing outer timeout",
             ".github/workflows/ci.yml",
             good_musl.replace("        timeout-minutes: 25\n", "", 1),
-            "outer timeout-minutes",
+            "reviewed 25-minute",
+        ),
+        (
+            "an outer timeout shorter than the reviewed budget",
+            ".github/workflows/ci.yml",
+            good_musl.replace("        timeout-minutes: 25\n", "        timeout-minutes: 20\n", 1),
+            "reviewed 25-minute",
         ),
         (
             "only one musl lane",

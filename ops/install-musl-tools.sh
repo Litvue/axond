@@ -6,7 +6,7 @@
 set -euo pipefail
 
 readonly APT_ATTEMPTS=3
-readonly APT_TIMEOUT_SECONDS=180
+readonly APT_TIMEOUT_SECONDS=150
 readonly APT_KILL_AFTER_SECONDS=15
 readonly RETRY_DELAY_SECONDS=5
 
@@ -75,7 +75,8 @@ install_musl_tools() {
 }
 
 self_test() {
-    local actual expected attempts repairs sleeps status problems=0
+    local actual expected attempts bounded_commands outer_seconds repairs
+    local sleeps status worst_case_seconds problems=0
 
     # Assert that both apt phases are wrapped in the reviewed timeout and apt
     # retry options; replacing this with a stubbed success would make the retry
@@ -84,7 +85,7 @@ self_test() {
         printf '%s\n' "$*"
     }
     actual="$(run_bounded_apt update)"
-    expected="-n env DEBIAN_FRONTEND=noninteractive timeout --signal=TERM --kill-after=15s 180s apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 update"
+    expected="-n env DEBIAN_FRONTEND=noninteractive timeout --signal=TERM --kill-after=15s 150s apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 update"
     if [[ $actual != "$expected" ]]; then
         echo "self-test: bounded apt command was '$actual', expected '$expected'" >&2
         problems=1
@@ -93,9 +94,23 @@ self_test() {
     # only after its exact command has been asserted here.
     # shellcheck disable=SC2218
     actual="$(repair_dpkg)"
-    expected="-n env DEBIAN_FRONTEND=noninteractive timeout --signal=TERM --kill-after=15s 180s dpkg --configure -a"
+    expected="-n env DEBIAN_FRONTEND=noninteractive timeout --signal=TERM --kill-after=15s 150s dpkg --configure -a"
     if [[ $actual != "$expected" ]]; then
         echo "self-test: bounded dpkg repair was '$actual', expected '$expected'" >&2
+        problems=1
+    fi
+
+    # The three workflow steps cap this script at 25 minutes. Even if every apt
+    # and repair command needs its TERM-to-KILL grace, leave at least one minute
+    # for this script to print its terminal diagnostic before Actions stops it.
+    bounded_commands=$((APT_ATTEMPTS * 2 + APT_ATTEMPTS - 1))
+    worst_case_seconds=$((
+        bounded_commands * (APT_TIMEOUT_SECONDS + APT_KILL_AFTER_SECONDS)
+        + RETRY_DELAY_SECONDS * APT_ATTEMPTS * (APT_ATTEMPTS - 1) / 2
+    ))
+    outer_seconds=$((25 * 60))
+    if ((worst_case_seconds > outer_seconds - 60)); then
+        echo "self-test: ${worst_case_seconds}s inner budget leaves less than one minute inside ${outer_seconds}s Actions timeout" >&2
         problems=1
     fi
 
