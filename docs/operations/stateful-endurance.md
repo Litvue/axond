@@ -62,9 +62,11 @@ the allowance plus the slack rather than by the allowance alone. A test asserts
 every one of those separations at both durations. The separate
 `upstream_outage_correlation_slack_ms` widens only the provider outage's leading
 edge for exact cancellation/status correlation; it never extends recovery.
-The supervisor applies scripted transitions before network probes and
-`event_dispatch_slack_ms` bounds every observed transition after its nominal
-offset; missing that bound fails the run rather than silently widening a fault.
+An independent timer applies fault-gate transitions while the supervisor
+measures convergence and probes the fleet. `event_dispatch_slack_ms` bounds
+each observed gate edge after its nominal offset; missing that bound becomes a
+recorded failed stop, so the diagnostic artifact survives instead of silently
+widening a fault or disappearing in a panic.
 
 | Tier | Duration | Concurrency | Sample interval | Segment |
 | --- | --- | --- | --- | --- |

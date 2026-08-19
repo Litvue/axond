@@ -61,9 +61,10 @@ segment_ms = 900000
 # attribution span at ninety seconds and outside it at twelve hours, which is
 # two different qualifications rather than one at two scales.
 [profile.schedule]
-# Every scripted transition must be applied within this bound after its
-# committed offset. It is larger than the 100 ms supervisor tick and fails the
-# run if host scheduling would otherwise turn a narrow fault into a broad one.
+# Every fault-gate transition must be applied within this bound after its
+# committed offset. A dedicated timer actuates the gates independently of the
+# supervisor's convergence and probe work; a late edge is recorded as a failed
+# run instead of silently turning a narrow fault into a broad one.
 event_dispatch_slack_ms = 250
 catalogue_revision_at = 0.06
 credential_revision_at = 0.11
@@ -83,8 +84,8 @@ upstream_outage_for = 0.06
 # gateway observes and records the terminal upstream close immediately after.
 # This leading allowance is one 250 ms harness drain interval before the
 # committed nominal opening. The window closes at the observed instant the
-# supervisor restores the provider gate, before that tick's probes and no more
-# than event_dispatch_slack_ms after the nominal close. It does not extend to
+# gate scheduler restores the provider gate, independently of the supervisor's
+# probes and no more than event_dispatch_slack_ms after the nominal close. It does not extend to
 # the later recovery-success allowance.
 upstream_outage_correlation_slack_ms = 250
 usage_backend_outage_at = 0.52

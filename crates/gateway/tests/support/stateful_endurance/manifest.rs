@@ -103,8 +103,8 @@ pub struct SloOverrides {
 /// the offered duration rather than offsets, so both tiers run the same script.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Schedule {
-    /// Maximum permitted delay between a committed event offset and the
-    /// supervisor actually applying that transition.
+    /// Maximum permitted delay between a committed fault-gate offset and the
+    /// independent gate scheduler actually applying that transition.
     pub event_dispatch_slack_ms: u64,
     pub catalogue_revision_at: f64,
     pub credential_revision_at: f64,
@@ -155,6 +155,21 @@ pub enum Event {
 }
 
 impl Event {
+    /// Whether this event changes one of the two fault gates. Gate transitions
+    /// run on their own timer so convergence and probe work in the supervisor
+    /// cannot broaden a committed fault window.
+    pub fn is_gate_transition(self) -> bool {
+        matches!(
+            self,
+            Self::UpstreamLatencyBegins
+                | Self::UpstreamLatencyEnds
+                | Self::UpstreamOutageBegins
+                | Self::UpstreamOutageEnds
+                | Self::UsageBackendOutageBegins
+                | Self::UsageBackendOutageEnds
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CatalogueRevision => "catalogue-revision",
@@ -360,6 +375,10 @@ pub enum Stop {
     UnplannedErrors,
     /// A restarted replica never came back ready.
     ReplicaNeverReady,
+    /// The harness could not apply a committed fault-gate edge in bound. The
+    /// transition is still applied and the run is finalized so its diagnostic
+    /// artifact survives; it is not promotable qualification evidence.
+    EventDispatchLate,
 }
 
 impl Stop {
