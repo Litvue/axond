@@ -124,18 +124,23 @@ impl Collector {
         expected_instance: &str,
     ) -> Result<BTreeSet<String>, String> {
         self.trace_identity_delta(expected_instance)?;
+        Ok(self.cached_trace_ids_for_instance(expected_instance))
+    }
+
+    /// Every successfully decoded trace id retained so far, including the
+    /// partial prefix of a later export that made the receiver fail closed.
+    /// Callers must separately retain any decode/ownership error; this method
+    /// exposes diagnostic state, not a successful witness by itself.
+    pub fn cached_trace_ids_for_instance(&self, expected_instance: &str) -> BTreeSet<String> {
         let caches = self
             .state
             .trace_identity_caches
             .lock()
             .expect("collector trace cache lock");
-        Ok(caches
+        caches
             .get(expected_instance)
-            .expect("trace decoding created the owner cache")
-            .trace_id_occurrences
-            .keys()
-            .cloned()
-            .collect())
+            .map(|cache| cache.trace_id_occurrences.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn trace_identity_delta(

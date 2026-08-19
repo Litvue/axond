@@ -145,8 +145,12 @@ from the retained ingress attempt, including the refusing replica and the
 replica that accepted the same caller trace. Caller-domain export activity must
 remain quiet for five configured batch intervals before that exact snapshot is
 serialized and judged; a duplicate caller span resets the window while an
-unrelated readiness span does not. An unlisted or delayed extra trace still
-fails. A count-only or status-multiset fallback is not an accepted proof
+unrelated readiness span does not. An unlisted or delayed extra decoded during
+that bounded drain still fails; this is not an unbounded claim about activity
+after the configured quiet window. A timeout, malformed export, or receiver
+ownership error is serialized with the partial witness and fails the same
+identity gate instead of aborting before diagnostics are written. A count-only
+or status-multiset fallback is not an accepted proof
 because it can hide one lost event behind an unrelated row.
 
 **Only environment-independent properties are hard failures.** The gates are:

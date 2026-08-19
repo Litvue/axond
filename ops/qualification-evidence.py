@@ -1143,6 +1143,7 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
     if (
         usage_reconciliation.get("mode") != "exact_trace"
         or usage_reconciliation.get("retained_trace_context") != "loopback_otlp_http"
+        or usage_reconciliation.get("otlp_trace_collection_errors") != []
         or not isinstance(usage_reconciliation.get("exact_trace_replicas"), list)
         or fleet_replicas is None
         or len(set(fleet_replicas)) != len(fleet_replicas)
@@ -2009,6 +2010,7 @@ def self_test() -> int:
                 "otlp_trace_exports": 1,
                 "otlp_trace_export_replicas": ["candidate-0"],
                 "expected_non_usage_trace_identities": [],
+                "otlp_trace_collection_errors": [],
                 "otlp_trace_identities": [
                     {
                         "replica": "candidate-0",
@@ -2162,6 +2164,12 @@ def self_test() -> int:
         for name, mutate in (
             ("attributed exported extra", lambda candidate: None),
             (
+                "OTLP trace collection error",
+                lambda candidate: candidate["loss"]["usage_reconciliation"].update(
+                    otlp_trace_collection_errors=["settlement timed out"]
+                ),
+            ),
+            (
                 "failed-attempt reason substitution",
                 lambda candidate: candidate["loss"]["failed_ingress_attempts"][0].update(
                     reason="untyped_503"
@@ -2194,7 +2202,9 @@ def self_test() -> int:
             ),
         ):
             invalid = copy.deepcopy(
-                attributed_export if name == "attributed exported extra" else transport_retry
+                attributed_export
+                if name in {"attributed exported extra", "OTLP trace collection error"}
+                else transport_retry
             )
             mutate(invalid)
             try:

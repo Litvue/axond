@@ -59,8 +59,12 @@ promoter requires the exported trace set to equal the complete caller trace
 ledger: usage-bearing requests plus explicitly reasoned capability and typed
 drain refusals that deliberately owe no usage row. The harness waits for
 caller-domain activity to remain quiet across five exporter intervals and
-judges that exact settled snapshot, so a duplicate span resets the window and a
-delayed extra trace cannot arrive after the gate has already taken its evidence.
+judges that exact settled snapshot. A duplicate span resets the window, and any
+delayed extra decoded during that bounded five-interval drain is included and
+fails the exact-set gate; the claim does not extend to hypothetical exporter
+activity after the configured quiet window. A timeout, malformed export, or
+receiver-owner error retains the partial witness and reason in the artifact and
+fails the same gate.
 Typed drain exemptions retain the exact ingress attempt and the replica that
 subsequently accepted the same trace. Untyped 503 and transport-failure attempts
 are retained separately to attribute matching surplus spans without exempting

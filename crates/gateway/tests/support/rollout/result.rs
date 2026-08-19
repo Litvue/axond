@@ -488,6 +488,10 @@ pub struct UsageReconciliation {
     /// an exact failed ingress attempt when one exists. Every row still counts
     /// in `otlp_trace_export_identity_mismatches`.
     pub unexpected_otlp_trace_identities: Vec<UnexpectedTraceIdentity>,
+    /// Bounded settlement, decoding, or receiver-ownership failures. The
+    /// partial identity set remains in this artifact for diagnosis, but any
+    /// non-empty value fails the exact trace mismatch verdict and promotion.
+    pub otlp_trace_collection_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]

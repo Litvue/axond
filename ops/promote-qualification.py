@@ -1839,6 +1839,9 @@ def validate_raw_rollout(
     claimed_unexpected_trace_identities = reconciliation.get(
         "unexpected_otlp_trace_identities"
     )
+    claimed_trace_collection_errors = reconciliation.get(
+        "otlp_trace_collection_errors"
+    )
     if (
         reconciliation.get("mode") != "exact_trace"
         or reconciliation.get("exact_trace_replicas") != expected_exact_replicas
@@ -1850,6 +1853,7 @@ def validate_raw_rollout(
         or not isinstance(claimed_failed_attempts, list)
         or not isinstance(claimed_trace_identities, list)
         or not isinstance(claimed_unexpected_trace_identities, list)
+        or claimed_trace_collection_errors != []
         or not isinstance(trace_exports, int)
         or isinstance(trace_exports, bool)
         or trace_exports < len(expected_exact_replicas)
@@ -2283,6 +2287,7 @@ def validate_raw_rollout(
         "otlp_trace_exports": trace_exports,
         "otlp_trace_export_replicas": expected_exact_replicas,
         "expected_non_usage_trace_identities": expected_non_usage_trace_identities,
+        "otlp_trace_collection_errors": [],
         "otlp_trace_identities": expected_trace_identities,
         "unexpected_otlp_trace_identities": expected_unexpected_trace_identities,
     }
@@ -5922,6 +5927,7 @@ def self_test() -> int:
                 "otlp_trace_exports": len(exact_replicas),
                 "otlp_trace_export_replicas": exact_replicas,
                 "expected_non_usage_trace_identities": [],
+                "otlp_trace_collection_errors": [],
                 "otlp_trace_identities": otlp_trace_identities,
                 "unexpected_otlp_trace_identities": [],
             },
@@ -6397,6 +6403,11 @@ def self_test() -> int:
             "incomplete OTLP caller-trace witness",
             "otlp_trace_identities",
             otlp_trace_identities[1:],
+        ),
+        (
+            "OTLP trace collection error",
+            "otlp_trace_collection_errors",
+            ["settlement timed out"],
         ),
     ):
         invalid = copy.deepcopy(rollout_result)

@@ -303,8 +303,7 @@ pub async fn run(scenario: &Scenario, tier: Tier, manifest_text: &str) -> Rollou
     let trace_witness = harness
         .fleet
         .settle_trace_identities(&expected_trace_identities, Duration::from_secs(5))
-        .await
-        .unwrap_or_else(|error| panic!("rollout OTLP trace export must decode: {error}"));
+        .await;
     let elapsed = started.elapsed();
 
     let mixed = mixed.expect("the rollout has at least one mixed-version window");
@@ -1774,6 +1773,7 @@ fn ledger(
         expected_non_usage_trace_identities,
         otlp_trace_identities,
         unexpected_otlp_trace_identities,
+        otlp_trace_collection_errors: trace_witness.collection_errors.clone(),
     };
     LossLedger {
         caller_requests: callers.len() as u64,
@@ -2150,7 +2150,7 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
         ),
         Verdict::at_most(
             "otlp_trace_export_identity_mismatches",
-            result
+            (result
                 .loss
                 .expected_usage_identities
                 .iter()
@@ -2173,7 +2173,12 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
                         .map(|identity| (&identity.replica, &identity.trace_id))
                         .collect::<BTreeSet<_>>(),
                 )
-                .count() as f64,
+                .count()
+                + result
+                    .loss
+                    .usage_reconciliation
+                    .otlp_trace_collection_errors
+                    .len()) as f64,
             0.0,
         ),
         // Every drain must have been *observed* to leave rotation. A drain with
