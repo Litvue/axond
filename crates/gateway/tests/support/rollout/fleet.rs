@@ -44,14 +44,18 @@ pub const NEXT_ONLY_ALIAS: &str = "chat-next-only";
 /// is starved, and the alternative is a phantom lost usage record.
 const OUTPUT_SETTLE: Duration = Duration::from_secs(5);
 
-/// The transport bounds every replica is booted with. Written out rather than
-/// defaulted so the recorded config hash pins them: a later change to a shipped
-/// default must not silently move a qualification result.
-const TUNING: &str = r"
+/// Stateless failover bounds. Stateful mode projects failover policy from the
+/// control plane, so these must never appear in its bootstrap TOML.
+const STATELESS_FAILOVER_TUNING: &str = r"
 [failover]
 max_attempts = 1
 overall_timeout_ms = 60000
+";
 
+/// The transport bounds every replica is booted with. Written out rather than
+/// defaulted so the recorded config hash pins them: a later change to a shipped
+/// default must not silently move a qualification result.
+const TRANSPORT_TUNING: &str = r"
 [transport]
 connect_timeout_ms = 10000
 response_header_timeout_ms = 30000
@@ -84,8 +88,11 @@ impl Revision {
 
     /// The stateless diagnostic config this revision adds on top of the shared
     /// bounds. Stateful deployment bypasses this candidate-only model.
-    pub fn tuning(self, shutdown: ShutdownBounds) -> String {
-        let mut tuning = format!("{TUNING}{}", shutdown.toml());
+    pub fn stateless_tuning(self, shutdown: ShutdownBounds) -> String {
+        let mut tuning = format!(
+            "{STATELESS_FAILOVER_TUNING}{TRANSPORT_TUNING}{}",
+            shutdown.toml()
+        );
         if self.label == NEXT {
             tuning.push_str(&format!(
                 "\n[[model]]\nname = \"{NEXT_ONLY_ALIAS}\"\ntargets = [ {{ provider = \
@@ -98,6 +105,12 @@ impl Revision {
             ));
         }
         tuning
+    }
+
+    /// Bootstrap-only tuning for a stateful replica. Failover and serving
+    /// policy are deliberately absent because the durable revision owns them.
+    pub fn stateful_tuning(shutdown: ShutdownBounds) -> String {
+        format!("{TRANSPORT_TUNING}{}", shutdown.toml())
     }
 }
 
@@ -221,7 +234,7 @@ impl Fleet {
             None => crate::support::gateway::config_toml(
                 bind,
                 &self.upstream.base_url,
-                &revision.tuning(self.shutdown),
+                &revision.stateless_tuning(self.shutdown),
                 "",
             ),
         }
@@ -286,7 +299,7 @@ impl Fleet {
             None => Process::Stateless(
                 Axond::start_with_binary(
                     &self.upstream.base_url,
-                    &revision.tuning(self.shutdown),
+                    &revision.stateless_tuning(self.shutdown),
                     binary,
                 )
                 .await,
@@ -427,4 +440,60 @@ pub mod pinned {
     pub const BUFFERED: &str = super::alias::CHAT_LATE_HEADERS;
     /// A stream whose upstream never ends it, so only the shutdown deadline can.
     pub const STREAM: &str = super::alias::CHAT_STALL_AFTER_BYTES;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHUTDOWN: ShutdownBounds = ShutdownBounds {
+        drain_grace_ms: 100,
+        deadline_ms: 200,
+        flush_timeout_ms: 300,
+    };
+
+    #[test]
+    fn stateful_tuning_contains_only_bootstrap_owned_sections() {
+        let tuning = Revision::stateful_tuning(SHUTDOWN);
+
+        assert!(tuning.contains("[transport]"));
+        assert!(tuning.contains("[shutdown]"));
+        assert!(!tuning.contains("[failover]"));
+        assert!(!tuning.contains("[[model]]"));
+    }
+
+    #[test]
+    fn stateless_tuning_retains_the_previous_config_contract() {
+        let previous = Revision::previous().stateless_tuning(SHUTDOWN);
+        let compatibility = Revision::compatibility().stateless_tuning(SHUTDOWN);
+        let next = Revision::next().stateless_tuning(SHUTDOWN);
+        let expected = r"
+[failover]
+max_attempts = 1
+overall_timeout_ms = 60000
+
+[transport]
+connect_timeout_ms = 10000
+response_header_timeout_ms = 30000
+buffered_body_timeout_ms = 30000
+stream_idle_timeout_ms = 30000
+
+[shutdown]
+drain_grace_ms = 100
+deadline_ms = 200
+flush_timeout_ms = 300
+";
+
+        assert_eq!(previous, expected);
+        assert_eq!(compatibility, expected);
+        assert_eq!(
+            next,
+            format!(
+                "{expected}\n[[model]]\nname = \"chat-next-only\"\ntargets = [ {{ provider = \
+                 \"fake-openai\", model = \"fixture-chat\", price = {{ \
+                 input_microdollars_per_million = 2500000, \
+                 output_microdollars_per_million = 10000000 }} }} ]\n"
+            )
+        );
+    }
 }

@@ -120,33 +120,7 @@ impl Deployment {
     }
 
     pub fn config(&self, bind: SocketAddr, shutdown: ShutdownBounds) -> String {
-        let tuning = Revision::compatibility().tuning(shutdown);
-        format!(
-            "mode = \"stateful\"\n\
-             [server]\n\
-             bind = \"{bind}\"\n\
-             [control_plane]\n\
-             dsn_env = \"{DSN_ENV}\"\n\
-             schema = \"{schema}\"\n\
-             connect_timeout_ms = 5000\n\
-             operation_timeout_ms = 30000\n\
-             [secret_store]\n\
-             backend = \"postgres\"\n\
-             kek_env = \"{KEK_ENV}\"\n\
-             schema = \"{schema}\"\n\
-             [catalog]\n\
-             source = \"seed\"\n\
-             store = \"postgres\"\n\
-             schema = \"{schema}\"\n\
-             bootstrap = \"seed\"\n\
-             [[admin_breakglass]]\n\
-             env = \"{BREAKGLASS_ENV}\"\n\
-             id = \"breakglass\"\n\
-             [[usage_sink]]\n\
-             kind = \"stdout\"\n\
-             {tuning}",
-            schema = self.schema,
-        )
+        render_bootstrap_config(bind, &self.schema, shutdown)
     }
 
     pub fn migration_target(&self) -> MigrationTarget {
@@ -516,6 +490,66 @@ impl Deployment {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+
+fn render_bootstrap_config(bind: SocketAddr, schema: &str, shutdown: ShutdownBounds) -> String {
+    let tuning = Revision::stateful_tuning(shutdown);
+    format!(
+        "mode = \"stateful\"\n\
+         [server]\n\
+         bind = \"{bind}\"\n\
+         [control_plane]\n\
+         dsn_env = \"{DSN_ENV}\"\n\
+         schema = \"{schema}\"\n\
+         connect_timeout_ms = 5000\n\
+         operation_timeout_ms = 30000\n\
+         [secret_store]\n\
+         backend = \"postgres\"\n\
+         kek_env = \"{KEK_ENV}\"\n\
+         schema = \"{schema}\"\n\
+         [catalog]\n\
+         source = \"seed\"\n\
+         store = \"postgres\"\n\
+         schema = \"{schema}\"\n\
+         bootstrap = \"seed\"\n\
+         [[admin_breakglass]]\n\
+         env = \"{BREAKGLASS_ENV}\"\n\
+         id = \"breakglass\"\n\
+         [[usage_sink]]\n\
+         kind = \"stdout\"\n\
+         {tuning}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use figment::Figment;
+    use figment::providers::{Format, Toml};
+
+    use super::*;
+
+    #[test]
+    fn rendered_stateful_bootstrap_omits_control_plane_owned_sections() {
+        let config = render_bootstrap_config(
+            SocketAddr::from(([127, 0, 0, 1], 8080)),
+            "rollout_schema",
+            ShutdownBounds {
+                drain_grace_ms: 100,
+                deadline_ms: 200,
+                flush_timeout_ms: 300,
+            },
+        );
+        let parsed: serde_json::Value = Figment::from(Toml::string(&config))
+            .extract()
+            .expect("the rendered bootstrap is valid TOML");
+
+        assert_eq!(parsed["mode"], "stateful");
+        assert_eq!(parsed["control_plane"]["schema"], "rollout_schema");
+        assert_eq!(parsed["transport"]["connect_timeout_ms"], 10_000);
+        assert_eq!(parsed["shutdown"]["deadline_ms"], 200);
+        assert!(parsed.get("failover").is_none());
+        assert!(parsed.get("model").is_none());
     }
 }
 
