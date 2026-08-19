@@ -476,7 +476,7 @@ def render(results: list[dict], runner: str, note: str) -> str:
             f"accepted = {throughput['accepted']}",
             f"rejected = {throughput['rejected']}",
             f"errors = {throughput['errors']}",
-            f"elapsed_ms = {throughput['elapsed_ms']}",
+            f"elapsed_ms = {result['run']['elapsed_ms']}",
             f"accepted_rps = {number(throughput['accepted_rps'])}",
             f"latency_p50_ms = {number(latency['p50'], 2)}",
             f"latency_p95_ms = {number(latency['p95'], 2)}",
@@ -1447,6 +1447,64 @@ def self_test() -> int:
         )
         is None
     )
+
+    capacity_result = {
+        "schema_version": CAPACITY_RESULT_SCHEMA_VERSION,
+        "profile": {
+            "id": "elapsed-contract",
+            "tier": "heavy",
+            "concurrency": 1,
+            "requests": 1,
+        },
+        "run": {"elapsed_ms": 1001},
+        "throughput": {
+            "offered": 1,
+            "accepted": 1,
+            "rejected": 0,
+            "errors": 0,
+            "elapsed_ms": 1000,
+            "accepted_rps": 1.0,
+        },
+        "latency_ms": {"p50": 1.0, "p95": 1.0, "p99": 1.0},
+        "resources": {
+            "rss_kib": {"baseline": 1, "peak": 2, "settled": 2},
+            "sockets": {"peak": 1},
+            "cpu_seconds": 0.01,
+        },
+        "usage_records": {"missing": 0},
+        "occupancy": {"admission_max_in_flight": None},
+        "upstream": {"streams_open_at_end": 0},
+        "verdicts": [{"passed": True}],
+        "environment": {
+            "source": {
+                "git_commit": "commit",
+                "git_dirty": False,
+                "crate_version": "0.0.0",
+            },
+            "binary": {"sha256": "binary", "version": "0.0.0"},
+            "toolchain": {"cargo_profile": "release", "rustc": "rustc test"},
+            "manifest": {"path": "manifest.toml", "sha256": "manifest"},
+            "config": {"sha256": "config"},
+            "fixtures": [],
+            "hardware": {
+                "os": "test",
+                "arch": "test",
+                "kernel": "kernel",
+                "cpu_model": "cpu",
+                "cpus": 1,
+                "total_memory_kib": 1,
+                "containerized": False,
+            },
+        },
+    }
+    with tempfile.TemporaryDirectory() as capacity_directory:
+        capacity_path = Path(capacity_directory) / "elapsed-contract.json"
+        capacity_path.write_text(json.dumps(capacity_result), encoding="utf-8")
+        capacity_result["_artifact_path"] = str(capacity_path)
+        capacity_record = tomllib.loads(
+            render([capacity_result], "github-actions", "capacity self-test")
+        )
+        assert capacity_record["profile"][0]["elapsed_ms"] == 1001
 
     manifest_relative = GENERIC_MANIFESTS["rollout"]
     manifest_bytes = (ROOT / manifest_relative).read_bytes()
