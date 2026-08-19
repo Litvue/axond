@@ -22,7 +22,7 @@ use crate::support::endurance::manifest::Mix;
 pub const MANIFEST_RELATIVE: &str = "qualification/stateful-endurance/manifest.toml";
 
 /// The manifest schema this harness understands.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// The result-artifact schema version. Bumped when a field changes meaning, so
 /// a stored artifact is never reinterpreted under a newer contract.
@@ -111,6 +111,11 @@ pub struct Schedule {
     pub upstream_latency_ms: u64,
     pub upstream_outage_at: f64,
     pub upstream_outage_for: f64,
+    /// Leading-edge allowance for the gateway to observe a caller close. A
+    /// client can finish just before the gate cuts the upstream while the
+    /// gateway settles that same request just after it. This is deliberately
+    /// separate from the much larger recovery allowance.
+    pub upstream_outage_correlation_slack_ms: u64,
     pub usage_backend_outage_at: f64,
     pub usage_backend_outage_for: f64,
     /// How far either side of the usage-backend outage a record still counts as
@@ -171,6 +176,20 @@ pub struct Scheduled {
 }
 
 impl Schedule {
+    /// The exact integer window used for stateful cancellation correlation.
+    ///
+    /// Computing directly in milliseconds avoids asking the promoter to mimic
+    /// `Duration::mul_f64`'s nanosecond rounding before truncation. Python's
+    /// `int(duration_ms * fraction)` is the same non-negative floor operation.
+    pub fn upstream_correlation_window_ms(&self, duration: Duration) -> (u64, u64) {
+        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let at = |fraction: f64| ((duration_ms as f64) * fraction.clamp(0.0, 1.0)).floor() as u64;
+        (
+            at(self.upstream_outage_at).saturating_sub(self.upstream_outage_correlation_slack_ms),
+            at(self.upstream_outage_at + self.upstream_outage_for),
+        )
+    }
+
     /// The script, in the order it happens. Resolving fractions against the
     /// duration here — rather than in the driver — is what makes the smoke tier
     /// a shorter run of the same qualification rather than a different one.

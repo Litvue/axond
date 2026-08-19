@@ -514,17 +514,13 @@ def stateful_correlation_tally(
     return tally
 
 
-def stateful_correlation_window_tally(
-    directory: Path,
-    correlation_directory: Path,
-    label: str,
-    seed: int,
-    duration_ms: int,
-    schedule: dict[str, Any],
-) -> dict[str, int]:
-    """Re-derive exact code-4 membership from retained request intervals."""
+def stateful_correlation_window_ms(
+    duration_ms: int, schedule: dict[str, Any], label: str
+) -> tuple[int, int]:
+    """Mirror the harness' non-negative floating multiply then ms floor."""
     outage_at = schedule.get("upstream_outage_at")
     outage_for = schedule.get("upstream_outage_for")
+    leading_slack_ms = schedule.get("upstream_outage_correlation_slack_ms")
     if (
         not isinstance(duration_ms, int)
         or isinstance(duration_ms, bool)
@@ -535,14 +531,36 @@ def stateful_correlation_window_tally(
         or not isinstance(outage_for, (int, float))
         or isinstance(outage_for, bool)
         or not math.isfinite(outage_for)
+        or not isinstance(leading_slack_ms, int)
+        or isinstance(leading_slack_ms, bool)
+        or leading_slack_ms < 0
     ):
         fail(f"{label}: correlation-window schedule is malformed")
-    opened_ms = int(duration_ms * min(max(float(outage_at), 0.0), 1.0))
+    opened_ms = max(
+        0,
+        int(duration_ms * min(max(float(outage_at), 0.0), 1.0))
+        - leading_slack_ms,
+    )
     closed_ms = int(
         duration_ms * min(max(float(outage_at + outage_for), 0.0), 1.0)
     )
     if opened_ms >= closed_ms:
-        fail(f"{label}: raw upstream outage window is empty")
+        fail(f"{label}: upstream correlation window is empty")
+    return opened_ms, closed_ms
+
+
+def stateful_correlation_window_tally(
+    directory: Path,
+    correlation_directory: Path,
+    label: str,
+    seed: int,
+    duration_ms: int,
+    schedule: dict[str, Any],
+) -> dict[str, int]:
+    """Re-derive exact code-4 membership from retained request intervals."""
+    opened_ms, closed_ms = stateful_correlation_window_ms(
+        duration_ms, schedule, label
+    )
 
     workload_high = (seed ^ CORRELATION_DOMAIN).to_bytes(8, "big")
     tally = {
@@ -3114,7 +3132,7 @@ def validate_raw_stateful_endurance(
     if exact_summary["concurrent_ending_membership_mismatches"] != 0:
         fail(
             f"{label}: retained concurrent endings do not exactly match request "
-            "lifetimes in the raw upstream outage window"
+            "lifetimes in the committed upstream correlation window"
         )
 
     segment_offered = 0
@@ -5670,6 +5688,20 @@ def self_test() -> int:
         manifest_stateful_scale = manifest_stateful_profile[full_stateful["tier"]]
         manifest_stateful_slo = copy.deepcopy(manifest_stateful_profile["slo"])
         manifest_stateful_slo.setdefault("max_rss_drift_kib_per_hour", None)
+        assert stateful_correlation_window_ms(
+            90_000,
+            manifest_stateful_profile["schedule"],
+            "stateful window arithmetic self-test",
+        ) == (24_950, 30_600)
+        assert stateful_correlation_window_ms(
+            1_001,
+            {
+                "upstream_outage_at": 0.001,
+                "upstream_outage_for": 0.002,
+                "upstream_outage_correlation_slack_ms": 1,
+            },
+            "stateful fractional-ms arithmetic self-test",
+        ) == (0, 3)
         for field, value in manifest_stateful_scale.get("slo_overrides", {}).items():
             if value is not None:
                 manifest_stateful_slo[field] = value

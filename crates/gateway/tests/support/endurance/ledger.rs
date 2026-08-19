@@ -455,7 +455,8 @@ impl CorrelationWindowLedger {
     }
 
     /// Record the original settlement and the exact integer interval used to
-    /// decide whether a cancellation overlaps the raw upstream outage.
+    /// decide whether a cancellation overlaps the committed upstream
+    /// correlation window.
     pub fn record(
         &mut self,
         trace_id: [u8; ID_WIDTH],
@@ -494,7 +495,7 @@ impl CorrelationWindowLedger {
         drop(self.shards);
         assert!(
             raw_window_ms.0 < raw_window_ms.1,
-            "the raw outage window is non-empty"
+            "the upstream correlation window is non-empty"
         );
 
         let (mut recorded, mut concurrent_endings, mut membership_mismatches, mut peak) =

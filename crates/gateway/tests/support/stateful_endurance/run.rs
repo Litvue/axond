@@ -415,13 +415,6 @@ fn request_interval_ms(at: Duration, latency_ms: f64) -> (u64, u64) {
     (started_ms, started_ms.saturating_add(elapsed_ms))
 }
 
-fn window_ms(window: (Duration, Duration)) -> (u64, u64) {
-    (
-        u64::try_from(window.0.as_millis()).unwrap_or(u64::MAX),
-        u64::try_from(window.1.as_millis()).unwrap_or(u64::MAX),
-    )
-}
-
 fn intervals_overlap_ms(interval: (u64, u64), window: (u64, u64)) -> bool {
     interval.1 >= window.0 && interval.0 < window.1
 }
@@ -1337,12 +1330,12 @@ struct State {
     /// one: a database this harness reaches directly cannot be taken away, so
     /// there is no window for a lost row to shelter in.
     usage_window: Option<(Duration, Duration)>,
-    /// The raw upstream outage. A caller cancellation whose lifetime overlaps
-    /// this window races the gateway's observation of the terminal upstream
-    /// error, so its exact correlation row carries the explicit concurrent-
-    /// ending set rather than weakening every cancellation. Recovery allowance
-    /// is deliberately excluded: post-outage cancellations stay strict.
-    upstream_fault_window: (Duration, Duration),
+    /// The raw upstream outage with only its committed leading attribution
+    /// slack. A caller can finish just before the gate cuts while the gateway
+    /// observes the terminal upstream error just after it; the leading slack
+    /// bounds that observer race. The closing edge has no recovery allowance,
+    /// so post-outage cancellations stay strict.
+    upstream_fault_window: (u64, u64),
     fault_windows: Vec<(Duration, Duration)>,
     /// When the last usage record arrived, absent until the first one does.
     last_record_at: Option<Duration>,
@@ -1495,11 +1488,7 @@ impl State {
     ) -> Self {
         let probe_identity = plan::CorrelationId::new(seed ^ PROBE_CORRELATION_DOMAIN, 0).bytes();
         let workload_identity = plan::CorrelationId::new(seed, 0).bytes();
-        let upstream_fault_window = schedule
-            .fault_windows_of(duration, Injected::UpstreamFaultsOnly)
-            .into_iter()
-            .next()
-            .expect("the stateful schedule always declares an upstream outage");
+        let upstream_fault_window = schedule.upstream_correlation_window_ms(duration);
         Self {
             segment_ms: scale.segment_ms.max(1),
             segments: Vec::new(),
@@ -1673,7 +1662,7 @@ impl State {
                 .record(attempt.correlation, settlement, interval.0, interval.1)
                 .expect("the stateful workload emits a valid trace identity");
             let recorded = if settlement == Ending::Cancelled
-                && intervals_overlap_ms(interval, window_ms(self.upstream_fault_window))
+                && intervals_overlap_ms(interval, self.upstream_fault_window)
             {
                 self.correlations
                     .record_cancelled_during_upstream_fault(attempt.correlation)
@@ -2280,7 +2269,7 @@ fn assemble(
         .tally(
             &mut correlations,
             workload_trace_high,
-            window_ms(upstream_fault_window),
+            upstream_fault_window,
         )
         .expect("the stateful correlation-window ledger is readable and complete");
     let correlation = correlations
@@ -2661,7 +2650,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn concurrent_endings_exclude_the_recovery_allowance() {
+    fn concurrent_endings_use_only_the_committed_leading_edge_slack() {
         let run_dir = std::env::temp_dir().join(format!(
             "axond-stateful-endurance-concurrent-window-{}-{}",
             std::process::id(),
@@ -2675,6 +2664,18 @@ mod tests {
         let (manifest, _) = crate::support::stateful_endurance::manifest::load();
         let profile = &manifest.profiles[0];
         let duration = Duration::from_millis(profile.smoke.duration_ms);
+        assert_eq!(
+            profile.schedule.upstream_correlation_window_ms(duration),
+            (24_950, 30_600)
+        );
+        let mut fractional = profile.schedule;
+        fractional.upstream_outage_at = 0.001;
+        fractional.upstream_outage_for = 0.002;
+        fractional.upstream_outage_correlation_slack_ms = 1;
+        assert_eq!(
+            fractional.upstream_correlation_window_ms(Duration::from_millis(1_001)),
+            (0, 3)
+        );
         let state = State::new(
             &run_dir,
             "concurrent-window",
@@ -2691,8 +2692,18 @@ mod tests {
             .schedule
             .attribution_windows_of(duration, Injected::UpstreamFaultsOnly)[0];
 
-        assert_eq!(state.upstream_fault_window, raw);
-        assert!(attributed.1 > state.upstream_fault_window.1);
+        let raw_ms = (
+            u64::try_from(raw.0.as_millis()).unwrap(),
+            u64::try_from(raw.1.as_millis()).unwrap(),
+        );
+        assert_eq!(
+            state.upstream_fault_window.0,
+            raw_ms
+                .0
+                .saturating_sub(profile.schedule.upstream_outage_correlation_slack_ms)
+        );
+        assert_eq!(state.upstream_fault_window.1, raw_ms.1);
+        assert!(u64::try_from(attributed.1.as_millis()).unwrap() > state.upstream_fault_window.1);
 
         drop(state);
         std::fs::remove_dir_all(&run_dir).expect("the window test directory is removable");

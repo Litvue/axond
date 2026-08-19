@@ -10,7 +10,7 @@
 # ninety-second smoke and the twelve-hour soak exercise the same events in the
 # same order. Only the time between them differs.
 
-schema_version = 1
+schema_version = 2
 
 [[profile]]
 id = "mixed-stateful-endurance"
@@ -75,6 +75,11 @@ upstream_latency_ms = 250
 # recovery allowance plus the slack rather than the allowance alone.
 upstream_outage_at = 0.28
 upstream_outage_for = 0.06
+# The client can finish immediately before the provider gate cuts while the
+# gateway observes and records the terminal upstream close immediately after.
+# This leading-only allowance is one 250 ms harness drain interval. It is not a
+# recovery allowance: the closing edge remains the raw outage endpoint.
+upstream_outage_correlation_slack_ms = 250
 usage_backend_outage_at = 0.52
 usage_backend_outage_for = 0.06
 # A record settled a couple of seconds either side of the outage is the
