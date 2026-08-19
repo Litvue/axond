@@ -460,7 +460,7 @@ impl CorrelationLedger {
     }
 
     /// Record the exact concurrent-ending set for a caller cancellation that
-    /// overlaps a declared upstream fault window.
+    /// overlaps the raw declared upstream outage.
     ///
     /// Once the caller drops a stream, the client and gateway race to observe
     /// the caller cancellation versus the upstream's terminal error. Both
@@ -516,13 +516,18 @@ impl CorrelationLedger {
             mut missing,
             mut unexpected,
             mut status_mismatches,
+            mut concurrent_endings,
             mut peak,
-        ) = (0, 0, 0, 0, 0, 0);
+        ) = (0, 0, 0, 0, 0, 0, 0);
         for shard in 0..SHARDS {
             let mut expected = read_expected_rows(&shard_path(&self.dir, "expected", shard))?;
             let mut observed = read_observed_rows(&shard_path(&self.dir, "observed", shard))?;
             expected_count += expected.len() as u64;
             observed_count += observed.len() as u64;
+            concurrent_endings += expected
+                .iter()
+                .filter(|row| row.settlement == ExpectedSettlement::CancelledDuringUpstreamFault)
+                .count() as u64;
             peak = peak.max((expected.len() + observed.len()) as u64);
             expected.sort_unstable();
             observed.sort_unstable();
@@ -540,6 +545,7 @@ impl CorrelationLedger {
             missing,
             unexpected,
             status_mismatches,
+            concurrent_endings,
             shards: SHARDS,
             peak_shard_rows: peak,
             exact: true,
@@ -557,6 +563,8 @@ pub struct CorrelationTally {
     pub missing: u64,
     pub unexpected: u64,
     pub status_mismatches: u64,
+    /// Expectations that carry the explicit cancellation/upstream close race.
+    pub concurrent_endings: u64,
     pub shards: usize,
     pub peak_shard_rows: u64,
     pub exact: bool,
@@ -588,7 +596,7 @@ enum ObservedStatus {
 ///
 /// Codes 0-3 deliberately retain the historical `Ending` representation.
 /// Code 4 is only emitted for a caller cancellation whose lifetime overlaps
-/// the declared upstream-fault attribution window.
+/// the raw declared upstream outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ExpectedSettlement {
     Complete,
@@ -1198,6 +1206,7 @@ mod tests {
             .unwrap();
         let tally = ledger.tally().unwrap();
         assert_eq!((tally.missing, tally.unexpected), (0, 0));
+        assert_eq!(tally.concurrent_endings, 2);
         assert_eq!(
             tally.status_mismatches, 1,
             "only the ordinary cancellation must reject upstream_error"

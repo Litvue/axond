@@ -1310,10 +1310,11 @@ struct State {
     /// one: a database this harness reaches directly cannot be taken away, so
     /// there is no window for a lost row to shelter in.
     usage_window: Option<(Duration, Duration)>,
-    /// The upstream outage plus its recovery allowance. A caller cancellation
-    /// that overlaps this window races the gateway's observation of the
-    /// terminal upstream error, so its exact correlation row carries the
-    /// explicit concurrent-ending set rather than weakening every cancellation.
+    /// The raw upstream outage. A caller cancellation whose lifetime overlaps
+    /// this window races the gateway's observation of the terminal upstream
+    /// error, so its exact correlation row carries the explicit concurrent-
+    /// ending set rather than weakening every cancellation. Recovery allowance
+    /// is deliberately excluded: post-outage cancellations stay strict.
     upstream_fault_window: (Duration, Duration),
     fault_windows: Vec<(Duration, Duration)>,
     /// When the last usage record arrived, absent until the first one does.
@@ -1467,7 +1468,7 @@ impl State {
     ) -> Self {
         let probe_identity = plan::CorrelationId::new(seed ^ PROBE_CORRELATION_DOMAIN, 0).bytes();
         let upstream_fault_window = schedule
-            .attribution_windows_of(duration, Injected::UpstreamFaultsOnly)
+            .fault_windows_of(duration, Injected::UpstreamFaultsOnly)
             .into_iter()
             .next()
             .expect("the stateful schedule always declares an upstream outage");
@@ -2254,6 +2255,12 @@ fn assemble(
     let missing = correlation.missing;
     let unexpected_records = correlation.unexpected + uncorrelated;
     let unexpected_statuses = unexpected_statuses + correlation.status_mismatches;
+    let cancelled_plans = *by_ending.get("cancelled").unwrap_or(&0);
+    let concurrent_ending_limit = concurrent_ending_limit(
+        cancelled_plans,
+        scale.concurrency,
+        profile.schedule.upstream_outage_for,
+    );
     let loss = reconcile_exact_durable_loss(&durable_identity, &durable_outside_identity);
     let trend = trend(&segments, slo);
     let growth = resources
@@ -2291,6 +2298,11 @@ fn assemble(
         ),
         Verdict::at_most("unexpected_usage_records", unexpected_records as f64, 0.0),
         Verdict::at_most("unexpected_usage_statuses", unexpected_statuses as f64, 0.0),
+        Verdict::at_most(
+            "concurrent_endings",
+            correlation.concurrent_endings as f64,
+            concurrent_ending_limit as f64,
+        ),
         Verdict::at_most("unidentified_usage_records", unidentified as f64, 0.0),
         Verdict::at_most("uncorrelated_usage_records", uncorrelated as f64, 0.0),
         Verdict::at_most("refusal_usage_records", refusal_records as f64, 0.0),
@@ -2478,6 +2490,7 @@ fn assemble(
             missing,
             unexpected_records,
             unexpected_statuses,
+            concurrent_endings: correlation.concurrent_endings,
             unidentified,
             uncorrelated,
             refusal_records,
@@ -2502,6 +2515,19 @@ fn assemble(
         timeline,
         verdicts,
     }
+}
+
+/// Bound the explicit cancellation/upstream close race independently of the
+/// driver's classification. One doubled outage-window share admits starts in
+/// the raw window plus in-flight/rate skew at its leading edge; one additional
+/// row per worker admits the requests already in flight when the outage begins.
+/// The cap at all planned cancellations keeps the bound meaningful for tiny
+/// diagnostic runs without allowing code 4 to relabel the whole run.
+fn concurrent_ending_limit(cancelled: u64, concurrency: usize, outage_share: f64) -> u64 {
+    let share_budget = ((cancelled as f64) * outage_share.clamp(0.0, 1.0) * 2.0).ceil() as u64;
+    share_budget
+        .saturating_add(u64::try_from(concurrency).unwrap_or(u64::MAX))
+        .min(cancelled)
 }
 
 fn identity_evidence(tally: &Tally) -> IdentityEvidence {
@@ -2590,6 +2616,51 @@ fn readiness_gap_ms(since: Duration, ended: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_ending_budget_is_tied_to_the_raw_outage_share() {
+        assert_eq!(concurrent_ending_limit(3_043, 8, 0.06), 374);
+        assert_eq!(concurrent_ending_limit(3, 8, 0.06), 3);
+        assert_eq!(concurrent_ending_limit(0, 8, 0.06), 0);
+    }
+
+    #[test]
+    fn concurrent_endings_exclude_the_recovery_allowance() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "axond-stateful-endurance-concurrent-window-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the test clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&run_dir).expect("the window test directory is writable");
+
+        let (manifest, _) = crate::support::stateful_endurance::manifest::load();
+        let profile = &manifest.profiles[0];
+        let duration = Duration::from_millis(profile.smoke.duration_ms);
+        let state = State::new(
+            &run_dir,
+            "concurrent-window",
+            profile.smoke,
+            profile.schedule,
+            duration,
+            Injected::EveryDeclaredFault,
+            profile.seed,
+        );
+        let raw = profile
+            .schedule
+            .fault_windows_of(duration, Injected::UpstreamFaultsOnly)[0];
+        let attributed = profile
+            .schedule
+            .attribution_windows_of(duration, Injected::UpstreamFaultsOnly)[0];
+
+        assert_eq!(state.upstream_fault_window, raw);
+        assert!(attributed.1 > state.upstream_fault_window.1);
+
+        drop(state);
+        std::fs::remove_dir_all(&run_dir).expect("the window test directory is removable");
+    }
 
     #[test]
     fn state_finalizes_an_open_readiness_gap_at_run_end() {

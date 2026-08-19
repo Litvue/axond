@@ -158,7 +158,13 @@ def resolve_stateful_ledger(raw_path: Path, declared: object, label: str) -> Pat
 
 
 def stateful_ledger_claim(
-    directory: Path, label: str, field: str, evidence: dict
+    directory: Path,
+    label: str,
+    field: str,
+    evidence: dict,
+    *,
+    schema_label: str,
+    digest_domain: bytes,
 ) -> dict[str, object]:
     """Hash every fixed-width shard with names and lengths in canonical order."""
     entries = sorted(directory.iterdir(), key=lambda path: path.name)
@@ -171,8 +177,10 @@ def stateful_ledger_claim(
         {path.name for path in entries} != expected_names
         or any(path.is_symlink() or not path.is_file() for path in entries)
     ):
-        raise SystemExit(f"{label}: exact ledger filenames do not match schema 3")
-    digest = hashlib.sha256(b"axond-stateful-ledger-v2\0")
+        raise SystemExit(
+            f"{label}: exact ledger filenames do not match {schema_label}"
+        )
+    digest = hashlib.sha256(digest_domain)
     total_bytes = 0
     row_width = STATEFUL_LEDGER_WIDTHS[field]
     for path in entries:
@@ -224,7 +232,12 @@ def stateful_ledger_claims(result: dict, workload: str) -> dict[str, dict[str, o
             raw_path, evidence.get("path"), f"{workload}: {field}"
         )
         claim = stateful_ledger_claim(
-            directory, f"{workload}: {field}", field, evidence
+            directory,
+            f"{workload}: {field}",
+            field,
+            evidence,
+            schema_label="stateful-endurance schema 3",
+            digest_domain=b"axond-stateful-ledger-v2\0",
         )
         expected_files = shards * files_per_shard
         if claim["files"] != expected_files or claim["bytes"] <= 0:
@@ -255,7 +268,12 @@ def endurance_ledger_claims(result: dict, workload: str) -> dict[str, dict[str, 
             raw_path, evidence.get("path"), f"{workload}: {field}"
         )
         claim = stateful_ledger_claim(
-            directory, f"{workload}: {field}", field, evidence
+            directory,
+            f"{workload}: {field}",
+            field,
+            evidence,
+            schema_label="endurance schema 4",
+            digest_domain=b"axond-stateful-ledger-v1\0",
         )
         expected_files = shards * files_per_shard
         if claim["files"] != expected_files or claim["bytes"] <= 0:
@@ -1800,6 +1818,7 @@ def self_test() -> int:
                 "missing": 0,
                 "unexpected_records": 0,
                 "unexpected_statuses": 0,
+                "concurrent_endings": 0,
                 "unidentified": 0,
                 "uncorrelated": 0,
                 "refusal_records": 0,

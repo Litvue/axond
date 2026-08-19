@@ -242,7 +242,13 @@ def verify_resource_sample_claim(
 
 
 def stateful_ledger_claim(
-    directory: Path, label: str, field: str, evidence: dict
+    directory: Path,
+    label: str,
+    field: str,
+    evidence: dict,
+    *,
+    schema_label: str,
+    digest_domain: bytes,
 ) -> dict[str, object]:
     entries = sorted(directory.iterdir(), key=lambda path: path.name)
     expected_names = {
@@ -254,8 +260,8 @@ def stateful_ledger_claim(
         {path.name for path in entries} != expected_names
         or any(path.is_symlink() or not path.is_file() for path in entries)
     ):
-        fail(f"{label}: exact ledger filenames do not match schema 3")
-    digest = hashlib.sha256(b"axond-stateful-ledger-v2\0")
+        fail(f"{label}: exact ledger filenames do not match {schema_label}")
+    digest = hashlib.sha256(digest_domain)
     total_bytes = 0
     row_width = STATEFUL_LEDGER_WIDTHS[field]
     for path in entries:
@@ -430,7 +436,11 @@ def compatible_correlation_pairs(expected: Counter[int], observed: Counter[int])
 
 
 def stateful_correlation_tally(
-    directory: Path, label: str, seed: int
+    directory: Path,
+    label: str,
+    seed: int,
+    *,
+    allow_concurrent_endings: bool,
 ) -> dict[str, Any]:
     tally: dict[str, Any] = {
         "expected": 0,
@@ -441,6 +451,7 @@ def stateful_correlation_tally(
         "peak_shard_rows": 0,
         "workload_expected": 0,
         "probe_expected": 0,
+        "concurrent_endings": 0,
         "by_status": Counter(),
     }
     workload_high = (seed ^ CORRELATION_DOMAIN).to_bytes(8, "big")
@@ -458,7 +469,8 @@ def stateful_correlation_tally(
         observed_by_identity: dict[bytes, Counter[int]] = defaultdict(Counter)
         for row_at, row in enumerate(expected_rows):
             code = row[16]
-            if code > 4:
+            maximum_expected_code = 4 if allow_concurrent_endings else 3
+            if code > maximum_expected_code:
                 fail(
                     f"{label}: expected shard {shard} row {row_at} has invalid "
                     f"settlement {code}"
@@ -470,6 +482,8 @@ def stateful_correlation_tally(
                 tally["workload_expected"] += 1
             else:
                 tally["probe_expected"] += 1
+            if code == 4:
+                tally["concurrent_endings"] += 1
             expected_by_identity[row[:16]][code] += 1
         for row_at, row in enumerate(observed_rows):
             code = row[16]
@@ -494,6 +508,27 @@ def stateful_correlation_tally(
                 expected, observed
             )
     return tally
+
+
+def concurrent_ending_limit(
+    cancelled: int, concurrency: int, outage_share: float
+) -> int:
+    """Bound code-4 rows by the committed raw outage's share of cancellations."""
+    if (
+        not isinstance(cancelled, int)
+        or isinstance(cancelled, bool)
+        or cancelled < 0
+        or not isinstance(concurrency, int)
+        or isinstance(concurrency, bool)
+        or concurrency < 0
+        or not isinstance(outage_share, (int, float))
+        or isinstance(outage_share, bool)
+        or not math.isfinite(outage_share)
+        or not 0.0 <= outage_share <= 1.0
+    ):
+        fail("stateful concurrent-ending bound inputs are malformed")
+    share_budget = math.ceil(cancelled * outage_share * 2.0)
+    return min(cancelled, share_budget + concurrency)
 
 
 def stateful_request_ids_are_subset(request_dir: Path, durable_dir: Path, label: str) -> bool:
@@ -2686,7 +2721,12 @@ def validate_raw_stateful_endurance(
         )
         ledger_directories[field] = directory
         actual_claim = stateful_ledger_claim(
-            directory, f"{label}: {field}", field, evidence
+            directory,
+            f"{label}: {field}",
+            field,
+            evidence,
+            schema_label="stateful-endurance schema 3",
+            digest_domain=b"axond-stateful-ledger-v2\0",
         )
         expected_claim = {
             "sha256": sha256_digest(
@@ -2713,7 +2753,10 @@ def validate_raw_stateful_endurance(
         ledger_directories["request_identities"], f"{label}: request identities"
     )
     correlation_tally = stateful_correlation_tally(
-        ledger_directories["correlations"], f"{label}: correlations", seed
+        ledger_directories["correlations"],
+        f"{label}: correlations",
+        seed,
+        allow_concurrent_endings=True,
     )
     durable_tally = stateful_identity_pair_tally(
         ledger_directories["durable_identities"], f"{label}: durable identities"
@@ -2790,6 +2833,7 @@ def validate_raw_stateful_endurance(
         "missing": correlation_tally["missing"],
         "unexpected_records": correlation_tally["unexpected"]
         + usage["uncorrelated"],
+        "concurrent_endings": correlation_tally["concurrent_endings"],
         "refusal_records": correlation_tally["by_status"]["rejected"],
         "durable_loss_total": durable_tally["missing"],
         "durable_loss_outside_windows": outside_missing,
@@ -2977,6 +3021,15 @@ def validate_raw_stateful_endurance(
         fail(f"{label}: stateful workload did not exercise the committed ending mix")
     if len(workload["by_tenant"]) < 3:
         fail(f"{label}: stateful workload did not exercise the committed tenant mix")
+    concurrent_limit = concurrent_ending_limit(
+        workload["by_ending"]["cancelled"],
+        scale["concurrency"],
+        schedule["upstream_outage_for"],
+    )
+    if correlation_tally["concurrent_endings"] > concurrent_limit:
+        fail(
+            f"{label}: retained concurrent endings exceed the raw outage-window bound"
+        )
 
     segment_offered = 0
     previous_end = 0
@@ -3080,6 +3133,11 @@ def validate_raw_stateful_endurance(
         ),
         "unexpected_usage_records": ("<=", exact_summary["unexpected_records"], 0),
         "unexpected_usage_statuses": ("<=", usage.get("unexpected_statuses"), 0),
+        "concurrent_endings": (
+            "<=",
+            correlation_tally["concurrent_endings"],
+            concurrent_limit,
+        ),
         "unidentified_usage_records": ("<=", usage.get("unidentified"), 0),
         "uncorrelated_usage_records": ("<=", usage.get("uncorrelated"), 0),
         "refusal_usage_records": ("<=", exact_summary["refusal_records"], 0),
@@ -4209,7 +4267,12 @@ def validate_raw_endurance(
         )
         ledger_directories[field] = directory
         actual_claim = stateful_ledger_claim(
-            directory, f"{label}: {field}", field, evidence
+            directory,
+            f"{label}: {field}",
+            field,
+            evidence,
+            schema_label="endurance schema 4",
+            digest_domain=b"axond-stateful-ledger-v1\0",
         )
         expected_claim = {
             "sha256": sha256_digest(
@@ -4236,7 +4299,10 @@ def validate_raw_endurance(
         ledger_directories["request_identities"], f"{label}: request identities"
     )
     correlation_tally = stateful_correlation_tally(
-        ledger_directories["correlations"], f"{label}: correlations", seed
+        ledger_directories["correlations"],
+        f"{label}: correlations",
+        seed,
+        allow_concurrent_endings=False,
     )
     identity_evidence = reconciliation["request_identities"]
     correlation_evidence = reconciliation["correlations"]
@@ -5521,6 +5587,12 @@ def self_test() -> int:
         for field, value in manifest_stateful_scale.get("slo_overrides", {}).items():
             if value is not None:
                 manifest_stateful_slo[field] = value
+        stateful_concurrent_limit = concurrent_ending_limit(
+            manifest_stateful_profile["mix"]["cancelled"],
+            manifest_stateful_scale["concurrency"],
+            manifest_stateful_profile["schedule"]["upstream_outage_for"],
+        )
+        assert concurrent_ending_limit(3_043, 8, 0.06) == 374
         stateful_verdict_specs = (
             ("segments", ">=", manifest_stateful_slo["min_segments"]),
             ("unplanned_errors", "<=", manifest_stateful_slo["max_unplanned_errors"]),
@@ -5536,6 +5608,7 @@ def self_test() -> int:
             ),
             ("unexpected_usage_records", "<=", 0),
             ("unexpected_usage_statuses", "<=", 0),
+            ("concurrent_endings", "<=", stateful_concurrent_limit),
             ("unidentified_usage_records", "<=", 0),
             ("uncorrelated_usage_records", "<=", 0),
             ("refusal_usage_records", "<=", 0),
@@ -5719,6 +5792,7 @@ def self_test() -> int:
                 "missing": 0,
                 "unexpected_records": 0,
                 "unexpected_statuses": 0,
+                "concurrent_endings": 0,
                 "unidentified": 0,
                 "uncorrelated": 0,
                 "refusal_records": 0,
@@ -5831,6 +5905,8 @@ def self_test() -> int:
                 f"stateful self-test: {field}",
                 field,
                 raw_stateful["usage"][field],
+                schema_label="stateful-endurance schema 3",
+                digest_domain=b"axond-stateful-ledger-v2\0",
             )
             compact_row[f"{field}_sha256"] = claim["sha256"]
             compact_row[f"{field}_files"] = claim["files"]
@@ -5961,6 +6037,8 @@ def self_test() -> int:
             "stateful semantic-forgery self-test",
             "correlations",
             raw_stateful["usage"]["correlations"],
+            schema_label="stateful-endurance schema 3",
+            digest_domain=b"axond-stateful-ledger-v2\0",
         )
         for claim_field, claim_value in forged_claim.items():
             compact_row[f"correlations_{claim_field}"] = claim_value
@@ -5979,6 +6057,8 @@ def self_test() -> int:
             "stateful restored-ledger self-test",
             "correlations",
             raw_stateful["usage"]["correlations"],
+            schema_label="stateful-endurance schema 3",
+            digest_domain=b"axond-stateful-ledger-v2\0",
         )
         for claim_field, claim_value in restored_claim.items():
             compact_row[f"correlations_{claim_field}"] = claim_value
@@ -6519,6 +6599,8 @@ def self_test() -> int:
                 f"endurance self-test: {field}",
                 field,
                 raw_result["reconciliation"][field],
+                schema_label="endurance schema 4",
+                digest_domain=b"axond-stateful-ledger-v1\0",
             )
             for claim_field, claim_value in claim.items():
                 compact_row[f"{field}_{claim_field}"] = claim_value
@@ -6529,6 +6611,47 @@ def self_test() -> int:
             raw.read_bytes()
         ).hexdigest()
         verify_promotion_artifacts(compact, Path(directory))
+
+        # Stateless schema 4 keeps the pre-existing v1 digest contract and
+        # rejects the stateful-only concurrent-ending code even when a compact
+        # record is rehashed to match the forged shard.
+        legacy_claim = stateful_ledger_claim(
+            correlation_dir,
+            "endurance legacy-domain self-test",
+            "correlations",
+            raw_result["reconciliation"]["correlations"],
+            schema_label="endurance schema 4",
+            digest_domain=b"axond-stateful-ledger-v1\0",
+        )
+        stateful_domain_claim = stateful_ledger_claim(
+            correlation_dir,
+            "endurance stateful-domain self-test",
+            "correlations",
+            raw_result["reconciliation"]["correlations"],
+            schema_label="stateful-endurance schema 3",
+            digest_domain=b"axond-stateful-ledger-v2\0",
+        )
+        assert legacy_claim["sha256"] != stateful_domain_claim["sha256"]
+        expected_shard = correlation_dir / "expected-shard-01.bin"
+        original_expected_row = expected_shard.read_bytes()
+        expected_shard.write_bytes(original_expected_row[:16] + bytes([4]))
+        forged_claim = stateful_ledger_claim(
+            correlation_dir,
+            "endurance code-4 self-test",
+            "correlations",
+            raw_result["reconciliation"]["correlations"],
+            schema_label="endurance schema 4",
+            digest_domain=b"axond-stateful-ledger-v1\0",
+        )
+        for claim_field, claim_value in forged_claim.items():
+            compact_row[f"correlations_{claim_field}"] = claim_value
+        expect_refusal(
+            "stateless concurrent-ending code",
+            lambda: verify_promotion_artifacts(compact, artifact_dir),
+        )
+        expected_shard.write_bytes(original_expected_row)
+        for claim_field, claim_value in legacy_claim.items():
+            compact_row[f"correlations_{claim_field}"] = claim_value
 
         original_samples = samples_path.read_bytes()
         samples_path.write_bytes(original_samples + original_samples.splitlines()[0] + b"\n")

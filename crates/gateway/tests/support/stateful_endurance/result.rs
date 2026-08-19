@@ -310,6 +310,10 @@ pub struct Usage {
     /// successful probe requests that owed a settlement.
     pub unexpected_records: u64,
     pub unexpected_statuses: u64,
+    /// Exact code-4 expectations whose cancellation lifetime touched the raw
+    /// upstream outage. Promotion recounts these from the retained ledger and
+    /// bounds them against the committed fault-window share.
+    pub concurrent_endings: u64,
     pub unidentified: u64,
     pub uncorrelated: u64,
     /// Refusal settlements. The qualification contract requires zero because

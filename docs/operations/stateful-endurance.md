@@ -139,11 +139,15 @@ take, written as it went. Fixed-width `.bin` shards under the paths named by
 raw exact-set evidence without holding a twelve-hour run in memory.
 Correlation expectation codes 0–3 retain the four ordinary endings. Code 4 is
 the explicit concurrent-ending set for a caller cancellation whose lifetime
-overlaps the declared upstream-fault attribution window: the gateway may
+overlaps the raw upstream outage (not its recovery allowance): the gateway may
 truthfully settle that request as `client_cancelled`, `partial`, or
 `upstream_error`, depending on which close it observes first. Outside that
 window an ordinary cancellation still rejects `upstream_error`; the special
 code records the bounded race instead of weakening the status gate globally.
+The result reports the exact number of code-4 rows. Promotion recounts those
+rows from the retained shards and caps them at twice the committed outage's
+share of planned cancellations plus one already-in-flight request per worker,
+so a driver cannot relabel ordinary cancellations wholesale.
 Writes keep at most 64 KiB buffered per shard group and open one shard file at
 a time. Terminal sorting is capped at 1,500,000 rows per shard (96 million rows
 per ledger); exceeding that ceiling fails the run instead of allocating with
@@ -151,7 +155,9 @@ the offered request count.
 The compact writer refuses a missing, extra, or non-`.bin` shard and refuses a
 soak shorter than the manifest's committed duration. Promotion then parses the
 schema-3 result and re-hashes the schema-3 exact-ledger format; schema 3 adds the
-explicit fault-window cancellation code described above. It parses the
+explicit fault-window cancellation code and the v2 stateful digest domain
+described above. Stateless endurance schema 4 remains on its v1 digest domain
+and rejects code 4. Promotion parses the
 fixed-width rows independently: UUID/trace shape, shard placement, duplicates,
 expected/observed set differences, ending/status compatibility, and durable SQL
 counts must reproduce the JSON summaries and the verdict values. Matching file
