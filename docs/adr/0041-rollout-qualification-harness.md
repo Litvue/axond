@@ -138,8 +138,9 @@ does not name its owner. Promotion independently requires the exported
 caller-trace set to equal the complete caller trace ledger and reconstructs
 every sink join from the raw ledgers. Usage-bearing traces remain separate from
 a canonical,
-reasoned list of expected capability and typed-drain refusals that deliberately
-owe no usage row. Promotable drain exemptions are independently reconstructed
+reasoned list of expected typed-drain refusals that deliberately owe no usage
+row. Reduced raw diagnostics can additionally expose capability refusals, but
+they are not promotable. Promotable drain exemptions are independently reconstructed
 from the retained ingress attempt, including the refusing replica and the
 replica that accepted the same caller trace. Caller-domain export activity must
 remain quiet for five configured batch intervals before that exact snapshot is

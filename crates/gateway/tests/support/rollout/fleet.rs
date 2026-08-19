@@ -213,6 +213,7 @@ pub struct Fleet {
     started: usize,
 }
 
+#[derive(Debug)]
 pub struct TraceWitnessSnapshot {
     pub exports: u64,
     pub identities: BTreeSet<(String, String)>,
@@ -548,12 +549,22 @@ where
             unchanged_since = now;
         }
         identities.extend(delta.identities);
-        if (expected.is_subset(&identities) && now.duration_since(unchanged_since) >= quiescence)
-            || now >= deadline
-        {
+        if expected.is_subset(&identities) && now.duration_since(unchanged_since) >= quiescence {
             return Ok(TraceWitnessSnapshot {
                 exports: 0,
                 identities,
+            });
+        }
+        if now >= deadline {
+            let missing = expected.difference(&identities).count();
+            return Err(if missing > 0 {
+                format!(
+                    "caller-domain trace evidence timed out after {within:?} with {missing} expected identities still missing"
+                )
+            } else {
+                format!(
+                    "caller-domain trace evidence did not remain quiet for {quiescence:?} within {within:?}"
+                )
             });
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -735,5 +746,26 @@ flush_timeout_ms = 300
         .expect("caller activity keeps the synthetic collector open");
 
         assert!(snapshot.identities.contains(&extra_identity));
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_reports_an_incomplete_timeout() {
+        let expected = [(
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1"),
+        )]
+        .into_iter()
+        .collect();
+
+        let error = settle_identity_set(
+            &expected,
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+            || Ok(TraceIdentityDelta::default()),
+        )
+        .await
+        .expect_err("an incomplete witness times out explicitly");
+
+        assert!(error.contains("1 expected identities still missing"));
     }
 }

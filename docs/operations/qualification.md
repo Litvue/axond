@@ -202,9 +202,10 @@ survives the raw workflow artifact's retention window. Raw rollout schema 4 and
 compact rollout record schema 4 additionally preserve the shared durable
 revision, the `chat` alias, successful serving probes from both v0.3.40 and
 v0.4.0, and the per-replica exact caller-trace/OTLP witness, including the
-separate reasoned ledger for capability or typed-drain refusals that owe no
-usage row, the exact ingress attempt behind every promotable drain exemption,
-and a settled exporter snapshot. Fault observations
+separate reasoned ledger for typed-drain refusals that owe no usage row, the
+exact ingress attempt behind every promotable drain exemption, and a settled
+exporter snapshot. Reduced raw diagnostics may also record capability refusals,
+but those are not accepted into a promotable compact record. Fault observations
 bind raw artifact schema 1. Recovery stage rows bind raw artifact schema 2 and
 the exact executable digest, which must equal the record's release binary
 digest. The compact rollout row retains the OTLP caller-trace set's SHA-256 and
