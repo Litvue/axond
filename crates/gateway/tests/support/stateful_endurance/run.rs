@@ -35,7 +35,8 @@ use super::manifest::{
 use super::result::*;
 use crate::support::capacity::result::{Environment, Percentiles, Verdict};
 use crate::support::endurance::ledger::{
-    CorrelationLedger, CorrelationTally, IdentityPairLedger, IdentityPairTally, Ledger, Tally,
+    CorrelationLedger, CorrelationTally, CorrelationWindowLedger, CorrelationWindowTally,
+    IdentityPairLedger, IdentityPairTally, Ledger, Tally,
 };
 use crate::support::endurance::manifest::Ending;
 use crate::support::endurance::plan::{self, Planned, Tenant};
@@ -399,6 +400,30 @@ pub fn segment_ms(scale: &Scale, duration: Duration, min_segments: u64) -> u64 {
 pub fn touched(windows: &[(Duration, Duration)], at: Duration, latency_ms: f64) -> bool {
     let ended = at + Duration::from_secs_f64((latency_ms / 1000.0).max(0.0));
     windows.iter().any(|(from, to)| ended >= *from && at < *to)
+}
+
+/// The fixed-width integer interval retained for independent stateful
+/// correlation classification. Start is floored to the harness millisecond;
+/// duration is rounded up, so a sub-millisecond request never disappears.
+fn request_interval_ms(at: Duration, latency_ms: f64) -> (u64, u64) {
+    let started_ms = u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
+    let elapsed_ms = if latency_ms.is_finite() {
+        latency_ms.max(0.0).ceil() as u64
+    } else {
+        u64::MAX
+    };
+    (started_ms, started_ms.saturating_add(elapsed_ms))
+}
+
+fn window_ms(window: (Duration, Duration)) -> (u64, u64) {
+    (
+        u64::try_from(window.0.as_millis()).unwrap_or(u64::MAX),
+        u64::try_from(window.1.as_millis()).unwrap_or(u64::MAX),
+    )
+}
+
+fn intervals_overlap_ms(interval: (u64, u64), window: (u64, u64)) -> bool {
+    interval.1 >= window.0 && interval.0 < window.1
 }
 
 /// Whether a record or a drop report drained at `now` falls inside the declared
@@ -1287,6 +1312,7 @@ struct State {
     ttft: Reservoir,
     ledger: Ledger,
     correlations: CorrelationLedger,
+    correlation_windows: CorrelationWindowLedger,
     /// Every stdout-emitted request identity against every durable PostgreSQL
     /// row, over the whole run and outside the declared usage outage.
     durable_identities: IdentityPairLedger,
@@ -1299,6 +1325,7 @@ struct State {
     /// High trace word reserved for probes in this run. Exact correlation still
     /// proves whether each full trace was actually issued.
     probe_trace_high: [u8; 8],
+    workload_trace_high: [u8; 8],
     records_observed: u64,
     unidentified: u64,
     uncorrelated: u64,
@@ -1467,6 +1494,7 @@ impl State {
         seed: u64,
     ) -> Self {
         let probe_identity = plan::CorrelationId::new(seed ^ PROBE_CORRELATION_DOMAIN, 0).bytes();
+        let workload_identity = plan::CorrelationId::new(seed, 0).bytes();
         let upstream_fault_window = schedule
             .fault_windows_of(duration, Injected::UpstreamFaultsOnly)
             .into_iter()
@@ -1491,6 +1519,9 @@ impl State {
             ttft: Reservoir::new(),
             ledger: Ledger::create(&dir.join(format!("{stem}-fingerprints"))),
             correlations: CorrelationLedger::create(&dir.join(format!("{stem}-correlations"))),
+            correlation_windows: CorrelationWindowLedger::create(
+                &dir.join(format!("{stem}-correlation-windows")),
+            ),
             durable_identities: IdentityPairLedger::create(
                 &dir.join(format!("{stem}-durable-identities")),
             ),
@@ -1499,6 +1530,9 @@ impl State {
             ),
             probe_ledger: Ledger::create(&dir.join(format!("{stem}-probe-fingerprints"))),
             probe_trace_high: probe_identity[..8]
+                .try_into()
+                .expect("a correlation identity has an eight-byte high word"),
+            workload_trace_high: workload_identity[..8]
                 .try_into()
                 .expect("a correlation identity has an eight-byte high word"),
             records_observed: 0,
@@ -1564,10 +1598,6 @@ impl State {
 
     fn touched_fault_window(&self, at: Duration, latency_ms: f64) -> bool {
         touched(&self.fault_windows, at, latency_ms)
-    }
-
-    fn touched_upstream_fault_window(&self, at: Duration, latency_ms: f64) -> bool {
-        touched(&[self.upstream_fault_window], at, latency_ms)
     }
 
     fn start_sampler(&mut self, id: &str, pid: u32, interval: Duration, dir: &Path, stem: &str) {
@@ -1638,8 +1668,12 @@ impl State {
         }
         if let Some(settlement) = attempt.outcome.settlement() {
             self.owed += 1;
+            let interval = request_interval_ms(attempt.at, attempt.latency_ms);
+            self.correlation_windows
+                .record(attempt.correlation, settlement, interval.0, interval.1)
+                .expect("the stateful workload emits a valid trace identity");
             let recorded = if settlement == Ending::Cancelled
-                && self.touched_upstream_fault_window(attempt.at, attempt.latency_ms)
+                && intervals_overlap_ms(interval, window_ms(self.upstream_fault_window))
             {
                 self.correlations
                     .record_cancelled_during_upstream_fault(attempt.correlation)
@@ -2191,10 +2225,13 @@ fn assemble(
         latency,
         ttft,
         ledger,
-        correlations,
+        mut correlations,
+        correlation_windows,
         durable_identities,
         durable_outside_identities,
         probe_ledger,
+        workload_trace_high,
+        upstream_fault_window,
         records_observed,
         unidentified,
         uncorrelated,
@@ -2236,9 +2273,16 @@ fn assemble(
     // run is live. Promotion derives their exact distinct count from the
     // retained all-emitted durable set minus the retained workload set, and
     // rejects any cross-collision. Leaving these unclaimed shards beside the
-    // four evidence ledgers would make the artifact set ambiguous.
+    // five evidence ledgers would make the artifact set ambiguous.
     std::fs::remove_dir_all(&probes.directory)
         .expect("the stateful probe scratch ledger is removable after tallying");
+    let correlation_window = correlation_windows
+        .tally(
+            &mut correlations,
+            workload_trace_high,
+            window_ms(upstream_fault_window),
+        )
+        .expect("the stateful correlation-window ledger is readable and complete");
     let correlation = correlations
         .tally()
         .expect("the stateful trace correlation ledger is readable and complete");
@@ -2255,12 +2299,12 @@ fn assemble(
     let missing = correlation.missing;
     let unexpected_records = correlation.unexpected + uncorrelated;
     let unexpected_statuses = unexpected_statuses + correlation.status_mismatches;
-    let cancelled_plans = *by_ending.get("cancelled").unwrap_or(&0);
-    let concurrent_ending_limit = concurrent_ending_limit(
-        cancelled_plans,
-        scale.concurrency,
-        profile.schedule.upstream_outage_for,
-    );
+    let concurrent_ending_membership_mismatches =
+        correlation_window.membership_mismatches.saturating_add(
+            correlation
+                .concurrent_endings
+                .abs_diff(correlation_window.concurrent_endings),
+        );
     let loss = reconcile_exact_durable_loss(&durable_identity, &durable_outside_identity);
     let trend = trend(&segments, slo);
     let growth = resources
@@ -2299,9 +2343,9 @@ fn assemble(
         Verdict::at_most("unexpected_usage_records", unexpected_records as f64, 0.0),
         Verdict::at_most("unexpected_usage_statuses", unexpected_statuses as f64, 0.0),
         Verdict::at_most(
-            "concurrent_endings",
-            correlation.concurrent_endings as f64,
-            concurrent_ending_limit as f64,
+            "concurrent_ending_membership_mismatches",
+            concurrent_ending_membership_mismatches as f64,
+            0.0,
         ),
         Verdict::at_most("unidentified_usage_records", unidentified as f64, 0.0),
         Verdict::at_most("uncorrelated_usage_records", uncorrelated as f64, 0.0),
@@ -2491,12 +2535,14 @@ fn assemble(
             unexpected_records,
             unexpected_statuses,
             concurrent_endings: correlation.concurrent_endings,
+            concurrent_ending_membership_mismatches,
             unidentified,
             uncorrelated,
             refusal_records,
             by_status,
             request_identities: identity_evidence(&tally),
             correlations: correlation_evidence(&correlation),
+            correlation_windows: correlation_window_evidence(&correlation_window),
             durable: durable.counts,
             durable_lag_ms: durable.settled.lag_ms,
             durable_settled: durable.settled.within_bound,
@@ -2517,20 +2563,17 @@ fn assemble(
     }
 }
 
-/// Bound the explicit cancellation/upstream close race independently of the
-/// driver's classification. One doubled outage-window share admits starts in
-/// the raw window plus in-flight/rate skew at its leading edge; one additional
-/// row per worker admits the requests already in flight when the outage begins.
-/// The cap at all planned cancellations keeps the bound meaningful for tiny
-/// diagnostic runs without allowing code 4 to relabel the whole run.
-fn concurrent_ending_limit(cancelled: u64, concurrency: usize, outage_share: f64) -> u64 {
-    let share_budget = ((cancelled as f64) * outage_share.clamp(0.0, 1.0) * 2.0).ceil() as u64;
-    share_budget
-        .saturating_add(u64::try_from(concurrency).unwrap_or(u64::MAX))
-        .min(cancelled)
+fn identity_evidence(tally: &Tally) -> IdentityEvidence {
+    IdentityEvidence {
+        recorded: tally.recorded,
+        shards: tally.shards,
+        peak_shard_rows: tally.peak_shard_rows,
+        exact: tally.exact,
+        path: fleet::relative(&tally.directory),
+    }
 }
 
-fn identity_evidence(tally: &Tally) -> IdentityEvidence {
+fn correlation_window_evidence(tally: &CorrelationWindowTally) -> IdentityEvidence {
     IdentityEvidence {
         recorded: tally.recorded,
         shards: tally.shards,
@@ -2616,13 +2659,6 @@ fn readiness_gap_ms(since: Duration, ended: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn concurrent_ending_budget_is_tied_to_the_raw_outage_share() {
-        assert_eq!(concurrent_ending_limit(3_043, 8, 0.06), 374);
-        assert_eq!(concurrent_ending_limit(3, 8, 0.06), 3);
-        assert_eq!(concurrent_ending_limit(0, 8, 0.06), 0);
-    }
 
     #[test]
     fn concurrent_endings_exclude_the_recovery_allowance() {

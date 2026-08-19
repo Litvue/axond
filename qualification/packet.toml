@@ -106,7 +106,7 @@ heavy_tier = "soak"
 retained = []
 outstanding = """
 The exact-reconciliation driver has run only its ninety-second smoke tier. No
-retained twelve-hour run yet binds the raw JSON, all four fixed-width exact
+retained twelve-hour run yet binds the raw JSON, all five fixed-width exact
 ledger shard sets, and its non-empty per-replica-incarnation resource-sample
 JSONL set under artifact schema 3."""
 
@@ -205,7 +205,7 @@ satisfied = false
 requirement = [
   "Every slice has a driver, a committed manifest, and a contract page.",
   "Every slice has exactly one retained heavy record from the same frozen v0.4.0 source cohort, built in release profile from a clean tree.",
-  "Both endurance slices bind exact request-identity and correlation ledgers; stateless endurance binds exactly one sample JSONL, while stateful endurance binds a non-empty set with one file per replica incarnation.",
+  "Both endurance slices bind exact request-identity and correlation ledgers; stateful endurance additionally binds exact per-request timing evidence; stateless endurance binds exactly one sample JSONL, while stateful endurance binds a non-empty set with one file per replica incarnation.",
   "Fault observations bind raw schema 1; recovery stages bind raw schema 2 and the exact candidate executable digest.",
   "Rollout proves published v0.3.40 to candidate v0.4.0 on one durable revision and alias served by both fleets.",
   "Both reference tiers — small single-replica and larger multi-replica — are covered.",

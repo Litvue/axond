@@ -18,6 +18,7 @@ pub const SHARDS: usize = 64;
 /// Fixed width of every request and trace identity stored by these ledgers.
 pub const ID_WIDTH: usize = 16;
 const CORRELATION_WIDTH: usize = ID_WIDTH + 1;
+const CORRELATION_WINDOW_WIDTH: usize = ID_WIDTH + 1 + 8 + 8;
 const REQUEST_PREFIX: &str = "req_";
 /// Hard ceiling for one in-memory sort. With 64 deterministic shards this
 /// admits 96 million rows per ledger while preventing a corrupt or clustered
@@ -431,6 +432,143 @@ pub struct CorrelationLedger {
     observed: u64,
 }
 
+/// Exact request lifetimes used to prove the stateful harness' narrow
+/// cancellation/upstream-close race classification.
+///
+/// This is deliberately separate from the shared correlation ledger. The
+/// stateless contract keeps its historical 17-byte rows, while stateful runs
+/// retain one additional 33-byte row for every workload settlement.
+pub struct CorrelationWindowLedger {
+    dir: PathBuf,
+    shards: ShardWriters,
+    recorded: u64,
+}
+
+impl CorrelationWindowLedger {
+    pub fn create(dir: &Path) -> Self {
+        recreate_directory(dir);
+        Self {
+            dir: dir.to_owned(),
+            shards: create_shards(dir, "window"),
+            recorded: 0,
+        }
+    }
+
+    /// Record the original settlement and the exact integer interval used to
+    /// decide whether a cancellation overlaps the raw upstream outage.
+    pub fn record(
+        &mut self,
+        trace_id: [u8; ID_WIDTH],
+        ending: Ending,
+        started_ms: u64,
+        ended_ms: u64,
+    ) -> Result<(), IdentityError> {
+        let trace_id = validate_trace_bytes(trace_id)?;
+        assert!(
+            started_ms <= ended_ms,
+            "a request cannot end before it starts"
+        );
+        let shard = shard_for(&trace_id);
+        let mut row = [0_u8; CORRELATION_WINDOW_WIDTH];
+        row[..ID_WIDTH].copy_from_slice(&trace_id);
+        row[ID_WIDTH] = ExpectedSettlement::from(ending).code();
+        row[ID_WIDTH + 1..ID_WIDTH + 9].copy_from_slice(&started_ms.to_be_bytes());
+        row[ID_WIDTH + 9..].copy_from_slice(&ended_ms.to_be_bytes());
+        self.shards.write(shard, &row);
+        self.recorded += 1;
+        Ok(())
+    }
+
+    /// Re-derive every stateful workload expectation from retained request
+    /// lifetimes and compare it exactly with the correlation ledger. Probe
+    /// expectations use a separate trace domain and intentionally have no
+    /// lifetime row.
+    pub fn tally(
+        mut self,
+        correlations: &mut CorrelationLedger,
+        workload_high: [u8; 8],
+        raw_window_ms: (u64, u64),
+    ) -> Result<CorrelationWindowTally, ShardError> {
+        self.shards.flush();
+        correlations.expected_shards.flush();
+        drop(self.shards);
+        assert!(
+            raw_window_ms.0 < raw_window_ms.1,
+            "the raw outage window is non-empty"
+        );
+
+        let (mut recorded, mut concurrent_endings, mut membership_mismatches, mut peak) =
+            (0, 0, 0, 0);
+        for shard in 0..SHARDS {
+            let windows =
+                read_correlation_window_rows(&shard_path(&self.dir, "window", shard), shard)?;
+            let expected = read_expected_rows(&shard_path(&correlations.dir, "expected", shard))?;
+            let mut workload_expected: Vec<_> = expected
+                .into_iter()
+                .filter(|row| row.identity[..8] == workload_high)
+                .collect();
+            let mut derived = Vec::with_capacity(windows.len());
+            for (row_at, row) in windows.into_iter().enumerate() {
+                if row.identity[..8] != workload_high
+                    || u64::from_be_bytes(
+                        row.identity[8..]
+                            .try_into()
+                            .expect("a trace identity has an eight-byte low word"),
+                    ) == 0
+                {
+                    return Err(ShardError::InvalidRow {
+                        path: shard_path(&self.dir, "window", shard),
+                        row: row_at,
+                        field: "workload trace domain",
+                        value: 0,
+                    });
+                }
+                let settlement = if row.settlement == ExpectedSettlement::Cancelled
+                    && intervals_overlap((row.started_ms, row.ended_ms), raw_window_ms)
+                {
+                    concurrent_endings += 1;
+                    ExpectedSettlement::CancelledDuringUpstreamFault
+                } else {
+                    row.settlement
+                };
+                derived.push(ExpectedRow {
+                    identity: row.identity,
+                    settlement,
+                });
+            }
+            recorded += derived.len() as u64;
+            peak = peak.max((derived.len() + workload_expected.len()) as u64);
+            derived.sort_unstable();
+            workload_expected.sort_unstable();
+            membership_mismatches += symmetric_difference_rows(&derived, &workload_expected);
+        }
+        assert_eq!(
+            recorded, self.recorded,
+            "all correlation-window rows were tallied"
+        );
+        Ok(CorrelationWindowTally {
+            recorded,
+            concurrent_endings,
+            membership_mismatches,
+            shards: SHARDS,
+            peak_shard_rows: peak,
+            exact: true,
+            directory: self.dir,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrelationWindowTally {
+    pub recorded: u64,
+    pub concurrent_endings: u64,
+    pub membership_mismatches: u64,
+    pub shards: usize,
+    pub peak_shard_rows: u64,
+    pub exact: bool,
+    pub directory: PathBuf,
+}
+
 impl CorrelationLedger {
     pub fn create(dir: &Path) -> Self {
         recreate_directory(dir);
@@ -575,6 +713,14 @@ pub struct CorrelationTally {
 struct ExpectedRow {
     identity: [u8; ID_WIDTH],
     settlement: ExpectedSettlement,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CorrelationWindowRow {
+    identity: [u8; ID_WIDTH],
+    settlement: ExpectedSettlement,
+    started_ms: u64,
+    ended_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -821,6 +967,96 @@ fn read_expected_rows(path: &Path) -> Result<Vec<ExpectedRow>, ShardError> {
             })
         })
         .collect()
+}
+
+fn read_correlation_window_rows(
+    path: &Path,
+    expected_shard: usize,
+) -> Result<Vec<CorrelationWindowRow>, ShardError> {
+    read_fixed_rows::<CORRELATION_WINDOW_WIDTH>(path)?
+        .into_iter()
+        .enumerate()
+        .map(|(row, bytes)| {
+            let identity = bytes[..ID_WIDTH].try_into().expect("16 identity bytes");
+            if identity == [0; ID_WIDTH] || shard_for(&identity) != expected_shard {
+                return Err(ShardError::InvalidRow {
+                    path: path.to_owned(),
+                    row,
+                    field: "trace identity",
+                    value: 0,
+                });
+            }
+            let value = bytes[ID_WIDTH];
+            let settlement = ExpectedSettlement::from_code(value)
+                .filter(|settlement| {
+                    *settlement != ExpectedSettlement::CancelledDuringUpstreamFault
+                })
+                .ok_or_else(|| ShardError::InvalidRow {
+                    path: path.to_owned(),
+                    row,
+                    field: "base settlement",
+                    value,
+                })?;
+            let started_ms = u64::from_be_bytes(
+                bytes[ID_WIDTH + 1..ID_WIDTH + 9]
+                    .try_into()
+                    .expect("eight start-time bytes"),
+            );
+            let ended_ms = u64::from_be_bytes(
+                bytes[ID_WIDTH + 9..]
+                    .try_into()
+                    .expect("eight end-time bytes"),
+            );
+            if ended_ms < started_ms {
+                return Err(ShardError::InvalidRow {
+                    path: path.to_owned(),
+                    row,
+                    field: "request interval",
+                    value: 0,
+                });
+            }
+            Ok(CorrelationWindowRow {
+                identity,
+                settlement,
+                started_ms,
+                ended_ms,
+            })
+        })
+        .collect()
+}
+
+fn intervals_overlap(interval: (u64, u64), window: (u64, u64)) -> bool {
+    interval.1 >= window.0 && interval.0 < window.1
+}
+
+fn symmetric_difference_rows(left: &[ExpectedRow], right: &[ExpectedRow]) -> u64 {
+    let (mut left_at, mut right_at, mut mismatches) = (0, 0, 0);
+    while left_at < left.len() || right_at < right.len() {
+        match (left.get(left_at), right.get(right_at)) {
+            (Some(left_row), Some(right_row)) if left_row == right_row => {
+                left_at += 1;
+                right_at += 1;
+            }
+            (Some(left_row), Some(right_row)) if left_row < right_row => {
+                mismatches += 1;
+                left_at += 1;
+            }
+            (Some(_), Some(_)) => {
+                mismatches += 1;
+                right_at += 1;
+            }
+            (Some(_), None) => {
+                mismatches += (left.len() - left_at) as u64;
+                break;
+            }
+            (None, Some(_)) => {
+                mismatches += (right.len() - right_at) as u64;
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    mismatches
 }
 
 fn read_observed_rows(path: &Path) -> Result<Vec<ObservedRow>, ShardError> {
@@ -1212,6 +1448,66 @@ mod tests {
             "only the ordinary cancellation must reject upstream_error"
         );
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn correlation_windows_exactly_prove_concurrent_ending_membership() {
+        let root = test_dir("correlation-window-membership");
+        let correlation_dir = root.join("correlations");
+        let window_dir = root.join("windows");
+        let mut correlations = CorrelationLedger::create(&correlation_dir);
+        let mut windows = CorrelationWindowLedger::create(&window_dir);
+        let identities = [trace(20), trace(21), trace(22)];
+        let workload_high = identities[0][..8].try_into().unwrap();
+
+        correlations
+            .record_cancelled_during_upstream_fault(identities[0])
+            .unwrap();
+        correlations
+            .record_expected(identities[1], Ending::Cancelled)
+            .unwrap();
+        correlations
+            .record_expected(identities[2], Ending::Complete)
+            .unwrap();
+        windows
+            .record(identities[0], Ending::Cancelled, 90, 110)
+            .unwrap();
+        windows
+            .record(identities[1], Ending::Cancelled, 201, 220)
+            .unwrap();
+        windows
+            .record(identities[2], Ending::Complete, 120, 130)
+            .unwrap();
+
+        let tally = windows
+            .tally(&mut correlations, workload_high, (100, 200))
+            .unwrap();
+        assert_eq!(tally.recorded, 3);
+        assert_eq!(tally.concurrent_endings, 1);
+        assert_eq!(tally.membership_mismatches, 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn correlation_windows_reject_a_forged_post_outage_code_four() {
+        let root = test_dir("forged-correlation-window-membership");
+        let mut correlations = CorrelationLedger::create(&root.join("correlations"));
+        let mut windows = CorrelationWindowLedger::create(&root.join("windows"));
+        let identity = trace(23);
+        let workload_high = identity[..8].try_into().unwrap();
+        correlations
+            .record_cancelled_during_upstream_fault(identity)
+            .unwrap();
+        windows
+            .record(identity, Ending::Cancelled, 201, 220)
+            .unwrap();
+
+        let tally = windows
+            .tally(&mut correlations, workload_high, (100, 200))
+            .unwrap();
+        assert_eq!(tally.concurrent_endings, 0);
+        assert_eq!(tally.membership_mismatches, 2);
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

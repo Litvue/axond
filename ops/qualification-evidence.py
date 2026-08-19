@@ -87,24 +87,28 @@ STATEFUL_LEDGER_FIELDS: tuple[tuple[str, int], ...] = (
     ("correlations", 2),
     ("durable_identities", 2),
     ("durable_outside_identities", 2),
+    ("correlation_windows", 1),
 )
 STATEFUL_LEDGER_STEMS: dict[str, tuple[str, ...]] = {
     "request_identities": ("request",),
     "correlations": ("expected", "observed"),
     "durable_identities": ("expected-request", "observed-request"),
     "durable_outside_identities": ("expected-request", "observed-request"),
+    "correlation_windows": ("window",),
 }
 STATEFUL_LEDGER_WIDTHS = {
     "request_identities": 16,
     "correlations": 17,
     "durable_identities": 16,
     "durable_outside_identities": 16,
+    "correlation_windows": 33,
 }
 STATEFUL_LEDGER_COUNTS: dict[str, tuple[str, ...]] = {
     "request_identities": ("recorded",),
     "correlations": ("expected", "observed"),
     "durable_identities": ("expected_rows", "observed_rows"),
     "durable_outside_identities": ("expected_rows", "observed_rows"),
+    "correlation_windows": ("recorded",),
 }
 
 
@@ -1819,6 +1823,7 @@ def self_test() -> int:
                 "unexpected_records": 0,
                 "unexpected_statuses": 0,
                 "concurrent_endings": 0,
+                "concurrent_ending_membership_mismatches": 0,
                 "unidentified": 0,
                 "uncorrelated": 0,
                 "refusal_records": 0,
@@ -1842,6 +1847,11 @@ def self_test() -> int:
                 "durable_outside_identities": {
                     "exact": True,
                     "path": "durable-outside-ledger",
+                    "shards": STATEFUL_LEDGER_SHARDS,
+                },
+                "correlation_windows": {
+                    "exact": True,
+                    "path": "correlation-window-ledger",
                     "shards": STATEFUL_LEDGER_SHARDS,
                 },
             },

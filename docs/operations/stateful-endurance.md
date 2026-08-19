@@ -122,7 +122,7 @@ series plus a compact qualification record at
 `target/qualification-records/stateful-endurance-soak.toml`. The record binds
 the workload, duration provenance, verdicts, manifest, binary, and machine to
 the raw JSON artifact, the complete per-incarnation JSONL sample set, and all
-four exact-ledger shard sets. Each ledger and sample claim
+five exact-ledger shard sets. Each ledger and sample claim
 retains its canonical SHA-256, file count, and byte count; promotion re-hashes
 the downloaded files rather than trusting a path label. It is
 the first-class `stateful-endurance` slice of the six-slice #156 packet, which
@@ -135,8 +135,9 @@ remains the reviewed promotion boundary.
 replica — including the ones that were retired and replaced — was observed to
 take, written as it went. Fixed-width `.bin` shards under the paths named by
 `usage.request_identities`, `usage.correlations`,
-`usage.durable_identities`, and `usage.durable_outside_identities` retain the
-raw exact-set evidence without holding a twelve-hour run in memory.
+`usage.correlation_windows`, `usage.durable_identities`, and
+`usage.durable_outside_identities` retain the raw exact-set evidence without
+holding a twelve-hour run in memory.
 Correlation expectation codes 0–3 retain the four ordinary endings. Code 4 is
 the explicit concurrent-ending set for a caller cancellation whose lifetime
 overlaps the raw upstream outage (not its recovery allowance): the gateway may
@@ -144,10 +145,12 @@ truthfully settle that request as `client_cancelled`, `partial`, or
 `upstream_error`, depending on which close it observes first. Outside that
 window an ordinary cancellation still rejects `upstream_error`; the special
 code records the bounded race instead of weakening the status gate globally.
-The result reports the exact number of code-4 rows. Promotion recounts those
-rows from the retained shards and caps them at twice the committed outage's
-share of planned cancellations plus one already-in-flight request per worker,
-so a driver cannot relabel ordinary cancellations wholesale.
+The result reports the exact number of code-4 rows. The separate 33-byte timing
+rows retain each workload trace identity, its original ending, and its integer
+start/end milliseconds. Promotion independently re-derives every code-4 member
+from those rows and the committed raw outage window, then requires the derived
+multiset to equal the correlation expectations exactly. There is no request-rate
+or average-cancellation assumption for a bursty twelve-hour run.
 Writes keep at most 64 KiB buffered per shard group and open one shard file at
 a time. Terminal sorting is capped at 1,500,000 rows per shard (96 million rows
 per ledger); exceeding that ceiling fails the run instead of allocating with
@@ -155,8 +158,8 @@ the offered request count.
 The compact writer refuses a missing, extra, or non-`.bin` shard and refuses a
 soak shorter than the manifest's committed duration. Promotion then parses the
 schema-3 result and re-hashes the schema-3 exact-ledger format; schema 3 adds the
-explicit fault-window cancellation code and the v2 stateful digest domain
-described above. Stateless endurance schema 4 remains on its v1 digest domain
+explicit fault-window cancellation code, its exact timing ledger, and the v2
+stateful digest domain described above. Stateless endurance schema 4 remains on its v1 digest domain
 and rejects code 4. Promotion parses the
 fixed-width rows independently: UUID/trace shape, shard placement, duplicates,
 expected/observed set differences, ending/status compatibility, and durable SQL

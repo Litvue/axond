@@ -74,24 +74,28 @@ STATEFUL_LEDGER_FIELDS: tuple[tuple[str, int], ...] = (
     ("correlations", 2),
     ("durable_identities", 2),
     ("durable_outside_identities", 2),
+    ("correlation_windows", 1),
 )
 STATEFUL_LEDGER_STEMS: dict[str, tuple[str, ...]] = {
     "request_identities": ("request",),
     "correlations": ("expected", "observed"),
     "durable_identities": ("expected-request", "observed-request"),
     "durable_outside_identities": ("expected-request", "observed-request"),
+    "correlation_windows": ("window",),
 }
 STATEFUL_LEDGER_WIDTHS = {
     "request_identities": 16,
     "correlations": 17,
     "durable_identities": 16,
     "durable_outside_identities": 16,
+    "correlation_windows": 33,
 }
 STATEFUL_LEDGER_COUNTS: dict[str, tuple[str, ...]] = {
     "request_identities": ("recorded",),
     "correlations": ("expected", "observed"),
     "durable_identities": ("expected_rows", "observed_rows"),
     "durable_outside_identities": ("expected_rows", "observed_rows"),
+    "correlation_windows": ("recorded",),
 }
 CORRELATION_DOMAIN = 0x6178_6F6E_642D_656E
 PROBE_CORRELATION_DOMAIN = 0x7072_6F62_652D_6964
@@ -510,25 +514,91 @@ def stateful_correlation_tally(
     return tally
 
 
-def concurrent_ending_limit(
-    cancelled: int, concurrency: int, outage_share: float
-) -> int:
-    """Bound code-4 rows by the committed raw outage's share of cancellations."""
+def stateful_correlation_window_tally(
+    directory: Path,
+    correlation_directory: Path,
+    label: str,
+    seed: int,
+    duration_ms: int,
+    schedule: dict[str, Any],
+) -> dict[str, int]:
+    """Re-derive exact code-4 membership from retained request intervals."""
+    outage_at = schedule.get("upstream_outage_at")
+    outage_for = schedule.get("upstream_outage_for")
     if (
-        not isinstance(cancelled, int)
-        or isinstance(cancelled, bool)
-        or cancelled < 0
-        or not isinstance(concurrency, int)
-        or isinstance(concurrency, bool)
-        or concurrency < 0
-        or not isinstance(outage_share, (int, float))
-        or isinstance(outage_share, bool)
-        or not math.isfinite(outage_share)
-        or not 0.0 <= outage_share <= 1.0
+        not isinstance(duration_ms, int)
+        or isinstance(duration_ms, bool)
+        or duration_ms <= 0
+        or not isinstance(outage_at, (int, float))
+        or isinstance(outage_at, bool)
+        or not math.isfinite(outage_at)
+        or not isinstance(outage_for, (int, float))
+        or isinstance(outage_for, bool)
+        or not math.isfinite(outage_for)
     ):
-        fail("stateful concurrent-ending bound inputs are malformed")
-    share_budget = math.ceil(cancelled * outage_share * 2.0)
-    return min(cancelled, share_budget + concurrency)
+        fail(f"{label}: correlation-window schedule is malformed")
+    opened_ms = int(duration_ms * min(max(float(outage_at), 0.0), 1.0))
+    closed_ms = int(
+        duration_ms * min(max(float(outage_at + outage_for), 0.0), 1.0)
+    )
+    if opened_ms >= closed_ms:
+        fail(f"{label}: raw upstream outage window is empty")
+
+    workload_high = (seed ^ CORRELATION_DOMAIN).to_bytes(8, "big")
+    tally = {
+        "recorded": 0,
+        "concurrent_endings": 0,
+        "membership_mismatches": 0,
+        "peak_shard_rows": 0,
+    }
+    for shard in range(STATEFUL_LEDGER_SHARDS):
+        window_rows = stateful_shard_rows(
+            directory, "window", shard, 33, label, request_ids=False
+        )
+        expected_rows = stateful_shard_rows(
+            correlation_directory,
+            "expected",
+            shard,
+            17,
+            f"{label}: correlations",
+            request_ids=False,
+        )
+        workload_expected = Counter(
+            row for row in expected_rows if row[:8] == workload_high
+        )
+        derived: Counter[bytes] = Counter()
+        for row_at, row in enumerate(window_rows):
+            identity = row[:16]
+            if identity[:8] != workload_high or int.from_bytes(identity[8:], "big") == 0:
+                fail(
+                    f"{label}: window shard {shard} row {row_at} was not "
+                    "issued by the workload driver"
+                )
+            base_ending = row[16]
+            if base_ending > 3:
+                fail(
+                    f"{label}: window shard {shard} row {row_at} has invalid "
+                    f"base settlement {base_ending}"
+                )
+            started_ms = int.from_bytes(row[17:25], "big")
+            ended_ms = int.from_bytes(row[25:33], "big")
+            if ended_ms < started_ms:
+                fail(
+                    f"{label}: window shard {shard} row {row_at} ends before it starts"
+                )
+            overlaps = ended_ms >= opened_ms and started_ms < closed_ms
+            settlement = 4 if base_ending == 1 and overlaps else base_ending
+            if settlement == 4:
+                tally["concurrent_endings"] += 1
+            derived[identity + bytes((settlement,))] += 1
+        tally["recorded"] += len(window_rows)
+        tally["peak_shard_rows"] = max(
+            tally["peak_shard_rows"],
+            len(window_rows) + sum(workload_expected.values()),
+        )
+        tally["membership_mismatches"] += sum((derived - workload_expected).values())
+        tally["membership_mismatches"] += sum((workload_expected - derived).values())
+    return tally
 
 
 def stateful_request_ids_are_subset(request_dir: Path, durable_dir: Path, label: str) -> bool:
@@ -2758,6 +2828,14 @@ def validate_raw_stateful_endurance(
         seed,
         allow_concurrent_endings=True,
     )
+    correlation_window_tally = stateful_correlation_window_tally(
+        ledger_directories["correlation_windows"],
+        ledger_directories["correlations"],
+        f"{label}: correlation windows",
+        seed,
+        profile.get("duration_ms"),
+        schedule,
+    )
     durable_tally = stateful_identity_pair_tally(
         ledger_directories["durable_identities"], f"{label}: durable identities"
     )
@@ -2782,6 +2860,11 @@ def validate_raw_stateful_endurance(
         "correlations",
         correlation_tally,
         ("expected", "observed", "peak_shard_rows"),
+    )
+    require_evidence(
+        "correlation_windows",
+        correlation_window_tally,
+        ("recorded", "peak_shard_rows"),
     )
     identity_fields = (
         "expected_rows",
@@ -2834,6 +2917,13 @@ def validate_raw_stateful_endurance(
         "unexpected_records": correlation_tally["unexpected"]
         + usage["uncorrelated"],
         "concurrent_endings": correlation_tally["concurrent_endings"],
+        "concurrent_ending_membership_mismatches": correlation_window_tally[
+            "membership_mismatches"
+        ]
+        + abs(
+            correlation_tally["concurrent_endings"]
+            - correlation_window_tally["concurrent_endings"]
+        ),
         "refusal_records": correlation_tally["by_status"]["rejected"],
         "durable_loss_total": durable_tally["missing"],
         "durable_loss_outside_windows": outside_missing,
@@ -3021,14 +3111,10 @@ def validate_raw_stateful_endurance(
         fail(f"{label}: stateful workload did not exercise the committed ending mix")
     if len(workload["by_tenant"]) < 3:
         fail(f"{label}: stateful workload did not exercise the committed tenant mix")
-    concurrent_limit = concurrent_ending_limit(
-        workload["by_ending"]["cancelled"],
-        scale["concurrency"],
-        schedule["upstream_outage_for"],
-    )
-    if correlation_tally["concurrent_endings"] > concurrent_limit:
+    if exact_summary["concurrent_ending_membership_mismatches"] != 0:
         fail(
-            f"{label}: retained concurrent endings exceed the raw outage-window bound"
+            f"{label}: retained concurrent endings do not exactly match request "
+            "lifetimes in the raw upstream outage window"
         )
 
     segment_offered = 0
@@ -3133,10 +3219,10 @@ def validate_raw_stateful_endurance(
         ),
         "unexpected_usage_records": ("<=", exact_summary["unexpected_records"], 0),
         "unexpected_usage_statuses": ("<=", usage.get("unexpected_statuses"), 0),
-        "concurrent_endings": (
+        "concurrent_ending_membership_mismatches": (
             "<=",
-            correlation_tally["concurrent_endings"],
-            concurrent_limit,
+            exact_summary["concurrent_ending_membership_mismatches"],
+            0,
         ),
         "unidentified_usage_records": ("<=", usage.get("unidentified"), 0),
         "uncorrelated_usage_records": ("<=", usage.get("uncorrelated"), 0),
@@ -5587,12 +5673,6 @@ def self_test() -> int:
         for field, value in manifest_stateful_scale.get("slo_overrides", {}).items():
             if value is not None:
                 manifest_stateful_slo[field] = value
-        stateful_concurrent_limit = concurrent_ending_limit(
-            manifest_stateful_profile["mix"]["cancelled"],
-            manifest_stateful_scale["concurrency"],
-            manifest_stateful_profile["schedule"]["upstream_outage_for"],
-        )
-        assert concurrent_ending_limit(3_043, 8, 0.06) == 374
         stateful_verdict_specs = (
             ("segments", ">=", manifest_stateful_slo["min_segments"]),
             ("unplanned_errors", "<=", manifest_stateful_slo["max_unplanned_errors"]),
@@ -5608,7 +5688,7 @@ def self_test() -> int:
             ),
             ("unexpected_usage_records", "<=", 0),
             ("unexpected_usage_statuses", "<=", 0),
-            ("concurrent_endings", "<=", stateful_concurrent_limit),
+            ("concurrent_ending_membership_mismatches", "<=", 0),
             ("unidentified_usage_records", "<=", 0),
             ("uncorrelated_usage_records", "<=", 0),
             ("refusal_usage_records", "<=", 0),
@@ -5793,6 +5873,7 @@ def self_test() -> int:
                 "unexpected_records": 0,
                 "unexpected_statuses": 0,
                 "concurrent_endings": 0,
+                "concurrent_ending_membership_mismatches": 0,
                 "unidentified": 0,
                 "uncorrelated": 0,
                 "refusal_records": 0,
@@ -5875,7 +5956,9 @@ def self_test() -> int:
                 "exact": True,
                 "path": field,
                 "shards": STATEFUL_LEDGER_SHARDS,
-                "peak_shard_rows": 2 if files_per_shard == 2 else 1,
+                "peak_shard_rows": (
+                    2 if field in ("correlations", "correlation_windows") else 1
+                ),
             }
             for count_field in STATEFUL_LEDGER_COUNTS[field]:
                 raw_stateful["usage"][field][count_field] = 1
@@ -5887,6 +5970,13 @@ def self_test() -> int:
                 )
                 (ledger / "observed-shard-01.bin").write_bytes(
                     trace_identity + bytes([0])
+                )
+            elif field == "correlation_windows":
+                (ledger / "window-shard-01.bin").write_bytes(
+                    trace_identity
+                    + bytes([0])
+                    + (0).to_bytes(8, "big")
+                    + (1).to_bytes(8, "big")
                 )
             else:
                 (ledger / "expected-request-shard-01.bin").write_bytes(
@@ -6025,6 +6115,42 @@ def self_test() -> int:
             lambda: verify_promotion_artifacts(compact_stateful, artifact_dir),
         )
         changed_shard.write_bytes(original_shard)
+
+        window_shard = artifact_dir / "correlation_windows" / "window-shard-01.bin"
+        original_window_shard = window_shard.read_bytes()
+        window_shard.write_bytes(
+            trace_identity
+            + bytes([1])
+            + (0).to_bytes(8, "big")
+            + (1).to_bytes(8, "big")
+        )
+        forged_window_claim = stateful_ledger_claim(
+            artifact_dir / "correlation_windows",
+            "stateful timing-forgery self-test",
+            "correlation_windows",
+            raw_stateful["usage"]["correlation_windows"],
+            schema_label="stateful-endurance schema 3",
+            digest_domain=b"axond-stateful-ledger-v2\0",
+        )
+        for claim_field, claim_value in forged_window_claim.items():
+            compact_row[f"correlation_windows_{claim_field}"] = claim_value
+        persist_stateful_fixture()
+        expect_refusal(
+            "stateful correlation-window semantic forgery with matching hashes",
+            lambda: verify_promotion_artifacts(compact_stateful, artifact_dir),
+        )
+        window_shard.write_bytes(original_window_shard)
+        restored_window_claim = stateful_ledger_claim(
+            artifact_dir / "correlation_windows",
+            "stateful restored timing-ledger self-test",
+            "correlation_windows",
+            raw_stateful["usage"]["correlation_windows"],
+            schema_label="stateful-endurance schema 3",
+            digest_domain=b"axond-stateful-ledger-v2\0",
+        )
+        for claim_field, claim_value in restored_window_claim.items():
+            compact_row[f"correlation_windows_{claim_field}"] = claim_value
+        persist_stateful_fixture()
 
         observed_shard = artifact_dir / "correlations" / "observed-shard-01.bin"
         forged_trace_identity = bytearray(trace_identity)

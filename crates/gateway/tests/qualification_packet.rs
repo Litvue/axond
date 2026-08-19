@@ -50,6 +50,11 @@ fn validate_observation_artifact_schema(
     ];
     let stateful_ledger_claims = [
         (
+            observation.correlation_windows_sha256.as_deref(),
+            observation.correlation_windows_files,
+            observation.correlation_windows_bytes,
+        ),
+        (
             observation.durable_identities_sha256.as_deref(),
             observation.durable_identities_files,
             observation.durable_identities_bytes,
@@ -101,11 +106,12 @@ fn validate_observation_artifact_schema(
             && (!stateful_ledger_claims.iter().copied().all(complete_claim)
                 || observation.request_identities_files != Some(64)
                 || observation.correlations_files != Some(128)
+                || observation.correlation_windows_files != Some(64)
                 || observation.durable_identities_files != Some(128)
                 || observation.durable_outside_identities_files != Some(128))
         {
             return Err(
-                "stateful endurance observations require all four fixed-width exact-ledger shard sets"
+                "stateful endurance observations require all five fixed-width exact-ledger shard sets"
                     .to_owned(),
             );
         }
@@ -359,6 +365,9 @@ request_identities_bytes = 1024
 correlations_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 correlations_files = 128
 correlations_bytes = 2048
+correlation_windows_sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+correlation_windows_files = 64
+correlation_windows_bytes = 2112
 samples_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 samples_files = 6
 samples_bytes = 4096
