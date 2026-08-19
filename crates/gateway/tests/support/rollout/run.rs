@@ -53,11 +53,11 @@ use super::ingress::{Forward, Ingress, REPLICA_HEADER, REVISION_HEADER};
 use super::manifest::{RESULT_SCHEMA_VERSION, Scale, Scenario, Tier};
 use super::result::{
     CapacityEnvelope, CommandRecord, DrainRecord, DrainingRefusalAttempt, Environment, Event,
-    ExpectedNonUsageTraceIdentity, ExpectedUsageIdentity, Fence, InFlight, LossLedger,
-    MigrationEvidence, MigrationMatrix, MigrationVersion, MixedVersion, ObservedUsageIdentity,
-    PatchRollback, PhaseTraffic, ReplicaRecord, ReplicaUsage, RetainedRelease, RevisionMeta,
-    RollbackEvidence, RolloutResult, RunMeta, ScenarioEcho, StreamCut, TraceExportIdentity,
-    UsageReconciliation,
+    ExpectedNonUsageTraceIdentity, ExpectedUsageIdentity, FailedIngressAttempt, Fence, InFlight,
+    LossLedger, MigrationEvidence, MigrationMatrix, MigrationVersion, MixedVersion,
+    ObservedUsageIdentity, PatchRollback, PhaseTraffic, ReplicaRecord, ReplicaUsage,
+    RetainedRelease, RevisionMeta, RollbackEvidence, RolloutResult, RunMeta, ScenarioEcho,
+    StreamCut, TraceExportIdentity, UnexpectedTraceIdentity, UsageReconciliation,
 };
 use super::stateful::{
     BUFFERED_PROMPT, MigrationTarget as StatefulMigrationTarget, SLOW_PROMPT, STALLED_PROMPT,
@@ -504,11 +504,41 @@ impl Harness {
         attempts
     }
 
+    fn failed_ingress_attempts(&self) -> Vec<FailedIngressAttempt> {
+        let mut attempts = Vec::new();
+        for caller in self.ingress.state.callers() {
+            let Some(trace_id) = caller.trace_id.as_ref() else {
+                continue;
+            };
+            for attempt in &caller.attempts {
+                let reason = if attempt.refused_while_draining {
+                    continue;
+                } else if attempt.status.is_none() {
+                    "transport_failure"
+                } else if attempt.status == Some(503) {
+                    "untyped_503"
+                } else {
+                    continue;
+                };
+                attempts.push(FailedIngressAttempt {
+                    caller_id: caller.id,
+                    trace_id: trace_id.clone(),
+                    replica: attempt.replica.clone(),
+                    reason: reason.to_owned(),
+                });
+            }
+        }
+        attempts.sort();
+        attempts
+    }
+
     fn expected_otlp_trace_identities(&self) -> BTreeSet<(String, String)> {
         // A transport failure can leave a server span behind without a usage
         // row. Do not silently excuse it here: the exact trace mismatch and
-        // request-loss verdicts must both fail, preserving the failed attempt's
-        // real attribution instead of laundering it as successful accounting.
+        // exact trace verdict must fail, preserving the failed attempt's real
+        // attribution instead of laundering it as successful accounting. The
+        // caller may still succeed after a transport retry, so availability is
+        // judged independently.
         self.expected_usage
             .iter()
             .map(|identity| (identity.replica.clone(), identity.trace_id.clone()))
@@ -1718,6 +1748,23 @@ fn ledger(
         .collect();
     let expected_non_usage_trace_identities = harness.expected_non_usage_trace_identities();
     let draining_refusal_attempts = harness.draining_refusal_attempts();
+    let failed_ingress_attempts = harness.failed_ingress_attempts();
+    let expected_trace_identities = reconciliation
+        .expected
+        .iter()
+        .map(|identity| (identity.replica.clone(), identity.trace_id.clone()))
+        .chain(
+            expected_non_usage_trace_identities
+                .iter()
+                .map(|identity| (identity.replica.clone(), identity.trace_id.clone())),
+        )
+        .collect();
+    let observed_trace_identities = trace_witness.identities.clone();
+    let unexpected_otlp_trace_identities = classify_unexpected_trace_identities(
+        &expected_trace_identities,
+        &observed_trace_identities,
+        &failed_ingress_attempts,
+    );
     let usage_reconciliation = UsageReconciliation {
         mode: EXACT_TRACE_RECONCILIATION.to_owned(),
         exact_trace_replicas: reconciliation.exact_trace_replicas.clone(),
@@ -1726,6 +1773,7 @@ fn ledger(
         otlp_trace_export_replicas: trace_export_replicas,
         expected_non_usage_trace_identities,
         otlp_trace_identities,
+        unexpected_otlp_trace_identities,
     };
     LossLedger {
         caller_requests: callers.len() as u64,
@@ -1749,6 +1797,7 @@ fn ledger(
         usage_records_distinct: reconciliation.request_ids_distinct,
         usage_reconciliation,
         draining_refusal_attempts,
+        failed_ingress_attempts,
         // A typed drain refusal happens outside the accepted request path and
         // owes no usage row. It remains a routing diagnostic, never a credit
         // that can excuse an otherwise unexpected record.
@@ -1757,6 +1806,33 @@ fn ledger(
         usage_by_status: by_status,
         upstream_streams_open_at_end: harness.fleet.upstream.state.open_streams(),
     }
+}
+
+pub fn classify_unexpected_trace_identities(
+    expected: &BTreeSet<(String, String)>,
+    observed: &BTreeSet<(String, String)>,
+    failed_attempts: &[FailedIngressAttempt],
+) -> Vec<UnexpectedTraceIdentity> {
+    let reasons = failed_attempts
+        .iter()
+        .map(|attempt| {
+            (
+                (attempt.replica.clone(), attempt.trace_id.clone()),
+                attempt.reason.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    observed
+        .difference(expected)
+        .map(|(replica, trace_id)| UnexpectedTraceIdentity {
+            replica: replica.clone(),
+            trace_id: trace_id.clone(),
+            reason: reasons
+                .get(&(replica.clone(), trace_id.clone()))
+                .cloned()
+                .unwrap_or_else(|| "unattributed".to_owned()),
+        })
+        .collect()
 }
 
 #[derive(Debug)]

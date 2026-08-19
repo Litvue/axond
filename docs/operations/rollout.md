@@ -57,11 +57,14 @@ every exact-trace replica and records every exact caller trace decoded by that
 replica's receiver. A receiver refuses a different process identity, and the
 promoter requires the exported trace set to equal the complete caller trace
 ledger: usage-bearing requests plus explicitly reasoned capability and typed
-drain refusals that deliberately owe no usage row. The harness waits for the
-caller-domain set to remain unchanged across five exporter intervals and judges
-that exact settled snapshot, so a delayed extra trace cannot arrive after the
-gate has already taken its evidence. Typed drain exemptions retain the exact
-ingress attempt and the replica that subsequently accepted the same trace.
+drain refusals that deliberately owe no usage row. The harness waits for
+caller-domain activity to remain quiet across five exporter intervals and
+judges that exact settled snapshot, so a duplicate span resets the window and a
+delayed extra trace cannot arrive after the gate has already taken its evidence.
+Typed drain exemptions retain the exact ingress attempt and the replica that
+subsequently accepted the same trace. Untyped 503 and transport-failure attempts
+are retained separately to attribute matching surplus spans without exempting
+them.
 
 ## What a run gates on
 
@@ -74,7 +77,7 @@ Hard failures — all of them environment-independent:
 | `max_usage_record_loss` | One usage record per request, all flushed before the process exits. A record left behind by a refusal the balancer retried is discounted before the comparison, so a duplicate cannot fill a lost record's place. |
 | `unexplained_usage_record_surplus` / `duplicate_usage_record_ids` | No record beyond what a caller request explains, and no `request_id` recorded twice. |
 | `otlp_trace_context_exported` | Every replica-dedicated receiver observed at least one caller-domain trace, proving the qualification instrumentation was exercised by the full fleet. Readiness-only batches cannot satisfy this gate. |
-| `otlp_trace_export_identity_mismatches` | The settled exact caller traces decoded by the replica-dedicated receivers equal the complete caller trace ledger. Usage-bearing identities and exact retried drain-attempt evidence are disclosed separately, so neither a missing trace, substituted exemption, delayed arrival, nor unexplained extra trace can hide. A span from an untyped `503` or transport failure remains a mismatch alongside the request-loss/error verdict; it is never converted into a passing exemption. |
+| `otlp_trace_export_identity_mismatches` | The settled exact caller traces decoded by the replica-dedicated receivers equal the complete caller trace ledger. Usage-bearing identities and exact retried drain-attempt evidence are disclosed separately, so neither a missing trace, substituted exemption, delayed arrival, nor unexplained extra trace can hide. A span from an untyped `503` or transport failure remains a mismatch even when a transport retry later succeeds; it is never converted into a passing exemption. |
 | `max_readiness_removal_ms` | How long after `SIGTERM` the balancer still considers the replica ready. |
 | `max_replacement_admission_ms` | How long a new replica takes from boot to carrying traffic. |
 | `max_drain_exit_slack_ms` | How far past `drain_grace_ms + deadline_ms + flush_timeout_ms` a termination may run. |
@@ -171,5 +174,7 @@ problem.
 - A production load balancer's own behaviour. The fixture is a representative
   readiness-driven proxy — round-robin, one retry onto another member, no outlier
   ejection.
-- Stateful serving or revision convergence during a rollout. The fleet is
-  config-only; the control plane appears here only in the migration matrix.
+- Arbitrary control-plane mutation or convergence while a rollout is in
+  progress. The heavy lane does qualify both binaries against one shared,
+  durable serving revision; mutation drills remain part of the separate
+  stateful endurance and recovery slices.

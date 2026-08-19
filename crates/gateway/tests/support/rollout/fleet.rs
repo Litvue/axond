@@ -218,8 +218,8 @@ pub struct TraceWitnessSnapshot {
     pub identities: BTreeSet<(String, String)>,
 }
 
-#[derive(Clone)]
-struct TraceIdentityObservation {
+#[derive(Clone, Default)]
+struct TraceIdentityDelta {
     identities: BTreeSet<(String, String)>,
     caller_spans_seen: u64,
 }
@@ -478,11 +478,11 @@ impl Fleet {
             .sum()
     }
 
-    fn trace_identity_observation(&self) -> Result<TraceIdentityObservation, String> {
+    fn trace_identity_delta(&self) -> Result<TraceIdentityDelta, String> {
         let mut identities = BTreeSet::new();
         let mut caller_spans_seen = 0_u64;
         for (replica, collector) in self.collectors() {
-            let observed = collector.trace_identity_observation(replica)?;
+            let observed = collector.trace_identity_delta(replica)?;
             for (trace_id, occurrences) in observed
                 .occurrences
                 .into_iter()
@@ -494,7 +494,7 @@ impl Fleet {
                 identities.insert((replica.to_owned(), trace_id));
             }
         }
-        Ok(TraceIdentityObservation {
+        Ok(TraceIdentityDelta {
             identities,
             caller_spans_seen,
         })
@@ -510,7 +510,7 @@ impl Fleet {
         within: Duration,
     ) -> Result<TraceWitnessSnapshot, String> {
         let mut snapshot = settle_identity_set(expected, within, TRACE_QUIESCENCE, || {
-            self.trace_identity_observation()
+            self.trace_identity_delta()
         })
         .await?;
         snapshot.exports = self.trace_exports();
@@ -536,27 +536,24 @@ async fn settle_identity_set<F>(
     mut observe: F,
 ) -> Result<TraceWitnessSnapshot, String>
 where
-    F: FnMut() -> Result<TraceIdentityObservation, String>,
+    F: FnMut() -> Result<TraceIdentityDelta, String>,
 {
     let deadline = Instant::now() + within;
-    let mut last = observe()?;
+    let mut identities = BTreeSet::new();
     let mut unchanged_since = Instant::now();
     loop {
         let now = Instant::now();
-        let observed = observe()?;
-        if observed.identities != last.identities
-            || observed.caller_spans_seen != last.caller_spans_seen
-        {
-            last = observed;
+        let delta = observe()?;
+        if delta.caller_spans_seen > 0 {
             unchanged_since = now;
         }
-        if (expected.is_subset(&last.identities)
-            && now.duration_since(unchanged_since) >= quiescence)
+        identities.extend(delta.identities);
+        if (expected.is_subset(&identities) && now.duration_since(unchanged_since) >= quiescence)
             || now >= deadline
         {
             return Ok(TraceWitnessSnapshot {
                 exports: 0,
-                identities: last.identities,
+                identities,
             });
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -658,7 +655,7 @@ flush_timeout_ms = 300
             format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}2"),
         );
         let expected = [expected_identity.clone()].into_iter().collect();
-        let observed = Arc::new(Mutex::new(TraceIdentityObservation {
+        let observed = Arc::new(Mutex::new(TraceIdentityDelta {
             identities: [expected_identity].into_iter().collect(),
             caller_spans_seen: 1,
         }));
@@ -666,19 +663,20 @@ flush_timeout_ms = 300
         let expected_extra = extra_identity.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            delayed
-                .lock()
-                .expect("trace test lock")
-                .identities
-                .insert(expected_extra);
-            delayed.lock().expect("trace test lock").caller_spans_seen += 1;
+            let mut delta = delayed.lock().expect("trace test lock");
+            delta.identities.insert(expected_extra);
+            delta.caller_spans_seen += 1;
         });
 
         let snapshot = settle_identity_set(
             &expected,
             Duration::from_millis(250),
             Duration::from_millis(80),
-            || Ok(observed.lock().expect("trace test lock").clone()),
+            || {
+                Ok(std::mem::take(
+                    &mut *observed.lock().expect("trace test lock"),
+                ))
+            },
         )
         .await
         .expect("the synthetic collector settles");
@@ -708,7 +706,7 @@ flush_timeout_ms = 300
             format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}2"),
         );
         let expected = [expected_identity.clone()].into_iter().collect();
-        let observed = Arc::new(Mutex::new(TraceIdentityObservation {
+        let observed = Arc::new(Mutex::new(TraceIdentityDelta {
             identities: [expected_identity].into_iter().collect(),
             caller_spans_seen: 1,
         }));
@@ -727,7 +725,11 @@ flush_timeout_ms = 300
             &expected,
             Duration::from_millis(250),
             Duration::from_millis(70),
-            || Ok(observed.lock().expect("trace test lock").clone()),
+            || {
+                Ok(std::mem::take(
+                    &mut *observed.lock().expect("trace test lock"),
+                ))
+            },
         )
         .await
         .expect("caller activity keeps the synthetic collector open");

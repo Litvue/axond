@@ -1122,7 +1122,11 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
         "expected_non_usage_trace_identities"
     )
     draining_refusal_attempts = loss.get("draining_refusal_attempts")
+    failed_ingress_attempts = loss.get("failed_ingress_attempts")
     otlp_trace_identities = usage_reconciliation.get("otlp_trace_identities")
+    unexpected_otlp_trace_identities = usage_reconciliation.get(
+        "unexpected_otlp_trace_identities"
+    )
     fleet = result.get("fleet")
     fleet_replicas = (
         sorted(member.get("id") for member in fleet)
@@ -1147,7 +1151,9 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
         or not isinstance(expected_usage_identities, list)
         or not isinstance(expected_non_usage_trace_identities, list)
         or not isinstance(draining_refusal_attempts, list)
+        or not isinstance(failed_ingress_attempts, list)
         or not isinstance(otlp_trace_identities, list)
+        or not isinstance(unexpected_otlp_trace_identities, list)
         or not otlp_trace_identities
         or any(
             not isinstance(identity, dict)
@@ -1196,6 +1202,8 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
     canonical_refusal_attempts = []
     seen_refusal_keys = set()
     seen_caller_refusals = set()
+    caller_trace_ids = {}
+    trace_caller_ids = {}
     for attempt in draining_refusal_attempts:
         if not isinstance(attempt, dict):
             raise SystemExit(f"{workload}: rollout drain-refusal attempt is malformed")
@@ -1224,6 +1232,8 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
             or refusal_key in expected_usage_keys
             or refusal_key in seen_refusal_keys
             or caller_refusal in seen_caller_refusals
+            or caller_trace_ids.get(caller_id, trace_id) != trace_id
+            or trace_caller_ids.get(trace_id, caller_id) != caller_id
             or (accepted_replica, trace_id) not in expected_usage_keys
         ):
             raise SystemExit(
@@ -1231,6 +1241,8 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
             )
         seen_refusal_keys.add(refusal_key)
         seen_caller_refusals.add(caller_refusal)
+        caller_trace_ids[caller_id] = trace_id
+        trace_caller_ids[trace_id] = caller_id
         canonical_refusal_attempts.append(
             {
                 "caller_id": caller_id,
@@ -1283,6 +1295,146 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
         ],
         key=lambda identity: (identity["replica"], identity["trace_id"]),
     )
+    canonical_failed_attempts = []
+    failed_reasons_by_identity = {}
+    seen_failed_attempts = set()
+    usage_trace_owners = defaultdict(set)
+    for identity in expected_usage_identities:
+        usage_trace_owners[identity["trace_id"]].add(identity["replica"])
+    transport_failures_by_replica = Counter()
+    for attempt in failed_ingress_attempts:
+        if not isinstance(attempt, dict):
+            raise SystemExit(f"{workload}: rollout failed ingress attempt is malformed")
+        caller_id = attempt.get("caller_id")
+        replica = attempt.get("replica")
+        trace_id = attempt.get("trace_id")
+        reason = attempt.get("reason")
+        attempt_key = (caller_id, trace_id, replica, reason)
+        identity_key = (replica, trace_id)
+        if (
+            not isinstance(caller_request_count, int)
+            or isinstance(caller_request_count, bool)
+            or not isinstance(caller_id, int)
+            or isinstance(caller_id, bool)
+            or not 0 <= caller_id < caller_request_count
+            or replica not in fleet_replicas
+            or not isinstance(trace_id, str)
+            or len(trace_id) != 32
+            or not trace_id.startswith("61786f6e642d726f")
+            or reason not in {"transport_failure", "untyped_503"}
+            or attempt_key in seen_failed_attempts
+            or identity_key in failed_reasons_by_identity
+            or caller_trace_ids.get(caller_id, trace_id) != trace_id
+            or trace_caller_ids.get(trace_id, caller_id) != caller_id
+            or reason == "untyped_503"
+            or not (usage_trace_owners.get(trace_id, set()) - {replica})
+        ):
+            raise SystemExit(
+                f"{workload}: rollout failed ingress attempt is not canonical"
+            )
+        seen_failed_attempts.add(attempt_key)
+        failed_reasons_by_identity[identity_key] = reason
+        caller_trace_ids[caller_id] = trace_id
+        trace_caller_ids[trace_id] = caller_id
+        transport_failures_by_replica[replica] += 1
+        canonical_failed_attempts.append(
+            {
+                "caller_id": caller_id,
+                "trace_id": trace_id,
+                "replica": replica,
+                "reason": reason,
+            }
+        )
+    canonical_failed_attempts.sort(
+        key=lambda attempt: (
+            attempt["caller_id"],
+            attempt["trace_id"],
+            attempt["replica"],
+            attempt["reason"],
+        )
+    )
+    fleet_refusals = {}
+    for member in fleet:
+        replica = member.get("id")
+        refusals = member.get("refusals")
+        if (
+            not isinstance(refusals, int)
+            or isinstance(refusals, bool)
+            or refusals < 0
+        ):
+            raise SystemExit(
+                f"{workload}: rollout failed attempts lack fleet refusal evidence"
+            )
+        fleet_refusals[replica] = refusals
+    draining_refusals = {}
+    per_replica = loss.get("per_replica")
+    if not isinstance(per_replica, list):
+        raise SystemExit(
+            f"{workload}: rollout failed attempts lack per-replica evidence"
+        )
+    for row in per_replica:
+        if not isinstance(row, dict):
+            raise SystemExit(
+                f"{workload}: rollout failed attempts have malformed per-replica evidence"
+            )
+        replica = row.get("replica")
+        refusals = row.get("caller_requests_refused_while_draining")
+        if (
+            replica not in fleet_refusals
+            or replica in draining_refusals
+            or not isinstance(refusals, int)
+            or isinstance(refusals, bool)
+            or not 0 <= refusals <= fleet_refusals[replica]
+        ):
+            raise SystemExit(
+                f"{workload}: rollout failed attempts have malformed refusal evidence"
+            )
+        draining_refusals[replica] = refusals
+    expected_transport_failures = Counter(
+        {
+            replica: fleet_refusals[replica]
+            - draining_refusals.get(replica, 0)
+            for replica in fleet_refusals
+            if fleet_refusals[replica] - draining_refusals.get(replica, 0) > 0
+        }
+    )
+    if transport_failures_by_replica != expected_transport_failures:
+        raise SystemExit(
+            f"{workload}: rollout transport attempts do not match fleet refusals"
+        )
+    expected_trace_keys = {
+        (identity["replica"], identity["trace_id"])
+        for identity in expected_otlp_trace_identities
+    }
+    observed_trace_keys = {
+        (identity["replica"], identity["trace_id"])
+        for identity in otlp_trace_identities
+    }
+    derived_unexpected_trace_identities = sorted(
+        [
+            {
+                "replica": replica,
+                "trace_id": trace_id,
+                "reason": failed_reasons_by_identity.get(
+                    (replica, trace_id), "unattributed"
+                ),
+            }
+            for replica, trace_id in observed_trace_keys - expected_trace_keys
+        ],
+        key=lambda identity: (
+            identity["replica"],
+            identity["trace_id"],
+            identity["reason"],
+        ),
+    )
+    if (
+        failed_ingress_attempts != canonical_failed_attempts
+        or unexpected_otlp_trace_identities
+        != derived_unexpected_trace_identities
+    ):
+        raise SystemExit(
+            f"{workload}: rollout failed-attempt trace attribution is not canonical"
+        )
     if (
         len(
             {
@@ -1820,6 +1972,7 @@ def self_test() -> int:
             {
                 "id": "candidate-0",
                 "revision": "next",
+                "refusals": 0,
             }
         ],
         "mixed_version": {
@@ -1831,7 +1984,14 @@ def self_test() -> int:
         },
         "loss": {
             "caller_requests": 1,
+            "per_replica": [
+                {
+                    "replica": "candidate-0",
+                    "caller_requests_refused_while_draining": 0,
+                }
+            ],
             "draining_refusal_attempts": [],
+            "failed_ingress_attempts": [],
             "expected_usage_identities": [
                 {
                     "replica": "candidate-0",
@@ -1852,6 +2012,7 @@ def self_test() -> int:
                         "trace_id": "61786f6e642d726f0000000000000001",
                     }
                 ],
+                "unexpected_otlp_trace_identities": [],
             }
         },
         "migration": {
@@ -1910,7 +2071,9 @@ def self_test() -> int:
         assert parsed["inputs"]["fixtures"] == 0
 
         retried = copy.deepcopy(result)
-        retried["fleet"].append({"id": "previous-0", "revision": "previous"})
+        retried["fleet"].append(
+            {"id": "previous-0", "revision": "previous", "refusals": 0}
+        )
         accepted_trace = "61786f6e642d726f0000000000000002"
         retried["loss"]["caller_requests"] = 2
         retried["loss"]["expected_usage_identities"].append(
@@ -1936,6 +2099,7 @@ def self_test() -> int:
             },
         ]
         retried["loss"]["refusals_retried"] = 1
+        retried["fleet"][0]["refusals"] = 1
         retried_reconciliation = retried["loss"]["usage_reconciliation"]
         retried_reconciliation["exact_trace_replicas"] = [
             "candidate-0",
@@ -1962,6 +2126,80 @@ def self_test() -> int:
             {"replica": "previous-0", "trace_id": accepted_trace},
         ]
         check_rollout_qualifiable(retried, "retried refusal self-test")
+
+        transport_retry = copy.deepcopy(retried)
+        first_trace = "61786f6e642d726f0000000000000001"
+        transport_retry["loss"]["failed_ingress_attempts"] = [
+            {
+                "caller_id": 0,
+                "trace_id": first_trace,
+                "replica": "previous-0",
+                "reason": "transport_failure",
+            }
+        ]
+        for member in transport_retry["fleet"]:
+            member["refusals"] = 1
+        check_rollout_qualifiable(
+            transport_retry, "retried transport failure without export self-test"
+        )
+
+        attributed_export = copy.deepcopy(transport_retry)
+        attributed_export["loss"]["usage_reconciliation"][
+            "otlp_trace_identities"
+        ].append({"replica": "previous-0", "trace_id": first_trace})
+        attributed_export["loss"]["usage_reconciliation"][
+            "unexpected_otlp_trace_identities"
+        ] = [
+            {
+                "replica": "previous-0",
+                "trace_id": first_trace,
+                "reason": "transport_failure",
+            }
+        ]
+        for name, mutate in (
+            ("attributed exported extra", lambda candidate: None),
+            (
+                "failed-attempt reason substitution",
+                lambda candidate: candidate["loss"]["failed_ingress_attempts"][0].update(
+                    reason="untyped_503"
+                ),
+            ),
+            (
+                "inconsistent failed-attempt caller trace",
+                lambda candidate: candidate["loss"]["failed_ingress_attempts"].append(
+                    {
+                        "caller_id": 0,
+                        "trace_id": accepted_trace,
+                        "replica": "candidate-0",
+                        "reason": "transport_failure",
+                    }
+                ),
+            ),
+            (
+                "failed-attempt refusal count mismatch",
+                lambda candidate: next(
+                    member
+                    for member in candidate["fleet"]
+                    if member["id"] == "previous-0"
+                ).update(refusals=0),
+            ),
+            (
+                "deleted failed-attempt ledger",
+                lambda candidate: candidate["loss"].update(
+                    failed_ingress_attempts=[]
+                ),
+            ),
+        ):
+            invalid = copy.deepcopy(
+                attributed_export if name == "attributed exported extra" else transport_retry
+            )
+            mutate(invalid)
+            try:
+                check_rollout_qualifiable(invalid, name)
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError(f"rollout accepted {name}")
 
         for name, mutate in (
             (

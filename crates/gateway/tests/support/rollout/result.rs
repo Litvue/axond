@@ -392,6 +392,10 @@ pub struct LossLedger {
     /// the replica that later answered the same caller trace. This is the raw
     /// source from which promotion reconstructs non-usage OTLP exemptions.
     pub draining_refusal_attempts: Vec<DrainingRefusalAttempt>,
+    /// Exact ingress attempts that ended in an untyped 503 or transport
+    /// failure. These explain matching surplus spans diagnostically but never
+    /// exempt them from exact reconciliation.
+    pub failed_ingress_attempts: Vec<FailedIngressAttempt>,
     /// The exact caller-side ledger. Each expected event names the replica that
     /// owed it, the caller-controlled trace identity, and its terminal usage
     /// status. Keeping the rows in the artifact makes reconciliation durable
@@ -480,6 +484,10 @@ pub struct UsageReconciliation {
     /// is retained raw so promotion can compare it directly with the complete
     /// expected trace ledger instead of trusting a derived count.
     pub otlp_trace_identities: Vec<TraceExportIdentity>,
+    /// Exported caller identities outside the expected ledger, partitioned by
+    /// an exact failed ingress attempt when one exists. Every row still counts
+    /// in `otlp_trace_export_identity_mismatches`.
+    pub unexpected_otlp_trace_identities: Vec<UnexpectedTraceIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -502,6 +510,21 @@ pub struct DrainingRefusalAttempt {
     pub refused_replica: String,
     pub accepted_replica: Option<String>,
     pub accepted_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct FailedIngressAttempt {
+    pub caller_id: u64,
+    pub trace_id: String,
+    pub replica: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct UnexpectedTraceIdentity {
+    pub replica: String,
+    pub trace_id: String,
+    pub reason: String,
 }
 
 /// One caller event the rollout driver proves reached a specific replica.

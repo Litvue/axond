@@ -1835,6 +1835,10 @@ def validate_raw_rollout(
         "expected_non_usage_trace_identities"
     )
     claimed_refusal_attempts = loss.get("draining_refusal_attempts")
+    claimed_failed_attempts = loss.get("failed_ingress_attempts")
+    claimed_unexpected_trace_identities = reconciliation.get(
+        "unexpected_otlp_trace_identities"
+    )
     if (
         reconciliation.get("mode") != "exact_trace"
         or reconciliation.get("exact_trace_replicas") != expected_exact_replicas
@@ -1843,7 +1847,9 @@ def validate_raw_rollout(
         != expected_exact_replicas
         or not isinstance(claimed_non_usage_trace_identities, list)
         or not isinstance(claimed_refusal_attempts, list)
+        or not isinstance(claimed_failed_attempts, list)
         or not isinstance(claimed_trace_identities, list)
+        or not isinstance(claimed_unexpected_trace_identities, list)
         or not isinstance(trace_exports, int)
         or isinstance(trace_exports, bool)
         or trace_exports < len(expected_exact_replicas)
@@ -1905,6 +1911,8 @@ def validate_raw_rollout(
     expected_refusal_attempts: list[dict[str, Any]] = []
     expected_non_usage_keys: set[tuple[str, str]] = set()
     refusal_callers: set[tuple[int, str]] = set()
+    caller_trace_ids: dict[int, str] = {}
+    trace_caller_ids: dict[str, int] = {}
     caller_request_count = loss.get("caller_requests")
     if (
         not isinstance(caller_request_count, int)
@@ -1937,11 +1945,15 @@ def validate_raw_rollout(
             or key in expected_counter
             or key in expected_non_usage_keys
             or caller_key in refusal_callers
+            or caller_trace_ids.get(caller_id, trace_id) != trace_id
+            or trace_caller_ids.get(trace_id, caller_id) != caller_id
             or (accepted_replica, trace_id) not in expected_counter
         ):
             fail(f"{label}: draining-refusal attempt {index} is not canonical")
         expected_non_usage_keys.add(key)
         refusal_callers.add(caller_key)
+        caller_trace_ids[caller_id] = trace_id
+        trace_caller_ids[trace_id] = caller_id
         expected_refusal_attempts.append(
             {
                 "caller_id": caller_id,
@@ -1986,6 +1998,135 @@ def validate_raw_rollout(
             set(expected_counter) | expected_non_usage_keys
         )
     ]
+    expected_failed_attempts: list[dict[str, Any]] = []
+    failed_reasons_by_identity: dict[tuple[str, str], str] = {}
+    failed_attempt_keys: set[tuple[int, str, str, str]] = set()
+    usage_trace_owners: dict[str, set[str]] = defaultdict(set)
+    for identity in expected_rows:
+        usage_trace_owners[identity["trace_id"]].add(identity["replica"])
+    transport_failures_by_replica: Counter[str] = Counter()
+    for index, attempt in enumerate(claimed_failed_attempts):
+        if not isinstance(attempt, dict):
+            fail(f"{label}: failed ingress attempt {index} is malformed")
+        caller_id = attempt.get("caller_id")
+        trace_id = attempt.get("trace_id")
+        replica = attempt.get("replica")
+        reason = attempt.get("reason")
+        attempt_key = (caller_id, trace_id, replica, reason)
+        identity_key = (replica, trace_id)
+        if (
+            not isinstance(caller_id, int)
+            or isinstance(caller_id, bool)
+            or caller_id < 0
+            or caller_id >= caller_request_count
+            or replica not in fleet_revision_by_replica
+            or not canonical_rollout_trace(trace_id)
+            or reason not in {"transport_failure", "untyped_503"}
+            or attempt_key in failed_attempt_keys
+            or identity_key in failed_reasons_by_identity
+            or caller_trace_ids.get(caller_id, trace_id) != trace_id
+            or trace_caller_ids.get(trace_id, caller_id) != caller_id
+            or reason == "untyped_503"
+            or not (usage_trace_owners.get(trace_id, set()) - {replica})
+        ):
+            fail(f"{label}: failed ingress attempt {index} is not canonical")
+        failed_attempt_keys.add(attempt_key)
+        failed_reasons_by_identity[identity_key] = reason
+        caller_trace_ids[caller_id] = trace_id
+        trace_caller_ids[trace_id] = caller_id
+        transport_failures_by_replica[replica] += 1
+        expected_failed_attempts.append(
+            {
+                "caller_id": caller_id,
+                "trace_id": trace_id,
+                "replica": replica,
+                "reason": reason,
+            }
+        )
+    expected_failed_attempts.sort(
+        key=lambda attempt: (
+            attempt["caller_id"],
+            attempt["trace_id"],
+            attempt["replica"],
+            attempt["reason"],
+        )
+    )
+    fleet_refusals = {}
+    for index, member in enumerate(fleet):
+        replica = member.get("id") if isinstance(member, dict) else None
+        refusals = member.get("refusals") if isinstance(member, dict) else None
+        if (
+            replica not in fleet_revision_by_replica
+            or replica in fleet_refusals
+            or not isinstance(refusals, int)
+            or isinstance(refusals, bool)
+            or refusals < 0
+        ):
+            fail(f"{label}: rollout fleet row {index} has malformed refusal evidence")
+        fleet_refusals[replica] = refusals
+    draining_refusals = {}
+    claimed_per_replica = loss.get("per_replica")
+    if not isinstance(claimed_per_replica, list):
+        fail(f"{label}: rollout failed attempts lack per-replica evidence")
+    for index, per_replica_row in enumerate(claimed_per_replica):
+        replica = (
+            per_replica_row.get("replica")
+            if isinstance(per_replica_row, dict)
+            else None
+        )
+        refusals = (
+            per_replica_row.get("caller_requests_refused_while_draining")
+            if isinstance(per_replica_row, dict)
+            else None
+        )
+        if (
+            replica not in fleet_refusals
+            or replica in draining_refusals
+            or not isinstance(refusals, int)
+            or isinstance(refusals, bool)
+            or not 0 <= refusals <= fleet_refusals[replica]
+        ):
+            fail(f"{label}: rollout per-replica row {index} has malformed refusal evidence")
+        draining_refusals[replica] = refusals
+    expected_transport_failures = Counter(
+        {
+            replica: fleet_refusals[replica]
+            - draining_refusals.get(replica, 0)
+            for replica in fleet_refusals
+            if fleet_refusals[replica] - draining_refusals.get(replica, 0) > 0
+        }
+    )
+    if transport_failures_by_replica != expected_transport_failures:
+        fail(f"{label}: rollout transport attempts do not match fleet refusals")
+    expected_trace_keys = {
+        (identity["replica"], identity["trace_id"])
+        for identity in expected_trace_identities
+    }
+    observed_trace_keys = set()
+    for index, identity in enumerate(claimed_trace_identities):
+        if (
+            not isinstance(identity, dict)
+            or identity.get("replica") not in fleet_revision_by_replica
+            or not canonical_rollout_trace(identity.get("trace_id"))
+        ):
+            fail(f"{label}: OTLP caller-trace identity {index} is malformed")
+        observed_trace_keys.add((identity["replica"], identity["trace_id"]))
+    expected_unexpected_trace_identities = [
+        {
+            "replica": replica,
+            "trace_id": trace_id,
+            "reason": failed_reasons_by_identity.get(
+                (replica, trace_id), "unattributed"
+            ),
+        }
+        for replica, trace_id in sorted(observed_trace_keys - expected_trace_keys)
+    ]
+    if (
+        claimed_failed_attempts != expected_failed_attempts
+        or claimed_unexpected_trace_identities
+        != expected_unexpected_trace_identities
+    ):
+        fail(f"{label}: failed-attempt trace attribution is not canonical")
     if claimed_trace_identities != expected_trace_identities:
         fail(f"{label}: OTLP caller-trace witness does not match the exact caller ledger")
     trace_identities_sha256 = hashlib.sha256(
@@ -2142,6 +2283,7 @@ def validate_raw_rollout(
         "otlp_trace_export_replicas": expected_exact_replicas,
         "expected_non_usage_trace_identities": expected_non_usage_trace_identities,
         "otlp_trace_identities": expected_trace_identities,
+        "unexpected_otlp_trace_identities": expected_unexpected_trace_identities,
     }
     if reconciliation != expected_reconciliation:
         fail(f"{label}: rollout usage reconciliation disclosure is not reproducible")
@@ -2179,6 +2321,7 @@ def validate_raw_rollout(
         "usage_records_distinct": len(request_ids),
         "usage_reconciliation": expected_reconciliation,
         "draining_refusal_attempts": expected_refusal_attempts,
+        "failed_ingress_attempts": expected_failed_attempts,
         "usage_identity_duplicates": identity_duplicates,
         "usage_record_id_duplicates": request_id_duplicates,
         "usage_status_mismatches": status_mismatches,
@@ -5770,6 +5913,7 @@ def self_test() -> int:
             "usage_records_observed": len(observed_usage),
             "usage_records_distinct": len(observed_usage),
             "draining_refusal_attempts": [],
+            "failed_ingress_attempts": [],
             "usage_reconciliation": {
                 "mode": "exact_trace",
                 "exact_trace_replicas": exact_replicas,
@@ -5778,6 +5922,7 @@ def self_test() -> int:
                 "otlp_trace_export_replicas": exact_replicas,
                 "expected_non_usage_trace_identities": [],
                 "otlp_trace_identities": otlp_trace_identities,
+                "unexpected_otlp_trace_identities": [],
             },
             "expected_usage_identities": expected_usage,
             "observed_usage_identities": observed_usage,
@@ -5894,6 +6039,122 @@ def self_test() -> int:
     rollout_row["verdicts"] = len(rollout_result["verdicts"])
     validate_raw_rollout(
         rollout_result, "rollout self-test", rollout_record, rollout_row
+    )
+    transport_retry = copy.deepcopy(rollout_result)
+    failed_replica = exact_replicas[0]
+    retried_identity = next(
+        identity
+        for identity in expected_usage
+        if identity["replica"] != failed_replica
+    )
+    transport_retry["loss"]["failed_ingress_attempts"] = [
+        {
+            "caller_id": 0,
+            "trace_id": retried_identity["trace_id"],
+            "replica": failed_replica,
+            "reason": "transport_failure",
+        }
+    ]
+    failed_member = next(
+        member
+        for member in transport_retry["fleet"]
+        if member["id"] == failed_replica
+    )
+    failed_member["refusals"] = 1
+    failed_member["requests_served"] += 1
+    transport_retry["traffic"][0]["retried"] = 1
+    validate_raw_rollout(
+        transport_retry,
+        "retried transport failure without export self-test",
+        rollout_record,
+        rollout_row,
+    )
+
+    attributed_export = copy.deepcopy(transport_retry)
+    attributed_identity = {
+        "replica": failed_replica,
+        "trace_id": retried_identity["trace_id"],
+    }
+    attributed_export["loss"]["usage_reconciliation"][
+        "otlp_trace_identities"
+    ].append(attributed_identity)
+    attributed_export["loss"]["usage_reconciliation"][
+        "otlp_trace_identities"
+    ].sort(key=lambda identity: (identity["replica"], identity["trace_id"]))
+    attributed_export["loss"]["usage_reconciliation"][
+        "unexpected_otlp_trace_identities"
+    ] = [{**attributed_identity, "reason": "transport_failure"}]
+    expect_refusal(
+        "attributed exported transport trace",
+        lambda: validate_raw_rollout(
+            attributed_export,
+            "attributed exported transport trace self-test",
+            rollout_record,
+            rollout_row,
+        ),
+    )
+    substituted_failure_reason = copy.deepcopy(transport_retry)
+    substituted_failure_reason["loss"]["failed_ingress_attempts"][0][
+        "reason"
+    ] = "untyped_503"
+    expect_refusal(
+        "failed-attempt reason substitution",
+        lambda: validate_raw_rollout(
+            substituted_failure_reason,
+            "failed-attempt reason substitution self-test",
+            rollout_record,
+            rollout_row,
+        ),
+    )
+    inconsistent_failed_caller = copy.deepcopy(transport_retry)
+    second_identity = next(
+        identity
+        for identity in expected_usage
+        if identity["replica"] != failed_replica
+        and identity["trace_id"] != retried_identity["trace_id"]
+    )
+    inconsistent_failed_caller["loss"]["failed_ingress_attempts"].append(
+        {
+            "caller_id": 0,
+            "trace_id": second_identity["trace_id"],
+            "replica": failed_replica,
+            "reason": "transport_failure",
+        }
+    )
+    expect_refusal(
+        "inconsistent failed-attempt caller trace",
+        lambda: validate_raw_rollout(
+            inconsistent_failed_caller,
+            "inconsistent failed-attempt caller trace self-test",
+            rollout_record,
+            rollout_row,
+        ),
+    )
+    mismatched_failed_count = copy.deepcopy(transport_retry)
+    next(
+        member
+        for member in mismatched_failed_count["fleet"]
+        if member["id"] == failed_replica
+    )["refusals"] = 0
+    expect_refusal(
+        "failed-attempt refusal count mismatch",
+        lambda: validate_raw_rollout(
+            mismatched_failed_count,
+            "failed-attempt refusal count mismatch self-test",
+            rollout_record,
+            rollout_row,
+        ),
+    )
+    deleted_failed_attempts = copy.deepcopy(transport_retry)
+    deleted_failed_attempts["loss"]["failed_ingress_attempts"] = []
+    expect_refusal(
+        "deleted failed-attempt ledger",
+        lambda: validate_raw_rollout(
+            deleted_failed_attempts,
+            "deleted failed-attempt ledger self-test",
+            rollout_record,
+            rollout_row,
+        ),
     )
     same_binary_rollout = copy.deepcopy(rollout_result)
     for revision in same_binary_rollout["revisions"]:

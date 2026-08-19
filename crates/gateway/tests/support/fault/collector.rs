@@ -58,9 +58,8 @@ struct TraceIdentityCache {
     error: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct TraceIdentityObservation {
-    pub trace_ids: BTreeSet<String>,
+#[derive(Clone, Debug, Default)]
+pub struct TraceIdentityDelta {
     pub occurrences: BTreeMap<String, u64>,
 }
 
@@ -124,15 +123,25 @@ impl Collector {
         &self,
         expected_instance: &str,
     ) -> Result<BTreeSet<String>, String> {
-        Ok(self
-            .trace_identity_observation(expected_instance)?
-            .trace_ids)
+        self.trace_identity_delta(expected_instance)?;
+        let caches = self
+            .state
+            .trace_identity_caches
+            .lock()
+            .expect("collector trace cache lock");
+        Ok(caches
+            .get(expected_instance)
+            .expect("trace decoding created the owner cache")
+            .trace_id_occurrences
+            .keys()
+            .cloned()
+            .collect())
     }
 
-    pub fn trace_identity_observation(
+    pub fn trace_identity_delta(
         &self,
         expected_instance: &str,
-    ) -> Result<TraceIdentityObservation, String> {
+    ) -> Result<TraceIdentityDelta, String> {
         // Settlement polls this method several times while exporters flush.
         // Decode only exports that arrived since the last observation instead
         // of repeatedly cloning and decoding the complete retained corpus.
@@ -146,6 +155,7 @@ impl Collector {
             return Err(error.clone());
         }
         let exports = self.state.exports.lock().expect("collector lock");
+        let mut delta = TraceIdentityDelta::default();
         for export in exports
             .iter()
             .skip(cache.exports_seen)
@@ -201,15 +211,16 @@ impl Collector {
                         cache.error = Some(error.clone());
                         return Err(error);
                     };
-                    *cache.trace_id_occurrences.entry(trace_id).or_default() += 1;
+                    *cache
+                        .trace_id_occurrences
+                        .entry(trace_id.clone())
+                        .or_default() += 1;
+                    *delta.occurrences.entry(trace_id).or_default() += 1;
                 }
             }
         }
         cache.exports_seen = exports.len();
-        Ok(TraceIdentityObservation {
-            trace_ids: cache.trace_id_occurrences.keys().cloned().collect(),
-            occurrences: cache.trace_id_occurrences.clone(),
-        })
+        Ok(delta)
     }
 
     #[cfg(test)]
