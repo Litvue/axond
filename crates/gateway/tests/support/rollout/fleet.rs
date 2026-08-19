@@ -45,8 +45,9 @@ pub const NEXT_ONLY_ALIAS: &str = "chat-next-only";
 /// is starved, and the alternative is a phantom lost usage record.
 const OUTPUT_SETTLE: Duration = Duration::from_secs(5);
 /// Five batch-processor intervals after the last rollout trace. The harness
-/// configures a 200 ms OTLP schedule, so a caller-domain set stable for this
-/// window is a settled exporter snapshot rather than the first expected subset.
+/// configures a 200 ms OTLP schedule, so no caller-domain span activity for
+/// this window is a settled exporter snapshot rather than the first expected
+/// subset. Duplicate caller spans reset the window; readiness spans do not.
 const TRACE_QUIESCENCE: Duration = Duration::from_secs(1);
 const ROLLOUT_TRACE_DOMAIN_PREFIX: &str = "61786f6e642d726f";
 
@@ -215,6 +216,12 @@ pub struct Fleet {
 pub struct TraceWitnessSnapshot {
     pub exports: u64,
     pub identities: BTreeSet<(String, String)>,
+}
+
+#[derive(Clone)]
+struct TraceIdentityObservation {
+    identities: BTreeSet<(String, String)>,
+    caller_spans_seen: u64,
 }
 
 impl Fleet {
@@ -471,17 +478,26 @@ impl Fleet {
             .sum()
     }
 
-    /// Every `(replica, trace_id)` decoded from the receiver dedicated to that
-    /// replica. The collector itself rejects a resource identity that does not
-    /// match the receiver owner.
-    pub fn trace_identities(&self) -> Result<BTreeSet<(String, String)>, String> {
+    fn trace_identity_observation(&self) -> Result<TraceIdentityObservation, String> {
         let mut identities = BTreeSet::new();
+        let mut caller_spans_seen = 0_u64;
         for (replica, collector) in self.collectors() {
-            for trace_id in collector.trace_ids_for_instance(replica)? {
+            let observed = collector.trace_identity_observation(replica)?;
+            for (trace_id, occurrences) in observed
+                .occurrences
+                .into_iter()
+                .filter(|(trace_id, _)| trace_id.starts_with(ROLLOUT_TRACE_DOMAIN_PREFIX))
+            {
+                caller_spans_seen = caller_spans_seen
+                    .checked_add(occurrences)
+                    .ok_or_else(|| "rollout caller-span count overflowed u64".to_owned())?;
                 identities.insert((replica.to_owned(), trace_id));
             }
         }
-        Ok(identities)
+        Ok(TraceIdentityObservation {
+            identities,
+            caller_spans_seen,
+        })
     }
 
     /// Settle the complete caller-domain trace set. Once every expected trace
@@ -494,11 +510,7 @@ impl Fleet {
         within: Duration,
     ) -> Result<TraceWitnessSnapshot, String> {
         let mut snapshot = settle_identity_set(expected, within, TRACE_QUIESCENCE, || {
-            Ok(self
-                .trace_identities()?
-                .into_iter()
-                .filter(|(_, trace_id)| trace_id.starts_with(ROLLOUT_TRACE_DOMAIN_PREFIX))
-                .collect())
+            self.trace_identity_observation()
         })
         .await?;
         snapshot.exports = self.trace_exports();
@@ -524,7 +536,7 @@ async fn settle_identity_set<F>(
     mut observe: F,
 ) -> Result<TraceWitnessSnapshot, String>
 where
-    F: FnMut() -> Result<BTreeSet<(String, String)>, String>,
+    F: FnMut() -> Result<TraceIdentityObservation, String>,
 {
     let deadline = Instant::now() + within;
     let mut last = observe()?;
@@ -532,16 +544,19 @@ where
     loop {
         let now = Instant::now();
         let observed = observe()?;
-        if observed != last {
+        if observed.identities != last.identities
+            || observed.caller_spans_seen != last.caller_spans_seen
+        {
             last = observed;
             unchanged_since = now;
         }
-        if (expected.is_subset(&last) && now.duration_since(unchanged_since) >= quiescence)
+        if (expected.is_subset(&last.identities)
+            && now.duration_since(unchanged_since) >= quiescence)
             || now >= deadline
         {
             return Ok(TraceWitnessSnapshot {
                 exports: 0,
-                identities: last,
+                identities: last.identities,
             });
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -643,9 +658,10 @@ flush_timeout_ms = 300
             format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}2"),
         );
         let expected = [expected_identity.clone()].into_iter().collect();
-        let observed = Arc::new(Mutex::new(
-            [expected_identity].into_iter().collect::<BTreeSet<_>>(),
-        ));
+        let observed = Arc::new(Mutex::new(TraceIdentityObservation {
+            identities: [expected_identity].into_iter().collect(),
+            caller_spans_seen: 1,
+        }));
         let delayed = observed.clone();
         let expected_extra = extra_identity.clone();
         tokio::spawn(async move {
@@ -653,7 +669,9 @@ flush_timeout_ms = 300
             delayed
                 .lock()
                 .expect("trace test lock")
+                .identities
                 .insert(expected_extra);
+            delayed.lock().expect("trace test lock").caller_spans_seen += 1;
         });
 
         let snapshot = settle_identity_set(
@@ -677,5 +695,43 @@ flush_timeout_ms = 300
             .into_iter()
             .collect()
         );
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_resets_for_duplicate_caller_activity_before_a_late_extra() {
+        let expected_identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1"),
+        );
+        let extra_identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}2"),
+        );
+        let expected = [expected_identity.clone()].into_iter().collect();
+        let observed = Arc::new(Mutex::new(TraceIdentityObservation {
+            identities: [expected_identity].into_iter().collect(),
+            caller_spans_seen: 1,
+        }));
+        let delayed = observed.clone();
+        let expected_extra = extra_identity.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            delayed.lock().expect("trace test lock").caller_spans_seen += 1;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let mut observed = delayed.lock().expect("trace test lock");
+            observed.identities.insert(expected_extra);
+            observed.caller_spans_seen += 1;
+        });
+
+        let snapshot = settle_identity_set(
+            &expected,
+            Duration::from_millis(250),
+            Duration::from_millis(70),
+            || Ok(observed.lock().expect("trace test lock").clone()),
+        )
+        .await
+        .expect("caller activity keeps the synthetic collector open");
+
+        assert!(snapshot.identities.contains(&extra_identity));
     }
 }

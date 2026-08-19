@@ -819,16 +819,51 @@ mod otlp_witness {
         )
         .await;
 
+        let first = [
+            TRACE.to_owned(),
+            "61786f6e642d726f0000000000000002".to_owned(),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             collector
                 .trace_ids_for_instance("previous-0")
                 .expect("the witness decodes"),
-            [
-                TRACE.to_owned(),
-                "61786f6e642d726f0000000000000002".to_owned(),
-            ]
-            .into_iter()
-            .collect()
+            first
+        );
+        assert_eq!(
+            collector.trace_exports_decoded_for_instance("previous-0"),
+            1
+        );
+
+        // A settlement poll with no new export reuses the decoded witness.
+        assert_eq!(
+            collector
+                .trace_ids_for_instance("previous-0")
+                .expect("the cached witness remains valid"),
+            first
+        );
+        assert_eq!(
+            collector.trace_exports_decoded_for_instance("previous-0"),
+            1
+        );
+
+        send(
+            &collector,
+            vec![resource_spans("previous-0", &trace_bytes(3))],
+        )
+        .await;
+        let mut with_late_export = first;
+        with_late_export.insert("61786f6e642d726f0000000000000003".to_owned());
+        assert_eq!(
+            collector
+                .trace_ids_for_instance("previous-0")
+                .expect("only the late export is decoded"),
+            with_late_export
+        );
+        assert_eq!(
+            collector.trace_exports_decoded_for_instance("previous-0"),
+            2
         );
     }
 
@@ -836,15 +871,23 @@ mod otlp_witness {
     async fn one_receiver_cannot_claim_a_second_replica() {
         let collector = Collector::start().await;
         let trace = trace_bytes(1);
-        send(
-            &collector,
-            vec![
-                resource_spans("previous-0", &trace),
-                resource_spans("previous-1", &trace),
-            ],
-        )
-        .await;
+        send(&collector, vec![resource_spans("previous-0", &trace)]).await;
+        assert_eq!(
+            collector
+                .trace_ids_for_instance("previous-0")
+                .expect("the first owner is valid"),
+            [TRACE.to_owned()].into_iter().collect()
+        );
+
+        // A foreign owner arriving after an earlier successful observation is
+        // still decoded and permanently fails the dedicated receiver.
+        send(&collector, vec![resource_spans("previous-1", &trace)]).await;
 
         assert!(collector.trace_ids_for_instance("previous-0").is_err());
+        assert!(collector.trace_ids_for_instance("previous-0").is_err());
+        assert_eq!(
+            collector.trace_exports_decoded_for_instance("previous-0"),
+            2
+        );
     }
 }

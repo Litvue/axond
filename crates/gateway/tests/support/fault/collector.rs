@@ -47,6 +47,21 @@ pub struct HistogramPoint {
 #[derive(Default)]
 struct CollectorState {
     exports: Mutex<Vec<Export>>,
+    trace_identity_caches: Mutex<BTreeMap<String, TraceIdentityCache>>,
+}
+
+#[derive(Default)]
+struct TraceIdentityCache {
+    exports_seen: usize,
+    trace_exports_decoded: usize,
+    trace_id_occurrences: BTreeMap<String, u64>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraceIdentityObservation {
+    pub trace_ids: BTreeSet<String>,
+    pub occurrences: BTreeMap<String, u64>,
 }
 
 pub struct Collector {
@@ -109,10 +124,42 @@ impl Collector {
         &self,
         expected_instance: &str,
     ) -> Result<BTreeSet<String>, String> {
-        let mut trace_ids = BTreeSet::new();
-        for export in self.exports().into_iter().filter(|e| e.signal == "traces") {
-            let request = ExportTraceServiceRequest::decode(export.bytes)
-                .map_err(|error| format!("invalid OTLP trace export: {error}"))?;
+        Ok(self
+            .trace_identity_observation(expected_instance)?
+            .trace_ids)
+    }
+
+    pub fn trace_identity_observation(
+        &self,
+        expected_instance: &str,
+    ) -> Result<TraceIdentityObservation, String> {
+        // Settlement polls this method several times while exporters flush.
+        // Decode only exports that arrived since the last observation instead
+        // of repeatedly cloning and decoding the complete retained corpus.
+        let mut caches = self
+            .state
+            .trace_identity_caches
+            .lock()
+            .expect("collector trace cache lock");
+        let cache = caches.entry(expected_instance.to_owned()).or_default();
+        if let Some(error) = &cache.error {
+            return Err(error.clone());
+        }
+        let exports = self.state.exports.lock().expect("collector lock");
+        for export in exports
+            .iter()
+            .skip(cache.exports_seen)
+            .filter(|export| export.signal == "traces")
+        {
+            cache.trace_exports_decoded += 1;
+            let request = match ExportTraceServiceRequest::decode(export.bytes.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let error = format!("invalid OTLP trace export: {error}");
+                    cache.error = Some(error.clone());
+                    return Err(error);
+                }
+            };
             for resource_spans in request.resource_spans {
                 let spans = resource_spans
                     .scope_spans
@@ -123,9 +170,10 @@ impl Collector {
                     continue;
                 }
                 let Some(resource) = resource_spans.resource else {
-                    return Err(format!(
-                        "OTLP trace export for `{expected_instance}` has no resource"
-                    ));
+                    let error =
+                        format!("OTLP trace export for `{expected_instance}` has no resource");
+                    cache.error = Some(error.clone());
+                    return Err(error);
                 };
                 let instances = resource
                     .attributes
@@ -139,21 +187,39 @@ impl Collector {
                     })
                     .collect::<Vec<_>>();
                 if instances != [expected_instance] {
-                    return Err(format!(
+                    let error = format!(
                         "OTLP trace receiver for `{expected_instance}` observed resource identities {instances:?}"
-                    ));
+                    );
+                    cache.error = Some(error.clone());
+                    return Err(error);
                 }
                 for span in spans {
-                    let trace_id = canonical_trace_id(&span.trace_id).ok_or_else(|| {
-                        format!(
+                    let Some(trace_id) = canonical_trace_id(&span.trace_id) else {
+                        let error = format!(
                             "OTLP trace receiver for `{expected_instance}` observed a malformed trace id"
-                        )
-                    })?;
-                    trace_ids.insert(trace_id);
+                        );
+                        cache.error = Some(error.clone());
+                        return Err(error);
+                    };
+                    *cache.trace_id_occurrences.entry(trace_id).or_default() += 1;
                 }
             }
         }
-        Ok(trace_ids)
+        cache.exports_seen = exports.len();
+        Ok(TraceIdentityObservation {
+            trace_ids: cache.trace_id_occurrences.keys().cloned().collect(),
+            occurrences: cache.trace_id_occurrences.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn trace_exports_decoded_for_instance(&self, expected_instance: &str) -> usize {
+        self.state
+            .trace_identity_caches
+            .lock()
+            .expect("collector trace cache lock")
+            .get(expected_instance)
+            .map_or(0, |cache| cache.trace_exports_decoded)
     }
 
     /// Whether `needle` appears in any exported payload of `signal`.

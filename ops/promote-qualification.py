@@ -52,6 +52,8 @@ CAPACITY_RESULT_SCHEMA_VERSION = 2
 FAULT_RESULT_SCHEMA_VERSION = 1
 ROLLOUT_RESULT_SCHEMA_VERSION = 4
 ROLLOUT_RECORD_SCHEMA_VERSION = 4
+ROLLOUT_PREVIOUS_VERSION = "0.3.40"
+ROLLOUT_CANDIDATE_VERSION = "0.4.0"
 STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION = 3
 STATEFUL_LEDGER_SHARDS = 64
 STATEFUL_MAX_SHARD_ROWS = 1_500_000
@@ -1664,8 +1666,8 @@ def validate_raw_rollout(
         retained.get("archive_sha256"), f"{label}: retained release archive digest"
     )
     if (
-        previous.get("binary", {}).get("version") != "0.3.40"
-        or candidate.get("binary", {}).get("version") != "0.4.0"
+        previous.get("binary", {}).get("version") != ROLLOUT_PREVIOUS_VERSION
+        or candidate.get("binary", {}).get("version") != ROLLOUT_CANDIDATE_VERSION
         or retained.get("expected_version") != previous.get("binary", {}).get("version")
         or expected_previous_digest
         != str(previous.get("binary", {}).get("sha256", "")).lower()
@@ -2468,7 +2470,8 @@ def validate_raw_rollout(
     if (
         len(trace_verdicts) != 1
         or trace_verdicts[0].get("comparison") != ">="
-        or trace_verdicts[0].get("value") != trace_exports
+        or trace_verdicts[0].get("value")
+        != len(reconciliation["otlp_trace_export_replicas"])
         or trace_verdicts[0].get("bound") != len(expected_exact_replicas)
         or trace_verdicts[0].get("passed") is not True
     ):
@@ -2821,7 +2824,7 @@ def validate_raw_rollout(
         "duplicate_usage_record_ids": ("<=", request_id_duplicates, 0),
         "otlp_trace_context_exported": (
             ">=",
-            trace_exports,
+            len(reconciliation["otlp_trace_export_replicas"]),
             len(expected_exact_replicas),
         ),
         "otlp_trace_export_identity_mismatches": ("<=", 0, 0),
@@ -5594,10 +5597,18 @@ def self_test() -> int:
     rollout_identities = sorted(
         {
             json.dumps(
-                {"sha256": previous_digest, "version": "0.3.40"}, sort_keys=True
+                {
+                    "sha256": previous_digest,
+                    "version": ROLLOUT_PREVIOUS_VERSION,
+                },
+                sort_keys=True,
             ),
             json.dumps(
-                {"sha256": candidate_digest, "version": "0.4.0"}, sort_keys=True
+                {
+                    "sha256": candidate_digest,
+                    "version": ROLLOUT_CANDIDATE_VERSION,
+                },
+                sort_keys=True,
             ),
         }
     )
@@ -5606,7 +5617,7 @@ def self_test() -> int:
         "source": {
             "git_commit": "commit",
             "git_dirty": False,
-            "crate_version": "0.4.0",
+            "crate_version": ROLLOUT_CANDIDATE_VERSION,
         },
         "binary": {
             "sha256": hashlib.sha256("\n".join(rollout_identities).encode()).hexdigest(),
@@ -5623,9 +5634,9 @@ def self_test() -> int:
         "artifact_schema_version": ROLLOUT_RESULT_SCHEMA_VERSION,
         "elapsed_ms": 100,
         "verdicts": 0,
-        "rollout_previous_version": "0.3.40",
+        "rollout_previous_version": ROLLOUT_PREVIOUS_VERSION,
         "rollout_previous_binary_sha256": previous_digest,
-        "rollout_candidate_version": "0.4.0",
+        "rollout_candidate_version": ROLLOUT_CANDIDATE_VERSION,
         "rollout_candidate_binary_sha256": candidate_digest,
         "rollout_retained_archive_sha256": "3" * 64,
         "rollout_shared_stateful_revision": "rev_shared",
@@ -5671,11 +5682,11 @@ def self_test() -> int:
             "started_at_unix_ms": 1,
             "elapsed_ms": 100,
             "harness": "axond rollout harness",
-            "harness_version": "0.4.0",
+            "harness_version": ROLLOUT_CANDIDATE_VERSION,
             "mode": "qualification",
             "promotable": True,
             "retained_release": {
-                "expected_version": "0.3.40",
+                "expected_version": ROLLOUT_PREVIOUS_VERSION,
                 "expected_binary_sha256": previous_digest,
                 "archive_sha256": "3" * 64,
             },
@@ -5691,7 +5702,10 @@ def self_test() -> int:
         "revisions": [
             {
                 "label": "previous",
-                "binary": {"sha256": previous_digest, "version": "0.3.40"},
+                "binary": {
+                    "sha256": previous_digest,
+                    "version": ROLLOUT_PREVIOUS_VERSION,
+                },
                 "config": {
                     "sha256": previous_config_digest,
                     "normalized_toml": previous_config,
@@ -5702,7 +5716,10 @@ def self_test() -> int:
             },
             {
                 "label": "candidate-previous-config",
-                "binary": {"sha256": candidate_digest, "version": "0.4.0"},
+                "binary": {
+                    "sha256": candidate_digest,
+                    "version": ROLLOUT_CANDIDATE_VERSION,
+                },
                 "config": {
                     "sha256": previous_config_digest,
                     "normalized_toml": previous_config,
@@ -5713,7 +5730,10 @@ def self_test() -> int:
             },
             {
                 "label": "next",
-                "binary": {"sha256": candidate_digest, "version": "0.4.0"},
+                "binary": {
+                    "sha256": candidate_digest,
+                    "version": ROLLOUT_CANDIDATE_VERSION,
+                },
                 "config": {
                     "sha256": previous_config_digest,
                     "normalized_toml": previous_config,
@@ -5877,7 +5897,10 @@ def self_test() -> int:
     )
     same_binary_rollout = copy.deepcopy(rollout_result)
     for revision in same_binary_rollout["revisions"]:
-        revision["binary"] = {"sha256": candidate_digest, "version": "0.4.0"}
+        revision["binary"] = {
+            "sha256": candidate_digest,
+            "version": ROLLOUT_CANDIDATE_VERSION,
+        }
     expect_refusal(
         "same-binary rollout evidence",
         lambda: validate_raw_rollout(

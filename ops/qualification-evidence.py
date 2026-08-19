@@ -81,6 +81,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 ops floor
 
 ROOT = Path(__file__).resolve().parent.parent
 CAPACITY_RESULT_SCHEMA_VERSION = 2
+ROLLOUT_PREVIOUS_VERSION = "0.3.40"
+ROLLOUT_CANDIDATE_VERSION = "0.4.0"
 STATEFUL_LEDGER_SHARDS = 64
 STATEFUL_MAX_SHARD_ROWS = 1_500_000
 STATEFUL_LEDGER_FIELDS: tuple[tuple[str, int], ...] = (
@@ -1105,8 +1107,8 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
     retained = run.get("retained_release", {})
     previous_binary = previous.get("binary", {})
     if (
-        previous_binary.get("version") != "0.3.40"
-        or candidate.get("binary", {}).get("version") != "0.4.0"
+        previous_binary.get("version") != ROLLOUT_PREVIOUS_VERSION
+        or candidate.get("binary", {}).get("version") != ROLLOUT_CANDIDATE_VERSION
         or retained.get("expected_version") != previous_binary.get("version")
         or retained.get("expected_binary_sha256") != previous_binary.get("sha256")
         or not isinstance(retained.get("archive_sha256"), str)
@@ -1769,7 +1771,7 @@ def self_test() -> int:
             "mode": "qualification",
             "promotable": True,
             "retained_release": {
-                "expected_version": "0.3.40",
+                "expected_version": ROLLOUT_PREVIOUS_VERSION,
                 "expected_binary_sha256": "previous",
                 "archive_sha256": "a" * 64,
             },
@@ -1778,21 +1780,30 @@ def self_test() -> int:
         "revisions": [
             {
                 "label": "previous",
-                "binary": {"sha256": "previous", "version": "0.3.40"},
+                "binary": {
+                    "sha256": "previous",
+                    "version": ROLLOUT_PREVIOUS_VERSION,
+                },
                 "config": {"sha256": "shared-bootstrap"},
                 "distinct_binary": False,
                 "desired_state_revision": "rev_shared",
             },
             {
                 "label": "candidate-previous-config",
-                "binary": {"sha256": "candidate", "version": "0.4.0"},
+                "binary": {
+                    "sha256": "candidate",
+                    "version": ROLLOUT_CANDIDATE_VERSION,
+                },
                 "config": {"sha256": "shared-bootstrap"},
                 "distinct_binary": True,
                 "desired_state_revision": "rev_shared",
             },
             {
                 "label": "next",
-                "binary": {"sha256": "candidate", "version": "0.4.0"},
+                "binary": {
+                    "sha256": "candidate",
+                    "version": ROLLOUT_CANDIDATE_VERSION,
+                },
                 "config": {"sha256": "shared-bootstrap"},
                 "distinct_binary": True,
                 "desired_state_revision": "rev_shared",

@@ -505,6 +505,10 @@ impl Harness {
     }
 
     fn expected_otlp_trace_identities(&self) -> BTreeSet<(String, String)> {
+        // A transport failure can leave a server span behind without a usage
+        // row. Do not silently excuse it here: the exact trace mismatch and
+        // request-loss verdicts must both fail, preserving the failed attempt's
+        // real attribution instead of laundering it as successful accounting.
         self.expected_usage
             .iter()
             .map(|identity| (identity.replica.clone(), identity.trace_id.clone()))
@@ -2061,7 +2065,11 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
         ),
         Verdict::at_least(
             "otlp_trace_context_exported",
-            result.loss.usage_reconciliation.otlp_trace_exports as f64,
+            result
+                .loss
+                .usage_reconciliation
+                .otlp_trace_export_replicas
+                .len() as f64,
             result.loss.usage_reconciliation.exact_trace_replicas.len() as f64,
         ),
         Verdict::at_most(
