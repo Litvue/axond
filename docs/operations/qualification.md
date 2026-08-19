@@ -78,6 +78,11 @@ Freeze the cohort in this order:
    the frozen object that produced the candidate binaries.
 5. Merge the release PR only after the pre-tag publication test is green.
 
+Fault and recovery evidence comes from a manual `CI` workflow dispatch on the
+frozen release branch. Pull-request CI still tests GitHub's synthetic merge ref,
+which is the right merge gate but not the candidate head named by the cohort;
+its generated records are diagnostic and cannot be promoted into that cohort.
+
 The `axond-qualification` self-hosted runner label is also a provisioning
 contract: it names a Linux x86_64 host with a running Docker Engine capable of
 starting GitHub Actions service containers. Stateful endurance uses a pinned

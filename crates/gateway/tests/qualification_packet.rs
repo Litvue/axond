@@ -697,6 +697,37 @@ fn every_path_the_packet_names_exists() {
     }
 }
 
+/// Fault and recovery records must come from the frozen branch head. Ordinary
+/// pull-request CI intentionally checks GitHub's synthetic merge ref, so it is
+/// a merge gate rather than promotable cohort provenance.
+#[test]
+fn fault_and_recovery_have_an_exact_head_dispatch_lane() {
+    let packet = packet::load();
+    for slice_id in [SliceId::Fault, SliceId::Recovery] {
+        assert_eq!(
+            packet.slice(slice_id).heavy_lane.as_deref(),
+            Some(".github/workflows/ci.yml"),
+            "{} must use the service-backed CI workflow",
+            slice_id.as_str()
+        );
+    }
+
+    let workflow =
+        std::fs::read_to_string(packet::workspace_root().join(".github/workflows/ci.yml"))
+            .expect("CI workflow should be readable");
+    assert!(
+        workflow.lines().any(|line| line == "  workflow_dispatch:"),
+        "CI must be manually dispatchable from the frozen release branch"
+    );
+
+    let contract = packet::contract_text();
+    assert!(
+        contract.contains("manual `CI` workflow dispatch")
+            && contract.contains("synthetic merge ref"),
+        "the qualification runbook must distinguish exact-head evidence from PR merge-ref CI"
+    );
+}
+
 /// The status ladder is derived, not asserted. Each rung has a requirement the
 /// slice's own fields either meet or do not, so a slice cannot promote itself:
 /// `declared` needs a manifest, `harnessed` needs a driver that runs, and
