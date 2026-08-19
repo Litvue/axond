@@ -528,9 +528,15 @@ fn rollout_observations_require_the_current_artifact_schema() {
 }
 
 #[test]
-fn rollout_raw_and_compact_contracts_are_both_schema_four() {
-    assert_eq!(ROLLOUT_RESULT_SCHEMA_VERSION, 4);
+fn rollout_raw_schema_five_and_compact_schema_four_are_explicit() {
+    assert_eq!(ROLLOUT_RESULT_SCHEMA_VERSION, 5);
     assert_eq!(packet::ROLLOUT_RECORD_SCHEMA_VERSION, 4);
+    let packet_text = std::fs::read_to_string(packet::manifest_path())
+        .expect("qualification packet should be readable as text");
+    assert!(
+        packet_text.contains("raw-schema-5/compact-schema-4 contract"),
+        "the packet must distinguish the raw and compact rollout schemas"
+    );
 }
 
 #[test]

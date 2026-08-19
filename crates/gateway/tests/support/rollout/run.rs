@@ -54,8 +54,8 @@ use super::manifest::{RESULT_SCHEMA_VERSION, Scale, Scenario, Tier};
 use super::result::{
     CapacityEnvelope, CommandRecord, DrainRecord, DrainingRefusalAttempt, Environment, Event,
     ExpectedNonUsageTraceIdentity, ExpectedUsageIdentity, FailedIngressAttempt, Fence, InFlight,
-    LossLedger, MigrationEvidence, MigrationMatrix, MigrationVersion, MixedVersion,
-    ObservedUsageIdentity, PatchRollback, PhaseTraffic, ReplicaRecord, ReplicaUsage,
+    LossLedger, MigrationEvidence, MigrationMatrix, MigrationTargetEvidence, MigrationVersion,
+    MixedVersion, ObservedUsageIdentity, PatchRollback, PhaseTraffic, ReplicaRecord, ReplicaUsage,
     RetainedRelease, RevisionMeta, RollbackEvidence, RolloutResult, RunMeta, ScenarioEcho,
     StreamCut, TraceExportIdentity, UnexpectedTraceIdentity, UsageReconciliation,
 };
@@ -391,6 +391,7 @@ struct Harness {
 
 struct PendingGate {
     config_path: String,
+    config_sha256: String,
     migration: Option<PreparedMigration>,
 }
 
@@ -599,6 +600,7 @@ impl Harness {
         );
         PendingGate {
             config_path: path,
+            config_sha256: sha256_hex(config.as_bytes()),
             migration,
         }
     }
@@ -615,6 +617,7 @@ impl Harness {
     ) -> (MigrationEvidence, Fence) {
         let PendingGate {
             config_path,
+            config_sha256,
             migration,
         } = gate;
         let env = migration
@@ -660,7 +663,7 @@ impl Harness {
                 }
             ),
         );
-        let (status, matrix, fence, control_plane) = if let Some(prepared) = migration {
+        let (status, matrix, fence, target, control_plane) = if let Some(prepared) = migration {
             let candidate_apply = axond_at(
                 candidate_binary,
                 &["migrate", "apply", "--config", &config_path],
@@ -769,6 +772,11 @@ impl Harness {
                     if refused { "refused" } else { "allowed" }
                 ),
             );
+            let target = MigrationTargetEvidence {
+                dsn_env: prepared.target.dsn_env.clone(),
+                schema: prepared.target.schema.clone(),
+                config_sha256,
+            };
             let matrix = MigrationMatrix {
                 evaluated: true,
                 skipped_reason: None,
@@ -799,6 +807,7 @@ impl Harness {
                 candidate_status_after,
                 matrix,
                 fence,
+                Some(target),
                 format!(
                     "one real PostgreSQL schema ({}) supplied migrations, desired state, and the \
                      serving fleet",
@@ -835,6 +844,7 @@ impl Harness {
                     refusal_names_newer_build: false,
                     expected_refused: false,
                 },
+                None,
                 format!("not evaluated: {reason}"),
             )
         };
@@ -859,6 +869,7 @@ impl Harness {
                 preflight,
                 status,
                 gate_passed,
+                target,
                 control_plane,
                 matrix,
             },

@@ -191,7 +191,7 @@ heavy_tier = "heavy"
 retained = []
 outstanding = """
 The historical heavy record used one candidate binary for both sides. The
-current raw and compact schema-4 contract requires the published v0.3.40
+current raw-schema-5/compact-schema-4 contract requires the published v0.3.40
 predecessor, the v0.4.0 cohort candidate, a common durable revision and alias
 served by both fleets, and a real PostgreSQL migration and rollback matrix. No
 retained run has yet met that contract."""

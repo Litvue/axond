@@ -60,6 +60,7 @@ static FIXTURES: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct MigrationTarget {
     pub dsn: String,
+    pub dsn_env: String,
     pub schema: String,
     pub env: Vec<(String, String)>,
 }
@@ -126,6 +127,7 @@ impl Deployment {
     pub fn migration_target(&self) -> MigrationTarget {
         MigrationTarget {
             dsn: self.dsn.clone(),
+            dsn_env: DSN_ENV.to_owned(),
             schema: self.schema.clone(),
             env: self.env.clone(),
         }

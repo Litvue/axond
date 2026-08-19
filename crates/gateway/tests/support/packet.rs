@@ -482,9 +482,9 @@ pub struct RecordObservation {
     pub durable_outside_identities_files: Option<u32>,
     #[serde(default)]
     pub durable_outside_identities_bytes: Option<u64>,
-    /// Rollout schema 4 preserves both serving executable identities, the
-    /// checksum-pinned retained archive, and the shared durable serving proof
-    /// after disposable raw artifacts expire.
+    /// Compact rollout record schema 4 preserves both serving executable
+    /// identities, the checksum-pinned retained archive, and the shared durable
+    /// serving proof after disposable raw artifacts expire.
     #[serde(default)]
     pub rollout_previous_version: Option<String>,
     #[serde(default)]

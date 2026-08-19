@@ -18,7 +18,7 @@ pub const MANIFEST_RELATIVE: &str = "qualification/rollout/manifest.toml";
 
 /// The result-artifact schema version. Bumped when a field changes meaning, so
 /// a stored artifact is never reinterpreted under a newer contract.
-pub const RESULT_SCHEMA_VERSION: u32 = 4;
+pub const RESULT_SCHEMA_VERSION: u32 = 5;
 
 /// The manifest schema this harness understands.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
