@@ -1310,6 +1310,11 @@ struct State {
     /// one: a database this harness reaches directly cannot be taken away, so
     /// there is no window for a lost row to shelter in.
     usage_window: Option<(Duration, Duration)>,
+    /// The upstream outage plus its recovery allowance. A caller cancellation
+    /// that overlaps this window races the gateway's observation of the
+    /// terminal upstream error, so its exact correlation row carries the
+    /// explicit concurrent-ending set rather than weakening every cancellation.
+    upstream_fault_window: (Duration, Duration),
     fault_windows: Vec<(Duration, Duration)>,
     /// When the last usage record arrived, absent until the first one does.
     last_record_at: Option<Duration>,
@@ -1461,6 +1466,11 @@ impl State {
         seed: u64,
     ) -> Self {
         let probe_identity = plan::CorrelationId::new(seed ^ PROBE_CORRELATION_DOMAIN, 0).bytes();
+        let upstream_fault_window = schedule
+            .attribution_windows_of(duration, Injected::UpstreamFaultsOnly)
+            .into_iter()
+            .next()
+            .expect("the stateful schedule always declares an upstream outage");
         Self {
             segment_ms: scale.segment_ms.max(1),
             segments: Vec::new(),
@@ -1505,6 +1515,7 @@ impl State {
                 Injected::EveryDeclaredFault => Some(schedule.usage_outage_window(duration)),
                 Injected::UpstreamFaultsOnly => None,
             },
+            upstream_fault_window,
             fault_windows: schedule.attribution_windows_of(duration, injected),
             last_record_at: None,
             samplers: Vec::new(),
@@ -1552,6 +1563,10 @@ impl State {
 
     fn touched_fault_window(&self, at: Duration, latency_ms: f64) -> bool {
         touched(&self.fault_windows, at, latency_ms)
+    }
+
+    fn touched_upstream_fault_window(&self, at: Duration, latency_ms: f64) -> bool {
+        touched(&[self.upstream_fault_window], at, latency_ms)
     }
 
     fn start_sampler(&mut self, id: &str, pid: u32, interval: Duration, dir: &Path, stem: &str) {
@@ -1622,9 +1637,16 @@ impl State {
         }
         if let Some(settlement) = attempt.outcome.settlement() {
             self.owed += 1;
-            self.correlations
-                .record_expected(attempt.correlation, settlement)
-                .expect("the stateful workload emits a valid trace identity");
+            let recorded = if settlement == Ending::Cancelled
+                && self.touched_upstream_fault_window(attempt.at, attempt.latency_ms)
+            {
+                self.correlations
+                    .record_cancelled_during_upstream_fault(attempt.correlation)
+            } else {
+                self.correlations
+                    .record_expected(attempt.correlation, settlement)
+            };
+            recorded.expect("the stateful workload emits a valid trace identity");
         }
         self.latency.record(attempt.latency_ms);
         if let Some(ttft) = attempt.ttft_ms {

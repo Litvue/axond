@@ -108,7 +108,7 @@ outstanding = """
 The exact-reconciliation driver has run only its ninety-second smoke tier. No
 retained twelve-hour run yet binds the raw JSON, all four fixed-width exact
 ledger shard sets, and its non-empty per-replica-incarnation resource-sample
-JSONL set under artifact schema 2."""
+JSONL set under artifact schema 3."""
 
 # The recovery slice: what a stateful deployment does when it loses its state.
 [[slice]]

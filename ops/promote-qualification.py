@@ -51,7 +51,7 @@ ENDURANCE_RESULT_SCHEMA_VERSION = 4
 CAPACITY_RESULT_SCHEMA_VERSION = 2
 FAULT_RESULT_SCHEMA_VERSION = 1
 ROLLOUT_RESULT_SCHEMA_VERSION = 3
-STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION = 2
+STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION = 3
 STATEFUL_LEDGER_SHARDS = 64
 STATEFUL_MAX_SHARD_ROWS = 1_500_000
 STATEFUL_DROP_LOG_SAMPLE = 1_000
@@ -254,8 +254,8 @@ def stateful_ledger_claim(
         {path.name for path in entries} != expected_names
         or any(path.is_symlink() or not path.is_file() for path in entries)
     ):
-        fail(f"{label}: exact ledger filenames do not match schema 2")
-    digest = hashlib.sha256(b"axond-stateful-ledger-v1\0")
+        fail(f"{label}: exact ledger filenames do not match schema 3")
+    digest = hashlib.sha256(b"axond-stateful-ledger-v2\0")
     total_bytes = 0
     row_width = STATEFUL_LEDGER_WIDTHS[field]
     for path in entries:
@@ -382,10 +382,10 @@ def stateful_identity_pair_tally(directory: Path, label: str) -> dict[str, int]:
 
 def compatible_correlation_pairs(expected: Counter[int], observed: Counter[int]) -> int:
     """Maximum compatible ending/status matching for one trace identity."""
-    source, ending_start, status_start, sink = 0, 1, 5, 10
-    capacity = [[0] * 11 for _ in range(11)]
+    source, settlement_start, status_start, sink = 0, 1, 6, 11
+    capacity = [[0] * 12 for _ in range(12)]
     for code, count in expected.items():
-        capacity[source][ending_start + code] = count
+        capacity[source][settlement_start + code] = count
     for code, count in observed.items():
         capacity[status_start + code][sink] = count
     compatibility = {
@@ -393,11 +393,15 @@ def compatible_correlation_pairs(expected: Counter[int], observed: Counter[int])
         1: (2, 3),
         2: (1, 3),
         3: (1,),
+        # Caller cancellation overlapping the declared upstream fault window:
+        # either close may win at the gateway, and the retained code makes
+        # that bounded race explicit without widening ordinary cancellation.
+        4: (1, 2, 3),
     }
     edge_capacity = min(sum(expected.values()), sum(observed.values()))
-    for ending, statuses in compatibility.items():
+    for settlement, statuses in compatibility.items():
         for status in statuses:
-            capacity[ending_start + ending][status_start + status] = edge_capacity
+            capacity[settlement_start + settlement][status_start + status] = edge_capacity
     total = 0
     while True:
         parent = [-1] * len(capacity)
@@ -454,8 +458,11 @@ def stateful_correlation_tally(
         observed_by_identity: dict[bytes, Counter[int]] = defaultdict(Counter)
         for row_at, row in enumerate(expected_rows):
             code = row[16]
-            if code > 3:
-                fail(f"{label}: expected shard {shard} row {row_at} has invalid ending {code}")
+            if code > 4:
+                fail(
+                    f"{label}: expected shard {shard} row {row_at} has invalid "
+                    f"settlement {code}"
+                )
             high, low = row[:8], int.from_bytes(row[8:16], "big")
             if low == 0 or high not in (workload_high, probe_high):
                 fail(f"{label}: expected shard {shard} row {row_at} was not issued by the driver")
@@ -2574,7 +2581,10 @@ def validate_raw_stateful_endurance(
     if result.get("schema_version") != STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION:
         fail(f"{label}: unsupported stateful endurance artifact schema")
     if row.get("artifact_schema_version") != STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION:
-        fail(f"{label}: compact stateful endurance row does not bind result schema 2")
+        fail(
+            f"{label}: compact stateful endurance row does not bind result schema "
+            f"{STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION}"
+        )
     verdicts = result.get("verdicts")
     if (
         not isinstance(verdicts, list)
@@ -2669,7 +2679,7 @@ def validate_raw_stateful_endurance(
         if shards != STATEFUL_LEDGER_SHARDS:
             fail(
                 f"{label}: raw stateful endurance {field} has {shards!r} shards, "
-                f"expected schema-2 count {STATEFUL_LEDGER_SHARDS}"
+                f"expected schema-3 count {STATEFUL_LEDGER_SHARDS}"
             )
         directory = resolve_stateful_ledger(
             raw_path, evidence.get("path"), f"{label}: {field}"
@@ -4393,7 +4403,7 @@ def validate(record: dict[str, Any]) -> None:
                 if row.get(f"{field}_files") != STATEFUL_LEDGER_SHARDS * files_per_shard:
                     fail(
                         f"{row.get('id')}: compact {field} file count does not match "
-                        "the schema-2 shard topology"
+                        "the schema-3 shard topology"
                     )
                 byte_count = row.get(f"{field}_bytes")
                 if (
@@ -4443,6 +4453,12 @@ def validate(record: dict[str, Any]) -> None:
 
 
 def self_test() -> int:
+    assert compatible_correlation_pairs(Counter({4: 1}), Counter({1: 1})) == 1
+    assert compatible_correlation_pairs(Counter({4: 1}), Counter({2: 1})) == 1
+    assert compatible_correlation_pairs(Counter({4: 1}), Counter({3: 1})) == 1
+    assert compatible_correlation_pairs(Counter({1: 1}), Counter({1: 1})) == 0
+    assert compatible_correlation_pairs(Counter({4: 1}), Counter({4: 1})) == 0
+
     path = ROOT / "qualification/capacity/evidence/heavy-local.toml"
     record = tomllib.loads(path.read_text(encoding="utf-8"))
     # The retained file is intentionally historical and must keep the manifest

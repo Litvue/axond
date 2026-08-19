@@ -171,8 +171,8 @@ def stateful_ledger_claim(
         {path.name for path in entries} != expected_names
         or any(path.is_symlink() or not path.is_file() for path in entries)
     ):
-        raise SystemExit(f"{label}: exact ledger filenames do not match schema 2")
-    digest = hashlib.sha256(b"axond-stateful-ledger-v1\0")
+        raise SystemExit(f"{label}: exact ledger filenames do not match schema 3")
+    digest = hashlib.sha256(b"axond-stateful-ledger-v2\0")
     total_bytes = 0
     row_width = STATEFUL_LEDGER_WIDTHS[field]
     for path in entries:
@@ -218,7 +218,7 @@ def stateful_ledger_claims(result: dict, workload: str) -> dict[str, dict[str, o
         if shards != STATEFUL_LEDGER_SHARDS:
             raise SystemExit(
                 f"{workload}: {field} has {shards!r} shards, expected "
-                f"schema-2 count {STATEFUL_LEDGER_SHARDS}"
+                f"schema-3 count {STATEFUL_LEDGER_SHARDS}"
             )
         directory = resolve_stateful_ledger(
             raw_path, evidence.get("path"), f"{workload}: {field}"
@@ -532,7 +532,7 @@ RECOVERY_MANIFEST = "qualification/recovery/manifest.toml"
 ENDURANCE_RESULT_SCHEMA_VERSION = 4
 FAULT_RESULT_SCHEMA_VERSION = 1
 ROLLOUT_RESULT_SCHEMA_VERSION = 3
-STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION = 2
+STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION = 3
 ENDURANCE_SURPLUS_VERDICT = "max_unexpected_usage_records"
 
 

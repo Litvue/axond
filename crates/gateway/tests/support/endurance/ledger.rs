@@ -450,7 +450,34 @@ impl CorrelationLedger {
         ending: Ending,
     ) -> Result<(), IdentityError> {
         let trace_id = validate_trace_bytes(trace_id)?;
-        write_correlation_row(&mut self.expected_shards, trace_id, ending_code(ending));
+        write_correlation_row(
+            &mut self.expected_shards,
+            trace_id,
+            ExpectedSettlement::from(ending).code(),
+        );
+        self.expected += 1;
+        Ok(())
+    }
+
+    /// Record the exact concurrent-ending set for a caller cancellation that
+    /// overlaps a declared upstream fault window.
+    ///
+    /// Once the caller drops a stream, the client and gateway race to observe
+    /// the caller cancellation versus the upstream's terminal error. Both
+    /// `client_cancelled`/`partial` and `upstream_error` are truthful outcomes
+    /// for that one explicitly fault-attributed request. Keeping a distinct
+    /// on-disk code preserves that narrow boundary instead of teaching every
+    /// ordinary cancellation to accept an upstream failure.
+    pub fn record_cancelled_during_upstream_fault(
+        &mut self,
+        trace_id: [u8; ID_WIDTH],
+    ) -> Result<(), IdentityError> {
+        let trace_id = validate_trace_bytes(trace_id)?;
+        write_correlation_row(
+            &mut self.expected_shards,
+            trace_id,
+            ExpectedSettlement::CancelledDuringUpstreamFault.code(),
+        );
         self.expected += 1;
         Ok(())
     }
@@ -539,7 +566,7 @@ pub struct CorrelationTally {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ExpectedRow {
     identity: [u8; ID_WIDTH],
-    ending: Ending,
+    settlement: ExpectedSettlement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -555,6 +582,61 @@ enum ObservedStatus {
     ClientCancelled,
     Partial,
     Rejected,
+}
+
+/// The exact set of usage statuses one request is allowed to produce.
+///
+/// Codes 0-3 deliberately retain the historical `Ending` representation.
+/// Code 4 is only emitted for a caller cancellation whose lifetime overlaps
+/// the declared upstream-fault attribution window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ExpectedSettlement {
+    Complete,
+    Cancelled,
+    Dropped,
+    Faulted,
+    CancelledDuringUpstreamFault,
+}
+
+impl ExpectedSettlement {
+    const ALL: [Self; 5] = [
+        Self::Complete,
+        Self::Cancelled,
+        Self::Dropped,
+        Self::Faulted,
+        Self::CancelledDuringUpstreamFault,
+    ];
+
+    const fn code(self) -> u8 {
+        self as u8
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code)).copied()
+    }
+
+    fn settles(self, status: &str) -> bool {
+        match self {
+            Self::Complete => Ending::Complete.settles(status),
+            Self::Cancelled => Ending::Cancelled.settles(status),
+            Self::Dropped => Ending::Dropped.settles(status),
+            Self::Faulted => Ending::Faulted.settles(status),
+            Self::CancelledDuringUpstreamFault => {
+                Ending::Cancelled.settles(status) || status == "upstream_error"
+            }
+        }
+    }
+}
+
+impl From<Ending> for ExpectedSettlement {
+    fn from(ending: Ending) -> Self {
+        match ending {
+            Ending::Complete => Self::Complete,
+            Ending::Cancelled => Self::Cancelled,
+            Ending::Dropped => Self::Dropped,
+            Ending::Faulted => Self::Faulted,
+        }
+    }
 }
 
 impl ObservedStatus {
@@ -594,19 +676,6 @@ impl ObservedStatus {
     fn from_code(code: u8) -> Option<Self> {
         Self::ALL.get(usize::from(code)).copied()
     }
-}
-
-fn ending_code(ending: Ending) -> u8 {
-    match ending {
-        Ending::Complete => 0,
-        Ending::Cancelled => 1,
-        Ending::Dropped => 2,
-        Ending::Faulted => 3,
-    }
-}
-
-fn ending_from_code(code: u8) -> Option<Ending> {
-    Ending::ALL.get(usize::from(code)).copied()
 }
 
 fn recreate_directory(dir: &Path) {
@@ -731,13 +800,17 @@ fn read_expected_rows(path: &Path) -> Result<Vec<ExpectedRow>, ShardError> {
         .map(|(row, bytes)| {
             let identity = bytes[..ID_WIDTH].try_into().expect("16 identity bytes");
             let value = bytes[ID_WIDTH];
-            let ending = ending_from_code(value).ok_or_else(|| ShardError::InvalidRow {
-                path: path.to_owned(),
-                row,
-                field: "ending",
-                value,
-            })?;
-            Ok(ExpectedRow { identity, ending })
+            let settlement =
+                ExpectedSettlement::from_code(value).ok_or_else(|| ShardError::InvalidRow {
+                    path: path.to_owned(),
+                    row,
+                    field: "settlement",
+                    value,
+                })?;
+            Ok(ExpectedRow {
+                identity,
+                settlement,
+            })
         })
         .collect()
 }
@@ -829,29 +902,30 @@ fn group_end_observed(rows: &[ObservedRow], start: usize) -> usize {
 fn compatible_pairs(expected: &[ExpectedRow], observed: &[ObservedRow]) -> u64 {
     const SOURCE: usize = 0;
     const ENDING_START: usize = 1;
-    const STATUS_START: usize = ENDING_START + 4;
+    const STATUS_START: usize = ENDING_START + 5;
     const SINK: usize = STATUS_START + 5;
     const NODES: usize = SINK + 1;
-    let mut endings = [0_u64; 4];
+    let mut settlements = [0_u64; 5];
     let mut statuses = [0_u64; 5];
     for row in expected {
-        endings[usize::from(ending_code(row.ending))] += 1;
+        settlements[usize::from(row.settlement.code())] += 1;
     }
     for row in observed {
         statuses[usize::from(row.status.code())] += 1;
     }
     let mut capacity = [[0_u64; NODES]; NODES];
-    for (index, count) in endings.into_iter().enumerate() {
+    for (index, count) in settlements.into_iter().enumerate() {
         capacity[SOURCE][ENDING_START + index] = count;
     }
     for (index, count) in statuses.into_iter().enumerate() {
         capacity[STATUS_START + index][SINK] = count;
     }
     let edge_capacity = expected.len().min(observed.len()) as u64;
-    for (ending_index, ending) in Ending::ALL.into_iter().enumerate() {
+    for (settlement_index, settlement) in ExpectedSettlement::ALL.into_iter().enumerate() {
         for (status_index, status) in ObservedStatus::ALL.into_iter().enumerate() {
-            if ending.settles(status.as_str()) {
-                capacity[ENDING_START + ending_index][STATUS_START + status_index] = edge_capacity;
+            if settlement.settles(status.as_str()) {
+                capacity[ENDING_START + settlement_index][STATUS_START + status_index] =
+                    edge_capacity;
             }
         }
     }
@@ -1095,6 +1169,38 @@ mod tests {
         assert_eq!(
             (tally.missing, tally.unexpected, tally.status_mismatches),
             (0, 0, 1)
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fault_window_cancellation_keeps_its_narrow_concurrent_ending_set() {
+        let dir = test_dir("fault-window-cancellation");
+        let mut ledger = CorrelationLedger::create(&dir);
+        let identities = [trace(10), trace(11), trace(12)];
+        ledger
+            .record_cancelled_during_upstream_fault(identities[0])
+            .unwrap();
+        ledger
+            .record_cancelled_during_upstream_fault(identities[1])
+            .unwrap();
+        ledger
+            .record_expected(identities[2], Ending::Cancelled)
+            .unwrap();
+        ledger
+            .record_observed(&trace_text(identities[0]), "client_cancelled")
+            .unwrap();
+        ledger
+            .record_observed(&trace_text(identities[1]), "upstream_error")
+            .unwrap();
+        ledger
+            .record_observed(&trace_text(identities[2]), "upstream_error")
+            .unwrap();
+        let tally = ledger.tally().unwrap();
+        assert_eq!((tally.missing, tally.unexpected), (0, 0));
+        assert_eq!(
+            tally.status_mismatches, 1,
+            "only the ordinary cancellation must reject upstream_error"
         );
         fs::remove_dir_all(dir).ok();
     }
