@@ -6,7 +6,11 @@
 //! makes ordered failover legible: N attempt spans under one server span, the
 //! last one carrying the status the caller saw.
 
+use axum::http::HeaderMap;
+use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt;
+use opentelemetry_http::HeaderExtractor;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tracing::Span;
 use tracing::field::Empty;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -25,6 +29,46 @@ pub fn trace_id() -> Option<String> {
     let span_context = context.span().span_context().clone();
     span_context
         .is_valid()
+        .then(|| span_context.trace_id().to_string())
+}
+
+/// The validated correlation trace for one inbound request.
+///
+/// When export is active the server span is authoritative: it contains the
+/// context selected by the configured propagator and gives every child attempt
+/// the same trace. With export disabled there is deliberately no tracer or
+/// global propagator on the request path, but a usage record still retains a
+/// valid caller-supplied W3C trace id. This keeps correlation useful without
+/// enabling an exporter and without treating the trace id as the billing event
+/// identity.
+pub fn request_trace_id(headers: &HeaderMap) -> Option<String> {
+    trace_id().or_else(|| inbound_trace_id(headers))
+}
+
+fn inbound_trace_id(headers: &HeaderMap) -> Option<String> {
+    // Trace Context version 00 has one canonical four-field representation.
+    // The SDK extractor deliberately accepts future-version extensions, but
+    // this fallback runs without the configured request propagator and must
+    // not turn a partially understood header into durable usage correlation.
+    let traceparent = headers.get("traceparent")?.to_str().ok()?;
+    let mut fields = traceparent.split('-');
+    let version = fields.next()?;
+    let trace_id = fields.next()?;
+    let parent_id = fields.next()?;
+    let flags = fields.next()?;
+    if fields.next().is_some()
+        || version != "00"
+        || trace_id.len() != 32
+        || parent_id.len() != 16
+        || flags.len() != 2
+    {
+        return None;
+    }
+
+    let propagator = TraceContextPropagator::new();
+    let context = propagator.extract(&HeaderExtractor(headers));
+    let span_context = context.span().span_context().clone();
+    (span_context.is_valid() && span_context.is_remote())
         .then(|| span_context.trace_id().to_string())
 }
 
@@ -258,4 +302,47 @@ pub fn record_routing(
 /// left to record onto — the metrics and the record's `trace_id` carry it.
 pub fn record_streamed(record: &UsageRecord, ttft_ms: Option<u64>) {
     metrics::record_request(record, ttft_ms);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const SPAN_ID: &str = "00f067aa0ba902b7";
+
+    fn headers(traceparent: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            traceparent.parse().expect("valid header bytes"),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_valid_remote_w3c_trace_is_retained_without_an_exporter() {
+        assert_eq!(
+            inbound_trace_id(&headers(&format!("00-{TRACE_ID}-{SPAN_ID}-01"))).as_deref(),
+            Some(TRACE_ID)
+        );
+    }
+
+    #[test]
+    fn malformed_or_zero_w3c_context_is_not_usage_correlation() {
+        for traceparent in [
+            "not-a-traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+        ] {
+            assert_eq!(
+                inbound_trace_id(&headers(traceparent)),
+                None,
+                "{traceparent}"
+            );
+        }
+        assert_eq!(inbound_trace_id(&HeaderMap::new()), None);
+    }
 }

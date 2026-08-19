@@ -553,6 +553,25 @@ fn restore_drill_owns_restore_stages_and_reads_catalogue_before_recovered_boot()
     );
 }
 
+#[test]
+fn restore_drill_binds_evidence_to_the_release_executable_it_runs() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    for expected in [
+        "cargo build -p axond --locked --release",
+        "a supplied AXOND_BIN requires AXOND_RECOVERY_EXECUTABLE_SHA256",
+        "AXOND_BIN must resolve beneath the Cargo release directory",
+        "export AXOND_RECOVERY_EXECUTED_SHA256=\"$recovery_axond_sha256\"",
+        "export AXOND_RECOVERY_EXECUTABLE_PATH=\"$axond_bin\"",
+        "export AXOND_RECOVERY_EXECUTION_BOUND=\"true\"",
+    ] {
+        assert!(
+            source.contains(expected),
+            "restore evidence lost its release/execution binding: {expected}"
+        );
+    }
+}
+
 /// A durable-inventory artifact states every gate field, even though this
 /// inventory-only stage defers all six rather than pretending to measure them.
 #[test]
@@ -591,6 +610,72 @@ fn durable_inventory_records_all_gate_fields_and_setup_failures() {
     assert!(
         source.contains("record_durable_setup_failure"),
         "setup failures must retain an evidence artifact before stopping the drill"
+    );
+}
+
+/// The usage-boundary stage owns PITR usage observations, not revision loss,
+/// but every recovery artifact must still state an explicit decision for all
+/// six scenario gates. Omitting a deferral makes the drill fail at `close`.
+#[test]
+fn pitr_usage_boundary_records_or_defers_every_gate() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let start = source
+        .find("stage point-in-time-recovery/usage-boundary live")
+        .expect("the PITR usage-boundary stage is driven");
+    let end = source[start..]
+        .find("stage point-in-time-recovery/reconvergence live")
+        .map(|offset| start + offset)
+        .expect("the PITR usage-boundary stage has a bounded body");
+    let stage = &source[start..end];
+    for gate in [
+        "readiness",
+        "max_serving_error_fraction",
+        "max_convergence_lag_seconds",
+        "max_data_loss_revisions",
+        "admin_writes",
+        "max_unauthenticated_admin_successes",
+    ] {
+        assert!(
+            stage.contains(&format!("defer {gate}")) || stage.contains(&format!("gate {gate}")),
+            "PITR usage-boundary must record or defer {gate}"
+        );
+    }
+}
+
+#[test]
+fn restore_drill_closes_async_usage_and_numeric_reconstruction_races() {
+    let source = std::fs::read_to_string(recovery::workspace_root().join("ops/restore-drill.sh"))
+        .expect("the restore drill is readable");
+    let backup = source
+        .find("# Put one settled billing event on the durable side")
+        .expect("the logical-backup usage boundary is present");
+    let restore = source[backup..]
+        .find("stage backup-restore/restore logical_restore")
+        .map(|offset| backup + offset)
+        .expect("the logical restore follows its usage boundary");
+    let boundary = &source[backup..restore];
+    assert_eq!(
+        boundary.matches("wait_for_usage_quiet live 5432").count(),
+        2,
+        "the drill must quiesce prior usage and the fixture before pg_dump"
+    );
+    assert!(
+        source
+            .matches("canonical_seconds \"$survivor_lag_seconds\"")
+            .count()
+            >= 2,
+        "both reconvergence stages must submit the same float spelling their observations retain"
+    );
+    let restored_count = source
+        .find("restored_usage_rows=\"$(usage_count logical_restore 5432)\"")
+        .expect("the restored usage total is captured");
+    let restored_boot = source
+        .find("serve logical_restore \"$logical_http\"")
+        .expect("the restored replica is booted");
+    assert!(
+        restored_count < restored_boot,
+        "backup-boundary totals must be captured before qualification traffic can write to the restore"
     );
 }
 
@@ -782,10 +867,11 @@ fn the_prose_contract_and_the_manifest_agree() {
 }
 
 /// The two lanes write into one evidence directory, and a reader compares the
-/// artifacts in it. That only holds while they agree on the schema: the shell
-/// lane's recorder repeats the version the driver's `EVIDENCE_SCHEMA_VERSION`
-/// declares, and a bump on one side that is not made on the other silently
-/// produces a directory holding two schemas under one version number.
+/// artifacts in it. That only holds while they agree on the schema: both shell
+/// consumers import one shared Python contract, whose version must match the
+/// driver's `EVIDENCE_SCHEMA_VERSION`. A bump on one side that is not made on
+/// the other would silently produce a directory holding two schemas under one
+/// version number.
 #[test]
 fn the_two_lanes_write_the_same_artifact_schema() {
     let root = recovery::workspace_root();
@@ -800,18 +886,27 @@ fn the_two_lanes_write_the_same_artifact_schema() {
         })
         .expect("the driver declares an evidence schema version");
 
+    let shared_path = "ops/recovery_contract.py";
+    let shared =
+        std::fs::read_to_string(root.join(shared_path)).expect("the shared contract is readable");
+    let shared_version = shared
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("RECOVERY_RESULT_SCHEMA_VERSION = ")
+                .and_then(|rest| rest.trim().parse::<u32>().ok())
+        })
+        .expect("the shared contract declares a recovery result schema version");
+    assert_eq!(
+        shared_version, declared,
+        "{shared_path} writes schema {shared_version} and the driver writes {declared}"
+    );
+
     for lane in ["ops/recovery-evidence.py", "ops/check-recovery-evidence.py"] {
         let source = std::fs::read_to_string(root.join(lane)).expect("the lane script is readable");
-        let repeated = source
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("SCHEMA_VERSION = ")
-                    .and_then(|rest| rest.trim().parse::<u32>().ok())
-            })
-            .unwrap_or_else(|| panic!("{lane} declares no SCHEMA_VERSION"));
-        assert_eq!(
-            repeated, declared,
-            "{lane} writes schema {repeated} and the driver writes {declared}"
+        assert!(
+            source.contains("RECOVERY_RESULT_SCHEMA_VERSION,")
+                && source.contains("SCHEMA_VERSION = RECOVERY_RESULT_SCHEMA_VERSION"),
+            "{lane} does not consume the shared recovery schema version"
         );
     }
 }

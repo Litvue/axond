@@ -75,14 +75,17 @@ there is a balancer that is still routing to a drained member. Both counts and
 the worst observed lag are kept in the artifact, so the margin is visible rather
 than inferred.
 
-**The subjects are real processes at two revisions.** A revision is the (binary,
-config) pair a process was started from. The incoming revision serves an alias
+**The subjects are real processes at two revisions.** The promotable heavy lane
+downloads and checksum-verifies the retained release and runs it beside the
+candidate executable. A revision is the (binary, config) pair a process was
+started from. Before candidate-only configuration is enabled, the candidate must
+serve behind the fleet using the retained configuration. The incoming revision serves an alias
 the outgoing one has never heard of, so the harness can prove a mixed-version
 window is genuinely mixed: the same request is answered `200` by one replica and
 `404` by another, at the same moment, through the same balancer. This is the
-shape of the mixed-version rule in the upgrade guide. It is *not* a second build:
-the artifact records `distinct_binary: false` rather than implying that two
-compilations were compared.
+shape of the mixed-version rule in the upgrade guide. The reduced lane reuses the
+candidate binary, records `promotable: false`, and cannot cross the promotion
+boundary.
 
 **The drain is observed from both sides at once.** A buffered request and a
 stream the upstream never ends are pinned directly to the victim replica and
@@ -95,15 +98,14 @@ the buffered request finished and with what usage status, when the stream was cu
 and how many bytes had been relayed, and how many usage records the replica
 flushed on its way out.
 
-**Both rollbacks are exercised.** The compatible one is performed: a
-previous-revision replica is admitted, a next-revision replica is drained, and
-the artifact records that the older build then served real traffic. The
-prohibited one is *evaluated* against a real PostgreSQL — a control plane is
-migrated, a ledger entry only a newer build could have written is inserted, and
-the harness records that this build refuses to serve it and that the refusal
-names a newer gateway. Without a database the fence is recorded as
-`evaluated: false` with a reason, so a skipped fence can never read as a passing
-one.
+**Rollback follows the real migration matrix.** On a private PostgreSQL schema,
+the retained binary applies and inspects its migrations, the candidate inspects
+and applies its migrations, and the retained binary inspects the resulting
+ledger. Exact version/name/checksum rows classify the result. An unchanged
+layout permits a retained-binary traffic rollback; candidate-added versions must
+make the retained binary refuse with the newer-gateway fence. No synthetic
+future migration is used. Heavy qualification refuses to start without the
+database.
 
 **The operator gate runs before the fleet does.** `axond check preflight` and
 `axond migrate status` are run as subprocesses against the incoming revision's
@@ -134,17 +136,16 @@ inside the deadline and accounted for as partial, the migration gate passed, and
 the compatible rollback serving. Throughput and latency are recorded and never
 asserted, for the reason ADR 0033 gives.
 
-**Both tiers are the same code.** The reduced tier runs inside
-`cargo test --workspace`. The heavy tier is the identical driver, manifest, and
-assertions at a scale that wants a runner to itself: `AXOND_ROLLOUT=1`, run by the
-`Rollout` workflow on dispatch and weekly.
+**Both tiers use the same driver but make different claims.** The reduced tier
+runs inside `cargo test --workspace` as a same-binary diagnostic. The heavy tier
+requires `AXOND_ROLLOUT_PREVIOUS_BINARY`, a distinct digest, and PostgreSQL; only
+that tier is promotable.
 
 ### State tier
 
-Tier 0 for the fleet, Tier 2 for the fence. The replicas are config-only
-processes needing no service container, so the rollout scenario runs in the
-hermetic suite. The forward-only rollback fence needs a real PostgreSQL and is
-skipped — visibly, in the artifact — when `AXOND_TEST_POSTGRES_DSN` is unset.
+Tier 0 for the reduced diagnostic; Tier 2 for heavy qualification. Heavy runs
+require a retained release artifact and real PostgreSQL. Missing either is a
+hard refusal, not a skipped passing gate.
 
 ## Consequences
 
@@ -155,14 +156,11 @@ skipped — visibly, in the artifact — when `AXOND_TEST_POSTGRES_DSN` is unset
 - The drain bound an orchestrator's `terminationGracePeriodSeconds` is set from is
   measured against a real process on every run, so the documented sum is evidence
   rather than arithmetic.
-- The mixed-version claim is proven by capability, not by version string. That
-  covers the property that matters — two revisions serving different catalogues
-  through one balancer — and does not cover anything that would need two
-  compilations, such as a wire-format change between builds.
-- The fence is the harness's only stateful dependency, and it is the one piece
-  whose absence is easiest to misread. It is therefore recorded explicitly as
-  skipped, and the threshold it feeds only passes when it was actually evaluated
-  or explicitly not required.
+- The mixed-version claim is proven by both executable digest and observable
+  capability, while the compatibility phase proves the candidate can consume the
+  retained config before candidate-only configuration is enabled.
+- PostgreSQL and a distinct retained binary are promotion prerequisites; their
+  absence cannot be represented as a successful heavy result.
 - A rollout run boots several processes and drains them at their real deadlines,
   so it costs wall-clock time proportional to the shutdown bounds, not to the
   traffic. The manifest's bounds are chosen so the reduced tier stays inside a

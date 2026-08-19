@@ -54,7 +54,7 @@ committed data and the enum that admits it, as in ADR 0033.
 `soak` is the twelve-hour tier, dispatched from the `Endurance` workflow. They
 differ in duration, concurrency, and which *drift* gates apply — a slope stated
 per hour is noise on a fifteen-second run. Everything that does not depend on
-duration (losses, duplicates, leaks, unexpected statuses, socket balance) is
+duration (losses, surplus identities, duplicates, leaks, unexpected statuses, socket balance) is
 asserted at both tiers.
 
 **A dispatched duration moves the soak tier only.** Both tiers share a test
@@ -111,10 +111,11 @@ tier.
 - Bounded retention costs some disk during a run (the fingerprint shards) and a
   second pass at the end. That is the cheaper direction: the alternative scales
   the harness's memory with the run and contaminates the reading.
-- The hosted workflow offers five hours, because a GitHub-hosted runner cancels
-  at six and a cancelled job uploads nothing. The committed twelve-hour tier is
-  run off CI on a host without the limit. No twelve-hour envelope is claimed
-  here until such a run has published its artifact.
+- The promotion workflow targets a labelled self-hosted qualification runner
+  and offers the committed twelve hours. A shorter dispatch may diagnose the
+  harness but both compact-record construction and promotion refuse it. No
+  twelve-hour envelope is claimed until that full run publishes validated
+  artifacts.
 - Gating socket and descriptor balance at zero tolerance makes the suite
   sensitive to a genuinely leaky change and to nothing else: the readings are
   taken after the driver's own client is dropped and the process has settled.

@@ -2,13 +2,13 @@
 //!
 //! Each test here runs one *stage* of a scenario in
 //! `qualification/recovery/manifest.toml` against a real PostgreSQL journal, and
-//! writes what it observed to `target/recovery/<scenario>.<stage>.json`. The
-//! stages driven today are the control-plane halves: a converged replica losing
-//! the journal, the three cold boots the signed cache defines, and the fleet
-//! converging when the journal comes back. The remaining serving halves stay
-//! blocked because this driver does not yet retain live HTTP observations; the
-//! separate stateful integration lane owns the cached-serving and rotation
-//! stages it can prove directly.
+//! writes what it observed to
+//! `target/recovery-diagnostics/<scenario>.<stage>.json`. These tests preserve
+//! precise regression coverage for the control-plane halves: a converged
+//! reconciler losing the journal, the three cold boots the signed cache defines,
+//! and convergence when the journal comes back. They are deliberately not
+//! release qualification: the separate stateful integration lane owns every
+//! promotable stateful stage and observes the release `axond` process over HTTP.
 //!
 //! # What makes this a recovery test rather than a mock
 //!
@@ -74,17 +74,19 @@ use crate::desired_state::{
 use crate::state::AppState;
 use crate::usage::{UsageFanout, UsageSink};
 
-/// The lane this driver is, as the manifest spells it.
-pub(crate) const RUNNER: &str = "stateful-tests";
+/// A runner name no recovery manifest stage accepts. Keeping the diagnostics on
+/// a separate runner and directory makes it impossible to promote one by
+/// confusing it with process-backed evidence from the stateful integration lane.
+pub(crate) const RUNNER: &str = "stateful-regression";
+
+/// Non-promotable output from the internal reconciler regression harness.
+const DIAGNOSTIC_DIR: &str = "target/recovery-diagnostics";
 
 /// The stages this driver runs, as `scenario/stage`.
 ///
-/// The honesty gate for the whole harness: a manifest stage marked `executable`
-/// under this driver's [`RUNNER`] that is not in this list, or a stage in this
-/// list the manifest still calls blocked, fails
-/// [`the_driver_runs_exactly_the_stages_the_manifest_calls_executable`].
-/// A recovery claim is only as good as the code behind it, and this is the one
-/// place the two are compared.
+/// The process stages whose internal behavior this regression harness mirrors.
+/// These names remain tied to the manifest, but this module never writes into
+/// the promotable recovery evidence directory.
 pub(crate) const DRIVEN_STAGES: [&str; 5] = [
     "control-plane-outage/journal-outage",
     "cold-boot-valid-cache/cold-boot",
@@ -137,6 +139,7 @@ enum Driver {
     #[default]
     Qualification,
     StatefulIntegration,
+    RestoreDrill,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1680,14 +1683,19 @@ async fn converge_until_head(replica: &Replica, head: RevisionId) -> crate::conv
     last
 }
 
-/// Write the artifact, print where it landed, and fail on any gate this stage
-/// evaluated and did not meet.
+/// Write a non-promotable diagnostic, print where it landed, and fail on any
+/// internal assertion this regression stage evaluated and did not meet.
 fn finish(recorder: Recorder) {
     let artifact = recorder.finish();
-    let path = artifact.write();
+    let directory = super::evidence::workspace_root().join(DIAGNOSTIC_DIR);
+    std::fs::create_dir_all(&directory).expect("the recovery diagnostic directory is writable");
+    let path = directory.join(format!("{}.{}.json", artifact.scenario, artifact.stage));
+    let encoded =
+        serde_json::to_string_pretty(&artifact).expect("the recovery diagnostic serializes");
+    std::fs::write(&path, format!("{encoded}\n")).expect("the recovery diagnostic is writable");
     println!("{} -> {}", artifact.summary(), path.display());
-    // Evidence is retained and published as a CI artifact, so the rule that no
-    // material reaches it is checked rather than trusted.
+    // Diagnostics can still be retained by a developer, so the rule that no
+    // material reaches them is checked rather than trusted.
     let retained = std::fs::read_to_string(&path).expect("the artifact just written is readable");
     assert!(
         !retained.contains(QUALIFICATION_MATERIAL),
@@ -1704,30 +1712,37 @@ fn finish(recorder: Recorder) {
 
 // ── The honesty gate ─────────────────────────────────────────────────────────
 
-/// The claim this whole harness rests on: the manifest's `executable` stages and
-/// the stages the driver runs are the same set. Marking a stage executable
-/// without a driver fails here, and writing a driver without marking the stage
-/// fails here too.
+/// Every internal regression diagnostic mirrors a process-backed manifest stage.
+/// It may deepen that stage's assertions, but it can never own the promotable
+/// artifact or silently drift onto a stage the black-box lane does not run.
 #[test]
-fn the_driver_runs_exactly_the_stages_the_manifest_calls_executable() {
+fn every_regression_diagnostic_mirrors_a_process_backed_stage() {
     let manifest = manifest();
-    let mut executable: Vec<String> = Vec::new();
-    for scenario in &manifest.scenarios {
-        for stage in &scenario.stages {
-            if stage.status == "executable"
-                && stage.runner.as_deref() == Some(RUNNER)
-                && stage.driver == Driver::Qualification
-            {
-                executable.push(format!("{}/{}", scenario.id, stage.id));
-            }
-        }
+    for key in DRIVEN_STAGES {
+        let (scenario_id, stage_id) = key.split_once('/').expect("a stage key");
+        let scenario = manifest
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.id == scenario_id)
+            .unwrap_or_else(|| panic!("the manifest declares {scenario_id}"));
+        let stage = scenario
+            .stages
+            .iter()
+            .find(|stage| stage.id == stage_id)
+            .unwrap_or_else(|| panic!("the manifest declares {key}"));
+        assert_eq!(stage.status, "executable", "{key}");
+        assert_eq!(stage.runner.as_deref(), Some("stateful-tests"), "{key}");
+        assert_eq!(stage.driver, Driver::StatefulIntegration, "{key}");
     }
-    executable.sort();
-    let mut driven: Vec<String> = DRIVEN_STAGES.iter().map(|key| (*key).to_owned()).collect();
-    driven.sort();
+    let restore_stages = manifest
+        .scenarios
+        .iter()
+        .flat_map(|scenario| scenario.stages.iter())
+        .filter(|stage| stage.driver == Driver::RestoreDrill)
+        .count();
     assert_eq!(
-        executable, driven,
-        "the manifest and the driver disagree about which `{RUNNER}` stages run"
+        restore_stages, 8,
+        "the shell restore driver owns exactly the eight restore/PITR stages"
     );
 }
 

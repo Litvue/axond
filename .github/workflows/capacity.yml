@@ -39,7 +39,7 @@ jobs:
       # than the replica.
       - name: Run the committed capacity profiles
         run: |
-          cargo test --locked --all-features --test capacity -- \
+          cargo test --release --locked --all-features --test capacity -- \
             --nocapture --test-threads=1
         env:
           AXOND_CAPACITY: '1'
@@ -55,6 +55,7 @@ jobs:
         run: |
           python3 ops/promote-qualification.py \
             target/qualification-records/capacity-heavy.toml \
+            --artifacts target/capacity/heavy \
             --out target/qualification-records/validated-capacity-heavy.toml
       - name: Publish the result artifacts
         # Uploaded even on failure: a run that missed a threshold is the run whose
@@ -67,10 +68,10 @@ jobs:
           if-no-files-found: error
           retention-days: 90
       - name: Publish the heavy capacity qualification record
-        if: always()
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qualification-record-capacity
-          path: target/qualification-records/capacity-heavy.toml
-          if-no-files-found: warn
+          path: target/qualification-records/validated-capacity-heavy.toml
+          if-no-files-found: error
           retention-days: 90

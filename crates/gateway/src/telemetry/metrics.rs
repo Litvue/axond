@@ -20,6 +20,10 @@ use opentelemetry::{KeyValue, global};
 
 use crate::usage::UsageRecord;
 
+const ADMISSION_QUEUE_DEPTH_BOUNDARIES: [f64; 11] = [
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+];
+
 struct Instruments {
     http_requests: Counter<u64>,
     http_duration: Histogram<f64>,
@@ -68,6 +72,7 @@ struct Instruments {
     middleware_capacity_wait: Histogram<f64>,
     middleware_capacity_timeouts: Counter<u64>,
     middleware_buffering_duration: Histogram<f64>,
+    admission_queue_depth: Histogram<u64>,
     admission_in_flight: UpDownCounter<i64>,
     admission_rejections: Counter<u64>,
     rate_limit_denials: Counter<u64>,
@@ -363,6 +368,13 @@ impl Instruments {
                 .with_description(
                     "Time spent fully buffering a stream for response-mutating middleware.",
                 )
+                .build(),
+            admission_queue_depth: meter
+                .u64_histogram("axond.admission.queue.depth")
+                .with_description(
+                    "Exact bounded admission-queue depth observed when a request enters the queue.",
+                )
+                .with_boundaries(ADMISSION_QUEUE_DEPTH_BOUNDARIES.to_vec())
                 .build(),
             admission_in_flight: meter
                 .i64_up_down_counter("axond.admission.in_flight")
@@ -898,6 +910,23 @@ pub fn record_admission_acquired(resource: &'static str) {
         .add(1, &[KeyValue::new("axond.admission.resource", resource)]);
 }
 
+/// One request acquired a bounded admission-queue slot. The current-depth
+/// counter and the label-free peak-retaining histogram share one instrument
+/// lookup so queue admission cannot update one observation without the other.
+pub fn record_admission_queue_acquired(depth: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.admission_in_flight.add(
+        1,
+        &[KeyValue::new(
+            "axond.admission.resource",
+            crate::admission::RESOURCE_QUEUE,
+        )],
+    );
+    instruments.admission_queue_depth.record(depth, &[]);
+}
+
 /// Admission capacity returned. Called from the permit's `Drop`, so it pairs
 /// with [`record_admission_acquired`] on every exit path.
 pub fn record_admission_released(resource: &'static str) {
@@ -1079,4 +1108,24 @@ pub fn record_circuit_state(target_provider: &str, target_model: &str, state: Ci
             KeyValue::new("axond.target.model", target_model.to_owned()),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_queue_depth_boundaries_are_fixed_and_exponential() {
+        assert_eq!(
+            ADMISSION_QUEUE_DEPTH_BOUNDARIES,
+            [
+                1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+            ]
+        );
+        assert!(
+            ADMISSION_QUEUE_DEPTH_BOUNDARIES
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+    }
 }

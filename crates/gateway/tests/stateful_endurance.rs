@@ -628,21 +628,34 @@ fn a_request_in_flight_when_a_fault_opens_is_the_faults() {
 /// for a workload record the deployment lost.
 #[test]
 fn the_drivers_own_probe_records_are_not_the_workloads() {
-    let record = |namespace: &str, model: &str| {
-        stateful_endurance::run::issued_by_the_driver(&json!({
-            "namespace": namespace,
-            "model": model,
-        }))
+    let probe_high = [0x11; 8];
+    let trace = |high: [u8; 8]| {
+        high.into_iter()
+            .chain([0x22; 8])
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     };
-    assert!(record(fleet::PROBE, alias::CHAT), "the boundary probe's");
+    let record = |trace_id: String, namespace: &str, model: &str| {
+        stateful_endurance::run::issued_by_the_driver(
+            &json!({
+                "trace_id": trace_id,
+                "namespace": namespace,
+                "model": model,
+            }),
+            probe_high,
+        )
+    };
     assert!(
-        record(fleet::PLATFORM, fleet::CATALOGUE_ALIAS),
+        record(trace(probe_high), fleet::PROBE, alias::CHAT),
+        "the boundary probe's"
+    );
+    assert!(
+        record(trace(probe_high), fleet::PLATFORM, fleet::CATALOGUE_ALIAS),
         "the convergence poll's, which only the driver asks for"
     );
-    assert!(!record(fleet::PLATFORM, alias::CHAT), "the workload's");
     assert!(
-        !record(fleet::BYOK, alias::MESSAGES),
-        "and the BYOK tenant's"
+        !record(trace([0x33; 8]), fleet::PROBE, fleet::CATALOGUE_ALIAS),
+        "labels alone cannot turn an unrelated row into a probe"
     );
 }
 
@@ -764,52 +777,64 @@ fn a_tier_offers_load_alone() {
 }
 
 /// The database outage excuses the rows it lost, and only those. The split is
-/// made on the window both sides can be counted over — records the processes
-/// settled outside it against rows the database holds outside it — so a row
-/// lost at a safe moment is charged to the deployment however many records the
-/// sink reported dropping while the backend was gone.
+/// made on the exact population that answers the question — records the
+/// processes settled outside it against every row the database holds — so a
+/// stored row cannot become fictitious loss at a clock boundary, while a row
+/// truly lost at a safe moment is charged to the deployment however many
+/// records the sink reported dropping while the backend was gone.
 #[test]
 fn a_durable_loss_is_excused_by_when_it_happened() {
-    let split = |emitted_outside, duplicates, durable_distinct, durable_outside| {
-        stateful_endurance::run::reconcile_durable_loss(
-            100,
-            emitted_outside,
-            duplicates,
-            durable_distinct,
-            durable_outside,
-        )
+    use support::endurance::ledger::IdentityPairTally;
+
+    let tally = |expected_distinct, missing, unexpected| IdentityPairTally {
+        expected_rows: expected_distinct,
+        observed_rows: expected_distinct - missing + unexpected,
+        expected_distinct,
+        observed_distinct: expected_distinct - missing + unexpected,
+        expected_duplicates: 0,
+        observed_duplicates: 0,
+        missing,
+        unexpected,
+        shards: 32,
+        peak_shard_rows: 1,
+        exact: true,
+        directory: std::path::PathBuf::new(),
+    };
+    let split = |all: IdentityPairTally, outside: IdentityPairTally| {
+        stateful_endurance::run::reconcile_exact_durable_loss(&all, &outside)
     };
 
     // Nothing lost: every settled record is in the database.
-    let clean = split(90, 0, 100, 90);
+    let clean = split(tally(100, 0, 0), tally(90, 0, 0));
     assert_eq!((clean.total, clean.outside, clean.in_window), (0, 0, 0));
 
-    // Ten lost, and the database holds every record settled outside the
-    // window: the outage accounts for all of them.
-    let excused = split(90, 0, 90, 90);
+    // Ten lost, and every record settled outside the window is durable
+    // somewhere: the outage accounts for all of them.
+    let excused = split(tally(100, 10, 0), tally(90, 0, 0));
     assert_eq!(
         (excused.total, excused.outside, excused.in_window),
         (10, 0, 10)
     );
 
-    // Ten lost, and three of them were settled outside the window. Those three
-    // are the deployment's, whatever the sinks reported losing during the
-    // outage — the old magnitude comparison excused them.
-    let mixed = split(90, 0, 90, 87);
+    // Ten lost, and three outside-settled identities are absent from the whole
+    // durable population. Those three are the deployment's, whatever the sinks
+    // reported losing during the outage — the old magnitude comparison excused
+    // them.
+    let mixed = split(tally(100, 10, 0), tally(90, 3, 0));
     assert_eq!((mixed.total, mixed.outside, mixed.in_window), (10, 3, 7));
 
-    // Duplicates are charged to the outside bucket, so a second copy of a
-    // record cannot be read as a row the database is missing.
-    let duplicated = split(90, 3, 90, 87);
+    // Equal cardinalities do not cancel an unrelated identity: exact set
+    // difference retains both the missing and unexpected row.
+    let unrelated = split(tally(100, 10, 10), tally(90, 0, 0));
     assert_eq!(
-        (duplicated.total, duplicated.outside, duplicated.in_window),
+        (unrelated.total, unrelated.outside, unrelated.in_window),
         (10, 0, 10)
     );
 
     // The outside half is a part of the whole-run loss, never more than it: a
     // drain tick's disagreement about which side of the edge a record fell on
     // must not invent a loss that the set difference does not show.
-    let bounded = split(90, 0, 98, 80);
+    let bounded = split(tally(100, 2, 0), tally(90, 10, 0));
     assert_eq!(
         (bounded.total, bounded.outside, bounded.in_window),
         (2, 2, 0)
@@ -924,6 +949,25 @@ fn an_outage_that_was_never_injected_excuses_nothing() {
         0.0
     ));
 
+    assert_eq!(
+        stateful_endurance::run::durable_distinct_for_verdict(
+            Injected::UpstreamFaultsOnly,
+            17,
+            None,
+        ),
+        17,
+        "a database outage the harness did not inject excuses no durable rows"
+    );
+    assert_eq!(
+        stateful_endurance::run::durable_distinct_for_verdict(
+            Injected::EveryDeclaredFault,
+            17,
+            Some(13),
+        ),
+        13,
+        "an injected database outage grades the population outside its window"
+    );
+
     // And the run decides which faults it can cause once, from how the database
     // is reached, before anything is measured — rather than clearing one of the
     // two places the outage is recorded after the fact.
@@ -932,7 +976,6 @@ fn an_outage_that_was_never_injected_excuses_nothing() {
         "Reach::Gated => Injected::EveryDeclaredFault,",
         "Reach::Direct => Injected::UpstreamFaultsOnly,",
         "fault_windows: schedule.attribution_windows_of(duration, injected),",
-        "Injected::UpstreamFaultsOnly => durable_counts.distinct,",
     ] {
         assert!(
             source.contains(required),

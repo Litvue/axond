@@ -1,13 +1,12 @@
-# A PodDisruptionBudget counts *Ready* Pods, and a replica refusing inference is
-# never Ready, so the budget's healthy count is zero and it allows no eviction at
-# all: `kubectl drain` on any node holding an axond Pod blocks until it is
-# deleted by hand. That is the budget protecting an availability the fleet is not
-# claiming.
+# A PodDisruptionBudget counts *Ready* Pods. During administrative bootstrap,
+# before any serving revision is admitted, the healthy count is zero and an
+# ordinary budget would allow no eviction at all: `kubectl drain` on any node
+# holding an axond Pod would block even though the fleet claims no availability.
 #
 # `AlwaysAllow` (Kubernetes 1.31+) lets an unready Pod be evicted while keeping
-# the budget in force for Ready ones, so the same object is correct before and
-# after convergence ships. It is the right trade only because an unready replica
-# is serving no inference; do not carry it over to a serving fleet.
+# the budget in force for Ready ones, so the same object remains correct after a
+# serving revision converges. Ready serving replicas stay protected; an unready
+# replica is fail-closed and may be replaced.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

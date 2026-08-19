@@ -14,7 +14,9 @@ export AXOND_INSTANCE_ID=axond-replica-a                  # optional, unique per
 - **Unset** (the default): JSON logs on stdout and nothing else. No exporter,
   tracer, meter, or propagator is installed, and the recording helpers return
   before they build a single attribute — the request path does no exporter work
-  at all. This is a supported production posture, not a degraded one.
+  at all. A valid inbound W3C trace id is still retained as optional usage
+  correlation; validating that bounded header does not install or invoke an
+  exporter. This is a supported production posture, not a degraded one.
 - **Set**: traces, metrics, and (with the OTLP usage sink) usage logs are
   exported with `service.name = axond`. If `AXOND_INSTANCE_ID` is set, the same
   bounded deployment identity is exported as the OTLP resource attribute
@@ -195,6 +197,7 @@ destination receives by exactly what the refusals in
 | `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
 | `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |
 | `axond.policy.unenforceable_denials` | counter | `axond.policy.condition`, `axond.policy.store` | Admissions denied because this replica holds no policy it can enforce for the namespace: `ungoverned` (no published document governs it) or `layout` (the published cap disagrees with the key layout the store booted on). The store is healthy in both cases, so these are counted apart from the unavailable-denial counters; the explanatory log line is sampled, this count is not. `axond.policy.store` names the responsibility as well as the backend — `budget:redis`, `budget:postgres` or `rate_limit:redis` — because a namespace with neither a published spend cap nor a published concurrency ceiling is denied by two stores that are commonly the same Redis, and the two are fixed separately. |
+| `axond.admission.queue.depth` | histogram | — | Exact server-side queue depth observed when a request acquires a bounded queue slot. The label-free histogram retains short-lived peaks between export intervals; compare its maximum with `queue_capacity`. |
 | `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`, `diagnostic` (status reads being answered, ceiling eight), `diagnostic_auth` (status reads being authenticated, ceiling seventy-two, split forty-eight for minted tokens, sixteen for credentials that resolve in memory, and eight for callers presenting none — a separate dimension because one read holds one of each and the two ceilings differ). Bounded label set — no tenant, subject, or request identity. |
 | `axond.admission.rejections` | counter | `axond.admission.resource`, `axond.error.type` | Requests shed by admission control, by resource and stable error type. |
 | `axond.status.component_state` | gauge | `axond.status.component` | Last observed dependency state: `0` disabled, `1` ok, `2` degraded, `3` unavailable — a severity ladder, so `>= 2` is trouble and the stateless posture (`disabled` everywhere) sits below `ok` rather than above `unavailable`. Bounded label set — no tenant, subject, or credential identity. |

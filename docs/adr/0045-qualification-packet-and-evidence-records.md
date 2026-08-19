@@ -14,7 +14,7 @@ the two schemas that carry that report: the packet and the evidence record.
 ## Context
 
 axond #156 asks for reproducible evidence in place of qualitative production
-claims, and decomposes into five child issues. Those children merge one at a
+claims, and now decomposes into six qualification slices. Those slices land one at a
 time, and each merge leaves the epic somewhere different: a harness with runs
 behind it, a harness with none, a contract with no driver, an issue with
 neither. Nothing in the tree distinguished those states, and the failure that
@@ -31,8 +31,11 @@ described a different CPU than the one the numbers came from.
 
 ## Decision
 
-Commit two schemas, both `schema_version = 1`, both read by
-`deny_unknown_fields`.
+Commit two schema families, both read by `deny_unknown_fields`. Packet manifest
+schema 2 adds a frozen release-candidate cohort. Compact records evolve per
+slice: generic records remain schema 1, capacity is schema 2, and rollout is
+schema 3 because it retains both executable identities and durable shared-state
+serving proof.
 
 **The packet** (`qualification/packet.toml`) states each slice's depth on a
 four-rung ladder, and `crates/gateway/tests/qualification_packet.rs` *derives*
@@ -45,11 +48,14 @@ every rung from the slice's own fields rather than trusting the word:
 | `harnessed` | a manifest, a driver, a lane that runs it, and no retained run of its heavy tier |
 | `evidenced` | a manifest, a driver, and a retained run of the slice's own `heavy_tier` |
 
-Closure is derived the same way, so #156 cannot be closed by editing a flag:
+Closure is derived from both the ladder and the release cohort, so #156 cannot
+be closed by editing a flag. It requires exactly one heavy record for every
+slice, all six built in release profile from a clean tree at the same exact
+v0.4.0 source commit:
 
 ```rust
-let outstanding = slices.filter(|s| s.status != Evidenced).map(id);
-assert_eq!(packet.closure.satisfied, outstanding.is_empty());
+let errors = qualification_closure_errors(&packet, load_record);
+assert_eq!(packet.closure.satisfied, errors.is_empty());
 ```
 
 **The evidence record** (`qualification/<slice>/evidence/*.toml`, written by
@@ -63,10 +69,20 @@ slice retains it, is checked against the manifest it names — same workload set
 matching digest, all gates passed, nothing lost between offered and accounted
 for. Endurance observations also retain the offered duration, the committed
 duration, and the duration source; the promotion boundary refuses a `soak` run
-that is shorter than the committed long tier.
-Recovery records retain one row per executable manifest stage and the digest of
-its raw stage artifact, so the stateful-test and restore-drill halves cannot be
-promoted independently.
+that is shorter than the committed long tier. Both endurance slices bind exact
+request-identity and correlation ledger digests, file counts, and byte counts,
+plus sample claims through `samples_sha256`, `samples_files`, and
+`samples_bytes`. Stateless endurance requires exactly one non-empty JSONL file;
+stateful endurance requires a non-empty set with one file per replica
+incarnation and adds its durable and outside-window identity ledgers.
+Fault observations require raw artifact schema 1. Recovery records retain one
+row per executable manifest stage, raw artifact schema 2, the digest of its raw
+stage artifact, and the exact executable digest; active evidence requires that
+stage digest to equal the record's release binary. Historical rows may omit the
+new optional fields because they are indexed as history rather than retained as
+closure evidence. Rollout raw and compact schema 3 preserve published v0.3.40,
+candidate v0.4.0, one shared durable revision and `chat` alias, and successful
+serving probes from both fleets.
 
 Two consequences are deliberate. Editing a profile's scale or thresholds changes
 the manifest digest and *invalidates every record taken before the edit*, which
@@ -86,35 +102,29 @@ slices do not agree on the word: capacity's long tier is `heavy`, endurance's is
 harness shows it produces records — but only a run of its own heavy tier moves
 it to `evidenced`.
 
-A record is identified by its digests, not by a commit. This repository
-squash-merges, so `source.git_commit` — the branch commit a run happened on — is
-never a commit that lands, and an identity that dies at merge is not an
-identity. What does survive is content-addressed: `binary.sha256` names the
-artifact that produced the numbers, `inputs.manifest_sha256` names the workload
-it ran, and each profile's `config_sha256` names what the process booted. Those
-three answer the question a commit was standing in for — *was this measured on
-the thing I am looking at* — and they answer it by comparison rather than by
-lookup.
+A record remains content-addressed by its binary, manifest, raw artifact, and
+config digests. For ordinary historical records, `source.git_commit` can still
+be a pre-squash provenance note. Release closure is deliberately stricter: the
+packet's cohort starts with `source_commit = "pending"`, then freezes one exact
+Git object id before any promotable run. Every one of the six heavy records must
+name that exact source, v0.4.0 in source and binary provenance, a clean tree, and
+the release Cargo profile. This separates useful historical measurements from
+evidence that can qualify a particular release candidate.
 
-So the operator page discloses the binary digest and the contract test asserts
-it, the manifest digest is checked against the committed manifest on every run,
-and the branch commit stays in the record labelled as a pre-squash note. Nothing
-resolves the commit against git, deliberately: such a check would fail on every
-squash merge and teach people to delete records rather than re-take them.
+### Stateful release boundary
 
-### State tier
-
-Tier 0 (config-only). The packet, the records, and the writer are committed
-files and a test binary: no Redis, no Postgres, no control plane, and no change
-to the tier of any deployment. The evidence they carry is Tier 0 evidence too,
-which is exactly why the packet has to say that the stateful slices are not
-qualified.
+The packet itself changes no deployment tier. Its closure contract does require
+the heavy rollout lane to exercise real PostgreSQL state and prove that
+published v0.3.40 and candidate v0.4.0 both serve the same durable revision and
+alias. Recovery, fault, and both endurance slices must come from that same
+frozen source cohort; a process-level or debug historical record cannot stand
+in for the release candidate.
 
 ## Consequences
 
 The report on #156 is now a file that can be wrong in a way CI notices, rather
-than a claim in a comment. The docs' envelope table is a retained record read in
-operator units, and drift between them is visible.
+than a claim in a comment. The operator page distinguishes active retained
+records from indexed history, and drift between it and the packet is visible.
 
 The cost is real: every manifest edit forces a re-run of the tiers that have
 retained records, and rebuilding the binary changes the digest the operator page
@@ -123,5 +133,6 @@ friction is the point — it is what stops the numbers from quietly outliving
 their inputs — but it makes the heavy tier something a change to the manifest
 must budget for.
 
-This ADR does not claim any slice is qualified. At the time of writing four of
-the five are not, and the packet says so.
+This ADR does not claim any slice is qualified. At the time of this amendment,
+all six await heavy release-profile records from the frozen v0.4.0 cohort, and
+the packet says so.

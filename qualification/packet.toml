@@ -1,12 +1,12 @@
 # The production qualification packet: what axond #156 is waiting for, as data.
 #
 # #156 asks for reproducible evidence in place of qualitative production claims,
-# and it decomposes into five slices — capacity, provider and backend faults,
-# stateful recovery, multi-replica rollout, and a long soak. Each has landed to a
-# different depth: capacity, fault, and recovery are evidenced with retained
-# runs, while rollout and endurance remain harnessed. The local rollout heavy
-# tier has been exercised, but a run outside the committed evidence set cannot
-# promote that slice. The #158 dependency formerly attached to fault and
+# and it decomposes into six slices — capacity, provider and backend faults,
+# stateful recovery, multi-replica rollout, and stateless plus stateful long
+# soaks. Each has landed to a
+# different depth, but all six are currently harnessed pending release-profile
+# candidate runs from one frozen v0.4.0 source. Historical records remain
+# indexed separately and cannot contribute to closure. The #158 dependency formerly attached to fault and
 # rollout is retired: the remaining deployment-overlay and preflight work stays
 # on #158, while those qualification questions now have their own evidence
 # paths. That spread is
@@ -18,18 +18,26 @@
 # every path here must exist, a slice may not claim evidence it has not
 # retained, the recovery dependency map must match the recovery manifest, every
 # scenario #156 names must belong to some slice, and `closure.satisfied` must
-# agree with the slices rather than with an opinion.
+# agree with the slices and frozen release cohort rather than with an opinion.
 #
 # Read docs/operations/qualification.md for the prose; the two are checked
 # against each other.
 
-schema_version = 1
+schema_version = 2
+
+# One frozen candidate must produce all six heavy records. The exact source is
+# intentionally pending until the v0.4.0 qualification cohort is cut; closure
+# cannot become true while this sentinel remains.
+[cohort]
+id = "v0.4.0-production-qualification"
+candidate_version = "0.4.0"
+source_commit = "pending"
 
 # The capacity slice: how much one stateless replica serves, at what cost.
 [[slice]]
 id = "capacity"
 issue = 217
-status = "evidenced"
+status = "harnessed"
 question = """
 What one Tier 0 replica serves at a fixed offered load, and what it costs in \
 memory, CPU, sockets, and latency while it does — including what it does at \
@@ -46,10 +54,12 @@ adr = "docs/adr/0033-capacity-qualification-harness.md"
 reduced_lane = "cargo test --workspace"
 heavy_lane = ".github/workflows/capacity.yml"
 heavy_tier = "heavy"
-retained = [
-  "qualification/capacity/evidence/reduced-local.toml",
-  "qualification/capacity/evidence/heavy-local.toml",
-]
+retained = []
+outstanding = """
+The historical local records predate capacity artifact and compact schema 2. A
+new reduced and heavy candidate run must retain every raw profile artifact,
+including decoded production queue-depth evidence, before this slice is
+evidenced again."""
 
 # The endurance slice: whether the same replica is the same process afterwards.
 [[slice]]
@@ -70,17 +80,41 @@ heavy_lane = ".github/workflows/endurance.yml"
 heavy_tier = "soak"
 retained = []
 outstanding = """
-The 12–24 hour tier has never been dispatched, so the drift thresholds that \
-only a long run can exercise have no run behind them. The stateful tier of the \
-same question — qualification/stateful-endurance/manifest.toml, driven by \
-crates/gateway/tests/stateful_endurance.rs against a fleet with a durable usage \
-sink — has run only at its ninety-second smoke tier."""
+The 12–24 hour tier has never been dispatched. A closure record must bind the
+exact request-identity and correlation ledgers plus its one resource-sample
+JSONL file, so the long-run accounting and drift thresholds have no retained
+evidence behind them."""
+
+# The stateful endurance slice: the fleet stays correct while state and
+# dependencies change repeatedly over the committed duration.
+[[slice]]
+id = "stateful-endurance"
+issue = 221
+status = "harnessed"
+question = """
+Whether a multi-replica stateful fleet remains bounded and exactly accounted
+for through catalogue, credential, and policy revisions, provider and usage
+backend faults, recovery, and rolling restarts over twelve hours."""
+covers = ["mixed_workload", "backend_outage", "control_plane_outage", "rolling_upgrade", "long_soak"]
+manifest = "qualification/stateful-endurance/manifest.toml"
+driver = "crates/gateway/tests/stateful_endurance.rs"
+contract = "docs/operations/stateful-endurance.md"
+adr = "docs/adr/0057-stateful-endurance-qualification.md"
+reduced_lane = "cargo test --workspace"
+heavy_lane = ".github/workflows/endurance.yml"
+heavy_tier = "soak"
+retained = []
+outstanding = """
+The exact-reconciliation driver has run only its ninety-second smoke tier. No
+retained twelve-hour run yet binds the raw JSON, all four fixed-width exact
+ledger shard sets, and its non-empty per-replica-incarnation resource-sample
+JSONL set under artifact schema 2."""
 
 # The recovery slice: what a stateful deployment does when it loses its state.
 [[slice]]
 id = "recovery"
 issue = 219
-status = "evidenced"
+status = "harnessed"
 question = """
 What a stateful deployment serves, refuses, and converges to across a \
 control-plane outage, a cold boot, a credential rotation, and a restore."""
@@ -102,7 +136,12 @@ heavy_lane = ".github/workflows/ci.yml"
 # from a real PostgreSQL-backed run. A multi-replica fleet baseline remains a
 # separate production gate.
 heavy_tier = "serving"
-retained = ["qualification/recovery/evidence/serving-ci.toml"]
+retained = []
+historical = ["qualification/recovery/evidence/serving-ci.toml"]
+outstanding = """
+The historical serving record is a clean v0.3.39 debug run. Re-run every
+executable recovery stage in release profile from the frozen v0.4.0 cohort
+before this slice can contribute to closure."""
 # Mirrors the union of the recovery manifest's own dependency map, and is
 # checked against it.
 blocked_on = []
@@ -111,7 +150,7 @@ blocked_on = []
 [[slice]]
 id = "fault"
 issue = 218
-status = "evidenced"
+status = "harnessed"
 question = """
 How every provider and backend failure — 429 and 5xx, DNS, TLS and connect \
 stalls, truncation, idle streams, oversized errors, Redis and Postgres latency \
@@ -125,7 +164,12 @@ adr = "docs/adr/0048-fault-qualification-harness.md"
 reduced_lane = "cargo test --workspace"
 heavy_lane = ".github/workflows/ci.yml"
 heavy_tier = "full"
-retained = ["qualification/faults/evidence/full-ci.toml"]
+retained = []
+historical = ["qualification/faults/evidence/full-ci.toml"]
+outstanding = """
+The historical full record is a clean v0.3.39 debug run. Re-run the complete
+fault matrix in release profile from the frozen v0.4.0 cohort before this slice
+can contribute to closure."""
 
 # The rollout slice: what a fleet does while it is being replaced.
 [[slice]]
@@ -146,19 +190,24 @@ heavy_lane = ".github/workflows/rollout.yml"
 heavy_tier = "heavy"
 retained = []
 outstanding = """
-The heavy tier has now passed locally, but no run of a fleet under load is \
-retained in the packet; mixed-version serving across a migration still needs a \
-stateful replica qualification."""
+The historical heavy record used one candidate binary for both sides. The
+current raw and compact schema-3 contract requires the published v0.3.40
+predecessor, the v0.4.0 cohort candidate, a common durable revision and alias
+served by both fleets, and a real PostgreSQL migration and rollback matrix. No
+retained run has yet met that contract."""
 
 # What closing #156 requires. `satisfied` is not an opinion: the contract test
-# derives it from the slices above, so it can only become true when every slice
-# has a driver and a retained run behind it.
+# derives it from the slices and cohort above. It can only become true when each
+# slice has exactly one heavy v0.4.0 release record from the same clean source.
 [closure]
 issue = 156
 satisfied = false
 requirement = [
   "Every slice has a driver, a committed manifest, and a contract page.",
-  "Every slice has retained evidence from a run of its heavy tier, on a recorded machine.",
+  "Every slice has exactly one retained heavy record from the same frozen v0.4.0 source cohort, built in release profile from a clean tree.",
+  "Both endurance slices bind exact request-identity and correlation ledgers; stateless endurance binds exactly one sample JSONL, while stateful endurance binds a non-empty set with one file per replica incarnation.",
+  "Fault observations bind raw schema 1; recovery stages bind raw schema 2 and the exact candidate executable digest.",
+  "Rollout proves published v0.3.40 to candidate v0.4.0 on one durable revision and alias served by both fleets.",
   "Both reference tiers — small single-replica and larger multi-replica — are covered.",
   "The production documentation links the current evidence and names the known limits.",
 ]

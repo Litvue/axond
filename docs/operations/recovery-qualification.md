@@ -37,15 +37,20 @@ half became executable at different times — and each stage carries its own
 status, evidence, and blockers. A scenario is executable exactly when all of its
 stages are. The separate stateful integration lane owns the process-level stages
 marked `driver = "stateful-integration"`; the restore drill owns the durable
-usage-boundary measurement. The recovery slice still lacks a retained fleet
-record, even though all of its stages are executable.
+usage-boundary measurement. All stages are executable, but the recovery slice
+still lacks a promotable fleet record. The retained v0.3.39 GitHub Actions
+record remains indexed as historical debug evidence only; it cannot promote
+the v0.4.0 slice. Closure requires a fresh release-profile run of all twenty-two
+stages from the same frozen v0.4.0 source commit as the other five qualification
+slices. The full digests and per-stage artifact bindings belong in that
+generated record, not in prose.
 
 An executable stage also names the **lane** that runs it, because the two halves
 of the harness need different machinery:
 
 | Lane | What it is | What it runs |
 | --- | --- | --- |
-| `stateful-tests` | The in-process driver in `crates/gateway/src/qualification/recovery.rs` plus the black-box stateful integration test lane. | An outage produced by cutting a loopback link to a real journal, process-level outage and recovery serving, the cold boots and convergence around it, cached process serving, and secret rotation. |
+| `stateful-tests` | The black-box `stateful_integration` lane, run in release mode against real PostgreSQL. The in-process recovery module remains diagnostic coverage and cannot write promotable artifacts. | A TCP-level journal outage, process-level outage and recovery serving, all three cold boots, convergence around the outage, cached process serving, and secret rotation. |
 | `restore-drill` | `ops/restore-drill.sh`, run by `just restore-drill`. | A real PostgreSQL with WAL archiving in Docker, a deployment published through `axond admin` against a running replica, a logical restore, and a point-in-time recovery — each read and extended by a replica booted on the recovered database, with a long-lived survivor switched onto each recovered journal to prove reconvergence and serving. |
 
 A stage that claims neither lane, and a lane with no stages, both fail the
@@ -93,7 +98,7 @@ never be upgraded by editing the manifest alone.
 | `secret-rotation/serving` | runs | Requests authenticated with the rotated material and authenticated audit attribution. |
 | `backup-restore/restore` | runs | A deployment published through `axond admin` is dumped, restored into a database no replica ever wrote, and read back by a replica booted on it: same head, same checksum, whole revision chain, whole resource set, a publication against the restored head accepted, and `/readyz` plus inference serve once the projected snapshot exists. |
 | `backup-restore/administration` | runs | The audit trail read back through the authenticated surface of that replica, refused there without a credential, and checked to name a credential's reference rather than any material. |
-| `backup-restore/durable-inventory` | runs | The encrypted secret material and lifecycle, retained catalogue snapshot and active pointer, and the approved price book's checksum, catalogue pin, approval, effective-dated rules, rates, and provenance beyond the journal and its tenancy. |
+| `backup-restore/durable-inventory` | runs | The encrypted secret material and lifecycle, retained catalogue snapshot and active pointer, exact usage and outbox row counts, and the approved price book's checksum, catalogue pin, approval, effective-dated rules, rates, and provenance beyond the journal and its tenancy. |
 | `backup-restore/reconvergence` | runs | A long-lived survivor is switched to the logical-restore database through a stable DSN, reconnects, converges to the recovered head, remains ready, and answers authenticated inference traffic. |
 | `point-in-time-recovery/recovery` | runs | A base backup plus archived WAL recovered to a target taken between two publications: everything before the target is present, the revision after it is absent, and a replica booted on the promoted cluster reads the pre-target head and accepts a publication against it. |
 | `point-in-time-recovery/administration` | runs | The audit trail on the safe side of the target read back through the authenticated surface; the trail of the revision after it is gone with the revision. |
@@ -104,26 +109,23 @@ never be upgraded by editing the manifest alone.
 
 ### The `stateful-tests` lane
 
-The driver lives in the crate rather than in `tests/`, because a recovery stage
-has to hold a replica's reconciler, its signed cache, and a real
-`PostgresControlPlane` at once and then take the database away from underneath
-them. The separate stateful integration lane owns process-level serving, outage,
-recovery, and rotation; this driver owns the in-process severable-link evidence
-and the durable recovery contract.
+Promotable stateful evidence is produced only by the black-box integration
+suite. It boots the release `axond` executable, hashes the exact absolute path it
+launches, and records both the retained and executed digest in every stage.
+`crates/gateway/src/qualification/recovery.rs` remains useful in-process
+diagnostic coverage, but writes only to `target/recovery-diagnostics/` and is
+excluded from the qualification packet.
 
 ```sh
 AXOND_TEST_POSTGRES_DSN=postgres://postgres:secret@127.0.0.1:5432/postgres \
-  cargo test -p axond --bin axond qualification::recovery
+  cargo test -p axond --all-features --locked --release --test stateful_integration
 ```
 
 Each stage creates its own schema, migrates it with this build, and reaches it
-through a loopback link the harness cuts to produce the outage — so the replica
-meets a dead socket and a refused reconnect, and the database keeps its rows.
-Without a DSN the stages write nothing rather than falling back to an in-process
-control plane: an outage of a fake is evidence about the fake. The process-level
-serving and rotation path is exercised separately by
-`stateful_revision_compiles_rotates_and_recovers`; the stages below remain the
-durable recovery driver's evidence contract.
+through a loopback TCP proxy the harness cuts to produce the outage — so the
+process meets a dead socket and a refused reconnect while PostgreSQL keeps its
+rows. Without a DSN the stages write nothing rather than falling back to an
+in-process control plane: an outage of a fake is evidence about the fake.
 
 One JSON artifact per stage lands at
 `target/recovery/<scenario>.<stage>.json`, carrying the build and schema it ran
@@ -141,7 +143,7 @@ green.
 
 ```sh
 just restore-drill              # builds the current gateway, then runs the drill
-# or, after building target/debug/axond yourself:
+# or, to build the release executable inside the script:
 bash ops/restore-drill.sh
 ```
 
@@ -183,11 +185,20 @@ ops/check-recovery-evidence.py --runner restore-drill
 
 Each lane owes an artifact for every stage the manifest gives it. The checker
 reads the manifest, then refuses a missing artifact, a wrong schema version, a
-wrong scenario, stage, lane, capability or evidence set, a failed gate or check,
-an empty timeline, an artifact an earlier run left behind (`--since-unix-ms`),
-and any artifact carrying a string named by `--forbid-env`. CI runs it in
+wrong scenario, stage, lane, capability or evidence set, a missing or forged
+verdict, omitted stage-specific durable observations, non-Postgres schema
+provenance, a debug or substituted executable, an empty timeline, an artifact
+an earlier run left behind (`--since-unix-ms`), and any artifact carrying a
+string named by `--forbid-env`. CI runs it in
 both lanes before uploading `target/recovery/`, so a lane that produced no
 evidence fails the build instead of uploading nothing.
+
+In CI, a dedicated producer builds the release executable once and publishes a
+checksum alongside it. Both recovery lanes verify and execute separate downloads
+of that immutable artifact. Their retained copies and every process-backed raw
+stage must therefore agree on one SHA-256 identity before the combined recovery
+record can be created; independently rebuilding the same commit is not accepted
+as proof of identical executable bytes.
 
 ## What a run retains
 

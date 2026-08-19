@@ -15,7 +15,9 @@ pub const MANIFEST_RELATIVE: &str = "qualification/capacity/manifest.toml";
 
 /// The result-artifact schema version. Bumped when a field changes meaning, so
 /// a stored artifact is never reinterpreted under a newer contract.
-pub const RESULT_SCHEMA_VERSION: u32 = 1;
+/// 2: queued admission carries decoded OTLP depth evidence and committed queue
+/// bounds rather than inferring queue behavior from caller latency.
+pub const RESULT_SCHEMA_VERSION: u32 = 2;
 
 /// The manifest schema this harness understands.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -45,6 +47,12 @@ pub struct Profile {
     /// a run was measured against is in the manifest and in the record.
     #[serde(default)]
     pub max_in_flight: Option<u64>,
+    /// Queueing only: the bounded number of callers allowed to wait.
+    #[serde(default)]
+    pub queue_capacity: Option<u64>,
+    /// Queueing only: the longest one of those callers may wait.
+    #[serde(default)]
+    pub queue_wait_ms: Option<u64>,
     /// Backend limits only: the transport bound the profile boots the replica
     /// with, and therefore the wall clock every request must end inside.
     #[serde(default)]
@@ -81,6 +89,7 @@ pub enum Workload {
     Cancellation,
     Tenants,
     Shedding,
+    Queueing,
     BackendLimits,
 }
 
@@ -94,6 +103,7 @@ impl Workload {
             Self::Cancellation => "cancellation",
             Self::Tenants => "tenants",
             Self::Shedding => "shedding",
+            Self::Queueing => "queueing",
             Self::BackendLimits => "backend_limits",
         }
     }
@@ -101,7 +111,7 @@ impl Workload {
     /// Every workload the driver implements. The manifest coverage test reads
     /// this, so adding a variant without a committed profile fails rather than
     /// leaving the new shape unqualified.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Buffered,
         Self::Streaming,
         Self::Mixed,
@@ -109,6 +119,7 @@ impl Workload {
         Self::Cancellation,
         Self::Tenants,
         Self::Shedding,
+        Self::Queueing,
         Self::BackendLimits,
     ];
 }
@@ -171,6 +182,11 @@ pub struct Thresholds {
     /// be served, or the permits the run consumed never came back.
     #[serde(default)]
     pub max_unserved_after_load: Option<u64>,
+    /// Queueing: exact decoded peak of the label-free queue-depth histogram.
+    #[serde(default)]
+    pub min_queue_depth: Option<u64>,
+    #[serde(default)]
+    pub max_queue_depth: Option<u64>,
 }
 
 /// Which scale to run.

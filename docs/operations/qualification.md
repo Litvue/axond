@@ -5,15 +5,16 @@ been declared or harnessed, and what has not yet been retained — in one place,
 between a merged harness and an answered question stays visible.
 
 Production qualification ([#156](https://github.com/Litvue/axond/issues/156))
-decomposes into five slices. They landed, and will land, at different depths:
+decomposes into six slices. They landed, and will land, at different depths:
 
 | Slice | Issue | Status | What exists today |
 | --- | --- | --- | --- |
-| `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `evidenced` | Driver, eight committed profiles — including multi-tenant isolation, admission shedding, and a bounded stalling backend — reduced tier on every change, heavy tier on demand, and two retained runs. |
-| `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Two drivers and committed mixes — one stateless, one against a fleet with a durable usage sink — whose smoke tiers run in CI. Neither 12–24 hour tier has been dispatched. |
-| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `evidenced` | Driver, committed scenarios, and twenty-two executable stages running against real PostgreSQL in two lanes — outage, cold boots, cached process serving, cache refusal, secret rotation, convergence, durable inventory, logical restore, point-in-time recovery, and the durable usage boundary — with a retained GitHub Actions record. A multi-replica fleet baseline remains open. |
-| `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `evidenced` | Committed provider, transport, Redis, and Postgres fault matrix plus a driver; the full pinned-service matrix has a clean retained GitHub Actions record. A second reference tier and integrated fleet evidence remain open. |
-| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver, committed scenarios, reduced and heavy tiers; the local heavy run passed, but no retained record is committed, and mixed-version serving across a migration still needs a stateful multi-replica qualification. |
+| `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `harnessed` | Driver and eight committed profiles — including multi-tenant isolation, admission shedding, a bounded stalling backend, and decoded production queue-depth telemetry. Its historical records predate raw-artifact-bound compact schema 2 and are not active evidence. |
+| `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Stateless mixed-workload driver and committed mix whose smoke tier runs in CI. Its 12-hour tier has not retained exact request/correlation ledgers and its sample JSONL under the current contract. |
+| `stateful-endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Multi-replica driver for revisions, backend faults, tenant isolation, durable accounting, and rolling restarts. Its smoke lane is harness validation; no 12-hour record binds all four exact ledgers and the per-incarnation sample JSONL set. |
+| `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver and twenty-two executable real-Postgres stages exist. The historical v0.3.39 debug record remains indexed for audit, but a release-profile v0.4.0 cohort rerun with raw schema 2, per-stage executable digests, and process-bound executed-binary identity is pending. |
+| `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `harnessed` | The provider, transport, Redis, and Postgres matrix is complete. Its historical v0.3.39 debug record remains indexed for audit, but raw-schema-1 release evidence from the v0.4.0 cohort is pending. |
+| `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver and committed reduced/heavy scenarios now require published v0.3.40 and candidate v0.4.0 serving one shared durable revision and alias through the real-Postgres migration/rollback matrix. No raw/compact schema-3 record is retained. |
 
 `qualification/packet.toml` is that table as data — question, inputs, lanes,
 retained runs, and what each slice still owes; see
@@ -26,18 +27,18 @@ the manifest it names is a test failure.
 
 ## What the packet may not be read as
 
-- **Not a claim that Axond is production-qualified.** Three of five slices are
-  evidenced and two have a driver with no retained heavy run behind them; no
-  slice has retained a run of a fleet. #156 stays open until every slice
-  is `evidenced`; `closure.satisfied` in the packet is derived from the slices,
-  so it cannot be set by hand.
-- **Not a stateful fleet baseline.** The two capacity records are Tier 0 local
-  runs; the retained fault and recovery records are process-level GitHub
-  Actions runs against pinned Redis/Postgres lanes. None is a multi-replica
-  load or soak measurement. The stateful endurance harness has run its
+- **Not a claim that Axond is production-qualified.** All six slices are
+  currently harnessed. #156 stays open until every slice has exactly one heavy
+  release-profile record from the same clean v0.4.0 source cohort;
+  `closure.satisfied` is derived from those records and cannot be set by hand.
+- **Not yet a stateful endurance baseline.** The historical capacity records are Tier 0
+  local runs; the historical fault and recovery records are v0.3.39 debug
+  GitHub Actions runs against pinned Redis/Postgres lanes and are not active
+  closure evidence. The stateful endurance harness has run its
   ninety-second smoke tier, but the 12–24 hour tiers have not been dispatched.
-- **Not a fleet baseline.** The retained CI records qualify process behavior,
-  not offered load across replicas.
+- **Not a long-soak baseline.** The rollout scenario offers fleet load for under
+  a minute, and no current rollout record is retained; it says nothing about
+  resource drift over hours.
 
 ## The status ladder
 
@@ -49,7 +50,39 @@ than from what it says:
 | `unbuilt` | The question is written down. Nothing runs. |
 | `declared` | A committed manifest and contract page, kept honest by a `contract_test`, with no driver behind them. A contract test measures nothing, which is why it is not one. |
 | `harnessed` | A driver a lane runs, with no retained run of its heavy tier. A short run may be retained here — it shows the harness produces records — but it does not promote the slice. |
-| `evidenced` | A driver, and at least one retained run in the repository — including one from the tier the slice's own manifest calls heavy (`heavy` for capacity, `soak` for endurance), because a short run is a correctness check, not a measurement of what a replica does. |
+| `evidenced` | A driver, and at least one retained run in the repository — including one from the tier the slice's own manifest calls heavy (`heavy` for capacity/rollout, `soak` for endurance/stateful endurance), because a short run is a correctness check, not a measurement of what a replica does. |
+
+## Qualification cohort
+
+Packet manifest schema 2 names one immutable release cohort:
+`v0.4.0-production-qualification`, candidate version `0.4.0`. Its exact
+`source_commit` is truthfully `pending` until the candidate is frozen. Closure
+requires replacing that sentinel with an exact Git object id and matching it
+against every one of the six heavy records. Every candidate record must also be
+clean, use `cargo_profile = "release"`, and identify v0.4.0 in both its source
+and binary provenance. Rollout additionally fixes the published predecessor at
+v0.3.40.
+
+Freeze the cohort in this order:
+
+1. Land every candidate code, manifest, workflow, and documentation change,
+   set the workspace and shipped dependency versions to `0.4.0`, and commit.
+   Keep the release-please PR unmerged.
+2. Record that clean commit as `cohort.source_commit`; do not amend it.
+3. Run capacity, fault, recovery, rollout, stateless endurance, and stateful
+   endurance from that exact Git object. A rerun after any source change starts
+   a new cohort rather than mixing records.
+4. Promote and commit the six records, change each slice to `evidenced`, and set
+   closure only when the packet test derives no error. These evidence-only
+   commits may descend from the frozen source; their records must still name
+   the frozen object that produced the candidate binaries.
+5. Merge the release PR only after the pre-tag publication test is green.
+
+The `axond-qualification` self-hosted runner label is also a provisioning
+contract: it names a Linux x86_64 host with a running Docker Engine capable of
+starting GitHub Actions service containers. Stateful endurance uses a pinned
+PostgreSQL service, which GitHub creates before the first job step; a host with
+the label but without Docker is misconfigured and cannot produce evidence.
 
 ## Retained evidence
 
@@ -63,27 +96,25 @@ asserted against the committed manifest, so editing a profile's scale or
 thresholds invalidates every record taken before the edit rather than leaving it
 quietly describing a workload that no longer exists.
 
-A record's identity is its digests, not its commit. The binary that produced
-the numbers, the manifest it ran, and the config each profile booted are
-content-addressed; they say exactly what was measured and they outlive any
-rewriting of history. The branch commit is recorded too, but this repository
-squash-merges, so read it as a note about the run rather than something to
-check out.
+A record remains content-addressed by the binary, manifest, raw artifact, and
+config digests. A historical branch commit can be a pre-squash provenance note;
+an active v0.4.0 record is stricter and must name the packet cohort's exact
+frozen source commit.
 
-| Record | Tier | Runner | Binary `sha256` | Branch commit (pre-squash) |
-| --- | --- | --- | --- | --- |
-| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `8e2cbb566e82` | `8ba8b96` |
-| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `8e2cbb566e82` | `8ba8b96` |
-| `qualification/faults/evidence/full-ci.toml` | full | github-actions | `c7c250314925` | `c18b7a5` |
-| `qualification/recovery/evidence/serving-ci.toml` | serving | github-actions | `4c1789c306b9` | `c18b7a5` |
+The packet currently has no active retained records. It separately indexes
+these historical records so they remain reviewable without contributing to a
+slice's status or to closure:
 
-The two capacity records were produced on an 8 vCPU cloud VM from a **debug build**, which is what
-`cargo test` builds. They are the first envelope, not a fleet baseline: a release
-build on production-representative hardware will move every number in them, and
-`runner = "local"` is in the record so that caveat travels with the data instead
-of with this paragraph. The CI records are retained process-level fault and
-recovery evidence; their GitHub Actions provenance and Redis/Postgres lanes do
-not make them fleet-load measurements. The contract test requires a locally
+| Historical record | Tier | Runner | Version/profile | Binary `sha256` | Branch commit (pre-squash) |
+| --- | --- | --- | --- | --- | --- |
+| `qualification/faults/evidence/full-ci.toml` | full | github-actions | v0.3.39/debug | `c7c250314925` | `c18b7a5` |
+| `qualification/recovery/evidence/serving-ci.toml` | serving | github-actions | v0.3.39/debug | `4c1789c306b9` | `c18b7a5` |
+
+The earlier capacity and rollout files remain as historical measurements, not
+active packet evidence: neither binds the raw artifacts required by the current
+contract, and the rollout run used one binary on both sides. The indexed fault
+and recovery records are likewise historical because v0.3.39 debug executables
+cannot qualify the frozen v0.4.0 release cohort. The contract test requires a locally
 recorded run to be disclosed here by path and by the digest of the binary that
 produced it, so re-running a tier — which rebuilds the binary, and so changes
 the digest — without rewriting this table is a test failure rather than a stale
@@ -109,7 +140,7 @@ The other load-shaped slices use the same provenance envelope and a compact
 `[[observation]]` per committed workload. The raw artifact remains the detailed
 diagnosis; the observation binds its SHA-256 digest, elapsed time, verdict count,
 and pass result to the manifest that produced it. The heavy rollout and
-endurance workflows, including the supplemental stateful-endurance lane, the
+endurance workflows, including the first-class stateful-endurance slice, the
 full service-backed fault lane, and the combined recovery job publish records
 as `qualification-record-*` workflow artifacts:
 
@@ -126,7 +157,7 @@ ops/qualification-evidence.py target/rollout/heavy \
 
 ops/qualification-evidence.py target/recovery \
   --slice recovery --tier serving --runner local \
-  --binary target/debug/axond \
+  --binary target/release/axond \
   --note "local stateful-tests plus restore-drill" \
   --out target/qualification-records/recovery-serving.toml
 ```
@@ -149,18 +180,42 @@ python3 ops/promote-qualification.py \
 ```
 
 Promotion verifies the source tree, manifest, binary, and workload coverage as
-before, and now also hashes every supplied raw JSON artifact. A compact record
+before, and now also hashes every supplied raw JSON artifact. Both endurance
+slices bind and re-hash request-identity and correlation ledgers, including
+their file and byte counts. Sample sets are bound through `samples_sha256`,
+`samples_files`, and `samples_bytes`. Stateless endurance binds exactly one
+non-empty resource-sample JSONL file. Stateful endurance binds a non-empty set
+with one file per replica incarnation and additionally binds its durable and
+outside-window identity ledgers.
+Promotion independently reconstructs accounting and resource verdicts from
+those retained bytes. A compact record
 cannot be promoted from a TOML file alone: its claimed artifact digests must
 match the complete raw-artifact directory from the same run.
+Rollout observations also retain the previous and candidate executable versions
+and digests plus the checksum-pinned release archive digest, so that provenance
+survives the raw workflow artifact's retention window. Raw rollout schema 3 and
+compact rollout record schema 3 additionally preserve the shared durable
+revision, the `chat` alias, and successful serving probes from both v0.3.40 and
+v0.4.0. Fault observations bind raw artifact schema 1. Recovery stage rows bind
+raw artifact schema 2 and the exact executable digest, which must equal the
+record's release binary digest.
 
 Promotion refuses dirty provenance, stale manifest hashes, wrong heavy tiers,
-partial workload sets, failed verdicts, and an endurance `soak` run shorter than
-the committed 12-hour duration. A shortened dispatched soak can still be
-generated and uploaded for diagnosis, but it cannot be promoted as #156
+partial workload sets, failed verdicts, and an endurance or stateful-endurance
+`soak` run shorter than the committed 12-hour duration. A shortened dispatched
+soak can still leave raw diagnostic artifacts, but the compact writer and
+promoter both refuse it as #156
 evidence. Recovery promotion additionally requires all 22 executable stages,
 with the stateful-test and restore-drill lane attribution from the manifest.
 Promotion does not edit the packet; the status and `retained` path remain a
 reviewed change checked by the packet test.
+
+The release workflow runs the packet's dedicated publication test before
+release-please. While the workspace version is below `0.4.0`, the release PR may
+remain open and absorb candidate work. Once the workspace identifies itself as
+`0.4.0`, the workflow refuses to create the tag unless `closure.satisfied` is
+true and the six independently validated records all belong to the frozen
+cohort. This makes qualification a pre-tag gate rather than post-release prose.
 
 ## Dependency retirements
 
@@ -173,33 +228,37 @@ checked by the qualification packet test.
 
 ## What each slice still owes
 
-- **`endurance`** — a dispatched 12–24 hour run. The drift thresholds that only
+- **`endurance`** — a dispatched 12–24 hour run binding exact request and
+  correlation ledgers plus one sample JSONL. The drift thresholds that only
   hours can exercise (`max_rss_drift_kib_per_hour` and its neighbours) have no
   run behind them, so the soak tiers are declared bounds rather than measured
   ones.
-- **`recovery`** — a multi-replica fleet baseline: serving through the outage,
-  from a restored cache, and across a recovery, plus rotation and restore under
-  offered load. The retained process/recovery record covers all twenty-two
-  executable stages today; the packet mirrors the manifest's dependency map and
-  is tested against it so future dependencies cannot disappear silently.
-- **`fault`** — a second reference tier and integrated fleet fault evidence. The
-  full provider, transport, Redis, and Postgres matrix now has a clean retained
-  GitHub Actions record.
-- **`rollout`** — a manifest, a driver, and a stateful fleet: two or more
-  replicas behind an ingress, with the artifact-digest, migration, and timeline
-  metadata a rollout has to retain.
-- **All of them** — a second reference tier. Every number retained so far is
-  single-replica.
+- **`stateful-endurance`** — a complete 12-hour multi-replica run with exact
+  request, trace, and durable-identity shards plus the non-empty per-incarnation
+  sample JSONL set independently promoted from the raw artifact set.
+- **`capacity`** — a schema-2 heavy run that retains and binds every raw profile
+  artifact, including decoded production queue-depth telemetry.
+- **`recovery`** — re-run all executable real-Postgres stages from the frozen
+  v0.4.0 source in release profile, retaining raw schema 2 and each stage's
+  exact executable digest.
+- **`fault`** — re-run the complete provider, transport, Redis, and Postgres
+  matrix from the frozen v0.4.0 source in release profile, retaining raw schema
+  1 on every compact observation.
+- **`rollout`** — a release-profile raw/compact schema-3 run using published
+  v0.3.40 and cohort v0.4.0 as distinct binaries, proving both serve one shared
+  durable revision and `chat` alias through the migration and rollback ledger.
+- **Second reference tier** — rollout must supply the short fleet-under-load
+  baseline; stateful endurance must supply the long-duration baseline.
 
 One question the packet is regularly asked for, and still cannot answer: a
-**stateful fleet qualification baseline**. A stateful replica now compiles
-durable tenant/project principals and serves after a complete snapshot is
-published; without one it keeps readiness and inference fail-closed. The
-single-process evidence belongs to #219, while a profile against multiple
-replicas, offered load, and recovery remains outstanding. That is why #219
-remains open: its twenty-two executable stages run against real PostgreSQL and
-are retained, but no complete multi-replica fleet record is retained. It is also
-why no capacity profile claims stateful serving.
+**stateful fleet endurance baseline**. Durable workload-principal projection can
+now compile a complete revision into a serving snapshot, and the persistent
+StatefulSet/PVC overlay can restore its authenticated caches. The historical
+single-process recovery run documents the #219 harness but does not qualify
+v0.4.0. What remains outstanding is direct evidence: a stateful two-version rollout and the
+stateful endurance profile against multiple replicas for the committed 12
+hours, including revisions, backend faults, and rolling restarts. Until those
+runs are retained, no capacity profile claims stateful serving.
 
 ## Related
 

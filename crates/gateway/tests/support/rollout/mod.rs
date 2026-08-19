@@ -11,17 +11,17 @@
 //! and the two rollbacks — the compatible one an operator may perform, and the
 //! one a forward-only migration prohibits.
 //!
-//! What it does not qualify: nothing here runs a second *build*. A revision is
-//! the (binary, config) pair a process was started from, and the incoming one
-//! differs by a capability the outgoing one does not have, which is exactly the
-//! shape of the mixed-version rule in `docs/operations/upgrades.md`. The
-//! artifact records `distinct_binary: false` rather than implying otherwise.
+//! The heavy lane runs a checksum-verified retained release beside the candidate
+//! build and requires a real migration matrix before its artifact is promotable.
+//! The reduced lane uses one binary for both sides and labels its artifact as a
+//! non-promotable diagnostic.
 
 pub mod fleet;
 pub mod ingress;
 pub mod manifest;
 pub mod result;
 pub mod run;
+mod stateful;
 
 pub use fleet::{Fleet, Revision};
 pub use ingress::Ingress;

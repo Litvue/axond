@@ -120,10 +120,9 @@ pub struct ProviderProjection;
 /// The production projection: tenancy, credentials, and inbound principals for
 /// the namespaces they authenticate.
 ///
-/// This projection intentionally does not project inbound gateway principals.
-/// Stateful compilation reports that as a typed `unsupported` refusal instead
-/// of constructing a keyless serving snapshot. Adding a principal source here
-/// is the narrow point at which stateful serving can become Ready.
+/// Durable workload principals are projected last, after their namespaces and
+/// provider credentials exist. A revision with no admissible principal still
+/// fails closed instead of constructing a keyless serving snapshot.
 ///
 /// One type rather than a generic chain because the order is not a configuration
 /// choice — a credential's namespace has to exist before the credential can name

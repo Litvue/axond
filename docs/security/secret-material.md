@@ -131,8 +131,9 @@ project-scoped workload principals supply a digest-backed inbound key bound to
 the qualified project namespace. A projected project is reached by a qualified
 id no `axond.toml` can declare, so the integration fixture obtains the one-time
 workload key from the administrative response and uses it only to exercise the
-shipped verifier. Human OIDC authentication remains an administrative-surface
-follow-up; it is not substituted with a workload key.
+shipped verifier. Human OIDC principals are separately authenticated and
+authorized on the administrative surface; they are not substituted with a
+workload key.
 
 The `/admin/v1` boundary is swept over its real route table and the real Postgres
 journal, with authentication and authorization faked — an administrator's

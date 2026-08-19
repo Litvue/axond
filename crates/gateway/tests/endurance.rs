@@ -307,7 +307,7 @@ fn the_drain_interval_is_bounded_independently_of_the_segment_length() {
 /// identities always share a shard, and bounded, because the driver only ever
 /// holds one shard's worth.
 #[test]
-fn the_fingerprint_ledger_counts_duplicates_exactly_without_holding_the_run() {
+fn the_identity_ledger_counts_duplicates_exactly_without_holding_the_run() {
     let dir = std::env::temp_dir().join(format!("axond-endurance-ledger-{}", std::process::id()));
     let mut ledger = endurance::ledger::Ledger::create(&dir);
     // Sixty thousand identities, of which every hundredth arrives twice and
@@ -315,16 +315,19 @@ fn the_fingerprint_ledger_counts_duplicates_exactly_without_holding_the_run() {
     let identities = 60_000_u64;
     let mut expected_duplicates = 0;
     for id in 0..identities {
-        ledger.record(id);
+        let request_id = format!("req_0192f5e1-2b3c-7def-8000-{id:012x}");
+        ledger.record(&request_id).unwrap();
         if id.is_multiple_of(100) {
-            ledger.record(id);
+            ledger.record(&request_id).unwrap();
             expected_duplicates += 1;
         }
     }
-    ledger.record(7);
+    ledger
+        .record("req_0192f5e1-2b3c-7def-8000-000000000007")
+        .unwrap();
     expected_duplicates += 1;
 
-    let tally = ledger.tally();
+    let tally = ledger.tally().unwrap();
     assert_eq!(
         (tally.distinct, tally.duplicates),
         (identities, expected_duplicates),
@@ -333,9 +336,9 @@ fn the_fingerprint_ledger_counts_duplicates_exactly_without_holding_the_run() {
     assert_eq!(tally.recorded, identities + expected_duplicates);
     // The bound the whole-run set did not have: no shard is the run.
     assert!(
-        tally.peak_shard_fingerprints < tally.recorded / 8,
+        tally.peak_shard_rows < tally.recorded / 8,
         "one shard held {} of {} identities",
-        tally.peak_shard_fingerprints,
+        tally.peak_shard_rows,
         tally.recorded
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -426,13 +429,14 @@ async fn the_two_tiers_run_in_sequence_and_each_records_the_duration_it_was_offe
             result.segments.len()
         );
         assert!(
-            result.reconciliation.fingerprints.exact
-                && result.reconciliation.fingerprints.peak_shard_fingerprints
-                    <= result.reconciliation.fingerprints.recorded,
+            result.reconciliation.request_identities.exact
+                && result.reconciliation.request_identities.peak_shard_rows
+                    <= result.reconciliation.request_identities.recorded
+                && result.reconciliation.correlations.exact,
             "{} [{}]: duplicate detection did not say how it looked: {:?}",
             result.profile.id,
             result.profile.tier,
-            result.reconciliation.fingerprints
+            result.reconciliation.request_identities
         );
     }
 }

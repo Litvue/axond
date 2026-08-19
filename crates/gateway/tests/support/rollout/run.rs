@@ -4,18 +4,22 @@
 //! prescribes, because the point is to qualify *that* sequence rather than a
 //! convenient approximation of it:
 //!
-//! 1. gate on `axond check preflight` and `axond migrate status` before any
-//!    replica exists;
-//! 2. bring up the previous revision and offer traffic through the balancer;
-//! 3. for each old replica: surge in a next-revision replacement, wait for the
+//! 1. apply the retained release's migrations, publish one complete
+//!    desired-state revision, and boot the retained fleet against it;
+//! 2. offer traffic through that retained fleet, preflight and status the
+//!    candidate, then apply its migrations to the same schema while the
+//!    retained replicas keep serving;
+//! 3. canary the candidate executable on the shared bootstrap and durable
+//!    revision, then drain it;
+//! 4. for each old replica: surge in a candidate replacement, wait for the
 //!    balancer to admit it, then `SIGTERM` the old one with a buffered request
 //!    and a stream already in flight on it, and keep offering traffic across the
 //!    whole window;
-//! 4. offer traffic to the fully replaced fleet;
-//! 5. roll one replica back to the previous revision, which is allowed here
-//!    because no migration ran;
-//! 6. show the rollback that is *not* allowed: a control plane a newer build has
-//!    migrated is refused rather than served.
+//! 5. offer traffic to the fully replaced fleet;
+//! 6. retain the real previous-to-candidate migration matrix from that same
+//!    serving schema;
+//! 7. either roll one replica back on an unchanged layout, or prove the retained
+//!    binary refuses a candidate-migrated forward-only layout.
 //!
 //! Everything measured is recorded; the thresholds in the manifest decide what
 //! fails. Throughput is deliberately not a gate — a shared runner moves it — but
@@ -35,17 +39,26 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::support::capacity::manifest::sha256_hex;
-use crate::support::capacity::result::{BinaryMeta, ConfigMeta, Percentiles, Verdict, binary_meta};
+use crate::support::capacity::result::{
+    BinaryMeta, ConfigMeta, Percentiles, Verdict, binary_meta_at,
+    binary_meta_at_with_version_fallback,
+};
 use crate::support::gateway::{self, GATEWAY_KEY, alias};
-use crate::support::schema::Schema;
 
-use super::fleet::{Drained, Fleet, NEXT, NEXT_ONLY_ALIAS, PREVIOUS, Revision, pinned};
-use super::ingress::{CallerRequest, Forward, Ingress, REPLICA_HEADER, REVISION_HEADER};
-use super::manifest::{RESULT_SCHEMA_VERSION, Scale, Scenario, ShutdownBounds, Tier};
+use super::fleet::{
+    COMPATIBILITY, Drained, Fleet, NEXT, NEXT_ONLY_ALIAS, PREVIOUS, Revision, pinned,
+};
+use super::ingress::{Forward, Ingress, REPLICA_HEADER, REVISION_HEADER};
+use super::manifest::{RESULT_SCHEMA_VERSION, Scale, Scenario, Tier};
 use super::result::{
-    CapacityEnvelope, CommandRecord, DrainRecord, Environment, Event, Fence, InFlight, LossLedger,
-    MigrationEvidence, MixedVersion, PatchRollback, PhaseTraffic, ReplicaRecord, ReplicaUsage,
-    RevisionMeta, RollbackEvidence, RolloutResult, RunMeta, ScenarioEcho, StreamCut,
+    CapacityEnvelope, CommandRecord, DrainRecord, Environment, Event, ExpectedUsageIdentity, Fence,
+    InFlight, LossLedger, MigrationEvidence, MigrationMatrix, MigrationVersion, MixedVersion,
+    ObservedUsageIdentity, PatchRollback, PhaseTraffic, ReplicaRecord, ReplicaUsage,
+    RetainedRelease, RevisionMeta, RollbackEvidence, RolloutResult, RunMeta, ScenarioEcho,
+    StreamCut,
+};
+use super::stateful::{
+    BUFFERED_PROMPT, MigrationTarget as StatefulMigrationTarget, SLOW_PROMPT, STALLED_PROMPT,
 };
 
 /// How often the balancer re-probes readiness. Fast enough that the measured
@@ -68,25 +81,157 @@ const IN_FLIGHT_WAIT: Duration = Duration::from_secs(5);
 /// therefore the byte counts and the priced tokens — are the same on every run.
 const PROMPT: &str = "qualify the rollout";
 
+const PREVIOUS_BINARY_ENV: &str = "AXOND_ROLLOUT_PREVIOUS_BINARY";
+const EXPECTED_PREVIOUS_VERSION_ENV: &str = "AXOND_ROLLOUT_EXPECTED_PREVIOUS_VERSION";
+const EXPECTED_PREVIOUS_SHA256_ENV: &str = "AXOND_ROLLOUT_EXPECTED_PREVIOUS_SHA256";
+const RETAINED_ARCHIVE_SHA256_ENV: &str = "AXOND_ROLLOUT_RETAINED_ARCHIVE_SHA256";
+
+/// Run-scoped caller correlation. The high word domains rollout traffic and the
+/// low word is a monotonically allocated, one-based request sequence. It is a
+/// qualification identity, not a production trace-id generator.
+#[derive(Debug, Clone, Copy)]
+struct CorrelationId(u64);
+
+impl CorrelationId {
+    const DOMAIN: u64 = 0x6178_6f6e_642d_726f;
+
+    fn new(sequence: u64) -> Self {
+        assert!(sequence > 0, "a rollout correlation sequence is nonzero");
+        Self(sequence)
+    }
+
+    fn trace_id(self) -> String {
+        format!("{:016x}{:016x}", Self::DOMAIN, self.0)
+    }
+
+    fn traceparent(self) -> String {
+        format!("00-{}-0000000000000001-01", self.trace_id())
+    }
+}
+
+struct Binaries {
+    previous: PathBuf,
+    candidate: PathBuf,
+    promotable: bool,
+    retained_release: Option<RetainedRelease>,
+}
+
+impl Binaries {
+    fn resolve(tier: Tier) -> Self {
+        let candidate = PathBuf::from(env!("CARGO_BIN_EXE_axond"));
+        let supplied = (tier == Tier::Heavy)
+            .then(|| std::env::var_os(PREVIOUS_BINARY_ENV).map(PathBuf::from))
+            .flatten();
+        if tier == Tier::Heavy {
+            assert!(
+                supplied.is_some(),
+                "heavy rollout qualification requires {PREVIOUS_BINARY_ENV} to name the verified \
+                 retained release executable"
+            );
+            assert!(
+                std::env::var_os("AXOND_TEST_POSTGRES_DSN").is_some(),
+                "heavy rollout qualification requires AXOND_TEST_POSTGRES_DSN"
+            );
+        }
+        let previous = supplied.unwrap_or_else(|| candidate.clone());
+        for (label, path) in [("previous", &previous), ("candidate", &candidate)] {
+            assert!(
+                path.is_file(),
+                "the {label} rollout binary {} is not a file",
+                path.display()
+            );
+        }
+        let expected_previous_version = (tier == Tier::Heavy).then(|| {
+            std::env::var(EXPECTED_PREVIOUS_VERSION_ENV).unwrap_or_else(|_| {
+                panic!("heavy rollout qualification requires {EXPECTED_PREVIOUS_VERSION_ENV}")
+            })
+        });
+        let previous_meta =
+            binary_meta_at_with_version_fallback(&previous, expected_previous_version.as_deref());
+        let candidate_meta = binary_meta_at(&candidate);
+        let distinct = previous_meta.sha256 != candidate_meta.sha256;
+        let retained_release = (tier == Tier::Heavy).then(|| {
+            let required = |name: &str| {
+                std::env::var(name)
+                    .unwrap_or_else(|_| panic!("heavy rollout qualification requires {name}"))
+            };
+            let expected_version = expected_previous_version
+                .clone()
+                .expect("the heavy tier loaded its expected predecessor version");
+            let expected_binary_sha256 = required(EXPECTED_PREVIOUS_SHA256_ENV);
+            let archive_sha256 = required(RETAINED_ARCHIVE_SHA256_ENV);
+            for (name, digest) in [
+                (EXPECTED_PREVIOUS_SHA256_ENV, &expected_binary_sha256),
+                (RETAINED_ARCHIVE_SHA256_ENV, &archive_sha256),
+            ] {
+                assert!(
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "{name} must be a 64-character SHA-256 digest"
+                );
+            }
+            assert_eq!(
+                previous_meta.version, expected_version,
+                "the retained executable version does not match the pinned release"
+            );
+            assert_eq!(
+                previous_meta.sha256.to_ascii_lowercase(),
+                expected_binary_sha256.to_ascii_lowercase(),
+                "the retained executable digest does not match the verified archive"
+            );
+            RetainedRelease {
+                expected_version,
+                expected_binary_sha256: expected_binary_sha256.to_ascii_lowercase(),
+                archive_sha256: archive_sha256.to_ascii_lowercase(),
+            }
+        });
+        if tier == Tier::Heavy {
+            assert!(
+                distinct,
+                "heavy rollout qualification requires distinct previous and candidate binary digests"
+            );
+        }
+        Self {
+            previous,
+            candidate,
+            promotable: tier == Tier::Heavy && distinct,
+            retained_release,
+        }
+    }
+}
+
 pub async fn run(scenario: &Scenario, tier: Tier, manifest_text: &str) -> RolloutResult {
+    let binaries = Binaries::resolve(tier);
     let scale = *scenario.scale(tier);
     let started_at = SystemTime::now();
     let started = Instant::now();
-    let mut harness = Harness::new(scenario.clone(), scale, started).await;
+    let mut harness = Harness::new(scenario.clone(), scale, tier, started, &binaries).await;
+    let gate = harness.prepare_gate(&binaries.previous).await;
 
-    let revisions = revisions(&harness.fleet.upstream.base_url, scenario.shutdown);
-    let migration = harness.gate(&revisions).await;
-
-    // The fleet as it was before anyone touched it.
+    // Boot and admit the retained serving fleet before the candidate touches
+    // the schema.
     for _ in 0..scenario.replicas {
         harness.admit(Revision::previous()).await;
     }
     harness.phase("steady-previous").await;
 
+    // The previous processes are now demonstrably serving the projected
+    // revision. Apply the candidate migration to that same schema before its
+    // first process starts. Existing previous processes may drain from their
+    // active immutable snapshot; a fresh previous process is admitted later
+    // only when the migration ledger still permits it.
+    let (migration, fence) = harness
+        .complete_gate(gate, &binaries.previous, &binaries.candidate)
+        .await;
+
+    // Before replacement, prove that the candidate can boot and serve behind
+    // the fleet with the same stateful bootstrap and durable revision.
+    let compatibility = harness.admit(Revision::compatibility()).await;
+    harness.phase("candidate-on-previous-config").await;
+    let mut drains = vec![harness.drain(&compatibility, "compatibility-drain").await];
+
     // The rollout proper: one replacement at a time, never below the original
     // replica count, which is what makes it a rolling deployment rather than a
     // restart.
-    let mut drains = Vec::new();
     let mut mixed = None;
     for index in 0..scenario.replicas {
         let victim = harness
@@ -106,52 +251,71 @@ pub async fn run(scenario: &Scenario, tier: Tier, manifest_text: &str) -> Rollou
     }
     harness.phase("steady-next").await;
 
-    // The rollback an operator is allowed to perform, performed the same way the
-    // rollout was: surge the previous revision back in, then drain a new one.
-    let rollback_replica = harness.admit(Revision::previous()).await;
-    let replaced = harness
-        .fleet
-        .oldest(Revision::next())
-        .expect("a next-revision replica is serving")
-        .id
-        .clone();
-    drains.push(harness.drain(&replaced, "rollback-drain").await);
-    let rollback_traffic = harness.phase("rolled-back").await;
-    let served = rollback_traffic
-        .by_replica
-        .get(&rollback_replica)
-        .copied()
-        .unwrap_or_default();
-
-    let fence = fence(&mut harness.timeline).await;
-
-    // Everything is quiet now, so the accounting can settle.
-    let expected_usage = harness.expected_usage;
-    let records = harness
-        .fleet
-        .await_usage_records(expected_usage as usize, Duration::from_secs(10))
-        .await;
-    let elapsed = started.elapsed();
-
-    let mixed = mixed.expect("the rollout has at least one mixed-version window");
-    let loss = ledger(&harness, expected_usage, &records);
-    let capacity = envelope(&harness.traffic);
-    let fleet_records = fleet_records(&harness, &drains);
-    let rollback = RollbackEvidence {
-        compatible_patch_rollback: PatchRollback {
+    // Roll back only when the real migration matrix proved the ledger remained
+    // compatible. If the candidate added a version, the previous binary's
+    // refusal is the rollback result; starting it as a replica would violate the
+    // deployment rule the harness is supposed to qualify.
+    let patch_rollback = if fence.expected_refused {
+        PatchRollback {
+            performed: false,
+            skipped_reason: Some(
+                "candidate added forward-only migrations; previous binary refused the layout"
+                    .to_owned(),
+            ),
+            replica: None,
+            answered: 0,
+            errors: 0,
+            served_traffic: false,
+        }
+    } else {
+        let rollback_replica = harness.admit(Revision::previous()).await;
+        let replaced = harness
+            .fleet
+            .oldest(Revision::next())
+            .expect("a next-revision replica is serving")
+            .id
+            .clone();
+        drains.push(harness.drain(&replaced, "rollback-drain").await);
+        let rollback_traffic = harness.phase("rolled-back").await;
+        let served = rollback_traffic
+            .by_replica
+            .get(&rollback_replica)
+            .copied()
+            .unwrap_or_default();
+        PatchRollback {
             performed: true,
-            replica: rollback_replica,
+            skipped_reason: None,
+            replica: Some(rollback_replica),
             answered: served,
             errors: rollback_traffic.errors,
             served_traffic: served > 0,
-        },
+        }
+    };
+
+    // Everything is quiet now, so the accounting can settle.
+    let records = await_exact_usage_records(&harness, Duration::from_secs(10)).await;
+    let elapsed = started.elapsed();
+
+    let mixed = mixed.expect("the rollout has at least one mixed-version window");
+    let revisions = revisions(&harness.fleet, &binaries);
+    let loss = ledger(&harness, &records);
+    let capacity = envelope(&harness.traffic);
+    let fleet_records = fleet_records(&harness, &drains);
+    let rollback = RollbackEvidence {
+        compatible_patch_rollback: patch_rollback,
         migrated_layout_fence: fence,
     };
 
     let result = RolloutResult {
         schema_version: RESULT_SCHEMA_VERSION,
         scenario: ScenarioEcho::new(scenario, tier),
-        run: RunMeta::new(started_at, elapsed),
+        run: RunMeta::new(
+            started_at,
+            elapsed,
+            tier,
+            binaries.promotable,
+            binaries.retained_release.clone(),
+        ),
         environment: Environment::collect(manifest_text),
         revisions,
         fleet: fleet_records,
@@ -169,6 +333,23 @@ pub async fn run(scenario: &Scenario, tier: Tier, manifest_text: &str) -> Rollou
     RolloutResult { verdicts, ..result }
 }
 
+/// Wait for the exact expected traces, not merely the expected cardinality. An
+/// unrelated early row must not stop settlement before the row it would appear
+/// to substitute has had the full flush window to arrive.
+async fn await_exact_usage_records(harness: &Harness, within: Duration) -> Vec<Value> {
+    let deadline = Instant::now() + within;
+    loop {
+        let records = harness.fleet.usage_records_by_replica();
+        let reconciliation = reconcile(&harness.expected_usage, &records, &BTreeMap::new());
+        if (reconciliation.missing == 0 && reconciliation.status_mismatches == 0)
+            || Instant::now() >= deadline
+        {
+            return harness.fleet.usage_records();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The run's mutable state, in one place so the phases can be methods: a phase
 /// needs the fleet, the balancer, the clock, and the ledger, and threading four
 /// of those through free functions is how a driver becomes unreadable.
@@ -181,14 +362,12 @@ struct Harness {
     started: Instant,
     timeline: Timeline,
     traffic: Vec<PhaseTraffic>,
-    /// One per request that reached a replica's request path. Counted as the run
-    /// goes, so the denominator of the loss ledger is derived from what was
-    /// offered rather than from what turned up.
-    expected_usage: u64,
-    /// Records expected from requests the harness pinned past the balancer,
-    /// under the replica it pinned them to. The balancer's caller ledger cannot
-    /// know about these, and usage is reconciled per replica.
-    pinned_expectations: BTreeMap<String, u64>,
+    /// Exact caller-side accounting rows. The denominator and every expected
+    /// identity are derived from requests the driver proved reached a replica,
+    /// never from records that happened to turn up later.
+    expected_usage: Vec<ExpectedUsageIdentity>,
+    /// Monotonic run-scoped source for caller trace identities.
+    next_correlation: u64,
     mixed_probe: Option<MixedVersion>,
     /// How long each replica took from being booted to carrying traffic. Kept
     /// per replica because the offset the balancer records is an offset from the
@@ -197,9 +376,33 @@ struct Harness {
     admissions: BTreeMap<String, Duration>,
 }
 
+struct PendingGate {
+    config_path: String,
+    migration: Option<PreparedMigration>,
+}
+
+struct PreparedMigration {
+    target: StatefulMigrationTarget,
+    previous_apply: CommandRecord,
+    previous_status_before: CommandRecord,
+    previous_versions: Vec<MigrationVersion>,
+}
+
 impl Harness {
-    async fn new(scenario: Scenario, scale: Scale, started: Instant) -> Self {
-        let fleet = Fleet::start(scenario.shutdown).await;
+    async fn new(
+        scenario: Scenario,
+        scale: Scale,
+        tier: Tier,
+        started: Instant,
+        binaries: &Binaries,
+    ) -> Self {
+        let fleet = Fleet::start(
+            scenario.shutdown,
+            &binaries.previous,
+            &binaries.candidate,
+            tier == Tier::Heavy,
+        )
+        .await;
         let ingress = Ingress::start(PROBE_POLL, started).await;
         Self {
             scenario,
@@ -210,49 +413,350 @@ impl Harness {
             started,
             timeline: Timeline::new(started),
             traffic: Vec::new(),
-            expected_usage: 0,
-            pinned_expectations: BTreeMap::new(),
+            expected_usage: Vec::new(),
+            next_correlation: 1,
             mixed_probe: None,
             admissions: BTreeMap::new(),
         }
     }
 
-    /// The deployment gate, run before a replica exists — which is the whole
-    /// point of it: a config that fails preflight must never become a process.
-    async fn gate(&mut self, revisions: &[RevisionMeta]) -> MigrationEvidence {
+    fn reserve_correlations(&mut self, count: usize) -> u64 {
+        let first = self.next_correlation;
+        self.next_correlation = self
+            .next_correlation
+            .checked_add(u64::try_from(count).expect("a rollout phase count fits u64"))
+            .expect("the rollout correlation sequence does not overflow");
+        first
+    }
+
+    fn next_correlation(&mut self) -> CorrelationId {
+        let sequence = self.reserve_correlations(1);
+        CorrelationId::new(sequence)
+    }
+
+    fn expect_usage(&mut self, replica: &str, correlation: CorrelationId, status: &str) {
+        self.expected_usage.push(ExpectedUsageIdentity {
+            replica: replica.to_owned(),
+            trace_id: correlation.trace_id(),
+            status: status.to_owned(),
+        });
+    }
+
+    /// Apply the retained layout and publish its complete desired state before
+    /// any fleet replica starts. Candidate migration is intentionally deferred:
+    /// the previous fleet must first prove it can serve the exact schema and
+    /// revision that will be upgraded underneath it.
+    async fn prepare_gate(&mut self, previous_binary: &Path) -> PendingGate {
         let dir = scratch_dir("gate");
-        let next = revisions
-            .iter()
-            .find(|revision| revision.label == NEXT)
-            .expect("the next revision is described");
-        let path = write_config(&dir, "next.toml", &next.config.normalized_toml);
-        let preflight = axond(&["check", "preflight", "--config", &path], &[]);
-        let status = axond(&["migrate", "status", "--config", &path], &[]);
+        let bind: SocketAddr = GATE_BIND.parse().expect("the gate address parses");
+        let config = self.fleet.config(bind, Revision::next());
+        let path = write_config(&dir, "next.toml", &config);
+
+        let migration = if let Some(target) = self.fleet.migration_target() {
+            let previous_apply = axond_at(
+                previous_binary,
+                &["migrate", "apply", "--config", &path],
+                &target.env,
+            );
+            assert!(
+                previous_apply.succeeded,
+                "the retained release could not apply its migrations to the serving schema:\n{}",
+                previous_apply.output
+            );
+            let previous_status_before = axond_at(
+                previous_binary,
+                &["migrate", "status", "--config", &path],
+                &target.env,
+            );
+            assert!(
+                previous_status_before.succeeded,
+                "the retained release did not accept its own serving layout:\n{}",
+                previous_status_before.output
+            );
+            let client = connect(&target.dsn).await;
+            let previous_versions = migration_versions(&client, &target.schema).await;
+            Some(PreparedMigration {
+                target,
+                previous_apply,
+                previous_status_before,
+                previous_versions,
+            })
+        } else {
+            None
+        };
+        self.fleet.prepare_stateful().await;
+        self.timeline.at(
+            "gate",
+            "retained-layout-ready",
+            "retained migrations and complete desired state are ready for the previous fleet",
+        );
+        PendingGate {
+            config_path: path,
+            migration,
+        }
+    }
+
+    /// Once old replicas have served the retained revision, apply candidate
+    /// migrations to that same live schema. Already-running old replicas remain
+    /// eligible to drain their immutable serving snapshot; the final status
+    /// probe decides whether a fresh old process is an allowed rollback.
+    async fn complete_gate(
+        &mut self,
+        gate: PendingGate,
+        previous_binary: &Path,
+        candidate_binary: &Path,
+    ) -> (MigrationEvidence, Fence) {
+        let PendingGate {
+            config_path,
+            migration,
+        } = gate;
+        let env = migration
+            .as_ref()
+            .map(|migration| migration.target.env.as_slice())
+            .unwrap_or(&[]);
+        let preflight = axond_at(
+            candidate_binary,
+            &["check", "preflight", "--config", &config_path],
+            env,
+        );
+        assert!(
+            preflight.succeeded,
+            "the incoming revision failed preflight against the retained fleet's live schema:\n{}",
+            preflight.output
+        );
+        let candidate_status_before = axond_at(
+            candidate_binary,
+            &["migrate", "status", "--config", &config_path],
+            env,
+        );
+        let candidate_status_acceptable = candidate_status_before.succeeded
+            || (migration.is_some()
+                && candidate_status_before
+                    .output
+                    .contains("migration(s) pending"));
+        assert!(
+            candidate_status_acceptable,
+            "the candidate neither accepted the retained fleet's live schema nor reported expected \
+             pending migrations:\n{}",
+            candidate_status_before.output
+        );
+        self.timeline.at(
+            "gate",
+            "candidate-gate-on-live-retained-fleet",
+            format!(
+                "candidate preflight {}; pre-apply migrate status {}",
+                verdict_word(preflight.succeeded),
+                if candidate_status_before.succeeded {
+                    "accepted"
+                } else {
+                    "reported pending migrations"
+                }
+            ),
+        );
+        let (status, matrix, fence, control_plane) = if let Some(prepared) = migration {
+            let candidate_apply = axond_at(
+                candidate_binary,
+                &["migrate", "apply", "--config", &config_path],
+                &prepared.target.env,
+            );
+            assert!(
+                candidate_apply.succeeded,
+                "the candidate could not migrate the schema the retained fleet is serving:\n{}",
+                candidate_apply.output
+            );
+            let candidate_status_after = axond_at(
+                candidate_binary,
+                &["migrate", "status", "--config", &config_path],
+                &prepared.target.env,
+            );
+            assert!(
+                candidate_status_after.succeeded,
+                "the candidate did not accept its migrated serving layout:\n{}",
+                candidate_status_after.output
+            );
+            let client = connect(&prepared.target.dsn).await;
+            let candidate_versions = migration_versions(&client, &prepared.target.schema).await;
+            assert!(
+                candidate_versions.starts_with(&prepared.previous_versions),
+                "the candidate migration ledger changed or reordered retained rows"
+            );
+            let candidate_added_versions: Vec<i32> = candidate_versions
+                [prepared.previous_versions.len()..]
+                .iter()
+                .map(|migration| migration.version)
+                .collect();
+            let expected_refused = !candidate_added_versions.is_empty();
+            let classification = if expected_refused {
+                "forward-only"
+            } else {
+                "unchanged"
+            };
+            assert_eq!(
+                candidate_status_before.succeeded, !expected_refused,
+                "candidate pre-apply status disagrees with the versions it added:\n{}",
+                candidate_status_before.output
+            );
+            let previous_status_after_candidate = axond_at(
+                previous_binary,
+                &["migrate", "status", "--config", &config_path],
+                &prepared.target.env,
+            );
+            let status_refused = !previous_status_after_candidate.succeeded;
+            let status_names_newer = previous_status_after_candidate
+                .output
+                .contains("newer gateway");
+            assert_eq!(
+                status_refused, expected_refused,
+                "migration classification {classification} disagrees with previous-binary \
+                 status:\n{}",
+                previous_status_after_candidate.output
+            );
+            if expected_refused {
+                assert!(
+                    status_names_newer,
+                    "the previous binary refused the candidate layout without naming the newer \
+                     gateway"
+                );
+            }
+            let cold_start = self
+                .fleet
+                .previous_cold_start()
+                .await
+                .expect("a heavy stateful rollout can cold-start the retained binary");
+            let refused =
+                !cold_start.reached_readiness && cold_start.exit_code.is_some_and(|code| code != 0);
+            let names_newer = cold_start.output.contains("newer gateway");
+            assert_eq!(
+                refused, expected_refused,
+                "migration classification {classification} disagrees with the real retained-binary \
+                 cold start (ready {}, exit {:?}):\n{}",
+                cold_start.reached_readiness, cold_start.exit_code, cold_start.output
+            );
+            if expected_refused {
+                assert!(
+                    names_newer,
+                    "the retained binary's cold-start refusal did not name the newer gateway:\n{}",
+                    cold_start.output
+                );
+            } else {
+                assert!(
+                    cold_start.reached_readiness,
+                    "the unchanged layout did not permit a retained binary to reach authenticated \
+                     readiness:\n{}",
+                    cold_start.output
+                );
+            }
+            let mut cold_start_secrets: Vec<(&str, &str)> = prepared
+                .target
+                .env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            cold_start_secrets.push(("STATEFUL_WORKLOAD_KEY", self.fleet.caller_key()));
+            let cold_start_output = redacted(&cold_start.output, &cold_start_secrets);
+            self.timeline.at(
+                "migration",
+                "candidate-layout-active",
+                format!(
+                    "candidate migration was {classification}; a retained cold start was {}",
+                    if refused { "refused" } else { "allowed" }
+                ),
+            );
+            let matrix = MigrationMatrix {
+                evaluated: true,
+                skipped_reason: None,
+                previous_apply: Some(prepared.previous_apply),
+                previous_status_before: Some(prepared.previous_status_before),
+                candidate_status_before: Some(candidate_status_before),
+                candidate_apply: Some(candidate_apply),
+                candidate_status_after: Some(candidate_status_after.clone()),
+                previous_status_after_candidate: Some(previous_status_after_candidate.clone()),
+                previous_versions: prepared.previous_versions,
+                candidate_versions,
+                candidate_added_versions,
+                classification: classification.to_owned(),
+            };
+            let fence = Fence {
+                evaluated: true,
+                skipped_reason: None,
+                status: Some(previous_status_after_candidate),
+                cold_start_attempted: true,
+                cold_start_reached_readiness: cold_start.reached_readiness,
+                cold_start_exit_code: cold_start.exit_code,
+                cold_start_output: Some(cold_start_output),
+                refused,
+                refusal_names_newer_build: names_newer,
+                expected_refused,
+            };
+            (
+                candidate_status_after,
+                matrix,
+                fence,
+                format!(
+                    "one real PostgreSQL schema ({}) supplied migrations, desired state, and the \
+                     serving fleet",
+                    prepared.target.schema
+                ),
+            )
+        } else {
+            let reason = "reduced diagnostic intentionally has no PostgreSQL control plane";
+            (
+                candidate_status_before,
+                MigrationMatrix {
+                    evaluated: false,
+                    skipped_reason: Some(reason.to_owned()),
+                    previous_apply: None,
+                    previous_status_before: None,
+                    candidate_status_before: None,
+                    candidate_apply: None,
+                    candidate_status_after: None,
+                    previous_status_after_candidate: None,
+                    previous_versions: Vec::new(),
+                    candidate_versions: Vec::new(),
+                    candidate_added_versions: Vec::new(),
+                    classification: "not-evaluated".to_owned(),
+                },
+                Fence {
+                    evaluated: false,
+                    skipped_reason: Some(reason.to_owned()),
+                    status: None,
+                    cold_start_attempted: false,
+                    cold_start_reached_readiness: false,
+                    cold_start_exit_code: None,
+                    cold_start_output: None,
+                    refused: false,
+                    refusal_names_newer_build: false,
+                    expected_refused: false,
+                },
+                format!("not evaluated: {reason}"),
+            )
+        };
         let gate_passed = preflight.succeeded && status.succeeded;
         self.timeline.at(
             "gate",
             "migration-gate",
             format!(
-                "preflight {} and migrate status {} for the incoming revision",
+                "preflight {} and post-apply migrate status {} for the incoming revision",
                 verdict_word(preflight.succeeded),
                 verdict_word(status.succeeded)
             ),
         );
         assert!(
             gate_passed,
-            "the incoming revision failed its own deployment gate, so the rollout must not \
-             start:\npreflight:\n{}\nmigrate status:\n{}",
+            "the incoming revision failed its deployment gate:\npreflight:\n{}\nmigrate \
+             status:\n{}",
             preflight.output, status.output
         );
-        MigrationEvidence {
-            preflight,
-            status,
-            gate_passed,
-            control_plane: "none: the qualified deployment is stateless, so there is no schema to \
-                            migrate. The forward-only fence is exercised separately against a real \
-                            control plane."
-                .to_owned(),
-        }
+        (
+            MigrationEvidence {
+                preflight,
+                status,
+                gate_passed,
+                control_plane,
+                matrix,
+            },
+            fence,
+        )
     }
 
     /// Boot a replica, put it in rotation, and wait for the balancer to start
@@ -293,11 +797,16 @@ impl Harness {
     /// Offer one phase of caller traffic through the balancer.
     async fn phase(&mut self, name: &str) -> PhaseTraffic {
         let before = self.ingress.state.forwards().len();
+        let requests_per_phase = self.scale.requests_per_phase;
+        let first_correlation = self.reserve_correlations(requests_per_phase);
+        let caller_key = self.fleet.caller_key().to_owned();
         self.timeline.at(name, "phase-start", "offering traffic");
         let (outcomes, elapsed) = offer(
             self.ingress.base_url.clone(),
             self.scale,
             self.client.clone(),
+            caller_key,
+            first_correlation,
         )
         .await;
         let traffic = self.settle(name, &outcomes, elapsed, before);
@@ -333,9 +842,23 @@ impl Harness {
             if let Some(revision) = outcome.revision.as_ref() {
                 *by_revision.entry(revision.clone()).or_default() += 1;
             }
+            if outcome.ok() {
+                let replica = outcome
+                    .replica
+                    .as_deref()
+                    .expect("an answered rollout request names its replica");
+                self.expect_usage(
+                    replica,
+                    outcome.correlation,
+                    if outcome.torn {
+                        "client_cancelled"
+                    } else {
+                        "ok"
+                    },
+                );
+            }
         }
         let latencies: Vec<f64> = outcomes.iter().map(|o| o.latency_ms).collect();
-        self.expected_usage += answered;
         let traffic = PhaseTraffic {
             phase: name.to_owned(),
             offered: outcomes.len() as u64,
@@ -364,62 +887,116 @@ impl Harness {
         traffic
     }
 
-    /// The mixed-version window, put to the processes rather than assumed: the
-    /// capability only the incoming revision has is asked of one replica of each
-    /// revision, at the moment both are in rotation.
+    /// The mixed-version window, put to the processes rather than assumed. The
+    /// reduced diagnostic observes a candidate-only alias. The heavy stateful
+    /// lane instead requires both binaries to serve the same immutable durable
+    /// revision: desired state is global and cannot truthfully vary by replica.
     async fn mixed_version(&mut self) -> MixedVersion {
-        let (_, previous) = self.pinned_replica(PREVIOUS);
+        let (previous_id, previous) = self.pinned_replica(PREVIOUS);
         let (next_id, next) = self.pinned_replica(NEXT);
-        let on_next = self
-            .capability(&next)
+        let next_correlation = self.next_correlation();
+        let previous_correlation = self.next_correlation();
+        let probe_alias = if self.fleet.is_stateful() {
+            alias::CHAT
+        } else {
+            NEXT_ONLY_ALIAS
+        };
+        let (on_next, _) = self
+            .capability(&next, probe_alias, next_correlation)
             .await
-            .expect("the incoming revision answered the capability probe");
-        let on_previous = self
-            .capability(&previous)
+            .expect("the incoming revision answered the mixed-version probe");
+        let (on_previous, previous_error_type) = self
+            .capability(&previous, probe_alias, previous_correlation)
             .await
-            .expect("the outgoing revision answered the capability probe");
-        // The probe that succeeded is a request like any other, so it is in the
-        // accounting; the one that was refused never reached a provider and has
-        // no usage record to expect.
+            .expect("the outgoing revision answered the mixed-version probe");
+        // Every successful probe is a request like any other and belongs in the
+        // exact usage ledger. The reduced previous-revision refusal never
+        // reaches a provider and therefore has no usage record to expect.
         if (200..300).contains(&on_next) {
-            self.expected_usage += 1;
-            *self.pinned_expectations.entry(next_id).or_default() += 1;
+            self.expect_usage(&next_id, next_correlation, "ok");
+        }
+        if (200..300).contains(&on_previous) {
+            self.expect_usage(&previous_id, previous_correlation, "ok");
         }
         let phase = self
             .traffic
             .last()
             .expect("a mixed-version phase has already run");
-        let mixed = MixedVersion {
-            previous_requests: phase.by_revision.get(PREVIOUS).copied().unwrap_or_default(),
-            next_requests: phase.by_revision.get(NEXT).copied().unwrap_or_default(),
-            exclusive_alias: NEXT_ONLY_ALIAS.to_owned(),
-            next_serves_exclusive_alias: (200..300).contains(&on_next),
-            previous_refuses_exclusive_alias: !(200..300).contains(&on_previous),
-            previous_status_for_exclusive_alias: Some(on_previous),
-        };
-        self.timeline.at(
-            "mixed-version",
-            "capability-probe",
-            format!(
+        let (mixed, kind, detail) = if self.fleet.is_stateful() {
+            let revision = self
+                .fleet
+                .desired_state_revision()
+                .expect("a heavy stateful fleet published a durable revision")
+                .to_owned();
+            let mixed = MixedVersion {
+                previous_requests: phase.by_revision.get(PREVIOUS).copied().unwrap_or_default(),
+                next_requests: phase.by_revision.get(NEXT).copied().unwrap_or_default(),
+                exclusive_alias: String::new(),
+                next_serves_exclusive_alias: false,
+                previous_refuses_exclusive_alias: false,
+                previous_status_for_exclusive_alias: None,
+                previous_error_type_for_exclusive_alias: None,
+                shared_stateful_revision: Some(revision.clone()),
+                shared_alias: Some(probe_alias.to_owned()),
+                previous_serves_shared_alias: (200..300).contains(&on_previous),
+                next_serves_shared_alias: (200..300).contains(&on_next),
+            };
+            let detail = format!(
+                "durable revision {revision} alias `{probe_alias}` answered {on_previous} on the \
+                 retained revision and {on_next} on the candidate, with {} and {} exact \
+                 by-revision requests served in the window",
+                mixed.previous_requests, mixed.next_requests
+            );
+            (mixed, "shared-revision-probe", detail)
+        } else {
+            let mixed = MixedVersion {
+                previous_requests: phase.by_revision.get(PREVIOUS).copied().unwrap_or_default(),
+                next_requests: phase.by_revision.get(NEXT).copied().unwrap_or_default(),
+                exclusive_alias: NEXT_ONLY_ALIAS.to_owned(),
+                next_serves_exclusive_alias: (200..300).contains(&on_next),
+                previous_refuses_exclusive_alias: on_previous == 404
+                    && previous_error_type.as_deref() == Some("unknown_model"),
+                previous_status_for_exclusive_alias: Some(on_previous),
+                previous_error_type_for_exclusive_alias: previous_error_type,
+                shared_stateful_revision: None,
+                shared_alias: None,
+                previous_serves_shared_alias: false,
+                next_serves_shared_alias: false,
+            };
+            let detail = format!(
                 "`{NEXT_ONLY_ALIAS}` answered {on_next} on the incoming revision and \
                  {on_previous} on the outgoing one, with {} and {} requests served in the window",
                 mixed.next_requests, mixed.previous_requests
-            ),
-        );
+            );
+            (mixed, "capability-probe", detail)
+        };
+        self.timeline.at("mixed-version", kind, detail);
         self.mixed_probe = Some(mixed.clone());
         mixed
     }
 
-    /// Ask one replica for the alias only the incoming revision serves.
-    async fn capability(&self, base_url: &str) -> Option<u16> {
-        self.client
+    /// Ask one exact replica for the mixed-version contract's selected alias.
+    async fn capability(
+        &self,
+        base_url: &str,
+        alias: &str,
+        correlation: CorrelationId,
+    ) -> Option<(u16, Option<String>)> {
+        let response = self
+            .client
             .post(format!("{base_url}/v1/chat/completions"))
-            .bearer_auth(GATEWAY_KEY)
-            .json(&body(NEXT_ONLY_ALIAS, false))
+            .bearer_auth(self.fleet.caller_key())
+            .header("traceparent", correlation.traceparent())
+            .json(&body(alias, false))
             .send()
             .await
+            .ok()?;
+        let status = response.status().as_u16();
+        let body = response.text().await.ok()?;
+        let error_type = serde_json::from_str::<Value>(&body)
             .ok()
-            .map(|response| response.status().as_u16())
+            .and_then(|value| value["error"]["type"].as_str().map(ToOwned::to_owned));
+        Some((status, error_type))
     }
 
     /// A live replica at `revision`, as the pair a pinned request needs: the id
@@ -442,19 +1019,30 @@ impl Harness {
         let base_url = self.fleet.replica(id).base_url().to_owned();
         let revision = self.fleet.replica(id).revision.label.to_owned();
 
-        let buffered = self.pin(&base_url, pinned::BUFFERED, false).await;
-        let stream = self.pin(&base_url, pinned::STREAM, true).await;
+        let buffered_correlation = self.next_correlation();
+        let stream_correlation = self.next_correlation();
+        let buffered = self
+            .pin(&base_url, pinned::BUFFERED, false, buffered_correlation)
+            .await;
+        let stream = self
+            .pin(&base_url, pinned::STREAM, true, stream_correlation)
+            .await;
         // Both are through the replica's request path and at the upstream, so
         // both will settle a usage record however the drain ends them. The
         // stream is the one the deadline cuts, so its record is a cancellation.
-        self.expected_usage += 2;
-        *self.pinned_expectations.entry(id.to_owned()).or_default() += 2;
+        self.expect_usage(id, buffered_correlation, "ok");
+        self.expect_usage(id, stream_correlation, "client_cancelled");
 
         let forwards_before = self.ingress.state.forwards().len();
+        let requests_per_phase = self.scale.requests_per_phase;
+        let first_correlation = self.reserve_correlations(requests_per_phase);
+        let caller_key = self.fleet.caller_key().to_owned();
         let traffic = tokio::spawn(offer(
             self.ingress.base_url.clone(),
             self.scale,
             self.client.clone(),
+            caller_key,
+            first_correlation,
         ));
 
         let signalled = Instant::now();
@@ -569,7 +1157,9 @@ impl Harness {
                 cut_after_signal_ms: stream.ended_after(signalled).as_millis(),
                 relayed_bytes: stream.bytes,
                 usage_status: usage_status(&drained, pinned::STREAM),
-                within_deadline: stream.ended_after(signalled) <= drained.budget,
+                within_deadline: stream.ended_after(signalled)
+                    <= self.scenario.shutdown.stream_budget()
+                        + Duration::from_millis(thresholds.max_stream_cut_observation_slack_ms),
             },
             usage_records_flushed: drained.usage_records.len() as u64,
         }
@@ -578,18 +1168,26 @@ impl Harness {
     /// Start a request pinned to one replica — past the balancer, so the drain
     /// cannot route it away — and return once the upstream has seen it, which is
     /// what makes "in flight" a fact rather than a hope.
-    async fn pin(&self, base_url: &str, alias: &str, stream: bool) -> Pinned {
+    async fn pin(
+        &self,
+        base_url: &str,
+        alias: &str,
+        stream: bool,
+        correlation: CorrelationId,
+    ) -> Pinned {
         // The exact arrival count, not the retained-request list: that list is
         // capped, so at heavy scale its length stops growing and a wait on it
         // could never be satisfied.
         let seen = self.fleet.upstream.state.received();
         let client = self.client.clone();
+        let caller_key = self.fleet.caller_key().to_owned();
         let url = format!("{base_url}/v1/chat/completions");
         let payload = body(alias, stream);
         let handle = tokio::spawn(async move {
             let response = client
                 .post(url)
-                .bearer_auth(GATEWAY_KEY)
+                .bearer_auth(caller_key)
+                .header("traceparent", correlation.traceparent())
                 .json(&payload)
                 .send()
                 .await;
@@ -650,6 +1248,7 @@ impl Settled {
 
 /// One caller request as the driver saw it.
 struct Outcome {
+    correlation: CorrelationId,
     status: Option<u16>,
     replica: Option<String>,
     revision: Option<String>,
@@ -675,11 +1274,18 @@ async fn offer(
     base_url: String,
     scale: Scale,
     client: reqwest::Client,
+    caller_key: String,
+    first_correlation: u64,
 ) -> (Vec<Outcome>, Duration) {
     let next = Arc::new(AtomicUsize::new(0));
     let started = Instant::now();
     let workers = (0..scale.workers).map(|_| {
-        let (client, base_url, next) = (client.clone(), base_url.clone(), next.clone());
+        let (client, base_url, caller_key, next) = (
+            client.clone(),
+            base_url.clone(),
+            caller_key.clone(),
+            next.clone(),
+        );
         tokio::spawn(async move {
             let mut mine = Vec::new();
             loop {
@@ -687,7 +1293,19 @@ async fn offer(
                 if index >= scale.requests_per_phase {
                     return mine;
                 }
-                mine.push(one(&client, &base_url, scale.streams(index)).await);
+                let sequence = first_correlation
+                    .checked_add(u64::try_from(index).expect("a request index fits u64"))
+                    .expect("the rollout correlation sequence does not overflow");
+                mine.push(
+                    one(
+                        &client,
+                        &base_url,
+                        &caller_key,
+                        scale.streams(index),
+                        CorrelationId::new(sequence),
+                    )
+                    .await,
+                );
             }
         })
     });
@@ -700,7 +1318,13 @@ async fn offer(
 }
 
 /// One request through the balancer, read to the last byte.
-async fn one(client: &reqwest::Client, base_url: &str, streamed: bool) -> Outcome {
+async fn one(
+    client: &reqwest::Client,
+    base_url: &str,
+    caller_key: &str,
+    streamed: bool,
+    correlation: CorrelationId,
+) -> Outcome {
     let alias = if streamed {
         alias::CHAT_SLOW
     } else {
@@ -709,12 +1333,14 @@ async fn one(client: &reqwest::Client, base_url: &str, streamed: bool) -> Outcom
     let at = Instant::now();
     let sent = client
         .post(format!("{base_url}/v1/chat/completions"))
-        .bearer_auth(GATEWAY_KEY)
+        .bearer_auth(caller_key)
+        .header("traceparent", correlation.traceparent())
         .json(&body(alias, streamed))
         .send()
         .await;
     let Ok(response) = sent else {
         return Outcome {
+            correlation,
             status: None,
             replica: None,
             revision: None,
@@ -741,6 +1367,7 @@ async fn one(client: &reqwest::Client, base_url: &str, streamed: bool) -> Outcom
         }
     }
     Outcome {
+        correlation,
         status: Some(status),
         replica,
         revision,
@@ -751,90 +1378,40 @@ async fn one(client: &reqwest::Client, base_url: &str, streamed: bool) -> Outcom
 }
 
 fn body(alias: &str, stream: bool) -> Value {
+    let prompt = match alias {
+        alias::CHAT_SLOW => SLOW_PROMPT,
+        alias::CHAT_LATE_HEADERS => BUFFERED_PROMPT,
+        alias::CHAT_STALL_AFTER_BYTES => STALLED_PROMPT,
+        _ => PROMPT,
+    };
     json!({
         "model": alias,
-        "messages": [{"role": "user", "content": PROMPT}],
+        "messages": [{"role": "user", "content": prompt}],
         "stream": stream,
     })
 }
 
-/// The rollback that must *not* be possible: a control plane a newer build has
-/// migrated is refused rather than served, and the refusal names the reason.
-///
-/// Needs a real PostgreSQL, because the fence lives in the ledger rather than in
-/// the binary; without one the artifact says the fence was not evaluated instead
-/// of implying it passed.
-async fn fence(timeline: &mut Timeline) -> Fence {
-    let Ok(dsn) = std::env::var("AXOND_TEST_POSTGRES_DSN") else {
-        let reason = "AXOND_TEST_POSTGRES_DSN is unset, so no control plane exists to migrate \
-                      past this build";
-        timeline.at("rollback", "fence-skipped", reason);
-        return Fence {
-            evaluated: false,
-            skipped_reason: Some(reason.to_owned()),
-            status: None,
-            refused: false,
-            refusal_names_newer_build: false,
-        };
-    };
-    let schema = format!(
-        "rollout_fence_{}",
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    );
-    // The claim outlives every step below, including the assertion that the
-    // control plane migrated: a fence that fails there must not leave its schema
-    // on a database every other run shares.
-    let _schema = Schema::create(&dsn, &schema).await;
-    let client = connect(&dsn).await;
-
-    let dir = scratch_dir("fence");
-    let path = write_config(&dir, "stateful.toml", &stateful_config(&schema));
-    let kek = "0".repeat(64);
-    let env = [
-        ("GW_CONTROL_PLANE_DSN", dsn.as_str()),
-        ("GW_KEK", kek.as_str()),
-        ("GW_BREAKGLASS", "fence-breakglass"),
-    ];
-    let applied = axond(&["migrate", "apply", "--config", &path], &env);
-    assert!(
-        applied.succeeded,
-        "the fence needs a migrated control plane to roll back onto:\n{}",
-        applied.output
-    );
-
-    // What a *newer* build leaves behind: a ledger entry this build has never
-    // heard of. Rolling this binary onto that database is the rollback the
-    // forward-only rule prohibits.
+async fn migration_versions(
+    client: &tokio_postgres::Client,
+    schema: &str,
+) -> Vec<MigrationVersion> {
     client
-        .batch_execute(&format!(
-            "INSERT INTO {schema}.axond_cp_schema_migration (version, name, checksum) VALUES \
-             (999, 'control_plane_0999_namespace_cap', 'sha256:{}')",
-            sha256_hex(b"a newer, namespace-cap-aware build wrote this")
-        ))
+        .query(
+            &format!(
+                "SELECT version, name, checksum FROM {schema}.axond_cp_schema_migration \
+                 ORDER BY version"
+            ),
+            &[],
+        )
         .await
-        .expect("a newer build's ledger entry is written");
-
-    let status = axond(&["migrate", "status", "--config", &path], &env);
-    let refused = !status.succeeded;
-    let names_newer = status.output.contains("newer gateway");
-    timeline.at(
-        "rollback",
-        "fence-evaluated",
-        format!(
-            "rolling this build onto a migrated control plane was {}",
-            if refused { "refused" } else { "ALLOWED" }
-        ),
-    );
-    Fence {
-        evaluated: true,
-        skipped_reason: None,
-        status: Some(status),
-        refused,
-        refusal_names_newer_build: names_newer,
-    }
+        .expect("the migration ledger is readable")
+        .into_iter()
+        .map(|row| MigrationVersion {
+            version: row.get(0),
+            name: row.get(1),
+            checksum: row.get(2),
+        })
+        .collect()
 }
 
 async fn connect(dsn: &str) -> tokio_postgres::Client {
@@ -847,49 +1424,42 @@ async fn connect(dsn: &str) -> tokio_postgres::Client {
     client
 }
 
-/// A stateful config pointed at one schema of its own. Names variables, never
-/// values: nothing here or in the artifact carries a DSN.
-fn stateful_config(schema: &str) -> String {
-    format!(
-        "mode = \"stateful\"\n\
-         [control_plane]\n\
-         dsn_env = \"GW_CONTROL_PLANE_DSN\"\n\
-         schema = \"{schema}\"\n\
-         [secret_store]\n\
-         kek_env = \"GW_KEK\"\n\
-         [[admin_breakglass]]\n\
-         env = \"GW_BREAKGLASS\"\n"
-    )
-}
-
-/// Run one operator command against the built binary and keep what an operator
+/// Run one operator command against the named binary and keep what an operator
 /// would read.
-fn axond(args: &[&str], env: &[(&str, &str)]) -> CommandRecord {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_axond"));
-    let secrets: Vec<(&str, &str)> = [
-        ("GW_INBOUND_KEY", GATEWAY_KEY),
-        // The gate resolves every reference the config makes, including the
-        // per-boot key a replica is given, so the command's environment is the
-        // one a replica would boot with.
-        (gateway::BOOT_KEY_ENV, "gate-boot-key"),
-        ("GW_FAKE_OPENAI_KEY", gateway::OPENAI_KEY),
-        ("GW_FAKE_ANTHROPIC_KEY", gateway::ANTHROPIC_KEY),
-        (gateway::OPENAI_SECONDARY_ENV, gateway::OPENAI_KEY_SECONDARY),
-        (
-            gateway::ANTHROPIC_SECONDARY_ENV,
-            gateway::ANTHROPIC_KEY_SECONDARY,
-        ),
-    ]
-    .into_iter()
-    .chain(env.iter().copied())
-    .collect();
+fn axond_at(binary: &Path, args: &[&str], env: &[(String, String)]) -> CommandRecord {
+    let mut command = Command::new(binary);
+    let mut secrets = env.to_vec();
+    if env.is_empty() {
+        // Only the reduced stateless config references generated fixture
+        // credentials. Heavy commands receive exclusively the same stateful
+        // deployment environment as their serving fleet.
+        secrets.extend(
+            [
+                ("GW_INBOUND_KEY", GATEWAY_KEY),
+                (gateway::BOOT_KEY_ENV, "gate-boot-key"),
+                ("GW_FAKE_OPENAI_KEY", gateway::OPENAI_KEY),
+                ("GW_FAKE_ANTHROPIC_KEY", gateway::ANTHROPIC_KEY),
+                (gateway::OPENAI_SECONDARY_ENV, gateway::OPENAI_KEY_SECONDARY),
+                (
+                    gateway::ANTHROPIC_SECONDARY_ENV,
+                    gateway::ANTHROPIC_KEY_SECONDARY,
+                ),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned())),
+        );
+    }
     command.args(args).env("RUST_LOG", "warn");
     for (name, value) in &secrets {
         command.env(name, value);
     }
     let output = command.output().expect("the axond binary runs");
+    let secret_refs: Vec<(&str, &str)> = secrets
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
     CommandRecord {
-        argv: std::iter::once("axond".to_owned())
+        argv: std::iter::once(binary.display().to_string())
             .chain(args.iter().map(ToString::to_string))
             .collect(),
         exit_code: output.status.code(),
@@ -900,7 +1470,7 @@ fn axond(args: &[&str], env: &[(&str, &str)]) -> CommandRecord {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ),
-            &secrets,
+            &secret_refs,
         ),
     }
     // `args` are not part of the environment, so they are recorded verbatim:
@@ -949,31 +1519,46 @@ fn scrub_urls(text: &str) -> String {
     out
 }
 
-/// The two revisions the rollout moves between, with the artifact identity of
-/// each. One binary, two configs: the artifact says so rather than implying a
-/// cross-build rollout the test did not perform.
-fn revisions(upstream: &str, shutdown: ShutdownBounds) -> Vec<RevisionMeta> {
+/// Every executable/config pair used by the rollout, named by byte digest.
+fn revisions(fleet: &Fleet, binaries: &Binaries) -> Vec<RevisionMeta> {
     let bind: SocketAddr = GATE_BIND.parse().expect("the gate address parses");
-    [Revision::previous(), Revision::next()]
-        .into_iter()
-        .map(|revision| {
-            let config = gateway::config_toml(bind, upstream, &revision.tuning(shutdown), "")
-                .replace(upstream, "http://127.0.0.1:UPSTREAM_PORT");
-            RevisionMeta {
-                label: revision.label.to_owned(),
-                binary: binary_meta(),
-                config: ConfigMeta {
-                    sha256: sha256_hex(config.as_bytes()),
-                    normalized_toml: config,
-                },
-                distinct_binary: false,
-                exclusive_aliases: match revision.label {
-                    NEXT => vec![NEXT_ONLY_ALIAS.to_owned()],
-                    _ => Vec::new(),
-                },
-            }
-        })
-        .collect()
+    let previous_binary = binary_meta_at_with_version_fallback(
+        &binaries.previous,
+        binaries
+            .retained_release
+            .as_ref()
+            .map(|release| release.expected_version.as_str()),
+    );
+    let candidate_binary = binary_meta_at(&binaries.candidate);
+    let desired_state_revision = fleet.desired_state_revision().map(ToOwned::to_owned);
+    [
+        (Revision::previous(), previous_binary.clone()),
+        (Revision::compatibility(), candidate_binary.clone()),
+        (Revision::next(), candidate_binary),
+    ]
+    .into_iter()
+    .map(|(revision, binary)| {
+        let mut config = fleet.config(bind, revision);
+        if !fleet.is_stateful() {
+            config = config.replace(&fleet.upstream.base_url, "http://127.0.0.1:UPSTREAM_PORT");
+        }
+        RevisionMeta {
+            label: revision.label.to_owned(),
+            distinct_binary: binary.sha256 != previous_binary.sha256,
+            binary,
+            config: ConfigMeta {
+                sha256: sha256_hex(config.as_bytes()),
+                normalized_toml: config,
+            },
+            desired_state_revision: desired_state_revision.clone(),
+            exclusive_aliases: match (fleet.is_stateful(), revision.label) {
+                (true, _) => Vec::new(),
+                (false, NEXT) => vec![NEXT_ONLY_ALIAS.to_owned()],
+                _ => Vec::new(),
+            },
+        }
+    })
+    .collect()
 }
 
 /// Everything the balancer and the fleet know about each replica, live or gone.
@@ -1015,112 +1600,242 @@ fn fleet_records(harness: &Harness, drains: &[DrainRecord]) -> Vec<ReplicaRecord
         .collect()
 }
 
-fn ledger(harness: &Harness, expected: u64, records: &[Value]) -> LossLedger {
+fn ledger(harness: &Harness, records: &[Value]) -> LossLedger {
     let mut by_status: BTreeMap<String, u64> = BTreeMap::new();
     for record in records {
         let status = record["status"].as_str().unwrap_or("unknown").to_owned();
         *by_status.entry(status).or_default() += 1;
     }
-    let observed = records.len() as u64;
-    let distinct: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|record| record["request_id"].as_str())
-        .collect();
-
-    // Usage is reconciled per replica, against the caller requests the balancer
-    // attempted on it. A caller request is one identity however many replicas
-    // it touched: the replica that answered it owes exactly one record, and a
-    // replica that refused it mid-drain may hold one for the work it had
-    // already begun. Because the comparison is made replica by replica, a
-    // duplicate one replica wrote cannot fill the hole another replica's lost
-    // record left — which a fleet-wide count of records would let it do.
     let callers = harness.ingress.state.callers();
-    let per_replica = reconcile(
-        &callers,
-        &harness.pinned_expectations,
-        &harness
-            .fleet
-            .usage_records_by_replica()
-            .into_iter()
-            .map(|(id, rows)| (id, rows.len() as u64))
-            .collect(),
+    let mut refusals: BTreeMap<String, u64> = BTreeMap::new();
+    for caller in &callers {
+        for replica in caller.draining_refusals() {
+            *refusals.entry(replica.to_owned()).or_default() += 1;
+        }
+    }
+    let reconciliation = reconcile(
+        &harness.expected_usage,
+        &harness.fleet.usage_records_by_replica(),
+        &refusals,
     );
-    let duplicates = per_replica.iter().map(|row| row.retry_duplicates).sum();
-    let refusals_retried = per_replica
-        .iter()
-        .map(|row| row.caller_requests_refused_while_draining)
-        .sum();
     LossLedger {
         caller_requests: callers.len() as u64,
-        usage_records_missing: per_replica.iter().map(|row| row.missing).sum(),
-        usage_records_surplus: per_replica.iter().map(|row| row.unexplained_surplus).sum(),
-        per_replica,
+        usage_records_missing: reconciliation.missing,
+        usage_records_surplus: reconciliation.unexpected,
+        usage_identity_duplicates: reconciliation.identity_duplicates,
+        usage_record_id_duplicates: reconciliation.request_id_duplicates,
+        usage_status_mismatches: reconciliation.status_mismatches,
+        usage_records_unidentified: reconciliation.unidentified,
+        expected_usage_identities: reconciliation.expected,
+        observed_usage_identities: reconciliation.observed,
+        per_replica: reconciliation.per_replica,
         offered: harness.traffic.iter().map(|phase| phase.offered).sum(),
         answered: harness.traffic.iter().map(|phase| phase.answered).sum(),
         errors: harness.traffic.iter().map(|phase| phase.errors).sum(),
         unanswered: harness.traffic.iter().map(|phase| phase.unanswered).sum(),
         torn_streams: harness.traffic.iter().map(|phase| phase.torn_streams).sum(),
         unavailable: harness.ingress.state.unavailable(),
-        usage_records_expected: expected,
-        usage_records_observed: observed,
-        usage_records_distinct: distinct.len() as u64,
-        usage_records_retry_duplicates: duplicates,
-        refusals_retried,
+        usage_records_expected: harness.expected_usage.len() as u64,
+        usage_records_observed: records.len() as u64,
+        usage_records_distinct: reconciliation.request_ids_distinct,
+        // A typed drain refusal happens outside the accepted request path and
+        // owes no usage row. It remains a routing diagnostic, never a credit
+        // that can excuse an otherwise unexpected record.
+        usage_records_retry_duplicates: 0,
+        refusals_retried: refusals.values().sum(),
         usage_by_status: by_status,
         upstream_streams_open_at_end: harness.fleet.upstream.state.open_streams(),
     }
 }
 
-/// Reconcile usage replica by replica: what each replica owes for the caller
-/// requests it answered against what it actually wrote.
+#[derive(Debug)]
+pub struct ReconciledUsage {
+    pub expected: Vec<ExpectedUsageIdentity>,
+    pub observed: Vec<ObservedUsageIdentity>,
+    pub per_replica: Vec<ReplicaUsage>,
+    pub missing: u64,
+    pub unexpected: u64,
+    pub identity_duplicates: u64,
+    pub request_id_duplicates: u64,
+    pub request_ids_distinct: u64,
+    pub status_mismatches: u64,
+    pub unidentified: u64,
+}
+
+#[derive(Default)]
+struct ReplicaReconciliation {
+    expected: u64,
+    observed: u64,
+    missing: u64,
+    unexpected: u64,
+    identity_duplicates: u64,
+    status_mismatches: u64,
+    unidentified: u64,
+}
+
+/// Reconcile exact caller traces against exact usage rows.
 ///
-/// A caller request is one identity however many replicas it was attempted on,
-/// so the replica that answered owes exactly one record for it. A replica that
-/// refused it mid-drain may also hold one — it settles the work it had already
-/// begun — and that is the only thing that entitles a replica to a record
-/// beyond what it answered. Doing this per replica is the point: a fleet-wide
-/// count lets a duplicate one replica wrote stand in for the record another
-/// replica lost, and then a loss of one and a duplicate of one reads as a clean
-/// run.
+/// The identity is `(replica, trace_id)`, and status is compared separately so
+/// a terminal-status rewrite is reported as such rather than hidden as a
+/// missing row plus a surplus row. Reconciliation is a multiset operation: an
+/// extra row with the right trace is still a duplicate, and a different trace
+/// on the same replica can never fill a missing expected trace.
 pub fn reconcile(
-    callers: &[CallerRequest],
-    pinned: &BTreeMap<String, u64>,
-    records: &BTreeMap<String, u64>,
-) -> Vec<ReplicaUsage> {
-    let mut answered: BTreeMap<&str, u64> = BTreeMap::new();
-    let mut refused: BTreeMap<&str, u64> = BTreeMap::new();
-    for caller in callers {
-        if let Some(attempt) = caller.answered_by() {
-            *answered.entry(attempt.replica.as_str()).or_default() += 1;
-        }
-        for replica in caller.draining_refusals() {
-            *refused.entry(replica).or_default() += 1;
+    expected: &[ExpectedUsageIdentity],
+    records: &BTreeMap<String, Vec<Value>>,
+    refusals: &BTreeMap<String, u64>,
+) -> ReconciledUsage {
+    let mut expected = expected.to_vec();
+    expected.sort();
+    let mut observed: Vec<ObservedUsageIdentity> = records
+        .iter()
+        .flat_map(|(replica, rows)| {
+            rows.iter().map(|record| ObservedUsageIdentity {
+                replica: replica.clone(),
+                trace_id: record["trace_id"].as_str().map(ToOwned::to_owned),
+                status: record["status"].as_str().map(ToOwned::to_owned),
+                request_id: record["request_id"].as_str().map(ToOwned::to_owned),
+            })
+        })
+        .collect();
+    observed.sort();
+
+    let mut replicas: BTreeMap<String, ReplicaReconciliation> = BTreeMap::new();
+    let mut expected_by_identity: BTreeMap<(String, String), String> = BTreeMap::new();
+    for row in &expected {
+        let metrics = replicas.entry(row.replica.clone()).or_default();
+        metrics.expected += 1;
+        let identity = (row.replica.clone(), row.trace_id.clone());
+        if expected_by_identity
+            .insert(identity, row.status.clone())
+            .is_some()
+        {
+            metrics.identity_duplicates += 1;
         }
     }
-    let ids: BTreeSet<&str> = answered
-        .keys()
-        .copied()
-        .chain(pinned.keys().map(String::as_str))
-        .chain(records.keys().map(String::as_str))
-        .collect();
-    ids.into_iter()
-        .map(|id| {
-            let owed = answered.get(id).copied().unwrap_or_default()
-                + pinned.get(id).copied().unwrap_or_default();
-            let wrote = records.get(id).copied().unwrap_or_default();
-            let refused_here = refused.get(id).copied().unwrap_or_default();
-            let over = wrote.saturating_sub(owed);
-            ReplicaUsage {
-                replica: id.to_owned(),
-                caller_requests_answered: owed,
-                usage_records: wrote,
-                caller_requests_refused_while_draining: refused_here,
-                retry_duplicates: over.min(refused_here),
-                missing: owed.saturating_sub(wrote),
-                unexplained_surplus: over.saturating_sub(refused_here),
+
+    let mut observed_by_identity: BTreeMap<(String, String), Vec<&ObservedUsageIdentity>> =
+        BTreeMap::new();
+    let mut request_ids: BTreeMap<&str, u64> = BTreeMap::new();
+    for row in &observed {
+        let metrics = replicas.entry(row.replica.clone()).or_default();
+        metrics.observed += 1;
+        let trace_and_status_identified = row.trace_id.as_deref().is_some_and(canonical_trace_id)
+            && row.status.as_deref().is_some_and(canonical_usage_status);
+        let request_id_identified = row.request_id.as_deref().is_some_and(canonical_request_id);
+        if let Some(request_id) = row.request_id.as_deref().filter(|_| request_id_identified) {
+            *request_ids.entry(request_id).or_default() += 1;
+        }
+        if !request_id_identified || !trace_and_status_identified {
+            metrics.unidentified += 1;
+        }
+        match (row.trace_id.as_deref(), row.status.as_deref()) {
+            (Some(trace_id), Some(status))
+                if canonical_trace_id(trace_id) && canonical_usage_status(status) =>
+            {
+                observed_by_identity
+                    .entry((row.replica.clone(), trace_id.to_owned()))
+                    .or_default()
+                    .push(row);
             }
+            _ => {
+                metrics.unexpected += 1;
+            }
+        }
+    }
+
+    for ((replica, trace_id), expected_status) in &expected_by_identity {
+        let metrics = replicas.entry(replica.clone()).or_default();
+        let Some(rows) = observed_by_identity.get(&(replica.clone(), trace_id.clone())) else {
+            metrics.missing += 1;
+            continue;
+        };
+        if !rows
+            .iter()
+            .any(|row| row.status.as_deref() == Some(expected_status.as_str()))
+        {
+            metrics.status_mismatches += 1;
+        }
+        let extras = rows.len().saturating_sub(1) as u64;
+        metrics.identity_duplicates += extras;
+        metrics.unexpected += extras;
+    }
+    for ((replica, trace_id), rows) in &observed_by_identity {
+        if expected_by_identity.contains_key(&(replica.clone(), trace_id.clone())) {
+            continue;
+        }
+        let metrics = replicas.entry(replica.clone()).or_default();
+        metrics.unexpected += rows.len() as u64;
+        metrics.identity_duplicates += rows.len().saturating_sub(1) as u64;
+    }
+
+    let request_id_duplicates = request_ids
+        .values()
+        .map(|count| count.saturating_sub(1))
+        .sum();
+    let per_replica = replicas
+        .into_iter()
+        .map(|(replica, metrics)| ReplicaUsage {
+            caller_requests_answered: metrics.expected,
+            usage_records: metrics.observed,
+            caller_requests_refused_while_draining: refusals
+                .get(&replica)
+                .copied()
+                .unwrap_or_default(),
+            retry_duplicates: 0,
+            missing: metrics.missing,
+            unexplained_surplus: metrics.unexpected,
+            identity_duplicates: metrics.identity_duplicates,
+            status_mismatches: metrics.status_mismatches,
+            unidentified: metrics.unidentified,
+            replica,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    ReconciledUsage {
+        missing: per_replica.iter().map(|row| row.missing).sum(),
+        unexpected: per_replica.iter().map(|row| row.unexplained_surplus).sum(),
+        identity_duplicates: per_replica.iter().map(|row| row.identity_duplicates).sum(),
+        status_mismatches: per_replica.iter().map(|row| row.status_mismatches).sum(),
+        unidentified: per_replica.iter().map(|row| row.unidentified).sum(),
+        request_id_duplicates,
+        request_ids_distinct: request_ids.len() as u64,
+        expected,
+        observed,
+        per_replica,
+    }
+}
+
+fn canonical_trace_id(trace_id: &str) -> bool {
+    trace_id.len() == 32
+        && trace_id != "00000000000000000000000000000000"
+        && trace_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_usage_status(status: &str) -> bool {
+    matches!(
+        status,
+        "ok" | "upstream_error" | "client_cancelled" | "partial" | "rejected"
+    )
+}
+
+fn canonical_request_id(request_id: &str) -> bool {
+    let Some(uuid) = request_id.strip_prefix("req_") else {
+        return false;
+    };
+    let bytes = uuid.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes[14] == b'7'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            [8, 13, 18, 23].contains(&index)
+                || byte.is_ascii_digit()
+                || (b'a'..=b'f').contains(byte)
+        })
 }
 
 /// What the rollout cost in throughput while the fleet was short a replica.
@@ -1197,11 +1912,29 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
             result.loss.usage_records_surplus as f64,
             0.0,
         ),
-        // Records are identified by `request_id`, so a repeated one is the same
-        // event billed twice rather than two requests.
+        // The trace joins the exact caller event to the exact replica. A second
+        // row under that identity is double accounting even if it minted a new
+        // billing id.
+        Verdict::at_most(
+            "duplicate_usage_trace_identities",
+            result.loss.usage_identity_duplicates as f64,
+            0.0,
+        ),
+        Verdict::at_most(
+            "usage_status_mismatches",
+            result.loss.usage_status_mismatches as f64,
+            0.0,
+        ),
+        Verdict::at_most(
+            "unidentified_usage_records",
+            result.loss.usage_records_unidentified as f64,
+            0.0,
+        ),
+        // `request_id` is the independent billing event identity. Reusing it
+        // remains a failure even when the trace ledger otherwise reconciles.
         Verdict::at_most(
             "duplicate_usage_record_ids",
-            (result.loss.usage_records_observed - result.loss.usage_records_distinct) as f64,
+            result.loss.usage_record_id_duplicates as f64,
             0.0,
         ),
         // Every drain must have been *observed* to leave rotation. A drain with
@@ -1260,16 +1993,6 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
                 .min(result.mixed_version.next_requests) as f64,
             thresholds.min_mixed_version_requests as f64,
         ),
-        // The mixed-version rule itself: during the window, the capability only
-        // the incoming revision has is served by it and refused by the other.
-        Verdict::at_most(
-            "mixed_version_capability_split",
-            f64::from(
-                !(result.mixed_version.next_serves_exclusive_alias
-                    && result.mixed_version.previous_refuses_exclusive_alias),
-            ),
-            0.0,
-        ),
         // A buffered request the replica admitted before the signal is finished
         // rather than dropped.
         Verdict::at_most(
@@ -1317,29 +2040,136 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
         ),
         Verdict::at_most(
             "migration_gate_passed",
-            f64::from(!result.migration.gate_passed),
+            f64::from(u8::from(!result.migration.gate_passed)),
             0.0,
         ),
         Verdict::at_most(
-            "compatible_rollback_serves_traffic",
-            f64::from(!result.rollback.compatible_patch_rollback.served_traffic),
+            "rollback_matches_migration_classification",
+            f64::from(u8::from(
+                if result.rollback.migrated_layout_fence.expected_refused {
+                    result.rollback.compatible_patch_rollback.performed
+                        || !result.rollback.migrated_layout_fence.refused
+                } else {
+                    !result.rollback.compatible_patch_rollback.performed
+                        || !result.rollback.compatible_patch_rollback.served_traffic
+                        || result.rollback.migrated_layout_fence.refused
+                },
+            )),
             0.0,
         ),
     ];
+    if result.scenario.tier == "heavy" {
+        let mixed = &result.mixed_version;
+        let projected_revision = result
+            .revisions
+            .iter()
+            .find(|revision| revision.label == PREVIOUS)
+            .and_then(|revision| revision.desired_state_revision.as_deref());
+        verdicts.push(Verdict::at_most(
+            "mixed_version_shared_stateful_serving",
+            f64::from(u8::from(
+                mixed.shared_stateful_revision.is_none()
+                    || mixed.shared_stateful_revision.as_deref() != projected_revision
+                    || mixed.shared_alias.as_deref() != Some(alias::CHAT)
+                    || !mixed.previous_serves_shared_alias
+                    || !mixed.next_serves_shared_alias
+                    || mixed.previous_requests == 0
+                    || mixed.next_requests == 0,
+            )),
+            0.0,
+        ));
+    } else {
+        // Reduced diagnostics keep the observable candidate-only capability
+        // split. Desired state is global in heavy stateful mode, so applying
+        // this contract there would fabricate per-replica configuration.
+        verdicts.push(Verdict::at_most(
+            "mixed_version_shared_stateful_serving",
+            f64::from(u8::from(
+                !(result.mixed_version.next_serves_exclusive_alias
+                    && result.mixed_version.previous_refuses_exclusive_alias),
+            )),
+            0.0,
+        ));
+    }
     // The fence is a gate only where it could be evaluated; an artifact from a
     // runner with no PostgreSQL says it was skipped rather than passing it.
     if result.rollback.migrated_layout_fence.evaluated {
+        let fence = &result.rollback.migrated_layout_fence;
         verdicts.push(Verdict::at_most(
-            "migrated_layout_rollback_refused",
-            f64::from(
-                !(result.rollback.migrated_layout_fence.refused
-                    && result
-                        .rollback
-                        .migrated_layout_fence
-                        .refusal_names_newer_build),
-            ),
+            "migration_fence_matches_classification",
+            f64::from(u8::from(if fence.expected_refused {
+                !(fence.cold_start_attempted
+                    && !fence.cold_start_reached_readiness
+                    && fence.cold_start_exit_code.is_some_and(|code| code != 0)
+                    && fence.refused
+                    && fence.refusal_names_newer_build)
+            } else {
+                !(fence.cold_start_attempted
+                    && fence.cold_start_reached_readiness
+                    && !fence.refused)
+            })),
             0.0,
         ));
+    }
+    if result.scenario.tier == "heavy" {
+        let binary_digests: BTreeSet<&str> = result
+            .revisions
+            .iter()
+            .map(|revision| revision.binary.sha256.as_str())
+            .collect();
+        let previous = result
+            .revisions
+            .iter()
+            .find(|revision| revision.label == PREVIOUS);
+        let compatibility = result
+            .revisions
+            .iter()
+            .find(|revision| revision.label == COMPATIBILITY);
+        let next = result
+            .revisions
+            .iter()
+            .find(|revision| revision.label == NEXT);
+        let compatibility_served = result
+            .traffic
+            .iter()
+            .find(|phase| phase.phase == "candidate-on-previous-config")
+            .and_then(|phase| phase.by_revision.get(COMPATIBILITY))
+            .is_some_and(|requests| *requests > 0);
+        let exact_phases = previous.zip(compatibility).zip(next).is_some_and(
+            |((previous, compatibility), next)| {
+                let shared_revision = previous.desired_state_revision.as_deref();
+                previous.config.sha256 == compatibility.config.sha256
+                    && compatibility.config.sha256 == next.config.sha256
+                    && previous.binary.sha256 != compatibility.binary.sha256
+                    && compatibility.binary.sha256 == next.binary.sha256
+                    && shared_revision.is_some()
+                    && compatibility.desired_state_revision.as_deref() == shared_revision
+                    && next.desired_state_revision.as_deref() == shared_revision
+                    && compatibility_served
+            },
+        );
+        verdicts.extend([
+            Verdict::at_most(
+                "heavy_rollout_is_promotable",
+                f64::from(u8::from(!result.run.promotable)),
+                0.0,
+            ),
+            Verdict::at_most(
+                "heavy_rollout_uses_two_binary_digests",
+                f64::from(u8::from(binary_digests.len() != 2)),
+                0.0,
+            ),
+            Verdict::at_most(
+                "candidate_serves_shared_stateful_revision",
+                f64::from(u8::from(!exact_phases)),
+                0.0,
+            ),
+            Verdict::at_most(
+                "migration_matrix_evaluated",
+                f64::from(u8::from(!result.migration.matrix.evaluated)),
+                0.0,
+            ),
+        ]);
     }
     verdicts
 }

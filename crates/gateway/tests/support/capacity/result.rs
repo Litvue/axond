@@ -6,7 +6,7 @@
 //! from another machine, and comparing them anyway is how a capacity claim
 //! becomes folklore.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +31,9 @@ pub struct CapacityResult {
     pub stream_lifetime_ms: Option<Percentiles>,
     pub resources: ResourceReport,
     pub occupancy: Occupancy,
+    /// Decoded OTLP evidence for the queueing profile. Absent on profiles that
+    /// intentionally boot with no queue.
+    pub queue: Option<QueueEvidence>,
     pub outcomes: Outcomes,
     pub usage_records: UsageRecords,
     pub upstream: Upstream,
@@ -104,6 +107,9 @@ pub struct ProfileEcho {
     pub tier: String,
     pub concurrency: usize,
     pub requests: usize,
+    pub max_in_flight: Option<u64>,
+    pub queue_capacity: Option<u64>,
+    pub queue_wait_ms: Option<u64>,
     pub thresholds: Thresholds,
 }
 
@@ -117,6 +123,9 @@ impl ProfileEcho {
             tier: tier.as_str().to_owned(),
             concurrency: scale.concurrency,
             requests: scale.requests,
+            max_in_flight: profile.max_in_flight,
+            queue_capacity: profile.queue_capacity,
+            queue_wait_ms: profile.queue_wait_ms,
             thresholds: profile.thresholds,
         }
     }
@@ -125,6 +134,8 @@ impl ProfileEcho {
 #[derive(Debug, Clone, Serialize)]
 pub struct RunMeta {
     pub started_at_unix_ms: u128,
+    /// Whole milliseconds, rounding a positive sub-millisecond run up to one
+    /// so a retained record cannot confuse a real run with missing duration.
     pub elapsed_ms: u128,
     /// The harness, so an artifact from an older driver is recognisable.
     pub harness: &'static str,
@@ -145,10 +156,39 @@ impl RunMeta {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
-            elapsed_ms: elapsed.as_millis(),
+            elapsed_ms: duration_millis_ceil(elapsed),
             harness,
             harness_version: env!("CARGO_PKG_VERSION"),
         }
+    }
+}
+
+/// Preserve a positive measured duration when an artifact's unit is whole
+/// milliseconds. `Duration::as_millis` truncates, which would make a real
+/// sub-millisecond run indistinguishable from a run with no elapsed time.
+pub(crate) fn duration_millis_ceil(duration: Duration) -> u128 {
+    duration.as_nanos().div_ceil(1_000_000)
+}
+
+#[cfg(test)]
+mod run_meta_tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{RunMeta, duration_millis_ceil};
+
+    #[test]
+    fn whole_millisecond_artifacts_retain_positive_sub_millisecond_durations() {
+        assert_eq!(duration_millis_ceil(Duration::ZERO), 0);
+        assert_eq!(duration_millis_ceil(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_millis_ceil(Duration::from_millis(1)), 1);
+        assert_eq!(
+            duration_millis_ceil(Duration::from_millis(1) + Duration::from_nanos(1)),
+            2
+        );
+        assert_eq!(
+            RunMeta::for_harness("test harness", UNIX_EPOCH, Duration::from_nanos(1)).elapsed_ms,
+            1
+        );
     }
 }
 
@@ -213,7 +253,7 @@ impl Environment {
                 size_bytes: std::fs::metadata(&binary)
                     .map(|m| m.len())
                     .unwrap_or_default(),
-                version: env!("CARGO_PKG_VERSION"),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
             },
             config: ConfigMeta {
                 sha256: manifest::sha256_hex(normalized.as_bytes()),
@@ -236,7 +276,7 @@ pub struct BinaryMeta {
     pub path: String,
     pub sha256: String,
     pub size_bytes: u64,
-    pub version: &'static str,
+    pub version: String,
 }
 
 /// The binary under test, named by hash. Shared with the rollout harness so two
@@ -244,13 +284,83 @@ pub struct BinaryMeta {
 /// same digest.
 pub fn binary_meta() -> BinaryMeta {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_axond"));
+    binary_meta_at(&binary)
+}
+
+/// Identify an arbitrary `axond` executable by its own bytes and reported
+/// version. A rollout may not infer the retained release's version from the
+/// candidate crate that compiled the harness.
+pub fn binary_meta_at(binary: &std::path::Path) -> BinaryMeta {
+    binary_meta_at_with_version_fallback(binary, None)
+}
+
+/// Identify an arbitrary executable, accepting a pinned external version only
+/// when a legacy binary cannot self-report it.
+///
+/// The fallback is safe only when the caller separately authenticates the
+/// bytes. The heavy rollout does that with the published archive checksum and
+/// then compares this function's binary digest with the extracted executable.
+/// Candidate binaries never receive a fallback.
+pub fn binary_meta_at_with_version_fallback(
+    binary: &std::path::Path,
+    pinned_legacy_version: Option<&str>,
+) -> BinaryMeta {
+    let version_output = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| panic!("{} --version failed to run: {error}", binary.display()));
+    let version = if version_output.status.success() {
+        let reported = String::from_utf8_lossy(&version_output.stdout);
+        reported
+            .split_whitespace()
+            .last()
+            .unwrap_or_else(|| panic!("{} --version produced no version", binary.display()))
+            .to_owned()
+    } else if let Some(version) = pinned_legacy_version {
+        version.to_owned()
+    } else {
+        panic!(
+            "{} --version failed: {}{}",
+            binary.display(),
+            String::from_utf8_lossy(&version_output.stdout),
+            String::from_utf8_lossy(&version_output.stderr),
+        );
+    };
     BinaryMeta {
         path: binary.display().to_string(),
-        sha256: manifest::sha256_file(&binary),
-        size_bytes: std::fs::metadata(&binary)
+        sha256: manifest::sha256_file(binary),
+        size_bytes: std::fs::metadata(binary)
             .map(|meta| meta.len())
             .unwrap_or_default(),
-        version: env!("CARGO_PKG_VERSION"),
+        version,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod binary_meta_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn a_checksum_pinned_legacy_binary_may_lack_version_self_report() {
+        let directory =
+            std::env::temp_dir().join(format!("axond-legacy-binary-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the test directory is writable");
+        let binary = directory.join("axond-v0.3.40");
+        std::fs::write(&binary, "#!/bin/sh\nexit 2\n").expect("the test executable is written");
+        let mut permissions = std::fs::metadata(&binary)
+            .expect("the test executable exists")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("the test executable is runnable");
+
+        let metadata = binary_meta_at_with_version_fallback(&binary, Some("0.3.40"));
+        assert_eq!(metadata.version, "0.3.40");
+        assert_eq!(metadata.path, binary.display().to_string());
+        assert_eq!(metadata.sha256.len(), 64);
+
+        std::fs::remove_dir_all(directory).expect("the test directory is removable");
     }
 }
 
@@ -329,12 +439,179 @@ impl Hardware {
 fn cpu_model() -> Option<String> {
     std::fs::read_to_string("/proc/cpuinfo")
         .ok()
-        .and_then(|info| {
-            info.lines()
-                .find_map(|line| line.strip_prefix("model name")?.split_once(':'))
-                .map(|(_, model)| model.trim().to_owned())
-        })
+        .and_then(|info| cpu_model_from(&info))
         .or_else(|| command_output("sysctl", &["-n", "machdep.cpu.brand_string"]))
+}
+
+fn cpu_model_from(info: &str) -> Option<String> {
+    let fields: Vec<(&str, &str)> = info
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
+
+    for preferred in ["model name", "Hardware"] {
+        if let Some((_, model)) = fields.iter().find(|(key, _)| *key == preferred) {
+            return Some((*model).to_owned());
+        }
+    }
+
+    // AArch64 kernels commonly omit both x86's `model name` and the older
+    // ARM `Hardware` field, especially inside virtualized Docker runtimes.
+    // Each implementer/part pair is a kernel-provided CPU identity in that
+    // format. Keep every distinct literal pair: translating values to a
+    // marketing name would make the evidence depend on an incomplete lookup
+    // table, while retaining only the first pair would hide heterogeneous ARM
+    // systems.
+    let identities = arm_cpu_identities_from(info)?;
+    Some(
+        identities
+            .into_iter()
+            .map(|(implementer, part)| format!("CPU implementer {implementer}, part {part}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+fn arm_cpu_identities_from(info: &str) -> Option<BTreeSet<(String, String)>> {
+    fn finish_record(
+        implementers: &mut Vec<String>,
+        parts: &mut Vec<String>,
+        identities: &mut BTreeSet<(String, String)>,
+    ) -> Option<()> {
+        if implementers.is_empty() && parts.is_empty() {
+            return Some(());
+        }
+        if implementers.len() != 1
+            || parts.len() != 1
+            || implementers[0].is_empty()
+            || parts[0].is_empty()
+        {
+            return None;
+        }
+        identities.insert((implementers.pop()?, parts.pop()?));
+        Some(())
+    }
+
+    let mut identities = BTreeSet::new();
+    let mut implementers = Vec::new();
+    let mut parts = Vec::new();
+
+    for line in info.lines() {
+        if line.trim().is_empty() {
+            finish_record(&mut implementers, &mut parts, &mut identities)?;
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key == "processor" {
+            finish_record(&mut implementers, &mut parts, &mut identities)?;
+        }
+        match key {
+            "CPU implementer" => implementers.push(value.to_owned()),
+            "CPU part" => parts.push(value.to_owned()),
+            _ => {}
+        }
+    }
+    finish_record(&mut implementers, &mut parts, &mut identities)?;
+    (!identities.is_empty()).then_some(identities)
+}
+
+#[cfg(test)]
+mod cpu_model_tests {
+    use super::cpu_model_from;
+
+    #[test]
+    fn prefers_a_human_model_name() {
+        let info = concat!(
+            "Hardware : Example Board\n",
+            "model name : Example CPU\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+        );
+        assert_eq!(cpu_model_from(info).as_deref(), Some("Example CPU"));
+    }
+
+    #[test]
+    fn accepts_the_older_arm_hardware_field() {
+        let info = "Hardware : Example Board\nCPU implementer : 0x41\nCPU part : 0xd03\n";
+        assert_eq!(cpu_model_from(info).as_deref(), Some("Example Board"));
+    }
+
+    #[test]
+    fn records_aarch64_implementer_and_part_when_no_model_is_exposed() {
+        let info = "processor : 0\nCPU implementer : 0x61\nCPU part : 0x000\n";
+        assert_eq!(
+            cpu_model_from(info).as_deref(),
+            Some("CPU implementer 0x61, part 0x000")
+        );
+    }
+
+    #[test]
+    fn refuses_an_incomplete_cpu_identity() {
+        assert_eq!(cpu_model_from("CPU implementer : 0x61\n"), None);
+    }
+
+    #[test]
+    fn records_all_distinct_aarch64_identities_in_lexical_order() {
+        let info = concat!(
+            "processor : 7\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+            "\n",
+            "processor : 3\n",
+            "CPU implementer : 0x41\n",
+            "CPU part : 0xD03\n",
+        );
+        assert_eq!(
+            cpu_model_from(info).as_deref(),
+            Some("CPU implementer 0x41, part 0xD03; CPU implementer 0x61, part 0x000")
+        );
+    }
+
+    #[test]
+    fn deduplicates_homogeneous_aarch64_identities_without_blank_lines() {
+        let info = concat!(
+            "processor : 0\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+            "processor : 1\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+        );
+        assert_eq!(
+            cpu_model_from(info).as_deref(),
+            Some("CPU implementer 0x61, part 0x000")
+        );
+    }
+
+    #[test]
+    fn refuses_any_incomplete_aarch64_processor_identity() {
+        let info = concat!(
+            "processor : 0\n",
+            "CPU implementer : 0x61\n",
+            "CPU part : 0x000\n",
+            "\n",
+            "processor : 1\n",
+            "CPU implementer : 0x41\n",
+        );
+        assert_eq!(cpu_model_from(info), None);
+    }
+
+    #[test]
+    fn refuses_ambiguous_aarch64_processor_identity() {
+        let info = concat!(
+            "processor : 0\n",
+            "CPU implementer : 0x61\n",
+            "CPU implementer : 0x41\n",
+            "CPU part : 0x000\n",
+        );
+        assert_eq!(cpu_model_from(info), None);
+    }
 }
 
 fn total_memory_kib() -> Option<u64> {
@@ -485,6 +762,20 @@ pub struct Occupancy {
     /// offered load, so the run measured the process rather than its own
     /// shedding.
     pub admission_max_in_flight: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueEvidence {
+    pub instrument: &'static str,
+    pub points_exported: usize,
+    pub observations: u64,
+    pub min_depth: Option<u64>,
+    pub max_depth: Option<u64>,
+    pub explicit_bounds: Vec<u64>,
+    pub bucket_counts: Vec<u64>,
+    /// Must be zero: queue depth is deliberately label-free.
+    pub attributes: usize,
+    pub exact: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

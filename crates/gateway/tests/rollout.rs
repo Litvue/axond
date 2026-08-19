@@ -16,9 +16,9 @@
 //! partial, every usage record flushed before the process exits, and a
 //! termination inside the bound an orchestrator's grace period is set from.
 //!
-//! The reduced tier runs under `cargo test`. The heavy tier is the same code and
-//! the same assertions at a scale that wants a runner to itself, behind
-//! `AXOND_ROLLOUT=1`.
+//! The reduced tier runs under `cargo test` as a non-promotable same-binary
+//! diagnostic. The heavy tier requires `AXOND_ROLLOUT=1`, a distinct retained
+//! release executable, and PostgreSQL; only it can produce qualification evidence.
 
 mod support;
 
@@ -107,6 +107,12 @@ fn the_committed_manifest_describes_a_real_rolling_deployment() {
         assert!(
             thresholds.min_mixed_version_requests >= 1,
             "{}: a rollout that never served both revisions is a restart",
+            scenario.id
+        );
+        assert!(
+            thresholds.max_stream_cut_observation_slack_ms > 0
+                && thresholds.max_stream_cut_observation_slack_ms < shutdown.flush_timeout_ms,
+            "{}: external signal observation needs a small margin that cannot consume the flush budget",
             scenario.id
         );
     }
@@ -516,41 +522,38 @@ mod artifact_redaction {
 mod usage_accounting {
     use std::collections::BTreeMap;
 
-    use super::support::rollout::ingress::{Attempt, CallerRequest};
-    use super::support::rollout::result::ReplicaUsage;
+    use serde_json::{Value, json};
+
+    use super::support::rollout::result::{ExpectedUsageIdentity, ReplicaUsage};
     use super::support::rollout::run::reconcile;
 
-    fn caller(id: u64, attempts: Vec<Attempt>) -> CallerRequest {
-        CallerRequest { id, attempts }
+    fn trace(sequence: u64) -> String {
+        format!("61786f6e642d726f{sequence:016x}")
     }
 
-    fn refused(replica: &str) -> Attempt {
-        Attempt {
+    fn expected(replica: &str, sequence: u64, status: &str) -> ExpectedUsageIdentity {
+        ExpectedUsageIdentity {
             replica: replica.to_owned(),
-            status: Some(503),
-            refused_while_draining: true,
+            trace_id: trace(sequence),
+            status: status.to_owned(),
         }
     }
 
-    fn answered(replica: &str) -> Attempt {
-        Attempt {
-            replica: replica.to_owned(),
-            status: Some(200),
-            refused_while_draining: false,
-        }
+    fn request_id(sequence: u64) -> String {
+        format!("req_00000000-0000-7000-8000-{sequence:012x}")
     }
 
-    fn dropped(replica: &str) -> Attempt {
-        Attempt {
-            replica: replica.to_owned(),
-            status: None,
-            refused_while_draining: false,
-        }
+    fn observed(sequence: u64, status: &str, request_sequence: u64) -> Value {
+        json!({
+            "trace_id": trace(sequence),
+            "status": status,
+            "request_id": request_id(request_sequence),
+        })
     }
 
-    fn records(rows: [(&str, u64); 2]) -> BTreeMap<String, u64> {
+    fn records(rows: Vec<(&str, Vec<Value>)>) -> BTreeMap<String, Vec<Value>> {
         rows.into_iter()
-            .map(|(id, count)| (id.to_owned(), count))
+            .map(|(id, records)| (id.to_owned(), records))
             .collect()
     }
 
@@ -561,103 +564,153 @@ mod usage_accounting {
             .expect("the replica is in the ledger")
     }
 
-    /// One caller request, two replicas: the draining one refused it and the
-    /// other answered. Only the answering replica owes a record, and the record
-    /// the refusing one kept for the work it had begun is a duplicate of that
-    /// caller request rather than a second answered caller.
+    /// The clean case proves identity and terminal status, not just cardinality.
     #[test]
-    fn a_refusal_retried_elsewhere_is_one_caller_request_not_two() {
-        let ledger = reconcile(
-            &[caller(0, vec![refused("previous-0"), answered("next-0")])],
-            &BTreeMap::new(),
-            &records([("previous-0", 1), ("next-0", 1)]),
-        );
-
-        assert_eq!(row(&ledger, "next-0").caller_requests_answered, 1);
-        assert_eq!(row(&ledger, "previous-0").caller_requests_answered, 0);
-        assert_eq!(row(&ledger, "previous-0").retry_duplicates, 1);
-        assert!(ledger.iter().all(|row| row.missing == 0));
-        assert!(ledger.iter().all(|row| row.unexplained_surplus == 0));
-    }
-
-    /// Two records for one caller request on the replica that answered it, with
-    /// no refusal to explain either: double accounting, and the surplus says so.
-    #[test]
-    fn a_duplicate_record_for_one_caller_request_is_surplus() {
-        let ledger = reconcile(
-            &[caller(0, vec![answered("next-0")])],
-            &BTreeMap::new(),
-            &records([("next-0", 2), ("previous-0", 0)]),
-        );
-
-        assert_eq!(row(&ledger, "next-0").unexplained_surplus, 1);
-        assert_eq!(row(&ledger, "next-0").retry_duplicates, 0);
-    }
-
-    /// The case a fleet-wide count gets wrong. One caller request was refused
-    /// and retried, so a duplicate exists and is explained; a second caller
-    /// request was answered by a different replica that lost its record. The
-    /// totals match — two callers, two records — and the loss is still reported,
-    /// because the comparison is made replica by replica.
-    #[test]
-    fn a_duplicate_on_one_replica_cannot_mask_a_loss_on_another() {
+    fn exact_trace_and_status_rows_reconcile() {
         let ledger = reconcile(
             &[
-                caller(0, vec![refused("previous-0"), answered("next-0")]),
-                caller(1, vec![answered("previous-1")]),
+                expected("next-0", 1, "ok"),
+                expected("next-0", 2, "client_cancelled"),
             ],
+            &records(vec![(
+                "next-0",
+                vec![observed(1, "ok", 1), observed(2, "client_cancelled", 2)],
+            )]),
             &BTreeMap::new(),
-            &[("previous-0", 1), ("next-0", 1), ("previous-1", 0)]
-                .into_iter()
-                .map(|(id, count)| (id.to_owned(), count))
-                .collect(),
         );
 
-        let owed: u64 = ledger.iter().map(|row| row.caller_requests_answered).sum();
-        let wrote: u64 = ledger.iter().map(|row| row.usage_records).sum();
-        assert_eq!(
-            owed, wrote,
-            "the fleet-wide totals agree, which is the trap"
-        );
-        assert_eq!(row(&ledger, "previous-1").missing, 1);
-        assert_eq!(row(&ledger, "previous-0").retry_duplicates, 1);
+        assert_eq!(ledger.missing, 0);
+        assert_eq!(ledger.unexpected, 0);
+        assert_eq!(ledger.identity_duplicates, 0);
+        assert_eq!(ledger.status_mismatches, 0);
+        assert_eq!(ledger.unidentified, 0);
     }
 
-    /// A replica that dropped the connection never reached its request path, so
-    /// it is owed nothing and entitled to nothing: a transport failure is not a
-    /// draining refusal, and cannot be spent explaining a record.
+    /// The original false pass: counts are equal on the same replica, but one
+    /// expected caller trace is absent and an unrelated trace took its place.
     #[test]
-    fn a_transport_failure_is_not_a_draining_refusal() {
+    fn same_replica_missing_and_surplus_rows_cannot_substitute() {
         let ledger = reconcile(
-            &[caller(0, vec![dropped("previous-0"), answered("next-0")])],
+            &[expected("next-0", 1, "ok"), expected("next-0", 2, "ok")],
+            &records(vec![(
+                "next-0",
+                vec![observed(1, "ok", 1), observed(3, "ok", 3)],
+            )]),
             &BTreeMap::new(),
-            &records([("previous-0", 1), ("next-0", 1)]),
         );
 
+        assert_eq!(row(&ledger.per_replica, "next-0").usage_records, 2);
         assert_eq!(
-            row(&ledger, "previous-0").caller_requests_refused_while_draining,
-            0
+            row(&ledger.per_replica, "next-0").caller_requests_answered,
+            2
         );
-        assert_eq!(row(&ledger, "previous-0").retry_duplicates, 0);
-        assert_eq!(
-            row(&ledger, "previous-0").unexplained_surplus,
-            1,
-            "a record from a replica that never answered is unexplained"
-        );
+        assert_eq!(ledger.missing, 1);
+        assert_eq!(ledger.unexpected, 1);
     }
 
-    /// Requests the harness pinned to a replica bypass the balancer, so they
-    /// have no caller identity of their own and are owed against that replica
-    /// directly.
+    /// A repeated trace is double accounting even when each row has a distinct
+    /// billing request id.
     #[test]
-    fn pinned_requests_are_owed_by_the_replica_they_were_sent_to() {
+    fn duplicate_trace_identities_are_not_hidden_by_fresh_request_ids() {
+        let ledger = reconcile(
+            &[expected("next-0", 1, "ok")],
+            &records(vec![(
+                "next-0",
+                vec![observed(1, "ok", 1), observed(1, "ok", 2)],
+            )]),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(ledger.identity_duplicates, 1);
+        assert_eq!(ledger.unexpected, 1);
+        assert_eq!(ledger.request_id_duplicates, 0);
+    }
+
+    #[test]
+    fn duplicate_billing_ids_fail_even_when_traces_are_distinct() {
+        let ledger = reconcile(
+            &[expected("next-0", 1, "ok"), expected("next-0", 2, "ok")],
+            &records(vec![(
+                "next-0",
+                vec![observed(1, "ok", 7), observed(2, "ok", 7)],
+            )]),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(ledger.identity_duplicates, 0);
+        assert_eq!(ledger.request_id_duplicates, 1);
+    }
+
+    /// A row with the right trace but the wrong terminal status is neither
+    /// silently accepted nor misreported as a cardinality loss.
+    #[test]
+    fn a_terminal_status_rewrite_is_a_mismatch() {
+        let ledger = reconcile(
+            &[expected("next-0", 1, "client_cancelled")],
+            &records(vec![("next-0", vec![observed(1, "ok", 1)])]),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(ledger.status_mismatches, 1);
+        assert_eq!(ledger.missing, 0);
+        assert_eq!(ledger.unexpected, 0);
+    }
+
+    /// A typed draining refusal is diagnostic only. It does not grant the
+    /// refusing replica a fungible record credit.
+    #[test]
+    fn a_refusal_cannot_excuse_an_unexpected_usage_row() {
         let ledger = reconcile(
             &[],
-            &[("previous-0".to_owned(), 2)].into_iter().collect(),
-            &records([("previous-0", 1), ("next-0", 0)]),
+            &records(vec![("previous-0", vec![observed(9, "rejected", 9)])]),
+            &[("previous-0".to_owned(), 1)].into_iter().collect(),
         );
 
-        assert_eq!(row(&ledger, "previous-0").caller_requests_answered, 2);
-        assert_eq!(row(&ledger, "previous-0").missing, 1);
+        assert_eq!(ledger.unexpected, 1);
+        assert_eq!(
+            row(&ledger.per_replica, "previous-0").caller_requests_refused_while_draining,
+            1
+        );
+        assert_eq!(row(&ledger.per_replica, "previous-0").retry_duplicates, 0);
+    }
+
+    #[test]
+    fn malformed_or_unidentified_rows_fail_closed() {
+        let ledger = reconcile(
+            &[expected("next-0", 1, "ok")],
+            &records(vec![(
+                "next-0",
+                vec![json!({
+                    "trace_id": "not-a-trace",
+                    "status": "ok",
+                })],
+            )]),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(ledger.missing, 1);
+        assert_eq!(ledger.unexpected, 1);
+        assert_eq!(ledger.unidentified, 1);
+    }
+
+    #[test]
+    fn malformed_billing_identity_or_status_cannot_satisfy_an_expected_trace() {
+        let ledger = reconcile(
+            &[expected("next-0", 1, "ok")],
+            &records(vec![(
+                "next-0",
+                vec![json!({
+                    "trace_id": trace(1),
+                    "status": "invented",
+                    "request_id": "req_not-a-uuid-v7",
+                })],
+            )]),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(ledger.missing, 1);
+        assert_eq!(ledger.unexpected, 1);
+        assert_eq!(ledger.unidentified, 1);
+        assert_eq!(ledger.request_ids_distinct, 0);
     }
 }

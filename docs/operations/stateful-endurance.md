@@ -121,15 +121,37 @@ against a PostgreSQL service container, and uploads the result with its time
 series plus a compact qualification record at
 `target/qualification-records/stateful-endurance-soak.toml`. The record binds
 the workload, duration provenance, verdicts, manifest, binary, and machine to
-the raw JSON artifact; it is supplemental fleet evidence for #221, while the
-five-slice #156 packet remains the reviewed promotion boundary.
+the raw JSON artifact, the complete per-incarnation JSONL sample set, and all
+four exact-ledger shard sets. Each ledger and sample claim
+retains its canonical SHA-256, file count, and byte count; promotion re-hashes
+the downloaded files rather than trusting a path label. It is
+the first-class `stateful-endurance` slice of the six-slice #156 packet, which
+remains the reviewed promotion boundary.
 
 ## What a run leaves behind
 
 `target/stateful-endurance/<tier>/<profile>.json` is the result, and
 `<profile>.replica-N.samples.jsonl` beside it is every resource sample each
 replica — including the ones that were retired and replaced — was observed to
-take, written as it went.
+take, written as it went. Fixed-width `.bin` shards under the paths named by
+`usage.request_identities`, `usage.correlations`,
+`usage.durable_identities`, and `usage.durable_outside_identities` retain the
+raw exact-set evidence without holding a twelve-hour run in memory.
+Writes keep at most 64 KiB buffered per shard group and open one shard file at
+a time. Terminal sorting is capped at 1,500,000 rows per shard (96 million rows
+per ledger); exceeding that ceiling fails the run instead of allocating with
+the offered request count.
+The compact writer refuses a missing, extra, or non-`.bin` shard and refuses a
+soak shorter than the manifest's committed duration. Promotion then parses the
+fixed-width rows independently: UUID/trace shape, shard placement, duplicates,
+expected/observed set differences, ending/status compatibility, and durable SQL
+counts must reproduce the JSON summaries and the verdict values. Matching file
+hashes alone are not sufficient.
+Promotion also parses each retained replica-incarnation sample series and
+rebuilds its sample count, RSS baseline, and the retained lower bounds for RSS,
+descriptor, socket, and CPU peaks. It then checks the separately sampled
+settled values reproduce the reported peaks and growth. A matching sample
+digest with a forged or internally inconsistent JSON summary is refused.
 
 The compact record can be generated from a downloaded soak artifact with:
 
@@ -161,8 +183,10 @@ label attribution — `fake-openai-rotated` — not material.
 
 Hard failures, asserted at both tiers:
 
-- **exactly one usage record per dispatched request** — none missing, none
-  duplicated, none carrying a status the plan cannot account for;
+- **exactly one usage record per dispatched request** — deterministic W3C trace
+  identities pair every owed caller ending to its exact row and status; no
+  missing, unrelated, duplicate, unidentified, or uncorrelated row can offset
+  another;
 - **no durable row lost outside a declared window**
   (`max_durable_usage_loss_outside_windows = 0`), where *outside* is decided by
   when the records were settled rather than by how many the processes reported
@@ -217,19 +241,21 @@ its bounded scrollback: `usage.sink_drops` records how many batches were
 dropped, how many records they held, why, and whether each fell inside the
 declared window.
 
-Which half of the loss the outage excuses is a question about *when*, so it is
-answered on the window both sides can be counted over rather than by comparing
-magnitudes. `usage.settled_outside_usage_window` is what the processes settled
-outside the outage — the driver's count, less every duplicate the run saw, since
-nothing says which side of the window a second copy arrived on.
-`usage.durable_outside_usage_window` is what the database holds outside it, by
-the `recorded_at` the gateway stamped when the record was produced rather than
-when the batch flushed. The difference is `durable_loss_outside_windows`, and it
-is gated at zero; the rest of the whole-run loss is `durable_loss_in_window`,
-which the outage accounts for. A row lost at a safe moment therefore stays a
-finding however many batches the sink reported dropping while the backend was
-gone. The edge between the two is carried one drain interval past the declared
-close, so a record the driver sees a tick late is not read as a safe-time loss.
+Which half of the loss the outage excuses is a question about *which identities
+were emitted when*. The whole-run ledger pairs every emitted identity with every
+durable identity. The outside-loss ledger pairs only identities emitted outside
+the widened outage with that same complete durable population. Its missing set
+is therefore exactly `emitted outside - durable anywhere`: a row PostgreSQL did
+store cannot become fictitious loss merely because its independent
+`recorded_at` fell on the other side of the boundary. The outside expected set
+must be a subset of the whole emitted set, and the two durable observed sets
+must be byte-for-byte equal; promotion checks both relations. The remainder of
+the whole-run missing set is `durable_loss_in_window`. An unrelated durable row
+or duplicate therefore cannot conceal a missing safe-time row. The edge is
+carried one drain interval past the declared close, so a record the driver sees
+a tick late is not read as a safe-time loss. The separate
+`durable_outside_usage_window` SQL count remains a timestamp diagnostic, not the
+proof that a particular identity was lost.
 
 Being inside the window is not by itself an excuse. `durable_loss_in_window` is
 gated against `sink_drops.records_in_usage_window` — what the processes
@@ -261,11 +287,11 @@ Fields worth knowing:
 - `faults[].gate` is what the loopback gate did — accepted, refused, cut,
   delayed — which is how a run shows the fault it declared actually met traffic.
 - `usage.distinct` is what the *workload* settled and `usage.probe_distinct`
-  what the driver's own boundary and convergence probes settled. Only the first
-  is reconciled against `usage.owed`: the probes are the harness asking, nothing
-  owed them, and counting them together would let a probe record stand in for a
-  workload record the deployment lost. Both are rejoined where the database is
-  compared, because the database holds them too.
+  what the driver's own boundary and convergence probes settled. Workload rows
+  are reconciled by exact trace identity and observed ending; probes stay outside
+  that correlation so one cannot stand in for a lost workload row. Both are
+  included in the exact emitted-to-durable request-ID sets because PostgreSQL
+  holds both.
 - `usage.durable_loss_total` is every emitted record the database never
   received, split into the part the outage explains
   (`durable_loss_in_window`) and the part it does not

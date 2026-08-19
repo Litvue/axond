@@ -24,6 +24,7 @@ use super::gate::GateCounts;
 use super::manifest::{Schedule, Slo, Stop, Termination, Tier};
 use crate::support::capacity::result::{Environment, Verdict};
 use crate::support::endurance::result::Distribution;
+use crate::support::endurance::result::{CorrelationEvidence, IdentityEvidence};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatefulEnduranceResult {
@@ -301,10 +302,22 @@ pub struct Usage {
     /// [`Self::distinct`] so a probe record cannot stand in for a workload
     /// record the deployment lost.
     pub probe_distinct: u64,
+    /// Duplicate request IDs across all emitted rows. Taken from the single
+    /// durable-expected identity set so workload/probe cross-collisions count.
     pub duplicates: u64,
     pub missing: u64,
+    /// Usage rows whose trace identity was not among the exact workload or
+    /// successful probe requests that owed a settlement.
+    pub unexpected_records: u64,
     pub unexpected_statuses: u64,
+    pub unidentified: u64,
+    pub uncorrelated: u64,
+    /// Refusal settlements. The qualification contract requires zero because
+    /// no refusal response is owed a usage row; any such row is surplus.
+    pub refusal_records: u64,
     pub by_status: BTreeMap<String, u64>,
+    pub request_identities: IdentityEvidence,
+    pub correlations: CorrelationEvidence,
     pub durable: Counts,
     /// How long the durable table took to stop growing after the load stopped.
     pub durable_lag_ms: u64,
@@ -316,14 +329,16 @@ pub struct Usage {
     /// Records emitted outside every declared fault window that never reached
     /// the database. The gate: a sink may drop a batch while its backend is
     /// gone (ADR 0009), and may not lose a record at any other time. The
-    /// difference of the two counts below, so a loss is excused by *when* it
-    /// happened rather than by how much the processes reported losing.
+    /// exact request-ID set difference outside the widened window, so a loss is
+    /// excused by *when* it happened rather than by unrelated rows preserving
+    /// the same cardinality.
     pub durable_loss_outside_windows: u64,
     /// Records emitted during the usage-backend outage that never reached the
-    /// database. Reported, not gated.
+    /// database. Gated against the bounded sink-drop evidence emitted while the
+    /// backend was unavailable.
     pub durable_loss_in_window: u64,
     /// Distinct records the processes settled outside the widened usage-outage
-    /// window, by the driver's clock, less every duplicate the run saw.
+    /// window, by the driver's clock.
     pub settled_outside_usage_window: u64,
     /// Distinct rows the database holds outside that window, by the gateway's
     /// own `recorded_at`. The other side of the same comparison.
@@ -331,10 +346,35 @@ pub struct Usage {
     /// Rows the database holds twice for one request. Documented behaviour of a
     /// retried batch, so reported rather than gated.
     pub durable_duplicate_rows: u64,
+    pub durable_unexpected_rows: u64,
+    pub durable_identities: DurableIdentityEvidence,
+    /// Exact proof of outside-window loss. The expected side is every record
+    /// emitted outside the widened outage window; the observed side is every
+    /// durable row, wherever its independently stamped `recorded_at` falls.
+    /// Therefore `missing` is exactly `emitted outside - durable anywhere`.
+    /// `unexpected` is the durable in-window population and is diagnostic, not
+    /// surplus durable data (that is gated by [`Self::durable_identities`]).
+    pub durable_outside_identities: DurableIdentityEvidence,
     /// What the processes themselves said they dropped, which is how a missing
     /// row is attributed to a declared outage rather than inferred from two
     /// clocks that disagree by a drain tick.
     pub sink_drops: SinkDrops,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DurableIdentityEvidence {
+    pub expected_rows: u64,
+    pub observed_rows: u64,
+    pub expected_distinct: u64,
+    pub observed_distinct: u64,
+    pub expected_duplicates: u64,
+    pub observed_duplicates: u64,
+    pub missing: u64,
+    pub unexpected: u64,
+    pub shards: usize,
+    pub peak_shard_rows: u64,
+    pub exact: bool,
+    pub path: String,
 }
 
 /// The fleet's own account of usage batches that never reached a sink.

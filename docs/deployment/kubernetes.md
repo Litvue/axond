@@ -316,10 +316,11 @@ tenants, or `[convergence]` cache: in this mode the control plane owns
 resources, and this Recreate Deployment has no durable per-replica volume for a
 cold-boot cache. Apply the `axond-secrets` Secret first — including
 `GW_CONTROL_PLANE_DSN`, `GW_SECRET_STORE_KEK`, and `GW_ADMIN_BREAKGLASS` — then
-apply the ConfigMap/overlay. A future StatefulSet/PVC overlay may add the
-authenticated cache, but must provision its canonical 32-byte signing key
-before the ConfigMap and keep the exact value on every replica; never put the
-key in the ConfigMap or diagnostics.
+apply the ConfigMap/overlay. The shipped
+`production-stateful-persistent` StatefulSet/PVC overlay adds the authenticated
+cache; provision its canonical 32-byte signing key before the ConfigMap and keep
+the exact value on every replica. Never put the key in the ConfigMap or
+diagnostics.
 and see [Stateful backends](./stateful-backends.md) for choosing the stores and
 [backup and recovery](../operations/backup-and-recovery.md) for what has to be
 recoverable before the fleet holds anything.
@@ -368,11 +369,12 @@ deleting it with the workload.
 This option does not change the existing
 `deploy/kubernetes/overlays/production-stateful` render. The latter remains the
 Recreate/emptyDir administrative deployment and is the current fail-closed
-path. The persistent option also keeps `OnDelete` until the main serving path
-reports valid snapshots: the current stateful process is intentionally unready,
-so an automatic rolling update would wait on a condition it cannot yet satisfy.
-Use the persistent option only when its storage class and recovery ownership
-are approved:
+path. The persistent option keeps `OnDelete` so the operator controls
+replacement of each stable ordinal and its retained RWO volume. A complete
+projected revision can report Ready and serve; an incomplete bootstrap remains
+intentionally unready. Keep replacement manual until the stateful rollout
+qualification is retained, and use the persistent option only when its storage
+class and recovery ownership are approved:
 
 ```bash
 overlay=deploy/kubernetes/overlays/production-stateful-persistent

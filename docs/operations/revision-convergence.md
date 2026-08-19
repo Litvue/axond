@@ -20,12 +20,12 @@ for the mode as a whole.
 3. A replica that sees a head it is not serving hydrates the **whole** revision,
    projects it onto its configuration, runs the same whole-graph validation boot
    runs, and resolves every secret the result needs.
-4. Once the principal-projection dependency exists, if all of that succeeds, the
-   replica swaps in the new snapshot atomically and the next request is served
-   from it.
+4. If all of that succeeds, including durable workload-principal projection,
+   the replica swaps in the new snapshot atomically and the next request is
+   served from it.
 5. Once an active snapshot exists, if any later candidate fails, the replica
-   keeps serving what it already had and reports why. In this PR's current build
-   every stateful candidate stops at the typed `unsupported` boundary above.
+   keeps serving what it already had and reports why. A bootstrap with no
+   complete revision remains unready and fails closed.
 
 When the published snapshot carries effective-dated pricing, the reconciler also
 arms a timer for `PricingSnapshot::effective().ends()`. At that boundary it
@@ -703,9 +703,6 @@ Backoff clears on the first success.
 
 ## During a control-plane outage
 
-The serving behavior described below is the future serving contract; the current
-build remains fail-closed until inbound-principal projection lands.
-
 A **new** replica normally compiles the durable head. If the control plane or
 SecretStore is unavailable, the encrypted compiled-serving sibling of the
 signed last-known-good cache can restore the last admitted snapshot instead.
@@ -714,8 +711,8 @@ references, not usable credential material.
 
 ### The signed last-known-good cache
 
-When enabled by a durable StatefulSet/PVC deployment after principal projection
-lands, every replica writes the revision it just published to a local file, and
+When enabled by the durable StatefulSet/PVC deployment, every replica writes
+the revision it just published to a local file, and
 a replica that boots while the control plane is unreachable may restore that
 file instead of failing to start. The current Recreate overlay intentionally
 does not enable this path.

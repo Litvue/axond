@@ -26,7 +26,7 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// The result-artifact schema version. Bumped when a field changes meaning, so
 /// a stored artifact is never reinterpreted under a newer contract.
-pub const RESULT_SCHEMA_VERSION: u32 = 1;
+pub const RESULT_SCHEMA_VERSION: u32 = 2;
 
 /// Overrides the soak tier's duration, for an operator dispatching a shorter
 /// run than the manifest commits to. The soak alone, for the reason the

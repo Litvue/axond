@@ -21,13 +21,11 @@ on:
     inputs:
       duration_ms:
         description: >-
-          The soak duration, in milliseconds. The default is the longest run
-          that fits a GitHub-hosted runner's six-hour execution limit; the
-          manifest's twelve-hour tier is run off CI (`just endurance`) on a
-          host without it. Shorter runs are segmented to match, so they still
-          produce the segments the trend gates need.
+          The soak duration, in milliseconds. Promotion requires at least the
+          manifest's committed twelve hours; shorter dispatches are diagnostic
+          and the qualification-record builder will refuse them.
         required: false
-        default: '18000000'
+        default: '43200000'
         type: string
   schedule:
     # The first of each month, 06:41 UTC — a weekday-agnostic slot that shares a
@@ -44,14 +42,11 @@ env:
 jobs:
   endurance:
     name: Mixed-workload endurance
-    runs-on: ubuntu-latest
-    # A GitHub-hosted runner cancels a job at six hours whatever this says, and
-    # a cancelled job uploads nothing — so a run here offers five hours and
-    # finishes inside the limit, leaving the rest for the build, the settle
-    # wait, and the upload. The manifest's twelve-hour tier is run off CI on a
-    # host without the limit; either way the artifact records the duration that
-    # was asked for and that it did not come from the manifest.
-    timeout-minutes: 350
+    runs-on: [self-hosted, linux, x64, axond-qualification]
+    # Twelve hours of offered load plus build, terminal settlement, independent
+    # promotion, and artifact upload. A six-hour hosted runner cannot produce a
+    # promotable soak and is intentionally not eligible for this job.
+    timeout-minutes: 840
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -67,21 +62,26 @@ jobs:
       # the filter still admits.
       - name: Soak the mixed workload
         run: |
-          cargo test --locked --all-features --test endurance -- \
+          cargo test --release --locked --all-features --test endurance -- \
             the_endurance_soak_tier_qualifies_and_publishes_its_evidence \
             --exact --nocapture --test-threads=1
         env:
           AXOND_ENDURANCE: '1'
-          # `inputs` is unset on the monthly schedule, which therefore takes
-          # the same five hours rather than the manifest's twelve.
-          AXOND_ENDURANCE_DURATION_MS: ${{ inputs.duration_ms || '18000000' }}
+          AXOND_ENDURANCE_DURATION_MS: ${{ inputs.duration_ms || '43200000' }}
       - name: Build the stateless endurance qualification record
         if: success()
         run: |
           python3 ops/qualification-evidence.py target/endurance/soak \
             --slice endurance --tier soak --runner github-actions \
-            --note "GitHub Actions ubuntu-latest, dispatched endurance soak" \
+            --note "GitHub Actions self-hosted qualification runner, twelve-hour endurance soak" \
             --out target/qualification-records/endurance-soak.toml
+      - name: Verify the endurance record and raw artifacts
+        if: success()
+        run: |
+          python3 ops/promote-qualification.py \
+            target/qualification-records/endurance-soak.toml \
+            --artifacts target/endurance/soak \
+            --out target/qualification-records/validated-endurance-soak.toml
       - name: Publish the result artifacts
         # Uploaded even on failure: a run that missed a threshold is the run
         # whose evidence is worth reading. The time series is uploaded with the
@@ -94,24 +94,26 @@ jobs:
           path: |
             target/endurance/**/*.json
             target/endurance/**/*.samples.jsonl
+            target/endurance/**/*.bin
           if-no-files-found: error
           retention-days: 90
       - name: Publish the endurance qualification record
-        if: always()
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qualification-record-endurance
-          path: target/qualification-records/endurance-soak.toml
-          if-no-files-found: warn
+          path: target/qualification-records/validated-endurance-soak.toml
+          if-no-files-found: error
           retention-days: 90
 
   stateful-endurance:
     name: Stateful mixed-workload endurance
-    runs-on: ubuntu-latest
-    # The same six-hour ceiling, and the same answer: the dispatched default
-    # offers five hours, and the manifest's twelve-hour tier is run off CI on a
-    # host without the limit (`just stateful-endurance`).
-    timeout-minutes: 350
+    # Provisioning contract for this label: Linux x86_64 with a running Docker
+    # Engine. GitHub creates service containers before any step can preflight
+    # them, so attaching axond-qualification without Docker is a runner
+    # configuration error, not an unevaluated soak.
+    runs-on: [self-hosted, linux, x64, axond-qualification]
+    timeout-minutes: 840
     services:
       postgres:
         image: postgres:17.6-alpine
@@ -138,12 +140,12 @@ jobs:
       # dispatched hours.
       - name: Soak the mixed stateful workload
         run: |
-          cargo test --locked --all-features --test stateful_endurance -- \
+          cargo test --release --locked --all-features --test stateful_endurance -- \
             the_stateful_endurance_soak_tier_qualifies_and_publishes_its_evidence \
             --exact --nocapture --test-threads=1
         env:
           AXOND_STATEFUL_ENDURANCE: '1'
-          AXOND_STATEFUL_ENDURANCE_DURATION_MS: ${{ inputs.duration_ms || '18000000' }}
+          AXOND_STATEFUL_ENDURANCE_DURATION_MS: ${{ inputs.duration_ms || '43200000' }}
           AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
           AXOND_TEST_REQUIRE_SERVICES: '1'
       - name: Build the stateful endurance qualification record
@@ -151,8 +153,15 @@ jobs:
         run: |
           python3 ops/qualification-evidence.py target/stateful-endurance/soak \
             --slice stateful-endurance --tier soak --runner github-actions \
-            --note "GitHub Actions ubuntu-latest, dispatched stateful endurance soak" \
+            --note "GitHub Actions self-hosted qualification runner, twelve-hour stateful endurance soak" \
             --out target/qualification-records/stateful-endurance-soak.toml
+      - name: Verify the stateful endurance record and raw artifacts
+        if: success()
+        run: |
+          python3 ops/promote-qualification.py \
+            target/qualification-records/stateful-endurance-soak.toml \
+            --artifacts target/stateful-endurance/soak \
+            --out target/qualification-records/validated-stateful-endurance-soak.toml
       - name: Publish the result artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -161,13 +170,14 @@ jobs:
           path: |
             target/stateful-endurance/**/*.json
             target/stateful-endurance/**/*.samples.jsonl
+            target/stateful-endurance/**/*.bin
           if-no-files-found: error
           retention-days: 90
       - name: Publish the stateful endurance qualification record
-        if: always()
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qualification-record-stateful-endurance
-          path: target/qualification-records/stateful-endurance-soak.toml
-          if-no-files-found: warn
+          path: target/qualification-records/validated-stateful-endurance-soak.toml
+          if-no-files-found: error
           retention-days: 90

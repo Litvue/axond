@@ -92,8 +92,9 @@ and operate it.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
 - [Administering a stateful deployment](./operations/admin-api.md) — the
-  `/admin/v1` routes and `axond admin`, their preconditions, and what a stateful
-  replica serves before revision convergence ships.
+  `/admin/v1` routes and `axond admin`, their preconditions, revision
+  convergence, and the fail-closed bootstrap state before a serving revision is
+  admitted.
 - [Stateful Kubernetes deployment runbook](./operations/stateful-deployment-runbook.md)
   — apply, migrate, verify readiness, upgrade, and roll back the shipped
   stateful overlay.

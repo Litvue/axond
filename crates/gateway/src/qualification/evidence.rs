@@ -28,9 +28,6 @@ use serde::Serialize;
 /// meaning, so an old artifact is recognisable rather than misread.
 pub(crate) const EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
-/// Where a stage's evidence lands, relative to the workspace root.
-pub(crate) const EVIDENCE_DIR: &str = "target/recovery";
-
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Artifact {
     pub(crate) schema_version: u32,
@@ -68,17 +65,6 @@ pub(crate) struct Artifact {
 }
 
 impl Artifact {
-    /// Write the artifact under `target/recovery/<scenario>.<stage>.json` and
-    /// return where it landed.
-    pub(crate) fn write(&self) -> PathBuf {
-        let dir = workspace_root().join(EVIDENCE_DIR);
-        std::fs::create_dir_all(&dir).expect("the recovery artifact directory is writable");
-        let path = dir.join(format!("{}.{}.json", self.scenario, self.stage));
-        let json = serde_json::to_string_pretty(self).expect("the evidence artifact serializes");
-        std::fs::write(&path, format!("{json}\n")).expect("the recovery artifact is writable");
-        path
-    }
-
     /// The gate verdicts this stage evaluated and failed. Empty is the passing
     /// case; a caller asserts on it rather than on the artifact as a whole, so a
     /// failure names the gate rather than printing the document.

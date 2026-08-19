@@ -23,8 +23,16 @@ pub const MANIFEST_RELATIVE: &str = "qualification/packet.toml";
 /// The operator-facing page that states the same packet in prose.
 pub const CONTRACT_RELATIVE: &str = "docs/operations/qualification.md";
 
-/// The schema this loader understands.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// The schema this loader understands. Schema 2 adds the release-candidate
+/// cohort that all six heavy records must share before closure.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const GENERIC_RECORD_SCHEMA_VERSION: u32 = 1;
+pub const CAPACITY_RECORD_SCHEMA_VERSION: u32 = 2;
+pub const ROLLOUT_RECORD_SCHEMA_VERSION: u32 = 3;
+
+pub const QUALIFICATION_CANDIDATE_VERSION: &str = "0.4.0";
+pub const ROLLOUT_PREVIOUS_VERSION: &str = "0.3.40";
+pub const PENDING_SOURCE_COMMIT: &str = "pending";
 
 /// The epic the packet reports on.
 pub const EPIC_ISSUE: u32 = 156;
@@ -33,6 +41,7 @@ pub const EPIC_ISSUE: u32 = 156;
 #[serde(deny_unknown_fields)]
 pub struct Packet {
     pub schema_version: u32,
+    pub cohort: QualificationCohort,
     #[serde(rename = "slice")]
     pub slices: Vec<Slice>,
     pub closure: Closure,
@@ -45,6 +54,17 @@ impl Packet {
             .find(|slice| slice.id == id)
             .unwrap_or_else(|| panic!("the packet is missing the {} slice", id.as_str()))
     }
+}
+
+/// The immutable candidate identity shared by the six release-qualification
+/// slices. While no candidate is frozen, `source_commit` is explicitly
+/// `pending`; a closed packet requires an exact hexadecimal Git object id.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationCohort {
+    pub id: String,
+    pub candidate_version: String,
+    pub source_commit: String,
 }
 
 /// One slice of #156: a question, whatever answers it so far, and what is left.
@@ -86,6 +106,10 @@ pub struct Slice {
     /// Retained runs, as committed evidence records.
     #[serde(default)]
     pub retained: Vec<String>,
+    /// Superseded records kept for audit history. They remain indexed and must
+    /// exist, but they cannot promote a slice or contribute to closure.
+    #[serde(default)]
+    pub historical: Vec<String>,
     /// What the slice still owes #156. Required unless it owes nothing.
     #[serde(default)]
     pub outstanding: Option<String>,
@@ -106,8 +130,13 @@ impl Slice {
             .chain(&self.heavy_lane)
             .map(String::as_str)
             .chain(self.retained.iter().map(String::as_str))
+            .chain(self.historical.iter().map(String::as_str))
             .collect()
     }
+}
+
+pub fn is_exact_git_commit(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// How far a slice got. The order is the order of the ladder, and the contract
@@ -144,15 +173,18 @@ impl Status {
 pub enum SliceId {
     Capacity,
     Endurance,
+    #[serde(rename = "stateful-endurance")]
+    StatefulEndurance,
     Recovery,
     Fault,
     Rollout,
 }
 
 impl SliceId {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Capacity,
         Self::Endurance,
+        Self::StatefulEndurance,
         Self::Recovery,
         Self::Fault,
         Self::Rollout,
@@ -162,6 +194,7 @@ impl SliceId {
         match self {
             Self::Capacity => "capacity",
             Self::Endurance => "endurance",
+            Self::StatefulEndurance => "stateful-endurance",
             Self::Recovery => "recovery",
             Self::Fault => "fault",
             Self::Rollout => "rollout",
@@ -313,6 +346,11 @@ pub struct RecordHardware {
 #[serde(deny_unknown_fields)]
 pub struct RecordProfile {
     pub id: String,
+    /// Compact capacity schema 2 binds every profile to its raw result.
+    #[serde(default)]
+    pub artifact_schema_version: Option<u32>,
+    #[serde(default)]
+    pub artifact_sha256: Option<String>,
     pub concurrency: u32,
     /// The config the process booted for this profile, which is per profile
     /// rather than per run: `mixed` boots a second credential per provider.
@@ -352,6 +390,17 @@ pub struct RecordProfile {
     /// Whether the replica served one more request after the load stopped.
     #[serde(default)]
     pub served_after_load: Option<bool>,
+    /// Exact queue-depth evidence emitted only by queue-enabled profiles.
+    #[serde(default)]
+    pub queue_observations: Option<u64>,
+    #[serde(default)]
+    pub queue_min_depth: Option<u64>,
+    #[serde(default)]
+    pub queue_max_depth: Option<u64>,
+    #[serde(default)]
+    pub queue_attributes: Option<u64>,
+    #[serde(default)]
+    pub queue_exact: Option<bool>,
     pub peak_rss_kib: u64,
     pub rss_growth_kib: u64,
     pub peak_sockets: u64,
@@ -368,6 +417,11 @@ pub struct RecordProfile {
 #[serde(deny_unknown_fields)]
 pub struct RecordObservation {
     pub id: String,
+    /// The schema of the raw artifact summarized by this row. Endurance and
+    /// rollout observations require it because their artifact contracts evolve
+    /// independently of this compact packet schema.
+    #[serde(default)]
+    pub artifact_schema_version: Option<u32>,
     pub artifact_sha256: String,
     pub elapsed_ms: u64,
     pub verdicts: u32,
@@ -382,6 +436,66 @@ pub struct RecordObservation {
     pub requested_duration_ms: Option<u64>,
     #[serde(default)]
     pub duration_source: Option<String>,
+    /// Both endurance rows bind their exact request and correlation ledgers in
+    /// addition to the raw JSON artifact. Promotion re-hashes these claims;
+    /// the packet retains them so exactness cannot be reduced to an unverified
+    /// path label after promotion.
+    #[serde(default)]
+    pub request_identities_sha256: Option<String>,
+    #[serde(default)]
+    pub request_identities_files: Option<u32>,
+    #[serde(default)]
+    pub request_identities_bytes: Option<u64>,
+    #[serde(default)]
+    pub correlations_sha256: Option<String>,
+    #[serde(default)]
+    pub correlations_files: Option<u32>,
+    #[serde(default)]
+    pub correlations_bytes: Option<u64>,
+    /// Endurance binds one resource-sample JSONL; stateful endurance binds a
+    /// non-empty set with one file per replica incarnation. Trend and bound
+    /// verdicts are reconstructed from these retained samples.
+    #[serde(default)]
+    pub samples_sha256: Option<String>,
+    #[serde(default)]
+    pub samples_files: Option<u32>,
+    #[serde(default)]
+    pub samples_bytes: Option<u64>,
+    /// Stateful endurance additionally binds durable usage identities inside
+    /// and outside the fault windows.
+    #[serde(default)]
+    pub durable_identities_sha256: Option<String>,
+    #[serde(default)]
+    pub durable_identities_files: Option<u32>,
+    #[serde(default)]
+    pub durable_identities_bytes: Option<u64>,
+    #[serde(default)]
+    pub durable_outside_identities_sha256: Option<String>,
+    #[serde(default)]
+    pub durable_outside_identities_files: Option<u32>,
+    #[serde(default)]
+    pub durable_outside_identities_bytes: Option<u64>,
+    /// Rollout schema 3 preserves both serving executable identities, the
+    /// checksum-pinned retained archive, and the shared durable serving proof
+    /// after disposable raw artifacts expire.
+    #[serde(default)]
+    pub rollout_previous_version: Option<String>,
+    #[serde(default)]
+    pub rollout_previous_binary_sha256: Option<String>,
+    #[serde(default)]
+    pub rollout_candidate_version: Option<String>,
+    #[serde(default)]
+    pub rollout_candidate_binary_sha256: Option<String>,
+    #[serde(default)]
+    pub rollout_retained_archive_sha256: Option<String>,
+    #[serde(default)]
+    pub rollout_shared_stateful_revision: Option<String>,
+    #[serde(default)]
+    pub rollout_shared_alias: Option<String>,
+    #[serde(default)]
+    pub rollout_previous_serves_shared_alias: Option<bool>,
+    #[serde(default)]
+    pub rollout_candidate_serves_shared_alias: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -390,7 +504,25 @@ pub struct RecordStage {
     /// The fully-qualified `scenario/stage` key from the recovery manifest.
     pub id: String,
     pub runner: String,
+    /// The manifest driver that produced the raw artifact. Optional only for
+    /// superseded historical records; active schema-2 evidence requires it.
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// Raw recovery artifacts are schema 2. These fields are optional so the
+    /// superseded v0.3.39 history remains readable; active evidence and closure
+    /// require both claims.
+    #[serde(default)]
+    pub artifact_schema_version: Option<u32>,
     pub artifact_sha256: String,
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
+    /// Process-backed stages bind the exact executable they launched. Shell
+    /// restore stages execute the record binary too, but retain that identity
+    /// through their lane-level executable digest instead of these fields.
+    #[serde(default)]
+    pub executed_binary_sha256: Option<String>,
+    #[serde(default)]
+    pub execution_bound: Option<bool>,
     pub elapsed_ms: u64,
     pub verdicts: u32,
     pub passed: bool,
@@ -470,6 +602,8 @@ pub struct SliceManifestStage {
     pub status: String,
     #[serde(default)]
     pub runner: Option<String>,
+    #[serde(default)]
+    pub driver: Option<String>,
 }
 
 /// Load whichever manifest a slice names, with the digest a run of it records
@@ -496,11 +630,17 @@ pub fn load_record(relative: &str) -> Record {
     let record: Record = Figment::from(Toml::file(&path))
         .extract()
         .unwrap_or_else(|e| panic!("{} is not a valid evidence record: {e}", path.display()));
+    let expected = match record.slice_id {
+        SliceId::Capacity => CAPACITY_RECORD_SCHEMA_VERSION,
+        SliceId::Rollout => ROLLOUT_RECORD_SCHEMA_VERSION,
+        _ => GENERIC_RECORD_SCHEMA_VERSION,
+    };
     assert_eq!(
         record.schema_version,
-        MANIFEST_SCHEMA_VERSION,
-        "{}: unsupported evidence record schema",
-        path.display()
+        expected,
+        "{}: unsupported {} evidence record schema",
+        path.display(),
+        record.slice_id.as_str()
     );
     record
 }

@@ -184,12 +184,13 @@ the authority, and nothing about them changes if you never set `mode`. The
 opt-in, Postgres-backed control plane accepted in
 [ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) is partly
 built: a stateful replica boots, applies no schema of its own, and serves
-[`/admin/v1`](./operations/admin-api.md). The current production projection
-does not yet provide inbound caller principals, so the replica fails `/readyz`
-and remains fail-closed: anonymous inference is `401 unauthorized`, while an
-already authenticated caller reaches the typed `503 inference_unavailable`
-convergence refusal. It serves no inference traffic yet, and this wiring slice
-does not claim outage serving. Its deployment shape, and the operator commands
+[`/admin/v1`](./operations/admin-api.md). Before any complete revision has been
+published, the replica fails `/readyz` and remains fail-closed: anonymous
+inference is `401 unauthorized`, while an already authenticated bootstrap
+caller reaches the typed `503 inference_unavailable` convergence refusal. A
+complete revision projects recoverable workload principals with its tenancy,
+providers, credentials, models, aliases, and pricing, then publishes that whole
+serving snapshot atomically. Its deployment shape, and the operator commands
 that prepare its schema, are in
 [Kubernetes › Stateful mode](./deployment/kubernetes.md#stateful-mode).
 

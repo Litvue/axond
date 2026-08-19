@@ -210,10 +210,9 @@ pub struct Forward {
 }
 
 /// One attempt inside a caller request: the replica the balancer handed it to,
-/// and how that ended. A refusal the replica *answered* is the only kind that
-/// can have reached its request path, and therefore the only kind that can
-/// leave a usage record behind for a caller request another replica went on to
-/// answer.
+/// and how that ended. A typed draining refusal is recorded for routing
+/// diagnostics, but admission rejects it before the accepted request path and
+/// it therefore owes no usage row.
 #[derive(Debug, Clone, Serialize)]
 pub struct Attempt {
     pub replica: String,
@@ -222,9 +221,8 @@ pub struct Attempt {
 }
 
 /// One caller request, by the identity the balancer gave it. This — not the
-/// `request_id` a replica mints per event — is what usage is accounted by: a
-/// caller request that two replicas both wrote a record for is one caller
-/// request with a duplicate, not two answered callers.
+/// `request_id` a replica mints per event — is what lets the ingress explain
+/// retries and availability independently of the exact trace ledger.
 #[derive(Debug, Clone, Serialize)]
 pub struct CallerRequest {
     pub id: u64,
@@ -239,8 +237,8 @@ impl CallerRequest {
             .filter(|attempt| attempt.status.is_some_and(|status| status != 503))
     }
 
-    /// The replicas that refused it mid-drain and may therefore hold a record
-    /// for work they had already begun.
+    /// The replicas that refused it after admission closed. These are routing
+    /// diagnostics only; they do not earn accounting credit.
     pub fn draining_refusals(&self) -> impl Iterator<Item = &str> {
         self.attempts
             .iter()

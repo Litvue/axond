@@ -6,21 +6,25 @@ pipeline.
 
 ## Release order
 
-1. Resolve the immutable tag/version/commit.
-2. Require the tagged commit's `CI Success` aggregate.
-3. Build six binary targets with checksums, SPDX SBOMs, and provenance/SBOM
+1. Require the current `main` commit's exact `CI Success` aggregate before
+   release-please may maintain its PR or create a tag and GitHub release.
+2. Resolve the immutable tag/version/commit. On a repair dispatch this is the
+   requested tag's commit, not the workflow definition's `main` commit.
+3. Require that resolved commit's exact `CI Success` aggregate before any
+   archive, OCI, signing, attestation, release upload, or registry publication.
+4. Build six binary targets with checksums, SPDX SBOMs, and provenance/SBOM
    attestations, each Linux archive booted through the Tier 0 gate on a runner
    of its own architecture.
-4. Build and publish the `linux/amd64` and `linux/arm64` images, each on a native
+5. Build and publish the `linux/amd64` and `linux/arm64` images, each on a native
    runner, under their `<version>-<arch>` and `sha-<short>-<arch>` tags.
-5. Smoke each published single-platform image before signing it.
-6. Generate image SBOM/provenance attestations, sign the digest keylessly, and
+6. Smoke each published single-platform image before signing it.
+7. Generate image SBOM/provenance attestations, sign the digest keylessly, and
    verify signature plus attestations, per architecture.
-7. Join the signed child digests into a multi-architecture index, staged under
+8. Join the signed child digests into a multi-architecture index, staged under
    `sha-<short>-index`, and assert every descriptor in it is a supported platform
    child (or an attestation manifest for one).
-8. Pull that index digest on each architecture and smoke it natively.
-9. Promote the smoked index (`INDEX_MODE=promote`, which requires the smoked
+9. Pull that index digest on each architecture and smoke it natively.
+10. Promote the smoked index (`INDEX_MODE=promote`, which requires the smoked
    digest and refuses an empty one — staging cannot apply these tags at all):
    assert that digest still holds exactly the release children, retag *that
    digest* as `<version>` and `sha-<short>` — nothing is reassembled, so no check
@@ -28,8 +32,8 @@ pipeline.
    attest its provenance, verify both, and attach it to the release as
    `axond-image-<version>.digest`. SBOM attestations and SPDX assets stay
    per-architecture, on the children.
-10. Require every artifact lane.
-11. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.
+11. Require every artifact lane.
+12. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.
 
 crates.io is last because a published version cannot be replaced. The publish
 script is idempotent: an existing aligned package is skipped, and a partial

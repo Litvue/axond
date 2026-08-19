@@ -1,12 +1,14 @@
 # The committed rollout manifest: every input the rollout harness reads.
 #
 # A run is reproducible from this file plus the committed fixtures and the
-# binary the workspace builds — the driver records the hash of all three in each
-# result artifact (see docs/operations/rollout.md and ADR 0041).
+# retained release and candidate binaries — the driver records both executable
+# hashes and every config hash in each result artifact (see the rollout runbook
+# and ADR 0041).
 #
 # Each scenario ships two scales. `reduced` runs inside `cargo test` on every
 # change; `heavy` is the same code and the same assertions with more traffic per
-# phase, and only runs from the `capacity` workflow.
+# phase. Only the dedicated Rollout workflow can promote it because that lane
+# supplies a checksum-verified retained release and PostgreSQL migration matrix.
 #
 # `thresholds` are the hard failures. Like the capacity manifest they are
 # restricted to properties that do not move with the machine — where a request
@@ -71,6 +73,11 @@ max_replacement_admission_ms = 30000
 # Allowed over drain_grace + deadline + flush_timeout before a bounded
 # termination is not bounded.
 max_drain_exit_slack_ms = 5000
+# The harness starts its clock immediately before delivering SIGTERM, while the
+# gateway starts the deadline after the signal is observed. Allow only this
+# small external-observation margin; it is not added to the gateway's configured
+# request deadline or to the orchestrator's termination budget.
+max_stream_cut_observation_slack_ms = 250
 # The rollout must actually be mixed-version: both revisions serving caller
 # traffic in the same phase, at least this many requests each.
 min_mixed_version_requests = 1

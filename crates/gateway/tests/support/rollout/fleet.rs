@@ -4,15 +4,12 @@
 //! Two things here are worth being explicit about.
 //!
 //! **What a "revision" is.** A rollout is only interesting if the two builds
-//! differ in a way a caller can observe, and a test cannot build a second binary
-//! from a second commit. So a revision is the pair (binary, config) the process
-//! was started from, and the *next* revision differs by a capability the
-//! previous one does not have: an alias only it serves. That is exactly the
-//! shape of the mixed-version rule Axond documents — during a rollout a caller
-//! may only rely on what both revisions have — and it makes "which revision
-//! answered?" a question the harness can put to the process rather than to its
-//! own bookkeeping. Both revisions' binary and config hashes are recorded, so an
-//! artifact never claims two builds when it ran one.
+//! differ in a way a caller can observe. Heavy qualification supplies separate
+//! retained and candidate executables but gives both the same stateful bootstrap
+//! and immutable desired-state revision; exact response attribution proves both
+//! serve it. The reduced diagnostic keeps a candidate-only alias as its cheap
+//! observable split. Every binary, config, and durable revision hash is
+//! recorded, so an artifact never claims two builds when it ran one.
 //!
 //! **Why usage records are harvested at exit.** A drained replica's process is
 //! gone by the time the run ends, and its records are the ones most likely to be
@@ -20,6 +17,7 @@
 //! with the fleet, so the loss ledger covers replicas that no longer exist.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -28,14 +26,17 @@ use crate::support::gateway::{Axond, alias};
 use crate::support::upstream::{FakeUpstream, target};
 
 use super::manifest::ShutdownBounds;
+use super::stateful::{
+    ColdStartAttempt, Deployment as StatefulDeployment, MigrationTarget, Process as StatefulProcess,
+};
 
 /// The revision labels an artifact reports.
 pub const PREVIOUS: &str = "previous";
+pub const COMPATIBILITY: &str = "candidate-previous-config";
 pub const NEXT: &str = "next";
 
-/// An alias only the next revision serves. A caller that uses it during a
-/// mixed-version window gets an error from whichever replica has not been
-/// replaced yet, which is the documented rule made observable.
+/// The reduced stateless diagnostic's next-only alias. Stateful desired state
+/// is global, so the heavy lane never publishes or probes this split.
 pub const NEXT_ONLY_ALIAS: &str = "chat-next-only";
 
 /// How long a retiring replica's output pipe is given to reach EOF once the
@@ -73,7 +74,16 @@ impl Revision {
         Self { label: NEXT }
     }
 
-    /// The config this revision adds on top of the shared bounds.
+    /// The candidate executable reading the same bootstrap and desired revision
+    /// as the retained fleet before it enters the replacement sequence.
+    pub const fn compatibility() -> Self {
+        Self {
+            label: COMPATIBILITY,
+        }
+    }
+
+    /// The stateless diagnostic config this revision adds on top of the shared
+    /// bounds. Stateful deployment bypasses this candidate-only model.
     pub fn tuning(self, shutdown: ShutdownBounds) -> String {
         let mut tuning = format!("{TUNING}{}", shutdown.toml());
         if self.label == NEXT {
@@ -91,16 +101,69 @@ impl Revision {
     }
 }
 
+/// The two launch paths share one fleet contract. Reduced diagnostics keep the
+/// established generated stateless config; heavy qualification uses a config
+/// containing only bootstrap references and projects all serving state from
+/// Postgres.
+pub enum Process {
+    Stateless(Axond),
+    Stateful(StatefulProcess),
+}
+
+impl Process {
+    fn base_url(&self) -> &str {
+        match self {
+            Self::Stateless(process) => &process.base_url,
+            Self::Stateful(process) => &process.base_url,
+        }
+    }
+
+    pub fn usage_records(&self) -> Vec<Value> {
+        match self {
+            Self::Stateless(process) => process.usage_records(),
+            Self::Stateful(process) => process.usage_records(),
+        }
+    }
+
+    fn terminate(&self) {
+        match self {
+            Self::Stateless(process) => process.terminate(),
+            Self::Stateful(process) => process.terminate(),
+        }
+    }
+
+    async fn await_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        match self {
+            Self::Stateless(process) => process.await_exit(within).await,
+            Self::Stateful(process) => process.await_exit(within).await,
+        }
+    }
+
+    async fn settle_output(&self, within: Duration) {
+        match self {
+            Self::Stateless(process) => process.settle_output(within).await,
+            Self::Stateful(process) => process.settle_output(within).await,
+        }
+    }
+
+    fn output(&self) -> String {
+        match self {
+            Self::Stateless(process) => process.output(),
+            Self::Stateful(process) => process.output(),
+        }
+    }
+}
+
 /// One running replica.
 pub struct Replica {
     pub id: String,
     pub revision: Revision,
-    pub process: Axond,
+    pub process: Process,
 }
 
 impl Replica {
     pub fn base_url(&self) -> &str {
-        &self.process.base_url
+        self.process.base_url()
     }
 }
 
@@ -115,19 +178,93 @@ pub struct Retired {
 pub struct Fleet {
     pub upstream: FakeUpstream,
     shutdown: ShutdownBounds,
+    previous_binary: PathBuf,
+    candidate_binary: PathBuf,
     replicas: Vec<Replica>,
     retired: Vec<Retired>,
+    stateful: Option<StatefulDeployment>,
     started: usize,
 }
 
 impl Fleet {
-    pub async fn start(shutdown: ShutdownBounds) -> Self {
+    pub async fn start(
+        shutdown: ShutdownBounds,
+        previous_binary: &Path,
+        candidate_binary: &Path,
+        stateful: bool,
+    ) -> Self {
+        let upstream = FakeUpstream::start().await;
+        let stateful = if stateful {
+            Some(StatefulDeployment::create(&upstream.base_url).await)
+        } else {
+            None
+        };
         Self {
-            upstream: FakeUpstream::start().await,
+            upstream,
             shutdown,
+            previous_binary: previous_binary.to_owned(),
+            candidate_binary: candidate_binary.to_owned(),
             replicas: Vec::new(),
             retired: Vec::new(),
+            stateful,
             started: 0,
+        }
+    }
+
+    pub fn is_stateful(&self) -> bool {
+        self.stateful.is_some()
+    }
+
+    pub fn config(&self, bind: std::net::SocketAddr, revision: Revision) -> String {
+        match &self.stateful {
+            Some(deployment) => deployment.config(bind, self.shutdown),
+            None => crate::support::gateway::config_toml(
+                bind,
+                &self.upstream.base_url,
+                &revision.tuning(self.shutdown),
+                "",
+            ),
+        }
+    }
+
+    pub fn migration_target(&self) -> Option<MigrationTarget> {
+        self.stateful
+            .as_ref()
+            .map(StatefulDeployment::migration_target)
+    }
+
+    pub async fn prepare_stateful(&mut self) {
+        if let Some(deployment) = self.stateful.as_mut() {
+            deployment
+                .prepare(&self.previous_binary, self.shutdown)
+                .await;
+        }
+    }
+
+    pub fn desired_state_revision(&self) -> Option<&str> {
+        self.stateful
+            .as_ref()
+            .and_then(StatefulDeployment::revision)
+    }
+
+    /// The token every caller-side request must use. Stateful replicas only
+    /// accept the durable principal projected into their shared revision;
+    /// reduced stateless replicas retain the generated fixture key.
+    pub fn caller_key(&self) -> &str {
+        self.stateful.as_ref().map_or(
+            crate::support::gateway::GATEWAY_KEY,
+            StatefulDeployment::workload_key,
+        )
+    }
+
+    pub async fn previous_cold_start(&self) -> Option<ColdStartAttempt> {
+        match &self.stateful {
+            Some(deployment) => Some(
+                deployment
+                    .cold_start_attempt(&self.previous_binary, self.shutdown)
+                    .await,
+            ),
+            None => None,
         }
     }
 
@@ -137,8 +274,24 @@ impl Fleet {
     pub async fn admit(&mut self, revision: Revision) -> &Replica {
         let id = format!("{}-{}", revision.label, self.started);
         self.started += 1;
-        let process =
-            Axond::start_with(&self.upstream.base_url, &revision.tuning(self.shutdown)).await;
+        let binary = if revision.label == PREVIOUS {
+            &self.previous_binary
+        } else {
+            &self.candidate_binary
+        };
+        let process = match &self.stateful {
+            Some(deployment) => {
+                Process::Stateful(deployment.start_replica(binary, self.shutdown).await)
+            }
+            None => Process::Stateless(
+                Axond::start_with_binary(
+                    &self.upstream.base_url,
+                    &revision.tuning(self.shutdown),
+                    binary,
+                )
+                .await,
+            ),
+        };
         self.replicas.push(Replica {
             id,
             revision,
@@ -229,10 +382,9 @@ impl Fleet {
             .collect()
     }
 
-    /// The same records, kept under the replica that wrote them. Usage is
-    /// reconciled per replica, because a caller request is attempted on a
-    /// specific replica: a surplus one replica wrote for a refusal must not be
-    /// allowed to fill the hole another replica's lost record left.
+    /// The same records, kept under the replica that wrote them. Replica is one
+    /// component of the exact correlation identity, so neither a row from
+    /// another replica nor an unrelated row on this replica can fill a hole.
     pub fn usage_records_by_replica(&self) -> BTreeMap<String, Vec<Value>> {
         self.replicas
             .iter()
@@ -243,20 +395,6 @@ impl Fleet {
                     .map(|retired| (retired.id.clone(), retired.usage_records.clone())),
             )
             .collect()
-    }
-
-    /// Wait until the fleet has flushed at least `count` usage records, or the
-    /// deadline passes. Settlement is detached from the request, so a record can
-    /// land just after the caller's last byte.
-    pub async fn await_usage_records(&self, count: usize, within: Duration) -> Vec<Value> {
-        let deadline = std::time::Instant::now() + within;
-        loop {
-            let records = self.usage_records();
-            if records.len() >= count || std::time::Instant::now() >= deadline {
-                return records;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
     }
 
     pub fn retired(&self) -> &[Retired] {

@@ -276,6 +276,15 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
         }
     }
 
+    // Backend rows have already sent a priming request and recovery rows have
+    // also sent an outage probe. Usage settlement is detached, so either row
+    // may arrive after the measured request. Attribution uses the millisecond
+    // carried by each request's UUIDv7; cross one clock tick here so an earlier
+    // request can never share the measured request's inclusive mint boundary.
+    if backend.is_some() {
+        advance_request_identity_fence(unix_ms()).await;
+    }
+
     // Everything below is attributed to the measured request alone: a backend
     // row has already sent a priming request and possibly an outage probe, and
     // their records and dispatches are not this row's. Settlement is detached
@@ -1384,4 +1393,15 @@ fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .expect("a clock after 1970")
         .as_millis()
+}
+
+async fn advance_request_identity_fence(fence_unix_ms: u128) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while unix_ms() <= fence_unix_ms {
+        assert!(
+            Instant::now() < deadline,
+            "the system clock did not advance past the request-identity fence"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
