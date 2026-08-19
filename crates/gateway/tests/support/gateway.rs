@@ -42,7 +42,8 @@ pub const ANTHROPIC_SECONDARY_ENV: &str = "GW_FAKE_ANTHROPIC_KEY_SECONDARY";
 
 /// Caller-facing aliases the test config exposes.
 pub mod alias {
-    pub const CHAT: &str = "chat-golden";
+    /// The rollout evidence contract requires this shared durable alias verbatim.
+    pub const CHAT: &str = "chat";
     pub const CHAT_NO_HEADERS: &str = "chat-no-headers";
     pub const CHAT_LATE_HEADERS: &str = "chat-late-headers";
     pub const CHAT_SLOW_BODY: &str = "chat-slow-body";

@@ -534,6 +534,16 @@ fn rollout_raw_and_compact_contracts_are_both_schema_four() {
 }
 
 #[test]
+fn rollout_harness_uses_the_packet_shared_alias() {
+    let observation = generated_rollout_observation_fixture(Some(ROLLOUT_RESULT_SCHEMA_VERSION));
+    assert_eq!(support::gateway::alias::CHAT, "chat");
+    assert_eq!(
+        observation.rollout_shared_alias.as_deref(),
+        Some(support::gateway::alias::CHAT),
+    );
+}
+
+#[test]
 fn rollout_observations_require_complete_shared_stateful_serving_proof() {
     let current = generated_rollout_observation_fixture(Some(ROLLOUT_RESULT_SCHEMA_VERSION));
 
