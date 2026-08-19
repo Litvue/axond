@@ -568,8 +568,10 @@ pub struct MigrationEvidence {
     pub status: CommandRecord,
     /// Whether the rollout was allowed to proceed on this evidence.
     pub gate_passed: bool,
-    /// Absent Postgres, a stateless install has no schema to migrate and says so
-    /// rather than skipping the check.
+    /// Human-readable, redacted description of the control-plane topology.
+    /// Machine verification belongs to the digest-bound bootstrap configs and
+    /// the structured migration matrix below; this prose is not a discriminator.
+    /// Absent Postgres, a stateless install has no schema to migrate and says so.
     pub control_plane: String,
     /// Commands and ledger versions from a real previous-to-candidate schema
     /// transition. Heavy qualification requires this to be evaluated.

@@ -1748,6 +1748,7 @@ def validate_raw_rollout(
         candidate.get("binary", {}).get("sha256"),
         f"{label}: candidate binary digest",
     )
+    control_plane_identities: set[tuple[str, str]] = set()
     for revision_label, revision in by_label.items():
         config = revision.get("config", {})
         normalized = config.get("normalized_toml")
@@ -1758,6 +1759,44 @@ def validate_raw_rollout(
             != config.get("sha256")
         ):
             fail(f"{label}: revision {revision_label!r} config digest is unbound")
+        try:
+            bootstrap = tomllib.loads(normalized)
+        except tomllib.TOMLDecodeError as error:
+            fail(f"{label}: revision {revision_label!r} config is invalid TOML: {error}")
+        control_plane = bootstrap.get("control_plane")
+        secret_store = bootstrap.get("secret_store")
+        catalog = bootstrap.get("catalog")
+        if (
+            bootstrap.get("mode") != "stateful"
+            or not isinstance(control_plane, dict)
+            or not isinstance(secret_store, dict)
+            or not isinstance(catalog, dict)
+        ):
+            fail(
+                f"{label}: revision {revision_label!r} is not a complete stateful "
+                "PostgreSQL bootstrap"
+            )
+        dsn_env = control_plane.get("dsn_env")
+        schema = control_plane.get("schema")
+        if (
+            not isinstance(dsn_env, str)
+            or not dsn_env.strip()
+            or dsn_env != dsn_env.strip()
+            or not isinstance(schema, str)
+            or not schema.strip()
+            or schema != schema.strip()
+            or secret_store.get("backend") != "postgres"
+            or secret_store.get("schema") != schema
+            or catalog.get("store") != "postgres"
+            or catalog.get("schema") != schema
+        ):
+            fail(
+                f"{label}: revision {revision_label!r} does not bind its control "
+                "plane, secret store, and catalogue to one PostgreSQL schema"
+            )
+        control_plane_identities.add((dsn_env, schema))
+    if len(control_plane_identities) != 1:
+        fail(f"{label}: rollout revisions do not share one PostgreSQL control plane")
     if any(revision.get("exclusive_aliases") != [] for revision in revisions):
         fail(f"{label}: stateful rollout fabricated revision-exclusive aliases")
     compatibility_traffic = [
@@ -2699,14 +2738,15 @@ def validate_raw_rollout(
     status = migration.get("status")
     preflight = command_record(preflight, "preflight")
     status = command_record(status, "status")
+    control_plane_description = migration.get("control_plane")
     if (
         not isinstance(preflight, dict)
         or not isinstance(status, dict)
         or preflight.get("succeeded") is not True
         or status.get("succeeded") is not True
         or migration.get("gate_passed") is not True
-        or migration.get("control_plane")
-        != "real PostgreSQL previous-to-candidate migration matrix"
+        or not isinstance(control_plane_description, str)
+        or not control_plane_description.strip()
     ):
         fail(f"{label}: rollout deployment gate did not pass against PostgreSQL")
     matrix = migration.get("matrix", {})
@@ -5574,7 +5614,20 @@ def self_test() -> int:
     rollout_scale = rollout_scenario["heavy"]
     rollout_shutdown = rollout_scenario["shutdown"]
     rollout_thresholds = rollout_scenario["thresholds"]
-    previous_config = "previous config\n"
+    previous_config = """\
+mode = "stateful"
+[control_plane]
+dsn_env = "GW_ROLLOUT_CONTROL_PLANE_DSN"
+schema = "axond_rollout_self_test"
+[secret_store]
+backend = "postgres"
+schema = "axond_rollout_self_test"
+[catalog]
+source = "seed"
+store = "postgres"
+schema = "axond_rollout_self_test"
+bootstrap = "seed"
+"""
     revision_by_replica = {
         "compat-0": "candidate-previous-config",
         "next-0": "next",
@@ -5957,7 +6010,10 @@ def self_test() -> int:
             "preflight": copy.deepcopy(command_passed),
             "status": copy.deepcopy(command_passed),
             "gate_passed": True,
-            "control_plane": "real PostgreSQL previous-to-candidate migration matrix",
+            "control_plane": (
+                "one real PostgreSQL schema (axond_rollout_self_test) supplied "
+                "migrations, desired state, and the serving fleet"
+            ),
             "matrix": {
                 "evaluated": True,
                 "skipped_reason": None,
@@ -6047,6 +6103,119 @@ def self_test() -> int:
     validate_raw_rollout(
         rollout_result, "rollout self-test", rollout_record, rollout_row
     )
+    descriptive_control_plane = copy.deepcopy(rollout_result)
+    descriptive_control_plane["migration"]["control_plane"] = (
+        "redacted PostgreSQL topology description"
+    )
+    validate_raw_rollout(
+        descriptive_control_plane,
+        "descriptive control-plane prose self-test",
+        rollout_record,
+        rollout_row,
+    )
+    missing_control_plane_description = copy.deepcopy(rollout_result)
+    missing_control_plane_description["migration"]["control_plane"] = ""
+    expect_refusal(
+        "missing rollout control-plane description",
+        lambda: validate_raw_rollout(
+            missing_control_plane_description,
+            "missing control-plane description self-test",
+            rollout_record,
+            rollout_row,
+        ),
+    )
+
+    def replace_rollout_configs(candidate: dict[str, Any], normalized: str) -> None:
+        digest = hashlib.sha256(normalized.encode()).hexdigest()
+        for revision in candidate["revisions"]:
+            revision["config"] = {
+                "sha256": digest,
+                "normalized_toml": normalized,
+            }
+
+    invalid_bootstraps = (
+        (
+            "stateless rollout bootstrap",
+            previous_config.replace('mode = "stateful"', 'mode = "stateless"'),
+        ),
+        (
+            "missing rollout control-plane reference",
+            previous_config.replace(
+                'dsn_env = "GW_ROLLOUT_CONTROL_PLANE_DSN"', 'dsn_env = ""'
+            ),
+        ),
+        (
+            "mismatched rollout control-plane schema",
+            previous_config.replace(
+                'schema = "axond_rollout_self_test"',
+                'schema = "axond_rollout_other"',
+                1,
+            ),
+        ),
+        (
+            "non-PostgreSQL rollout secret store",
+            previous_config.replace(
+                '[secret_store]\nbackend = "postgres"',
+                '[secret_store]\nbackend = "memory"',
+            ),
+        ),
+        (
+            "non-PostgreSQL rollout catalogue",
+            previous_config.replace(
+                '[catalog]\nsource = "seed"\nstore = "postgres"',
+                '[catalog]\nsource = "seed"\nstore = "memory"',
+            ),
+        ),
+    )
+    for name, invalid_config in invalid_bootstraps:
+        invalid = copy.deepcopy(rollout_result)
+        replace_rollout_configs(invalid, invalid_config)
+        expect_refusal(
+            name,
+            lambda invalid=invalid, name=name: validate_raw_rollout(
+                invalid,
+                f"{name} self-test",
+                rollout_record,
+                rollout_row,
+            ),
+        )
+
+    split_control_plane = copy.deepcopy(rollout_result)
+    other_control_plane = previous_config.replace(
+        "axond_rollout_self_test", "axond_rollout_other"
+    )
+    split_control_plane["revisions"][0]["config"] = {
+        "sha256": hashlib.sha256(other_control_plane.encode()).hexdigest(),
+        "normalized_toml": other_control_plane,
+    }
+    expect_refusal(
+        "rollout revisions with distinct control planes",
+        lambda: validate_raw_rollout(
+            split_control_plane,
+            "split rollout control-plane self-test",
+            rollout_record,
+            rollout_row,
+        ),
+    )
+
+    for name, matrix_values in (
+        ("unevaluated rollout migration matrix", {"evaluated": False}),
+        (
+            "skipped rollout migration matrix",
+            {"skipped_reason": "PostgreSQL unavailable"},
+        ),
+    ):
+        invalid = copy.deepcopy(rollout_result)
+        invalid["migration"]["matrix"].update(matrix_values)
+        expect_refusal(
+            name,
+            lambda invalid=invalid, name=name: validate_raw_rollout(
+                invalid,
+                f"{name} self-test",
+                rollout_record,
+                rollout_row,
+            ),
+        )
     transport_retry = copy.deepcopy(rollout_result)
     failed_replica = exact_replicas[0]
     retried_identity = next(
