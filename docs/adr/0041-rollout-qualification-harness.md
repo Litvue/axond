@@ -105,7 +105,11 @@ ledger. Exact version/name/checksum rows classify the result. An unchanged
 layout permits a retained-binary traffic rollback; candidate-added versions must
 make the retained binary refuse with the newer-gateway fence. No synthetic
 future migration is used. Heavy qualification refuses to start without the
-database.
+database. Raw artifact schema 5 also binds this matrix to a redacted structured
+target: the control-plane environment-variable name, schema, and SHA-256 of the
+exact bootstrap file supplied to every command. Promotion compares that target
+with each digest-bound revision config, so a valid matrix from another schema
+cannot satisfy the rollout gate.
 
 **The operator gate runs before the fleet does.** `axond check preflight` and
 `axond migrate status` are run as subprocesses against the incoming revision's

@@ -50,7 +50,7 @@ PACKET_PATH = ROOT / "qualification/packet.toml"
 ENDURANCE_RESULT_SCHEMA_VERSION = 4
 CAPACITY_RESULT_SCHEMA_VERSION = 2
 FAULT_RESULT_SCHEMA_VERSION = 1
-ROLLOUT_RESULT_SCHEMA_VERSION = 4
+ROLLOUT_RESULT_SCHEMA_VERSION = 5
 ROLLOUT_RECORD_SCHEMA_VERSION = 4
 ROLLOUT_PREVIOUS_VERSION = "0.3.40"
 ROLLOUT_CANDIDATE_VERSION = "0.4.0"
@@ -1556,11 +1556,14 @@ def validate_raw_fault(
 def validate_raw_rollout(
     result: dict[str, Any], label: str, record: dict[str, Any], row: dict[str, Any]
 ) -> None:
-    """Bind a compact rollout claim to true two-binary stateful schema-4 evidence."""
+    """Bind compact schema 4 to true two-binary stateful raw-schema-5 evidence."""
     if result.get("schema_version") != ROLLOUT_RESULT_SCHEMA_VERSION:
         fail(f"{label}: unsupported rollout artifact schema")
     if row.get("artifact_schema_version") != ROLLOUT_RESULT_SCHEMA_VERSION:
-        fail(f"{label}: compact rollout row does not bind result schema 4")
+        fail(
+            f"{label}: compact rollout row does not bind result schema "
+            f"{ROLLOUT_RESULT_SCHEMA_VERSION}"
+        )
     if (
         record.get("binary", {}).get("cargo_profile") != "release"
         or result.get("environment", {})
@@ -1748,6 +1751,7 @@ def validate_raw_rollout(
         candidate.get("binary", {}).get("sha256"),
         f"{label}: candidate binary digest",
     )
+    verified_control_plane: tuple[str, str, str] | None = None
     for revision_label, revision in by_label.items():
         config = revision.get("config", {})
         normalized = config.get("normalized_toml")
@@ -1793,6 +1797,10 @@ def validate_raw_rollout(
                 f"{label}: revision {revision_label!r} does not bind its control "
                 "plane, secret store, and catalogue to one PostgreSQL schema"
             )
+        if verified_control_plane is None:
+            verified_control_plane = (dsn_env, schema, config["sha256"])
+    if verified_control_plane is None:
+        fail(f"{label}: rollout has no verified PostgreSQL control plane")
     if any(revision.get("exclusive_aliases") != [] for revision in revisions):
         fail(f"{label}: stateful rollout fabricated revision-exclusive aliases")
     compatibility_traffic = [
@@ -2710,6 +2718,26 @@ def validate_raw_rollout(
     migration = result.get("migration")
     if not isinstance(migration, dict):
         fail(f"{label}: raw migration evidence is missing")
+
+    migration_target = migration.get("target")
+    if not isinstance(migration_target, dict):
+        fail(f"{label}: raw migration target identity is missing")
+    target_dsn_env = migration_target.get("dsn_env")
+    target_schema = migration_target.get("schema")
+    target_config_sha256 = sha256_digest(
+        migration_target.get("config_sha256"),
+        f"{label}: migration target config digest",
+    )
+    expected_dsn_env, expected_schema, expected_config_sha256 = verified_control_plane
+    if (
+        target_dsn_env != expected_dsn_env
+        or target_schema != expected_schema
+        or target_config_sha256 != expected_config_sha256
+    ):
+        fail(
+            f"{label}: migration target is not bound to the digest-bound "
+            "PostgreSQL bootstrap"
+        )
 
     def command_record(command: object, field: str) -> dict[str, Any]:
         if not isinstance(command, dict):
@@ -5262,11 +5290,16 @@ def self_test() -> int:
     else:
         raise AssertionError("a shortened compact stateful soak was accepted")
 
-    def expect_refusal(label: str, action: Any) -> None:
+    def expect_refusal(
+        label: str, action: Any, expected_message: str | None = None
+    ) -> None:
         try:
             action()
-        except SystemExit:
-            pass
+        except SystemExit as error:
+            if expected_message is not None and expected_message not in str(error):
+                raise AssertionError(
+                    f"{label} was refused for the wrong reason: {error}"
+                ) from error
         else:
             raise AssertionError(f"{label} was accepted")
 
@@ -6006,6 +6039,11 @@ bootstrap = "seed"
             "preflight": copy.deepcopy(command_passed),
             "status": copy.deepcopy(command_passed),
             "gate_passed": True,
+            "target": {
+                "dsn_env": "GW_ROLLOUT_CONTROL_PLANE_DSN",
+                "schema": "axond_rollout_self_test",
+                "config_sha256": previous_config_digest,
+            },
             "control_plane": (
                 "one real PostgreSQL schema (axond_rollout_self_test) supplied "
                 "migrations, desired state, and the serving fleet"
@@ -6174,6 +6212,53 @@ bootstrap = "seed"
                 rollout_record,
                 rollout_row,
             ),
+        )
+
+    unbound_migration_target = copy.deepcopy(rollout_result)
+    other_control_plane = previous_config.replace(
+        "axond_rollout_self_test", "axond_rollout_other"
+    )
+    replace_rollout_configs(unbound_migration_target, other_control_plane)
+    expect_refusal(
+        "migration target detached from all rollout configs",
+        lambda: validate_raw_rollout(
+            unbound_migration_target,
+            "unbound migration target self-test",
+            rollout_record,
+            rollout_row,
+        ),
+        expected_message="migration target is not bound",
+    )
+
+    missing_migration_target = copy.deepcopy(rollout_result)
+    del missing_migration_target["migration"]["target"]
+    expect_refusal(
+        "missing migration target",
+        lambda: validate_raw_rollout(
+            missing_migration_target,
+            "missing migration target self-test",
+            rollout_record,
+            rollout_row,
+        ),
+        expected_message="migration target identity is missing",
+    )
+
+    for field, value in (
+        ("dsn_env", "GW_OTHER_DSN"),
+        ("schema", "axond_rollout_other"),
+        ("config_sha256", "0" * 64),
+    ):
+        wrong_target = copy.deepcopy(rollout_result)
+        wrong_target["migration"]["target"][field] = value
+        expect_refusal(
+            f"migration target with wrong {field}",
+            lambda wrong_target=wrong_target, field=field: validate_raw_rollout(
+                wrong_target,
+                f"wrong migration target {field} self-test",
+                rollout_record,
+                rollout_row,
+            ),
+            expected_message="migration target is not bound",
         )
 
     for name, matrix_values in (

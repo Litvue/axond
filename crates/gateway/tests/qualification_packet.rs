@@ -528,8 +528,8 @@ fn rollout_observations_require_the_current_artifact_schema() {
 }
 
 #[test]
-fn rollout_raw_and_compact_contracts_are_both_schema_four() {
-    assert_eq!(ROLLOUT_RESULT_SCHEMA_VERSION, 4);
+fn rollout_raw_schema_five_and_compact_schema_four_are_explicit() {
+    assert_eq!(ROLLOUT_RESULT_SCHEMA_VERSION, 5);
     assert_eq!(packet::ROLLOUT_RECORD_SCHEMA_VERSION, 4);
 }
 

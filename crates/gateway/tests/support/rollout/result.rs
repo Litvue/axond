@@ -568,14 +568,27 @@ pub struct MigrationEvidence {
     pub status: CommandRecord,
     /// Whether the rollout was allowed to proceed on this evidence.
     pub gate_passed: bool,
+    /// Redacted machine identity of the exact bootstrap target used by every
+    /// migration command. Present for stateful qualification and absent from
+    /// the reduced stateless diagnostic.
+    pub target: Option<MigrationTargetEvidence>,
     /// Human-readable, redacted description of the control-plane topology.
-    /// Machine verification belongs to the digest-bound bootstrap configs and
-    /// the structured migration matrix below; this prose is not a discriminator.
+    /// Machine verification belongs to `target`, the digest-bound bootstrap
+    /// configs, and the structured matrix below; this prose is not a discriminator.
     /// Absent Postgres, a stateless install has no schema to migrate and says so.
     pub control_plane: String,
     /// Commands and ledger versions from a real previous-to-candidate schema
     /// transition. Heavy qualification requires this to be evaluated.
     pub matrix: MigrationMatrix,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrationTargetEvidence {
+    /// Environment-variable name only; the DSN value remains secret.
+    pub dsn_env: String,
+    pub schema: String,
+    /// Digest of the exact config path supplied to the migration commands.
+    pub config_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
