@@ -44,8 +44,10 @@ pub const NEXT_ONLY_ALIAS: &str = "chat-next-only";
 /// is starved, and the alternative is a phantom lost usage record.
 const OUTPUT_SETTLE: Duration = Duration::from_secs(5);
 
-/// Stateless failover bounds. Stateful mode projects failover policy from the
-/// control plane, so these must never appear in its bootstrap TOML.
+/// Stateless failover bounds. Stateful mode rejects failover settings in its
+/// bootstrap TOML and the current desired-state schema has no deployment-wide
+/// failover-policy resource, so stateful replicas use the shipped defaults.
+/// Keep the stateless fixture's historical bounds explicit and separate.
 const STATELESS_FAILOVER_TUNING: &str = r"
 [failover]
 max_attempts = 1
@@ -107,8 +109,9 @@ impl Revision {
         tuning
     }
 
-    /// Bootstrap-only tuning for a stateful replica. Failover and serving
-    /// policy are deliberately absent because the durable revision owns them.
+    /// Bootstrap-only tuning for a stateful replica. Serving resources come
+    /// from the durable revision; failover stays absent because stateful
+    /// bootstrap rejects it and therefore uses the shipped defaults.
     pub fn stateful_tuning(shutdown: ShutdownBounds) -> String {
         format!("{TRANSPORT_TUNING}{}", shutdown.toml())
     }
