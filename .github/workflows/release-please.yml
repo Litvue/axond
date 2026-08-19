@@ -455,7 +455,8 @@ jobs:
           python-version: '3.12'
       - name: Install musl tools
         if: endsWith(matrix.target, '-unknown-linux-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        timeout-minutes: 25
+        run: bash ops/install-musl-tools.sh
       - name: Build the release binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p axond
       - name: Package the Unix binary

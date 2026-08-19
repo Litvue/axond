@@ -237,9 +237,11 @@ def check_signer_identity(text: str, relative: str) -> list[str]:
 
 
 def check_musl_installer(text: str, relative: str) -> list[str]:
-    """Both Linux-musl lanes use the same bounded package-manager path."""
-    if relative != ".github/workflows/ci.yml":
-        return []
+    """Every Linux-musl lane uses the same bounded package-manager path."""
+    expected_steps = {
+        ".github/workflows/ci.yml": 2,
+        ".github/workflows/release-please.yml": 1,
+    }
 
     lines = text.splitlines()
     blocks: list[tuple[int, str]] = []
@@ -254,10 +256,11 @@ def check_musl_installer(text: str, relative: str) -> list[str]:
         blocks.append((index + 1, "\n".join(lines[index:end])))
 
     failures: list[str] = []
-    if len(blocks) != 2:
+    expected = expected_steps.get(relative)
+    if expected is not None and len(blocks) != expected:
         failures.append(
-            f"{relative}: expected the static and binary-smoke musl install steps, "
-            f"found {len(blocks)}"
+            f"{relative}: expected {expected} bounded musl install step(s), found "
+            f"{len(blocks)}"
         )
     for number, block in blocks:
         if not re.search(
@@ -438,10 +441,26 @@ def self_test() -> list[str]:
         "        timeout-minutes: 20\n"
         "        run: bash ops/install-musl-tools.sh\n"
     )
+    good_release_musl = (
+        "jobs:\n"
+        "  release:\n"
+        "    steps:\n"
+        "      - name: Install musl tools\n"
+        "        if: matrix.musl\n"
+        "        timeout-minutes: 25\n"
+        "        run: bash ops/install-musl-tools.sh\n"
+    )
     musl_cases = [
-        ("shared bounded installers", good_musl, ""),
+        ("shared bounded CI installers", ".github/workflows/ci.yml", good_musl, ""),
+        (
+            "a shared bounded release installer",
+            ".github/workflows/release-please.yml",
+            good_release_musl,
+            "",
+        ),
         (
             "an inline apt installer",
+            ".github/workflows/ci.yml",
             good_musl.replace(
                 "run: bash ops/install-musl-tools.sh",
                 "run: sudo apt-get install -y musl-tools",
@@ -451,17 +470,32 @@ def self_test() -> list[str]:
         ),
         (
             "a missing outer timeout",
+            ".github/workflows/ci.yml",
             good_musl.replace("        timeout-minutes: 25\n", "", 1),
             "outer timeout-minutes",
         ),
         (
             "only one musl lane",
+            ".github/workflows/ci.yml",
             good_musl.split("  smoke:\n", 1)[0],
             "found 1",
         ),
+        (
+            "a missing release musl lane",
+            ".github/workflows/release-please.yml",
+            "jobs:\n  release:\n    steps:\n",
+            "found 0",
+        ),
+        (
+            "an inline install in another workflow",
+            ".github/workflows/other.yml",
+            "jobs:\n  job:\n    steps:\n"
+            "      - run: sudo apt-get install -y musl-tools\n",
+            "inline musl-tools",
+        ),
     ]
-    for description, body, expected in musl_cases:
-        failures = check_musl_installer(body, ".github/workflows/ci.yml")
+    for description, relative, body, expected in musl_cases:
+        failures = check_musl_installer(body, relative)
         if expected and not any(expected in failure for failure in failures):
             problems.append(
                 f"self-test: {description} was not rejected for {expected!r}: {failures}"
