@@ -236,6 +236,57 @@ def check_signer_identity(text: str, relative: str) -> list[str]:
     return failures
 
 
+def check_musl_installer(text: str, relative: str) -> list[str]:
+    """Both Linux-musl lanes use the same bounded package-manager path."""
+    if relative != ".github/workflows/ci.yml":
+        return []
+
+    lines = text.splitlines()
+    blocks: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)- name:\s*Install musl tools\s*$", line)
+        if not match:
+            continue
+        indent = match.group(1)
+        end = index + 1
+        while end < len(lines) and not lines[end].startswith(f"{indent}- "):
+            end += 1
+        blocks.append((index + 1, "\n".join(lines[index:end])))
+
+    failures: list[str] = []
+    if len(blocks) != 2:
+        failures.append(
+            f"{relative}: expected the static and binary-smoke musl install steps, "
+            f"found {len(blocks)}"
+        )
+    for number, block in blocks:
+        if not re.search(
+            r"^\s*run:\s*bash ops/install-musl-tools\.sh\s*$", block, re.MULTILINE
+        ):
+            failures.append(
+                f"{relative}:{number}: musl install must use the shared bounded "
+                "ops/install-musl-tools.sh path"
+            )
+        timeout = re.search(r"^\s*timeout-minutes:\s*(\d+)\s*$", block, re.MULTILINE)
+        if not timeout or not 1 <= int(timeout.group(1)) <= 25:
+            failures.append(
+                f"{relative}:{number}: musl install needs an outer timeout-minutes "
+                "of at most 25"
+            )
+        if re.search(r"^\s*continue-on-error:\s*true\s*$", block, re.MULTILINE):
+            failures.append(
+                f"{relative}:{number}: musl installation must remain fail-closed"
+            )
+
+    for number, line in enumerate(lines, 1):
+        if re.search(r"apt-get[^\n]*musl-tools", line):
+            failures.append(
+                f"{relative}:{number}: inline musl-tools installation bypasses the "
+                "shared timeout and retry policy"
+            )
+    return failures
+
+
 def check(root: Path) -> list[str]:
     files = workflows(root)
     if not files:
@@ -250,6 +301,7 @@ def check(root: Path) -> list[str]:
         failures.extend(check_permissions(text, relative))
         failures.extend(check_signer_identity(text, relative))
         failures.extend(check_cosign_verify(text, relative))
+        failures.extend(check_musl_installer(text, relative))
         for action, sha, comment, where in pins:
             first = seen.setdefault(action, (sha, comment, where))
             if first[0] != sha:
@@ -371,6 +423,52 @@ def self_test() -> list[str]:
         ),
     ]
     problems: list[str] = []
+
+    good_musl = (
+        "jobs:\n"
+        "  static:\n"
+        "    steps:\n"
+        "      - name: Install musl tools\n"
+        "        timeout-minutes: 25\n"
+        "        run: bash ops/install-musl-tools.sh\n"
+        "  smoke:\n"
+        "    steps:\n"
+        "      - name: Install musl tools\n"
+        "        if: matrix.musl\n"
+        "        timeout-minutes: 20\n"
+        "        run: bash ops/install-musl-tools.sh\n"
+    )
+    musl_cases = [
+        ("shared bounded installers", good_musl, ""),
+        (
+            "an inline apt installer",
+            good_musl.replace(
+                "run: bash ops/install-musl-tools.sh",
+                "run: sudo apt-get install -y musl-tools",
+                1,
+            ),
+            "shared bounded",
+        ),
+        (
+            "a missing outer timeout",
+            good_musl.replace("        timeout-minutes: 25\n", "", 1),
+            "outer timeout-minutes",
+        ),
+        (
+            "only one musl lane",
+            good_musl.split("  smoke:\n", 1)[0],
+            "found 1",
+        ),
+    ]
+    for description, body, expected in musl_cases:
+        failures = check_musl_installer(body, ".github/workflows/ci.yml")
+        if expected and not any(expected in failure for failure in failures):
+            problems.append(
+                f"self-test: {description} was not rejected for {expected!r}: {failures}"
+            )
+        if not expected and failures:
+            problems.append(f"self-test: {description} was rejected: {failures}")
+
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         directory = root / ".github" / "workflows"
