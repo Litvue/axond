@@ -137,11 +137,14 @@ api-compat-self-test:
     ops/api-compat.py --self-test
 
 # Workflow supply-chain policy: SHA-pinned Actions, least-privilege permissions,
-# and the release signer restriction. `actionlint` additionally lints the
-# workflow definitions; it is downloaded at a pinned, checksummed version.
+# the release signer restriction, and the bounded musl package installer.
+# `actionlint` additionally lints the workflow definitions; it is downloaded at
+# a pinned, checksummed version.
 workflow-policy:
     ops/workflow-policy.py --self-test
     ops/workflow-policy.py
+    shellcheck ops/install-musl-tools.sh
+    bash ops/install-musl-tools.sh --self-test
     ops/dependabot-labels.sh --self-test
     ops/dependabot-labels.sh
 
