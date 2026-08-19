@@ -2014,6 +2014,8 @@ def validate_raw_rollout(
         reason = attempt.get("reason")
         attempt_key = (caller_id, trace_id, replica, reason)
         identity_key = (replica, trace_id)
+        if reason == "untyped_503":
+            fail(f"{label}: an untyped 503 attempt is not promotable")
         if (
             not isinstance(caller_id, int)
             or isinstance(caller_id, bool)
@@ -2021,12 +2023,11 @@ def validate_raw_rollout(
             or caller_id >= caller_request_count
             or replica not in fleet_revision_by_replica
             or not canonical_rollout_trace(trace_id)
-            or reason not in {"transport_failure", "untyped_503"}
+            or reason != "transport_failure"
             or attempt_key in failed_attempt_keys
             or identity_key in failed_reasons_by_identity
             or caller_trace_ids.get(caller_id, trace_id) != trace_id
             or trace_caller_ids.get(trace_id, caller_id) != caller_id
-            or reason == "untyped_503"
             or not (usage_trace_owners.get(trace_id, set()) - {replica})
         ):
             fail(f"{label}: failed ingress attempt {index} is not canonical")

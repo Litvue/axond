@@ -176,9 +176,6 @@ impl Collector {
                     .into_iter()
                     .flat_map(|scope| scope.spans)
                     .collect::<Vec<_>>();
-                if spans.is_empty() {
-                    continue;
-                }
                 let Some(resource) = resource_spans.resource else {
                     let error =
                         format!("OTLP trace export for `{expected_instance}` has no resource");
@@ -202,6 +199,9 @@ impl Collector {
                     );
                     cache.error = Some(error.clone());
                     return Err(error);
+                }
+                if spans.is_empty() {
+                    continue;
                 }
                 for span in spans {
                     let Some(trace_id) = canonical_trace_id(&span.trace_id) else {

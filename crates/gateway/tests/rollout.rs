@@ -956,6 +956,17 @@ mod otlp_witness {
     }
 
     #[tokio::test]
+    async fn an_empty_foreign_resource_still_invalidates_the_receiver() {
+        let collector = Collector::start().await;
+        let mut foreign = resource_spans("previous-1", &trace_bytes(1));
+        foreign.scope_spans.clear();
+        send(&collector, vec![foreign]).await;
+
+        assert!(collector.trace_ids_for_instance("previous-0").is_err());
+        assert!(collector.trace_ids_for_instance("previous-0").is_err());
+    }
+
+    #[tokio::test]
     async fn a_late_malformed_trace_permanently_fails_the_cached_witness() {
         let collector = Collector::start().await;
         send(

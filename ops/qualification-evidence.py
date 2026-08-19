@@ -1311,6 +1311,10 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
         reason = attempt.get("reason")
         attempt_key = (caller_id, trace_id, replica, reason)
         identity_key = (replica, trace_id)
+        if reason == "untyped_503":
+            raise SystemExit(
+                f"{workload}: an untyped 503 attempt is not promotable"
+            )
         if (
             not isinstance(caller_request_count, int)
             or isinstance(caller_request_count, bool)
@@ -1321,12 +1325,11 @@ def check_rollout_qualifiable(result: dict, workload: str) -> None:
             or not isinstance(trace_id, str)
             or len(trace_id) != 32
             or not trace_id.startswith("61786f6e642d726f")
-            or reason not in {"transport_failure", "untyped_503"}
+            or reason != "transport_failure"
             or attempt_key in seen_failed_attempts
             or identity_key in failed_reasons_by_identity
             or caller_trace_ids.get(caller_id, trace_id) != trace_id
             or trace_caller_ids.get(trace_id, caller_id) != caller_id
-            or reason == "untyped_503"
             or not (usage_trace_owners.get(trace_id, set()) - {replica})
         ):
             raise SystemExit(
