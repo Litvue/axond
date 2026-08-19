@@ -10,7 +10,7 @@
 # ninety-second smoke and the twelve-hour soak exercise the same events in the
 # same order. Only the time between them differs.
 
-schema_version = 1
+schema_version = 2
 
 [[profile]]
 id = "mixed-stateful-endurance"
@@ -61,6 +61,11 @@ segment_ms = 900000
 # attribution span at ninety seconds and outside it at twelve hours, which is
 # two different qualifications rather than one at two scales.
 [profile.schedule]
+# Every fault-gate transition must be applied within this bound after its
+# committed offset. A dedicated timer actuates the gates independently of the
+# supervisor's convergence and probe work; a late edge is recorded as a failed
+# run instead of silently turning a narrow fault into a broad one.
+event_dispatch_slack_ms = 250
 catalogue_revision_at = 0.06
 credential_revision_at = 0.11
 policy_revision_at = 0.16
@@ -75,6 +80,14 @@ upstream_latency_ms = 250
 # recovery allowance plus the slack rather than the allowance alone.
 upstream_outage_at = 0.28
 upstream_outage_for = 0.06
+# The client can finish immediately before the provider gate cuts while the
+# gateway observes and records the terminal upstream close immediately after.
+# This leading allowance is one 250 ms harness drain interval before the
+# committed nominal opening. The window closes at the observed instant the
+# gate scheduler restores the provider gate, independently of the supervisor's
+# probes and no more than event_dispatch_slack_ms after the nominal close. It does not extend to
+# the later recovery-success allowance.
+upstream_outage_correlation_slack_ms = 250
 usage_backend_outage_at = 0.52
 usage_backend_outage_for = 0.06
 # A record settled a couple of seconds either side of the outage is the

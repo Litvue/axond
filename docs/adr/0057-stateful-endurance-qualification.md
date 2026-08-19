@@ -123,6 +123,43 @@ creates an ephemeral schema for each run. It changes no shipped code path and
 raises no deployment's tier; it does mean the smoke tier runs only in lanes that
 have a database, which is the `Stateful tests` lane in CI.
 
+## Amendment (2026-08-19): concurrent endings and independently timed faults
+
+A caller cancellation that overlaps an upstream outage has more than one
+truthful settlement. The caller may observe its own cancellation while the
+gateway, racing the same close, records `client_cancelled`, `partial`, or
+`upstream_error`. Treating that bounded race as an ordinary cancellation made
+an exact ledger reject otherwise reconciled evidence; allowing
+`upstream_error` for every cancellation would weaken the contract globally.
+
+Correlation expectation code 4 therefore represents only cancellations whose
+integer lifetime overlaps the committed upstream opening (including its 250 ms
+leading observer slack) through the gate's observed restoration. A fifth
+retained exact ledger stores one fixed-width 33-byte timing row per workload
+request: trace identity, planned ending, start millisecond, and end millisecond.
+Promotion parses those rows independently and must derive exactly the same
+code-4 multiset as the correlation ledger. The five retained shard sets are now
+the workload request identities, expected/observed correlations, request timing
+rows, whole-run emitted-to-durable identity pairs, and outside-window
+emitted-to-durable identity pairs. The probe identity ledger remains temporary
+scratch and is removed after tallying.
+
+Fault-gate edges also move onto their own spawned runtime task. That task sleeps
+until each committed offset, changes the gate, and only then timestamps and
+reports the transition to the supervisor. The 250 ms dispatch allowance is
+intentional: it is one complete drain interval of the harness, while changing a
+gate is only an atomic state update. A real applied edge later than that makes
+the run diagnostically invalid and records `event-dispatch-late` before normal
+artifact finalization; a deliberately skipped remote-database edge changes no
+gate and cannot fail this bound. This preserves the failed artifact while
+refusing to promote a soak whose observed fault window materially diverged from
+the committed schedule.
+
+These additions raise the stateful-endurance manifest to schema 2 and its raw
+result to schema 3. They change only the qualification and promotion contract:
+no shipped configuration key, default, typed API error, permission, or durable
+Axond schema changes.
+
 ## Consequences
 
 - The stateless soak stays cheap, portable, and unconditional, and this one

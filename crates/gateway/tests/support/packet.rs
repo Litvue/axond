@@ -461,8 +461,15 @@ pub struct RecordObservation {
     pub samples_files: Option<u32>,
     #[serde(default)]
     pub samples_bytes: Option<u64>,
-    /// Stateful endurance additionally binds durable usage identities inside
-    /// and outside the fault windows.
+    /// Stateful endurance additionally binds the original request intervals
+    /// used for exact fault-window classification and durable usage identities
+    /// inside and outside the fault windows.
+    #[serde(default)]
+    pub correlation_windows_sha256: Option<String>,
+    #[serde(default)]
+    pub correlation_windows_files: Option<u32>,
+    #[serde(default)]
+    pub correlation_windows_bytes: Option<u64>,
     #[serde(default)]
     pub durable_identities_sha256: Option<String>,
     #[serde(default)]

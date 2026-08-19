@@ -310,6 +310,14 @@ pub struct Usage {
     /// successful probe requests that owed a settlement.
     pub unexpected_records: u64,
     pub unexpected_statuses: u64,
+    /// Exact code-4 expectations whose cancellation lifetime touched the
+    /// committed upstream opening/slack through the observed gate restoration.
+    /// Promotion re-derives their complete membership from retained request
+    /// timings, the manifest, and the observed gate timestamps.
+    pub concurrent_endings: u64,
+    /// Symmetric difference between the expected correlation rows and the
+    /// rows independently derived from original endings and request timings.
+    pub concurrent_ending_membership_mismatches: u64,
     pub unidentified: u64,
     pub uncorrelated: u64,
     /// Refusal settlements. The qualification contract requires zero because
@@ -318,6 +326,7 @@ pub struct Usage {
     pub by_status: BTreeMap<String, u64>,
     pub request_identities: IdentityEvidence,
     pub correlations: CorrelationEvidence,
+    pub correlation_windows: IdentityEvidence,
     pub durable: Counts,
     /// How long the durable table took to stop growing after the load stopped.
     pub durable_lag_ms: u64,

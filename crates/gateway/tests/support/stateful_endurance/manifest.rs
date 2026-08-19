@@ -22,11 +22,11 @@ use crate::support::endurance::manifest::Mix;
 pub const MANIFEST_RELATIVE: &str = "qualification/stateful-endurance/manifest.toml";
 
 /// The manifest schema this harness understands.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// The result-artifact schema version. Bumped when a field changes meaning, so
 /// a stored artifact is never reinterpreted under a newer contract.
-pub const RESULT_SCHEMA_VERSION: u32 = 2;
+pub const RESULT_SCHEMA_VERSION: u32 = 3;
 
 /// Overrides the soak tier's duration, for an operator dispatching a shorter
 /// run than the manifest commits to. The soak alone, for the reason the
@@ -103,6 +103,9 @@ pub struct SloOverrides {
 /// the offered duration rather than offsets, so both tiers run the same script.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Schedule {
+    /// Maximum permitted delay between a committed fault-gate offset and the
+    /// independent gate scheduler actually applying that transition.
+    pub event_dispatch_slack_ms: u64,
     pub catalogue_revision_at: f64,
     pub credential_revision_at: f64,
     pub policy_revision_at: f64,
@@ -111,6 +114,11 @@ pub struct Schedule {
     pub upstream_latency_ms: u64,
     pub upstream_outage_at: f64,
     pub upstream_outage_for: f64,
+    /// Leading-edge allowance for the gateway to observe a caller close. A
+    /// client can finish just before the gate cuts the upstream while the
+    /// gateway settles that same request just after it. This is deliberately
+    /// separate from the much larger recovery allowance.
+    pub upstream_outage_correlation_slack_ms: u64,
     pub usage_backend_outage_at: f64,
     pub usage_backend_outage_for: f64,
     /// How far either side of the usage-backend outage a record still counts as
@@ -147,6 +155,21 @@ pub enum Event {
 }
 
 impl Event {
+    /// Whether this event changes one of the two fault gates. Gate transitions
+    /// run on their own timer so convergence and probe work in the supervisor
+    /// cannot broaden a committed fault window.
+    pub fn is_gate_transition(self) -> bool {
+        matches!(
+            self,
+            Self::UpstreamLatencyBegins
+                | Self::UpstreamLatencyEnds
+                | Self::UpstreamOutageBegins
+                | Self::UpstreamOutageEnds
+                | Self::UsageBackendOutageBegins
+                | Self::UsageBackendOutageEnds
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CatalogueRevision => "catalogue-revision",
@@ -171,6 +194,19 @@ pub struct Scheduled {
 }
 
 impl Schedule {
+    /// The deterministic opening edge and nominal closing edge used to seed
+    /// stateful cancellation correlation before the provider gate is cut.
+    /// The supervisor replaces the closing edge with the observed restoration
+    /// timestamp while the run is live.
+    pub fn upstream_correlation_window_ms(&self, duration: Duration) -> (u64, u64) {
+        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let at = |fraction: f64| ((duration_ms as f64) * fraction.clamp(0.0, 1.0)).floor() as u64;
+        (
+            at(self.upstream_outage_at).saturating_sub(self.upstream_outage_correlation_slack_ms),
+            at(self.upstream_outage_at + self.upstream_outage_for),
+        )
+    }
+
     /// The script, in the order it happens. Resolving fractions against the
     /// duration here — rather than in the driver — is what makes the smoke tier
     /// a shorter run of the same qualification rather than a different one.
@@ -339,6 +375,10 @@ pub enum Stop {
     UnplannedErrors,
     /// A restarted replica never came back ready.
     ReplicaNeverReady,
+    /// The harness could not apply a committed fault-gate edge in bound. The
+    /// transition is still applied and the run is finalized so its diagnostic
+    /// artifact survives; it is not promotable qualification evidence.
+    EventDispatchLate,
 }
 
 impl Stop {

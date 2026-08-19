@@ -11,7 +11,7 @@ decomposes into six slices. They landed, and will land, at different depths:
 | --- | --- | --- | --- |
 | `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `harnessed` | Driver and eight committed profiles — including multi-tenant isolation, admission shedding, a bounded stalling backend, and decoded production queue-depth telemetry. Its historical records predate raw-artifact-bound compact schema 2 and are not active evidence. |
 | `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Stateless mixed-workload driver and committed mix whose smoke tier runs in CI. Its 12-hour tier has not retained exact request/correlation ledgers and its sample JSONL under the current contract. |
-| `stateful-endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Multi-replica driver for revisions, backend faults, tenant isolation, durable accounting, and rolling restarts. Its smoke lane is harness validation; no 12-hour record binds all four exact ledgers and the per-incarnation sample JSONL set. |
+| `stateful-endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Multi-replica driver for revisions, backend faults, tenant isolation, durable accounting, and rolling restarts. Its smoke lane is harness validation; no 12-hour record binds all five exact ledgers and the per-incarnation sample JSONL set. |
 | `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver and twenty-two executable real-Postgres stages exist. The historical v0.3.39 debug record remains indexed for audit, but a release-profile v0.4.0 cohort rerun with raw schema 2, per-stage executable digests, and process-bound executed-binary identity is pending. |
 | `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `harnessed` | The provider, transport, Redis, and Postgres matrix is complete. Its historical v0.3.39 debug record remains indexed for audit, but raw-schema-1 release evidence from the v0.4.0 cohort is pending. |
 | `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver and committed reduced/heavy scenarios now require published v0.3.40 and candidate v0.4.0 serving one shared durable revision and alias through the real-Postgres migration/rollback matrix. No raw/compact schema-3 record is retained. |
@@ -185,8 +185,8 @@ slices bind and re-hash request-identity and correlation ledgers, including
 their file and byte counts. Sample sets are bound through `samples_sha256`,
 `samples_files`, and `samples_bytes`. Stateless endurance binds exactly one
 non-empty resource-sample JSONL file. Stateful endurance binds a non-empty set
-with one file per replica incarnation and additionally binds its durable and
-outside-window identity ledgers.
+with one file per replica incarnation and additionally binds its exact
+per-request timing, durable, and outside-window identity ledgers.
 Promotion independently reconstructs accounting and resource verdicts from
 those retained bytes. A compact record
 cannot be promoted from a TOML file alone: its claimed artifact digests must
@@ -234,8 +234,9 @@ checked by the qualification packet test.
   run behind them, so the soak tiers are declared bounds rather than measured
   ones.
 - **`stateful-endurance`** — a complete 12-hour multi-replica run with exact
-  request, trace, and durable-identity shards plus the non-empty per-incarnation
-  sample JSONL set independently promoted from the raw artifact set.
+  request, trace, per-request timing, and durable-identity shards plus the
+  non-empty per-incarnation sample JSONL set independently promoted from the
+  raw artifact set.
 - **`capacity`** — a schema-2 heavy run that retains and binds every raw profile
   artifact, including decoded production queue-depth telemetry.
 - **`recovery`** — re-run all executable real-Postgres stages from the frozen

@@ -87,24 +87,28 @@ STATEFUL_LEDGER_FIELDS: tuple[tuple[str, int], ...] = (
     ("correlations", 2),
     ("durable_identities", 2),
     ("durable_outside_identities", 2),
+    ("correlation_windows", 1),
 )
 STATEFUL_LEDGER_STEMS: dict[str, tuple[str, ...]] = {
     "request_identities": ("request",),
     "correlations": ("expected", "observed"),
     "durable_identities": ("expected-request", "observed-request"),
     "durable_outside_identities": ("expected-request", "observed-request"),
+    "correlation_windows": ("window",),
 }
 STATEFUL_LEDGER_WIDTHS = {
     "request_identities": 16,
     "correlations": 17,
     "durable_identities": 16,
     "durable_outside_identities": 16,
+    "correlation_windows": 33,
 }
 STATEFUL_LEDGER_COUNTS: dict[str, tuple[str, ...]] = {
     "request_identities": ("recorded",),
     "correlations": ("expected", "observed"),
     "durable_identities": ("expected_rows", "observed_rows"),
     "durable_outside_identities": ("expected_rows", "observed_rows"),
+    "correlation_windows": ("recorded",),
 }
 
 
@@ -158,7 +162,13 @@ def resolve_stateful_ledger(raw_path: Path, declared: object, label: str) -> Pat
 
 
 def stateful_ledger_claim(
-    directory: Path, label: str, field: str, evidence: dict
+    directory: Path,
+    label: str,
+    field: str,
+    evidence: dict,
+    *,
+    schema_label: str,
+    digest_domain: bytes,
 ) -> dict[str, object]:
     """Hash every fixed-width shard with names and lengths in canonical order."""
     entries = sorted(directory.iterdir(), key=lambda path: path.name)
@@ -171,8 +181,10 @@ def stateful_ledger_claim(
         {path.name for path in entries} != expected_names
         or any(path.is_symlink() or not path.is_file() for path in entries)
     ):
-        raise SystemExit(f"{label}: exact ledger filenames do not match schema 2")
-    digest = hashlib.sha256(b"axond-stateful-ledger-v1\0")
+        raise SystemExit(
+            f"{label}: exact ledger filenames do not match {schema_label}"
+        )
+    digest = hashlib.sha256(digest_domain)
     total_bytes = 0
     row_width = STATEFUL_LEDGER_WIDTHS[field]
     for path in entries:
@@ -218,13 +230,18 @@ def stateful_ledger_claims(result: dict, workload: str) -> dict[str, dict[str, o
         if shards != STATEFUL_LEDGER_SHARDS:
             raise SystemExit(
                 f"{workload}: {field} has {shards!r} shards, expected "
-                f"schema-2 count {STATEFUL_LEDGER_SHARDS}"
+                f"schema-3 count {STATEFUL_LEDGER_SHARDS}"
             )
         directory = resolve_stateful_ledger(
             raw_path, evidence.get("path"), f"{workload}: {field}"
         )
         claim = stateful_ledger_claim(
-            directory, f"{workload}: {field}", field, evidence
+            directory,
+            f"{workload}: {field}",
+            field,
+            evidence,
+            schema_label="stateful-endurance schema 3",
+            digest_domain=b"axond-stateful-ledger-v2\0",
         )
         expected_files = shards * files_per_shard
         if claim["files"] != expected_files or claim["bytes"] <= 0:
@@ -255,7 +272,12 @@ def endurance_ledger_claims(result: dict, workload: str) -> dict[str, dict[str, 
             raw_path, evidence.get("path"), f"{workload}: {field}"
         )
         claim = stateful_ledger_claim(
-            directory, f"{workload}: {field}", field, evidence
+            directory,
+            f"{workload}: {field}",
+            field,
+            evidence,
+            schema_label="endurance schema 4",
+            digest_domain=b"axond-stateful-ledger-v1\0",
         )
         expected_files = shards * files_per_shard
         if claim["files"] != expected_files or claim["bytes"] <= 0:
@@ -532,7 +554,7 @@ RECOVERY_MANIFEST = "qualification/recovery/manifest.toml"
 ENDURANCE_RESULT_SCHEMA_VERSION = 4
 FAULT_RESULT_SCHEMA_VERSION = 1
 ROLLOUT_RESULT_SCHEMA_VERSION = 3
-STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION = 2
+STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION = 3
 ENDURANCE_SURPLUS_VERDICT = "max_unexpected_usage_records"
 
 
@@ -1207,6 +1229,7 @@ def check_stateful_endurance_exact(result: dict, workload: str) -> None:
         "correlations",
         "durable_identities",
         "durable_outside_identities",
+        "correlation_windows",
     ):
         evidence = usage.get(field, {})
         if evidence.get("exact") is not True or not evidence.get("path"):
@@ -1215,6 +1238,7 @@ def check_stateful_endurance_exact(result: dict, workload: str) -> None:
         "missing",
         "unexpected_records",
         "unexpected_statuses",
+        "concurrent_ending_membership_mismatches",
         "unidentified",
         "uncorrelated",
         "refusal_records",
@@ -1800,6 +1824,8 @@ def self_test() -> int:
                 "missing": 0,
                 "unexpected_records": 0,
                 "unexpected_statuses": 0,
+                "concurrent_endings": 0,
+                "concurrent_ending_membership_mismatches": 0,
                 "unidentified": 0,
                 "uncorrelated": 0,
                 "refusal_records": 0,
@@ -1823,6 +1849,11 @@ def self_test() -> int:
                 "durable_outside_identities": {
                     "exact": True,
                     "path": "durable-outside-ledger",
+                    "shards": STATEFUL_LEDGER_SHARDS,
+                },
+                "correlation_windows": {
+                    "exact": True,
+                    "path": "correlation-window-ledger",
                     "shards": STATEFUL_LEDGER_SHARDS,
                 },
             },
@@ -1866,6 +1897,40 @@ def self_test() -> int:
             )
             assert len(parsed["observation"][0][f"{field}_sha256"]) == 64
         assert parsed["observation"][0]["samples_files"] == 2
+
+        inexact_correlation_windows = copy.deepcopy(stateful_result)
+        inexact_correlation_windows["usage"]["correlation_windows"]["exact"] = False
+        try:
+            render_generic(
+                [inexact_correlation_windows],
+                "stateful-endurance",
+                "soak",
+                "github-actions",
+                "inexact stateful correlation windows",
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("inexact stateful correlation-window evidence was accepted")
+
+        mismatched_correlation_windows = copy.deepcopy(stateful_result)
+        mismatched_correlation_windows["usage"][
+            "concurrent_ending_membership_mismatches"
+        ] = 1
+        try:
+            render_generic(
+                [mismatched_correlation_windows],
+                "stateful-endurance",
+                "soak",
+                "github-actions",
+                "mismatched stateful correlation windows",
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(
+                "stateful correlation-window membership mismatches were accepted"
+            )
 
         short_stateful = dict(stateful_result)
         short_stateful["profile"] = dict(stateful_result["profile"])

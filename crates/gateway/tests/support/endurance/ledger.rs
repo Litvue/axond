@@ -18,6 +18,7 @@ pub const SHARDS: usize = 64;
 /// Fixed width of every request and trace identity stored by these ledgers.
 pub const ID_WIDTH: usize = 16;
 const CORRELATION_WIDTH: usize = ID_WIDTH + 1;
+const CORRELATION_WINDOW_WIDTH: usize = ID_WIDTH + 1 + 8 + 8;
 const REQUEST_PREFIX: &str = "req_";
 /// Hard ceiling for one in-memory sort. With 64 deterministic shards this
 /// admits 96 million rows per ledger while preventing a corrupt or clustered
@@ -431,6 +432,144 @@ pub struct CorrelationLedger {
     observed: u64,
 }
 
+/// Exact request lifetimes used to prove the stateful harness' narrow
+/// cancellation/upstream-close race classification.
+///
+/// This is deliberately separate from the shared correlation ledger. The
+/// stateless contract keeps its historical 17-byte rows, while stateful runs
+/// retain one additional 33-byte row for every workload settlement.
+pub struct CorrelationWindowLedger {
+    dir: PathBuf,
+    shards: ShardWriters,
+    recorded: u64,
+}
+
+impl CorrelationWindowLedger {
+    pub fn create(dir: &Path) -> Self {
+        recreate_directory(dir);
+        Self {
+            dir: dir.to_owned(),
+            shards: create_shards(dir, "window"),
+            recorded: 0,
+        }
+    }
+
+    /// Record the original settlement and the exact integer interval used to
+    /// decide whether a cancellation overlaps the committed upstream
+    /// correlation window.
+    pub fn record(
+        &mut self,
+        trace_id: [u8; ID_WIDTH],
+        ending: Ending,
+        started_ms: u64,
+        ended_ms: u64,
+    ) -> Result<(), IdentityError> {
+        let trace_id = validate_trace_bytes(trace_id)?;
+        assert!(
+            started_ms <= ended_ms,
+            "a request cannot end before it starts"
+        );
+        let shard = shard_for(&trace_id);
+        let mut row = [0_u8; CORRELATION_WINDOW_WIDTH];
+        row[..ID_WIDTH].copy_from_slice(&trace_id);
+        row[ID_WIDTH] = ExpectedSettlement::from(ending).code();
+        row[ID_WIDTH + 1..ID_WIDTH + 9].copy_from_slice(&started_ms.to_be_bytes());
+        row[ID_WIDTH + 9..].copy_from_slice(&ended_ms.to_be_bytes());
+        self.shards.write(shard, &row);
+        self.recorded += 1;
+        Ok(())
+    }
+
+    /// Re-derive every stateful workload expectation from retained request
+    /// lifetimes and compare it exactly with the correlation ledger. Probe
+    /// expectations use a separate trace domain and intentionally have no
+    /// lifetime row.
+    pub fn tally(
+        mut self,
+        correlations: &mut CorrelationLedger,
+        workload_high: [u8; 8],
+        raw_window_ms: (u64, u64),
+    ) -> Result<CorrelationWindowTally, ShardError> {
+        self.shards.flush();
+        correlations.expected_shards.flush();
+        drop(self.shards);
+        assert!(
+            raw_window_ms.0 < raw_window_ms.1,
+            "the upstream correlation window is non-empty"
+        );
+
+        let (mut recorded, mut concurrent_endings, mut membership_mismatches, mut peak) =
+            (0, 0, 0, 0);
+        for shard in 0..SHARDS {
+            let windows =
+                read_correlation_window_rows(&shard_path(&self.dir, "window", shard), shard)?;
+            let expected = read_expected_rows(&shard_path(&correlations.dir, "expected", shard))?;
+            let mut workload_expected: Vec<_> = expected
+                .into_iter()
+                .filter(|row| row.identity[..8] == workload_high)
+                .collect();
+            let mut derived = Vec::with_capacity(windows.len());
+            for (row_at, row) in windows.into_iter().enumerate() {
+                if row.identity[..8] != workload_high
+                    || u64::from_be_bytes(
+                        row.identity[8..]
+                            .try_into()
+                            .expect("a trace identity has an eight-byte low word"),
+                    ) == 0
+                {
+                    return Err(ShardError::InvalidRow {
+                        path: shard_path(&self.dir, "window", shard),
+                        row: row_at,
+                        field: "workload trace domain",
+                        value: 0,
+                    });
+                }
+                let settlement = if row.settlement == ExpectedSettlement::Cancelled
+                    && intervals_overlap((row.started_ms, row.ended_ms), raw_window_ms)
+                {
+                    concurrent_endings += 1;
+                    ExpectedSettlement::CancelledDuringUpstreamFault
+                } else {
+                    row.settlement
+                };
+                derived.push(ExpectedRow {
+                    identity: row.identity,
+                    settlement,
+                });
+            }
+            recorded += derived.len() as u64;
+            peak = peak.max((derived.len() + workload_expected.len()) as u64);
+            derived.sort_unstable();
+            workload_expected.sort_unstable();
+            membership_mismatches += symmetric_difference_rows(&derived, &workload_expected);
+        }
+        assert_eq!(
+            recorded, self.recorded,
+            "all correlation-window rows were tallied"
+        );
+        Ok(CorrelationWindowTally {
+            recorded,
+            concurrent_endings,
+            membership_mismatches,
+            shards: SHARDS,
+            peak_shard_rows: peak,
+            exact: true,
+            directory: self.dir,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrelationWindowTally {
+    pub recorded: u64,
+    pub concurrent_endings: u64,
+    pub membership_mismatches: u64,
+    pub shards: usize,
+    pub peak_shard_rows: u64,
+    pub exact: bool,
+    pub directory: PathBuf,
+}
+
 impl CorrelationLedger {
     pub fn create(dir: &Path) -> Self {
         recreate_directory(dir);
@@ -450,7 +589,34 @@ impl CorrelationLedger {
         ending: Ending,
     ) -> Result<(), IdentityError> {
         let trace_id = validate_trace_bytes(trace_id)?;
-        write_correlation_row(&mut self.expected_shards, trace_id, ending_code(ending));
+        write_correlation_row(
+            &mut self.expected_shards,
+            trace_id,
+            ExpectedSettlement::from(ending).code(),
+        );
+        self.expected += 1;
+        Ok(())
+    }
+
+    /// Record the exact concurrent-ending set for a caller cancellation that
+    /// overlaps the committed opening through the observed gate restoration.
+    ///
+    /// Once the caller drops a stream, the client and gateway race to observe
+    /// the caller cancellation versus the upstream's terminal error. Both
+    /// `client_cancelled`/`partial` and `upstream_error` are truthful outcomes
+    /// for that one explicitly fault-attributed request. Keeping a distinct
+    /// on-disk code preserves that narrow boundary instead of teaching every
+    /// ordinary cancellation to accept an upstream failure.
+    pub fn record_cancelled_during_upstream_fault(
+        &mut self,
+        trace_id: [u8; ID_WIDTH],
+    ) -> Result<(), IdentityError> {
+        let trace_id = validate_trace_bytes(trace_id)?;
+        write_correlation_row(
+            &mut self.expected_shards,
+            trace_id,
+            ExpectedSettlement::CancelledDuringUpstreamFault.code(),
+        );
         self.expected += 1;
         Ok(())
     }
@@ -489,13 +655,18 @@ impl CorrelationLedger {
             mut missing,
             mut unexpected,
             mut status_mismatches,
+            mut concurrent_endings,
             mut peak,
-        ) = (0, 0, 0, 0, 0, 0);
+        ) = (0, 0, 0, 0, 0, 0, 0);
         for shard in 0..SHARDS {
             let mut expected = read_expected_rows(&shard_path(&self.dir, "expected", shard))?;
             let mut observed = read_observed_rows(&shard_path(&self.dir, "observed", shard))?;
             expected_count += expected.len() as u64;
             observed_count += observed.len() as u64;
+            concurrent_endings += expected
+                .iter()
+                .filter(|row| row.settlement == ExpectedSettlement::CancelledDuringUpstreamFault)
+                .count() as u64;
             peak = peak.max((expected.len() + observed.len()) as u64);
             expected.sort_unstable();
             observed.sort_unstable();
@@ -513,6 +684,7 @@ impl CorrelationLedger {
             missing,
             unexpected,
             status_mismatches,
+            concurrent_endings,
             shards: SHARDS,
             peak_shard_rows: peak,
             exact: true,
@@ -530,6 +702,8 @@ pub struct CorrelationTally {
     pub missing: u64,
     pub unexpected: u64,
     pub status_mismatches: u64,
+    /// Expectations that carry the explicit cancellation/upstream close race.
+    pub concurrent_endings: u64,
     pub shards: usize,
     pub peak_shard_rows: u64,
     pub exact: bool,
@@ -539,7 +713,15 @@ pub struct CorrelationTally {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ExpectedRow {
     identity: [u8; ID_WIDTH],
-    ending: Ending,
+    settlement: ExpectedSettlement,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CorrelationWindowRow {
+    identity: [u8; ID_WIDTH],
+    settlement: ExpectedSettlement,
+    started_ms: u64,
+    ended_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -555,6 +737,61 @@ enum ObservedStatus {
     ClientCancelled,
     Partial,
     Rejected,
+}
+
+/// The exact set of usage statuses one request is allowed to produce.
+///
+/// Codes 0-3 deliberately retain the historical `Ending` representation.
+/// Code 4 is only emitted for a caller cancellation whose lifetime overlaps
+/// the committed opening through the observed gate restoration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ExpectedSettlement {
+    Complete,
+    Cancelled,
+    Dropped,
+    Faulted,
+    CancelledDuringUpstreamFault,
+}
+
+impl ExpectedSettlement {
+    const ALL: [Self; 5] = [
+        Self::Complete,
+        Self::Cancelled,
+        Self::Dropped,
+        Self::Faulted,
+        Self::CancelledDuringUpstreamFault,
+    ];
+
+    const fn code(self) -> u8 {
+        self as u8
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code)).copied()
+    }
+
+    fn settles(self, status: &str) -> bool {
+        match self {
+            Self::Complete => Ending::Complete.settles(status),
+            Self::Cancelled => Ending::Cancelled.settles(status),
+            Self::Dropped => Ending::Dropped.settles(status),
+            Self::Faulted => Ending::Faulted.settles(status),
+            Self::CancelledDuringUpstreamFault => {
+                Ending::Cancelled.settles(status) || status == "upstream_error"
+            }
+        }
+    }
+}
+
+impl From<Ending> for ExpectedSettlement {
+    fn from(ending: Ending) -> Self {
+        match ending {
+            Ending::Complete => Self::Complete,
+            Ending::Cancelled => Self::Cancelled,
+            Ending::Dropped => Self::Dropped,
+            Ending::Faulted => Self::Faulted,
+        }
+    }
 }
 
 impl ObservedStatus {
@@ -594,19 +831,6 @@ impl ObservedStatus {
     fn from_code(code: u8) -> Option<Self> {
         Self::ALL.get(usize::from(code)).copied()
     }
-}
-
-fn ending_code(ending: Ending) -> u8 {
-    match ending {
-        Ending::Complete => 0,
-        Ending::Cancelled => 1,
-        Ending::Dropped => 2,
-        Ending::Faulted => 3,
-    }
-}
-
-fn ending_from_code(code: u8) -> Option<Ending> {
-    Ending::ALL.get(usize::from(code)).copied()
 }
 
 fn recreate_directory(dir: &Path) {
@@ -731,15 +955,109 @@ fn read_expected_rows(path: &Path) -> Result<Vec<ExpectedRow>, ShardError> {
         .map(|(row, bytes)| {
             let identity = bytes[..ID_WIDTH].try_into().expect("16 identity bytes");
             let value = bytes[ID_WIDTH];
-            let ending = ending_from_code(value).ok_or_else(|| ShardError::InvalidRow {
-                path: path.to_owned(),
-                row,
-                field: "ending",
-                value,
-            })?;
-            Ok(ExpectedRow { identity, ending })
+            let settlement =
+                ExpectedSettlement::from_code(value).ok_or_else(|| ShardError::InvalidRow {
+                    path: path.to_owned(),
+                    row,
+                    field: "settlement",
+                    value,
+                })?;
+            Ok(ExpectedRow {
+                identity,
+                settlement,
+            })
         })
         .collect()
+}
+
+fn read_correlation_window_rows(
+    path: &Path,
+    expected_shard: usize,
+) -> Result<Vec<CorrelationWindowRow>, ShardError> {
+    read_fixed_rows::<CORRELATION_WINDOW_WIDTH>(path)?
+        .into_iter()
+        .enumerate()
+        .map(|(row, bytes)| {
+            let identity = bytes[..ID_WIDTH].try_into().expect("16 identity bytes");
+            if identity == [0; ID_WIDTH] || shard_for(&identity) != expected_shard {
+                return Err(ShardError::InvalidRow {
+                    path: path.to_owned(),
+                    row,
+                    field: "trace identity",
+                    value: 0,
+                });
+            }
+            let value = bytes[ID_WIDTH];
+            let settlement = ExpectedSettlement::from_code(value)
+                .filter(|settlement| {
+                    *settlement != ExpectedSettlement::CancelledDuringUpstreamFault
+                })
+                .ok_or_else(|| ShardError::InvalidRow {
+                    path: path.to_owned(),
+                    row,
+                    field: "base settlement",
+                    value,
+                })?;
+            let started_ms = u64::from_be_bytes(
+                bytes[ID_WIDTH + 1..ID_WIDTH + 9]
+                    .try_into()
+                    .expect("eight start-time bytes"),
+            );
+            let ended_ms = u64::from_be_bytes(
+                bytes[ID_WIDTH + 9..]
+                    .try_into()
+                    .expect("eight end-time bytes"),
+            );
+            if ended_ms < started_ms {
+                return Err(ShardError::InvalidRow {
+                    path: path.to_owned(),
+                    row,
+                    field: "request interval",
+                    value: 0,
+                });
+            }
+            Ok(CorrelationWindowRow {
+                identity,
+                settlement,
+                started_ms,
+                ended_ms,
+            })
+        })
+        .collect()
+}
+
+fn intervals_overlap(interval: (u64, u64), window: (u64, u64)) -> bool {
+    interval.1 >= window.0 && interval.0 < window.1
+}
+
+fn symmetric_difference_rows(left: &[ExpectedRow], right: &[ExpectedRow]) -> u64 {
+    let (mut left_at, mut right_at, mut mismatches) = (0, 0, 0);
+    while left_at < left.len() || right_at < right.len() {
+        match (left.get(left_at), right.get(right_at)) {
+            (Some(left_row), Some(right_row)) if left_row == right_row => {
+                left_at += 1;
+                right_at += 1;
+            }
+            (Some(left_row), Some(right_row)) if left_row < right_row => {
+                mismatches += 1;
+                left_at += 1;
+            }
+            (Some(_), Some(_)) => {
+                mismatches += 1;
+                right_at += 1;
+            }
+            (Some(_), None) => {
+                mismatches += (left.len() - left_at) as u64;
+                break;
+            }
+            (None, Some(_)) => {
+                mismatches += (right.len() - right_at) as u64;
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    mismatches
 }
 
 fn read_observed_rows(path: &Path) -> Result<Vec<ObservedRow>, ShardError> {
@@ -829,29 +1147,30 @@ fn group_end_observed(rows: &[ObservedRow], start: usize) -> usize {
 fn compatible_pairs(expected: &[ExpectedRow], observed: &[ObservedRow]) -> u64 {
     const SOURCE: usize = 0;
     const ENDING_START: usize = 1;
-    const STATUS_START: usize = ENDING_START + 4;
+    const STATUS_START: usize = ENDING_START + 5;
     const SINK: usize = STATUS_START + 5;
     const NODES: usize = SINK + 1;
-    let mut endings = [0_u64; 4];
+    let mut settlements = [0_u64; 5];
     let mut statuses = [0_u64; 5];
     for row in expected {
-        endings[usize::from(ending_code(row.ending))] += 1;
+        settlements[usize::from(row.settlement.code())] += 1;
     }
     for row in observed {
         statuses[usize::from(row.status.code())] += 1;
     }
     let mut capacity = [[0_u64; NODES]; NODES];
-    for (index, count) in endings.into_iter().enumerate() {
+    for (index, count) in settlements.into_iter().enumerate() {
         capacity[SOURCE][ENDING_START + index] = count;
     }
     for (index, count) in statuses.into_iter().enumerate() {
         capacity[STATUS_START + index][SINK] = count;
     }
     let edge_capacity = expected.len().min(observed.len()) as u64;
-    for (ending_index, ending) in Ending::ALL.into_iter().enumerate() {
+    for (settlement_index, settlement) in ExpectedSettlement::ALL.into_iter().enumerate() {
         for (status_index, status) in ObservedStatus::ALL.into_iter().enumerate() {
-            if ending.settles(status.as_str()) {
-                capacity[ENDING_START + ending_index][STATUS_START + status_index] = edge_capacity;
+            if settlement.settles(status.as_str()) {
+                capacity[ENDING_START + settlement_index][STATUS_START + status_index] =
+                    edge_capacity;
             }
         }
     }
@@ -1097,6 +1416,99 @@ mod tests {
             (0, 0, 1)
         );
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fault_window_cancellation_keeps_its_narrow_concurrent_ending_set() {
+        let dir = test_dir("fault-window-cancellation");
+        let mut ledger = CorrelationLedger::create(&dir);
+        let identities = [trace(10), trace(11), trace(12)];
+        ledger
+            .record_cancelled_during_upstream_fault(identities[0])
+            .unwrap();
+        ledger
+            .record_cancelled_during_upstream_fault(identities[1])
+            .unwrap();
+        ledger
+            .record_expected(identities[2], Ending::Cancelled)
+            .unwrap();
+        ledger
+            .record_observed(&trace_text(identities[0]), "client_cancelled")
+            .unwrap();
+        ledger
+            .record_observed(&trace_text(identities[1]), "upstream_error")
+            .unwrap();
+        ledger
+            .record_observed(&trace_text(identities[2]), "upstream_error")
+            .unwrap();
+        let tally = ledger.tally().unwrap();
+        assert_eq!((tally.missing, tally.unexpected), (0, 0));
+        assert_eq!(tally.concurrent_endings, 2);
+        assert_eq!(
+            tally.status_mismatches, 1,
+            "only the ordinary cancellation must reject upstream_error"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn correlation_windows_exactly_prove_concurrent_ending_membership() {
+        let root = test_dir("correlation-window-membership");
+        let correlation_dir = root.join("correlations");
+        let window_dir = root.join("windows");
+        let mut correlations = CorrelationLedger::create(&correlation_dir);
+        let mut windows = CorrelationWindowLedger::create(&window_dir);
+        let identities = [trace(20), trace(21), trace(22)];
+        let workload_high = identities[0][..8].try_into().unwrap();
+
+        correlations
+            .record_cancelled_during_upstream_fault(identities[0])
+            .unwrap();
+        correlations
+            .record_expected(identities[1], Ending::Cancelled)
+            .unwrap();
+        correlations
+            .record_expected(identities[2], Ending::Complete)
+            .unwrap();
+        windows
+            .record(identities[0], Ending::Cancelled, 90, 110)
+            .unwrap();
+        windows
+            .record(identities[1], Ending::Cancelled, 201, 220)
+            .unwrap();
+        windows
+            .record(identities[2], Ending::Complete, 120, 130)
+            .unwrap();
+
+        let tally = windows
+            .tally(&mut correlations, workload_high, (100, 200))
+            .unwrap();
+        assert_eq!(tally.recorded, 3);
+        assert_eq!(tally.concurrent_endings, 1);
+        assert_eq!(tally.membership_mismatches, 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn correlation_windows_reject_a_forged_post_outage_code_four() {
+        let root = test_dir("forged-correlation-window-membership");
+        let mut correlations = CorrelationLedger::create(&root.join("correlations"));
+        let mut windows = CorrelationWindowLedger::create(&root.join("windows"));
+        let identity = trace(23);
+        let workload_high = identity[..8].try_into().unwrap();
+        correlations
+            .record_cancelled_during_upstream_fault(identity)
+            .unwrap();
+        windows
+            .record(identity, Ending::Cancelled, 201, 220)
+            .unwrap();
+
+        let tally = windows
+            .tally(&mut correlations, workload_high, (100, 200))
+            .unwrap();
+        assert_eq!(tally.concurrent_endings, 0);
+        assert_eq!(tally.membership_mismatches, 2);
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

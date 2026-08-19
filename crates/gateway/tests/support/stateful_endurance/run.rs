@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 
 use super::durable::{self, Durable, Reach};
 use super::fleet::{self, Deployment, Fleet, Revision};
@@ -35,7 +36,8 @@ use super::manifest::{
 use super::result::*;
 use crate::support::capacity::result::{Environment, Percentiles, Verdict};
 use crate::support::endurance::ledger::{
-    CorrelationLedger, CorrelationTally, IdentityPairLedger, IdentityPairTally, Ledger, Tally,
+    CorrelationLedger, CorrelationTally, CorrelationWindowLedger, CorrelationWindowTally,
+    IdentityPairLedger, IdentityPairTally, Ledger, Tally,
 };
 use crate::support::endurance::manifest::Ending;
 use crate::support::endurance::plan::{self, Planned, Tenant};
@@ -129,9 +131,9 @@ pub async fn run_with(
     scale.duration_ms = duration.as_millis() as u64;
 
     let upstream = FakeUpstream::start().await;
-    let upstream_gate = Gate::start(authority(&upstream.base_url)).await;
+    let upstream_gate = Arc::new(Gate::start(authority(&upstream.base_url)).await);
     let durable = Durable::create(&dsn, dispatch.stem).await;
-    let usage_gate = Gate::start(&durable.backend_authority()).await;
+    let usage_gate = Arc::new(Gate::start(&durable.backend_authority()).await);
     let (replica_dsn, reach) = durable.replica_dsn(&usage_gate.authority());
 
     let deployment = Deployment {
@@ -194,6 +196,8 @@ pub async fn run_with(
     let next = Arc::new(AtomicUsize::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let (tx, mut rx) = unbounded_channel();
+    let (gate_tx, mut gate_rx) = unbounded_channel();
+    let (gate_cancel_tx, gate_cancel_rx) = watch::channel(false);
 
     let sample_interval = Duration::from_millis(scale.sample_interval_ms.max(1));
     let booted: Vec<(String, u32)> = fleet
@@ -227,6 +231,27 @@ pub async fn run_with(
     }
     drop(tx);
 
+    // Fault-gate edges have their own timer. Convergence polling, readiness,
+    // tenant probes and rolling replacement are deliberately allowed to take
+    // time, but none of them may silently broaden a fault window. The
+    // supervisor consumes the exact actuation timestamps and still owns all
+    // artifact state.
+    // A spawned runtime task, rather than another future joined into the
+    // supervisor's task, keeps synchronous ledger or fleet work in one
+    // supervisor poll from delaying a due gate edge.
+    let gate_task = tokio::spawn(
+        FaultGateScheduler {
+            schedule: profile.schedule,
+            duration,
+            started,
+            upstream_gate: upstream_gate.clone(),
+            usage_gate: usage_gate.clone(),
+            reach,
+            tx: gate_tx,
+            cancel: gate_cancel_rx,
+        }
+        .run(),
+    );
     let stop = Supervisor {
         profile,
         slo,
@@ -234,9 +259,6 @@ pub async fn run_with(
         started,
         deadline: deadline.clone(),
         fleet: &mut fleet,
-        upstream_gate: &upstream_gate,
-        usage_gate: &usage_gate,
-        reach,
         client: &client,
         rotation: &rotation,
         offered: &next,
@@ -249,8 +271,12 @@ pub async fn run_with(
         policy_withdrawn: false,
         probe_index: 0,
     }
-    .run(&mut rx)
+    .run(&mut rx, &mut gate_rx)
     .await;
+    let _ = gate_cancel_tx.send(true);
+    gate_task
+        .await
+        .expect("the independent fault-gate scheduler must terminate successfully");
 
     stop_flag.store(true, Ordering::SeqCst);
     for worker in workers {
@@ -399,6 +425,23 @@ pub fn segment_ms(scale: &Scale, duration: Duration, min_segments: u64) -> u64 {
 pub fn touched(windows: &[(Duration, Duration)], at: Duration, latency_ms: f64) -> bool {
     let ended = at + Duration::from_secs_f64((latency_ms / 1000.0).max(0.0));
     windows.iter().any(|(from, to)| ended >= *from && at < *to)
+}
+
+/// The fixed-width integer interval retained for independent stateful
+/// correlation classification. Start is floored to the harness millisecond;
+/// duration is rounded up, so a sub-millisecond request never disappears.
+fn request_interval_ms(at: Duration, latency_ms: f64) -> (u64, u64) {
+    let started_ms = u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
+    let elapsed_ms = if latency_ms.is_finite() {
+        latency_ms.max(0.0).ceil() as u64
+    } else {
+        u64::MAX
+    };
+    (started_ms, started_ms.saturating_add(elapsed_ms))
+}
+
+fn intervals_overlap_ms(interval: (u64, u64), window: (u64, u64)) -> bool {
+    interval.1 >= window.0 && interval.0 < window.1
 }
 
 /// Whether a record or a drop report drained at `now` falls inside the declared
@@ -771,6 +814,110 @@ fn classify_usage_status(status: Option<&str>) -> Option<&'static str> {
 // The supervising loop
 // ---------------------------------------------------------------------------
 
+/// One fault-gate edge, timestamped only after the gate state changed. The
+/// supervisor may consume it later without changing what callers actually saw.
+#[derive(Debug, Clone, Copy)]
+struct AppliedGateEvent {
+    event: Event,
+    observed_at: Duration,
+    counts: GateCounts,
+    applied: bool,
+    late_by_ms: u64,
+}
+
+impl AppliedGateEvent {
+    /// Only a transition that changed a gate can have widened a measured fault
+    /// window. A remote usage backend is deliberately left untouched, so its
+    /// scheduled no-op remains diagnostic rather than invalidating the run.
+    fn missed_dispatch_bound(self, slack_ms: u64) -> bool {
+        self.applied && self.late_by_ms > slack_ms
+    }
+}
+
+/// Everything the independent fault-gate runtime task owns for one run.
+struct FaultGateScheduler {
+    schedule: super::manifest::Schedule,
+    duration: Duration,
+    started: Instant,
+    upstream_gate: Arc<Gate>,
+    usage_gate: Arc<Gate>,
+    reach: Reach,
+    tx: UnboundedSender<AppliedGateEvent>,
+    cancel: watch::Receiver<bool>,
+}
+
+impl FaultGateScheduler {
+    /// Apply fault gates from a timer that does not await fleet convergence or
+    /// probes. The supervisor remains the sole writer of evidence state; this
+    /// task sends exact actuation observations back in schedule order.
+    async fn run(mut self) {
+        for scheduled in self
+            .schedule
+            .resolve(self.duration)
+            .into_iter()
+            .filter(|scheduled| scheduled.event.is_gate_transition())
+        {
+            if *self.cancel.borrow() {
+                return;
+            }
+            let due = tokio::time::Instant::from_std(self.started + scheduled.at);
+            tokio::select! {
+                () = tokio::time::sleep_until(due) => {}
+                changed = self.cancel.changed() => {
+                    if changed.is_err() || *self.cancel.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+
+            let (counts, applied) = match scheduled.event {
+                Event::UpstreamLatencyBegins => {
+                    self.upstream_gate
+                        .set(Mode::Latency(self.schedule.upstream_latency_ms));
+                    (self.upstream_gate.counts(), true)
+                }
+                Event::UpstreamLatencyEnds | Event::UpstreamOutageEnds => {
+                    self.upstream_gate.set(Mode::Pass);
+                    (self.upstream_gate.counts(), true)
+                }
+                Event::UpstreamOutageBegins => {
+                    self.upstream_gate.set(Mode::Outage);
+                    (self.upstream_gate.counts(), true)
+                }
+                Event::UsageBackendOutageBegins if self.reach == Reach::Gated => {
+                    self.usage_gate.set(Mode::Outage);
+                    (self.usage_gate.counts(), true)
+                }
+                Event::UsageBackendOutageEnds if self.reach == Reach::Gated => {
+                    self.usage_gate.set(Mode::Pass);
+                    (self.usage_gate.counts(), true)
+                }
+                Event::UsageBackendOutageBegins | Event::UsageBackendOutageEnds => {
+                    (self.usage_gate.counts(), false)
+                }
+                _ => unreachable!("the fault-gate schedule contains only gate transitions"),
+            };
+            let observed_at = self.started.elapsed();
+            let late_by_ms = u64::try_from(observed_at.saturating_sub(scheduled.at).as_millis())
+                .unwrap_or(u64::MAX);
+            if self
+                .tx
+                .send(AppliedGateEvent {
+                    event: scheduled.event,
+                    observed_at,
+                    counts,
+                    applied,
+                    late_by_ms,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
 /// Drives the script, watches the fleet, and decides when the run stops.
 struct Supervisor<'a> {
     profile: &'a Profile,
@@ -779,9 +926,6 @@ struct Supervisor<'a> {
     started: Instant,
     deadline: Deadline,
     fleet: &'a mut Fleet,
-    upstream_gate: &'a Gate,
-    usage_gate: &'a Gate,
-    reach: Reach,
     client: &'a reqwest::Client,
     rotation: &'a Arc<std::sync::Mutex<Vec<String>>>,
     /// The workers' own live dispatch counter. The state tally is drained from
@@ -804,8 +948,17 @@ struct Supervisor<'a> {
 }
 
 impl Supervisor<'_> {
-    async fn run(&mut self, rx: &mut UnboundedReceiver<Attempt>) -> Stop {
-        let script = self.profile.schedule.resolve(self.duration);
+    async fn run(
+        &mut self,
+        rx: &mut UnboundedReceiver<Attempt>,
+        gate_rx: &mut UnboundedReceiver<AppliedGateEvent>,
+    ) -> Stop {
+        let script = self
+            .profile
+            .schedule
+            .resolve(self.duration)
+            .into_iter()
+            .filter(|scheduled| !scheduled.event.is_gate_transition());
         let mut due = script.into_iter().peekable();
         let mut last_drain = Instant::now();
         let mut last_readiness = Instant::now();
@@ -813,6 +966,27 @@ impl Supervisor<'_> {
 
         while !self.deadline.passed() {
             tokio::time::sleep(TICK).await;
+
+            if let Some(stop) = self.apply_gate_events(gate_rx) {
+                return stop;
+            }
+
+            // Non-gate events remain serial because they mutate the fleet or
+            // measure convergence. Fault gates are actuated independently and
+            // reported through `gate_rx`, so none of this awaited work can
+            // broaden a fault window.
+            while due
+                .peek()
+                .is_some_and(|scheduled| scheduled.at <= self.started.elapsed())
+            {
+                let scheduled = due.next().expect("the peeked event");
+                let event_now = self.started.elapsed();
+                self.event(scheduled.event, event_now).await;
+                if let Some(stop) = self.apply_gate_events(gate_rx) {
+                    return stop;
+                }
+            }
+
             let now = self.started.elapsed();
 
             if last_drain.elapsed() >= DRAIN_EVERY {
@@ -822,23 +996,105 @@ impl Supervisor<'_> {
             if last_readiness.elapsed() >= READINESS_EVERY {
                 last_readiness = Instant::now();
                 self.readiness(now).await;
+                if let Some(stop) = self.apply_gate_events(gate_rx) {
+                    return stop;
+                }
             }
             if last_probe.elapsed() >= PROBE_EVERY {
                 last_probe = Instant::now();
                 self.boundary_probes(now).await;
+                if let Some(stop) = self.apply_gate_events(gate_rx) {
+                    return stop;
+                }
             }
             self.state.maybe_close_segment(now);
 
-            while due.peek().is_some_and(|scheduled| scheduled.at <= now) {
-                let scheduled = due.next().expect("the peeked event");
-                self.event(scheduled.event, now).await;
-            }
-
-            if let Some(stop) = self.abort(now).await {
+            let abort_now = self.started.elapsed();
+            if let Some(stop) = self.abort(abort_now).await {
                 return stop;
             }
         }
+        if let Some(stop) = self.apply_gate_events(gate_rx) {
+            return stop;
+        }
         Stop::DurationElapsed
+    }
+
+    /// Fold independently actuated fault edges into the artifact. A tardy edge
+    /// invalidates and stops the run, but only after the exact transition and
+    /// reason have been recorded; `run_with` can therefore finalize and write
+    /// the diagnostic instead of losing twelve hours to a panic.
+    fn apply_gate_events(
+        &mut self,
+        gate_rx: &mut UnboundedReceiver<AppliedGateEvent>,
+    ) -> Option<Stop> {
+        let mut late = None;
+        while let Ok(applied) = gate_rx.try_recv() {
+            match applied.event {
+                Event::UpstreamLatencyBegins => {
+                    self.state
+                        .open_fault(applied.event, applied.observed_at, applied.counts)
+                }
+                Event::UpstreamLatencyEnds => self.state.close_fault(
+                    Event::UpstreamLatencyBegins,
+                    applied.observed_at,
+                    applied.counts,
+                ),
+                Event::UpstreamOutageBegins => {
+                    self.state.open_upstream_correlation_window();
+                    self.state
+                        .open_fault(applied.event, applied.observed_at, applied.counts);
+                }
+                Event::UpstreamOutageEnds => {
+                    self.state
+                        .close_upstream_correlation_window(applied.observed_at);
+                    self.state.close_fault(
+                        Event::UpstreamOutageBegins,
+                        applied.observed_at,
+                        applied.counts,
+                    );
+                }
+                Event::UsageBackendOutageBegins if applied.applied => {
+                    self.state
+                        .open_fault(applied.event, applied.observed_at, applied.counts)
+                }
+                Event::UsageBackendOutageEnds if applied.applied => self.state.close_fault(
+                    Event::UsageBackendOutageBegins,
+                    applied.observed_at,
+                    applied.counts,
+                ),
+                Event::UsageBackendOutageBegins | Event::UsageBackendOutageEnds => {
+                    self.state.note(
+                        applied.observed_at,
+                        applied.event.as_str(),
+                        "not evaluated: the configured database is not loopback, so the harness \
+                         leaves its remote DSN untouched",
+                    );
+                }
+                _ => unreachable!("the gate scheduler emits only gate transitions"),
+            }
+
+            if applied.missed_dispatch_bound(self.profile.schedule.event_dispatch_slack_ms) {
+                late = Some((applied.event, applied.observed_at, applied.late_by_ms));
+            }
+        }
+        late.map(|(event, observed_at, late_by_ms)| {
+            // Keep the stop explanation last even when several independently
+            // applied edges accumulated while the supervisor was awaiting a
+            // probe. Earlier edges have already been folded into the state, so
+            // the final diagnostic still agrees with what the gates did.
+            self.state.note(
+                self.started.elapsed().max(observed_at),
+                "event-dispatch-late",
+                &format!(
+                    "{} was applied {} ms after its committed offset, beyond the {} ms bound",
+                    event.as_str(),
+                    late_by_ms,
+                    self.profile.schedule.event_dispatch_slack_ms,
+                ),
+            );
+            Stop::EventDispatchLate
+        })
     }
 
     /// Take everything the workers and the replicas have produced since the
@@ -945,6 +1201,7 @@ impl Supervisor<'_> {
     }
 
     async fn event(&mut self, event: Event, now: Duration) {
+        debug_assert!(!event.is_gate_transition());
         match event {
             Event::CatalogueRevision => {
                 self.revision.catalogue = true;
@@ -989,55 +1246,13 @@ impl Supervisor<'_> {
                     ),
                 );
             }
-            Event::UpstreamLatencyBegins => {
-                self.upstream_gate
-                    .set(Mode::Latency(self.profile.schedule.upstream_latency_ms));
-                self.state
-                    .open_fault(event, now, self.upstream_gate.counts());
-            }
-            Event::UpstreamLatencyEnds => {
-                self.upstream_gate.set(Mode::Pass);
-                self.state.close_fault(
-                    Event::UpstreamLatencyBegins,
-                    now,
-                    self.upstream_gate.counts(),
-                );
-            }
-            Event::UpstreamOutageBegins => {
-                self.upstream_gate.set(Mode::Outage);
-                self.state
-                    .open_fault(event, now, self.upstream_gate.counts());
-            }
-            Event::UpstreamOutageEnds => {
-                self.upstream_gate.set(Mode::Pass);
-                self.state.close_fault(
-                    Event::UpstreamOutageBegins,
-                    now,
-                    self.upstream_gate.counts(),
-                );
-            }
-            Event::UsageBackendOutageBegins => {
-                if self.reach == Reach::Gated {
-                    self.usage_gate.set(Mode::Outage);
-                    self.state.open_fault(event, now, self.usage_gate.counts());
-                } else {
-                    self.state.note(
-                        now,
-                        event.as_str(),
-                        "not evaluated: the configured database is not loopback, so the \
-                         harness leaves its remote DSN untouched",
-                    );
-                }
-            }
-            Event::UsageBackendOutageEnds => {
-                if self.reach == Reach::Gated {
-                    self.usage_gate.set(Mode::Pass);
-                    self.state.close_fault(
-                        Event::UsageBackendOutageBegins,
-                        now,
-                        self.usage_gate.counts(),
-                    );
-                }
+            Event::UpstreamLatencyBegins
+            | Event::UpstreamLatencyEnds
+            | Event::UpstreamOutageBegins
+            | Event::UpstreamOutageEnds
+            | Event::UsageBackendOutageBegins
+            | Event::UsageBackendOutageEnds => {
+                unreachable!("fault-gate transitions use the independent scheduler")
             }
             Event::RollingRestart => self.rolling_restart(now).await,
         }
@@ -1287,6 +1502,7 @@ struct State {
     ttft: Reservoir,
     ledger: Ledger,
     correlations: CorrelationLedger,
+    correlation_windows: CorrelationWindowLedger,
     /// Every stdout-emitted request identity against every durable PostgreSQL
     /// row, over the whole run and outside the declared usage outage.
     durable_identities: IdentityPairLedger,
@@ -1299,6 +1515,7 @@ struct State {
     /// High trace word reserved for probes in this run. Exact correlation still
     /// proves whether each full trace was actually issued.
     probe_trace_high: [u8; 8],
+    workload_trace_high: [u8; 8],
     records_observed: u64,
     unidentified: u64,
     uncorrelated: u64,
@@ -1310,6 +1527,12 @@ struct State {
     /// one: a database this harness reaches directly cannot be taken away, so
     /// there is no window for a lost row to shelter in.
     usage_window: Option<(Duration, Duration)>,
+    /// The committed nominal opening minus its leading observer slack through
+    /// the instant the harness actually restores the gate. The deterministic
+    /// opening lets online accounting classify pre-open races exactly; the
+    /// observed close prevents the nominal schedule from ending attribution
+    /// while probes still hold the gate closed. It excludes recovery allowance.
+    upstream_fault_window: (u64, u64),
     fault_windows: Vec<(Duration, Duration)>,
     /// When the last usage record arrived, absent until the first one does.
     last_record_at: Option<Duration>,
@@ -1461,6 +1684,8 @@ impl State {
         seed: u64,
     ) -> Self {
         let probe_identity = plan::CorrelationId::new(seed ^ PROBE_CORRELATION_DOMAIN, 0).bytes();
+        let workload_identity = plan::CorrelationId::new(seed, 0).bytes();
+        let upstream_fault_window = schedule.upstream_correlation_window_ms(duration);
         Self {
             segment_ms: scale.segment_ms.max(1),
             segments: Vec::new(),
@@ -1480,6 +1705,9 @@ impl State {
             ttft: Reservoir::new(),
             ledger: Ledger::create(&dir.join(format!("{stem}-fingerprints"))),
             correlations: CorrelationLedger::create(&dir.join(format!("{stem}-correlations"))),
+            correlation_windows: CorrelationWindowLedger::create(
+                &dir.join(format!("{stem}-correlation-windows")),
+            ),
             durable_identities: IdentityPairLedger::create(
                 &dir.join(format!("{stem}-durable-identities")),
             ),
@@ -1488,6 +1716,9 @@ impl State {
             ),
             probe_ledger: Ledger::create(&dir.join(format!("{stem}-probe-fingerprints"))),
             probe_trace_high: probe_identity[..8]
+                .try_into()
+                .expect("a correlation identity has an eight-byte high word"),
+            workload_trace_high: workload_identity[..8]
                 .try_into()
                 .expect("a correlation identity has an eight-byte high word"),
             records_observed: 0,
@@ -1505,6 +1736,7 @@ impl State {
                 Injected::EveryDeclaredFault => Some(schedule.usage_outage_window(duration)),
                 Injected::UpstreamFaultsOnly => None,
             },
+            upstream_fault_window,
             fault_windows: schedule.attribution_windows_of(duration, injected),
             last_record_at: None,
             samplers: Vec::new(),
@@ -1622,9 +1854,20 @@ impl State {
         }
         if let Some(settlement) = attempt.outcome.settlement() {
             self.owed += 1;
-            self.correlations
-                .record_expected(attempt.correlation, settlement)
+            let interval = request_interval_ms(attempt.at, attempt.latency_ms);
+            self.correlation_windows
+                .record(attempt.correlation, settlement, interval.0, interval.1)
                 .expect("the stateful workload emits a valid trace identity");
+            let recorded = if settlement == Ending::Cancelled
+                && intervals_overlap_ms(interval, self.upstream_fault_window)
+            {
+                self.correlations
+                    .record_cancelled_during_upstream_fault(attempt.correlation)
+            } else {
+                self.correlations
+                    .record_expected(attempt.correlation, settlement)
+            };
+            recorded.expect("the stateful workload emits a valid trace identity");
         }
         self.latency.record(attempt.latency_ms);
         if let Some(ttft) = attempt.ttft_ms {
@@ -1814,6 +2057,13 @@ impl State {
     /// grading. In particular, an open readiness interval must be scored at
     /// the run's end even when no later probe observes recovery.
     fn finalize(&mut self, now: Duration) {
+        // An early stop can happen after the provider gate is cut but before
+        // its scheduled restoration. Close the diagnostic correlation window
+        // at the actual end instead of letting `u64::MAX` classify the whole
+        // tail as concurrent with an outage that no longer has observations.
+        if self.upstream_fault_window.1 == u64::MAX {
+            self.close_upstream_correlation_window(now);
+        }
         self.close_segment(now);
         self.close_readiness_gap(now);
     }
@@ -1957,6 +2207,29 @@ impl State {
             },
         });
         self.note(now, opened_by.as_str(), "lifted");
+    }
+
+    fn open_upstream_correlation_window(&mut self) {
+        assert_ne!(
+            self.upstream_fault_window.1,
+            u64::MAX,
+            "the upstream correlation window opens exactly once"
+        );
+        self.upstream_fault_window.1 = u64::MAX;
+    }
+
+    fn close_upstream_correlation_window(&mut self, now: Duration) {
+        assert_eq!(
+            self.upstream_fault_window.1,
+            u64::MAX,
+            "the upstream correlation window closes exactly once"
+        );
+        let closed_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+        assert!(
+            self.upstream_fault_window.0 < closed_ms,
+            "the observed upstream correlation window is non-empty"
+        );
+        self.upstream_fault_window.1 = closed_ms;
     }
 
     fn observe_retirement(&mut self, retired: &fleet::Retired, now: Duration) {
@@ -2168,10 +2441,13 @@ fn assemble(
         latency,
         ttft,
         ledger,
-        correlations,
+        mut correlations,
+        correlation_windows,
         durable_identities,
         durable_outside_identities,
         probe_ledger,
+        workload_trace_high,
+        upstream_fault_window,
         records_observed,
         unidentified,
         uncorrelated,
@@ -2213,9 +2489,16 @@ fn assemble(
     // run is live. Promotion derives their exact distinct count from the
     // retained all-emitted durable set minus the retained workload set, and
     // rejects any cross-collision. Leaving these unclaimed shards beside the
-    // four evidence ledgers would make the artifact set ambiguous.
+    // five evidence ledgers would make the artifact set ambiguous.
     std::fs::remove_dir_all(&probes.directory)
         .expect("the stateful probe scratch ledger is removable after tallying");
+    let correlation_window = correlation_windows
+        .tally(
+            &mut correlations,
+            workload_trace_high,
+            upstream_fault_window,
+        )
+        .expect("the stateful correlation-window ledger is readable and complete");
     let correlation = correlations
         .tally()
         .expect("the stateful trace correlation ledger is readable and complete");
@@ -2232,6 +2515,12 @@ fn assemble(
     let missing = correlation.missing;
     let unexpected_records = correlation.unexpected + uncorrelated;
     let unexpected_statuses = unexpected_statuses + correlation.status_mismatches;
+    let concurrent_ending_membership_mismatches =
+        correlation_window.membership_mismatches.saturating_add(
+            correlation
+                .concurrent_endings
+                .abs_diff(correlation_window.concurrent_endings),
+        );
     let loss = reconcile_exact_durable_loss(&durable_identity, &durable_outside_identity);
     let trend = trend(&segments, slo);
     let growth = resources
@@ -2269,6 +2558,11 @@ fn assemble(
         ),
         Verdict::at_most("unexpected_usage_records", unexpected_records as f64, 0.0),
         Verdict::at_most("unexpected_usage_statuses", unexpected_statuses as f64, 0.0),
+        Verdict::at_most(
+            "concurrent_ending_membership_mismatches",
+            concurrent_ending_membership_mismatches as f64,
+            0.0,
+        ),
         Verdict::at_most("unidentified_usage_records", unidentified as f64, 0.0),
         Verdict::at_most("uncorrelated_usage_records", uncorrelated as f64, 0.0),
         Verdict::at_most("refusal_usage_records", refusal_records as f64, 0.0),
@@ -2456,12 +2750,15 @@ fn assemble(
             missing,
             unexpected_records,
             unexpected_statuses,
+            concurrent_endings: correlation.concurrent_endings,
+            concurrent_ending_membership_mismatches,
             unidentified,
             uncorrelated,
             refusal_records,
             by_status,
             request_identities: identity_evidence(&tally),
             correlations: correlation_evidence(&correlation),
+            correlation_windows: correlation_window_evidence(&correlation_window),
             durable: durable.counts,
             durable_lag_ms: durable.settled.lag_ms,
             durable_settled: durable.settled.within_bound,
@@ -2483,6 +2780,16 @@ fn assemble(
 }
 
 fn identity_evidence(tally: &Tally) -> IdentityEvidence {
+    IdentityEvidence {
+        recorded: tally.recorded,
+        shards: tally.shards,
+        peak_shard_rows: tally.peak_shard_rows,
+        exact: tally.exact,
+        path: fleet::relative(&tally.directory),
+    }
+}
+
+fn correlation_window_evidence(tally: &CorrelationWindowTally) -> IdentityEvidence {
     IdentityEvidence {
         recorded: tally.recorded,
         shards: tally.shards,
@@ -2568,6 +2875,124 @@ fn readiness_gap_ms(since: Duration, ended: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skipped_remote_database_edge_cannot_fail_the_dispatch_bound() {
+        let counts = GateCounts {
+            accepted: 0,
+            refused: 0,
+            cut: 0,
+            delayed: 0,
+        };
+        let skipped = AppliedGateEvent {
+            event: Event::UsageBackendOutageBegins,
+            observed_at: Duration::from_secs(1),
+            counts,
+            applied: false,
+            late_by_ms: u64::MAX,
+        };
+        assert!(!skipped.missed_dispatch_bound(250));
+
+        let applied = AppliedGateEvent {
+            applied: true,
+            late_by_ms: 251,
+            ..skipped
+        };
+        assert!(applied.missed_dispatch_bound(250));
+        assert!(
+            !AppliedGateEvent {
+                late_by_ms: 250,
+                ..applied
+            }
+            .missed_dispatch_bound(250)
+        );
+    }
+
+    #[test]
+    fn concurrent_endings_use_the_committed_opening_and_observed_close() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "axond-stateful-endurance-concurrent-window-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the test clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&run_dir).expect("the window test directory is writable");
+
+        let (manifest, _) = crate::support::stateful_endurance::manifest::load();
+        let profile = &manifest.profiles[0];
+        let duration = Duration::from_millis(profile.smoke.duration_ms);
+        let mut state = State::new(
+            &run_dir,
+            "concurrent-window",
+            profile.smoke,
+            profile.schedule,
+            duration,
+            Injected::EveryDeclaredFault,
+            profile.seed,
+        );
+        let attributed = profile
+            .schedule
+            .attribution_windows_of(duration, Injected::UpstreamFaultsOnly)[0];
+
+        assert_eq!(state.upstream_fault_window, (24_950, 30_600));
+        state.open_upstream_correlation_window();
+        assert_eq!(state.upstream_fault_window.0, 24_950);
+        assert_eq!(state.upstream_fault_window.1, u64::MAX);
+        state.close_upstream_correlation_window(Duration::from_millis(30_780));
+        assert_eq!(state.upstream_fault_window.1, 30_780);
+        assert!(intervals_overlap_ms(
+            (30_650, 30_700),
+            state.upstream_fault_window
+        ));
+        assert!(!intervals_overlap_ms(
+            (30_780, 30_800),
+            state.upstream_fault_window
+        ));
+        assert!(u64::try_from(attributed.1.as_millis()).unwrap() > state.upstream_fault_window.1);
+
+        drop(state);
+        std::fs::remove_dir_all(&run_dir).expect("the window test directory is removable");
+    }
+
+    #[test]
+    fn finalization_closes_an_outage_window_left_open_by_an_early_stop() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "axond-stateful-endurance-open-window-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the test clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&run_dir).expect("the window test directory is writable");
+
+        let (manifest, _) = crate::support::stateful_endurance::manifest::load();
+        let profile = &manifest.profiles[0];
+        let duration = Duration::from_millis(profile.smoke.duration_ms);
+        let mut state = State::new(
+            &run_dir,
+            "open-window",
+            profile.smoke,
+            profile.schedule,
+            duration,
+            Injected::EveryDeclaredFault,
+            profile.seed,
+        );
+
+        state.open_upstream_correlation_window();
+        state.finalize(Duration::from_millis(30_720));
+        assert_eq!(state.upstream_fault_window, (24_950, 30_720));
+
+        // Finalization can run again after settlement without extending the
+        // observed outage or reclassifying more cancellations into it.
+        state.finalize(Duration::from_millis(31_000));
+        assert_eq!(state.upstream_fault_window, (24_950, 30_720));
+
+        drop(state);
+        std::fs::remove_dir_all(&run_dir).expect("the window test directory is removable");
+    }
 
     #[test]
     fn state_finalizes_an_open_readiness_gap_at_run_end() {
