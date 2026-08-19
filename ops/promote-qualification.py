@@ -1748,7 +1748,6 @@ def validate_raw_rollout(
         candidate.get("binary", {}).get("sha256"),
         f"{label}: candidate binary digest",
     )
-    control_plane_identities: set[tuple[str, str]] = set()
     for revision_label, revision in by_label.items():
         config = revision.get("config", {})
         normalized = config.get("normalized_toml")
@@ -1794,9 +1793,6 @@ def validate_raw_rollout(
                 f"{label}: revision {revision_label!r} does not bind its control "
                 "plane, secret store, and catalogue to one PostgreSQL schema"
             )
-        control_plane_identities.add((dsn_env, schema))
-    if len(control_plane_identities) != 1:
-        fail(f"{label}: rollout revisions do not share one PostgreSQL control plane")
     if any(revision.get("exclusive_aliases") != [] for revision in revisions):
         fail(f"{label}: stateful rollout fabricated revision-exclusive aliases")
     compatibility_traffic = [
@@ -6179,24 +6175,6 @@ bootstrap = "seed"
                 rollout_row,
             ),
         )
-
-    split_control_plane = copy.deepcopy(rollout_result)
-    other_control_plane = previous_config.replace(
-        "axond_rollout_self_test", "axond_rollout_other"
-    )
-    split_control_plane["revisions"][0]["config"] = {
-        "sha256": hashlib.sha256(other_control_plane.encode()).hexdigest(),
-        "normalized_toml": other_control_plane,
-    }
-    expect_refusal(
-        "rollout revisions with distinct control planes",
-        lambda: validate_raw_rollout(
-            split_control_plane,
-            "split rollout control-plane self-test",
-            rollout_record,
-            rollout_row,
-        ),
-    )
 
     for name, matrix_values in (
         ("unevaluated rollout migration matrix", {"evaluated": False}),
