@@ -77,8 +77,10 @@ upstream_outage_at = 0.28
 upstream_outage_for = 0.06
 # The client can finish immediately before the provider gate cuts while the
 # gateway observes and records the terminal upstream close immediately after.
-# This leading-only allowance is one 250 ms harness drain interval. It is not a
-# recovery allowance: the closing edge remains the raw outage endpoint.
+# This leading allowance is one 250 ms harness drain interval before the
+# committed nominal opening. The window closes at the observed instant the
+# supervisor restores the provider gate, which may trail the nominal schedule
+# while probes run. It does not extend to the later recovery-success allowance.
 upstream_outage_correlation_slack_ms = 250
 usage_backend_outage_at = 0.52
 usage_backend_outage_for = 0.06

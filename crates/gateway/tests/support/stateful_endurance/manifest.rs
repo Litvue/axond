@@ -176,11 +176,10 @@ pub struct Scheduled {
 }
 
 impl Schedule {
-    /// The exact integer window used for stateful cancellation correlation.
-    ///
-    /// Computing directly in milliseconds avoids asking the promoter to mimic
-    /// `Duration::mul_f64`'s nanosecond rounding before truncation. Python's
-    /// `int(duration_ms * fraction)` is the same non-negative floor operation.
+    /// The deterministic opening edge and nominal closing edge used to seed
+    /// stateful cancellation correlation before the provider gate is cut.
+    /// The supervisor replaces the closing edge with the observed restoration
+    /// timestamp while the run is live.
     pub fn upstream_correlation_window_ms(&self, duration: Duration) -> (u64, u64) {
         let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         let at = |fraction: f64| ((duration_ms as f64) * fraction.clamp(0.0, 1.0)).floor() as u64;

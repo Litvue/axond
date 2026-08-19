@@ -847,12 +847,21 @@ impl Supervisor<'_> {
             }
             self.state.maybe_close_segment(now);
 
-            while due.peek().is_some_and(|scheduled| scheduled.at <= now) {
+            while due
+                .peek()
+                .is_some_and(|scheduled| scheduled.at <= self.started.elapsed())
+            {
                 let scheduled = due.next().expect("the peeked event");
-                self.event(scheduled.event, now).await;
+                // Probes above may await for substantially longer than one
+                // tick. Stamp the gate transition when it actually happens,
+                // not with the pre-probe observation captured at the top of
+                // the loop.
+                let event_now = self.started.elapsed();
+                self.event(scheduled.event, event_now).await;
             }
 
-            if let Some(stop) = self.abort(now).await {
+            let abort_now = self.started.elapsed();
+            if let Some(stop) = self.abort(abort_now).await {
                 return stop;
             }
         }
@@ -1023,11 +1032,13 @@ impl Supervisor<'_> {
             }
             Event::UpstreamOutageBegins => {
                 self.upstream_gate.set(Mode::Outage);
+                self.state.open_upstream_correlation_window();
                 self.state
                     .open_fault(event, now, self.upstream_gate.counts());
             }
             Event::UpstreamOutageEnds => {
                 self.upstream_gate.set(Mode::Pass);
+                self.state.close_upstream_correlation_window(now);
                 self.state.close_fault(
                     Event::UpstreamOutageBegins,
                     now,
@@ -1330,11 +1341,11 @@ struct State {
     /// one: a database this harness reaches directly cannot be taken away, so
     /// there is no window for a lost row to shelter in.
     usage_window: Option<(Duration, Duration)>,
-    /// The raw upstream outage with only its committed leading attribution
-    /// slack. A caller can finish just before the gate cuts while the gateway
-    /// observes the terminal upstream error just after it; the leading slack
-    /// bounds that observer race. The closing edge has no recovery allowance,
-    /// so post-outage cancellations stay strict.
+    /// The committed nominal opening minus its leading observer slack through
+    /// the instant the harness actually restores the gate. The deterministic
+    /// opening lets online accounting classify pre-open races exactly; the
+    /// observed close prevents the nominal schedule from ending attribution
+    /// while probes still hold the gate closed. It excludes recovery allowance.
     upstream_fault_window: (u64, u64),
     fault_windows: Vec<(Duration, Duration)>,
     /// When the last usage record arrived, absent until the first one does.
@@ -2005,6 +2016,29 @@ impl State {
         self.note(now, opened_by.as_str(), "lifted");
     }
 
+    fn open_upstream_correlation_window(&mut self) {
+        assert_ne!(
+            self.upstream_fault_window.1,
+            u64::MAX,
+            "the upstream correlation window opens exactly once"
+        );
+        self.upstream_fault_window.1 = u64::MAX;
+    }
+
+    fn close_upstream_correlation_window(&mut self, now: Duration) {
+        assert_eq!(
+            self.upstream_fault_window.1,
+            u64::MAX,
+            "the upstream correlation window closes exactly once"
+        );
+        let closed_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+        assert!(
+            self.upstream_fault_window.0 < closed_ms,
+            "the observed upstream correlation window is non-empty"
+        );
+        self.upstream_fault_window.1 = closed_ms;
+    }
+
     fn observe_retirement(&mut self, retired: &fleet::Retired, now: Duration) {
         self.restart.flushed_on_exit += retired.flushed;
         self.restart.all_exits_clean &= retired.clean;
@@ -2650,7 +2684,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn concurrent_endings_use_only_the_committed_leading_edge_slack() {
+    fn concurrent_endings_use_the_committed_opening_and_observed_close() {
         let run_dir = std::env::temp_dir().join(format!(
             "axond-stateful-endurance-concurrent-window-{}-{}",
             std::process::id(),
@@ -2664,19 +2698,7 @@ mod tests {
         let (manifest, _) = crate::support::stateful_endurance::manifest::load();
         let profile = &manifest.profiles[0];
         let duration = Duration::from_millis(profile.smoke.duration_ms);
-        assert_eq!(
-            profile.schedule.upstream_correlation_window_ms(duration),
-            (24_950, 30_600)
-        );
-        let mut fractional = profile.schedule;
-        fractional.upstream_outage_at = 0.001;
-        fractional.upstream_outage_for = 0.002;
-        fractional.upstream_outage_correlation_slack_ms = 1;
-        assert_eq!(
-            fractional.upstream_correlation_window_ms(Duration::from_millis(1_001)),
-            (0, 3)
-        );
-        let state = State::new(
+        let mut state = State::new(
             &run_dir,
             "concurrent-window",
             profile.smoke,
@@ -2685,24 +2707,24 @@ mod tests {
             Injected::EveryDeclaredFault,
             profile.seed,
         );
-        let raw = profile
-            .schedule
-            .fault_windows_of(duration, Injected::UpstreamFaultsOnly)[0];
         let attributed = profile
             .schedule
             .attribution_windows_of(duration, Injected::UpstreamFaultsOnly)[0];
 
-        let raw_ms = (
-            u64::try_from(raw.0.as_millis()).unwrap(),
-            u64::try_from(raw.1.as_millis()).unwrap(),
-        );
-        assert_eq!(
-            state.upstream_fault_window.0,
-            raw_ms
-                .0
-                .saturating_sub(profile.schedule.upstream_outage_correlation_slack_ms)
-        );
-        assert_eq!(state.upstream_fault_window.1, raw_ms.1);
+        assert_eq!(state.upstream_fault_window, (24_950, 30_600));
+        state.open_upstream_correlation_window();
+        assert_eq!(state.upstream_fault_window.0, 24_950);
+        assert_eq!(state.upstream_fault_window.1, u64::MAX);
+        state.close_upstream_correlation_window(Duration::from_millis(30_780));
+        assert_eq!(state.upstream_fault_window.1, 30_780);
+        assert!(intervals_overlap_ms(
+            (30_650, 30_700),
+            state.upstream_fault_window
+        ));
+        assert!(!intervals_overlap_ms(
+            (30_780, 30_800),
+            state.upstream_fault_window
+        ));
         assert!(u64::try_from(attributed.1.as_millis()).unwrap() > state.upstream_fault_window.1);
 
         drop(state);

@@ -310,9 +310,10 @@ pub struct Usage {
     /// successful probe requests that owed a settlement.
     pub unexpected_records: u64,
     pub unexpected_statuses: u64,
-    /// Exact code-4 expectations whose cancellation lifetime touched the raw
-    /// upstream outage or its committed leading observer slack. Promotion
-    /// re-derives their complete membership from retained request timings.
+    /// Exact code-4 expectations whose cancellation lifetime touched the
+    /// committed upstream opening/slack through the observed gate restoration.
+    /// Promotion re-derives their complete membership from retained request
+    /// timings, the manifest, and the observed gate timestamps.
     pub concurrent_endings: u64,
     /// Symmetric difference between the expected correlation rows and the
     /// rows independently derived from original endings and request timings.

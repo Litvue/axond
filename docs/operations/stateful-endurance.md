@@ -142,8 +142,9 @@ take, written as it went. Fixed-width `.bin` shards under the paths named by
 holding a twelve-hour run in memory.
 Correlation expectation codes 0–3 retain the four ordinary endings. Code 4 is
 the explicit concurrent-ending set for a caller cancellation whose lifetime
-overlaps the raw upstream outage or its committed 250 ms leading observer
-slack (not its recovery allowance): the gateway may
+overlaps the committed upstream opening (including its 250 ms leading observer
+slack) through the observed gate restoration, but not its recovery allowance:
+the gateway may
 truthfully settle that request as `client_cancelled`, `partial`, or
 `upstream_error`, depending on which close it observes first. Outside that
 window an ordinary cancellation still rejects `upstream_error`; the special
@@ -151,11 +152,15 @@ code records the bounded race instead of weakening the status gate globally.
 The result reports the exact number of code-4 rows. The separate 33-byte timing
 rows retain each workload trace identity, its original ending, and its integer
 start/end milliseconds. Promotion independently re-derives every code-4 member
-from those rows and the committed upstream correlation window, then requires
-the derived multiset to equal the correlation expectations exactly. The
-leading-only slack covers a client that finishes just before the gate cuts but
-whose gateway observes the upstream close just after it; the closing edge stays
-at the raw outage endpoint. There is no request-rate or average-cancellation
+from those rows, the manifest's deterministic nominal opening and leading
+slack, and the observed gate-close timestamp in the raw fault artifact, then
+requires the derived multiset to equal the correlation expectations exactly.
+The opening remains deterministic so online accounting includes a client that
+finishes just before the gate cuts but whose gateway observes the upstream
+close just after it. The closing edge is the actual instant the supervisor
+restores the gate after any in-flight probes, so the nominal schedule cannot
+end the window while the fault is still active; it does not include the later
+recovery-success allowance. There is no request-rate or average-cancellation
 assumption for a bursty twelve-hour run.
 Writes keep at most 64 KiB buffered per shard group and open one shard file at
 a time. Terminal sorting is capped at 1,500,000 rows per shard (96 million rows
@@ -165,9 +170,10 @@ The compact writer refuses a missing, extra, or non-`.bin` shard and refuses a
 soak shorter than the manifest's committed duration. Promotion then parses the
 schema-3 result and re-hashes the schema-3 exact-ledger format; schema 3 adds the
 explicit fault-window cancellation code, its exact timing ledger, and the v2
-stateful digest domain described above. Manifest schema 2 commits the leading
-observer slack, which promotion derives with the same integer-millisecond
-arithmetic as the harness. Stateless endurance schema 4 remains on its v1
+stateful digest domain described above. Manifest schema 2 commits the opening
+and leading observer slack; promotion combines them with the raw artifact's
+observed gate timestamps and refuses a missing, duplicate, malformed, early,
+or empty outage window. Stateless endurance schema 4 remains on its v1
 digest domain and rejects code 4. Promotion parses the fixed-width rows
 independently: UUID/trace shape, shard placement, duplicates,
 expected/observed set differences, ending/status compatibility, and durable SQL

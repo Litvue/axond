@@ -599,7 +599,7 @@ impl CorrelationLedger {
     }
 
     /// Record the exact concurrent-ending set for a caller cancellation that
-    /// overlaps the raw declared upstream outage.
+    /// overlaps the committed opening through the observed gate restoration.
     ///
     /// Once the caller drops a stream, the client and gateway race to observe
     /// the caller cancellation versus the upstream's terminal error. Both
@@ -743,7 +743,7 @@ enum ObservedStatus {
 ///
 /// Codes 0-3 deliberately retain the historical `Ending` representation.
 /// Code 4 is only emitted for a caller cancellation whose lifetime overlaps
-/// the raw declared upstream outage.
+/// the committed opening through the observed gate restoration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ExpectedSettlement {
     Complete,

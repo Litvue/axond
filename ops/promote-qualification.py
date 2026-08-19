@@ -515,9 +515,9 @@ def stateful_correlation_tally(
 
 
 def stateful_correlation_window_ms(
-    duration_ms: int, schedule: dict[str, Any], label: str
+    duration_ms: int, faults: Any, schedule: dict[str, Any], label: str
 ) -> tuple[int, int]:
-    """Mirror the harness' non-negative floating multiply then ms floor."""
+    """Combine the committed opening edge with the observed gate restoration."""
     outage_at = schedule.get("upstream_outage_at")
     outage_for = schedule.get("upstream_outage_for")
     leading_slack_ms = schedule.get("upstream_outage_correlation_slack_ms")
@@ -536,16 +536,36 @@ def stateful_correlation_window_ms(
         or leading_slack_ms < 0
     ):
         fail(f"{label}: correlation-window schedule is malformed")
-    opened_ms = max(
-        0,
-        int(duration_ms * min(max(float(outage_at), 0.0), 1.0))
-        - leading_slack_ms,
+    if not isinstance(faults, list):
+        fail(f"{label}: observed fault windows are malformed")
+    outages = [
+        fault
+        for fault in faults
+        if isinstance(fault, dict) and fault.get("event") == "upstream-outage-begins"
+    ]
+    if len(outages) != 1:
+        fail(f"{label}: expected exactly one observed upstream outage")
+    observed = outages[0]
+    raw_opened_ms = observed.get("opened_ms")
+    closed_ms = observed.get("closed_ms")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in (raw_opened_ms, closed_ms)
+    ):
+        fail(f"{label}: observed upstream outage timestamps are malformed")
+    nominal_opened_ms = int(
+        duration_ms * min(max(float(outage_at), 0.0), 1.0)
     )
-    closed_ms = int(
+    nominal_closed_ms = int(
         duration_ms * min(max(float(outage_at + outage_for), 0.0), 1.0)
     )
+    if raw_opened_ms < nominal_opened_ms or closed_ms < nominal_closed_ms:
+        fail(f"{label}: observed upstream outage precedes its committed schedule")
+    if raw_opened_ms >= closed_ms:
+        fail(f"{label}: observed upstream gate interval is empty")
+    opened_ms = max(0, nominal_opened_ms - leading_slack_ms)
     if opened_ms >= closed_ms:
-        fail(f"{label}: upstream correlation window is empty")
+        fail(f"{label}: observed upstream correlation window is empty")
     return opened_ms, closed_ms
 
 
@@ -555,11 +575,12 @@ def stateful_correlation_window_tally(
     label: str,
     seed: int,
     duration_ms: int,
+    faults: Any,
     schedule: dict[str, Any],
 ) -> dict[str, int]:
     """Re-derive exact code-4 membership from retained request intervals."""
     opened_ms, closed_ms = stateful_correlation_window_ms(
-        duration_ms, schedule, label
+        duration_ms, faults, schedule, label
     )
 
     workload_high = (seed ^ CORRELATION_DOMAIN).to_bytes(8, "big")
@@ -2852,6 +2873,7 @@ def validate_raw_stateful_endurance(
         f"{label}: correlation windows",
         seed,
         profile.get("duration_ms"),
+        result.get("faults"),
         schedule,
     )
     durable_tally = stateful_identity_pair_tally(
@@ -5690,18 +5712,56 @@ def self_test() -> int:
         manifest_stateful_slo.setdefault("max_rss_drift_kib_per_hour", None)
         assert stateful_correlation_window_ms(
             90_000,
+            [
+                {
+                    "event": "upstream-outage-begins",
+                    "opened_ms": 25_200,
+                    "closed_ms": 30_700,
+                }
+            ],
             manifest_stateful_profile["schedule"],
-            "stateful window arithmetic self-test",
-        ) == (24_950, 30_600)
+            "stateful observed-window self-test",
+        ) == (24_950, 30_700)
         assert stateful_correlation_window_ms(
             1_001,
+            [
+                {
+                    "event": "upstream-outage-begins",
+                    "opened_ms": 1,
+                    "closed_ms": 3,
+                }
+            ],
             {
                 "upstream_outage_at": 0.001,
                 "upstream_outage_for": 0.002,
                 "upstream_outage_correlation_slack_ms": 1,
             },
-            "stateful fractional-ms arithmetic self-test",
+            "stateful saturating-slack self-test",
         ) == (0, 3)
+        expect_refusal(
+            "duplicate observed upstream outages",
+            lambda: stateful_correlation_window_ms(
+                1_001,
+                [
+                    {
+                        "event": "upstream-outage-begins",
+                        "opened_ms": 1,
+                        "closed_ms": 3,
+                    },
+                    {
+                        "event": "upstream-outage-begins",
+                        "opened_ms": 4,
+                        "closed_ms": 6,
+                    },
+                ],
+                {
+                    "upstream_outage_at": 0.001,
+                    "upstream_outage_for": 0.002,
+                    "upstream_outage_correlation_slack_ms": 1,
+                },
+                "duplicate observed-window self-test",
+            ),
+        )
         for field, value in manifest_stateful_scale.get("slo_overrides", {}).items():
             if value is not None:
                 manifest_stateful_slo[field] = value
@@ -5872,11 +5932,28 @@ def self_test() -> int:
                 )
             ],
             "faults": [
-                {"event": event, "recovered_ms": 0}
-                for event in (
-                    "upstream-latency-begins",
-                    "upstream-outage-begins",
-                    "usage-backend-outage-begins",
+                {
+                    "event": event,
+                    "opened_ms": opened_ms,
+                    "closed_ms": closed_ms,
+                    "recovered_ms": 0,
+                }
+                for event, opened_ms, closed_ms in (
+                    (
+                        "upstream-latency-begins",
+                        int(stateful_duration * 0.20) + 1,
+                        int(stateful_duration * 0.26) + 2,
+                    ),
+                    (
+                        "upstream-outage-begins",
+                        int(stateful_duration * 0.28) + 1,
+                        int(stateful_duration * 0.34) + 2,
+                    ),
+                    (
+                        "usage-backend-outage-begins",
+                        int(stateful_duration * 0.52) + 1,
+                        int(stateful_duration * 0.58) + 2,
+                    ),
                 )
             ],
             "restart": {
