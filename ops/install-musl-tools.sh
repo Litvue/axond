@@ -17,6 +17,8 @@ musl_is_available() {
 run_bounded_root() {
     # Run timeout as root with the package tool so it can terminate the complete
     # command on expiry. `sudo -n` makes a credential prompt fail immediately.
+    # GNU timeout's default creates a separate process group and covers command
+    # children too; do not add --foreground, which leaves children untimed.
     sudo -n env DEBIAN_FRONTEND=noninteractive \
         timeout --signal=TERM --kill-after="${APT_KILL_AFTER_SECONDS}s" \
         "${APT_TIMEOUT_SECONDS}s" "$@"
@@ -54,11 +56,9 @@ install_musl_tools() {
             echo "repairing any interrupted dpkg transaction before retry"
             if ! repair_dpkg; then
                 echo "dpkg repair failed on attempt ${attempt}/${APT_ATTEMPTS}" >&2
-            elif install_once && musl_is_available; then
-                echo "musl-tools installed successfully"
-                return 0
             fi
-        elif install_once && musl_is_available; then
+        fi
+        if install_once && musl_is_available; then
             echo "musl-tools installed successfully"
             return 0
         fi
@@ -99,8 +99,8 @@ self_test() {
         problems=1
     fi
 
-    # A transient first failure must retry once, apply the documented backoff,
-    # and require musl-gcc to exist before reporting success.
+    # A failed repair is diagnostic, not a consumed retry: apt must still run,
+    # apply the documented backoff, and require musl-gcc before success.
     attempts=0
     repairs=0
     sleeps=
@@ -113,6 +113,7 @@ self_test() {
     }
     repair_dpkg() {
         repairs=$((repairs + 1))
+        return 1
     }
     retry_sleep() {
         sleeps="${sleeps}${sleeps:+ }$1"
