@@ -16,12 +16,13 @@
 //! lost. They are taken from the process' stdout the moment it exits and kept
 //! with the fleet, so the loss ledger covers replicas that no longer exist.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::support::fault::collector::Collector;
 use crate::support::gateway::{Axond, alias};
 use crate::support::upstream::{FakeUpstream, target};
 
@@ -43,6 +44,11 @@ pub const NEXT_ONLY_ALIAS: &str = "chat-next-only";
 /// process is gone. Generous: it is only ever waited out when a reader thread
 /// is starved, and the alternative is a phantom lost usage record.
 const OUTPUT_SETTLE: Duration = Duration::from_secs(5);
+/// Five batch-processor intervals after the last rollout trace. The harness
+/// configures a 200 ms OTLP schedule, so a caller-domain set stable for this
+/// window is a settled exporter snapshot rather than the first expected subset.
+const TRACE_QUIESCENCE: Duration = Duration::from_secs(1);
+const ROLLOUT_TRACE_DOMAIN_PREFIX: &str = "61786f6e642d726f";
 
 /// Stateless failover bounds. Stateful mode rejects failover settings in its
 /// bootstrap TOML and the current desired-state schema has no deployment-wide
@@ -175,6 +181,9 @@ pub struct Replica {
     pub id: String,
     pub revision: Revision,
     pub process: Process,
+    /// Dedicated to this process, so no other replica can satisfy its trace
+    /// witness through a shared receiver.
+    pub collector: Collector,
 }
 
 impl Replica {
@@ -189,6 +198,7 @@ pub struct Retired {
     pub id: String,
     pub revision: Revision,
     pub usage_records: Vec<Value>,
+    pub collector: Collector,
 }
 
 pub struct Fleet {
@@ -200,6 +210,11 @@ pub struct Fleet {
     retired: Vec<Retired>,
     stateful: Option<StatefulDeployment>,
     started: usize,
+}
+
+pub struct TraceWitnessSnapshot {
+    pub exports: u64,
+    pub identities: BTreeSet<(String, String)>,
 }
 
 impl Fleet {
@@ -295,23 +310,48 @@ impl Fleet {
         } else {
             &self.candidate_binary
         };
-        let process = match &self.stateful {
-            Some(deployment) => {
-                Process::Stateful(deployment.start_replica(binary, self.shutdown).await)
-            }
-            None => Process::Stateless(
-                Axond::start_with_binary(
-                    &self.upstream.base_url,
-                    &revision.stateless_tuning(self.shutdown),
-                    binary,
-                )
-                .await,
+        let collector = Collector::start().await;
+        let telemetry_env = vec![
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_owned(),
+                collector.endpoint.clone(),
             ),
+            (
+                "OTEL_EXPORTER_OTLP_PROTOCOL".to_owned(),
+                "http/protobuf".to_owned(),
+            ),
+            ("OTEL_BSP_SCHEDULE_DELAY".to_owned(), "200".to_owned()),
+            ("OTEL_METRIC_EXPORT_INTERVAL".to_owned(), "1000".to_owned()),
+            ("RUST_LOG".to_owned(), "warn,axond=info".to_owned()),
+            ("AXOND_INSTANCE_ID".to_owned(), id.clone()),
+        ];
+        let process = match &self.stateful {
+            Some(deployment) => Process::Stateful(
+                deployment
+                    .start_replica(binary, self.shutdown, &telemetry_env)
+                    .await,
+            ),
+            None => {
+                let env = telemetry_env
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect::<Vec<_>>();
+                Process::Stateless(
+                    Axond::start_with_binary_and_env(
+                        &self.upstream.base_url,
+                        &revision.stateless_tuning(self.shutdown),
+                        binary,
+                        &env,
+                    )
+                    .await,
+                )
+            }
         };
         self.replicas.push(Replica {
             id,
             revision,
             process,
+            collector,
         });
         self.replicas.last().expect("the replica was pushed")
     }
@@ -372,6 +412,7 @@ impl Fleet {
             id: replica.id.clone(),
             revision: replica.revision,
             usage_records: usage_records.clone(),
+            collector: replica.collector,
         });
         Drained {
             id: replica.id,
@@ -416,6 +457,95 @@ impl Fleet {
     pub fn retired(&self) -> &[Retired] {
         &self.retired
     }
+
+    /// Total trace batches received across the replica-dedicated collectors.
+    pub fn trace_exports(&self) -> u64 {
+        self.collectors()
+            .map(|(_, collector)| {
+                collector
+                    .counts()
+                    .get("traces")
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .sum()
+    }
+
+    /// Every `(replica, trace_id)` decoded from the receiver dedicated to that
+    /// replica. The collector itself rejects a resource identity that does not
+    /// match the receiver owner.
+    pub fn trace_identities(&self) -> Result<BTreeSet<(String, String)>, String> {
+        let mut identities = BTreeSet::new();
+        for (replica, collector) in self.collectors() {
+            for trace_id in collector.trace_ids_for_instance(replica)? {
+                identities.insert((replica.to_owned(), trace_id));
+            }
+        }
+        Ok(identities)
+    }
+
+    /// Settle the complete caller-domain trace set. Once every expected trace
+    /// has arrived, the set must remain unchanged for several configured batch
+    /// intervals; the returned snapshot is the one serialized and judged.
+    /// Unrelated readiness and startup spans neither satisfy nor delay it.
+    pub async fn settle_trace_identities(
+        &self,
+        expected: &BTreeSet<(String, String)>,
+        within: Duration,
+    ) -> Result<TraceWitnessSnapshot, String> {
+        let mut snapshot = settle_identity_set(expected, within, TRACE_QUIESCENCE, || {
+            Ok(self
+                .trace_identities()?
+                .into_iter()
+                .filter(|(_, trace_id)| trace_id.starts_with(ROLLOUT_TRACE_DOMAIN_PREFIX))
+                .collect())
+        })
+        .await?;
+        snapshot.exports = self.trace_exports();
+        Ok(snapshot)
+    }
+
+    fn collectors(&self) -> impl Iterator<Item = (&str, &Collector)> {
+        self.replicas
+            .iter()
+            .map(|replica| (replica.id.as_str(), &replica.collector))
+            .chain(
+                self.retired
+                    .iter()
+                    .map(|replica| (replica.id.as_str(), &replica.collector)),
+            )
+    }
+}
+
+async fn settle_identity_set<F>(
+    expected: &BTreeSet<(String, String)>,
+    within: Duration,
+    quiescence: Duration,
+    mut observe: F,
+) -> Result<TraceWitnessSnapshot, String>
+where
+    F: FnMut() -> Result<BTreeSet<(String, String)>, String>,
+{
+    let deadline = Instant::now() + within;
+    let mut last = observe()?;
+    let mut unchanged_since = Instant::now();
+    loop {
+        let now = Instant::now();
+        let observed = observe()?;
+        if observed != last {
+            last = observed;
+            unchanged_since = now;
+        }
+        if (expected.is_subset(&last) && now.duration_since(unchanged_since) >= quiescence)
+            || now >= deadline
+        {
+            return Ok(TraceWitnessSnapshot {
+                exports: 0,
+                identities: last,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// What one replica's termination cost, and what it flushed on the way out.
@@ -447,6 +577,8 @@ pub mod pinned {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     const SHUTDOWN: ShutdownBounds = ShutdownBounds {
@@ -497,6 +629,53 @@ flush_timeout_ms = 300
                  input_microdollars_per_million = 2500000, \
                  output_microdollars_per_million = 10000000 }} }} ]\n"
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_settlement_retains_an_extra_identity_that_arrives_late() {
+        let expected_identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1"),
+        );
+        let extra_identity = (
+            "previous-0".to_owned(),
+            format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}2"),
+        );
+        let expected = [expected_identity.clone()].into_iter().collect();
+        let observed = Arc::new(Mutex::new(
+            [expected_identity].into_iter().collect::<BTreeSet<_>>(),
+        ));
+        let delayed = observed.clone();
+        let expected_extra = extra_identity.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            delayed
+                .lock()
+                .expect("trace test lock")
+                .insert(expected_extra);
+        });
+
+        let snapshot = settle_identity_set(
+            &expected,
+            Duration::from_millis(250),
+            Duration::from_millis(80),
+            || Ok(observed.lock().expect("trace test lock").clone()),
+        )
+        .await
+        .expect("the synthetic collector settles");
+
+        assert_eq!(
+            snapshot.identities,
+            [
+                (
+                    "previous-0".to_owned(),
+                    format!("{ROLLOUT_TRACE_DOMAIN_PREFIX}1")
+                ),
+                extra_identity,
+            ]
+            .into_iter()
+            .collect()
         );
     }
 }

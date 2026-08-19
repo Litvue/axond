@@ -132,7 +132,14 @@ fn validate_observation_artifact_schema(
         || observation.rollout_shared_stateful_revision.is_some()
         || observation.rollout_shared_alias.is_some()
         || observation.rollout_previous_serves_shared_alias.is_some()
-        || observation.rollout_candidate_serves_shared_alias.is_some();
+        || observation.rollout_candidate_serves_shared_alias.is_some()
+        || observation.rollout_usage_reconciliation.is_some()
+        || observation.rollout_exact_trace_replicas.is_some()
+        || observation.rollout_retained_trace_context.is_some()
+        || observation.rollout_otlp_trace_exports.is_some()
+        || observation.rollout_otlp_trace_export_replicas.is_some()
+        || observation.rollout_otlp_trace_identities.is_some()
+        || observation.rollout_otlp_trace_identities_sha256.is_some();
     if slice_id == SliceId::Rollout {
         let versions_complete = observation.rollout_previous_version.as_deref()
             == Some(ROLLOUT_PREVIOUS_VERSION)
@@ -157,13 +164,38 @@ fn validate_observation_artifact_schema(
             && observation.rollout_shared_alias.as_deref() == Some("chat")
             && observation.rollout_previous_serves_shared_alias == Some(true)
             && observation.rollout_candidate_serves_shared_alias == Some(true);
+        let usage_reconciliation_disclosed = observation.rollout_usage_reconciliation.as_deref()
+            == Some("exact_trace")
+            && observation
+                .rollout_exact_trace_replicas
+                .is_some_and(|count| count > 0)
+            && observation.rollout_retained_trace_context.as_deref() == Some("loopback_otlp_http")
+            && observation
+                .rollout_otlp_trace_exports
+                .zip(observation.rollout_exact_trace_replicas)
+                .is_some_and(|(exports, replicas)| exports >= u64::from(replicas))
+            && observation.rollout_otlp_trace_export_replicas
+                == observation.rollout_exact_trace_replicas
+            && observation
+                .rollout_otlp_trace_identities
+                .is_some_and(|count| count > 0)
+            && observation
+                .rollout_otlp_trace_identities_sha256
+                .as_deref()
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                });
         if !versions_complete
             || !digests_complete
             || !identities_distinct
             || !shared_stateful_serving
+            || !usage_reconciliation_disclosed
         {
             return Err(
-                "rollout observations require v0.3.40/v0.4.0 executable identities and both fleets serving the shared durable `chat` alias"
+                "rollout observations require v0.3.40/v0.4.0 executable identities, both fleets serving the shared durable `chat` alias, and exact-trace reconciliation with an OTLP witness"
                     .to_owned(),
             );
         }
@@ -398,6 +430,13 @@ fn generated_rollout_observation_fixture(
     observation.rollout_shared_alias = Some("chat".to_owned());
     observation.rollout_previous_serves_shared_alias = Some(true);
     observation.rollout_candidate_serves_shared_alias = Some(true);
+    observation.rollout_usage_reconciliation = Some("exact_trace".to_owned());
+    observation.rollout_exact_trace_replicas = Some(3);
+    observation.rollout_retained_trace_context = Some("loopback_otlp_http".to_owned());
+    observation.rollout_otlp_trace_exports = Some(3);
+    observation.rollout_otlp_trace_export_replicas = Some(3);
+    observation.rollout_otlp_trace_identities = Some(10);
+    observation.rollout_otlp_trace_identities_sha256 = Some("a".repeat(64));
     observation
 }
 
@@ -489,9 +528,9 @@ fn rollout_observations_require_the_current_artifact_schema() {
 }
 
 #[test]
-fn rollout_raw_and_compact_contracts_are_both_schema_three() {
-    assert_eq!(ROLLOUT_RESULT_SCHEMA_VERSION, 3);
-    assert_eq!(packet::ROLLOUT_RECORD_SCHEMA_VERSION, 3);
+fn rollout_raw_and_compact_contracts_are_both_schema_four() {
+    assert_eq!(ROLLOUT_RESULT_SCHEMA_VERSION, 4);
+    assert_eq!(packet::ROLLOUT_RECORD_SCHEMA_VERSION, 4);
 }
 
 #[test]
