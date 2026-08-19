@@ -557,6 +557,7 @@ change, not an implementation detail.
 
 **Fires on** any change under `.github/workflows/`, to `ops/publish-crates.sh`,
 `ops/docker-smoke.sh`, `ops/binary-smoke.py`, `ops/tier0-gate.sh`,
+`ops/install-musl-tools.sh`,
 `ops/publish-image-index.sh`, `ops/verify-image-evidence.sh`,
 `ops/msrv-gate.sh`, `ops/api-compat.py`, `install.sh`,
 `install.ps1`, the `Dockerfile`, or `deny.toml`; a new workflow, job permission,

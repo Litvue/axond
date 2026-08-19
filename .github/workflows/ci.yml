@@ -726,6 +726,10 @@ jobs:
           shellcheck ops/actionlint.sh
           ops/actionlint.sh --self-test
           ops/actionlint.sh
+      - name: Prove the musl installer is bounded and retrying
+        run: |
+          shellcheck ops/install-musl-tools.sh
+          bash ops/install-musl-tools.sh --self-test
 
   static-binary:
     name: Static musl binary
@@ -740,7 +744,8 @@ jobs:
         with:
           cache-targets: false
       - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        timeout-minutes: 25
+        run: bash ops/install-musl-tools.sh
       - name: Build the static single binary
         run: cargo build --release --locked --target x86_64-unknown-linux-musl -p axond
       - name: Assert the binary is statically linked
@@ -797,7 +802,8 @@ jobs:
           python-version: '3.12'
       - name: Install musl tools
         if: endsWith(matrix.target, '-unknown-linux-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        timeout-minutes: 25
+        run: bash ops/install-musl-tools.sh
       # The release profile is what ships: a debug binary would smoke different
       # code than the archives the installer downloads.
       - name: Build the release binary

@@ -236,6 +236,60 @@ def check_signer_identity(text: str, relative: str) -> list[str]:
     return failures
 
 
+def check_musl_installer(text: str, relative: str) -> list[str]:
+    """Every Linux-musl lane uses the same bounded package-manager path."""
+    expected_steps = {
+        ".github/workflows/ci.yml": 2,
+        ".github/workflows/release-please.yml": 1,
+    }
+
+    lines = text.splitlines()
+    blocks: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)- name:\s*Install musl tools\s*$", line)
+        if not match:
+            continue
+        indent = match.group(1)
+        end = index + 1
+        while end < len(lines) and not lines[end].startswith(f"{indent}- "):
+            end += 1
+        blocks.append((index + 1, "\n".join(lines[index:end])))
+
+    failures: list[str] = []
+    expected = expected_steps.get(relative)
+    if expected is not None and len(blocks) != expected:
+        failures.append(
+            f"{relative}: expected {expected} bounded musl install step(s), found "
+            f"{len(blocks)}"
+        )
+    for number, block in blocks:
+        if not re.search(
+            r"^\s*run:\s*bash ops/install-musl-tools\.sh\s*$", block, re.MULTILINE
+        ):
+            failures.append(
+                f"{relative}:{number}: musl install must use the shared bounded "
+                "ops/install-musl-tools.sh path"
+            )
+        timeout = re.search(r"^\s*timeout-minutes:\s*(\d+)\s*$", block, re.MULTILINE)
+        if not timeout or int(timeout.group(1)) != 25:
+            failures.append(
+                f"{relative}:{number}: musl install needs the reviewed 25-minute "
+                "outer timeout that its inner-budget self-test targets"
+            )
+        if re.search(r"^\s*continue-on-error:\s*true\s*$", block, re.MULTILINE):
+            failures.append(
+                f"{relative}:{number}: musl installation must remain fail-closed"
+            )
+
+    for number, line in enumerate(lines, 1):
+        if re.search(r"apt-get[^\n]*musl-tools", line):
+            failures.append(
+                f"{relative}:{number}: inline musl-tools installation bypasses the "
+                "shared timeout and retry policy"
+            )
+    return failures
+
+
 def check(root: Path) -> list[str]:
     files = workflows(root)
     if not files:
@@ -250,6 +304,7 @@ def check(root: Path) -> list[str]:
         failures.extend(check_permissions(text, relative))
         failures.extend(check_signer_identity(text, relative))
         failures.extend(check_cosign_verify(text, relative))
+        failures.extend(check_musl_installer(text, relative))
         for action, sha, comment, where in pins:
             first = seen.setdefault(action, (sha, comment, where))
             if first[0] != sha:
@@ -371,6 +426,89 @@ def self_test() -> list[str]:
         ),
     ]
     problems: list[str] = []
+
+    good_musl = (
+        "jobs:\n"
+        "  static:\n"
+        "    steps:\n"
+        "      - name: Install musl tools\n"
+        "        timeout-minutes: 25\n"
+        "        run: bash ops/install-musl-tools.sh\n"
+        "  smoke:\n"
+        "    steps:\n"
+        "      - name: Install musl tools\n"
+        "        if: matrix.musl\n"
+        "        timeout-minutes: 25\n"
+        "        run: bash ops/install-musl-tools.sh\n"
+    )
+    good_release_musl = (
+        "jobs:\n"
+        "  release:\n"
+        "    steps:\n"
+        "      - name: Install musl tools\n"
+        "        if: matrix.musl\n"
+        "        timeout-minutes: 25\n"
+        "        run: bash ops/install-musl-tools.sh\n"
+    )
+    musl_cases = [
+        ("shared bounded CI installers", ".github/workflows/ci.yml", good_musl, ""),
+        (
+            "a shared bounded release installer",
+            ".github/workflows/release-please.yml",
+            good_release_musl,
+            "",
+        ),
+        (
+            "an inline apt installer",
+            ".github/workflows/ci.yml",
+            good_musl.replace(
+                "run: bash ops/install-musl-tools.sh",
+                "run: sudo apt-get install -y musl-tools",
+                1,
+            ),
+            "shared bounded",
+        ),
+        (
+            "a missing outer timeout",
+            ".github/workflows/ci.yml",
+            good_musl.replace("        timeout-minutes: 25\n", "", 1),
+            "reviewed 25-minute",
+        ),
+        (
+            "an outer timeout shorter than the reviewed budget",
+            ".github/workflows/ci.yml",
+            good_musl.replace("        timeout-minutes: 25\n", "        timeout-minutes: 20\n", 1),
+            "reviewed 25-minute",
+        ),
+        (
+            "only one musl lane",
+            ".github/workflows/ci.yml",
+            good_musl.split("  smoke:\n", 1)[0],
+            "found 1",
+        ),
+        (
+            "a missing release musl lane",
+            ".github/workflows/release-please.yml",
+            "jobs:\n  release:\n    steps:\n",
+            "found 0",
+        ),
+        (
+            "an inline install in another workflow",
+            ".github/workflows/other.yml",
+            "jobs:\n  job:\n    steps:\n"
+            "      - run: sudo apt-get install -y musl-tools\n",
+            "inline musl-tools",
+        ),
+    ]
+    for description, relative, body, expected in musl_cases:
+        failures = check_musl_installer(body, relative)
+        if expected and not any(expected in failure for failure in failures):
+            problems.append(
+                f"self-test: {description} was not rejected for {expected!r}: {failures}"
+            )
+        if not expected and failures:
+            problems.append(f"self-test: {description} was rejected: {failures}")
+
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         directory = root / ".github" / "workflows"
