@@ -1229,6 +1229,7 @@ def check_stateful_endurance_exact(result: dict, workload: str) -> None:
         "correlations",
         "durable_identities",
         "durable_outside_identities",
+        "correlation_windows",
     ):
         evidence = usage.get(field, {})
         if evidence.get("exact") is not True or not evidence.get("path"):
@@ -1237,6 +1238,7 @@ def check_stateful_endurance_exact(result: dict, workload: str) -> None:
         "missing",
         "unexpected_records",
         "unexpected_statuses",
+        "concurrent_ending_membership_mismatches",
         "unidentified",
         "uncorrelated",
         "refusal_records",
@@ -1895,6 +1897,40 @@ def self_test() -> int:
             )
             assert len(parsed["observation"][0][f"{field}_sha256"]) == 64
         assert parsed["observation"][0]["samples_files"] == 2
+
+        inexact_correlation_windows = copy.deepcopy(stateful_result)
+        inexact_correlation_windows["usage"]["correlation_windows"]["exact"] = False
+        try:
+            render_generic(
+                [inexact_correlation_windows],
+                "stateful-endurance",
+                "soak",
+                "github-actions",
+                "inexact stateful correlation windows",
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("inexact stateful correlation-window evidence was accepted")
+
+        mismatched_correlation_windows = copy.deepcopy(stateful_result)
+        mismatched_correlation_windows["usage"][
+            "concurrent_ending_membership_mismatches"
+        ] = 1
+        try:
+            render_generic(
+                [mismatched_correlation_windows],
+                "stateful-endurance",
+                "soak",
+                "github-actions",
+                "mismatched stateful correlation windows",
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(
+                "stateful correlation-window membership mismatches were accepted"
+            )
 
         short_stateful = dict(stateful_result)
         short_stateful["profile"] = dict(stateful_result["profile"])
