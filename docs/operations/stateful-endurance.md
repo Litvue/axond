@@ -62,6 +62,9 @@ the allowance plus the slack rather than by the allowance alone. A test asserts
 every one of those separations at both durations. The separate
 `upstream_outage_correlation_slack_ms` widens only the provider outage's leading
 edge for exact cancellation/status correlation; it never extends recovery.
+The supervisor applies scripted transitions before network probes and
+`event_dispatch_slack_ms` bounds every observed transition after its nominal
+offset; missing that bound fails the run rather than silently widening a fault.
 
 | Tier | Duration | Concurrency | Sample interval | Segment |
 | --- | --- | --- | --- | --- |
@@ -158,10 +161,12 @@ requires the derived multiset to equal the correlation expectations exactly.
 The opening remains deterministic so online accounting includes a client that
 finishes just before the gate cuts but whose gateway observes the upstream
 close just after it. The closing edge is the actual instant the supervisor
-restores the gate after any in-flight probes, so the nominal schedule cannot
-end the window while the fault is still active; it does not include the later
-recovery-success allowance. There is no request-rate or average-cancellation
-assumption for a bursty twelve-hour run.
+restores the gate before that tick's probes, so the nominal schedule cannot end
+the window while the fault is still active. Both the harness and promotion
+require that timestamp to fall within the committed dispatch slack and run
+duration; an inflated raw timestamp is refused rather than widening code 4.
+The window does not include the later recovery-success allowance. There is no
+request-rate or average-cancellation assumption for a bursty twelve-hour run.
 Writes keep at most 64 KiB buffered per shard group and open one shard file at
 a time. Terminal sorting is capped at 1,500,000 rows per shard (96 million rows
 per ledger); exceeding that ceiling fails the run instead of allocating with
@@ -173,7 +178,7 @@ explicit fault-window cancellation code, its exact timing ledger, and the v2
 stateful digest domain described above. Manifest schema 2 commits the opening
 and leading observer slack; promotion combines them with the raw artifact's
 observed gate timestamps and refuses a missing, duplicate, malformed, early,
-or empty outage window. Stateless endurance schema 4 remains on its v1
+late, over-duration, or empty outage window. Stateless endurance schema 4 remains on its v1
 digest domain and rejects code 4. Promotion parses the fixed-width rows
 independently: UUID/trace shape, shard placement, duplicates,
 expected/observed set differences, ending/status compatibility, and durable SQL

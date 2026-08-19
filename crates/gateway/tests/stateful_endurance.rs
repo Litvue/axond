@@ -461,6 +461,34 @@ fn the_script_is_the_same_at_both_tiers() {
                     profile.id
                 );
             }
+            // Exact cancellation/status correlation has its own leading edge
+            // and a bounded observed close. It must contain the provider
+            // outage while clearing the adjacent declared faults even at the
+            // short tier; unlike recovery attribution, it may not spread into
+            // either neighbour.
+            let (correlation_from_ms, correlation_nominal_to_ms) =
+                profile.schedule.upstream_correlation_window_ms(duration);
+            let correlation_from = Duration::from_millis(correlation_from_ms);
+            let correlation_latest_to = Duration::from_millis(
+                correlation_nominal_to_ms.saturating_add(profile.schedule.event_dispatch_slack_ms),
+            );
+            let latency_latest_to = duration
+                .mul_f64(
+                    profile.schedule.upstream_latency_at + profile.schedule.upstream_latency_for,
+                )
+                .saturating_add(Duration::from_millis(
+                    profile.schedule.event_dispatch_slack_ms,
+                ));
+            assert!(
+                latency_latest_to <= correlation_from,
+                "{} [{label}]: the correlation opening overlaps provider latency",
+                profile.id
+            );
+            assert!(
+                correlation_from <= windows[0].0 && windows[0].1 <= correlation_latest_to,
+                "{} [{label}]: the correlation window does not contain the provider outage",
+                profile.id
+            );
             // Attribution runs past the end of each fault by the recovery
             // allowance, because a breaker tripped by a declared outage is
             // still open for its cooldown afterwards. The extended windows must
@@ -484,6 +512,11 @@ fn the_script_is_the_same_at_both_tiers() {
             // it, so the widened window has to clear every other fault's
             // attribution span too.
             let (usage_from, usage_to) = profile.schedule.usage_outage_window(duration);
+            assert!(
+                correlation_latest_to <= usage_from,
+                "{} [{label}]: the bounded correlation close overlaps the usage outage",
+                profile.id
+            );
             let usage_declared = windows.last().copied().expect("a usage outage window");
             for (from, to) in attributed
                 .iter()

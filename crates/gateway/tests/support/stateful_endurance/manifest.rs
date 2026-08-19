@@ -103,6 +103,9 @@ pub struct SloOverrides {
 /// the offered duration rather than offsets, so both tiers run the same script.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Schedule {
+    /// Maximum permitted delay between a committed event offset and the
+    /// supervisor actually applying that transition.
+    pub event_dispatch_slack_ms: u64,
     pub catalogue_revision_at: f64,
     pub credential_revision_at: f64,
     pub policy_revision_at: f64,

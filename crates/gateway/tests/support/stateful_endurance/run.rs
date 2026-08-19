@@ -831,6 +831,30 @@ impl Supervisor<'_> {
 
         while !self.deadline.passed() {
             tokio::time::sleep(TICK).await;
+
+            // Apply due transitions before any network probe can hold the
+            // supervisor past their committed boundary. The manifest still
+            // supplies a small upper bound for scheduler jitter, and a run
+            // that misses it is not valid qualification evidence.
+            while due
+                .peek()
+                .is_some_and(|scheduled| scheduled.at <= self.started.elapsed())
+            {
+                let scheduled = due.next().expect("the peeked event");
+                let event_now = self.started.elapsed();
+                let latest = scheduled.at.saturating_add(Duration::from_millis(
+                    self.profile.schedule.event_dispatch_slack_ms,
+                ));
+                assert!(
+                    event_now <= latest,
+                    "{} dispatched {} ms after its committed offset, beyond the {} ms bound",
+                    scheduled.event.as_str(),
+                    event_now.saturating_sub(scheduled.at).as_millis(),
+                    self.profile.schedule.event_dispatch_slack_ms,
+                );
+                self.event(scheduled.event, event_now).await;
+            }
+
             let now = self.started.elapsed();
 
             if last_drain.elapsed() >= DRAIN_EVERY {
@@ -846,19 +870,6 @@ impl Supervisor<'_> {
                 self.boundary_probes(now).await;
             }
             self.state.maybe_close_segment(now);
-
-            while due
-                .peek()
-                .is_some_and(|scheduled| scheduled.at <= self.started.elapsed())
-            {
-                let scheduled = due.next().expect("the peeked event");
-                // Probes above may await for substantially longer than one
-                // tick. Stamp the gate transition when it actually happens,
-                // not with the pre-probe observation captured at the top of
-                // the loop.
-                let event_now = self.started.elapsed();
-                self.event(scheduled.event, event_now).await;
-            }
 
             let abort_now = self.started.elapsed();
             if let Some(stop) = self.abort(abort_now).await {

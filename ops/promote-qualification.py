@@ -521,6 +521,7 @@ def stateful_correlation_window_ms(
     outage_at = schedule.get("upstream_outage_at")
     outage_for = schedule.get("upstream_outage_for")
     leading_slack_ms = schedule.get("upstream_outage_correlation_slack_ms")
+    dispatch_slack_ms = schedule.get("event_dispatch_slack_ms")
     if (
         not isinstance(duration_ms, int)
         or isinstance(duration_ms, bool)
@@ -534,6 +535,9 @@ def stateful_correlation_window_ms(
         or not isinstance(leading_slack_ms, int)
         or isinstance(leading_slack_ms, bool)
         or leading_slack_ms < 0
+        or not isinstance(dispatch_slack_ms, int)
+        or isinstance(dispatch_slack_ms, bool)
+        or dispatch_slack_ms < 0
     ):
         fail(f"{label}: correlation-window schedule is malformed")
     if not isinstance(faults, list):
@@ -561,6 +565,12 @@ def stateful_correlation_window_ms(
     )
     if raw_opened_ms < nominal_opened_ms or closed_ms < nominal_closed_ms:
         fail(f"{label}: observed upstream outage precedes its committed schedule")
+    if (
+        raw_opened_ms > nominal_opened_ms + dispatch_slack_ms
+        or closed_ms > nominal_closed_ms + dispatch_slack_ms
+        or closed_ms > duration_ms
+    ):
+        fail(f"{label}: observed upstream outage exceeds its dispatch bound")
     if raw_opened_ms >= closed_ms:
         fail(f"{label}: observed upstream gate interval is empty")
     opened_ms = max(0, nominal_opened_ms - leading_slack_ms)
@@ -5735,6 +5745,7 @@ def self_test() -> int:
                 "upstream_outage_at": 0.001,
                 "upstream_outage_for": 0.002,
                 "upstream_outage_correlation_slack_ms": 1,
+                "event_dispatch_slack_ms": 1,
             },
             "stateful saturating-slack self-test",
         ) == (0, 3)
@@ -5758,8 +5769,29 @@ def self_test() -> int:
                     "upstream_outage_at": 0.001,
                     "upstream_outage_for": 0.002,
                     "upstream_outage_correlation_slack_ms": 1,
+                    "event_dispatch_slack_ms": 1,
                 },
                 "duplicate observed-window self-test",
+            ),
+        )
+        expect_refusal(
+            "overlong observed upstream outage",
+            lambda: stateful_correlation_window_ms(
+                1_001,
+                [
+                    {
+                        "event": "upstream-outage-begins",
+                        "opened_ms": 1,
+                        "closed_ms": 5,
+                    }
+                ],
+                {
+                    "upstream_outage_at": 0.001,
+                    "upstream_outage_for": 0.002,
+                    "upstream_outage_correlation_slack_ms": 1,
+                    "event_dispatch_slack_ms": 1,
+                },
+                "overlong observed-window self-test",
             ),
         )
         for field, value in manifest_stateful_scale.get("slo_overrides", {}).items():
