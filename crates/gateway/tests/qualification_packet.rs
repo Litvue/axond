@@ -882,10 +882,10 @@ fn historical_debug_records_are_indexed_but_cannot_promote_a_slice() {
     let qualification = packet::load();
     let contract = packet::contract_text();
 
+    // Fault and recovery must be able to transition to active v0.4.0 evidence
+    // while these older debug records remain indexed for audit only.
     for id in [SliceId::Fault, SliceId::Recovery] {
         let slice = qualification.slice(id);
-        assert_eq!(slice.status, Status::Harnessed);
-        assert!(slice.retained.is_empty());
         assert_eq!(slice.historical.len(), 1);
         let historical = &slice.historical[0];
         assert!(contract.contains(historical));
