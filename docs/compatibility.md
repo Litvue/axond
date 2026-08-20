@@ -412,6 +412,39 @@ version 2 transition.
   than a control-plane resource, so it answers in either mode. See
   [administering a stateful deployment](./operations/admin-api.md).
 
+### Accepted stateful-v2 transition (not yet implemented)
+
+[ADR 0062](./adr/0062-blob-backed-flat-namespace-control-plane.md) accepts a
+breaking stateful redesign before the stateful surface above enters the `0.x`
+promise. The target uses blob-backed flat namespaces rather than durable
+tenants/projects/principals and mounts every provider-compatible route beneath
+`/namespaces/{namespace}` without changing its native suffix:
+
+```text
+/namespaces/{namespace}/v1/chat/completions
+/namespaces/{namespace}/v1/responses
+/namespaces/{namespace}/v1/embeddings
+/namespaces/{namespace}/v1/models
+/namespaces/{namespace}/v1/messages
+```
+
+An SDK changes only its base URL. OpenAI-compatible clients use a base ending
+in `/namespaces/{namespace}/v1`; Anthropic clients that append `/v1/messages`
+use one ending in `/namespaces/{namespace}`. Redirects are not a migration
+mechanism for authenticated or streaming `POST` requests.
+
+The implementation release must add these canonical routes and may retain the
+legacy direct `/v1/*` mount for at most one documented minor-release window as
+an opt-in stateless compatibility alias. Blob-backed stateful mode never serves
+an implicit namespace. A later breaking minor removes the alias. PostgreSQL
+configuration remains readable until the offline PostgreSQL-to-blob export and
+verification path has shipped for one release; there is no dual-write mode.
+
+Until that implementation lands, this section is a migration commitment rather
+than a claim about the current binary. The complete sequence and qualification
+reset are in the
+[namespace control-plane migration plan](./maintainers/namespace-control-plane-migration.md).
+
 ## Supported releases and who owns each matrix
 
 Four matrices decide what "supported" means, and each has one owner file so a

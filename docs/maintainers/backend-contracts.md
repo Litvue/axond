@@ -2,9 +2,23 @@
 
 Audience: contributors adding or implementing a stateful seam. This page is the
 map between [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md)
-and the code. Operators do not need it: nothing described here changes how a
-deployment is configured today, and no contract on this page has a durable
-implementation yet.
+and the code. Operators do not need it: this is the maintainer map of the
+implemented responsibility seams rather than deployment configuration.
+
+This page describes the current PostgreSQL stateful-v1 implementation boundary.
+[ADR 0062](../adr/0062-blob-backed-flat-namespace-control-plane.md) accepts the
+stateful-v2 target: the responsibility split remains, but durable desired state
+and sealed secrets move to a provider-neutral conditional object-store protocol
+and the domain becomes flat namespaces. Follow the
+[migration plan](./namespace-control-plane-migration.md); do not edit this table
+to claim an object-store implementation before its code and conformance suite
+land together.
+
+The provider-neutral `ObjectStore` primitive is intentionally narrower than a
+business responsibility: exact reads plus create/CAS writes are the publication
+and convergence path. `ObjectStoreMaintenance` is a separate background-only
+capability for native version-conditional ciphertext deletion after a durable
+tombstone. A backend may implement the former without claiming the latter.
 
 ## There is no universal state backend
 

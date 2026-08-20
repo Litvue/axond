@@ -82,62 +82,174 @@ async fn qualify(tier: Tier) {
 }
 
 #[test]
-fn stateful_smoke_is_explicitly_invoked_by_a_dedicated_ci_lane() {
+fn legacy_postgres_stateful_ci_requires_an_explicit_manual_opt_in() {
     let workflow = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
     )
     .expect("the CI workflow is committed");
-    let (shared, smoke) = workflow
-        .split_once("  stateful-endurance-smoke:")
-        .expect("CI has a dedicated stateful endurance smoke job");
-    for required in [
-        "  stateful-tests:\n    name: Stateful tests",
-        "AXOND_TEST_POSTGRES_DSN: postgres://",
-        "AXOND_TEST_REQUIRE_SERVICES: \"1\"",
-        "cargo test -p axond --all-features --locked",
-    ] {
+
+    let triggers = workflow
+        .split_once("permissions:")
+        .expect("CI declares workflow permissions")
+        .0;
+    for ordinary_event in ["  pull_request:", "  push:", "  merge_group:"] {
         assert!(
-            shared.contains(required),
-            "the shared Stateful tests lane no longer has its service contract: missing {required:?}"
+            triggers.contains(ordinary_event),
+            "ordinary software CI no longer handles {ordinary_event:?}"
         );
     }
     assert!(
-        !shared.contains("the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence"),
-        "the shared Stateful tests lane must not accidentally run the 90-second smoke tier"
+        !triggers.contains("\n  schedule:"),
+        "the CI workflow must not schedule the paused legacy PostgreSQL cohort"
     );
-    for required in [
-        "name: Stateful endurance smoke",
-        "the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence",
-        "AXOND_STATEFUL_ENDURANCE_SMOKE: \"1\"",
-        "name: Publish the stateful endurance smoke results",
-        "stateful-endurance-results-smoke",
+    for dispatch_contract in [
+        "      run_legacy_postgres_qualification:",
+        "        required: true",
+        "        default: false",
+        "        type: boolean",
     ] {
         assert!(
-            smoke.contains(required),
-            "the dedicated stateful endurance smoke lane is incomplete: missing {required:?}"
+            triggers.contains(dispatch_contract),
+            "legacy PostgreSQL qualification is missing dispatch contract {dispatch_contract:?}"
         );
     }
+
+    let guard = "${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}";
+    for (job, name) in [
+        (
+            "recovery-binary",
+            "Legacy PostgreSQL recovery qualification binary",
+        ),
+        ("stateful-tests", "Legacy PostgreSQL stateful tests"),
+        (
+            "stateful-endurance-smoke",
+            "Legacy PostgreSQL stateful endurance smoke",
+        ),
+        ("restore-drill", "Legacy PostgreSQL restore and PITR drill"),
+        (
+            "stateful-deploy-drill",
+            "Legacy PostgreSQL stateful deploy drill (three nodes)",
+        ),
+        (
+            "stateful-persistent-drill",
+            "Legacy PostgreSQL StatefulSet PVC drill (three nodes)",
+        ),
+    ] {
+        let guarded_job = format!("  {job}:\n    name: {name}\n    if: {guard}");
+        assert!(
+            workflow.contains(&guarded_job),
+            "legacy PostgreSQL job {job:?} must remain visibly legacy and manual-only"
+        );
+    }
+    let aggregate_guard = "${{ always() && github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}";
+    assert!(
+        workflow.contains(&format!(
+            "  recovery-record:\n    name: Build the legacy PostgreSQL recovery qualification record\n    if: {aggregate_guard}"
+        )),
+        "the legacy recovery aggregate must remain behind the exact manual opt-in guard"
+    );
+
+    // These were the old default-on contracts. Their return would make an
+    // ordinary pull request spend runners on the superseded PostgreSQL path.
+    assert!(
+        !workflow.contains("\n    name: Stateful tests\n"),
+        "the unqualified, default-on Stateful tests job name returned"
+    );
+    assert!(
+        !workflow.contains("\n    name: Stateful endurance smoke\n"),
+        "the unqualified, default-on stateful endurance job name returned"
+    );
 }
 
 #[test]
-fn stateful_soak_lane_publishes_a_qualification_record() {
+fn github_endurance_is_bounded_smoke_without_record_promotion() {
     let workflow = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/endurance.yml"),
     )
     .expect("the Endurance workflow is committed");
-    let (_, stateful) = workflow
-        .split_once("  stateful-endurance:\n")
-        .expect("the workflow has a stateful endurance lane");
-    for required in [
-        "name: Build the stateful endurance qualification record",
-        "--slice stateful-endurance --tier soak",
-        "stateful-endurance-soak.toml",
-        "name: qualification-record-stateful-endurance",
-        "retention-days: 90",
+
+    let triggers = workflow
+        .split_once("permissions:")
+        .expect("Endurance declares workflow permissions")
+        .0;
+    assert!(triggers.contains("  workflow_dispatch:"));
+    for dispatch_contract in [
+        "      run_stateless_endurance_smoke:",
+        "        required: true",
+        "        default: false",
+        "        type: boolean",
     ] {
         assert!(
-            stateful.contains(required),
-            "the stateful endurance lane does not retain a compact qualification record: missing {required:?}"
+            triggers.contains(dispatch_contract),
+            "stateless endurance smoke is missing dispatch contract {dispatch_contract:?}"
+        );
+    }
+    for automatic_event in ["  pull_request:", "  push:", "  schedule:"] {
+        assert!(
+            !triggers.contains(automatic_event),
+            "GitHub endurance must not run from {automatic_event:?}"
+        );
+    }
+
+    assert_eq!(
+        workflow.matches("    timeout-minutes: 15").count(),
+        2,
+        "both and only the two GitHub endurance smoke jobs need the hard 15-minute bound"
+    );
+    for smoke_entry_point in [
+        "the_endurance_smoke_tier_qualifies_and_publishes_its_evidence",
+        "the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence",
+    ] {
+        assert!(
+            workflow.contains(smoke_entry_point),
+            "GitHub endurance lost bounded smoke entry point {smoke_entry_point:?}"
+        );
+    }
+    let legacy_guard = "${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}";
+    let stateless_guard = "${{ github.event_name == 'workflow_dispatch' && inputs.run_stateless_endurance_smoke == true }}";
+    assert!(
+        workflow.contains(&format!(
+            "  endurance:\n    name: Mixed-workload endurance smoke\n    if: {stateless_guard}"
+        )),
+        "the stateless smoke job must require an explicit manual opt-in"
+    );
+    assert!(
+        workflow.contains(&format!(
+            "  stateful-endurance:\n    name: Legacy PostgreSQL stateful endurance smoke\n    if: {legacy_guard}"
+        )),
+        "the PostgreSQL stateful smoke job must require the explicit legacy opt-in"
+    );
+
+    // GitHub uploads raw smoke diagnostics only. A soak entry point, duration
+    // override, or compact-record builder would falsely promote a bounded
+    // harness check into production qualification evidence.
+    for forbidden in [
+        "_soak_tier_",
+        "ENDURANCE_DURATION_MS",
+        "43200000",
+        "qualification-evidence.py",
+        "promote-qualification.py",
+        "qualification-record",
+        "--tier soak",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "GitHub endurance regained forbidden soak/record marker {forbidden:?}"
+        );
+    }
+
+    let justfile =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../justfile"))
+            .expect("the off-platform qualification recipes are committed");
+    for off_platform_recipe in [
+        "endurance duration_ms=\"\":",
+        "AXOND_ENDURANCE=1 AXOND_ENDURANCE_DURATION_MS=",
+        "stateful-endurance duration_ms=\"\":",
+        "AXOND_STATEFUL_ENDURANCE=1 AXOND_STATEFUL_ENDURANCE_DURATION_MS=",
+    ] {
+        assert!(
+            justfile.contains(off_platform_recipe),
+            "the off-platform soak contract lost recipe {off_platform_recipe:?}"
         );
     }
 }

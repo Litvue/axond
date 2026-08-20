@@ -1,0 +1,26 @@
+# ADR 0062 blob-backed stateful configuration contract.
+#
+# This file is parsed by configuration tests, but is not yet a runnable Compose
+# deployment: object-store publication, convergence, and encrypted-secret
+# runtime wiring remain pending, and `axond check preflight` fails its serving
+# posture until they land. It intentionally names no PostgreSQL service, DSN,
+# schema, migration switch, account key, access token, or SAS query.
+
+mode = "stateful"
+
+[server]
+bind = "0.0.0.0:8080"
+
+[control_plane]
+backend = "object-storage"
+environment_id = "prod-us-east"
+container_url = "https://axondstate.blob.core.windows.net/control-plane"
+authentication = "workload-identity"
+connect_timeout_ms = 5000
+operation_timeout_ms = 30000
+max_object_bytes = 16777216
+max_read_bytes = 16777216
+max_write_bytes = 16777216
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"

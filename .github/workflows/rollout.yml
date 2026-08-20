@@ -8,10 +8,14 @@ name: Rollout
 # rollback fence is evaluated rather than recorded as skipped.
 on:
   workflow_dispatch:
-  schedule:
-    # Sundays, 07:23 UTC — after the capacity run, so the two do not share a
-    # runner: a rollout measured against a contended host measures the host.
-    - cron: '23 7 * * 0'
+    inputs:
+      run_legacy_postgres_qualification:
+        description: >-
+          Run the historical PostgreSQL stateful-v1 rollout qualification. It
+          does not qualify ADR 0062's blob-backed stateful-v2 target.
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -30,7 +34,8 @@ env:
 
 jobs:
   candidate:
-    name: Candidate freeze guard
+    name: Legacy PostgreSQL candidate freeze guard
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
     runs-on: ubuntu-latest
     outputs:
       ready: ${{ steps.version.outputs.ready }}
@@ -45,18 +50,15 @@ jobs:
           test -n "$candidate_version"
           if [[ "$candidate_version" == "$EXPECTED_CANDIDATE_VERSION" ]]; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
-          elif [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping scheduled rollout until the frozen $EXPECTED_CANDIDATE_VERSION candidate exists (workspace is $candidate_version)"
           else
             echo "manual rollout requires candidate $EXPECTED_CANDIDATE_VERSION; workspace is $candidate_version" >&2
             exit 1
           fi
 
   rollout:
-    name: Heavy rollout scenarios
+    name: Legacy PostgreSQL heavy rollout scenarios
     needs: candidate
-    if: needs.candidate.outputs.ready == 'true'
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true && needs.candidate.outputs.ready == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     services:

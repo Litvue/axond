@@ -54,26 +54,55 @@ runs, and that the drift gates need a run long enough to have a slope.
 
 ## Run it
 
+GitHub Actions smoke jobs have a hard **15-minute job timeout**. They invoke
+only the committed smoke entry point, expose no duration override, produce no
+promotable soak record, and exist to prove the harness still works. The smoke
+workload itself is 15 seconds; the rest of the job budget covers a cached
+release build, terminal settlement, and artifact upload.
+
+Long-soak qualification runs outside GitHub Actions on a dedicated Linux host.
+Start from the exact frozen candidate commit, use a release build, reserve the
+host for Axond, and retain the raw JSON, sample series, request/correlation
+ledgers, binary digest, manifest digest, and machine identity. The committed
+12-hour run is:
+
 ```bash
 # The smoke tier, the sequential two-tier regression, and the deterministic
 # checks. Part of the normal suite; also runs in CI.
 cargo test --locked --all-features --test endurance -- \
   --nocapture --test-threads=1
 
-# The soak tier: twelve hours, by name. The rest of the binary already ran in
-# the suite, and offering its load again here would only contend with the soak.
+# Off-platform only: the soak tier, twelve hours, by name. The rest of the
+# binary already ran in the suite, and offering its load again here would only
+# contend with the soak.
 just endurance
 
-# A shorter dispatched run — forty minutes here. The override applies to the
-# soak tier alone, so the smoke tier in the same binary keeps its committed
-# fifteen seconds. Segments shrink to match, so the run still produces the
-# segments the trend gates are evaluated over.
+# Off-platform diagnostic only: a shorter forty-minute run. The override
+# applies to the soak tier alone, so the smoke tier keeps its committed fifteen
+# seconds. This cannot be promoted as twelve-hour qualification evidence.
 just endurance 2400000
 ```
 
-The `Endurance` workflow runs the soak tier monthly and on dispatch (with an
-optional duration override) and uploads both the result and its time series. It
-invokes the soak test by name for the same reason `just endurance` does.
+After the off-platform run, build and verify its compact record against the raw
+artifacts before retaining it with the frozen cohort:
+
+```bash
+python3 ops/qualification-evidence.py target/endurance/soak \
+  --slice endurance --tier soak --runner dedicated-qualification \
+  --note "dedicated Linux qualification host, twelve-hour endurance soak" \
+  --out target/qualification-records/endurance-soak.toml
+python3 ops/promote-qualification.py \
+  target/qualification-records/endurance-soak.toml \
+  --artifacts target/endurance/soak \
+  --out target/qualification-records/validated-endurance-soak.toml
+```
+
+The manually dispatched `Endurance smoke` Actions workflow requires the
+`run_stateless_endurance_smoke=true` input to run the stateless job. This keeps
+a manual legacy-only dispatch from placing the stateless smoke on the
+self-hosted qualification runner. The workflow runs only the same short smoke
+tier already exercised by ordinary CI and uploads diagnostic smoke artifacts.
+It is deliberately incapable of producing the soak-tier record above.
 
 ## What the harness holds while it runs
 

@@ -4,6 +4,47 @@ What has actually been measured about running Axond in production, what has only
 been declared or harnessed, and what has not yet been retained — in one place, so the difference
 between a merged harness and an answered question stays visible.
 
+> **Architecture transition:**
+> [ADR 0062](../adr/0062-blob-backed-flat-namespace-control-plane.md) accepts a
+> blob-backed flat-namespace stateful-v2 topology. Do not dispatch the current
+> PostgreSQL stateful-v1 cohort as production evidence for that target. The
+> manifests and historical records below remain truthful for their source and
+> topology; the
+> [migration plan](../maintainers/namespace-control-plane-migration.md) defines
+> how every slice must be re-cut before qualification restarts.
+>
+> The blob-backed stateful-v2 gates remain **pending**. A green `CI Success`
+> proves the active software-change checks passed; it does not promote skipped
+> PostgreSQL evidence into blob-backed qualification. Ordinary pull requests,
+> pushes, merge queues, and schedules cannot start the legacy PostgreSQL cohort.
+
+## Paused legacy PostgreSQL workflows
+
+The PostgreSQL stateful-v1 lanes are retained only for deliberate compatibility
+investigations. Each invocation must opt in explicitly; omitting the input or
+setting it to false skips every legacy job:
+
+```bash
+gh workflow run ci.yml --ref <branch> \
+  -f run_legacy_postgres_qualification=true
+gh workflow run endurance.yml --ref <branch>
+gh workflow run endurance.yml --ref <branch> \
+  -f run_legacy_postgres_qualification=true
+gh workflow run endurance.yml --ref <branch> \
+  -f run_stateless_endurance_smoke=true
+gh workflow run rollout.yml --ref <branch> \
+  -f run_legacy_postgres_qualification=true
+```
+
+The `CI` opt-in covers the historical PostgreSQL stateful tests, restore/PITR,
+recovery-record assembly, stateful endurance smoke, and both PostgreSQL-backed
+Kubernetes stateful/PVC drills. The endurance and rollout workflows have no
+schedule. The `Endurance smoke` workflow requires an explicit
+`run_stateless_endurance_smoke=true` or `run_legacy_postgres_qualification=true`
+input, exposes no duration input, and applies a hard 15-minute timeout to both
+smoke jobs. Full stateless and target-topology long soaks run on dedicated
+qualification infrastructure outside GitHub Actions.
+
 Production qualification ([#156](https://github.com/Litvue/axond/issues/156))
 decomposes into six slices. They landed, and will land, at different depths:
 
@@ -78,10 +119,13 @@ Freeze the cohort in this order:
    the frozen object that produced the candidate binaries.
 5. Merge the release PR only after the pre-tag publication test is green.
 
-Fault and recovery evidence comes from a manual `CI` workflow dispatch on the
-frozen release branch. Pull-request CI still tests GitHub's synthetic merge ref,
-which is the right merge gate but not the candidate head named by the cohort;
-its generated records are diagnostic and cannot be promoted into that cohort.
+Historical PostgreSQL fault and recovery evidence can be reproduced only by a
+manual `CI` workflow dispatch on the frozen source with
+`run_legacy_postgres_qualification=true`. Pull-request CI still tests GitHub's
+synthetic merge ref, which is the right software-change gate, but it neither
+starts those legacy lanes nor produces target-topology evidence. The ADR 0062
+cohort needs new blob-backed fault and recovery workflows before qualification
+can restart.
 
 The `axond-qualification` self-hosted runner label is also a provisioning
 contract: it names a Linux x86_64 host with a running Docker Engine capable of

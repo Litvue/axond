@@ -1,36 +1,32 @@
-name: Endurance
+name: Endurance smoke
 
-# The long mixed-workload soak: three tenants over two providers and both wire
-# families, buffered and streamed, ending in success, caller cancellation, an
-# upstream that dies mid-stream, and an upstream that refuses. The same driver,
-# manifest, and assertions the `CI` workflow runs at the smoke scale, offered
-# for long enough that a leak has somewhere to show.
+# GitHub Actions exercises only the short harness tiers. Both jobs have a hard
+# 15-minute job timeout, and the workflow exposes no duration input, so it
+# cannot become an hours-long soak through dispatch. Full endurance
+# qualification runs on dedicated off-platform infrastructure as documented in
+# docs/operations/endurance.md.
 #
-# What it gates on does not move with the runner: balanced descriptors, no
-# upstream socket outliving its caller, exactly one usage record per dispatched
-# request, and resident memory that does not trend upwards. Throughput and
-# latency are recorded and never asserted.
-#
-# The second job is the stateful tier of the same question (issue #221): the
-# mixed workload offered to a fleet of replicas backed by a real database while
-# the catalogue, the credential pool, tenant policy, the provider, the database,
-# and the processes themselves all change underneath it. Both jobs take the
-# dispatched duration, and both run every scheduled month.
+# The second job is retained only as historical PostgreSQL stateful-v1 smoke
+# validation. ADR 0062 replaces that topology, so it additionally requires a
+# deliberate dispatch opt-in and cannot qualify the blob-backed stateful-v2
+# target.
 on:
   workflow_dispatch:
     inputs:
-      duration_ms:
+      run_stateless_endurance_smoke:
         description: >-
-          The soak duration, in milliseconds. Promotion requires at least the
-          manifest's committed twelve hours; shorter dispatches are diagnostic
-          and the qualification-record builder will refuse them.
-        required: false
-        default: '43200000'
-        type: string
-  schedule:
-    # The first of each month, 06:41 UTC — a weekday-agnostic slot that shares a
-    # runner with neither the weekly soak nor the capacity profiles.
-    - cron: '41 6 1 * *'
+          Run the stateless mixed-workload endurance smoke. Leave disabled for
+          a manual legacy-only qualification dispatch.
+        required: true
+        default: false
+        type: boolean
+      run_legacy_postgres_qualification:
+        description: >-
+          Run the historical PostgreSQL stateful-v1 endurance job. It is not
+          ADR 0062 blob-backed stateful-v2 qualification evidence.
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -41,12 +37,13 @@ env:
 
 jobs:
   endurance:
-    name: Mixed-workload endurance
+    name: Mixed-workload endurance smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_stateless_endurance_smoke == true }}
     runs-on: [self-hosted, linux, x64, axond-qualification]
-    # Twelve hours of offered load plus build, terminal settlement, independent
-    # promotion, and artifact upload. A six-hour hosted runner cannot produce a
-    # promotable soak and is intentionally not eligible for this job.
-    timeout-minutes: 840
+    # The committed smoke workload is 15 seconds. The remaining budget covers a
+    # cached release build, settlement, and artifact upload; policy rejects a
+    # larger Actions timeout or a user-controlled duration.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -55,65 +52,32 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-targets: false
-      # The soak test by name. The smoke tier, the sequential regression, and
-      # the deterministic checks share this binary and all run in `CI`; offering
-      # their load again here would only give the dispatched hours a second
-      # workload to contend with. `--test-threads=1` keeps that true of anything
-      # the filter still admits.
-      - name: Soak the mixed workload
+      - name: Exercise the mixed-workload smoke tier
         run: |
           cargo test --release --locked --all-features --test endurance -- \
-            the_endurance_soak_tier_qualifies_and_publishes_its_evidence \
+            the_endurance_smoke_tier_qualifies_and_publishes_its_evidence \
             --exact --nocapture --test-threads=1
-        env:
-          AXOND_ENDURANCE: '1'
-          AXOND_ENDURANCE_DURATION_MS: ${{ inputs.duration_ms || '43200000' }}
-      - name: Build the stateless endurance qualification record
-        if: success()
-        run: |
-          python3 ops/qualification-evidence.py target/endurance/soak \
-            --slice endurance --tier soak --runner github-actions \
-            --note "GitHub Actions self-hosted qualification runner, twelve-hour endurance soak" \
-            --out target/qualification-records/endurance-soak.toml
-      - name: Verify the endurance record and raw artifacts
-        if: success()
-        run: |
-          python3 ops/promote-qualification.py \
-            target/qualification-records/endurance-soak.toml \
-            --artifacts target/endurance/soak \
-            --out target/qualification-records/validated-endurance-soak.toml
-      - name: Publish the result artifacts
-        # Uploaded even on failure: a run that missed a threshold is the run
-        # whose evidence is worth reading. The time series is uploaded with the
-        # result, because a growth verdict is only arguable against the samples
-        # it was fitted through.
+      - name: Publish the smoke artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: endurance-results
+          name: endurance-results-actions-smoke
           path: |
-            target/endurance/**/*.json
-            target/endurance/**/*.samples.jsonl
-            target/endurance/**/*.bin
-          if-no-files-found: error
-          retention-days: 90
-      - name: Publish the endurance qualification record
-        if: success()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: qualification-record-endurance
-          path: target/qualification-records/validated-endurance-soak.toml
+            target/endurance/smoke/*.json
+            target/endurance/smoke/*.samples.jsonl
+            target/endurance/smoke/**/*.bin
           if-no-files-found: error
           retention-days: 90
 
   stateful-endurance:
-    name: Stateful mixed-workload endurance
+    name: Legacy PostgreSQL stateful endurance smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
     # Provisioning contract for this label: Linux x86_64 with a running Docker
     # Engine. GitHub creates service containers before any step can preflight
     # them, so attaching axond-qualification without Docker is a runner
     # configuration error, not an unevaluated soak.
     runs-on: [self-hosted, linux, x64, axond-qualification]
-    timeout-minutes: 840
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:17.6-alpine
@@ -134,50 +98,23 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-targets: false
-      # The stateful soak by name, for the reason the stateless job gives: the
-      # smoke tier and the deterministic checks share this binary and run in
-      # `CI`, and offering their load again here would only contend with the
-      # dispatched hours.
-      - name: Soak the mixed stateful workload
+      - name: Exercise the legacy PostgreSQL stateful smoke tier
         run: |
           cargo test --release --locked --all-features --test stateful_endurance -- \
-            the_stateful_endurance_soak_tier_qualifies_and_publishes_its_evidence \
+            the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence \
             --exact --nocapture --test-threads=1
         env:
-          AXOND_STATEFUL_ENDURANCE: '1'
-          AXOND_STATEFUL_ENDURANCE_DURATION_MS: ${{ inputs.duration_ms || '43200000' }}
+          AXOND_STATEFUL_ENDURANCE_SMOKE: '1'
           AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
           AXOND_TEST_REQUIRE_SERVICES: '1'
-      - name: Build the stateful endurance qualification record
-        if: success()
-        run: |
-          python3 ops/qualification-evidence.py target/stateful-endurance/soak \
-            --slice stateful-endurance --tier soak --runner github-actions \
-            --note "GitHub Actions self-hosted qualification runner, twelve-hour stateful endurance soak" \
-            --out target/qualification-records/stateful-endurance-soak.toml
-      - name: Verify the stateful endurance record and raw artifacts
-        if: success()
-        run: |
-          python3 ops/promote-qualification.py \
-            target/qualification-records/stateful-endurance-soak.toml \
-            --artifacts target/stateful-endurance/soak \
-            --out target/qualification-records/validated-stateful-endurance-soak.toml
-      - name: Publish the result artifacts
+      - name: Publish the legacy PostgreSQL smoke artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: stateful-endurance-results
+          name: legacy-postgres-stateful-endurance-results-actions-smoke
           path: |
-            target/stateful-endurance/**/*.json
-            target/stateful-endurance/**/*.samples.jsonl
-            target/stateful-endurance/**/*.bin
-          if-no-files-found: error
-          retention-days: 90
-      - name: Publish the stateful endurance qualification record
-        if: success()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: qualification-record-stateful-endurance
-          path: target/qualification-records/validated-stateful-endurance-soak.toml
+            target/stateful-endurance/smoke/*.json
+            target/stateful-endurance/smoke/*.samples.jsonl
+            target/stateful-endurance/smoke/**/*.bin
           if-no-files-found: error
           retention-days: 90

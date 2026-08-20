@@ -5,7 +5,13 @@ Date: 2026-08-09
 ## Status
 
 Accepted, partially superseded by
-[ADR 0027](./0027-stateless-and-stateful-operating-modes.md).
+[ADR 0027](./0027-stateless-and-stateful-operating-modes.md) and
+[ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
+
+ADR 0062 preserves the per-feature tier declaration and Tier 0/Tier 1
+properties, but changes Tier 2 from "Postgres" to "durable external state".
+Object storage is the preferred Tier 2 stateful control plane; PostgreSQL
+remains a possible implementation for responsibilities that need it.
 
 The state tiers, the per-feature tier declaration rule, the hermetic Tier 0 CI
 requirement, the `RateLimiter` decision, and both amendments below remain in

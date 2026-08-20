@@ -11,7 +11,7 @@
 //! stateful operating modes"; `docs/maintainers/backend-contracts.md` maps these
 //! contracts to it).
 //!
-//! Eight contracts exist. This module owns the four that are
+//! Eight responsibility contracts exist. This module owns the four that are
 //! control-plane-shaped, and it names the four request-path seams that already
 //! ship so the boundary between them is reviewable in one place:
 //!
@@ -42,7 +42,10 @@
 //! The catalogue store's background refresher and convergence reader are both
 //! intentionally off the request path. Requests receive a concrete immutable
 //! snapshot; they never retain a store handle or cause a catalogue query.
+//! [`object_store::ObjectStore`] is a provider-neutral storage primitive for a
+//! future control-plane implementation, not a ninth business responsibility.
 
+pub mod azure_blob;
 pub mod catalog;
 pub mod catalog_pins;
 pub mod catalog_projection;
@@ -52,6 +55,7 @@ pub mod catalog_store;
 pub mod control_plane;
 pub mod health;
 pub mod models_dev;
+pub mod object_store;
 pub mod secrets;
 
 #[cfg(test)]
@@ -106,6 +110,8 @@ pub enum BackendKind {
     Redis,
     /// Transactional durable storage.
     Postgres,
+    /// Durable exact-key object storage with native conditional writes.
+    ObjectStorage,
     /// Line-oriented stdout, for usage records.
     Stdout,
     /// OTLP export, for usage records.
@@ -127,7 +133,7 @@ impl BackendKind {
     /// Losing Redis loses hot enforcement precision, and losing durable state
     /// loses the deployment — those must not be the same store.
     pub const fn durable_control_plane(self) -> bool {
-        matches!(self, Self::Postgres)
+        matches!(self, Self::Postgres | Self::ObjectStorage)
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -136,6 +142,7 @@ impl BackendKind {
             Self::InMemory => "in-memory",
             Self::Redis => "redis",
             Self::Postgres => "postgres",
+            Self::ObjectStorage => "object-storage",
             Self::Stdout => "stdout",
             Self::Otlp => "otlp",
             Self::ModelsDev => "models.dev",
@@ -172,7 +179,7 @@ pub const RESPONSIBILITIES: &[Responsibility] = &[
         contract: "ControlPlaneStore",
         responsibility: "durable desired state: revisions, manifests, resource versions, audit",
         path: BackendPath::ControlPlane,
-        permitted: &[BackendKind::Postgres],
+        permitted: &[BackendKind::ObjectStorage, BackendKind::Postgres],
     },
     Responsibility {
         contract: "SecretStore",

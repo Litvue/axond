@@ -15,9 +15,10 @@
 //!   convergence and administration while replicas keep serving. The contract
 //!   is therefore allowed to be slow, and it is declared
 //!   [`BackendPath::ControlPlane`](super::BackendPath::ControlPlane).
-//! - **Redis cannot implement it.** [`ControlPlaneBackend`] has exactly one
-//!   variant, and parsing rejects `redis` with a typed error instead of falling
-//!   back, so "Redis is hot state only" is a compile- and boot-time property.
+//! - **Redis cannot implement it.** [`ControlPlaneBackend`] contains only
+//!   durable variants, and parsing rejects `redis` with a typed error instead
+//!   of falling back, so "Redis is hot state only" is a compile- and boot-time
+//!   property.
 //!
 //! ## What this module owns, and what the domain owns
 //!
@@ -57,15 +58,19 @@ use crate::desired_state::{
 
 /// The durable implementations a deployment may select for the control plane.
 ///
-/// One variant, on purpose. A second durable store is a new variant *and* a new
-/// `durable_control_plane` implementation, which is a reviewable change rather
-/// than a config string that happened to parse.
+/// Each durable store is an explicit variant and a `durable_control_plane`
+/// implementation, so adding a store is a reviewable change rather than a
+/// config string that happened to parse.
 ///
-/// [`ControlPlaneBackend::parse`] is the only resolution path: deserialization
-/// delegates to it, so a TOML value and a programmatic lookup accept exactly the
-/// same names and produce exactly the same explanation when they do not.
+/// [`ControlPlaneBackend::parse`] is the only resolution path. Configuration
+/// deserialization delegates to it but deliberately replaces a refusal with a
+/// fixed message: an operator may accidentally put credential material in a
+/// discriminator, and config-load diagnostics are copied into logs and tickets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ControlPlaneBackend {
+    /// Preferred ADR 0062 backend: immutable objects plus one CAS-updated head.
+    ObjectStorage,
+    /// Legacy/optional relational implementation retained for compatibility.
     #[default]
     Postgres,
 }
@@ -73,13 +78,25 @@ pub enum ControlPlaneBackend {
 impl<'de> serde::Deserialize<'de> for ControlPlaneBackend {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let name = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        Self::parse(&name).map_err(serde::de::Error::custom)
+        Self::parse(&name).map_err(|_| {
+            serde::de::Error::custom(
+                "unsupported control-plane backend; expected `object-storage` or `postgres`",
+            )
+        })
     }
 }
 
 impl ControlPlaneBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObjectStorage => "object-storage",
+            Self::Postgres => "postgres",
+        }
+    }
+
     pub const fn kind(self) -> BackendKind {
         match self {
+            Self::ObjectStorage => BackendKind::ObjectStorage,
             Self::Postgres => BackendKind::Postgres,
         }
     }
@@ -91,6 +108,7 @@ impl ControlPlaneBackend {
     /// answer is no, not that they made a typo.
     pub fn parse(name: &str) -> Result<Self, UnsupportedControlPlaneBackend> {
         match name {
+            "object-storage" => Ok(Self::ObjectStorage),
             "postgres" => Ok(Self::Postgres),
             // A near miss on the one durable backend is a typo, not a request
             // for something else.
@@ -115,12 +133,14 @@ impl ControlPlaneBackend {
 pub enum UnsupportedControlPlaneBackend {
     #[error(
         "`{name}` holds loss-tolerant hot state and cannot own durable control-plane state; \
-         the only durable control-plane backend is `postgres`"
+         select `object-storage` or the legacy `postgres` backend"
     )]
     HotStateOnly { name: String },
     #[error("`{name}` is not durable and cannot own control-plane state")]
     NotDurable { name: String },
-    #[error("unknown control-plane backend `{name}`; the only durable backend is `postgres`")]
+    #[error(
+        "unknown control-plane backend `{name}`; supported durable backends are `object-storage` and `postgres`"
+    )]
     Unknown { name: String },
 }
 
@@ -503,6 +523,10 @@ mod tests {
     fn every_selectable_control_plane_backend_is_durable() {
         let backend = ControlPlaneBackend::parse("postgres").expect("durable backend");
         assert!(backend.kind().durable_control_plane());
+        let object_storage =
+            ControlPlaneBackend::parse("object-storage").expect("durable object storage");
+        assert_eq!(object_storage.kind(), BackendKind::ObjectStorage);
+        assert!(object_storage.kind().durable_control_plane());
         assert_eq!(
             ControlPlaneBackend::default(),
             ControlPlaneBackend::Postgres
@@ -510,21 +534,32 @@ mod tests {
     }
 
     #[test]
-    fn deserialization_resolves_through_parse() {
+    fn deserialization_resolves_supported_values_without_echoing_refusals() {
         assert_eq!(
             serde_json::from_str::<ControlPlaneBackend>("\"postgres\"").unwrap(),
             ControlPlaneBackend::Postgres
         );
-        // One resolution path, so a configured value is refused with the same
-        // explanation a programmatic lookup gets — including for a near miss.
-        for name in ["redis", "in-memory", "postgresql", "sqlite"] {
+        assert_eq!(
+            serde_json::from_str::<ControlPlaneBackend>("\"object-storage\"").unwrap(),
+            ControlPlaneBackend::ObjectStorage
+        );
+        // The accepted set is still parse's accepted set, but a configured
+        // refusal cannot echo the supplied scalar: it may be a credential an
+        // operator put in the wrong field.
+        for name in [
+            "redis",
+            "in-memory",
+            "postgresql",
+            "sqlite",
+            "super-secret-backend-token",
+        ] {
             let refusal = serde_json::from_str::<ControlPlaneBackend>(&format!("\"{name}\""))
                 .expect_err("only postgres is a durable control plane")
                 .to_string();
-            let expected = ControlPlaneBackend::parse(name).unwrap_err().to_string();
             assert!(
-                refusal.contains(&expected),
-                "`{name}` was refused as `{refusal}` instead of `{expected}`"
+                refusal.contains("expected `object-storage` or `postgres`")
+                    && !refusal.contains(name),
+                "configured discriminator `{name}` was not safely refused: {refusal}"
             );
         }
     }

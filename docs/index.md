@@ -135,13 +135,20 @@ and operate it.
   floor, the published-crate API check, and the reviewed override for an
   intentional break.
 - [Backend responsibility boundaries](./maintainers/backend-contracts.md) — the
-  seven responsibility-specific backend contracts, which paths they may be
+  eight responsibility-specific backend contracts, which paths they may be
   called from, and why there is no universal state backend.
+- [Namespace and blob control-plane migration](./maintainers/namespace-control-plane-migration.md)
+  — the staged route, storage, domain, migration, deployment, and qualification
+  work required by the accepted stateful-v2 architecture.
 - [Release runbook](./maintainers/releasing.md) — release-please, artifact
   repair, crates.io ordering, and verification.
 - [Release readiness](../RELEASE.md) — current public-beta evidence and known
   limitations.
 - [Architecture decisions](./adr) — accepted design decisions and consequences.
+- [ADR 0062: blob-backed flat namespace control plane](./adr/0062-blob-backed-flat-namespace-control-plane.md)
+  — the accepted target stateful architecture: flat namespace ownership,
+  provider-compatible namespaced routes, immutable object graphs, and one CAS
+  publication head.
 - [ADR 0027: stateless and stateful operating modes](./adr/0027-stateless-and-stateful-operating-modes.md)
-  — state ownership matrix, failure/outage matrix, request-path database rules,
-  and the dependency map for the control-plane implementation slices.
+  — the implemented PostgreSQL stateful-v1 record; its stateless default,
+  immutable request snapshot, and outage boundaries remain in force.

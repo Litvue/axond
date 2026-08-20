@@ -520,6 +520,37 @@ assumed: a hand-applied database missing one table's `FORCE ROW LEVEL SECURITY` 
 one `..._isolation` policy is refused by name, so adoption cannot record a history
 whose tenant isolation is not actually in place.
 
+Blob publication formats are held by
+`head_documents_are_deterministic_bounded_and_strict`,
+`authenticated_heads_refuse_tamper_replay_wrong_keys_and_rollback`,
+`committed_winner_returns_success_after_shared_guard_observes_a_newer_head`,
+`only_the_current_fenced_head_can_cross_from_history_into_activation`,
+`manifest_signature_binds_every_publication_decision`,
+`idempotency_is_authorization_scoped_and_durable_metadata_is_redacted`,
+`bounded_history_exhaustion_is_visible_and_fails_novel_writes_closed`, and the
+`publication_parsers` committed fuzz corpus. Object-store bytes are untrusted on
+read: unknown schemas, signing schemas, algorithms, and keys; missing or invalid
+signatures; cross-environment replay; rollback below the observed head tuple;
+same-sequence/different-revision equivocation;
+malformed or non-canonical encodings; invalid integrity; oversized documents;
+impossible sequence links; and excessive object counts are typed fail-closed
+refusals rather than recovery defaults. The signed manifest binds actor/grant
+fingerprints, mutation identity/kind, scoped idempotency, state identity, and the
+complete object set. Raw attribution, idempotency strings, signing material, and
+secret values are absent from durable publication metadata and error rendering.
+`VerifiedRevisionManifest` is authenticated history traversal only. Hydration
+requires `VerifiedActiveRevision`, which carries the strong-read `ObjectVersion`
+for the exact selecting head, and activation requires the non-cloneable wrapper
+returned by a final unchanged-head validation. Signed orphan manifests, crash
+uploads, losing CAS bodies, and failed-condition payloads therefore remain
+unreachable even if an intermediary retains and later replays their bytes. The
+domain guard exports both sequence and active digest because sequence alone
+would not detect equivocation, but this slice retains that tuple only in memory
+and does not modify or claim integration with the production last-known-good
+cache. Cross-restart rollback/equivocation resistance remains unqualified until
+the authenticated blob LKG runtime slice persists and restores the bound tuple.
+Publication trust is bounded to 64 keys.
+
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),
 [ADR 0049](../adr/0049-billing-grade-usage-outbox.md),
