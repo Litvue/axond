@@ -2,23 +2,27 @@
 //!
 //! The blob codec must not let a backend caller assert an environment, owner,
 //! or exact reference directly. This independent crypto slice therefore exposes
-//! opaque binding types with **no production constructor**. The integration
-//! slice will wire [`AuthenticatedSecretBinding`] to a verified signed active
-//! revision plus its validated deployment secret-index entry, and
-//! [`BlobSecretPublicationBinding`] to a successful create-only reservation.
-//! Until then, production code cannot fabricate either authority from raw
-//! values. Tests and fuzzing get explicit cfg-only synthetic constructors.
+//! opaque binding types with **no raw production constructor**. The blob
+//! revision integration wires [`AuthenticatedSecretBinding`] to a verified
+//! signed active revision plus its validated deployment secret-index entry,
+//! while [`BlobSecretPublicationBinding`] remains reserved for a later
+//! create-only publication path. Tests and fuzzing get explicit cfg-only
+//! synthetic constructors.
 
-use super::{Checksum, EnvironmentId, SecretRef};
+use super::namespaces::NamespaceSecretRequest;
+use super::{
+    BlobSecretAuthority, BlobSecretBindingError, Checksum, EnvironmentId, SecretLifecycle,
+    SecretRef,
+};
 use crate::namespace::NamespaceId;
 
 /// Single-use authenticated context for opening one immutable secret object.
 ///
 /// It has no production constructor, formatter, or `Clone`. Opening consumes
 /// it. The ciphertext digest is checked before key selection, while environment,
-/// owner, and exact reference form the material AEAD AAD. The integration slice
-/// will add the only production minting path beside signed publication
-/// verification; this crypto slice deliberately cannot assert that provenance.
+/// owner, and exact reference form the material AEAD AAD. The only production
+/// minting path is beside signed publication verification; this type
+/// deliberately cannot assert that provenance on its own.
 pub struct AuthenticatedSecretBinding {
     environment: EnvironmentId,
     owner: NamespaceId,
@@ -57,6 +61,40 @@ impl AuthenticatedSecretBinding {
             ciphertext_digest,
         }
     }
+}
+
+/// Mint an authenticated binding only from the witness-owned deployment index.
+///
+/// Keeping this constructor in the binding module means the private fields of
+/// [`AuthenticatedSecretBinding`] never become available to the blob reader,
+/// resolver, or a caller supplying raw identity values.
+pub(crate) fn mint_from_blob_authority(
+    authority: &BlobSecretAuthority,
+    request: &NamespaceSecretRequest,
+) -> Result<AuthenticatedSecretBinding, BlobSecretBindingError> {
+    let Some(indexed) = authority.indexed_request(request) else {
+        return Err(BlobSecretBindingError::Undeclared);
+    };
+    if indexed.owner() != request.owner()
+        || indexed.reference() != request.reference()
+        || indexed.ciphertext_digest() != request.ciphertext_digest()
+    {
+        return Err(BlobSecretBindingError::Mismatch);
+    }
+    if request.lifecycle() != SecretLifecycle::Active {
+        return Err(BlobSecretBindingError::Inactive {
+            lifecycle: request.lifecycle(),
+        });
+    }
+    if indexed.lifecycle() != request.lifecycle() {
+        return Err(BlobSecretBindingError::Mismatch);
+    }
+    Ok(AuthenticatedSecretBinding {
+        environment: authority.environment().clone(),
+        owner: request.owner().clone(),
+        reference: request.reference(),
+        ciphertext_digest: request.ciphertext_digest(),
+    })
 }
 
 /// Single-use publisher authority to seal one create-only secret reference.
