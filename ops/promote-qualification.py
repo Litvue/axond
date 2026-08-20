@@ -2394,6 +2394,7 @@ def validate_raw_rollout(
         if (
             not isinstance(value, (int, float))
             or isinstance(value, bool)
+            or not math.isfinite(float(value))
             or value < 0
         ):
             fail(f"{label}: rollout {field} is missing or malformed")
@@ -2487,16 +2488,27 @@ def validate_raw_rollout(
         phases = [phase for phase in traffic if select(phase["phase"])]
         if not phases:
             return 0.0, None
-        answered_rps = sum(phase["answered_rps"] for phase in phases) / len(phases)
+        # Match Rust's ordered `Iterator::sum::<f64>()` exactly. Python's
+        # built-in sum uses a different floating-point algorithm and can round
+        # the same finite sequence one ULP differently.
+        answered_rps_total = 0.0
+        for phase in phases:
+            answered_rps_total += phase["answered_rps"]
+        answered_rps = answered_rps_total / len(phases)
+        if not math.isfinite(answered_rps):
+            fail(f"{label}: rollout capacity envelope is non-finite")
         latency_p95 = max(phase["latency_ms"]["p95"] for phase in phases)
         return answered_rps, latency_p95
 
     steady_rps, steady_p95 = phase_envelope(lambda name: name.startswith("steady"))
     degraded_rps, degraded_p95 = phase_envelope(lambda name: "drain" in name)
+    degraded_fraction = degraded_rps / steady_rps if steady_rps > 0 else 0.0
+    if not math.isfinite(degraded_fraction):
+        fail(f"{label}: rollout capacity envelope is non-finite")
     expected_capacity = {
         "steady_answered_rps": steady_rps,
         "degraded_answered_rps": degraded_rps,
-        "degraded_fraction": degraded_rps / steady_rps if steady_rps > 0 else 0.0,
+        "degraded_fraction": degraded_fraction,
         "steady_latency_p95_ms": steady_p95,
         "degraded_latency_p95_ms": degraded_p95,
     }
@@ -6136,6 +6148,100 @@ bootstrap = "seed"
     rollout_row["verdicts"] = len(rollout_result["verdicts"])
     validate_raw_rollout(
         rollout_result, "rollout self-test", rollout_record, rollout_row
+    )
+    ordered_float_capacity = copy.deepcopy(rollout_result)
+    phase_rps = {
+        "steady-previous": 207.77132243898762,
+        "compatibility-drain": 207.53550111145506,
+        "drain-0": 207.44541025409146,
+        "drain-1": 208.06369261293688,
+        "steady-next": 208.17288068827708,
+        "rollback-drain": 208.10973582528283,
+    }
+    for phase in ordered_float_capacity["traffic"]:
+        phase["answered_rps"] = phase_rps.get(phase["phase"], 208.0)
+    ordered_float_capacity["capacity"].update(
+        steady_answered_rps=207.97210156363235,
+        degraded_answered_rps=207.78858495094153,
+        degraded_fraction=0.999117590237772,
+    )
+    validate_raw_rollout(
+        ordered_float_capacity,
+        "ordered-float rollout capacity self-test",
+        rollout_record,
+        rollout_row,
+    )
+    overflowed_fraction = copy.deepcopy(rollout_result)
+    for phase in overflowed_fraction["traffic"]:
+        if phase["phase"].startswith("steady"):
+            phase["answered_rps"] = sys.float_info.min
+        elif "drain" in phase["phase"]:
+            phase["answered_rps"] = 1e307
+    overflowed_fraction["capacity"].update(
+        steady_answered_rps=sys.float_info.min,
+        degraded_answered_rps=1e307,
+        degraded_fraction=math.inf,
+    )
+    expect_refusal(
+        "overflowed rollout degraded fraction",
+        lambda: validate_raw_rollout(
+            overflowed_fraction,
+            "overflowed degraded fraction self-test",
+            rollout_record,
+            rollout_row,
+        ),
+        expected_message="capacity envelope is non-finite",
+    )
+    drifted_capacity = copy.deepcopy(ordered_float_capacity)
+    value = drifted_capacity["capacity"]["degraded_answered_rps"]
+    drifted_capacity["capacity"]["degraded_answered_rps"] = math.nextafter(
+        value, math.inf
+    )
+    expect_refusal(
+        "one-ULP drifted rollout capacity envelope",
+        lambda: validate_raw_rollout(
+            drifted_capacity,
+            "one-ULP drifted capacity self-test",
+            rollout_record,
+            rollout_row,
+        ),
+        expected_message="capacity envelope is not reproducible",
+    )
+    extra_capacity_field = copy.deepcopy(ordered_float_capacity)
+    extra_capacity_field["capacity"]["unverified"] = 0.0
+    expect_refusal(
+        "extra rollout capacity field",
+        lambda: validate_raw_rollout(
+            extra_capacity_field,
+            "extra capacity field self-test",
+            rollout_record,
+            rollout_row,
+        ),
+        expected_message="capacity envelope is not reproducible",
+    )
+    missing_capacity_field = copy.deepcopy(ordered_float_capacity)
+    del missing_capacity_field["capacity"]["degraded_fraction"]
+    expect_refusal(
+        "missing rollout capacity field",
+        lambda: validate_raw_rollout(
+            missing_capacity_field,
+            "missing capacity field self-test",
+            rollout_record,
+            rollout_row,
+        ),
+        expected_message="capacity envelope is not reproducible",
+    )
+    nonfinite_capacity = copy.deepcopy(ordered_float_capacity)
+    nonfinite_capacity["capacity"]["degraded_answered_rps"] = math.nan
+    expect_refusal(
+        "non-finite rollout capacity envelope",
+        lambda: validate_raw_rollout(
+            nonfinite_capacity,
+            "non-finite capacity self-test",
+            rollout_record,
+            rollout_row,
+        ),
+        expected_message="capacity envelope is not reproducible",
     )
     descriptive_control_plane = copy.deepcopy(rollout_result)
     descriptive_control_plane["migration"]["control_plane"] = (
