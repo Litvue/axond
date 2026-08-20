@@ -388,11 +388,10 @@ impl ObjectStore for InMemoryObjectStore {
             self.limits.max_write_bytes(),
         )?;
         let mut state = self.lock(key)?;
-        if state
-            .objects
-            .get(key)
-            .is_none_or(|current| current.version != *expected)
-        {
+        let Some(current) = state.objects.get(key) else {
+            return Err(ObjectStoreError::NotFound { key: key.clone() });
+        };
+        if current.version != *expected {
             return Err(ObjectStoreError::PreconditionFailed {
                 key: key.clone(),
                 operation: ObjectStoreOperation::ReplaceIfVersion,
@@ -505,6 +504,14 @@ mod tests {
         let error = store.get(&key()).await.expect_err("missing object");
         assert_eq!(error.kind(), ObjectStoreErrorKind::NotFound);
         assert_eq!(error.category(), FailureCategory::NotFound);
+
+        let expected = ObjectVersion::opaque("never-created").expect("opaque version");
+        let replace = store
+            .replace_if_version(&key(), Bytes::from_static(b"value"), &expected)
+            .await
+            .expect_err("conditional replacement requires an existing object");
+        assert_eq!(replace.kind(), ObjectStoreErrorKind::NotFound);
+        assert_eq!(replace.category(), FailureCategory::NotFound);
     }
 
     #[tokio::test]
