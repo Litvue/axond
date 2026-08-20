@@ -123,6 +123,10 @@ pub enum GatewayError {
     TokenForbidden(#[source] TokenVerificationError),
     #[error("token scope does not authorize `{0}`")]
     ScopeInsufficient(Capability),
+    #[error("namespace identifier is invalid")]
+    InvalidNamespace,
+    #[error("the authenticated grant does not authorize the selected namespace")]
+    NamespaceNotAuthorized,
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error(transparent)]
@@ -197,6 +201,8 @@ impl GatewayError {
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
             Self::ScopeInsufficient(_) => StatusCode::FORBIDDEN,
+            Self::InvalidNamespace => StatusCode::BAD_REQUEST,
+            Self::NamespaceNotAuthorized => StatusCode::FORBIDDEN,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::MintingDisabled => StatusCode::NOT_FOUND,
             Self::MintNotAuthorized
@@ -250,6 +256,8 @@ impl GatewayError {
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
+            Self::InvalidNamespace => "invalid_namespace",
+            Self::NamespaceNotAuthorized => "namespace_not_authorized",
             Self::BadRequest(_) => "bad_request",
             Self::MintingDisabled => "minting_disabled",
             Self::MintNotAuthorized => "mint_not_authorized",

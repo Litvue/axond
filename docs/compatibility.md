@@ -412,7 +412,7 @@ version 2 transition.
   than a control-plane resource, so it answers in either mode. See
   [administering a stateful deployment](./operations/admin-api.md).
 
-### Accepted stateful-v2 transition (not yet implemented)
+### Stateful-v2 namespace route transition (first runtime slice implemented)
 
 [ADR 0062](./adr/0062-blob-backed-flat-namespace-control-plane.md) accepts a
 breaking stateful redesign before the stateful surface above enters the `0.x`
@@ -426,6 +426,8 @@ tenants/projects/principals and mounts every provider-compatible route beneath
 /namespaces/{namespace}/v1/embeddings
 /namespaces/{namespace}/v1/models
 /namespaces/{namespace}/v1/messages
+/namespaces/{namespace}/v1/credentials
+/namespaces/{namespace}/v1/tokens
 ```
 
 An SDK changes only its base URL. OpenAI-compatible clients use a base ending
@@ -433,16 +435,22 @@ in `/namespaces/{namespace}/v1`; Anthropic clients that append `/v1/messages`
 use one ending in `/namespaces/{namespace}`. Redirects are not a migration
 mechanism for authenticated or streaming `POST` requests.
 
-The implementation release must add these canonical routes and may retain the
-legacy direct `/v1/*` mount for at most one documented minor-release window as
-an opt-in stateless compatibility alias. Blob-backed stateful mode never serves
-an implicit namespace. A later breaking minor removes the alias. PostgreSQL
-configuration remains readable until the offline PostgreSQL-to-blob export and
-verification path has shipped for one release; there is no dual-write mode.
+The first runtime slice implements the canonical routes and checks each path
+namespace against the current static-key or `axt1` token's one-namespace grant.
+Stateless mode also retains the legacy direct `/v1/*` mount by default for
+compatibility; it dispatches directly and never redirects. Stateful serving
+does not mount that alias and therefore never infers an inference namespace.
+Making the stateless alias explicitly configurable/opt-in, adding set/all
+namespace token grants, and scheduling the alias's removal remain follow-up
+work. PostgreSQL configuration remains readable until the offline
+PostgreSQL-to-blob export and verification path has shipped for one release;
+there is no dual-write mode.
 
-Until that implementation lands, this section is a migration commitment rather
-than a claim about the current binary. The complete sequence and qualification
-reset are in the
+Typed namespace identity, path selection, and authorization against existing
+one-namespace credentials are now runtime contracts. Blob publication, flat
+namespace desired-state projection, set/all grants, configurable legacy aliases,
+migration tooling, and topology qualification remain migration commitments. The
+complete sequence and qualification reset are in the
 [namespace control-plane migration plan](./maintainers/namespace-control-plane-migration.md).
 
 ## Supported releases and who owns each matrix

@@ -32,6 +32,7 @@ libfuzzer = ["dep:libfuzzer-sys"]
 
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
+sha2 = "0.11.0"
 # The seam this links against only exists under `--cfg fuzzing`, which
 # `.cargo/config.toml` sets for this workspace and `cargo fuzz` sets on its own.
 axond = { path = "../crates/gateway" }
@@ -105,6 +106,22 @@ bench = false
 [[bin]]
 name = "catalog_import"
 path = "fuzz_targets/catalog_import.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob_secret_envelope"
+path = "fuzz_targets/blob_secret_envelope.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob_secret_crypto"
+path = "fuzz_targets/blob_secret_crypto.rs"
 required-features = ["libfuzzer"]
 test = false
 doc = false

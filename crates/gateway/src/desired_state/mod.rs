@@ -69,6 +69,7 @@
 pub mod access;
 pub mod canonical;
 pub mod credentials;
+mod environment;
 pub mod ids;
 pub mod models;
 pub mod mutation;
@@ -79,6 +80,7 @@ pub mod publication;
 mod publication_auth;
 pub mod resource;
 pub mod revision;
+mod secret_binding;
 pub mod secrets;
 pub mod tenancy;
 
@@ -107,6 +109,8 @@ pub use credentials::{
     CredentialError, Credentials, PROVIDER_CREDENTIAL_SCHEMA, ProviderCredential,
     ProviderCredentialBody,
 };
+#[allow(unused_imports)]
+pub use environment::{EnvironmentId, InvalidEnvironmentId};
 #[allow(unused_imports)]
 pub use ids::{
     AuditEventId, InvalidId, InvalidSlug, InvalidUuid7, MutationId, PrincipalId, ProjectId,
@@ -144,8 +148,8 @@ pub use providers::{PROVIDER_SCHEMA, Provider, ProviderBody, ProviderError, Prov
 #[allow(unused_imports)]
 pub use publication::{
     ActivationReadyRevision, BlobPublication, BlobPublicationError, BlobPublicationRequest,
-    EnvironmentId, ExpectedHead, HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus,
-    ImmutableObject, ImmutableObjectKind, PublicationActorBinding, PublicationAuthorization,
+    ExpectedHead, HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus, ImmutableObject,
+    ImmutableObjectKind, PublicationActorBinding, PublicationAuthorization,
     PublicationGrantBinding, PublicationHeadState, PublicationOutcome, PublicationSequenceGuard,
     VerifiedActiveRevision, VerifiedRevisionManifest,
 };
@@ -165,6 +169,8 @@ pub use revision::{
     BodySkew, DesiredState, IntegrityError, LoadedRevision, ManifestEntry, RevisionCandidate,
     RevisionManifest, ValidationError,
 };
+#[allow(unused_imports)]
+pub use secret_binding::{AuthenticatedSecretBinding, BlobSecretPublicationBinding};
 #[allow(unused_imports)]
 pub use secrets::{
     ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,

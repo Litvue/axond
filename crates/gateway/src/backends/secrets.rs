@@ -58,6 +58,7 @@ use crate::desired_state::secrets::{
     ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,
 };
 
+pub mod blob_envelope;
 pub mod envelope;
 pub mod postgres;
 

@@ -1,6 +1,8 @@
 # Namespace and blob control-plane migration plan
 
-Status: accepted architecture; implementation has not started.
+Status: accepted architecture; Stage 1 is in progress. Typed namespace identity,
+canonical routes, and authorization against existing one-namespace credentials
+are implemented. Set/all grant projection and later stages remain open.
 
 Audience: maintainers planning the transition selected by
 [ADR 0062](../adr/0062-blob-backed-flat-namespace-control-plane.md). This is not

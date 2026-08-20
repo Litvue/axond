@@ -39,6 +39,7 @@ mod key_material;
 #[allow(dead_code)]
 mod middleware;
 mod mint;
+mod namespace;
 mod ops;
 mod policy;
 mod pricing;
@@ -116,6 +117,54 @@ pub struct StoredDocumentRejection {
     pub message: String,
 }
 
+/// Decode one untrusted namespace-native sealed-secret object through the
+/// production parser. An accepted object is returned in its one canonical
+/// spelling; a refusal exposes only a stable class and never rejected bytes.
+pub fn blob_secret_envelope_cbor(input: &[u8]) -> Result<Vec<u8>, &'static str> {
+    use backends::secrets::blob_envelope::{CodecError, SealedBlobSecret};
+
+    SealedBlobSecret::from_canonical_cbor(input)
+        .map(|sealed| sealed.to_canonical_cbor())
+        .map_err(|error| match error {
+            CodecError::Oversized => "oversized",
+            CodecError::Truncated => "truncated",
+            CodecError::Shape => "shape",
+            CodecError::Compatibility => "compatibility",
+            CodecError::NonCanonical => "noncanonical",
+            CodecError::KekId => "kek_id",
+            CodecError::FixedField => "fixed_field",
+            CodecError::Ciphertext => "ciphertext",
+            CodecError::Trailing => "trailing",
+        })
+}
+
+/// Parser ceiling exported as a value, not as an internal type dependency.
+pub const BLOB_SECRET_MAX_SEALED_BYTES: usize = backends::secrets::blob_envelope::MAX_SEALED_BYTES;
+
+/// Plaintext byte ceiling used by structured boundary scenarios.
+pub const BLOB_SECRET_MAX_PLAINTEXT_BYTES: usize =
+    backends::secrets::blob_envelope::MAX_PLAINTEXT_BYTES;
+
+/// Drive bounded synthetic seal/open scenarios through the private v2 codec.
+/// No production key or authenticated manifest enters this seam.
+pub fn blob_secret_seal_open(
+    material: &[u8],
+    scenario: u8,
+    primary_seed: u8,
+    secondary_seed: u8,
+    identity_seed: u64,
+    version_seed: u16,
+) -> &'static str {
+    backends::secrets::blob_envelope::fuzz_seal_open(
+        material,
+        scenario,
+        primary_seed,
+        secondary_seed,
+        identity_seed,
+        version_seed,
+    )
+}
+
 /// The bounded reason behind a seam rejection, so a fuzzed import can be admitted
 /// over a last-known-good catalogue the same way the refresh admits one.
 ///
@@ -156,40 +205,13 @@ pub struct ConfigShape {
     pub verifiers: usize,
 }
 
-/// Parse and validate untrusted configuration text, the way `axond` does at
-/// boot and on reload.
-///
-/// # Errors
-///
-/// [`Rejection::Load`] for text the loader refuses, [`Rejection::Invalid`] for
-/// a config that loads but fails validation.
-pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection> {
-    match Config::from_toml_str(input) {
-        Ok(config) => Ok(ConfigShape {
-            stateful: config.mode == config::Mode::Stateful,
-            namespaces: config.namespace.len(),
-            providers: config.provider.len(),
-            models: config.model.len(),
-            credentials: config.credential.len(),
-            gateway_keys: config.gateway_key.len(),
-            verifiers: config.gateway_verifier.len(),
-        }),
-        Err(config::ConfigError::Load(message)) => Err(Rejection::Load(message)),
-        Err(config::ConfigError::Invalid(message)) => Err(Rejection::Invalid(message)),
-    }
-}
-
 /// Decode an untrusted object-store environment head through the production
 /// bounded JSON parser.
 pub fn publication_head_document(input: &[u8]) -> Result<(), StoredDocumentRejection> {
     publication_head_document_with_state(input, "production-us-east", 0, [0; 32])
 }
 
-/// Exercise the public tuple guard with an independently selected environment
-/// and process-observed `(sequence, active_revision)` tuple.
-///
-/// This is an in-memory domain seam. The current runtime does not persist or
-/// restore the tuple through its production last-known-good cache.
+/// Exercise the public tuple guard with independently selected expectations.
 pub fn publication_head_document_with_state(
     input: &[u8],
     expected_environment: &str,
@@ -266,6 +288,29 @@ pub fn publication_active_revision(
 pub const PUBLICATION_HEAD_MAX_BYTES: usize = desired_state::publication::MAX_HEAD_DOCUMENT_BYTES;
 pub const PUBLICATION_MANIFEST_MAX_BYTES: usize =
     desired_state::publication::MAX_REVISION_MANIFEST_BYTES;
+
+/// Parse and validate untrusted configuration text, the way `axond` does at
+/// boot and on reload.
+///
+/// # Errors
+///
+/// [`Rejection::Load`] for text the loader refuses, [`Rejection::Invalid`] for
+/// a config that loads but fails validation.
+pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection> {
+    match Config::from_toml_str(input) {
+        Ok(config) => Ok(ConfigShape {
+            stateful: config.mode == config::Mode::Stateful,
+            namespaces: config.namespace.len(),
+            providers: config.provider.len(),
+            models: config.model.len(),
+            credentials: config.credential.len(),
+            gateway_keys: config.gateway_key.len(),
+            verifiers: config.gateway_verifier.len(),
+        }),
+        Err(config::ConfigError::Load(message)) => Err(Rejection::Load(message)),
+        Err(config::ConfigError::Invalid(message)) => Err(Rejection::Invalid(message)),
+    }
+}
 
 /// Parse the `namespaces` filter out of an untrusted `GET
 /// /v1/credentials/status` query string, percent-decoding included.
