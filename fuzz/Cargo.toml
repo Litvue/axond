@@ -32,6 +32,7 @@ libfuzzer = ["dep:libfuzzer-sys"]
 
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
+sha2 = "0.11.0"
 # The seam this links against only exists under `--cfg fuzzing`, which
 # `.cargo/config.toml` sets for this workspace and `cargo fuzz` sets on its own.
 axond = { path = "../crates/gateway" }

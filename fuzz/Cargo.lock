@@ -221,6 +221,7 @@ dependencies = [
  "gateway-core",
  "libfuzzer-sys",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

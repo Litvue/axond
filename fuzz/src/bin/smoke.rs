@@ -38,6 +38,7 @@ use axond_fuzz::{
     BlobSecretCryptoInput, CapabilityField, CatalogEdit, CatalogInput, CostField, LifecycleValue,
     MetaField, ProviderStreamInput, SseInput, StreamShape, TokenInput,
 };
+use sha2::{Digest, Sha256};
 
 /// Live heap the whole replay may hold at once. The parsers under test are
 /// bounded by their input, which is why this is generous in absolute terms and
@@ -442,43 +443,164 @@ const EXPECTED_PUBLICATION_SEED_CLASSES: &[(&str, &[&str])] = &[
     ),
 ];
 
-const EXPECTED_BLOB_ENVELOPE_SEEDS: &[(&str, &str)] = &[
-    ("accepted.cbor", "accepted"),
-    ("ciphertext.cbor", "ciphertext"),
-    ("compatibility.cbor", "compatibility"),
-    ("fixed-field.cbor", "fixed_field"),
-    ("kek-id.cbor", "kek_id"),
-    ("noncanonical.cbor", "noncanonical"),
-    ("oversized.cbor", "oversized"),
-    ("shape.cbor", "shape"),
-    ("trailing.cbor", "trailing"),
-    ("truncated.cbor", "truncated"),
+/// Exact outcome and SHA-256 byte pin for every committed envelope seed.
+const EXPECTED_BLOB_ENVELOPE_SEEDS: &[(&str, &str, &str)] = &[
+    (
+        "accepted.cbor",
+        "accepted",
+        "76235874f36073d57a677e660c6e6695903d51dccb28011d9f807078e0b3df5b",
+    ),
+    (
+        "ciphertext.cbor",
+        "ciphertext",
+        "67687b2c4afd2048c1d100ebe05e9e58acbdc8b5d04cc6acb9d8032d9c6dbba5",
+    ),
+    (
+        "compatibility.cbor",
+        "compatibility",
+        "fd96772c45de98ebf18863101d02ea5ce6e2f8ee392d928a75d35be02cf9e90a",
+    ),
+    (
+        "fixed-field.cbor",
+        "fixed_field",
+        "31eedaa2901b803eec05c5def8d759628428411274e65ff77d0e2359e5826e80",
+    ),
+    (
+        "kek-id.cbor",
+        "kek_id",
+        "832ebe7f6468a3cf0310903571903672a8fbb353c5017198ef3e9c8a7524445f",
+    ),
+    (
+        "noncanonical.cbor",
+        "noncanonical",
+        "a2ef34504a7a1917b69aeeea9bebb8d83e5e643104cc01e4ce09d3041a8bfbb4",
+    ),
+    (
+        "oversized.cbor",
+        "oversized",
+        "167eaeb258096ab4781a3f19db5ac9c1500712c75ec1f590b41a26872ebd608e",
+    ),
+    (
+        "shape.cbor",
+        "shape",
+        "a87a50293e792491ee5d908a95430885bb4407bdee2c7cf11a042a71dcdcbafb",
+    ),
+    (
+        "trailing.cbor",
+        "trailing",
+        "4901a289df008325860d220ada53b7118ad11e2ebd02bc88e15c8c26769518d7",
+    ),
+    (
+        "truncated.cbor",
+        "truncated",
+        "3cbdaf66b3dd2b174788a2f17f938b52dda93a2a97440cead19332cbfacba7c8",
+    ),
 ];
 
-const EXPECTED_BLOB_CRYPTO_SEEDS: &[(&str, &str)] = &[
-    ("00-roundtrip.bin", "roundtrip"),
-    ("01-wrong-environment.bin", "wrong_environment"),
-    ("02-wrong-namespace.bin", "wrong_namespace"),
-    ("03-wrong-reference.bin", "wrong_reference"),
-    ("04-wrong-version.bin", "wrong_version"),
-    ("05-wrong-purpose.bin", "wrong_purpose"),
-    ("06-wrapped-mutation.bin", "wrapped_mutation"),
-    ("07-nonce-mutation.bin", "nonce_mutation"),
-    ("08-ciphertext-mutation.bin", "ciphertext_mutation"),
-    ("09-unknown-key.bin", "unknown_key"),
-    ("10-rotation.bin", "rotation"),
-    ("11-alias-rejected.bin", "alias_rejected"),
-    ("12-invalid-utf8-refused.bin", "invalid_utf8_refused"),
-    ("13-stored-id-mutation.bin", "stored_id_mutation"),
-    ("boundary-empty.bin", "empty_refused"),
-    ("boundary-input-not-utf8.bin", "input_not_utf8"),
-    ("boundary-multibyte-limit.bin", "roundtrip"),
-    ("boundary-multibyte-over-limit.bin", "oversized_refused"),
+/// Exact outcome and SHA-256 byte pin for every committed crypto seed.
+const EXPECTED_BLOB_CRYPTO_SEEDS: &[(&str, &str, &str)] = &[
+    (
+        "00-roundtrip.bin",
+        "roundtrip",
+        "244cfec8f756021aa0a09c4ad27212e840cd2a0ab49ec866c5915613a832316e",
+    ),
+    (
+        "01-wrong-environment.bin",
+        "wrong_environment",
+        "bd7d21eb6c59cbf8bbd92adfe3859a9c006b5f3ea29ad706466ebaafe954f923",
+    ),
+    (
+        "02-wrong-namespace.bin",
+        "wrong_namespace",
+        "7de0bb1992430a8ef49ed6a163d5cd7df150c1f22bdb4507b668fa51adef8db7",
+    ),
+    (
+        "03-wrong-reference.bin",
+        "wrong_reference",
+        "d30ca3f719b0330d780ba48182cc4c647658f1768629fbf2ad9dcac1882de52a",
+    ),
+    (
+        "04-wrong-version.bin",
+        "wrong_version",
+        "915b20b0ffb6a87443ea70170a9abd4bf95b5e90e5588ec293612202e3030f6d",
+    ),
+    (
+        "05-wrong-purpose.bin",
+        "wrong_purpose",
+        "00487aa2f5893ad10995d16e64a1498b64376bd8ee2a5067c4fdfeb9e89d745c",
+    ),
+    (
+        "06-wrapped-mutation.bin",
+        "wrapped_mutation",
+        "9d6a04207362495b41b3b32460315599553e07d2ee3c28dd7b0400fabba60c8e",
+    ),
+    (
+        "07-nonce-mutation.bin",
+        "nonce_mutation",
+        "2df6b8211671cdd158c93a41fbbc83b48aa4bc0c6de08eaa33864828b85eb27e",
+    ),
+    (
+        "08-ciphertext-mutation.bin",
+        "ciphertext_mutation",
+        "51d5848ec3dbfb30112f41da429bcd1f983f9356c3c298f15d97330a54305ce7",
+    ),
+    (
+        "09-unknown-key.bin",
+        "unknown_key",
+        "0d8a7f7b7636a721fb29e59a0a9b9e0ff9446c16d94816b3d1a30dfb68f43a38",
+    ),
+    (
+        "10-rotation.bin",
+        "rotation",
+        "5fdbe3adb9889c7e82f1214bc9d4c92b799c1515c44c00dfd12a6d61db16f471",
+    ),
+    (
+        "11-alias-rejected.bin",
+        "alias_rejected",
+        "3f4d9694d9911d7c30f5af149044dd632b8779331da02dd21293273a3f35ff4f",
+    ),
+    (
+        "12-invalid-utf8-refused.bin",
+        "invalid_utf8_refused",
+        "fad71cd9027f58abbb2e62cd4bd758edbc165643d094c1acd98c1a6e9f9fe1c5",
+    ),
+    (
+        "13-stored-id-mutation.bin",
+        "stored_id_mutation",
+        "ae51ae828fb009738b70681af3d01c26f93847fd7c618a1c316c1e04c9967fe5",
+    ),
+    (
+        "boundary-empty.bin",
+        "empty_refused",
+        "6babf6bad712d40cc33b5c1bd10208d72269e7bc4b633b1c289ce47b5aa30f84",
+    ),
+    (
+        "boundary-input-not-utf8.bin",
+        "input_not_utf8",
+        "6d2f75b6322353c07db47cd3e1412316de99a334bd12adf6c0fc99be81dd6d8d",
+    ),
+    (
+        "boundary-multibyte-limit.bin",
+        "roundtrip",
+        "c2a404d3c5cf90c84d4fd26f53344fe730e59172cc740a7648ab5fe9053c8d6b",
+    ),
+    (
+        "boundary-multibyte-over-limit.bin",
+        "oversized_refused",
+        "498a4d4a6c3efa1359a9c10331f0f87809caac7b6f6c9504b31192def8ab735a",
+    ),
 ];
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 fn assert_exact_seed_outcomes(
     target: &str,
-    expected: &[(&str, &str)],
+    expected: &[(&str, &str, &str)],
     replay: fn(&[u8]) -> Vec<&'static str>,
 ) {
     let corpus = seeds(target);
@@ -488,10 +610,15 @@ fn assert_exact_seed_outcomes(
         "{target}: every raw seed must have exactly one filename pin"
     );
     for (filename, bytes) in corpus {
-        let (_, expected_class) = expected
+        let (_, expected_class, expected_sha256) = expected
             .iter()
-            .find(|(name, _)| *name == filename)
+            .find(|(name, _, _)| *name == filename)
             .unwrap_or_else(|| panic!("{target}/{filename} has no exact outcome pin"));
+        assert_eq!(
+            sha256_hex(&bytes),
+            *expected_sha256,
+            "{target}/{filename} bytes no longer match its SHA-256 pin"
+        );
         let classes = replay(&bytes);
         assert_eq!(
             classes.as_slice(),
@@ -499,7 +626,7 @@ fn assert_exact_seed_outcomes(
             "{target}/{filename} no longer reaches its exact named outcome"
         );
     }
-    for (filename, _) in expected {
+    for (filename, _, _) in expected {
         assert!(
             seed_directory(target).join(filename).is_file(),
             "{target}/{filename} is pinned but absent"
