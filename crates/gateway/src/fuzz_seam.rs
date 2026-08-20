@@ -39,6 +39,7 @@ mod key_material;
 #[allow(dead_code)]
 mod middleware;
 mod mint;
+mod namespace;
 mod ops;
 mod policy;
 mod pricing;
