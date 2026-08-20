@@ -52,6 +52,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 gateway-core.workspace = true
 gateway-transport.workspace = true
 
+aes-kw.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true
 async-trait.workspace = true

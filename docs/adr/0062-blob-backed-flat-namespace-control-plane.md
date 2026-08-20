@@ -257,6 +257,40 @@ receives a bootstrap key from an environment variable or mounted secret and
 uses per-version envelope encryption bound to the deployment, namespace owner,
 and exact secret reference. A KMS or external secret manager is optional.
 
+The native v2 object is a deterministic canonical-CBOR fixed array containing
+only schema `2`, scheme `aes256-kw.aes256-gcm.envelope.v2`, stable KEK id, RFC
+3394 wrapped DEK, material nonce, and ciphertext. Environment, namespace, and
+exact secret reference are authenticated caller context rather than stored
+fields. Binary length-prefixed material AAD binds its purpose, environment id,
+`NamespaceId`, secret UUID, version, and KEK id. RFC 3394 AES-256-KW wraps the
+fixed 32-byte DEK without a nonce; because AES-KW has no AAD, caller-context
+binding is asserted only for the complete object after material authentication.
+The environment value is the publication protocol's single `EnvironmentId`,
+not a codec-local spelling. Opening consumes an opaque
+`AuthenticatedSecretBinding` and checks its indexed ciphertext digest before
+selecting a KEK. This crypto slice intentionally provides no production
+constructor for that binding: the integration slice must mint it only after a
+signed active revision, its content-addressed deployment object, and the exact
+deployment secret-index entry have all been verified. Tests and fuzzing alone
+have synthetic constructors. The same is true of the distinct create-only
+publication binding; its production minting belongs beside immutable publisher
+reservation enforcement.
+Plaintext is capped at 64 KiB, and the strict decoder rejects alternate CBOR
+spellings and oversized objects before allocation. A serving
+`BlobSecretOpener` owns only a bounded `KekDecryptRing` and has no sealing API or
+publication authority. A publisher-only `BlobSecretSealer` owns one active KEK
+and one opaque create-only binding and has no opening API. Up to eight
+decrypt-only keys permit rolling rotation, while duplicate ids or aliased raw
+key bytes refuse the whole ring atomically. The legacy v1
+Postgres envelope is a separate unchanged format and is never guessed from blob
+bytes.
+
+Publication must reserve an exact `SecretRef` create-only and report a conflict
+if any value already occupies it; changing bytes always requires a new version.
+The object-store contract already refuses overwriting an immutable object key,
+but the reference index and publisher that enforce this stronger rule are a
+follow-up slice and are not claimed by the codec alone.
+
 Staging or rotation creates a new sealed version. Activation, disablement, and
 revocation publish namespace or deployment revisions that change references;
 they do not mutate ciphertext. Destruction first creates an immutable tombstone

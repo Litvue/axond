@@ -26,9 +26,23 @@ npm test
 
 ## What it asserts
 
-Beyond the wire round-trip on each supported route, two things a unit test
-cannot see:
+Beyond the wire round-trip on each supported route, the black-box lane proves
+several things a unit test cannot see:
 
+- **Provider-native SDK calls through a namespace.** The OpenAI clients use a
+  base URL ending in `/namespaces/platform/v1`; the Anthropic clients use one
+  ending in `/namespaces/platform`, because that SDK appends `/v1/messages`.
+  Chat Completions, Responses, embeddings, models, messages, and both SDKs'
+  streaming helpers remain native calls with their native response types. Each
+  contract also runs through the legacy stateless base URL during its documented
+  compatibility window.
+- **Only the outer mount disappears.** The fake upstream requires the same
+  `/chat/completions`, `/responses`, `/embeddings`, and `/messages` suffixes and
+  fixture payloads for canonical and legacy requests. It therefore catches a
+  leaked `/namespaces/{namespace}` prefix, a duplicate `/v1`, or an accidental
+  request-body rewrite. Existing-but-ungranted and absent namespaces also have
+  byte-equivalent refusals and never reach the upstream; malformed namespace
+  syntax receives a generic error that does not echo path material.
 - **The provider credential, not the caller's.** Every assertion on an upstream
   request checks the injected `Authorization` / `x-api-key` is the *provider*
   key. The gateway key the SDK authenticated with must not appear upstream.

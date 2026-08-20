@@ -110,6 +110,54 @@ pub enum Rejection {
     Unavailable,
 }
 
+/// Decode one untrusted namespace-native sealed-secret object through the
+/// production parser. An accepted object is returned in its one canonical
+/// spelling; a refusal exposes only a stable class and never rejected bytes.
+pub fn blob_secret_envelope_cbor(input: &[u8]) -> Result<Vec<u8>, &'static str> {
+    use backends::secrets::blob_envelope::{CodecError, SealedBlobSecret};
+
+    SealedBlobSecret::from_canonical_cbor(input)
+        .map(|sealed| sealed.to_canonical_cbor())
+        .map_err(|error| match error {
+            CodecError::Oversized => "oversized",
+            CodecError::Truncated => "truncated",
+            CodecError::Shape => "shape",
+            CodecError::Compatibility => "compatibility",
+            CodecError::NonCanonical => "noncanonical",
+            CodecError::KekId => "kek_id",
+            CodecError::FixedField => "fixed_field",
+            CodecError::Ciphertext => "ciphertext",
+            CodecError::Trailing => "trailing",
+        })
+}
+
+/// Parser ceiling exported as a value, not as an internal type dependency.
+pub const BLOB_SECRET_MAX_SEALED_BYTES: usize = backends::secrets::blob_envelope::MAX_SEALED_BYTES;
+
+/// Plaintext byte ceiling used by structured boundary scenarios.
+pub const BLOB_SECRET_MAX_PLAINTEXT_BYTES: usize =
+    backends::secrets::blob_envelope::MAX_PLAINTEXT_BYTES;
+
+/// Drive bounded synthetic seal/open scenarios through the private v2 codec.
+/// No production key or authenticated manifest enters this seam.
+pub fn blob_secret_seal_open(
+    material: &[u8],
+    scenario: u8,
+    primary_seed: u8,
+    secondary_seed: u8,
+    identity_seed: u64,
+    version_seed: u16,
+) -> &'static str {
+    backends::secrets::blob_envelope::fuzz_seal_open(
+        material,
+        scenario,
+        primary_seed,
+        secondary_seed,
+        identity_seed,
+        version_seed,
+    )
+}
+
 /// The bounded reason behind a seam rejection, so a fuzzed import can be admitted
 /// over a last-known-good catalogue the same way the refresh admits one.
 ///
