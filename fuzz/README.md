@@ -16,6 +16,7 @@ storage. This project fuzzes all five, on the parsers the process actually runs.
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission | A third party publishes it, a background refresh imports it unattended, and what it says about prices and capabilities feeds routing and spend decisions |
 | `blob_secret_envelope` | The v2 bounded canonical-CBOR fixed-array decoder | Authenticated desired state names immutable bytes, but the storage object itself is untrusted until strict parsing and AEAD opening succeed |
 | `blob_secret_crypto` | Structured bounded v2 sealing, opening, context substitution, rotation, and mutation | Valid cryptographic states are too sparse for raw byte mutation alone |
+| `publication_parsers` | Signed head tuples, revision manifests, active-revision matching, and the final version fence | Durable object-store bytes are outside the process trust boundary and must fail closed without panics or unbounded parsing |
 
 Every `blob_secret_envelope` filename is pinned to one exact parser outcome.
 The crypto corpus owns a stable binary layout: scenario, primary and secondary
@@ -23,6 +24,11 @@ key seed bytes, little-endian identity and version seeds, then the remaining
 bytes as material. It commits one file per crypto scenario plus empty,
 non-UTF-8, exact-multibyte-limit, and over-limit boundaries; smoke decodes each
 with `BlobSecretCryptoInput::arbitrary_take_rest` and asserts the exact outcome.
+
+The publication corpus is likewise pinned by filename to the exact sequence of
+head, manifest, and activation outcomes it documents. The smoke replay calls
+the same seam as the coverage-guided `publication_parsers` target, so removing
+or renaming a security vector cannot silently reduce coverage.
 
 The properties each target asserts live in [`src/lib.rs`](./src/lib.rs) and
 [`src/wire.rs`](./src/wire.rs): a parser returns rather than panicking, a

@@ -14,6 +14,12 @@ and the domain becomes flat namespaces. Follow the
 to claim an object-store implementation before its code and conformance suite
 land together.
 
+The provider-neutral `ObjectStore` primitive is intentionally narrower than a
+business responsibility: exact reads plus create/CAS writes are the publication
+and convergence path. `ObjectStoreMaintenance` is a separate background-only
+capability for native version-conditional ciphertext deletion after a durable
+tombstone. A backend may implement the former without claiming the latter.
+
 ## There is no universal state backend
 
 Axond selects a backend **per responsibility**. There is deliberately no

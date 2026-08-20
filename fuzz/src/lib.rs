@@ -25,9 +25,10 @@
 
 mod wire;
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
-use arbitrary::Arbitrary;
+use arbitrary::{Arbitrary, Unstructured};
 use axond_fuzz_seam::{Rejection, VerifiedToken};
 
 pub use wire::{
@@ -194,6 +195,314 @@ fn assert_typed(rejection: &Rejection) -> &'static str {
         // The seam resolves no store, so this is unreachable by construction.
         Rejection::Unavailable => panic!("the stateless seam reported a store as unavailable"),
     }
+}
+
+/// Stored publication documents are raw bytes. Human-reviewable manifest seeds
+/// use this prefix followed by lowercase hex because deterministic CBOR begins
+/// with non-UTF-8 bytes; arbitrary inputs without the prefix reach both parsers
+/// unchanged.
+const MANIFEST_HEX_PREFIX: &[u8] = b"manifest-hex:";
+const PROBE_CASE_PREFIX: &[u8] = b"publication-probe:";
+const HEAD_JSON_PREFIX: &[u8] = b"head-json:";
+const OVERSIZED_MANIFEST_SENTINEL: &[u8] = b"manifest-oversized";
+
+fn decode_lower_hex(hex: &[u8]) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |byte| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    hex.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect()
+}
+
+fn publication_payload(data: &[u8]) -> Cow<'_, [u8]> {
+    if strip_seed_line_ending(data) == OVERSIZED_MANIFEST_SENTINEL {
+        return Cow::Owned(vec![0; axond_fuzz_seam::PUBLICATION_MANIFEST_MAX_BYTES + 1]);
+    }
+    if let Some(json) = data.strip_prefix(HEAD_JSON_PREFIX) {
+        return Cow::Borrowed(strip_seed_line_ending(json));
+    }
+    let Some(hex) = data.strip_prefix(MANIFEST_HEX_PREFIX) else {
+        return Cow::Borrowed(data);
+    };
+    let Some(decoded) = decode_lower_hex(strip_seed_line_ending(hex)) else {
+        return Cow::Borrowed(data);
+    };
+    Cow::Owned(decoded)
+}
+
+fn strip_seed_line_ending(data: &[u8]) -> &[u8] {
+    data.strip_suffix(b"\n")
+        .map(|data| data.strip_suffix(b"\r").unwrap_or(data))
+        .unwrap_or(data)
+}
+
+fn stored_document_class(
+    accepted: &'static str,
+    result: &Result<(), axond_fuzz_seam::StoredDocumentRejection>,
+) -> &'static str {
+    match result {
+        Ok(()) => accepted,
+        Err(rejection) => {
+            assert!(
+                !rejection.code.is_empty(),
+                "stored-document refusal has no code"
+            );
+            assert!(
+                !rejection.message.is_empty(),
+                "stored-document refusal has no message"
+            );
+            rejection.code
+        }
+    }
+}
+
+/// Independent expectations and fences for the publication verification seam.
+///
+/// Keeping these fields separate lets coverage-guided mutation reach digest,
+/// sequence, environment, parent, tuple-guard, orphan, and changed-version
+/// refusals without first having to forge a new Ed25519 signature.
+#[derive(Debug, Arbitrary)]
+struct PublicationProbe<'a> {
+    expected_environment: &'a str,
+    expected_digest: [u8; 32],
+    expected_sequence: u64,
+    expected_parent: Option<[u8; 32]>,
+    accepted_sequence: u64,
+    accepted_revision: [u8; 32],
+    observed_version: &'a str,
+    current_version: &'a str,
+    head: &'a [u8],
+    manifest: &'a [u8],
+    current_head: &'a [u8],
+}
+
+#[derive(Debug)]
+struct OwnedPublicationProbe {
+    expected_environment: String,
+    expected_digest: [u8; 32],
+    expected_sequence: u64,
+    expected_parent: Option<[u8; 32]>,
+    accepted_sequence: u64,
+    accepted_revision: [u8; 32],
+    observed_version: String,
+    current_version: String,
+    head: Vec<u8>,
+    manifest: Vec<u8>,
+    current_head: Vec<u8>,
+}
+
+fn committed_publication_probe(data: &[u8]) -> Option<OwnedPublicationProbe> {
+    let scenario = strip_seed_line_ending(data.strip_prefix(PROBE_CASE_PREFIX)?);
+    let head = publication_payload(include_bytes!(
+        "../seeds/publication_parsers/valid-head.json"
+    ))
+    .into_owned();
+    let valid_manifest = publication_payload(include_bytes!(
+        "../seeds/publication_parsers/valid-manifest.hex"
+    ))
+    .into_owned();
+    let orphan_manifest = publication_payload(include_bytes!(
+        "../seeds/publication_parsers/signed-orphan-manifest.hex"
+    ))
+    .into_owned();
+    let valid_digest: [u8; 32] =
+        decode_lower_hex(b"6ea3fd50ccba76800b4abb561a493444e25e4d96ceaf320380463486305cd21b")?
+            .try_into()
+            .ok()?;
+    let orphan_digest: [u8; 32] =
+        decode_lower_hex(b"8186ec1d7c710b53f58b647abd6dbf8b39c22dc89af8ca729b9a47a8254ebb6b")?
+            .try_into()
+            .ok()?;
+    let (expected_digest, accepted_sequence, accepted_revision, manifest, current_version) =
+        match scenario {
+            b"valid-active" => (valid_digest, 0, [0; 32], valid_manifest, "version-1"),
+            b"fence-changed" => (valid_digest, 0, [0; 32], valid_manifest, "version-2"),
+            b"same-sequence-equivocation" => {
+                (valid_digest, 1, orphan_digest, valid_manifest, "version-1")
+            }
+            b"signed-orphan-activation" => {
+                (orphan_digest, 0, [0; 32], orphan_manifest, "version-1")
+            }
+            b"digest-mismatch" => ([0; 32], 0, [0; 32], valid_manifest, "version-1"),
+            _ => return None,
+        };
+    Some(OwnedPublicationProbe {
+        expected_environment: "production-us-east".to_owned(),
+        expected_digest,
+        expected_sequence: 1,
+        expected_parent: None,
+        accepted_sequence,
+        accepted_revision,
+        observed_version: "version-1".to_owned(),
+        current_version: current_version.to_owned(),
+        current_head: head.clone(),
+        head,
+        manifest,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publication_probe_classes(
+    expected_environment: &str,
+    expected_digest: [u8; 32],
+    expected_sequence: u64,
+    expected_parent: Option<[u8; 32]>,
+    accepted_sequence: u64,
+    accepted_revision: [u8; 32],
+    observed_version: &str,
+    current_version: &str,
+    head: &[u8],
+    manifest: &[u8],
+    current_head: &[u8],
+) -> [&'static str; 3] {
+    let guarded = axond_fuzz_seam::publication_head_document_with_state(
+        head,
+        expected_environment,
+        accepted_sequence,
+        accepted_revision,
+    );
+    let verified = axond_fuzz_seam::publication_revision_manifest_with_expectations(
+        manifest,
+        expected_environment,
+        expected_digest,
+        expected_sequence,
+        expected_parent,
+    );
+    let active = axond_fuzz_seam::publication_active_revision(
+        head,
+        manifest,
+        current_head,
+        expected_environment,
+        expected_digest,
+        expected_sequence,
+        expected_parent,
+        accepted_sequence,
+        accepted_revision,
+        observed_version,
+        current_version,
+    );
+    assert_eq!(
+        guarded,
+        axond_fuzz_seam::publication_head_document_with_state(
+            head,
+            expected_environment,
+            accepted_sequence,
+            accepted_revision,
+        ),
+        "the tuple guard was nondeterministic"
+    );
+    assert_eq!(
+        verified,
+        axond_fuzz_seam::publication_revision_manifest_with_expectations(
+            manifest,
+            expected_environment,
+            expected_digest,
+            expected_sequence,
+            expected_parent,
+        ),
+        "manifest verification was nondeterministic"
+    );
+    assert_eq!(
+        active,
+        axond_fuzz_seam::publication_active_revision(
+            head,
+            manifest,
+            current_head,
+            expected_environment,
+            expected_digest,
+            expected_sequence,
+            expected_parent,
+            accepted_sequence,
+            accepted_revision,
+            observed_version,
+            current_version,
+        ),
+        "active-revision fencing was nondeterministic"
+    );
+    [
+        stored_document_class("head_guard_accepted", &guarded),
+        stored_document_class("manifest_verified", &verified),
+        stored_document_class("active_verified", &active),
+    ]
+}
+
+/// Untrusted object-store bytes: the bounded canonical head JSON parser and the
+/// hand-written deterministic CBOR revision-manifest parser.
+pub fn publication_parsers(data: &[u8]) -> Vec<&'static str> {
+    let has_committed_encoding = data.starts_with(HEAD_JSON_PREFIX)
+        || data.starts_with(MANIFEST_HEX_PREFIX)
+        || data.starts_with(PROBE_CASE_PREFIX)
+        || strip_seed_line_ending(data) == OVERSIZED_MANIFEST_SENTINEL;
+    let payload = publication_payload(data);
+    let head = axond_fuzz_seam::publication_head_document(&payload);
+    let manifest = axond_fuzz_seam::publication_revision_manifest(&payload);
+    assert_eq!(
+        head,
+        axond_fuzz_seam::publication_head_document(&payload),
+        "the same environment head bytes were accepted and refused"
+    );
+    assert_eq!(
+        manifest,
+        axond_fuzz_seam::publication_revision_manifest(&payload),
+        "the same revision manifest bytes were accepted and refused"
+    );
+    if payload.len() > axond_fuzz_seam::PUBLICATION_HEAD_MAX_BYTES {
+        assert!(
+            matches!(&head, Err(error) if error.code == "head_oversized"),
+            "an oversized head bypassed its explicit bound: {head:?}"
+        );
+    }
+    if payload.len() > axond_fuzz_seam::PUBLICATION_MANIFEST_MAX_BYTES {
+        assert!(
+            matches!(&manifest, Err(error) if error.code == "manifest_oversized"),
+            "an oversized manifest bypassed its explicit bound: {manifest:?}"
+        );
+    }
+    let mut classes = vec![
+        stored_document_class("head_accepted", &head),
+        stored_document_class("manifest_accepted", &manifest),
+    ];
+    if let Some(probe) = committed_publication_probe(data) {
+        classes.extend(publication_probe_classes(
+            &probe.expected_environment,
+            probe.expected_digest,
+            probe.expected_sequence,
+            probe.expected_parent,
+            probe.accepted_sequence,
+            probe.accepted_revision,
+            &probe.observed_version,
+            &probe.current_version,
+            &probe.head,
+            &probe.manifest,
+            &probe.current_head,
+        ));
+    }
+    if !has_committed_encoding
+        && let Ok(probe) = PublicationProbe::arbitrary_take_rest(Unstructured::new(data))
+    {
+        classes.extend(publication_probe_classes(
+            probe.expected_environment,
+            probe.expected_digest,
+            probe.expected_sequence,
+            probe.expected_parent,
+            probe.accepted_sequence,
+            probe.accepted_revision,
+            probe.observed_version,
+            probe.current_version,
+            probe.head,
+            probe.manifest,
+            probe.current_head,
+        ));
+    }
+    classes
 }
 
 /// Untrusted configuration text: what an operator's file, a mounted ConfigMap,

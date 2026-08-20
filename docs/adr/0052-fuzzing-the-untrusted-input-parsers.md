@@ -31,9 +31,10 @@ the opposite of what a required pull-request lane can be.
 
 A fuzzing program in two halves over the production parsers for configuration,
 `axt1.` tokens, credential queries, provider SSE and error bodies, models.dev
-catalogues, and namespace-native sealed-secret objects. The target list grows
-with trust boundaries; the required bounded replay and scheduled
-coverage-guided run remain the two evidence tiers.
+catalogues, namespace-native sealed-secret objects, and signed durable
+publication documents. The target list grows with trust boundaries; the
+required bounded replay and scheduled coverage-guided run remain the two
+evidence tiers.
 
 ### An out-of-tree workspace, not a workspace member
 
@@ -63,6 +64,7 @@ pub fn credentials_query_namespaces(q: Option<&str>) -> Result<Option<String>, R
 pub fn verify_token(credential: &str) -> Result<Option<VerifiedToken>, Rejection>
 pub fn catalog_import_over_seed(payload: &[u8], etag: Option<&str>) -> CatalogAdmission
 pub fn blob_secret_envelope_cbor(input: &[u8]) -> Result<Vec<u8>, &'static str>
+pub fn publication_head_document(input: &[u8]) -> Result<(), StoredDocumentRejection>
 ```
 
 The catalogue entry point is the shape the rest follow as coverage grows: the

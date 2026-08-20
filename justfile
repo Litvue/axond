@@ -224,6 +224,7 @@ fuzz-all seconds="60":
     just fuzz catalog_import {{seconds}}
     just fuzz blob_secret_envelope {{seconds}}
     just fuzz blob_secret_crypto {{seconds}}
+    just fuzz publication_parsers {{seconds}}
 
 # The heavy SSE soak: hundreds of concurrent streams with cancels and drops.
 # The short subset runs in `just test`; this is the long one.

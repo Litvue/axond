@@ -29,6 +29,8 @@ anyhow = "1"
 arc-swap = "1.7"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
+azure_core = "=1.0.0"
+azure_storage_blob = "=1.0.0"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "error-context"] }

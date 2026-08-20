@@ -31,6 +31,7 @@ feature, and what that costs.
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission over the last-known-good catalogue | The scheduled catalogue refresh, unattended |
 | `blob_secret_envelope` | The v2 fixed-array canonical-CBOR sealed-secret decoder | Snapshot compilation after an authenticated blob manifest names immutable ciphertext |
 | `blob_secret_crypto` | Bounded synthetic v2 seal/open, context substitution, mutation, and rotation | Cryptographic invariants need structured valid objects that raw parser mutations rarely produce |
+| `publication_parsers` | Signed head, revision-manifest, active-revision, and final-fence verification | Object storage is outside the process trust boundary; malformed, unsigned, replayed, equivocated, orphaned, or unauthenticated durable bytes must fail closed |
 
 Every target asserts the same three properties, because they are what the
 gateway relies on.

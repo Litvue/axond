@@ -115,9 +115,11 @@ reload:
   `[secret_store]`, `[[admin_breakglass]]` — is rejected, since stateless mode
   never reads it. That is almost always a missing `mode = "stateful"`.
 
-Every value below is a *reference*: an environment-variable name or a file path.
-Nothing here connects to Postgres, reads a key, or resolves a DSN, and
-diagnostics name the reference rather than its value.
+Secret-bearing values below are *references*: environment-variable names or
+file paths. Object-storage URLs are credential-free settings, never SAS URLs,
+account keys, or bearer tokens. Loading configuration connects to no backend,
+reads no key, and resolves no DSN; diagnostics name references and fields rather
+than secret material.
 
 A referenced env var must also stay clear of the `AXOND_<section>` shape, because
 `AXOND_`-prefixed variables are the override layer described at the top of this
@@ -135,21 +137,60 @@ snapshot fails readiness rather than serving partial state.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `dsn_env` | string | — | Name of the env var holding the control-plane Postgres connection string. Required and non-empty. |
-| `schema` | string | connection default | PostgreSQL schema the journal lives in. A single unqualified identifier: it becomes `SET search_path`, so a qualified name like `a.b` and anything that is not an identifier are rejected at load. Omit to use whatever the DSN's own `search_path` selects. |
-| `migrate` | boolean | `false` | Whether a *booting replica* may apply pending migrations. Off by default: the safe order is one `axond migrate apply` before any replica starts, so a rollout cannot have one replica migrating a database the others are already reading. A replica checks the schema either way and refuses to serve one it does not recognise. |
-| `connect_timeout_ms` | integer | `5000` | Bound on establishing a control-plane connection. `0` is rejected. |
-| `operation_timeout_ms` | integer | `30000` | Bound on one control-plane operation, including a migration transaction. Higher than the connect bound because applying DDL to a large database is slower than opening a socket. `0` is rejected. |
+| `backend` | `object-storage` \| `postgres` | `postgres` | Durable Tier 2 implementation. The omitted default preserves existing PostgreSQL files; `object-storage` is the ADR 0062 target. Redis and memory are refused. |
+| `dsn_env` | string | — | **Postgres only.** Name of the env var holding the control-plane connection string. Required and non-empty for `postgres`; rejected for `object-storage`. |
+| `schema` | string | connection default | **Postgres only.** PostgreSQL journal schema. A single unqualified identifier; rejected for `object-storage`. |
+| `migrate` | boolean | `false` | **Postgres only.** Whether a booting replica may apply pending migrations. Even an explicit `false` is rejected for `object-storage`, preventing an ambiguous mixed contract. |
+| `environment_id` | string | — | **Object storage only; required.** Stable environment object-key segment: at most 128 bytes, lowercase ASCII letters/digits with internal `-`, `_`, or `.`, and alphanumeric boundaries. |
+| `container_url` | absolute URL | — | **Object storage only; required.** Credential-free container URL with exactly one unescaped container path segment. A loopback Azurite endpoint also accepts its native `account/container` pair over HTTPS or explicitly enabled HTTP. Production requires HTTPS. User info, query strings (including SAS), and fragments are rejected. |
+| `authentication` | `workload-identity` | — | **Object storage only; required.** The adapter obtains short-lived credentials from its workload identity chain. Tokens, account keys, client secrets, and SAS values cannot be represented in this section. |
+| `max_object_bytes` | integer | `16777216` | **Object storage only.** Absolute object ceiling; 1 byte through 64 MiB. |
+| `max_read_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Streaming read ceiling; 1 byte through 64 MiB and no greater than `max_object_bytes`. An explicit incoherent value is rejected rather than lowered. |
+| `max_write_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Conditional-write ceiling; 1 byte through 64 MiB and no greater than `max_read_bytes`, so this deployment can read every object it acknowledges writing. An explicit incoherent value is rejected rather than lowered. |
+| `allow_loopback_http` | boolean | `false` | **Object storage only.** Insecure development/Azurite escape hatch. It is accepted only for an `http://localhost` or loopback-IP endpoint and cannot weaken remote TLS. Native HTTPS Azurite needs no exception. |
+| `connect_timeout_ms` | integer | `5000` | Bound on establishing a backend connection. `0` is rejected. |
+| `operation_timeout_ms` | integer | `30000` | Bound on one control-plane operation. `0` is rejected. |
+
+The minimal object-storage configuration contract is:
+
+```toml
+mode = "stateful"
+
+[control_plane]
+backend = "object-storage"
+environment_id = "prod-us-east"
+container_url = "https://axondstate.blob.core.windows.net/control-plane"
+authentication = "workload-identity"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+```
+
+This slice validates and retains that contract but does **not** wire it into
+`axond serve`, migration commands, or secret hydration yet. It is reviewable
+configuration for the target topology, not a claim that blob-backed stateful
+serving is deployable. The checked repository example is
+[`ops/compose/axond.blob-contract.toml`](../ops/compose/axond.blob-contract.toml).
+`axond check preflight` therefore validates its references and syntax but fails
+the serving-posture check explicitly; it never asks this backend for a PostgreSQL
+DSN or reports the configuration contract as deployment readiness.
+
+PostgreSQL compatibility is unchanged: omit `backend`, keep `dsn_env`, and keep
+the existing `[secret_store]` section. Object storage rejects that legacy
+`[secret_store]` bootstrap because encrypted blob-secret runtime wiring is a
+separate implementation slice.
 
 `migrate` governs boot only. `axond migrate apply` is an operator asking for a
 migration explicitly, so it applies pending migrations whatever this key says;
 `axond check preflight` and `axond migrate status` never write regardless of it.
 See [the control-plane journal](operations/control-plane-journal.md#operator-commands).
 
-#### `[secret_store]`
+#### `[secret_store]` (legacy PostgreSQL control plane)
 
-Required in stateful mode. Tenant provider credentials are stored wrapped and
-unwrapped only while a snapshot is compiled; a request never unwraps a secret.
+Required when the stateful control plane uses `postgres`, and rejected by the
+new `object-storage` configuration contract. Tenant provider credentials are
+stored wrapped and unwrapped only while a snapshot is compiled; a request never
+unwraps a secret.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
