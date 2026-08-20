@@ -233,8 +233,12 @@ The exporter must either retain a narrowly bounded compatibility verifier for a
 documented window or require those credentials to rotate; it cannot claim to
 export key material it does not possess. Existing signed last-known-good caches
 use the old snapshot schema and must be regenerated after cutover.
-Compiled LKG layout 6 carries flat static policy and namespace-bound secret
-metadata; layout 5 and earlier are rejected before deserialization.
+Compiled LKG layout 6 can represent flat static policy and namespace-bound
+secret metadata, but this build neither writes nor cold-restores a
+credential-bearing flat-v2 compiled cache. Recovery remains refused until an
+authenticated monotonic revision/tombstone floor can prove that cached material
+has not since been withdrawn. Credential-free flat-v2 snapshots remain eligible;
+layout 5 and earlier are rejected before deserialization.
 
 Cutover uses one authority at a time. Rollback before any blob mutation may
 return to the quiesced PostgreSQL revision. After blob writes begin, returning

@@ -51,13 +51,11 @@ use crate::desired_state::pricing::{
 };
 use crate::desired_state::tenancy::DisplayName;
 use crate::desired_state::{
-    AuthorizationSnapshot, Checksum, NamespaceSecretRequest, ResourceId, ResourceKind, ResourceRef,
-    ResourceVersionNumber, SecretLifecycle,
+    AuthorizationSnapshot, Checksum, ResourceId, ResourceKind, ResourceRef, ResourceVersionNumber,
 };
 use crate::desired_state::{ProjectId, RevisionId, SecretRef, TenantId, WorkloadKey};
 use crate::key_material::{self, KeyMaterialError};
 use crate::middleware::{MiddlewareChain, MiddlewarePlan, MiddlewarePlanError, MiddlewareRuntime};
-use crate::namespace::NamespaceId;
 use crate::policy::PolicyRuntime;
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
@@ -560,6 +558,21 @@ pub(crate) struct CachedPriceTarget {
 }
 
 impl ConfigSnapshot {
+    /// Whether this snapshot is flat-v2 and carries provider credential
+    /// material.
+    ///
+    /// Such snapshots are deliberately ineligible for cross-restart recovery
+    /// until an authenticated monotonic revision/tombstone floor can prove that
+    /// cached material has not since been revoked.
+    pub(crate) fn credential_bearing_flat_v2(&self) -> bool {
+        self.config.credential.iter().any(|credential| {
+            credential.secret.is_some()
+                && self.config.namespace.iter().any(|namespace| {
+                    namespace.id == credential.namespace && namespace.static_policy.is_some()
+                })
+        })
+    }
+
     /// Capture the exact projection needed to rebuild a serving snapshot after
     /// a process restart. The caller encrypts the returned structure before it
     /// reaches disk; the cache writer explicitly zeroizes the temporary copy
@@ -780,6 +793,12 @@ impl ConfigSnapshot {
         env: &HashMap<String, String>,
         cached: CachedServingSnapshot,
     ) -> Result<(RevisionId, Self), String> {
+        if cached.credential_bearing_flat_v2() {
+            return Err(
+                "credential-bearing flat-v2 compiled snapshots are not eligible for cold restoration until an authenticated monotonic revision/tombstone floor exists"
+                    .to_owned(),
+            );
+        }
         verify_cached_guardrail_keys(&cached, env)?;
         let revision = RevisionId::parse(&cached.revision).map_err(|error| error.to_string())?;
         let restored_namespaces = cached
@@ -899,11 +918,6 @@ impl ConfigSnapshot {
         bootstrap
             .validate_compiled()
             .map_err(|error| error.to_string())?;
-        let flat_namespaces = bootstrap
-            .namespace
-            .iter()
-            .map(|namespace| (namespace.id.clone(), namespace.static_policy.is_some()))
-            .collect::<HashMap<_, _>>();
         let mut expected_secret_owners = HashMap::new();
         for credential in &bootstrap.credential {
             let Some(reference) = credential.secret else {
@@ -925,53 +939,17 @@ impl ConfigSnapshot {
             .map(|mut secret| {
                 let reference =
                     SecretRef::parse(&secret.reference).map_err(|error| error.to_string())?;
-                let expected_owner = expected_secret_owners.get(&reference).ok_or_else(|| {
-                    format!("compiled cache contains unreferenced secret {reference}")
-                })?;
-                let binding = match &secret.binding {
-                    CachedSecretBinding::Legacy => {
-                        if flat_namespaces.get(expected_owner).copied() == Some(true) {
-                            return Err(format!(
-                                "compiled cache omits namespace authority for flat-v2 secret {reference}"
-                            ));
-                        }
-                        ResolvedSecretBinding::Legacy
-                    }
-                    CachedSecretBinding::Namespace {
-                        owner_namespace,
-                        ciphertext_digest,
-                        lifecycle,
-                    } => {
-                        let owner = NamespaceId::parse(owner_namespace)
-                            .map_err(|error| error.to_string())?;
-                        if owner.as_str() != expected_owner {
-                            return Err(format!(
-                                "compiled cache binds secret {reference} to namespace `{owner}` but its credential belongs to `{expected_owner}`"
-                            ));
-                        }
-                        if flat_namespaces.get(expected_owner).copied() != Some(true) {
-                            return Err(format!(
-                                "compiled cache applies flat-v2 authority to legacy secret {reference}"
-                            ));
-                        }
-                        let digest = Checksum::parse(ciphertext_digest)
-                            .map_err(|error| error.to_string())?;
-                        let lifecycle = SecretLifecycle::parse(lifecycle).ok_or_else(|| {
-                            format!(
-                                "compiled cache declares unsupported lifecycle `{lifecycle}` for secret {reference}"
-                            )
-                        })?;
-                        if lifecycle != SecretLifecycle::Active {
-                            return Err(format!(
-                                "compiled cache cannot restore {lifecycle:?} secret {reference}"
-                            ));
-                        }
-                        ResolvedSecretBinding::Namespace(NamespaceSecretRequest::new(
-                            owner,
-                            reference,
-                            digest,
-                            lifecycle,
-                        ))
+                if !expected_secret_owners.contains_key(&reference) {
+                    return Err(format!(
+                        "compiled cache contains unreferenced secret {reference}"
+                    ));
+                }
+                let binding = match secret.binding {
+                    CachedSecretBinding::Legacy => ResolvedSecretBinding::Legacy,
+                    CachedSecretBinding::Namespace { .. } => {
+                        return Err(format!(
+                            "compiled cache carries namespace-bound secret {reference}; flat-v2 credential material is not eligible for cold restoration"
+                        ));
                     }
                 };
                 let material = std::mem::take(&mut secret.material);
@@ -1069,6 +1047,15 @@ fn restore_cached_buffered_routes(routes: &[String]) -> Result<Vec<BufferedRespo
 }
 
 impl CachedServingSnapshot {
+    fn credential_bearing_flat_v2(&self) -> bool {
+        self.credentials.iter().any(|credential| {
+            credential.secret.is_some()
+                && self.namespaces.iter().any(|namespace| {
+                    namespace.id == credential.namespace && namespace.static_policy.is_some()
+                })
+        })
+    }
+
     pub(crate) fn zeroize_secrets(&mut self) {
         for secret in &mut self.secrets {
             secret.material.zeroize();

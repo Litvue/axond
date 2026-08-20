@@ -80,7 +80,7 @@ pub struct DeploymentSecretIndexEntry {
 /// Keeping this distinct from [`SecretRef`] prevents a blob resolver from
 /// accidentally implementing deployment-wide, ownerless lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NamespaceSecretRequest {
+pub(crate) struct NamespaceSecretRequest {
     owner: NamespaceId,
     reference: SecretRef,
     ciphertext_digest: Checksum,
@@ -460,7 +460,7 @@ impl DeploymentSecretIndexEntry {
         self.lifecycle
     }
 
-    pub fn request(&self) -> NamespaceSecretRequest {
+    fn request(&self) -> NamespaceSecretRequest {
         NamespaceSecretRequest {
             owner: self.owner.clone(),
             reference: self.reference,
@@ -471,33 +471,19 @@ impl DeploymentSecretIndexEntry {
 }
 
 impl NamespaceSecretRequest {
-    pub fn new(
-        owner: NamespaceId,
-        reference: SecretRef,
-        ciphertext_digest: Checksum,
-        lifecycle: SecretLifecycle,
-    ) -> Self {
-        Self {
-            owner,
-            reference,
-            ciphertext_digest,
-            lifecycle,
-        }
-    }
-
-    pub fn owner(&self) -> &NamespaceId {
+    pub(crate) fn owner(&self) -> &NamespaceId {
         &self.owner
     }
 
-    pub const fn reference(&self) -> SecretRef {
+    pub(crate) const fn reference(&self) -> SecretRef {
         self.reference
     }
 
-    pub const fn ciphertext_digest(&self) -> Checksum {
+    pub(crate) const fn ciphertext_digest(&self) -> Checksum {
         self.ciphertext_digest
     }
 
-    pub const fn lifecycle(&self) -> SecretLifecycle {
+    pub(crate) const fn lifecycle(&self) -> SecretLifecycle {
         self.lifecycle
     }
 }

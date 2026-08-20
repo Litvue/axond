@@ -125,6 +125,8 @@ pub enum LastKnownGoodError {
     Decode(#[from] CanonicalDecodeError),
     #[error("compiled serving cache `{path}` could not be encoded: {detail}")]
     CompiledEncoding { path: PathBuf, detail: String },
+    #[error("compiled serving cache `{path}` is not eligible for persistence: {detail}")]
+    CompiledIneligible { path: PathBuf, detail: String },
     #[error("compiled serving cache `{path}` is not authentic or could not be decrypted")]
     CompiledSignature { path: PathBuf },
     #[error("compiled serving cache `{path}` is malformed: {detail}")]
@@ -225,7 +227,31 @@ impl LastKnownGood {
         snapshot: &crate::state::ConfigSnapshot,
         revision: RevisionId,
     ) -> Result<Vec<u8>, LastKnownGoodError> {
-        let mut cached = snapshot.cached_serving(revision);
+        if snapshot.credential_bearing_flat_v2() {
+            return Err(LastKnownGoodError::CompiledIneligible {
+                path: self.compiled_path(),
+                detail: "credential-bearing flat-v2 snapshots require an authenticated monotonic revision/tombstone floor before they can cross a restart"
+                    .to_owned(),
+            });
+        }
+        self.encode_cached(snapshot.cached_serving(revision))
+    }
+
+    /// Build an authentic legacy record for refusal-path tests. Production can
+    /// only enter through [`Self::encode_compiled`], which enforces eligibility.
+    #[cfg(test)]
+    pub(crate) fn encode_compiled_unchecked(
+        &self,
+        snapshot: &crate::state::ConfigSnapshot,
+        revision: RevisionId,
+    ) -> Result<Vec<u8>, LastKnownGoodError> {
+        self.encode_cached(snapshot.cached_serving(revision))
+    }
+
+    fn encode_cached(
+        &self,
+        mut cached: crate::state::CachedServingSnapshot,
+    ) -> Result<Vec<u8>, LastKnownGoodError> {
         let payload =
             serde_json::to_vec(&cached).map_err(|error| LastKnownGoodError::CompiledEncoding {
                 path: self.compiled_path(),

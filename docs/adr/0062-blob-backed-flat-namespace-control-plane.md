@@ -244,13 +244,20 @@ snapshot for their whole lifetime.
 
 Warm replicas keep serving during an object-store outage. Administration and
 convergence pause. A cold replica may restore an authenticated local
-last-known-good snapshot; without either object storage or a valid local cache
-it remains healthy-but-unready and serves no inference.
+last-known-good snapshot only when that snapshot contains no flat-v2 provider
+credentials. Credential-bearing flat-v2 snapshots deliberately do not cross a
+restart until the cache is checked against an authenticated monotonic
+revision/tombstone floor; otherwise a stale but authentic cache could resurrect
+material revoked by a newer revision whose cache write failed. Without object
+storage or an eligible local cache, the replica remains healthy-but-unready and
+serves no inference.
 
 The optional local cache is a recovery copy, never the desired-state authority.
 It is not an additional external service and may use a VM disk or per-replica
 persistent volume. A deployment that does not retain it makes no cold-start
-outage claim.
+outage claim. This projection slice retains cold recovery for credential-free
+flat-v2 state; credential-bearing recovery is a later integration gate, not a
+claim inferred from the cache format alone.
 
 ### Secrets remain encrypted and off the request path
 

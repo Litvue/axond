@@ -22,6 +22,22 @@ refusal is a typed value the gateway could answer with, and what it accepts
 stays inside the bounds the request path relies on — including that a signature
 from one namespace's signer never verifies into another.
 
+The `flat_v2_body` smoke replay pins every committed filename to one exact
+semantic outcome through the same `flat_v2_body_target` entrypoint libFuzzer
+uses. The table is intentionally exhaustive in both directions, so adding,
+removing, or renaming a seed requires updating the asserted contract:
+
+| Seed | Expected outcome |
+| --- | --- |
+| `deployment-missing-field.json` | `incompatible` |
+| `deployment-unknown-field.json` | `incompatible` |
+| `deployment-unknown-variant.json` | `incompatible` |
+| `deployment-valid.json` | `accepted` |
+| `grant-semantic-invalid.json` | `invalid` |
+| `grant-valid.json` | `accepted` |
+| `namespace-valid.json` | `accepted` |
+| `namespace-wrong-schema-shape.json` | `incompatible` |
+
 The wire targets add what a relay depends on: the decoder never holds more than
 its limit and never retains a complete event, decoding never expands its input,
 a chunk boundary cannot change what a body decodes to, a stream that ends

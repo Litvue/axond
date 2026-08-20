@@ -64,6 +64,20 @@ const MINIMUM_RESIGNED_CLASSES: usize = 10;
 /// [`EXPECTED_CATALOG_CLASSES`] pins which ones.
 const MINIMUM_CATALOG_EDIT_CLASSES: usize = 6;
 
+/// Every committed flat-v2 body seed and the semantic class it exists to pin.
+/// The guard below requires an exact filename match in both directions: adding,
+/// deleting, or renaming a seed requires an explicit decision here.
+const EXPECTED_FLAT_V2_SEED_CLASSES: &[(&str, &str)] = &[
+    ("deployment-missing-field.json", "incompatible"),
+    ("deployment-unknown-field.json", "incompatible"),
+    ("deployment-unknown-variant.json", "incompatible"),
+    ("deployment-valid.json", "accepted"),
+    ("grant-semantic-invalid.json", "invalid"),
+    ("grant-valid.json", "accepted"),
+    ("namespace-valid.json", "accepted"),
+    ("namespace-wrong-schema-shape.json", "incompatible"),
+];
+
 #[global_allocator]
 static ALLOCATOR: Capped = Capped;
 
@@ -263,7 +277,34 @@ fn replay_credentials_query(data: &[u8]) -> Vec<&'static str> {
 }
 
 fn replay_flat_v2_body(data: &[u8]) -> Vec<&'static str> {
-    vec![axond_fuzz::flat_v2_body(data)]
+    vec![axond_fuzz::flat_v2_body_target(data)]
+}
+
+fn assert_flat_v2_seed_contract() {
+    let corpus = seeds("flat_v2_body");
+    assert_eq!(
+        corpus.len(),
+        EXPECTED_FLAT_V2_SEED_CLASSES.len(),
+        "the flat-v2 corpus and its exact outcome table differ in size"
+    );
+    for (seed, bytes) in &corpus {
+        let expected = EXPECTED_FLAT_V2_SEED_CLASSES
+            .iter()
+            .find(|(filename, _)| filename == seed)
+            .map(|(_, outcome)| *outcome)
+            .unwrap_or_else(|| panic!("flat-v2 seed `{seed}` has no expected outcome entry"));
+        let actual = axond_fuzz::flat_v2_body_target(bytes);
+        assert_eq!(
+            actual, expected,
+            "flat-v2 seed `{seed}` reached `{actual}` rather than `{expected}`"
+        );
+    }
+    for (seed, _) in EXPECTED_FLAT_V2_SEED_CLASSES {
+        assert!(
+            corpus.iter().any(|(filename, _)| filename == seed),
+            "flat-v2 outcome table names missing seed `{seed}`"
+        );
+    }
 }
 
 /// The token target takes a structured input, so a seed file is replayed twice:
@@ -801,6 +842,7 @@ fn main() {
     // input carrying it, not a decoder disclosing it.
     axond_fuzz::assert_disclosure_check_survives_escaping();
     println!("provider_error: an escaped canary is read as the input that carried it");
+    assert_flat_v2_seed_contract();
     let mut inputs = 0_usize;
     for target in TARGETS {
         let mut target_inputs = 0_usize;

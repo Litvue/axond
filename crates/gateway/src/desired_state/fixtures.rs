@@ -20,7 +20,10 @@ use super::models::{
 use super::mutation::{
     Actor, AuditEvent, ExpectedRevision, IdempotencyKey, Mutation, MutationKind,
 };
-use super::namespaces::{DeploymentBody, InboundGrantBody, NamespaceBody, NamespacePolicySpec};
+use super::namespaces::{
+    DeploymentBody, DeploymentProvider, DeploymentSecretIndexEntry, FlatProviderKind,
+    InboundGrantBody, NamespaceBody, NamespaceCredential, NamespacePolicySpec,
+};
 use super::policy::{
     BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
 };
@@ -34,7 +37,7 @@ use super::resource::{
     ResourceVersionNumber,
 };
 use super::revision::{DesiredState, RevisionCandidate};
-use super::secrets::{SecretOwner, SecretRef, SecretVersion};
+use super::secrets::{SecretLifecycle, SecretOwner, SecretRef, SecretVersion};
 use super::tenancy::{DisplayName, ProjectBody, TenantBody};
 use crate::backends::catalog::{CatalogContentId, ProviderId};
 use crate::namespace::{NamespaceGrant, NamespaceId};
@@ -119,6 +122,101 @@ pub(crate) fn flat_namespace_state() -> DesiredState {
     state.insert(namespace).expect("namespace is unique");
     state.insert(grant).expect("grant is unique");
     state.validate().expect("flat namespace fixture is valid");
+    state
+}
+
+/// A flat-v2 revision whose active provider credential resolves through the
+/// deployment secret index.
+pub(crate) fn flat_namespace_state_with_active_credential() -> DesiredState {
+    flat_namespace_credential_state(SecretLifecycle::Active, true)
+}
+
+/// The successor to [`flat_namespace_state_with_active_credential`]: the
+/// credential is withdrawn and its exact indexed ciphertext is tombstoned.
+pub(crate) fn flat_namespace_state_with_tombstoned_credential() -> DesiredState {
+    flat_namespace_credential_state(SecretLifecycle::Tombstoned, false)
+}
+
+fn flat_namespace_credential_state(
+    lifecycle: SecretLifecycle,
+    include_credential: bool,
+) -> DesiredState {
+    let version = if include_credential {
+        ResourceVersionNumber::FIRST
+    } else {
+        ResourceVersionNumber::new(2).expect("fixture resource version")
+    };
+    let reference = secret_ref(953);
+    let deployment_body = DeploymentBody::new(
+        vec![DeploymentProvider {
+            id: Slug::parse("shared").expect("fixture provider slug"),
+            kind: FlatProviderKind::OpenaiCompatible,
+            base_url: "https://provider.example/v1".to_owned(),
+        }],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![DeploymentSecretIndexEntry::new(
+            NamespaceId::parse("acme").expect("fixture namespace"),
+            reference,
+            Checksum::of(b"fixture-ciphertext"),
+            lifecycle,
+        )],
+    )
+    .expect("fixture deployment is valid");
+    let deployment = ResourceVersion::new(
+        ResourceRef::new(ResourceKind::Deployment, resource_id(950), version),
+        ResourceScope::Deployment,
+        Slug::parse("deployment").expect("fixture slug"),
+        ResourceBody::Inline(deployment_body.canonical()),
+    );
+    let credentials = include_credential
+        .then(|| NamespaceCredential {
+            id: Slug::parse("primary").expect("fixture credential slug"),
+            provider: Slug::parse("shared").expect("fixture provider slug"),
+            secret: reference,
+            weight: 1,
+        })
+        .into_iter()
+        .collect();
+    let namespace_body = NamespaceBody::new(
+        NamespaceId::parse("acme").expect("fixture namespace"),
+        true,
+        false,
+        deployment.reference,
+        credentials,
+        Vec::new(),
+        NamespacePolicySpec {
+            epoch: 1,
+            exact: None,
+            middleware: Vec::new(),
+            buffered_response_routes: Vec::new(),
+        },
+        1,
+    )
+    .expect("fixture namespace is valid");
+    let namespace = ResourceVersion::new(
+        ResourceRef::new(ResourceKind::Namespace, resource_id(951), version),
+        ResourceScope::Deployment,
+        Slug::parse("acme").expect("fixture slug"),
+        ResourceBody::Inline(namespace_body.canonical()),
+    )
+    .depending_on([deployment.reference]);
+    let grant = InboundGrantBody::new(
+        Checksum::of(b"flat-namespace-credential-grant"),
+        NamespaceGrant::all(),
+        Some("fixture".to_owned()),
+    )
+    .expect("fixture grant")
+    .version(
+        resource_id(952),
+        Slug::parse("fixture").expect("fixture slug"),
+    );
+    let mut state = DesiredState::new();
+    state.insert(deployment).expect("deployment is unique");
+    state.insert(namespace).expect("namespace is unique");
+    state.insert(grant).expect("grant is unique");
+    state.validate().expect("flat credential fixture is valid");
     state
 }
 

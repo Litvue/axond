@@ -420,7 +420,7 @@ mod tests {
 
         async fn resolve_namespace(
             &self,
-            request: &crate::desired_state::NamespaceSecretRequest,
+            request: &crate::desired_state::namespaces::NamespaceSecretRequest,
         ) -> Result<SecretMaterial, SecretError> {
             assert_eq!(request.owner(), &self.owner);
             assert_eq!(request.reference(), self.reference);
@@ -432,7 +432,7 @@ mod tests {
 
         async fn exists_namespace(
             &self,
-            _request: &crate::desired_state::NamespaceSecretRequest,
+            _request: &crate::desired_state::namespaces::NamespaceSecretRequest,
         ) -> Result<bool, SecretError> {
             Ok(true)
         }
@@ -582,7 +582,7 @@ mod tests {
             .expect("globex explicitly borrows the default namespace pool");
         assert_eq!(plan.source, crate::credentials::CredentialSource::Platform);
 
-        let mut cached = snapshot.cached_serving(revision.id());
+        let cached = snapshot.cached_serving(revision.id());
         match &cached.secrets[0].binding {
             crate::state::CachedSecretBinding::Namespace {
                 owner_namespace,
@@ -600,76 +600,25 @@ mod tests {
                 panic!("flat-v2 cache material must retain namespace authority")
             }
         }
-        let (_, restored) = crate::state::ConfigSnapshot::from_cached_serving(
-            stateful_bootstrap(),
-            &HashMap::new(),
-            cached.clone(),
+        let cache = crate::convergence::LastKnownGood::new(
+            crate::convergence::lkg::testing::cache_path("flat-v2-credential-ineligible"),
+            crate::convergence::lkg::testing::KEY,
         )
         .unwrap();
-        assert!(
-            restored
-                .credentials
-                .is_present(&restored.config, "globex", "shared"),
-            "credential-bearing LKG restores platform fallback"
-        );
-        let mut foreign_owner = cached.clone();
-        let crate::state::CachedSecretBinding::Namespace {
-            owner_namespace, ..
-        } = &mut foreign_owner.secrets[0].binding
-        else {
-            unreachable!()
-        };
-        *owner_namespace = "globex".to_owned();
-        let error = match crate::state::ConfigSnapshot::from_cached_serving(
-            stateful_bootstrap(),
-            &HashMap::new(),
-            foreign_owner,
-        ) {
-            Ok(_) => panic!("a signed cache cannot move material to a foreign namespace"),
-            Err(error) => error,
-        };
-        assert!(error.contains("credential belongs to `acme`"), "{error}");
-
-        let mut tombstoned = cached.clone();
-        let crate::state::CachedSecretBinding::Namespace { lifecycle, .. } =
-            &mut tombstoned.secrets[0].binding
-        else {
-            unreachable!()
-        };
-        *lifecycle = "tombstoned".to_owned();
-        let error = match crate::state::ConfigSnapshot::from_cached_serving(
-            stateful_bootstrap(),
-            &HashMap::new(),
-            tombstoned,
-        ) {
-            Ok(_) => panic!("withdrawn cached material cannot reactivate"),
-            Err(error) => error,
-        };
-        assert!(error.contains("cannot restore Tombstoned"), "{error}");
-
-        let mut ownerless = cached.clone();
-        ownerless.secrets[0].binding = crate::state::CachedSecretBinding::Legacy;
-        let error = match crate::state::ConfigSnapshot::from_cached_serving(
-            stateful_bootstrap(),
-            &HashMap::new(),
-            ownerless,
-        ) {
-            Ok(_) => panic!("flat-v2 cached material cannot lose authority metadata"),
-            Err(error) => error,
-        };
-        assert!(error.contains("omits namespace authority"), "{error}");
-
-        cached.secrets.clear();
+        assert!(matches!(
+            cache.encode_compiled(&snapshot, revision.id()),
+            Err(crate::convergence::LastKnownGoodError::CompiledIneligible { .. })
+        ));
         let error = match crate::state::ConfigSnapshot::from_cached_serving(
             stateful_bootstrap(),
             &HashMap::new(),
             cached,
         ) {
-            Ok(_) => panic!("an LKG missing credential material must be rejected"),
+            Ok(_) => panic!("authenticated flat-v2 credential material crossed a restart"),
             Err(error) => error,
         };
         assert!(
-            error.contains("0 secret materials for 1 referenced versions"),
+            error.contains("not eligible for cold restoration"),
             "{error}"
         );
     }

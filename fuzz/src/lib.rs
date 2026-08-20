@@ -158,7 +158,10 @@ pub fn config_toml(data: &[u8]) -> &'static str {
 /// Untrusted canonical JSON for deployment, namespace, and inbound-grant v2
 /// bodies. Durable schema skew must remain a typed incompatibility and malformed
 /// storage must remain an ordinary refusal; neither may panic.
-pub fn flat_v2_body(data: &[u8]) -> &'static str {
+/// The exact target body called by both `fuzz_targets/flat_v2_body.rs` and the
+/// bounded seed replay. Keeping one public entrypoint prevents the smoke from
+/// testing a lookalike path while libFuzzer drives another.
+pub fn flat_v2_body_target(data: &[u8]) -> &'static str {
     let first = axond_fuzz_seam::flat_v2_body(data);
     assert!(
         matches!(

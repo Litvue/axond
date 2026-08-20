@@ -128,7 +128,7 @@ pub use namespaces::{
     DeploymentBody, DeploymentCatalogueEntry, DeploymentProvider, DeploymentSecretIndexEntry,
     DeploymentTrust, FlatNamespaces, FlatProviderKind, InboundGrantBody, NamespaceAlias,
     NamespaceBody, NamespaceCredential, NamespaceExactEnforcement, NamespacePolicySpec,
-    NamespaceProvider, NamespaceSecretRequest, NamespaceStateError, NamespaceTarget,
+    NamespaceProvider, NamespaceStateError, NamespaceTarget,
 };
 #[allow(unused_imports)]
 pub use policy::{
