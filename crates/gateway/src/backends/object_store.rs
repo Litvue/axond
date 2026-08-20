@@ -152,6 +152,7 @@ pub enum ObjectStoreOperation {
     Get,
     PutIfAbsent,
     ReplaceIfVersion,
+    DeleteIfVersion,
 }
 
 impl fmt::Display for ObjectStoreOperation {
@@ -160,6 +161,7 @@ impl fmt::Display for ObjectStoreOperation {
             Self::Get => "get",
             Self::PutIfAbsent => "put_if_absent",
             Self::ReplaceIfVersion => "replace_if_version",
+            Self::DeleteIfVersion => "delete_if_version",
         })
     }
 }
@@ -260,6 +262,22 @@ pub trait ObjectStore: Send + Sync {
         bytes: Bytes,
         expected: &ObjectVersion,
     ) -> Result<ObjectVersion, ObjectStoreError>;
+}
+
+/// Conditional object destruction used only by background maintenance.
+///
+/// Deletion is deliberately not part of [`ObjectStore`]: publication and
+/// serving correctness require exact reads and conditional writes, while
+/// ciphertext erasure happens only after a tombstone revision is durable. A
+/// backend that cannot provide native version-conditional deletion may still
+/// serve the control-plane contract, but cannot make a physical-erasure claim.
+#[async_trait]
+pub trait ObjectStoreMaintenance: Send + Sync {
+    async fn delete_if_version(
+        &self,
+        key: &ObjectKey,
+        expected: &ObjectVersion,
+    ) -> Result<(), ObjectStoreError>;
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +427,28 @@ impl ObjectStore for InMemoryObjectStore {
     }
 }
 
+#[async_trait]
+impl ObjectStoreMaintenance for InMemoryObjectStore {
+    async fn delete_if_version(
+        &self,
+        key: &ObjectKey,
+        expected: &ObjectVersion,
+    ) -> Result<(), ObjectStoreError> {
+        let mut state = self.lock(key)?;
+        let Some(current) = state.objects.get(key) else {
+            return Err(ObjectStoreError::NotFound { key: key.clone() });
+        };
+        if current.version != *expected {
+            return Err(ObjectStoreError::PreconditionFailed {
+                key: key.clone(),
+                operation: ObjectStoreOperation::DeleteIfVersion,
+            });
+        }
+        state.objects.remove(key);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +552,46 @@ mod tests {
             .expect_err("conditional replacement requires an existing object");
         assert_eq!(replace.kind(), ObjectStoreErrorKind::NotFound);
         assert_eq!(replace.category(), FailureCategory::NotFound);
+    }
+
+    #[tokio::test]
+    async fn maintenance_deletes_only_the_exact_version() {
+        let store = InMemoryObjectStore::new(limits(32));
+        let stale = store
+            .put_if_absent(&key(), Bytes::from_static(b"first"))
+            .await
+            .expect("first write");
+        let current = store
+            .replace_if_version(&key(), Bytes::from_static(b"second"), &stale)
+            .await
+            .expect("replacement");
+
+        let error = store
+            .delete_if_version(&key(), &stale)
+            .await
+            .expect_err("a stale eraser must not delete the winner");
+        assert_eq!(error.kind(), ObjectStoreErrorKind::PreconditionFailed);
+        assert_eq!(
+            store.get(&key()).await.expect("winner remains").version,
+            current
+        );
+
+        store
+            .delete_if_version(&key(), &current)
+            .await
+            .expect("current version is deleted");
+        assert_eq!(
+            store.get(&key()).await.expect_err("deleted object").kind(),
+            ObjectStoreErrorKind::NotFound
+        );
+        assert_eq!(
+            store
+                .delete_if_version(&key(), &current)
+                .await
+                .expect_err("missing erasure is reported for idempotent callers")
+                .kind(),
+            ObjectStoreErrorKind::NotFound
+        );
     }
 
     #[tokio::test]

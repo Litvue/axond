@@ -14,13 +14,16 @@ use azure_core::credentials::TokenCredential;
 use azure_core::error::ErrorKind as AzureErrorKind;
 use azure_core::http::{Etag, RequestContent, StatusCode, Url};
 use azure_storage_blob::clients::{BlobClient, BlobClientOptions};
-use azure_storage_blob::models::{BlobClientDownloadOptions, BlobClientUploadOptions, HttpRange};
+use azure_storage_blob::models::{
+    BlobClientDeleteOptions, BlobClientDownloadOptions, BlobClientUploadOptions,
+    DeleteSnapshotsOptionType, HttpRange,
+};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 
 use super::object_store::{
-    ObjectKey, ObjectStore, ObjectStoreError, ObjectStoreLimits, ObjectStoreOperation, ObjectValue,
-    ObjectVersion,
+    ObjectKey, ObjectStore, ObjectStoreError, ObjectStoreLimits, ObjectStoreMaintenance,
+    ObjectStoreOperation, ObjectValue, ObjectVersion,
 };
 
 /// Configuration errors detected before an Azure client is constructed.
@@ -298,6 +301,33 @@ impl ObjectStore for AzureBlobObjectStore {
     }
 }
 
+#[async_trait]
+impl ObjectStoreMaintenance for AzureBlobObjectStore {
+    async fn delete_if_version(
+        &self,
+        key: &ObjectKey,
+        expected: &ObjectVersion,
+    ) -> Result<(), ObjectStoreError> {
+        validate_etag(expected.as_opaque()).map_err(|message| {
+            ObjectStoreError::integrity(key.clone(), format!("invalid expected ETag: {message}"))
+        })?;
+        self.blob_client(key, ObjectStoreOperation::DeleteIfVersion)?
+            .delete(Some(BlobClientDeleteOptions {
+                // Azure otherwise refuses to delete a base blob that has
+                // snapshots. Including them is the strongest erasure request
+                // the adapter can issue; account-level soft-delete/version
+                // retention may still delay physical destruction and is an
+                // operator-visible deployment property.
+                delete_snapshots: Some(DeleteSnapshotsOptionType::Include),
+                if_match: Some(Etag::from(expected.as_opaque())),
+                ..Default::default()
+            }))
+            .await
+            .map_err(|error| map_azure_error(key, ObjectStoreOperation::DeleteIfVersion, error))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum UrlPolicy {
     Production,
@@ -426,7 +456,9 @@ fn map_azure_error(
         }
         if matches!(
             operation,
-            ObjectStoreOperation::PutIfAbsent | ObjectStoreOperation::ReplaceIfVersion
+            ObjectStoreOperation::PutIfAbsent
+                | ObjectStoreOperation::ReplaceIfVersion
+                | ObjectStoreOperation::DeleteIfVersion
         ) && matches!(
             status,
             StatusCode::Conflict | StatusCode::PreconditionFailed
@@ -778,6 +810,66 @@ mod tests {
         assert_eq!(request.headers["if-match"], "\"opaque/etag-1\"");
         assert!(request.headers.get("if-none-match").is_none());
         assert_eq!(request.body, Bytes::from_static(b"replacement"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_delete_uses_the_exact_opaque_etag() {
+        let mut server = FakeServer::start(vec![response(
+            HttpStatusCode::ACCEPTED,
+            None,
+            Body::empty(),
+        )])
+        .await;
+        let store = development_store(&server, limits(32, 32));
+        let expected = ObjectVersion::opaque("\"opaque/etag-1\"").expect("expected ETag");
+
+        store
+            .delete_if_version(&key(), &expected)
+            .await
+            .expect("delete exact blob version");
+
+        let request = server.request().await;
+        assert_eq!(request.method, Method::DELETE);
+        assert_eq!(request.headers["if-match"], "\"opaque/etag-1\"");
+        assert_eq!(request.headers["x-ms-delete-snapshots"], "include");
+        assert!(request.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn maintenance_delete_maps_missing_stale_and_auth_failures() {
+        let server = FakeServer::start(vec![
+            error_response(HttpStatusCode::NOT_FOUND),
+            error_response(HttpStatusCode::PRECONDITION_FAILED),
+            error_response(HttpStatusCode::FORBIDDEN),
+        ])
+        .await;
+        let store = development_store(&server, limits(32, 32));
+        let expected = ObjectVersion::opaque("\"current\"").expect("ETag");
+
+        assert_eq!(
+            store
+                .delete_if_version(&key(), &expected)
+                .await
+                .expect_err("missing")
+                .kind(),
+            ObjectStoreErrorKind::NotFound
+        );
+        assert_eq!(
+            store
+                .delete_if_version(&key(), &expected)
+                .await
+                .expect_err("stale")
+                .kind(),
+            ObjectStoreErrorKind::PreconditionFailed
+        );
+        assert_eq!(
+            store
+                .delete_if_version(&key(), &expected)
+                .await
+                .expect_err("auth")
+                .kind(),
+            ObjectStoreErrorKind::Unavailable
+        );
     }
 
     #[tokio::test]
