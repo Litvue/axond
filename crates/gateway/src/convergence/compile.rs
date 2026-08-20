@@ -51,15 +51,19 @@ use async_trait::async_trait;
 
 use crate::availability::{AvailabilityEvidence, AvailabilityProjectionError, CredentialReadiness};
 use crate::backends::catalog_store::CatalogStore;
+use crate::backends::object_store::ObjectStore;
+use crate::backends::secrets::blob_envelope::KekDecryptRing;
 use crate::config::{Config, ConfigError};
 use crate::desired_state::pricing::{
     EffectiveInstant, InvalidInstant, PriceBooks, PricingError, PricingSnapshot,
 };
-use crate::desired_state::{DesiredState, LoadedRevision, ResourceRef, RevisionId};
+use crate::desired_state::{
+    BlobCandidate, BlobReader, DesiredState, LoadedRevision, ResourceRef, RevisionId,
+};
 use crate::policy::ActivationRefusal;
 use crate::state::{ConfigSnapshot, SnapshotError};
 
-use super::secrets::{MaterialLedger, SecretMaterialization};
+use super::secrets::{BlobCandidateSecretError, MaterialLedger, SecretMaterialization};
 
 /// Filling the control-plane-owned sections of a config from desired state.
 ///
@@ -447,6 +451,76 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
         revision: &LoadedRevision,
         generation: u64,
     ) -> Result<ConfigSnapshot, CompileError> {
+        self.compile_with_materialization(revision, generation, &self.secrets)
+            .await
+    }
+
+    fn abandoned(&self) {
+        let Some(evidence) = self.availability.as_ref() else {
+            return;
+        };
+        let derived = self
+            .derived
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(derivation) = derived {
+            evidence.abandon(derivation);
+        }
+    }
+}
+
+impl<P: RevisionProjection> RevisionCompiler<P> {
+    /// Compile a verified blob candidate through the same stateful snapshot
+    /// pipeline as the journal-backed compiler.
+    ///
+    /// The loaded revision and blob candidate must describe the same desired
+    /// state. This check prevents a caller from pairing a candidate-bound
+    /// resolver with a different projection, and keeps any mismatch before the
+    /// sink can be asked to publish. The resolver itself is built from the
+    /// candidate authority and the trust-only reader, never from ambient owner,
+    /// reference, or environment values.
+    pub(crate) async fn compile_with_blob_candidate<S: ObjectStore + 'static>(
+        &self,
+        revision: &LoadedRevision,
+        candidate: BlobCandidate,
+        reader: BlobReader<S>,
+        ring: KekDecryptRing,
+        generation: u64,
+    ) -> Result<ConfigSnapshot, CompileError> {
+        let id = revision.id();
+        if candidate.state() != revision.state() {
+            return Err(CompileError::Projection {
+                revision: id,
+                source: ProjectionError::Incomplete {
+                    detail: "verified blob candidate does not match the loaded revision".to_owned(),
+                },
+            });
+        }
+        let secrets = SecretMaterialization::from_blob_candidate(
+            candidate,
+            reader,
+            ring,
+            Arc::clone(self.secrets.ledger()),
+        )
+        .map_err(
+            |source: BlobCandidateSecretError| CompileError::Projection {
+                revision: id,
+                source: ProjectionError::Incomplete {
+                    detail: source.to_string(),
+                },
+            },
+        )?;
+        self.compile_with_materialization(revision, generation, &secrets)
+            .await
+    }
+
+    async fn compile_with_materialization(
+        &self,
+        revision: &LoadedRevision,
+        generation: u64,
+        secrets: &SecretMaterialization,
+    ) -> Result<ConfigSnapshot, CompileError> {
         let id = revision.id();
         if self.bootstrap.mode == crate::config::Mode::Stateful
             && !self.projection.projects_inbound_principals()
@@ -499,14 +573,14 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
         // and material that cannot be unwrapped is a refusal rather than a
         // snapshot with holes in it. Either way the resolved set is dropped here,
         // which zeroizes it, and only a published snapshot keeps it alive.
-        let secrets = self
-            .secrets
-            .resolve(revision.state())
-            .await
-            .map_err(|source| CompileError::Projection {
-                revision: id,
-                source,
-            })?;
+        let secrets =
+            secrets
+                .resolve(revision.state())
+                .await
+                .map_err(|source| CompileError::Projection {
+                    revision: id,
+                    source,
+                })?;
         // Read before the set is handed to the snapshot: "this credential's exact
         // version is in hand" is what separates a credential a tenant holds from
         // one it can use, and it is a set of references, never material.
@@ -549,20 +623,6 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
         // dimensions the deployment refused.
         *self.derived.lock().unwrap_or_else(PoisonError::into_inner) = Some(projected.derivation());
         Ok(snapshot.with_availability(Arc::new(projected.into_index())))
-    }
-
-    fn abandoned(&self) {
-        let Some(evidence) = self.availability.as_ref() else {
-            return;
-        };
-        let derived = self
-            .derived
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(derivation) = derived {
-            evidence.abandon(derivation);
-        }
     }
 }
 
