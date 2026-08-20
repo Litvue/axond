@@ -97,10 +97,12 @@ python3 ops/promote-qualification.py \
   --out target/qualification-records/validated-endurance-soak.toml
 ```
 
-The manually dispatched `Endurance smoke` Actions workflow runs only the same
-short smoke tier already exercised by ordinary CI and uploads diagnostic smoke
-artifacts. It is deliberately incapable of producing the soak-tier record
-above.
+The manually dispatched `Endurance smoke` Actions workflow requires the
+`run_stateless_endurance_smoke=true` input to run the stateless job. This keeps
+a manual legacy-only dispatch from placing the stateless smoke on the
+self-hosted qualification runner. The workflow runs only the same short smoke
+tier already exercised by ordinary CI and uploads diagnostic smoke artifacts.
+It is deliberately incapable of producing the soak-tier record above.
 
 ## What the harness holds while it runs
 

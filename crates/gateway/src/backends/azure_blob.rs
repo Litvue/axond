@@ -15,8 +15,8 @@ use azure_core::error::ErrorKind as AzureErrorKind;
 use azure_core::http::{Etag, RequestContent, StatusCode, Url};
 use azure_storage_blob::clients::{BlobClient, BlobClientOptions};
 use azure_storage_blob::models::{
-    BlobClientDeleteOptions, BlobClientDownloadOptions, BlobClientUploadOptions,
-    DeleteSnapshotsOptionType, HttpRange,
+    BlobClientDeleteOptions, BlobClientDownloadOptions, BlobClientGetPropertiesResultHeaders,
+    BlobClientUploadOptions, DeleteSnapshotsOptionType, HttpRange,
 };
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
@@ -212,13 +212,49 @@ impl ObjectStore for AzureBlobObjectStore {
     }
 
     async fn get(&self, key: &ObjectKey) -> Result<ObjectValue, ObjectStoreError> {
-        let response = self
-            .blob_client(key, ObjectStoreOperation::Get)?
-            .download(Some(self.download_options()))
+        let client = self.blob_client(key, ObjectStoreOperation::Get)?;
+        // A ranged GET of an empty Azure blob returns 416. The pinned SDK
+        // retries that response internally, but keep the empty-object
+        // contract explicit here instead of depending on that implementation
+        // detail. The HEAD ETag also fences the subsequent bounded download.
+        let properties = client
+            .get_properties(None)
+            .await
+            .map_err(|error| map_azure_error(key, ObjectStoreOperation::Get, error))?;
+        let limit = self.limits.max_read_bytes();
+        let content_length = properties
+            .content_length()
+            .map_err(|error| map_azure_error(key, ObjectStoreOperation::Get, error))?;
+        let head_etag = properties
+            .etag()
+            .map_err(|error| map_azure_error(key, ObjectStoreOperation::Get, error))?;
+
+        if content_length == Some(0) {
+            return Ok(ObjectValue {
+                bytes: Bytes::new(),
+                version: parse_etag(key, head_etag)?,
+            });
+        }
+
+        if let Some(observed) = content_length
+            .and_then(u64_to_usize)
+            .filter(|observed| *observed > limit)
+        {
+            return Err(ObjectStoreError::PayloadTooLarge {
+                key: key.clone(),
+                operation: ObjectStoreOperation::Get,
+                observed,
+                limit,
+            });
+        }
+
+        let mut options = self.download_options();
+        options.if_match = head_etag;
+        let response = client
+            .download(Some(options))
             .await
             .map_err(|error| map_azure_error(key, ObjectStoreOperation::Get, error))?;
         let version = parse_etag(key, response.properties.etag)?;
-        let limit = self.limits.max_read_bytes();
 
         if let Some(observed) = response
             .headers
@@ -622,6 +658,21 @@ mod tests {
         builder.body(body.into()).expect("fake response")
     }
 
+    fn properties_response(etag: Option<&str>, content_length: Option<usize>) -> Response<Body> {
+        let mut builder = Response::builder().status(HttpStatusCode::OK);
+        if let Some(etag) = etag {
+            builder = builder.header("etag", etag);
+        }
+        if let Some(content_length) = content_length {
+            builder = builder.header("content-length", content_length);
+        }
+        let body = content_length.map_or_else(
+            || Body::from_stream(stream::empty::<Result<Bytes, Infallible>>()),
+            |_| Body::empty(),
+        );
+        builder.body(body).expect("properties response")
+    }
+
     fn ranged_response(etag: &str, bytes: &'static [u8]) -> Response<Body> {
         Response::builder()
             .status(HttpStatusCode::PARTIAL_CONTENT)
@@ -721,12 +772,19 @@ mod tests {
 
     #[tokio::test]
     async fn exact_key_get_preserves_path_and_opaque_etag() {
-        let mut server = FakeServer::start(vec![ranged_response("\"etag/one\"", b"value")]).await;
+        let mut server = FakeServer::start(vec![
+            properties_response(Some("\"etag/one\""), Some(5)),
+            ranged_response("\"etag/one\"", b"value"),
+        ])
+        .await;
         let store = development_store(&server, limits(16, 16));
 
         let value = store.get(&key()).await.expect("download object");
         assert_eq!(value.bytes, Bytes::from_static(b"value"));
         assert_eq!(value.version.as_opaque(), "\"etag/one\"");
+
+        let properties = server.request().await;
+        assert_eq!(properties.method, Method::HEAD);
 
         let request = server.request().await;
         assert_eq!(request.method, Method::GET);
@@ -736,33 +794,39 @@ mod tests {
         );
         assert_eq!(request.uri.query(), None);
         assert_eq!(request.headers["range"], "bytes=0-16");
+        assert_eq!(request.headers["if-match"], "\"etag/one\"");
     }
 
     #[tokio::test]
-    async fn empty_blob_get_uses_the_sdk_safe_retry_and_returns_a_value() {
-        let empty = Response::builder()
-            .status(HttpStatusCode::OK)
-            .header("etag", "\"empty\"")
-            .header("content-length", 0)
-            .body(Body::empty())
-            .expect("empty blob response");
-        let mut server = FakeServer::start(vec![
-            error_response(HttpStatusCode::RANGE_NOT_SATISFIABLE),
-            empty,
-        ])
-        .await;
+    async fn empty_blob_get_returns_empty_bytes_without_a_ranged_get() {
+        let mut server =
+            FakeServer::start(vec![properties_response(Some("\"empty\""), Some(0))]).await;
         let store = development_store(&server, limits(16, 16));
 
         let value = store.get(&key()).await.expect("download empty object");
         assert!(value.bytes.is_empty());
         assert_eq!(value.version.as_opaque(), "\"empty\"");
 
-        let ranged = server.request().await;
-        assert_eq!(ranged.method, Method::GET);
-        assert_eq!(ranged.headers["range"], "bytes=0-16");
-        let retry = server.request().await;
-        assert_eq!(retry.method, Method::GET);
-        assert!(retry.headers.get("range").is_none());
+        let properties = server.request().await;
+        assert_eq!(properties.method, Method::HEAD);
+        assert!(properties.headers.get("range").is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server.requests.recv())
+                .await
+                .is_err(),
+            "an empty blob must not require the SDK's ranged-GET retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_properties_errors_keep_the_typed_object_store_taxonomy() {
+        let mut server =
+            FakeServer::start(vec![error_response(HttpStatusCode::SERVICE_UNAVAILABLE)]).await;
+        let store = development_store(&server, limits(16, 16));
+
+        let error = store.get(&key()).await.expect_err("properties outage");
+        assert_eq!(error.kind(), ObjectStoreErrorKind::Unavailable);
+        assert_eq!(server.request().await.method, Method::HEAD);
     }
 
     #[tokio::test]
@@ -929,7 +993,9 @@ mod tests {
     #[tokio::test]
     async fn absent_or_malformed_response_etags_fail_integrity_validation() {
         let server = FakeServer::start(vec![
+            properties_response(None, Some(5)),
             ranged_response_without_etag(b"value"),
+            properties_response(Some("not-quoted"), Some(5)),
             ranged_response("not-quoted", b"value"),
             response(HttpStatusCode::CREATED, None, Body::empty()),
         ])
@@ -983,7 +1049,11 @@ mod tests {
             .header("etag", "\"streamed\"")
             .body(Body::from_stream(chunks))
             .expect("streaming response");
-        let mut server = FakeServer::start(vec![streaming]).await;
+        let mut server = FakeServer::start(vec![
+            properties_response(Some("\"streamed\""), Some(5)),
+            streaming,
+        ])
+        .await;
         let store = development_store(&server, limits(5, 32));
 
         let error = tokio::time::timeout(Duration::from_secs(1), store.get(&key()))
@@ -999,6 +1069,7 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(server.request().await.method, Method::HEAD);
         let request = server.request().await;
         assert_eq!(request.headers["range"], "bytes=0-5");
         tokio::time::sleep(Duration::from_millis(120)).await;
