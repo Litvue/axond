@@ -162,6 +162,16 @@ Listing, deletion, notifications, leases, object versioning, and retention are
 useful operational capabilities but are not on the publication or serving
 correctness path.
 
+Ciphertext destruction uses a separate background-maintenance capability:
+`delete_if_version(key, expected_version)`. It is called only after a signed
+tombstone revision has removed the ciphertext from the reachable object set.
+The operation must use the provider's native version precondition; a stale
+eraser may not delete a replacement object. `NotFound` is idempotent success to
+the eraser, while a failed precondition is an integrity alarm. Stores without
+this optional capability can still publish and serve, but cannot claim physical
+secret erasure. Provider soft-delete or version-retention policy may delay
+physical destruction and must be disclosed by deployment documentation.
+
 There is one mutable publication object per environment:
 
 ```text
