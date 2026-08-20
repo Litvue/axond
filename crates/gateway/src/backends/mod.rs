@@ -109,6 +109,8 @@ pub enum BackendKind {
     Redis,
     /// Transactional durable storage.
     Postgres,
+    /// Durable exact-key object storage with native conditional writes.
+    ObjectStorage,
     /// Line-oriented stdout, for usage records.
     Stdout,
     /// OTLP export, for usage records.
@@ -130,7 +132,7 @@ impl BackendKind {
     /// Losing Redis loses hot enforcement precision, and losing durable state
     /// loses the deployment — those must not be the same store.
     pub const fn durable_control_plane(self) -> bool {
-        matches!(self, Self::Postgres)
+        matches!(self, Self::Postgres | Self::ObjectStorage)
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -139,6 +141,7 @@ impl BackendKind {
             Self::InMemory => "in-memory",
             Self::Redis => "redis",
             Self::Postgres => "postgres",
+            Self::ObjectStorage => "object-storage",
             Self::Stdout => "stdout",
             Self::Otlp => "otlp",
             Self::ModelsDev => "models.dev",
@@ -175,7 +178,7 @@ pub const RESPONSIBILITIES: &[Responsibility] = &[
         contract: "ControlPlaneStore",
         responsibility: "durable desired state: revisions, manifests, resource versions, audit",
         path: BackendPath::ControlPlane,
-        permitted: &[BackendKind::Postgres],
+        permitted: &[BackendKind::ObjectStorage, BackendKind::Postgres],
     },
     Responsibility {
         contract: "SecretStore",

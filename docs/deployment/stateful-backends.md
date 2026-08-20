@@ -1,11 +1,45 @@
 # Stateful backends
 
-Axond is config-only by default. Add Redis or Postgres only when a feature must
-coordinate replicas or survive process replacement.
+Axond is config-only by default. Add object storage, Redis, or Postgres only
+when a feature must coordinate replicas or survive process replacement.
 
-This guide covers the **stateless** operating mode: TOML owns every resource, and
-a backend below is an opt-in for one capability. "Stateful backend" here does not
-mean the stateful control plane accepted in
+## Blob-backed control plane contract
+
+[ADR 0062](../adr/0062-blob-backed-flat-namespace-control-plane.md) selects
+object storage as the preferred durable Tier 2 control plane. The minimum
+external-service topology is one Axond process or fleet plus one blob account;
+telemetry, usage, and exact shared enforcement remain independent opt-ins.
+
+The checked configuration example is
+[`ops/compose/axond.blob-contract.toml`](../../ops/compose/axond.blob-contract.toml).
+It contains a credential-free HTTPS container URL and selects workload identity:
+
+```toml
+mode = "stateful"
+
+[control_plane]
+backend = "object-storage"
+environment_id = "prod-us-east"
+container_url = "https://axondstate.blob.core.windows.net/control-plane"
+authentication = "workload-identity"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+```
+
+The configuration/validation contract is implemented; runtime adapter,
+publication, convergence, and encrypted-secret wiring are still pending in
+this slice. Do not deploy this example with `axond serve` yet. PostgreSQL remains
+the implemented legacy/optional stateful backend during that transition.
+
+For local Azurite only, `http://localhost` or a loopback IP requires an explicit
+`allow_loopback_http = true`. The flag defaults off and cannot permit HTTP to a
+remote host. Production URLs must use HTTPS and contain no username, password,
+query/SAS token, or fragment.
+
+The remainder of this guide covers the **stateless** operating mode: TOML owns
+every resource, and a backend below is an opt-in for one capability. "Stateful
+backend" here does not mean the stateful control plane accepted in
 [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md), which moves
 resource ownership into Postgres behind
 [`/admin/v1`](../operations/admin-api.md). Stateful inference is enabled only

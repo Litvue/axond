@@ -1000,11 +1000,21 @@ mod tests {
 
     fn control_plane() -> crate::config::ControlPlane {
         crate::config::ControlPlane {
+            backend: crate::backends::control_plane::ControlPlaneBackend::Postgres,
             dsn_env: Some("AXOND_CONTROL_PLANE_DSN".to_owned()),
             schema: None,
             migrate: false,
+            environment_id: None,
+            container_url: None,
+            authentication: None,
+            max_object_bytes: 16 * 1024 * 1024,
+            max_read_bytes: 16 * 1024 * 1024,
+            max_write_bytes: 16 * 1024 * 1024,
+            allow_loopback_http: false,
             connect_timeout_ms: 5_000,
             operation_timeout_ms: 30_000,
+            migrate_explicit: false,
+            object_storage_fields_explicit: false,
         }
     }
 
