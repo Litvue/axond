@@ -372,18 +372,22 @@ fn validate_object_storage_container_url(
             )
         })?
         .collect::<Vec<_>>();
-    // Azurite's native endpoint is `/account/container` over either HTTP or
-    // HTTPS. Segment shape follows the endpoint, not the insecure-transport
-    // exception: OAuth/workload-identity Azurite specifically requires HTTPS
-    // and therefore does not set `allow_loopback_http`.
-    let expected_segments = if loopback { 1..=2 } else { 1..=1 };
+    // The production Azure adapter accepts exactly one container segment over
+    // HTTPS. Only the explicitly selected development constructor permits
+    // Azurite's `/account/container` shape, and that constructor is selected
+    // here only for loopback HTTP.
+    let expected_segments = if allow_loopback_http && url.scheme() == "http" {
+        1..=2
+    } else {
+        1..=1
+    };
     if !expected_segments.contains(&segments.len())
         || segments
             .iter()
             .any(|segment| segment.is_empty() || segment.contains('%'))
     {
         return Err(ConfigError::Invalid(
-            "`[control_plane] container_url` path must contain one unescaped container segment, or an Azurite account/container pair"
+            "`[control_plane] container_url` path must contain one unescaped container segment; loopback HTTP Azurite may use an account/container pair"
                 .into(),
         ));
     }
@@ -6362,8 +6366,19 @@ dsn_env = "AXOND_REDIS_URL"
             "https://axondstate.blob.core.windows.net/control-plane",
             "https://127.0.0.1:10000/devstoreaccount1/control-plane",
         );
-        Config::from_toml_str(&https)
-            .expect("native account/container Azurite over HTTPS supports workload identity");
+        let error = Config::from_toml_str(&https)
+            .expect_err("production HTTPS validation must reject Azurite account/container URLs");
+        assert!(
+            error
+                .to_string()
+                .contains("one unescaped container segment"),
+            "{error}"
+        );
+
+        let https_single_container =
+            https.replace("/devstoreaccount1/control-plane", "/control-plane");
+        Config::from_toml_str(&https_single_container)
+            .expect("production HTTPS validation accepts one container segment");
 
         let redundant_exception = https.replace(
             "authentication = \"workload-identity\"",

@@ -173,6 +173,17 @@ fn github_endurance_is_bounded_smoke_without_record_promotion() {
         .expect("Endurance declares workflow permissions")
         .0;
     assert!(triggers.contains("  workflow_dispatch:"));
+    for dispatch_contract in [
+        "      run_stateless_endurance_smoke:",
+        "        required: true",
+        "        default: false",
+        "        type: boolean",
+    ] {
+        assert!(
+            triggers.contains(dispatch_contract),
+            "stateless endurance smoke is missing dispatch contract {dispatch_contract:?}"
+        );
+    }
     for automatic_event in ["  pull_request:", "  push:", "  schedule:"] {
         assert!(
             !triggers.contains(automatic_event),
@@ -195,6 +206,13 @@ fn github_endurance_is_bounded_smoke_without_record_promotion() {
         );
     }
     let legacy_guard = "${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}";
+    let stateless_guard = "${{ github.event_name == 'workflow_dispatch' && inputs.run_stateless_endurance_smoke == true }}";
+    assert!(
+        workflow.contains(&format!(
+            "  endurance:\n    name: Mixed-workload endurance smoke\n    if: {stateless_guard}"
+        )),
+        "the stateless smoke job must require an explicit manual opt-in"
+    );
     assert!(
         workflow.contains(&format!(
             "  stateful-endurance:\n    name: Legacy PostgreSQL stateful endurance smoke\n    if: {legacy_guard}"

@@ -13,6 +13,13 @@ name: Endurance smoke
 on:
   workflow_dispatch:
     inputs:
+      run_stateless_endurance_smoke:
+        description: >-
+          Run the stateless mixed-workload endurance smoke. Leave disabled for
+          a manual legacy-only qualification dispatch.
+        required: true
+        default: false
+        type: boolean
       run_legacy_postgres_qualification:
         description: >-
           Run the historical PostgreSQL stateful-v1 endurance job. It is not
@@ -31,6 +38,7 @@ env:
 jobs:
   endurance:
     name: Mixed-workload endurance smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_stateless_endurance_smoke == true }}
     runs-on: [self-hosted, linux, x64, axond-qualification]
     # The committed smoke workload is 15 seconds. The remaining budget covers a
     # cached release build, settlement, and artifact upload; policy rejects a

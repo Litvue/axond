@@ -30,6 +30,8 @@ gh workflow run ci.yml --ref <branch> \
 gh workflow run endurance.yml --ref <branch>
 gh workflow run endurance.yml --ref <branch> \
   -f run_legacy_postgres_qualification=true
+gh workflow run endurance.yml --ref <branch> \
+  -f run_stateless_endurance_smoke=true
 gh workflow run rollout.yml --ref <branch> \
   -f run_legacy_postgres_qualification=true
 ```
@@ -37,9 +39,11 @@ gh workflow run rollout.yml --ref <branch> \
 The `CI` opt-in covers the historical PostgreSQL stateful tests, restore/PITR,
 recovery-record assembly, stateful endurance smoke, and both PostgreSQL-backed
 Kubernetes stateful/PVC drills. The endurance and rollout workflows have no
-schedule. The `Endurance smoke` workflow exposes no duration input and applies
-a hard 15-minute timeout to both smoke jobs. Full stateless and target-topology
-long soaks run on dedicated qualification infrastructure outside GitHub Actions.
+schedule. The `Endurance smoke` workflow requires an explicit
+`run_stateless_endurance_smoke=true` or `run_legacy_postgres_qualification=true`
+input, exposes no duration input, and applies a hard 15-minute timeout to both
+smoke jobs. Full stateless and target-topology long soaks run on dedicated
+qualification infrastructure outside GitHub Actions.
 
 Production qualification ([#156](https://github.com/Litvue/axond/issues/156))
 decomposes into six slices. They landed, and will land, at different depths:
