@@ -51,7 +51,7 @@ const PER_INPUT_BUDGET: Duration = Duration::from_secs(2);
 const TOTAL_BUDGET: Duration = Duration::from_secs(60);
 
 /// How large the oversized derivation of each seed is.
-const OVERSIZED_BYTES: usize = 64 * 1024;
+const OVERSIZED_BYTES: usize = 66 * 1024;
 
 /// How many outcome classes the freshly-minted token scenarios must reach.
 /// [`EXPECTED_MINTED_CLASSES`] pins which ones; this is the floor for the rest.
@@ -151,6 +151,11 @@ const TARGETS: &[Target] = &[
         name: "catalog_import",
         run: replay_catalog_import,
         minimum_classes: 6,
+    },
+    Target {
+        name: "blob_secret_envelope",
+        run: replay_blob_secret_envelope,
+        minimum_classes: 5,
     },
 ];
 
@@ -255,6 +260,10 @@ fn replay_config_toml(data: &[u8]) -> Vec<&'static str> {
 
 fn replay_credentials_query(data: &[u8]) -> Vec<&'static str> {
     vec![axond_fuzz::credentials_query(data)]
+}
+
+fn replay_blob_secret_envelope(data: &[u8]) -> Vec<&'static str> {
+    vec![axond_fuzz::blob_secret_envelope(data)]
 }
 
 /// The token target takes a structured input, so a seed file is replayed twice:

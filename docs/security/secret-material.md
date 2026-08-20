@@ -11,6 +11,40 @@ enforced as a test.
 The claims in [the deployment security model](./deployment-model.md) are
 unchanged by it. This page is the evidence for them under stateful mode.
 
+## Namespace-native blob envelope
+
+`backends/secrets/blob_envelope.rs` defines the independent v2 ciphertext
+codec. It does not alter or auto-detect the legacy v1 Postgres envelope. A v2
+object is exactly this deterministic canonical-CBOR array:
+
+```text
+[1, "aes256-gcm.envelope.v2", kek_id,
+ dek_nonce, wrapped_dek, material_nonce, ciphertext]
+```
+
+Environment, namespace ownership, `SecretId`, and exact version are not stored
+in the object. The authenticated manifest supplies them to the opener. Two
+binary length-prefixed AAD values bind those fields and the stable KEK id, with
+different purpose bytes for wrapping the per-version DEK and encrypting the
+material. Substituting environment, namespace, id, version, KEK id, or purpose
+therefore refuses the object; so does mutation of any authenticated byte.
+
+Plaintext is non-empty and at most 64 KiB. KEKs are exactly 32 bytes, KEK ids
+are at most 64 canonical ASCII bytes, nonces and the wrapped DEK have exact
+lengths, and the entire encoded object has a pre-parse ceiling. The decoder
+rejects indefinite forms, non-minimal lengths, unknown schema/scheme, trailing
+bytes, truncation, and any field outside the fixed array. Errors carry only a
+typed class; material, AAD, rejected bytes, keys, and ciphertext have no error
+payload. A `KekRing` uses one active key for new objects and resolves older ids
+only from explicit decrypt-only entries.
+
+Golden vectors and mutation, context-substitution, canonicality, truncation,
+oversize, rotation, and redaction tests live beside the codec. The same decoder
+is driven by the `blob_secret_envelope` fuzz target and its committed corpus.
+This slice intentionally stops at the codec: deployment resource indexing,
+blob retrieval, lifecycle publication, and snapshot-time materialization remain
+follow-up integration work and no production runtime selects this path yet.
+
 ## What is guaranteed
 
 - **A reference is durable; material is not.** A revision, a resource body, an

@@ -257,6 +257,18 @@ receives a bootstrap key from an environment variable or mounted secret and
 uses per-version envelope encryption bound to the deployment, namespace owner,
 and exact secret reference. A KMS or external secret manager is optional.
 
+The native v2 object is a deterministic canonical-CBOR fixed array containing
+only schema `1`, scheme `aes256-gcm.envelope.v2`, stable KEK id, DEK nonce,
+wrapped DEK, material nonce, and ciphertext. Environment, namespace, and exact
+secret reference are authenticated caller context rather than stored fields.
+Binary length-prefixed AAD uses distinct purpose bytes for DEK wrapping and
+material encryption and binds the environment id, `NamespaceId`, secret UUID,
+version, and KEK id. KEKs and DEKs are AES-256 keys, plaintext is capped at 64
+KiB, and the strict decoder rejects alternate CBOR spellings and oversized
+objects before allocation. One active KEK encrypts; explicitly retained
+decrypt-only keys permit rolling rotation. The legacy v1 Postgres envelope is a
+separate unchanged format and is never guessed from blob bytes.
+
 Staging or rotation creates a new sealed version. Activation, disablement, and
 revocation publish namespace or deployment revisions that change references;
 they do not mutate ciphertext. Destruction first creates an immutable tombstone

@@ -25,6 +25,7 @@
 
 mod wire;
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use arbitrary::Arbitrary;
@@ -42,6 +43,58 @@ pub use wire::{
 /// payload may be: the property is that refusal size does not scale with the
 /// payload, not that any particular wording fits.
 const CATALOG_REFUSAL_BYTES: usize = 4096;
+
+/// Untrusted immutable blob ciphertext: strict fixed-array canonical CBOR.
+///
+/// Human-reviewable committed seeds may use `hex:<lowercase hex>`; every other
+/// input is passed through byte-for-byte, including all coverage-guided input.
+pub fn blob_secret_envelope(data: &[u8]) -> &'static str {
+    let input = decode_hex_seed(data);
+    match axond_fuzz_seam::blob_secret_envelope_cbor(&input) {
+        Ok(canonical) => {
+            assert_eq!(
+                canonical.as_slice(),
+                input.as_ref(),
+                "the strict decoder accepted a second spelling"
+            );
+            assert!(
+                canonical.len() <= axond_fuzz_seam::BLOB_SECRET_MAX_SEALED_BYTES,
+                "the decoder accepted an object over its bound"
+            );
+            "accepted"
+        }
+        Err(class) => class,
+    }
+}
+
+fn decode_hex_seed(data: &[u8]) -> Cow<'_, [u8]> {
+    let Some(encoded) = data.strip_prefix(b"hex:") else {
+        return Cow::Borrowed(data);
+    };
+    let encoded = encoded.strip_suffix(b"\n").unwrap_or(encoded);
+    if encoded.len() % 2 != 0 {
+        return Cow::Borrowed(data);
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.chunks_exact(2) {
+        let Some(high) = hex_nibble(pair[0]) else {
+            return Cow::Borrowed(data);
+        };
+        let Some(low) = hex_nibble(pair[1]) else {
+            return Cow::Borrowed(data);
+        };
+        decoded.push(high << 4 | low);
+    }
+    Cow::Owned(decoded)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
 
 /// A refusal must carry an operator-facing reason. An empty one would reach a
 /// log or a response body as a blank message.

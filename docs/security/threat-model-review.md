@@ -48,7 +48,7 @@ unnoticed one.
 | --- | --- |
 | `routes.rs` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
 | Namespace resolution, `credentials.rs` pool lookup, `allow_platform_fallback`, budget/rate-limit keys, operator views | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
-| `backends/secrets.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
+| `backends/secrets.rs`, `backends/secrets/blob_envelope.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
 | `backends/catalog.rs`, `aliases.rs`, `availability/`, `admin/catalogue.rs`, `desired_state/models.rs`, `desired_state/pricing.rs`, `/v1/models`, alias scope and ownership, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `usage/`, `telemetry/`, control-plane journal | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
@@ -197,6 +197,20 @@ lifecycle: `one_secret_belongs_to_one_owner`,
 `only_staged_and_active_material_unwraps`,
 `one_version_of_a_secret_is_in_service_and_it_is_not_ambiguous`, and
 `a_revision_is_refused_before_publication_and_again_on_hydration`.
+
+The namespace-native blob envelope adds
+`deterministic_crypto_and_codec_golden_vector`,
+`context_and_purpose_are_cryptographic_boundaries`,
+`every_stored_byte_is_authenticated_or_a_strict_codec_field`,
+`canonical_cbor_is_the_only_accepted_spelling`,
+`every_truncation_and_oversized_object_is_refused`, and
+`context_is_not_stored_and_nothing_sensitive_is_rendered`. Together they pin
+the v2 wire format, owner/reference omission, every AAD dimension, strict
+canonical decoding, allocation ceilings, key rotation, mutation refusal, and
+non-rendering errors. The `blob_secret_envelope` fuzz target continuously drives
+that production decoder. A change to its fixed array, AAD bytes, key-selection
+rule, bound, or error payload fires this trigger even when no runtime wiring
+changes.
 
 Request-content redaction is held by
 `deterministic_redaction_round_trips_buffered_and_split_openai_sse_output`,

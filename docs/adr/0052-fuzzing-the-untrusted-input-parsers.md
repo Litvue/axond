@@ -29,9 +29,11 @@ the opposite of what a required pull-request lane can be.
 
 ## Decision
 
-A fuzzing program in two halves, over three targets: `Config::from_toml_str` plus
-its validation graph, `axt1.` token verification, and the credential-query
-parser.
+A fuzzing program in two halves over the production parsers for configuration,
+`axt1.` tokens, credential queries, provider SSE and error bodies, models.dev
+catalogues, and namespace-native sealed-secret objects. The target list grows
+with trust boundaries; the required bounded replay and scheduled
+coverage-guided run remain the two evidence tiers.
 
 ### An out-of-tree workspace, not a workspace member
 
@@ -60,6 +62,7 @@ pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection>
 pub fn credentials_query_namespaces(q: Option<&str>) -> Result<Option<String>, Rejection>
 pub fn verify_token(credential: &str) -> Result<Option<VerifiedToken>, Rejection>
 pub fn catalog_import_over_seed(payload: &[u8], etag: Option<&str>) -> CatalogAdmission
+pub fn blob_secret_envelope_cbor(input: &[u8]) -> Result<Vec<u8>, &'static str>
 ```
 
 The catalogue entry point is the shape the rest follow as coverage grows: the
@@ -125,6 +128,12 @@ The seam's verifiers come from a configuration compiled into the target with
 synthetic key material and an `.invalid` audience. No target opens a socket, reads
 a file, or holds real key material, which is also what makes the corpora
 publishable.
+
+The sealed-secret target does not open ciphertext and holds no KEK. It drives
+the production bounded canonical-CBOR decoder, requires accepted bytes to
+re-encode identically, and maps refusals to static classes with no rejected-byte
+payload. Its readable `hex:` seeds are synthetic golden bytes; coverage-guided
+inputs without that seed prefix pass through unchanged.
 
 ### State tier
 

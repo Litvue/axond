@@ -68,6 +68,18 @@ material stays in the secret store; see
 [secret material in the stateful control plane](./secret-material.md) for what
 that guarantees and how it is tested.
 
+The namespace-native blob format is a separate v2 envelope; the legacy
+Postgres v1 envelope is unchanged. A blob object stores only the wrapping
+scheme, stable KEK id, nonces, wrapped data key, and ciphertext. Authenticated
+desired state supplies the environment id, namespace, and exact secret
+reference, and AES-256-GCM binds those values through binary length-prefixed AAD
+in distinct DEK-wrapping and material-encryption domains. The parser accepts one
+bounded canonical-CBOR fixed-array spelling, never a generic CBOR extension.
+Bootstrap KEKs are exactly 32 bytes; a ring has one active encryption key and
+may retain explicitly decrypt-only keys for rolling rotation. This codec is an
+off-request-path building block: blob publication and snapshot-time resolution
+must be wired before it can serve a credential.
+
 Restrict files and environment access to the service identity. Rotate by
 overlapping distinct keys, moving callers, then removing the old key. See the
 [minted-token guide](../minted-token-guide.md) for signer rotation and JTI

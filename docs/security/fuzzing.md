@@ -1,11 +1,12 @@
 # Fuzzing
 
-Axond parses input it does not control on four paths: an operator's
+Axond parses input it does not control on five paths: an operator's
 configuration file at boot and on every reload, a caller's credential and query
 string on every request, everything a *provider* sends back — the SSE stream
 relayed to a tenant byte for byte and the failure body an error response is
-classified from — and the models.dev catalogue a background refresh imports
-unattended. All four are fuzzed continuously — a scheduled
+classified from — the models.dev catalogue a background refresh imports
+unattended, and immutable sealed-secret objects hydrated from blob storage. All
+five are fuzzed continuously — a scheduled
 coverage-guided run for exploration, and a bounded deterministic replay on every
 pull request so the result is required CI evidence rather than a dashboard
 nobody reads.
@@ -28,6 +29,7 @@ feature, and what that costs.
 | `provider_stream` | The provider stream decoders: OpenAI chat and Responses, Azure AI Foundry, Anthropic translated into OpenAI chunks, and a native Anthropic relay | Every streamed response, once framed |
 | `provider_error` | `ProviderError::from_upstream` and `ProviderError::transport`, and the classification, retry, and health judgements built on them | Every non-2xx or failed upstream call |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission over the last-known-good catalogue | The scheduled catalogue refresh, unattended |
+| `blob_secret_envelope` | The v2 fixed-array canonical-CBOR sealed-secret decoder | Snapshot compilation after an authenticated blob manifest names immutable ciphertext |
 
 Every target asserts the same three properties, because they are what the
 gateway relies on.
@@ -127,6 +129,15 @@ run against a document a third party publishes:
   modality, nothing a caller can mistake for an observed answer. A *stated*
   wrapper of the wrong shape is still a refusal, and the fuzz corpus carries
   both shapes so a future default cannot appear unnoticed.
+
+The blob-secret target adds the properties required before ciphertext reaches a
+key: the complete object is bounded before decoding; only the seven-element v2
+array and minimal definite CBOR lengths are accepted; nonce, wrapped-DEK, KEK-id,
+and ciphertext lengths stay inside their exact limits; and an accepted object
+re-encodes byte-for-byte to its input. Human-readable `hex:` corpus seeds pin a
+valid golden object, truncation, non-minimal lengths, unknown versions, wrong
+shape, and trailing bytes. Fixed derivations mutate and exceed the sealed-object
+ceiling, so both the acceptance path and its allocation refusal remain live.
 
 Runs are hermetic: the seam the targets call builds its verifiers from a
 configuration compiled into the binary with synthetic key material, so a fuzz run
