@@ -780,7 +780,7 @@ mod tests {
         KekId::parse(text).expect("KEK id fixture")
     }
 
-    fn ring(id_text: &str, byte: u8) -> KekRing {
+    fn kek_ring(id_text: &str, byte: u8) -> KekRing {
         KekRing::new(id(id_text), KekMaterial::from_array([byte; KEY_BYTES])).expect("KEK fixture")
     }
 
@@ -811,7 +811,7 @@ mod tests {
         SecretRef,
         SealedBlobSecret,
     ) {
-        let ring = ring("primary-2026-08", 0x11);
+        let ring = kek_ring("primary-2026-08", 0x11);
         let (environment, namespace, reference) = fixture();
         let sealed = ring
             .seal_with_parts(
@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn key_id_and_key_rotation_fail_closed_and_decrypt_only_keys_work() {
-        let old = ring("old", 0x11);
+        let old = kek_ring("old", 0x11);
         let (environment, namespace, reference) = fixture();
         let sealed = old
             .seal(
@@ -890,7 +890,7 @@ mod tests {
                 &SecretMaterial::new(PLAINTEXT.to_owned()),
             )
             .unwrap();
-        let mut rotated = ring("new", 0x22);
+        let mut rotated = kek_ring("new", 0x22);
         assert!(matches!(
             rotated.open(context(&environment, &namespace, &reference), &sealed),
             Err(BlobEnvelopeError::UnknownKek)
@@ -920,6 +920,17 @@ mod tests {
             rotated.add_decrypt_only(id("old"), KekMaterial::from_array([0x33; KEY_BYTES])),
             Err(KekRingError::DuplicateId)
         );
+    }
+
+    #[test]
+    fn wrong_key_material_under_the_right_id_fails_closed() {
+        let (ring, environment, namespace, reference, sealed) = deterministic_sealed();
+        assert_eq!(ring.active_id(), sealed.kek_id());
+        let wrong_material = kek_ring("primary-2026-08", 0x99);
+        assert!(matches!(
+            wrong_material.open(context(&environment, &namespace, &reference), &sealed),
+            Err(BlobEnvelopeError::Unopenable)
+        ));
     }
 
     #[test]
@@ -1009,7 +1020,7 @@ mod tests {
 
     #[test]
     fn plaintext_and_sealed_bounds_are_exact() {
-        let ring = ring("primary", 0x11);
+        let ring = kek_ring("primary", 0x11);
         let (environment, namespace, reference) = fixture();
         let context = context(&environment, &namespace, &reference);
         assert_eq!(
@@ -1040,6 +1051,14 @@ mod tests {
             .expose()
             .len(),
             MAX_PLAINTEXT_BYTES
+        );
+
+        let widest_ring = kek_ring(&"k".repeat(MAX_KEK_ID_BYTES), 0x11);
+        let widest = widest_ring.seal(context, &maximum).unwrap();
+        assert_eq!(widest.to_canonical_cbor().len(), MAX_SEALED_BYTES);
+        assert_eq!(
+            MAX_SEALED_BYTES,
+            encoded_size(MAX_KEK_ID_BYTES, MAX_CIPHERTEXT_BYTES)
         );
     }
 
