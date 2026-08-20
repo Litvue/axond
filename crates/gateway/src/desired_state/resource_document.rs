@@ -48,6 +48,7 @@ impl BlobResourceDocument {
     /// domain envelope.
     ///
     /// `ImmutableObject` values returned by
+    /// [`super::publication::BlobReader::read_immutable_object`] and
     /// [`super::publication::BlobPublication::read_immutable_object`] have
     /// already passed the content-address check. This method intentionally
     /// performs no I/O, projection, serving, or secret decryption.

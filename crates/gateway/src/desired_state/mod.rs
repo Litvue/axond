@@ -67,6 +67,7 @@
 //! `ControlPlaneStore` must behave when they do.
 
 pub mod access;
+pub mod blob_revision;
 pub mod canonical;
 pub mod credentials;
 mod environment;
@@ -100,6 +101,11 @@ pub use access::{
     AccessDenial, AccessRequest, Action, Authorization, AuthorizationSnapshot, Basis, Caller,
     Credential, Denial, DenialPage, DenialReason, Directory, IDENTITY_SCHEMA, IdentityBody,
     IdentityError, IdentityKind, KeyError, Principal, Role, Surface, WorkloadKey,
+};
+#[allow(unused_imports)]
+pub use blob_revision::{
+    BlobCandidate, BlobHydrationLimit, BlobHydrationLimits, BlobRevisionError,
+    BlobRevisionIdentity, BlobRevisionSource,
 };
 #[allow(unused_imports)]
 pub use canonical::{
@@ -149,8 +155,8 @@ pub use providers::{PROVIDER_SCHEMA, Provider, ProviderBody, ProviderError, Prov
 #[allow(unused_imports)]
 pub use publication::{
     ActivationReadyRevision, BlobPublication, BlobPublicationError, BlobPublicationRequest,
-    ExpectedHead, HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus, ImmutableObject,
-    ImmutableObjectKind, PublicationActorBinding, PublicationAuthorization,
+    BlobReader, ExpectedHead, HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus,
+    ImmutableObject, ImmutableObjectKind, PublicationActorBinding, PublicationAuthorization,
     PublicationGrantBinding, PublicationHeadState, PublicationOutcome, PublicationSequenceGuard,
     VerifiedActiveRevision, VerifiedRevisionManifest,
 };
