@@ -114,26 +114,26 @@ AXOND_STATEFUL_ENDURANCE_SMOKE=1 cargo test --locked --all-features \
   the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence \
   --exact --nocapture --test-threads=1
 
-# The soak tier: twelve hours, by name.
+# Off-platform only: the legacy soak tier, twelve hours, by name. It remains
+# historical stateful-v1 evidence and does not qualify ADR 0062.
 just stateful-endurance
 
-# A shorter dispatched run — forty minutes here. The override applies to the
-# soak tier alone, so the smoke tier in the same binary keeps its committed
-# ninety seconds. Segments shrink to match.
+# Off-platform diagnostic only: a shorter forty-minute run. The override
+# applies to the soak tier alone, so the smoke tier keeps its committed ninety
+# seconds. It cannot be promoted as target-topology evidence.
 just stateful-endurance 2400000
 ```
 
-The `Endurance` workflow's second job runs this soak monthly and on dispatch,
-against a PostgreSQL service container, and uploads the result with its time
-series plus a compact qualification record at
-`target/qualification-records/stateful-endurance-soak.toml`. The record binds
-the workload, duration provenance, verdicts, manifest, binary, and machine to
-the raw JSON artifact, the complete per-incarnation JSONL sample set, and all
-five exact-ledger shard sets. Each ledger and sample claim
-retains its canonical SHA-256, file count, and byte count; promotion re-hashes
-the downloaded files rather than trusting a path label. It is
-the first-class `stateful-endurance` slice of the six-slice #156 packet, which
-remains the reviewed promotion boundary.
+The manually dispatched `Endurance smoke` workflow's second job can run only the
+historical PostgreSQL smoke tier, requires
+`run_legacy_postgres_qualification=true`, and has a hard 15-minute job timeout.
+It exposes no duration override and cannot produce promotable soak evidence.
+Full stateful long-soak qualification runs on dedicated infrastructure outside
+GitHub Actions; ADR 0062 requires that harness to be replaced with the
+blob-backed target topology before qualification resumes. An off-platform
+record still binds the workload, duration provenance, verdicts, manifest,
+binary, machine, raw JSON artifact, per-incarnation JSONL samples, and all five
+exact-ledger shard sets before it can enter the six-slice #156 packet.
 
 ## What a run leaves behind
 

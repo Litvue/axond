@@ -20,6 +20,8 @@ import { CHAT, EMBEDDINGS, FakeUpstream, MESSAGES, RESPONSES } from "./fakeUpstr
 const REPO_ROOT = resolve(import.meta.dirname, "../../..");
 
 export const GATEWAY_KEY = "test-inbound-key";
+export const NAMESPACE = "platform";
+export const UNGRANTED_NAMESPACE = "tenant";
 export const UPSTREAM_OPENAI_KEY = "test-upstream-openai-key";
 export const UPSTREAM_ANTHROPIC_KEY = "test-upstream-anthropic-key";
 
@@ -80,8 +82,13 @@ function config(bind: string, upstream: string): string {
 bind = "${bind}"
 
 [[namespace]]
-id = "platform"
+id = "${NAMESPACE}"
 default = true
+
+# Configured but deliberately outside the SDK caller's grant. The compatibility
+# tests compare this namespace with one that does not exist.
+[[namespace]]
+id = "${UNGRANTED_NAMESPACE}"
 
 [[provider]]
 id = "fake-openai"
@@ -94,18 +101,18 @@ kind = "anthropic"
 base_url = "${upstream}"
 
 [[credential]]
-namespace = "platform"
+namespace = "${NAMESPACE}"
 provider = "fake-openai"
 env = "GW_FAKE_OPENAI_KEY"
 
 [[credential]]
-namespace = "platform"
+namespace = "${NAMESPACE}"
 provider = "fake-anthropic"
 env = "GW_FAKE_ANTHROPIC_KEY"
 
 [[gateway_key]]
 env = "GW_INBOUND_KEY"
-namespace = "platform"
+namespace = "${NAMESPACE}"
 
 ${models}`;
 }

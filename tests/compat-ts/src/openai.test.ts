@@ -3,10 +3,18 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 
-import OpenAI, { AuthenticationError } from "openai";
+import OpenAI, { APIError, AuthenticationError } from "openai";
 
 import { CHAT, RESPONSES, fixtureJson } from "./fakeUpstream.js";
-import { ALIAS_NAMES, GATEWAY_KEY, UPSTREAM_OPENAI_KEY, start, type Harness } from "./harness.js";
+import {
+  ALIAS_NAMES,
+  GATEWAY_KEY,
+  NAMESPACE,
+  UNGRANTED_NAMESPACE,
+  UPSTREAM_OPENAI_KEY,
+  start,
+  type Harness,
+} from "./harness.js";
 
 interface ChatFixture {
   choices: [{ message: { content: string } }];
@@ -25,11 +33,29 @@ interface ResponsesFixture {
 }
 
 let harness: Harness;
-let client: OpenAI;
+
+interface SdkMount {
+  readonly name: string;
+  readonly suffix: string;
+}
+
+const SDK_MOUNTS: readonly SdkMount[] = [
+  { name: "canonical namespace", suffix: `/namespaces/${NAMESPACE}/v1` },
+  { name: "legacy stateless", suffix: "/v1" },
+];
+
+function sdkClient(mount: SdkMount): OpenAI {
+  return new OpenAI({ baseURL: `${harness.baseUrl}${mount.suffix}`, apiKey: GATEWAY_KEY });
+}
+
+function sdkTest(name: string, body: (mount: SdkMount) => Promise<void>): void {
+  for (const mount of SDK_MOUNTS) {
+    test(`${mount.name}: ${name}`, () => body(mount));
+  }
+}
 
 before(async () => {
   harness = await start();
-  client = new OpenAI({ baseURL: `${harness.baseUrl}/v1`, apiKey: GATEWAY_KEY });
 });
 
 after(async () => {
@@ -37,7 +63,8 @@ after(async () => {
   await harness?.stop();
 });
 
-test("a buffered chat completion round-trips and forwards the provider credential", async () => {
+sdkTest("a buffered chat completion round-trips and forwards the provider credential", async (mount) => {
+  const client = sdkClient(mount);
   const completion = await client.chat.completions.create({
     model: "chat-golden",
     messages: [{ role: "user", content: "What is the capital of France?" }],
@@ -50,6 +77,7 @@ test("a buffered chat completion round-trips and forwards the provider credentia
   // The alias is rewritten to the target model, and the caller's gateway key
   // never travels upstream.
   const sent = harness.upstream.lastRequest();
+  assert.equal(sent.path, "/chat/completions");
   assert.equal(sent.model, CHAT);
   assert.equal(sent.authorization, `Bearer ${UPSTREAM_OPENAI_KEY}`);
   assert.ok(!(sent.authorization ?? "").includes(GATEWAY_KEY));
@@ -57,7 +85,8 @@ test("a buffered chat completion round-trips and forwards the provider credentia
   assert.equal(messages[0]?.content, "What is the capital of France?");
 });
 
-test("a streamed chat completion reassembles from the relayed deltas", async () => {
+sdkTest("a streamed chat completion reassembles from the relayed deltas", async (mount) => {
+  const client = sdkClient(mount);
   const stream = await client.chat.completions.create({
     model: "chat-golden",
     messages: [{ role: "user", content: "What is the capital of France?" }],
@@ -68,10 +97,17 @@ test("a streamed chat completion reassembles from the relayed deltas", async () 
     text += chunk.choices[0]?.delta.content ?? "";
   }
   assert.equal(text, "The capital of France is Paris.");
-  assert.equal(harness.upstream.lastRequest().body["stream"], true);
+  const sent = harness.upstream.lastRequest();
+  assert.equal(sent.path, "/chat/completions");
+  assert.equal(sent.model, CHAT);
+  assert.equal(sent.body["stream"], true);
+  assert.deepEqual(sent.body["messages"], [
+    { role: "user", content: "What is the capital of France?" },
+  ]);
 });
 
-test("embeddings round-trip", async () => {
+sdkTest("embeddings round-trip", async (mount) => {
+  const client = sdkClient(mount);
   // The Node SDK asks for `base64` unless told otherwise and decodes what it
   // gets; the committed fixture is a float body, so the request states the
   // encoding it expects. Passthrough forwards that choice to the provider.
@@ -89,7 +125,8 @@ test("embeddings round-trip", async () => {
   assert.equal(sent.authorization, `Bearer ${UPSTREAM_OPENAI_KEY}`);
 });
 
-test("a buffered Responses call round-trips natively", async () => {
+sdkTest("a buffered Responses call round-trips natively", async (mount) => {
+  const client = sdkClient(mount);
   const response = await client.responses.create({
     model: "responses-golden",
     input: "What is the capital of France?",
@@ -102,10 +139,12 @@ test("a buffered Responses call round-trips natively", async () => {
   const sent = harness.upstream.lastRequest();
   assert.equal(sent.path, "/responses");
   assert.equal(sent.model, RESPONSES);
+  assert.equal(sent.body["input"], "What is the capital of France?");
   assert.equal(sent.authorization, `Bearer ${UPSTREAM_OPENAI_KEY}`);
 });
 
-test("a streamed Responses call reassembles from the relayed deltas", async () => {
+sdkTest("a streamed Responses call reassembles from the relayed deltas", async (mount) => {
+  const client = sdkClient(mount);
   const stream = await client.responses.create({
     model: "responses-golden",
     input: "What is the capital of France?",
@@ -118,9 +157,15 @@ test("a streamed Responses call reassembles from the relayed deltas", async () =
     }
   }
   assert.equal(text, "The capital of France is Paris.");
+  const sent = harness.upstream.lastRequest();
+  assert.equal(sent.path, "/responses");
+  assert.equal(sent.model, RESPONSES);
+  assert.equal(sent.body["stream"], true);
+  assert.equal(sent.body["input"], "What is the capital of France?");
 });
 
-test("the alias catalogue is served to the SDK's models.list", async () => {
+sdkTest("the alias catalogue is served to the SDK's models.list", async (mount) => {
+  const client = sdkClient(mount);
   const listed = new Set<string>();
   for await (const model of client.models.list()) {
     listed.add(model.id);
@@ -130,9 +175,9 @@ test("the alias catalogue is served to the SDK's models.list", async () => {
   }
 });
 
-test("an unknown gateway key is rejected", async () => {
+sdkTest("an unknown gateway key is rejected", async (mount) => {
   const stranger = new OpenAI({
-    baseURL: `${harness.baseUrl}/v1`,
+    baseURL: `${harness.baseUrl}${mount.suffix}`,
     apiKey: "not-a-gateway-key",
     maxRetries: 0,
   });
@@ -143,4 +188,55 @@ test("an unknown gateway key is rejected", async () => {
     }),
     AuthenticationError,
   );
+});
+
+interface Refusal {
+  readonly status: number | undefined;
+  readonly error: unknown;
+}
+
+async function modelsRefusal(namespace: string): Promise<Refusal> {
+  const candidate = new OpenAI({
+    baseURL: `${harness.baseUrl}/namespaces/${namespace}/v1`,
+    apiKey: GATEWAY_KEY,
+    maxRetries: 0,
+  });
+  try {
+    await candidate.models.list();
+  } catch (error) {
+    assert.ok(error instanceof APIError);
+    return { status: error.status, error: error.error };
+  }
+  assert.fail("the namespace request unexpectedly succeeded");
+}
+
+test("existing and absent unauthorized namespaces are indistinguishable", async () => {
+  const before = harness.upstream.requests.length;
+  const existing = await modelsRefusal(UNGRANTED_NAMESPACE);
+  const absent = await modelsRefusal("ghost");
+
+  assert.deepEqual(existing, absent);
+  assert.deepEqual(existing, {
+    status: 403,
+    error: {
+      type: "namespace_not_authorized",
+      message: "the authenticated grant does not authorize the selected namespace",
+    },
+  });
+  assert.equal(harness.upstream.requests.length, before);
+});
+
+test("a noncanonical namespace path receives a generic non-disclosing refusal", async () => {
+  const before = harness.upstream.requests.length;
+  const refusal = await modelsRefusal("%70latform");
+
+  assert.deepEqual(refusal, {
+    status: 400,
+    error: {
+      type: "invalid_namespace",
+      message: "namespace identifier is invalid",
+    },
+  });
+  assert.ok(!JSON.stringify(refusal).includes("%70latform"));
+  assert.equal(harness.upstream.requests.length, before);
 });
