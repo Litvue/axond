@@ -47,6 +47,53 @@ ANCHORED_IDENTITY = re.compile(r"^\s*SIGNER_IDENTITY:\s*\^.+\$\s*$")
 # of this list, which is the point.
 KEY_VERIFY_FILES = frozenset({"ops/check-cosign-format.sh"})
 
+# ADR 0062 supersedes these PostgreSQL stateful-v1 qualification lanes. Keeping
+# the list here makes their paused status fail closed: adding an automatic event
+# or dropping one job's dispatch guard is a policy failure, not a review-time
+# convention. The aggregate needs `always()` so it can inspect both source jobs.
+LEGACY_POSTGRES_INPUT = "run_legacy_postgres_qualification"
+LEGACY_POSTGRES_GUARD = (
+    "${{ github.event_name == 'workflow_dispatch' && "
+    "inputs.run_legacy_postgres_qualification == true }}"
+)
+LEGACY_POSTGRES_ALWAYS_GUARD = (
+    "${{ always() && github.event_name == 'workflow_dispatch' && "
+    "inputs.run_legacy_postgres_qualification == true }}"
+)
+LEGACY_POSTGRES_JOBS = {
+    ".github/workflows/ci.yml": {
+        "recovery-binary": LEGACY_POSTGRES_GUARD,
+        "stateful-tests": LEGACY_POSTGRES_GUARD,
+        "stateful-endurance-smoke": LEGACY_POSTGRES_GUARD,
+        "restore-drill": LEGACY_POSTGRES_GUARD,
+        "recovery-record": LEGACY_POSTGRES_ALWAYS_GUARD,
+        "stateful-deploy-drill": LEGACY_POSTGRES_GUARD,
+        "stateful-persistent-drill": LEGACY_POSTGRES_GUARD,
+    },
+    ".github/workflows/endurance.yml": {
+        "stateful-endurance": LEGACY_POSTGRES_GUARD,
+    },
+    ".github/workflows/rollout.yml": {
+        "candidate": LEGACY_POSTGRES_GUARD,
+        "rollout": (
+            "${{ github.event_name == 'workflow_dispatch' && "
+            "inputs.run_legacy_postgres_qualification == true && "
+            "needs.candidate.outputs.ready == 'true' }}"
+        ),
+    },
+}
+UNSCHEDULED_LEGACY_WORKFLOWS = frozenset(
+    {".github/workflows/endurance.yml", ".github/workflows/rollout.yml"}
+)
+ACTIONS_ENDURANCE_WORKFLOW = ".github/workflows/endurance.yml"
+ACTIONS_ENDURANCE_MAX_JOB_MINUTES = 15
+ACTIONS_ENDURANCE_SMOKE_JOBS = {
+    "endurance": "the_endurance_smoke_tier_qualifies_and_publishes_its_evidence",
+    "stateful-endurance": (
+        "the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence"
+    ),
+}
+
 
 def workflows(root: Path) -> list[Path]:
     directory = root / ".github" / "workflows"
@@ -290,6 +337,186 @@ def check_musl_installer(text: str, relative: str) -> list[str]:
     return failures
 
 
+def nested_block(lines: list[str], start: int, indent: int) -> list[str]:
+    """Return the lines nested below one line at `indent` spaces."""
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        end += 1
+    return lines[start + 1 : end]
+
+
+def named_blocks(text: str, parent: str) -> dict[str, list[str]]:
+    """Return two-space-keyed blocks below a top-level YAML mapping."""
+    lines = text.splitlines()
+    try:
+        start = lines.index(f"{parent}:")
+    except ValueError:
+        return {}
+    blocks: dict[str, list[str]] = {}
+    for index in range(start + 1, len(lines)):
+        match = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", lines[index])
+        if match:
+            blocks[match.group(1)] = nested_block(lines, index, 2)
+        elif lines[index].strip() and not lines[index].startswith(" "):
+            break
+    return blocks
+
+
+def dispatch_block(text: str) -> list[str]:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line == "  workflow_dispatch:":
+            return nested_block(lines, index, 2)
+    return []
+
+
+def check_legacy_postgres_qualification(root: Path) -> list[str]:
+    """Keep superseded PostgreSQL qualification manual, explicit, and visible."""
+    failures: list[str] = []
+    for relative, expected_jobs in LEGACY_POSTGRES_JOBS.items():
+        path = root / relative
+        if not path.is_file():
+            failures.append(f"{relative}: legacy PostgreSQL workflow is missing")
+            continue
+        text = path.read_text(encoding="utf-8")
+        dispatch = dispatch_block(text)
+        try:
+            input_start = dispatch.index(f"      {LEGACY_POSTGRES_INPUT}:")
+        except ValueError:
+            failures.append(
+                f"{relative}: workflow_dispatch must declare the explicit boolean "
+                f"{LEGACY_POSTGRES_INPUT!r} opt-in"
+            )
+        else:
+            input_lines = nested_block(dispatch, input_start, 6)
+            required = {line.strip() for line in input_lines}
+            for setting in ("required: true", "default: false", "type: boolean"):
+                if setting not in required:
+                    failures.append(
+                        f"{relative}: {LEGACY_POSTGRES_INPUT} must include `{setting}`"
+                    )
+
+        if relative in UNSCHEDULED_LEGACY_WORKFLOWS and re.search(
+            r"(?m)^  schedule:\s*$", text
+        ):
+            failures.append(
+                f"{relative}: legacy/long qualification must not have a schedule"
+            )
+
+        jobs = named_blocks(text, "jobs")
+        for job, expected_guard in expected_jobs.items():
+            block = jobs.get(job)
+            if block is None:
+                failures.append(f"{relative}: legacy PostgreSQL job {job!r} is missing")
+                continue
+            guards = [
+                line.strip().removeprefix("if:").strip()
+                for line in block
+                if re.match(r"^    if:\s*", line)
+            ]
+            if guards != [expected_guard]:
+                failures.append(
+                    f"{relative}: legacy PostgreSQL job {job!r} must use the exact "
+                    f"explicit-dispatch guard `{expected_guard}`; found {guards or 'none'}"
+                )
+    return failures
+
+
+def check_blob_qualification_status(root: Path) -> list[str]:
+    """A green software CI aggregate must not imply stateful-v2 qualification."""
+    required = {
+        "RELEASE.md": (
+            "| Blob-backed flat-namespace stateful-v2 qualification | Pending |",
+            "is a software-change gate, not a production-qualification gate",
+        ),
+        "docs/operations/qualification.md": (
+            "run_legacy_postgres_qualification=true",
+            "The blob-backed stateful-v2 gates remain **pending**",
+        ),
+    }
+    failures: list[str] = []
+    for relative, markers in required.items():
+        path = root / relative
+        if not path.is_file():
+            failures.append(f"{relative}: qualification status document is missing")
+            continue
+        text = path.read_text(encoding="utf-8")
+        for marker in markers:
+            if marker not in text:
+                failures.append(
+                    f"{relative}: missing explicit blob qualification status {marker!r}"
+                )
+    return failures
+
+
+def check_actions_endurance_budget(root: Path) -> list[str]:
+    """GitHub Actions may exercise endurance smoke, never a configurable soak."""
+    relative = ACTIONS_ENDURANCE_WORKFLOW
+    path = root / relative
+    if not path.is_file():
+        return [f"{relative}: Actions endurance smoke workflow is missing"]
+    text = path.read_text(encoding="utf-8")
+    failures: list[str] = []
+
+    for marker in (
+        "_soak_tier_",
+        "ENDURANCE_DURATION_MS",
+        "43200000",
+        "qualification-evidence.py",
+        "promote-qualification.py",
+        "qualification-record",
+    ):
+        if marker in text:
+            failures.append(
+                f"{relative}: Actions endurance workflow contains soak-only "
+                f"marker {marker!r}"
+            )
+
+    dispatch = dispatch_block(text)
+    for line in dispatch:
+        match = re.match(r"^      ([A-Za-z0-9_-]+):\s*$", line)
+        if match and re.search(
+            r"(?:duration|hours?|minutes?|soak)", match.group(1), re.IGNORECASE
+        ):
+            failures.append(
+                f"{relative}: Actions endurance must not expose duration-like "
+                f"workflow_dispatch input {match.group(1)!r}"
+            )
+
+    jobs = named_blocks(text, "jobs")
+    unexpected = sorted(set(jobs) - set(ACTIONS_ENDURANCE_SMOKE_JOBS))
+    if unexpected:
+        failures.append(
+            f"{relative}: Actions endurance workflow has non-smoke jobs {unexpected}"
+        )
+    for job, smoke_test in ACTIONS_ENDURANCE_SMOKE_JOBS.items():
+        block = jobs.get(job)
+        if block is None:
+            failures.append(f"{relative}: endurance smoke job {job!r} is missing")
+            continue
+        body = "\n".join(block)
+        timeout = re.search(r"(?m)^    timeout-minutes:\s*(\d+)\s*$", body)
+        if timeout is None:
+            failures.append(
+                f"{relative}: endurance smoke job {job!r} needs an explicit "
+                f"{ACTIONS_ENDURANCE_MAX_JOB_MINUTES}-minute timeout"
+            )
+        elif int(timeout.group(1)) > ACTIONS_ENDURANCE_MAX_JOB_MINUTES:
+            failures.append(
+                f"{relative}: endurance smoke job {job!r} timeout exceeds "
+                f"{ACTIONS_ENDURANCE_MAX_JOB_MINUTES} minutes"
+            )
+        if smoke_test not in body:
+            failures.append(
+                f"{relative}: endurance smoke job {job!r} does not invoke "
+                f"{smoke_test}"
+            )
+    return failures
+
+
 def check(root: Path) -> list[str]:
     files = workflows(root)
     if not files:
@@ -321,6 +548,13 @@ def check(root: Path) -> list[str]:
         failures.extend(
             check_cosign_verify(path.read_text(encoding="utf-8"), str(path.relative_to(root)))
         )
+    # Temporary self-test repositories exercise the generic supply-chain rules
+    # without carrying Axond's release documents. A real checkout always has
+    # RELEASE.md, which turns on the repository-specific transition contract.
+    if (root / "RELEASE.md").is_file():
+        failures.extend(check_legacy_postgres_qualification(root))
+        failures.extend(check_blob_qualification_status(root))
+        failures.extend(check_actions_endurance_budget(root))
     return failures
 
 
@@ -426,6 +660,195 @@ def self_test() -> list[str]:
         ),
     ]
     problems: list[str] = []
+
+    opt_in = (
+        "  workflow_dispatch:\n"
+        "    inputs:\n"
+        f"      {LEGACY_POSTGRES_INPUT}:\n"
+        "        description: legacy only\n"
+        "        required: true\n"
+        "        default: false\n"
+        "        type: boolean\n"
+    )
+
+    def legacy_fixture(relative: str) -> str:
+        jobs = LEGACY_POSTGRES_JOBS[relative]
+        body = "name: fixture\non:\n"
+        if relative.endswith("ci.yml"):
+            body += "  pull_request:\n"
+        body += opt_in + "permissions:\n  contents: read\njobs:\n"
+        for job, guard in jobs.items():
+            body += f"  {job}:\n    if: {guard}\n    runs-on: ubuntu-latest\n"
+        return body
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        workflow_dir = root / ".github" / "workflows"
+        workflow_dir.mkdir(parents=True)
+        fixtures = {
+            relative: legacy_fixture(relative)
+            for relative in LEGACY_POSTGRES_JOBS
+        }
+
+        def write_legacy_fixtures() -> None:
+            for relative, body in fixtures.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body, encoding="utf-8")
+
+        write_legacy_fixtures()
+        failures = check_legacy_postgres_qualification(root)
+        if failures:
+            problems.append(
+                f"self-test: explicit legacy PostgreSQL opt-ins were rejected: {failures}"
+            )
+
+        ci = root / ".github/workflows/ci.yml"
+        ci.write_text(
+            fixtures[".github/workflows/ci.yml"].replace(
+                f"    if: {LEGACY_POSTGRES_GUARD}\n", "", 1
+            ),
+            encoding="utf-8",
+        )
+        failures = check_legacy_postgres_qualification(root)
+        if not any("explicit-dispatch guard" in failure for failure in failures):
+            problems.append(
+                "self-test: an unguarded PR-triggered legacy PostgreSQL job was accepted"
+            )
+
+        write_legacy_fixtures()
+        ci.write_text(
+            fixtures[".github/workflows/ci.yml"].replace(
+                "        default: false\n", "        default: true\n", 1
+            ),
+            encoding="utf-8",
+        )
+        failures = check_legacy_postgres_qualification(root)
+        if not any("default: false" in failure for failure in failures):
+            problems.append(
+                "self-test: a default-on legacy PostgreSQL dispatch was accepted"
+            )
+
+        write_legacy_fixtures()
+        endurance = root / ".github/workflows/endurance.yml"
+        endurance.write_text(
+            fixtures[".github/workflows/endurance.yml"].replace(
+                "permissions:\n", "  schedule:\n    - cron: '0 0 * * *'\npermissions:\n"
+            ),
+            encoding="utf-8",
+        )
+        failures = check_legacy_postgres_qualification(root)
+        if not any("must not have a schedule" in failure for failure in failures):
+            problems.append(
+                "self-test: an automatically scheduled legacy PostgreSQL workflow was accepted"
+            )
+
+        write_legacy_fixtures()
+        rollout = root / ".github/workflows/rollout.yml"
+        rollout.write_text(
+            fixtures[".github/workflows/rollout.yml"].replace(
+                LEGACY_POSTGRES_GUARD,
+                "${{ inputs.run_legacy_postgres_qualification == true }}",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        failures = check_legacy_postgres_qualification(root)
+        if not any("explicit-dispatch guard" in failure for failure in failures):
+            problems.append(
+                "self-test: a legacy job without a workflow_dispatch event guard was accepted"
+            )
+
+        actions_smoke = (
+            "name: Endurance smoke\n"
+            "on:\n"
+            + opt_in
+            + "permissions:\n  contents: read\n"
+            "jobs:\n"
+            "  endurance:\n"
+            "    timeout-minutes: 15\n"
+            "    steps:\n"
+            "      - run: cargo test the_endurance_smoke_tier_qualifies_and_publishes_its_evidence\n"
+            "  stateful-endurance:\n"
+            f"    if: {LEGACY_POSTGRES_GUARD}\n"
+            "    timeout-minutes: 15\n"
+            "    steps:\n"
+            "      - run: cargo test the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence\n"
+        )
+        endurance.write_text(actions_smoke, encoding="utf-8")
+        failures = check_actions_endurance_budget(root)
+        if failures:
+            problems.append(
+                f"self-test: bounded Actions endurance smoke was rejected: {failures}"
+            )
+
+        endurance.write_text(
+            actions_smoke.replace(
+                "    inputs:\n",
+                "    inputs:\n"
+                "      duration_ms:\n"
+                "        default: '43200000'\n"
+                "        type: string\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        failures = check_actions_endurance_budget(root)
+        if not any("duration-like" in failure for failure in failures):
+            problems.append(
+                "self-test: a twelve-hour Actions endurance input/default was accepted"
+            )
+
+        endurance.write_text(
+            actions_smoke.replace("    timeout-minutes: 15\n", "    timeout-minutes: 16\n", 1),
+            encoding="utf-8",
+        )
+        failures = check_actions_endurance_budget(root)
+        if not any("timeout exceeds 15 minutes" in failure for failure in failures):
+            problems.append(
+                "self-test: an Actions endurance job over fifteen minutes was accepted"
+            )
+
+        endurance.write_text(
+            actions_smoke.replace(
+                "the_endurance_smoke_tier_qualifies_and_publishes_its_evidence",
+                "the_endurance_soak_tier_qualifies_and_publishes_its_evidence",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        failures = check_actions_endurance_budget(root)
+        if not any("does not invoke" in failure for failure in failures):
+            problems.append(
+                "self-test: an Actions endurance soak entry point was accepted"
+            )
+
+        (root / "RELEASE.md").write_text(
+            "| Blob-backed flat-namespace stateful-v2 qualification | Pending | x |\n"
+            "CI Success is a software-change gate, not a production-qualification gate\n",
+            encoding="utf-8",
+        )
+        qualification = root / "docs/operations/qualification.md"
+        qualification.parent.mkdir(parents=True)
+        qualification.write_text(
+            "run_legacy_postgres_qualification=true\n"
+            "The blob-backed stateful-v2 gates remain **pending**\n",
+            encoding="utf-8",
+        )
+        if check_blob_qualification_status(root):
+            problems.append(
+                "self-test: explicit pending blob qualification status was rejected"
+            )
+        qualification.write_text(
+            "run_legacy_postgres_qualification=true\n", encoding="utf-8"
+        )
+        if not any(
+            "missing explicit blob qualification status" in failure
+            for failure in check_blob_qualification_status(root)
+        ):
+            problems.append(
+                "self-test: a missing pending blob qualification status was accepted"
+            )
 
     good_musl = (
         "jobs:\n"

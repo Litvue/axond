@@ -5,10 +5,18 @@ on:
   push:
     branches: [main]
   merge_group:
-  # Production fault and recovery records must name the frozen release head,
-  # not GitHub's ephemeral pull-request merge ref. A manual dispatch from that
-  # branch preserves ordinary merge-ref CI while producing exact-head evidence.
+  # Historical PostgreSQL fault and recovery records must name an exact head,
+  # not GitHub's ephemeral pull-request merge ref. They are available only when
+  # a manual dispatch also enables the explicit legacy qualification input.
   workflow_dispatch:
+    inputs:
+      run_legacy_postgres_qualification:
+        description: >-
+          Run the historical PostgreSQL stateful-v1 qualification lanes. These
+          lanes do not qualify ADR 0062's blob-backed stateful-v2 target.
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -131,7 +139,7 @@ jobs:
           path: target/capacity/**/*.json
           if-no-files-found: warn
       # The endurance smoke tier, likewise: the same driver and assertions the
-      # `Endurance` workflow runs for twelve hours, at seconds. The smoke
+      # off-platform qualification run exercises for twelve hours, at seconds. The smoke
       # directory alone — the sequential regression also publishes a soak-tier
       # artifact of a twenty-second run, and a bundle of smoke evidence is not
       # where a soak-tier file should be found.
@@ -147,8 +155,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
       # Likewise for the reduced rollout scenarios (ADR 0041). This lane has no
-      # database, so their rollback fence records itself as skipped; the
-      # `stateful-tests` lane below evaluates it.
+      # database, so their rollback fence records itself as skipped; a manually
+      # opted-in legacy `stateful-tests` lane can still evaluate stateful-v1.
       - name: Publish the reduced rollout results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -159,7 +167,8 @@ jobs:
           retention-days: 90
       # The fault matrix qualifies timing, so it does not run beside the rest of
       # the suite: this step has the machine to itself, one row at a time. The
-      # state-tier rows skip without a datastore and run in the stateful lane.
+      # state-tier rows skip without a datastore and remain available only in
+      # the manually opted-in legacy PostgreSQL lane.
       - name: Note the stateless fault lane start
         run: echo "fault_lane_started_ms=$(($(date +%s%N) / 1000000))" >>"$GITHUB_ENV"
       - name: Qualify the provider and transport fault rows
@@ -238,13 +247,19 @@ jobs:
         working-directory: fuzz
         run: cargo run --no-default-features --locked --bin fuzz-smoke
 
+  # ADR 0062 replaced this PostgreSQL stateful-v1 qualification cohort. Keep the
+  # historical lanes available for deliberate compatibility investigations, but
+  # never spend pull-request, push, or merge-queue runners on them. The workflow
+  # policy gate requires this exact opt-in on every legacy job below.
+  #
   # Build the release executable once for the two recovery source lanes. ThinLTO
   # does not promise byte-for-byte reproducibility across independent Cargo
   # invocations, so two builds from one commit are not one executable identity.
   # The source lanes download this immutable artifact and retain their own copy;
   # the aggregate then proves both copies and every raw stage name the same bytes.
   recovery-binary:
-    name: Recovery qualification binary
+    name: Legacy PostgreSQL recovery qualification binary
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -270,7 +285,8 @@ jobs:
           retention-days: 1
 
   stateful-tests:
-    name: Stateful tests
+    name: Legacy PostgreSQL stateful tests
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
     needs: recovery-binary
     runs-on: ubuntu-latest
     # Nothing in this lane may cut the endurance smoke tier off mid-run: its
@@ -426,7 +442,8 @@ jobs:
   # ordinary stateful checks cannot unexpectedly spend their budget on a load
   # test with process replacement and database fault injection.
   stateful-endurance-smoke:
-    name: Stateful endurance smoke
+    name: Legacy PostgreSQL stateful endurance smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
     runs-on: ubuntu-latest
     # A hang bound, not a budget, and it has to sit above the committed smoke
     # contract rather than near it: the cache is keyed with `cache-targets:
@@ -850,7 +867,8 @@ jobs:
   # The drill asserts the asymmetry — committed-before-target present, the write
   # after the target absent — with `axond migrate status` as the acceptance test.
   restore-drill:
-    name: Restore and PITR drill
+    name: Legacy PostgreSQL restore and PITR drill
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
     needs: recovery-binary
     runs-on: ubuntu-latest
     steps:
@@ -912,8 +930,8 @@ jobs:
   # restore-drill owns logical restore, PITR, and the durable usage boundary.
   # Neither partial upload is evidence of the recovery slice by itself.
   recovery-record:
-    name: Build the complete recovery qualification record
-    if: ${{ always() }}
+    name: Build the legacy PostgreSQL recovery qualification record
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
     needs:
       - stateful-tests
       - restore-drill
@@ -1022,7 +1040,8 @@ jobs:
   # manifest property, so the drill runs each against a real cluster with the
   # counterfactual that keeps the result honest.
   stateful-deploy-drill:
-    name: Stateful deploy drill (three nodes)
+    name: Legacy PostgreSQL stateful deploy drill (three nodes)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1059,7 +1078,8 @@ jobs:
   # claim layered on top of the Recreate drill. Run it on a real three-worker
   # cluster and require an ordinal PVC to retain data across Pod replacement.
   stateful-persistent-drill:
-    name: StatefulSet PVC drill (three nodes)
+    name: Legacy PostgreSQL StatefulSet PVC drill (three nodes)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1128,7 +1148,7 @@ jobs:
       - quickstart-smoke
     runs-on: ubuntu-latest
     steps:
-      - name: Require all lanes
+      - name: Require active lanes and account for paused legacy lanes
         run: |
           test "${{ needs.fmt.result }}" = success
           test "${{ needs.clippy.result }}" = success
@@ -1137,9 +1157,6 @@ jobs:
           test "${{ needs.build.result }}" = success
           test "${{ needs.tests.result }}" = success
           test "${{ needs.fuzz-smoke.result }}" = success
-          test "${{ needs.recovery-binary.result }}" = success
-          test "${{ needs.stateful-tests.result }}" = success
-          test "${{ needs.stateful-endurance-smoke.result }}" = success
           test "${{ needs.sdk-compat.result }}" = success
           test "${{ needs.sdk-compat-ts.result }}" = success
           test "${{ needs.docs.result }}" = success
@@ -1150,9 +1167,23 @@ jobs:
           test "${{ needs.binary-smoke.result }}" = success
           test "${{ needs.docker-smoke.result }}" = success
           test "${{ needs.cosign-format.result }}" = success
-          test "${{ needs.restore-drill.result }}" = success
           test "${{ needs.rollout-drill.result }}" = success
-          test "${{ needs.stateful-deploy-drill.result }}" = success
-          test "${{ needs.stateful-persistent-drill.result }}" = success
-          test "${{ needs.recovery-record.result }}" = success
           test "${{ needs.quickstart-smoke.result }}" = success
+          if [[ "${{ github.event_name }}" == workflow_dispatch && \
+            "${{ inputs.run_legacy_postgres_qualification }}" == true ]]; then
+            test "${{ needs.recovery-binary.result }}" = success
+            test "${{ needs.stateful-tests.result }}" = success
+            test "${{ needs.stateful-endurance-smoke.result }}" = success
+            test "${{ needs.restore-drill.result }}" = success
+            test "${{ needs.stateful-deploy-drill.result }}" = success
+            test "${{ needs.stateful-persistent-drill.result }}" = success
+            test "${{ needs.recovery-record.result }}" = success
+          else
+            test "${{ needs.recovery-binary.result }}" = skipped
+            test "${{ needs.stateful-tests.result }}" = skipped
+            test "${{ needs.stateful-endurance-smoke.result }}" = skipped
+            test "${{ needs.restore-drill.result }}" = skipped
+            test "${{ needs.stateful-deploy-drill.result }}" = skipped
+            test "${{ needs.stateful-persistent-drill.result }}" = skipped
+            test "${{ needs.recovery-record.result }}" = skipped
+          fi
