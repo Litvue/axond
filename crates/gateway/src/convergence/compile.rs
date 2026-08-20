@@ -58,7 +58,8 @@ use crate::desired_state::pricing::{
     EffectiveInstant, InvalidInstant, PriceBooks, PricingError, PricingSnapshot,
 };
 use crate::desired_state::{
-    BlobCandidate, BlobReader, DesiredState, LoadedRevision, ResourceRef, RevisionId,
+    BlobCandidate, BlobHydrationLimits, BlobReader, BlobRevisionSource, DesiredState,
+    LoadedRevision, ResourceRef, RevisionId,
 };
 use crate::policy::ActivationRefusal;
 use crate::state::{ConfigSnapshot, SnapshotError};
@@ -307,6 +308,106 @@ pub trait CandidateCompiler: Send + Sync {
     /// deployment refused. The default does nothing, for compilers that keep no
     /// such state.
     fn abandoned(&self) {}
+}
+
+/// The read-only blob inputs needed by the production candidate path.
+///
+/// The ring factory is intentionally called for every compilation attempt:
+/// convergence can retry after a refusal, but [`KekDecryptRing`] is a consumed
+/// decrypt-only capability and must not be cloned or retained after an attempt.
+pub(crate) struct BlobCandidateRuntime<S> {
+    source: BlobRevisionSource<S>,
+    reader: BlobReader<S>,
+    ring: Arc<dyn Fn() -> Option<KekDecryptRing> + Send + Sync>,
+}
+
+impl<S: ObjectStore> BlobCandidateRuntime<S> {
+    pub(crate) fn new(
+        reader: BlobReader<S>,
+        limits: BlobHydrationLimits,
+        ring: Arc<dyn Fn() -> Option<KekDecryptRing> + Send + Sync>,
+    ) -> Self {
+        Self {
+            source: BlobRevisionSource::new(reader.clone(), limits),
+            reader,
+            ring,
+        }
+    }
+}
+
+/// Candidate compiler used when a deployment supplies authenticated blob
+/// runtime inputs.
+///
+/// The delegate remains the generic compiler and the optional runtime is the
+/// only extra branch. With no blob runtime, callers use the delegate directly;
+/// with one present, an absent candidate or decrypt configuration is a typed
+/// refusal and never falls through to the generic secret path.
+pub(crate) struct BlobCandidateCompiler<P, S> {
+    delegate: Arc<RevisionCompiler<P>>,
+    runtime: Option<BlobCandidateRuntime<S>>,
+}
+
+impl<P, S> BlobCandidateCompiler<P, S> {
+    pub(crate) fn new(
+        delegate: Arc<RevisionCompiler<P>>,
+        runtime: Option<BlobCandidateRuntime<S>>,
+    ) -> Self {
+        Self { delegate, runtime }
+    }
+}
+
+#[async_trait]
+impl<P, S> CandidateCompiler for BlobCandidateCompiler<P, S>
+where
+    P: RevisionProjection,
+    S: ObjectStore + 'static,
+{
+    async fn compile(
+        &self,
+        revision: &LoadedRevision,
+        generation: u64,
+    ) -> Result<ConfigSnapshot, CompileError> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return self.delegate.compile(revision, generation).await;
+        };
+        let candidate = runtime
+            .source
+            .candidate()
+            .await
+            .map_err(|source| CompileError::Projection {
+                revision: revision.id(),
+                source: ProjectionError::Incomplete {
+                    detail: format!("blob candidate could not be hydrated: {source}"),
+                },
+            })?
+            .ok_or_else(|| CompileError::Projection {
+                revision: revision.id(),
+                source: ProjectionError::Incomplete {
+                    detail: "blob candidate is absent; refusing to compile a blob-backed snapshot"
+                        .to_owned(),
+                },
+            })?;
+        let ring = (runtime.ring)().ok_or_else(|| CompileError::Projection {
+            revision: revision.id(),
+            source: ProjectionError::Incomplete {
+                detail: "blob decrypt configuration is absent; refusing to compile a blob-backed snapshot"
+                    .to_owned(),
+            },
+        })?;
+        self.delegate
+            .compile_with_blob_candidate(
+                revision,
+                candidate,
+                runtime.reader.clone(),
+                ring,
+                generation,
+            )
+            .await
+    }
+
+    fn abandoned(&self) {
+        self.delegate.abandoned();
+    }
 }
 
 /// The production compiler: projection, then the boot gate, then the snapshot.

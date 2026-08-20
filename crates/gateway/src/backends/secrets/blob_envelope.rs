@@ -1252,7 +1252,13 @@ mod tests {
     use base64::Engine as _;
     use bytes::Bytes;
 
+    use crate::backends::control_plane::ControlPlaneStore;
     use crate::backends::object_store::{InMemoryObjectStore, ObjectStore, ObjectStoreLimits};
+    use crate::budget::NoBudget;
+    use crate::convergence::compile::{
+        BlobCandidateCompiler, BlobCandidateRuntime, RevisionCompiler,
+    };
+    use crate::convergence::{ConvergenceSettings, Reconciler, StateModelProjection, SystemClock};
     use crate::desired_state::fixtures::{
         flat_namespace_state_with_active_credential_digest, secret_id,
     };
@@ -1567,6 +1573,91 @@ mod tests {
                 .secrets()
                 .get(reference)
                 .expect("compiled secret")
+                .expose(),
+            PLAINTEXT
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciler_publishes_through_the_blob_candidate_compiler() {
+        let store = resolver_object_store();
+        let environment = environment_id("blob-secret-test");
+        let namespace = namespace_id("acme");
+        let reference = secret_reference(953, 1);
+        let sealer = test_sealer("primary", 0x11, &environment, &namespace, reference);
+        let sealed = sealer
+            .seal(&SecretMaterial::new(PLAINTEXT.to_owned()))
+            .expect("sealed fixture material");
+        let encoded = sealed.to_canonical_cbor();
+        let digest = Checksum::of(&encoded);
+        let desired = flat_namespace_state_with_active_credential_digest(digest);
+        let trust = publish_resolver_state(Arc::clone(&store), &desired).await;
+        store
+            .put_if_absent(
+                &crate::desired_state::publication::secret_key(digest),
+                Bytes::from(encoded),
+            )
+            .await
+            .expect("secret object publication");
+
+        let control_plane = Arc::new(crate::desired_state::oracle::InMemoryControlPlane::new());
+        let revision = control_plane
+            .publish_revision(crate::desired_state::fixtures::candidate(
+                crate::desired_state::ExpectedRevision::Empty,
+                "blob-runtime",
+                desired,
+            ))
+            .await
+            .expect("the generic control-plane revision is valid")
+            .id;
+
+        let bootstrap = crate::convergence::compile::testing::stateful_bootstrap();
+        let process_env = HashMap::new();
+        let serving = crate::state::AppState::new(
+            bootstrap.clone(),
+            &process_env,
+            crate::usage::UsageFanout::new(Vec::new()),
+            Box::new(NoBudget),
+        )
+        .expect("the stateful serving shell is valid");
+        let delegate = Arc::new(RevisionCompiler::new(
+            bootstrap,
+            process_env,
+            StateModelProjection,
+        ));
+        let reader = BlobReader::new(
+            Arc::clone(&store),
+            PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+            trust,
+        );
+        let runtime = BlobCandidateRuntime::new(
+            reader,
+            crate::desired_state::BlobHydrationLimits::default(),
+            Arc::new(|| Some(decrypt_ring(&[("primary", 0x11)]))),
+        );
+        let compiler = Arc::new(BlobCandidateCompiler::new(delegate, Some(runtime)));
+        let reconciler = Reconciler::new(
+            Arc::clone(&control_plane) as Arc<dyn ControlPlaneStore>,
+            compiler,
+            Arc::new(serving.clone()),
+            ConvergenceSettings::default(),
+            None,
+            Arc::new(SystemClock),
+        );
+
+        let outcome = reconciler.converge_once("blob-candidate-test").await;
+        assert!(matches!(
+            outcome,
+            crate::convergence::Outcome::Published { .. }
+        ));
+        assert_eq!(reconciler.report().active, Some(revision));
+        assert_eq!(serving.config().secrets().len(), 1);
+        assert_eq!(
+            serving
+                .config()
+                .secrets()
+                .get(reference)
+                .expect("candidate secret reached the published snapshot")
                 .expose(),
             PLAINTEXT
         );
