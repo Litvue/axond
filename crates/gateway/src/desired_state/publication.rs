@@ -1623,6 +1623,11 @@ impl<S: ObjectStore> BlobPublication<S> {
     /// keys. The provider's advertised read limit is checked again here so an
     /// adapter that returns an over-limit body cannot make this layer buffer or
     /// publish it as a valid immutable object.
+    ///
+    /// This is an integrity-only primitive, not an authorization decision:
+    /// callers must authenticate and authorize the requested resource before
+    /// invoking it. In particular, a matching digest does not authorize access
+    /// to a secret object and this method never decrypts or returns plaintext.
     pub async fn read_immutable_object(
         &self,
         kind: ImmutableObjectKind,
