@@ -366,8 +366,12 @@ fn valid_container_name(name: &str) -> bool {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
+    let address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    address.eq_ignore_ascii_case("localhost")
+        || address
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
 }
@@ -434,7 +438,10 @@ fn map_azure_error(
         }
         if matches!(
             status,
-            StatusCode::RequestTimeout | StatusCode::TooManyRequests
+            StatusCode::Unauthorized
+                | StatusCode::Forbidden
+                | StatusCode::RequestTimeout
+                | StatusCode::TooManyRequests
         ) || status.is_server_error()
         {
             return ObjectStoreError::unavailable(
@@ -648,6 +655,9 @@ mod tests {
         let azurite =
             Url::parse("http://127.0.0.1:10000/account/axond-state").expect("Azurite URL");
         assert!(validate_container_url(&azurite, UrlPolicy::Development).is_ok());
+        let ipv6_azurite =
+            Url::parse("http://[::1]:10000/account/axond-state").expect("IPv6 Azurite URL");
+        assert!(validate_container_url(&ipv6_azurite, UrlPolicy::Development).is_ok());
     }
 
     #[test]
@@ -694,6 +704,33 @@ mod tests {
         );
         assert_eq!(request.uri.query(), None);
         assert_eq!(request.headers["range"], "bytes=0-16");
+    }
+
+    #[tokio::test]
+    async fn empty_blob_get_uses_the_sdk_safe_retry_and_returns_a_value() {
+        let empty = Response::builder()
+            .status(HttpStatusCode::OK)
+            .header("etag", "\"empty\"")
+            .header("content-length", 0)
+            .body(Body::empty())
+            .expect("empty blob response");
+        let mut server = FakeServer::start(vec![
+            error_response(HttpStatusCode::RANGE_NOT_SATISFIABLE),
+            empty,
+        ])
+        .await;
+        let store = development_store(&server, limits(16, 16));
+
+        let value = store.get(&key()).await.expect("download empty object");
+        assert!(value.bytes.is_empty());
+        assert_eq!(value.version.as_opaque(), "\"empty\"");
+
+        let ranged = server.request().await;
+        assert_eq!(ranged.method, Method::GET);
+        assert_eq!(ranged.headers["range"], "bytes=0-16");
+        let retry = server.request().await;
+        assert_eq!(retry.method, Method::GET);
+        assert!(retry.headers.get("range").is_none());
     }
 
     #[tokio::test]
@@ -752,6 +789,8 @@ mod tests {
             error_response(HttpStatusCode::REQUEST_TIMEOUT),
             error_response(HttpStatusCode::TOO_MANY_REQUESTS),
             error_response(HttpStatusCode::INTERNAL_SERVER_ERROR),
+            error_response(HttpStatusCode::UNAUTHORIZED),
+            error_response(HttpStatusCode::FORBIDDEN),
             error_response(HttpStatusCode::BAD_REQUEST),
         ];
         let server = FakeServer::start(responses).await;
@@ -773,6 +812,10 @@ mod tests {
         for _ in 0..3 {
             let transient = store.get(&key()).await.expect_err("transient status");
             assert_eq!(transient.kind(), ObjectStoreErrorKind::Unavailable);
+        }
+        for _ in 0..2 {
+            let auth = store.get(&key()).await.expect_err("Azure auth status");
+            assert_eq!(auth.kind(), ObjectStoreErrorKind::Unavailable);
         }
         let malformed = store.get(&key()).await.expect_err("unexpected status");
         assert_eq!(malformed.kind(), ObjectStoreErrorKind::Integrity);
