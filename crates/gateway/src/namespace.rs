@@ -27,17 +27,13 @@ pub enum InvalidNamespaceId {
     #[error("a namespace identifier must not be empty")]
     Empty,
     #[error("a namespace identifier is over the {max}-byte limit")]
-    TooLong {
-        value: String,
-        length: usize,
-        max: usize,
-    },
+    TooLong { max: usize },
     #[error(
         "a namespace identifier contains a character outside ASCII letters, digits, `-`, and `_`"
     )]
-    Character { value: String },
+    Character,
     #[error("a namespace identifier must start and end with an ASCII letter or digit")]
-    Boundary { value: String },
+    Boundary,
 }
 
 impl fmt::Debug for InvalidNamespaceId {
@@ -56,19 +52,13 @@ impl NamespaceId {
             return Err(InvalidNamespaceId::Empty);
         }
         if input.len() > Self::MAX_LEN {
-            return Err(InvalidNamespaceId::TooLong {
-                value: input.to_owned(),
-                length: input.len(),
-                max: Self::MAX_LEN,
-            });
+            return Err(InvalidNamespaceId::TooLong { max: Self::MAX_LEN });
         }
         if !input
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         {
-            return Err(InvalidNamespaceId::Character {
-                value: input.to_owned(),
-            });
+            return Err(InvalidNamespaceId::Character);
         }
         if !input
             .as_bytes()
@@ -79,9 +69,7 @@ impl NamespaceId {
                 .last()
                 .is_some_and(u8::is_ascii_alphanumeric)
         {
-            return Err(InvalidNamespaceId::Boundary {
-                value: input.to_owned(),
-            });
+            return Err(InvalidNamespaceId::Boundary);
         }
         Ok(Self(input.to_owned()))
     }
