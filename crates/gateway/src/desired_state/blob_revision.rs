@@ -3,8 +3,9 @@
 //! This is deliberately not a [`ControlPlaneStore`](crate::backends::control_plane::ControlPlaneStore):
 //! blob identity is the signed head's `(sequence, revision digest)`, and this
 //! source neither fabricates a [`RevisionId`](super::RevisionId) nor offers an
-//! administrative mutation surface. Runtime compilation, secret opening,
-//! last-known-good persistence, and process wiring belong to later slices.
+//! administrative mutation surface. Runtime compilation, secret opening, and
+//! process wiring belong to later slices; the authenticated candidate cache is
+//! the durable boundary shared by those future consumers.
 
 use std::collections::BTreeMap;
 
@@ -101,6 +102,10 @@ pub struct BlobRevisionIdentity {
 }
 
 impl BlobRevisionIdentity {
+    pub(crate) const fn new(sequence: u64, digest: Checksum) -> Self {
+        Self { sequence, digest }
+    }
+
     pub const fn sequence(self) -> u64 {
         self.sequence
     }
@@ -127,6 +132,13 @@ impl BlobCandidate {
 
     pub const fn state(&self) -> &DesiredState {
         &self.state
+    }
+
+    /// The exact head fence that made this candidate eligible for activation.
+    /// A blob-native cache writer uses this binding to ensure it cannot persist
+    /// a candidate under a different environment than the one it authenticated.
+    pub const fn activation(&self) -> &ActivationReadyRevision {
+        &self.activation
     }
 
     pub fn into_parts(self) -> (BlobRevisionIdentity, DesiredState, ActivationReadyRevision) {
@@ -330,6 +342,7 @@ impl<S: ObjectStore> BlobRevisionSource<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -343,10 +356,12 @@ mod tests {
         InMemoryObjectStore, ObjectKey, ObjectStore, ObjectStoreError, ObjectStoreLimits,
         ObjectValue, ObjectVersion,
     };
+    use crate::convergence::LastKnownGood;
+    use crate::convergence::lkg::testing::{KEY as CACHE_KEY, cache_path};
     use crate::desired_state::fixtures;
     use crate::desired_state::publication::{
-        EnvironmentId, deployment_resource_key, environment_head_key, namespace_resource_key,
-        secret_key,
+        EnvironmentId, HeadDocumentError, deployment_resource_key, environment_head_key,
+        namespace_resource_key, secret_key,
     };
     use crate::desired_state::{
         BlobPublication, BlobPublicationRequest, ExpectedHead, IdempotencyHistoryLimit,
@@ -471,6 +486,217 @@ mod tests {
         assert_eq!(identity.digest(), outcome.revision);
         assert_eq!(hydrated, state);
         assert_eq!(activation.active_revision().revision(), outcome.revision);
+    }
+
+    #[tokio::test]
+    async fn blob_candidate_cache_recovers_cold_start_state_and_sequence_floor() {
+        let store = Arc::new(InMemoryObjectStore::new(object_store_limits()));
+        let state = fixtures::state();
+        let (trust, outcome) = publish_state(Arc::clone(&store), &state, "blob-cache-cold").await;
+        let candidate = BlobRevisionSource::new(
+            BlobReader::new(Arc::clone(&store), environment(), trust.clone()),
+            BlobHydrationLimits::default(),
+        )
+        .candidate()
+        .await
+        .expect("authenticated candidate")
+        .expect("published candidate");
+
+        let cache = LastKnownGood::new(cache_path("blob-cache-cold"), CACHE_KEY)
+            .expect("cache key is valid");
+        cache
+            .export_blob_candidate(&environment(), &candidate)
+            .expect("blob candidate cache writes atomically");
+        let restored = cache
+            .load_blob_candidate(&environment())
+            .expect("blob candidate cache authenticates")
+            .expect("blob candidate cache exists");
+
+        assert_eq!(restored.sequence(), outcome.sequence);
+        assert_eq!(restored.identity().digest(), outcome.revision);
+        assert_eq!(restored.state(), &state);
+
+        let reader = BlobReader::new_with_observed_state(
+            Arc::clone(&store),
+            environment(),
+            trust,
+            Some(restored.observed_head_state()),
+        )
+        .expect("cache environment binds to the reader");
+        let recovered = BlobRevisionSource::new(reader, BlobHydrationLimits::default())
+            .candidate()
+            .await
+            .expect("cold-start candidate remains readable")
+            .expect("active candidate");
+        assert_eq!(recovered.identity().sequence(), outcome.sequence);
+        assert_eq!(recovered.state(), &state);
+
+        let _ = fs::remove_file(cache.blob_path());
+    }
+
+    #[tokio::test]
+    async fn restored_blob_floor_fences_a_lower_authenticated_head() {
+        let store = Arc::new(InMemoryObjectStore::new(object_store_limits()));
+        let signer = signer();
+        let trust = trust(&signer);
+        let publisher = BlobPublication::new(
+            Arc::clone(&store),
+            environment(),
+            IdempotencyHistoryLimit::new(NonZeroUsize::new(8).expect("non-zero history")),
+            signer,
+            trust.clone(),
+            None,
+        )
+        .expect("trusted publisher");
+        let first_state = fixtures::state();
+        let first = publisher
+            .publish(BlobPublicationRequest {
+                expected: ExpectedHead::Empty,
+                authorization: PublicationAuthorization::new(
+                    PublicationActorBinding::of(b"blob-cache-floor-actor"),
+                    PublicationGrantBinding::of(b"blob-cache-floor-grant"),
+                    MutationId::new(Uuid7::from_parts(45, 0, 45).expect("valid mutation id")),
+                    MutationKind::Create,
+                ),
+                idempotency_key: IdempotencyKey::parse("blob-cache-floor-first")
+                    .expect("valid key"),
+                desired_state_checksum: first_state.checksum().expect("state checksum"),
+                objects: resource_objects(&first_state),
+            })
+            .await
+            .expect("first publication");
+        let first_head = store
+            .get(&environment_head_key(&environment()))
+            .await
+            .expect("first head");
+        let first_candidate = BlobRevisionSource::new(
+            BlobReader::new(Arc::clone(&store), environment(), trust.clone()),
+            BlobHydrationLimits::default(),
+        )
+        .candidate()
+        .await
+        .expect("first candidate hydrates")
+        .expect("first candidate exists");
+
+        let second_state = fixtures::state_with_renamed_alias();
+        let second = publisher
+            .publish(BlobPublicationRequest {
+                expected: ExpectedHead::Revision(first.revision),
+                authorization: PublicationAuthorization::new(
+                    PublicationActorBinding::of(b"blob-cache-floor-actor"),
+                    PublicationGrantBinding::of(b"blob-cache-floor-grant"),
+                    MutationId::new(Uuid7::from_parts(46, 0, 46).expect("valid mutation id")),
+                    MutationKind::Update,
+                ),
+                idempotency_key: IdempotencyKey::parse("blob-cache-floor-second")
+                    .expect("valid key"),
+                desired_state_checksum: second_state.checksum().expect("state checksum"),
+                objects: resource_objects(&second_state),
+            })
+            .await
+            .expect("second publication");
+        let second_candidate = BlobRevisionSource::new(
+            BlobReader::new(Arc::clone(&store), environment(), trust.clone()),
+            BlobHydrationLimits::default(),
+        )
+        .candidate()
+        .await
+        .expect("second candidate hydrates")
+        .expect("second candidate exists");
+        assert_eq!(second_candidate.identity().sequence(), second.sequence);
+
+        let cache = LastKnownGood::new(cache_path("blob-cache-floor"), CACHE_KEY)
+            .expect("cache key is valid");
+        cache
+            .export_blob_candidate(&environment(), &second_candidate)
+            .expect("second candidate cache writes");
+        assert!(matches!(
+            cache.export_blob_candidate(&environment(), &first_candidate),
+            Err(
+                crate::convergence::LastKnownGoodError::BlobSequenceRollback {
+                    minimum: 2,
+                    actual: 1,
+                    ..
+                }
+            )
+        ));
+
+        let current_head = store
+            .get(&environment_head_key(&environment()))
+            .await
+            .expect("second head");
+        store
+            .replace_if_version(
+                &environment_head_key(&environment()),
+                first_head.bytes,
+                &current_head.version,
+            )
+            .await
+            .expect("test restores an older signed head");
+
+        let restored = cache
+            .load_blob_candidate(&environment())
+            .expect("floor cache authenticates")
+            .expect("floor cache exists");
+        let reader = BlobReader::new_with_observed_state(
+            store,
+            environment(),
+            trust,
+            Some(restored.observed_head_state()),
+        )
+        .expect("cache environment binds to the reader");
+        assert!(matches!(
+            reader.read_active_revision().await,
+            Err(BlobPublicationError::Head(HeadDocumentError::Rollback {
+                minimum: 2,
+                actual: 1,
+            }))
+        ));
+
+        let _ = fs::remove_file(cache.blob_path());
+    }
+
+    #[tokio::test]
+    async fn blob_candidate_cache_refuses_corruption_and_wrong_environment() {
+        let store = Arc::new(InMemoryObjectStore::new(object_store_limits()));
+        let state = fixtures::state();
+        let (trust, _) = publish_state(Arc::clone(&store), &state, "blob-cache-integrity").await;
+        let candidate = BlobRevisionSource::new(
+            BlobReader::new(store, environment(), trust),
+            BlobHydrationLimits::default(),
+        )
+        .candidate()
+        .await
+        .expect("authenticated candidate")
+        .expect("published candidate");
+        let cache = LastKnownGood::new(cache_path("blob-cache-integrity"), CACHE_KEY)
+            .expect("cache key is valid");
+        cache
+            .export_blob_candidate(&environment(), &candidate)
+            .expect("blob candidate cache writes");
+
+        let mut bytes = fs::read(cache.blob_path()).expect("blob cache exists");
+        *bytes.last_mut().expect("blob cache is non-empty") ^= 1;
+        fs::write(cache.blob_path(), bytes).expect("test corrupts the blob cache");
+        assert!(matches!(
+            cache.load_blob_candidate(&environment()),
+            Err(crate::convergence::LastKnownGoodError::Signature { .. })
+        ));
+
+        // The corrupted record is not repaired or replaced by a later cache
+        // operation; remove it before testing the authenticated environment
+        // binding with a fresh record.
+        let _ = fs::remove_file(cache.blob_path());
+        cache
+            .export_blob_candidate(&environment(), &candidate)
+            .expect("a fresh signed candidate can be written");
+        let other_environment =
+            EnvironmentId::parse("other-blob-environment").expect("valid other environment");
+        assert!(matches!(
+            cache.load_blob_candidate(&other_environment),
+            Err(crate::convergence::LastKnownGoodError::BlobEnvironmentMismatch { .. })
+        ));
+        let _ = fs::remove_file(cache.blob_path());
     }
 
     #[tokio::test]
