@@ -4,7 +4,9 @@ Date: 2026-08-20
 
 ## Status
 
-Accepted, not yet implemented.
+Accepted. The provider-neutral object-store and authenticated publication domain
+contracts are implemented; runtime convergence and operator configuration are
+still staged work and blob-backed serving remains fail-closed until they land.
 
 Supersedes the PostgreSQL-only stateful control plane and the durable
 tenant/project/workload-principal hierarchy selected by
@@ -183,6 +185,39 @@ mutation summary, resource hashes, and signature. The namespace map is
 `namespace identifier -> immutable resource digest`, so changing one namespace
 reuses every unchanged resource.
 
+Both publication documents are authenticated v2 formats. The manifest is
+deterministic CBOR and the head is canonical JSON. Each carries signature schema
+`1`, algorithm `ed25519.v1`, a bounded non-secret signer key id, and an Ed25519
+signature. Their signing inputs are separately domain-separated; a signature
+over one format can never verify as the other. The manifest signature binds its
+schema, environment, sequence, parent, actor and grant bindings, mutation id and
+kind, authorization-scoped idempotency binding, desired-state checksum, sorted
+object references, and its own signing metadata. The head signature binds its
+schema, environment, sequence, revision digest, SHA-256 integrity metadata, and
+signing metadata.
+Manifest object references are strictly sorted and unique; a differently
+ordered or duplicated representation is not another valid spelling of the same
+revision.
+
+Serving replicas bootstrap with a verification-only key set. Publishers hold a
+private signer and refuse to start unless that signer is in the same trust set.
+Unknown key ids, algorithms, signature schemas, malformed signatures, and
+invalid signatures are distinct typed refusals. Raw actor/grant inputs and raw
+idempotency keys are domain-separated digests in durable metadata; signing key
+material, bearer values, and secret material are never serialized or included
+in errors. Key rotation adds the next public key to bootstrap trust before a
+publisher switches signer, then removes the old key only after no retained head,
+manifest, or last-known-good record depends on it.
+
+There is deliberately no public parse-only manifest API. Untrusted bytes can
+become a `VerifiedRevisionManifest` only after content-address, canonical-form,
+environment, sequence/parent shape, and signature verification. Hydration and
+future runtime wiring consume that verified type. A per-environment monotonic
+sequence guard raises its floor after every verified read and successful write;
+a valid older head or an absent head below that floor is rollback, not recovery.
+The floor must be persisted beside the last-known-good record for rollback
+resistance across process restarts.
+
 ### Publication is immutable upload followed by one CAS
 
 A publisher:
@@ -205,8 +240,10 @@ re-reads, and rebuilds; it never retries a stale head update as last-writer-wins
 
 Administrative mutations are declarative. Callers choose stable resource IDs
 and send an expected revision and idempotency key. The immutable revision binds
-that key to the desired-state checksum: the same key and checksum replay the
-original result, while the same key with different content is refused. The
+an authorization-scoped digest of that key to the desired-state checksum: the
+same actor/grant, key, and checksum replay the original result, while the same
+binding with different content is refused. The same caller string under another
+authenticated grant is an independent write rather than a collision. The
 check occurs before stale-head conflict reporting so a lost successful response
 is recoverable. The core protocol does not recreate a mutable relational
 idempotency table or imperative ID allocator; retained history is the initial
@@ -231,6 +268,13 @@ that publish no revision use individually immutable create-only audit objects;
 listing those records is administrative behavior, not serving correctness.
 Operational retention may additionally protect objects with store-native
 versioning or WORM policy.
+
+Unsigned blob publication is not a migration input. Unsigned head/manifest v2
+documents fail closed, as do the earlier unsigned blob schema-1 prototypes.
+There was no released blob authority to preserve. The legacy PostgreSQL journal,
+its canonical revision format, and its serving behavior are untouched; migration
+must authenticate newly exported blob v2 objects rather than copying an unsigned
+prototype format.
 
 Garbage collection starts from retained environment heads and walks immutable
 references. It deletes unreachable objects only after a grace period longer

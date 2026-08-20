@@ -522,11 +522,21 @@ whose tenant isolation is not actually in place.
 
 Blob publication formats are held by
 `head_documents_are_deterministic_bounded_and_strict`,
+`authenticated_heads_refuse_tamper_replay_wrong_keys_and_rollback`,
+`manifest_signature_binds_every_publication_decision`,
+`idempotency_is_authorization_scoped_and_durable_metadata_is_redacted`,
 `bounded_history_exhaustion_is_visible_and_fails_novel_writes_closed`, and the
 `publication_parsers` committed fuzz corpus. Object-store bytes are untrusted on
-read: unknown schemas, malformed or non-canonical encodings, invalid integrity,
-oversized documents, impossible sequence links, and excessive object counts are
-typed fail-closed refusals rather than recovery defaults.
+read: unknown schemas, signing schemas, algorithms, and keys; missing or invalid
+signatures; cross-environment replay; rollback below the observed sequence floor;
+malformed or non-canonical encodings; invalid integrity; oversized documents;
+impossible sequence links; and excessive object counts are typed fail-closed
+refusals rather than recovery defaults. The signed manifest binds actor/grant
+fingerprints, mutation identity/kind, scoped idempotency, state identity, and the
+complete object set. Raw attribution, idempotency strings, signing material, and
+secret values are absent from durable publication metadata and error rendering.
+Only `VerifiedRevisionManifest` crosses into hydration, so a future convergence
+path cannot accidentally treat parse success as authenticity.
 
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),

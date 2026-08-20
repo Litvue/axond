@@ -130,7 +130,9 @@ fn publication_payload(data: &[u8]) -> Cow<'_, [u8]> {
         _ => None,
     };
     let Some(decoded) = hex
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect::<Option<Vec<_>>>()
     else {

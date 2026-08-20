@@ -29,7 +29,7 @@ feature, and what that costs.
 | `provider_stream` | The provider stream decoders: OpenAI chat and Responses, Azure AI Foundry, Anthropic translated into OpenAI chunks, and a native Anthropic relay | Every streamed response, once framed |
 | `provider_error` | `ProviderError::from_upstream` and `ProviderError::transport`, and the classification, retry, and health judgements built on them | Every non-2xx or failed upstream call |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission over the last-known-good catalogue | The scheduled catalogue refresh, unattended |
-| `publication_parsers` | `HeadDocument::decode` and the deterministic CBOR revision-manifest decoder | Stateful convergence and administrative publication read durable object-store bytes |
+| `publication_parsers` | Signed `PublicationSequenceGuard::verify_head` and deterministic CBOR `VerifiedRevisionManifest` verification | Stateful convergence and administrative publication read durable object-store bytes |
 
 Every target asserts the same three properties, because they are what the
 gateway relies on.
@@ -131,10 +131,14 @@ run against a document a third party publishes:
   both shapes so a future default cannot appear unnoticed.
 
 The publication target drives the production parsers for both mutable head JSON
-and immutable revision-manifest CBOR. It requires deterministic outcomes,
-non-empty typed refusals, accepted canonical fixtures, explicit oversized
-refusals, and the schema, integrity, sequence, CBOR-length, and object-count
-bounds. Manifest corpus files use a documented `manifest-hex:` envelope so the
+and immutable revision-manifest CBOR, including real Ed25519 verification under
+a committed synthetic public key. It requires deterministic outcomes, non-empty
+typed refusals, accepted signed canonical fixtures, explicit oversized refusals,
+and the schema, environment, integrity, signing algorithm/key/schema, signature,
+sequence, CBOR-length, and object-count bounds. Seeds pin unsigned v2 refusal,
+cross-environment replay, modified signatures, and unknown algorithms in
+addition to malformed input. Manifest corpus files use a documented
+`manifest-hex:` envelope so the
 committed seed remains reviewable even though valid deterministic CBOR begins
 with non-UTF-8 bytes; canonical JSON uses `head-json:` so the corpus line ending
 is not treated as stored content. The harness removes those envelopes before
@@ -143,9 +147,10 @@ The committed `manifest-oversized` sentinel expands under the smoke allocator
 cap to one byte beyond the 1 MiB production ceiling, which the general 64 KiB
 seed derivation cannot reach.
 
-Runs are hermetic: the seam the targets call builds its verifiers from a
-configuration compiled into the binary with synthetic key material, so a fuzz run
-makes no network call, reads no file, and holds no real secret. The catalogue
+Runs are hermetic: the seam the targets call builds its token and publication
+verifiers from configuration and synthetic public key material compiled into the
+binary, so a fuzz run makes no network call, reads no file, and holds no real
+secret or publication private key. The catalogue
 target runs the *real* source — conditional fetch, strict parse, admission —
 against an in-memory fetcher that serves bytes already in hand and records what
 it was asked for, and then asserts that the only thing the import path reached

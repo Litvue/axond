@@ -151,6 +151,17 @@ Unreachable uploads are garbage, not visible partial state. Garbage collection
 starts from retained heads, follows manifests, and deletes only after a grace
 period.
 
+Before hydration, both head and manifest must pass the authenticated blob-v2
+contract from ADR 0062. Bootstrap trust is verification-only on replicas; an
+administrative publisher must prove its selected Ed25519 signer is present in
+that trust set before it can write. Convergence consumes
+`VerifiedRevisionManifest`, never raw or merely parsed CBOR. It persists the
+highest authenticated environment sequence beside last-known-good state and
+refuses a signed older or missing head below that floor. Unsigned blob v2 and
+the unsigned schema-1 prototype are not migration inputs. PostgreSQL export
+must create newly signed blob-v2 documents while leaving the PostgreSQL journal
+format unchanged.
+
 Replica convergence conditionally reads the head, verifies all immutable
 objects, compiles a snapshot, and swaps it atomically. Warm serving continues
 during storage loss. Cold start succeeds from object storage or an authenticated

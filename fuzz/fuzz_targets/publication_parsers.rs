@@ -1,5 +1,7 @@
-//! Coverage-guided fuzzing of object-store publication documents: bounded
-//! canonical head JSON and deterministic immutable revision-manifest CBOR.
+//! Coverage-guided fuzzing of object-store publication documents: bounded,
+//! signed canonical head JSON and signed deterministic revision-manifest CBOR.
+//! The shared target reaches schema/algorithm/key selection and real Ed25519
+//! verification under synthetic bootstrap trust as well as structural parsing.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

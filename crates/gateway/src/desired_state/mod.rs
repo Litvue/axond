@@ -76,6 +76,7 @@ pub mod policy;
 pub mod pricing;
 pub mod providers;
 pub mod publication;
+mod publication_auth;
 pub mod resource;
 pub mod revision;
 pub mod secrets;
@@ -144,7 +145,15 @@ pub use providers::{PROVIDER_SCHEMA, Provider, ProviderBody, ProviderError, Prov
 pub use publication::{
     BlobPublication, BlobPublicationError, BlobPublicationRequest, EnvironmentId, ExpectedHead,
     HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus, ImmutableObject,
-    ImmutableObjectKind, PublicationOutcome,
+    ImmutableObjectKind, PublicationActorBinding, PublicationAuthorization,
+    PublicationGrantBinding, PublicationOutcome, PublicationSequenceGuard,
+    VerifiedRevisionManifest,
+};
+#[allow(unused_imports)]
+pub use publication_auth::{
+    ED25519_V1_ALGORITHM, InvalidPublicationKeyId, PublicationAuthenticationError,
+    PublicationKeyId, PublicationSignatureAlgorithm, PublicationSigner, PublicationTrustStore,
+    TrustedPublicationKey,
 };
 #[allow(unused_imports)]
 pub use resource::{
