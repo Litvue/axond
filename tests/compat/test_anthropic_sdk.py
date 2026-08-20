@@ -13,13 +13,21 @@ import json
 import pytest
 from anthropic import Anthropic
 
-from conftest import GATEWAY_KEY, UPSTREAM_ANTHROPIC_KEY
+from conftest import GATEWAY_KEY, NAMESPACE, UPSTREAM_ANTHROPIC_KEY
 from fake_upstream import MESSAGES, fixture
 
 
+@pytest.fixture(params=("namespaced", "legacy"))
+def sdk_base_url(request, gateway) -> str:
+    """Anthropic appends `/v1/messages`; its base must stop at the namespace."""
+    if request.param == "namespaced":
+        return f"{gateway}/namespaces/{NAMESPACE}"
+    return gateway
+
+
 @pytest.fixture
-def client(gateway) -> Anthropic:
-    return Anthropic(base_url=gateway, api_key=GATEWAY_KEY)
+def client(sdk_base_url) -> Anthropic:
+    return Anthropic(base_url=sdk_base_url, api_key=GATEWAY_KEY)
 
 
 def test_buffered_message_preserves_thinking_and_tool_use(client, upstream):
@@ -45,9 +53,16 @@ def test_buffered_message_preserves_thinking_and_tool_use(client, upstream):
     assert sent["model"] == MESSAGES
     assert sent["x-api-key"] == UPSTREAM_ANTHROPIC_KEY
     assert sent["anthropic-version"]
+    assert sent["body"]["messages"] == [
+        {"role": "user", "content": "Weather in Paris?"}
+    ]
+    assert sent["body"]["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 1024,
+    }
 
 
-def test_streamed_message_reassembles_thinking_and_tool_use(client):
+def test_streamed_message_reassembles_thinking_and_tool_use(client, upstream):
     with client.messages.stream(
         model="messages-golden",
         max_tokens=1024,
@@ -67,11 +82,26 @@ def test_streamed_message_reassembles_thinking_and_tool_use(client):
     assert final.stop_reason == "tool_use"
     assert (final.usage.input_tokens, final.usage.output_tokens) == (41, 63)
 
+    sent = upstream.requests[-1]
+    # Both the legacy base and `/namespaces/platform` must cause the SDK to add
+    # `/v1/messages` exactly once; axond then removes its normal `/v1` route
+    # mount and the outer namespace mount before provider dispatch.
+    assert sent["path"] == "/messages"
+    assert sent["model"] == MESSAGES
+    assert sent["body"]["stream"] is True
+    assert sent["body"]["messages"] == [
+        {"role": "user", "content": "Weather in Paris?"}
+    ]
 
-def test_an_unknown_gateway_key_is_rejected(gateway):
+
+def test_an_unknown_gateway_key_is_rejected(sdk_base_url):
     import anthropic
 
-    stranger = Anthropic(base_url=gateway, api_key="not-a-gateway-key", max_retries=0)
+    stranger = Anthropic(
+        base_url=sdk_base_url,
+        api_key="not-a-gateway-key",
+        max_retries=0,
+    )
     with pytest.raises(anthropic.AuthenticationError):
         stranger.messages.create(
             model="messages-golden",
