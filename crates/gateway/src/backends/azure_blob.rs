@@ -779,6 +779,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_conditional_replace_matches_the_portable_not_found_contract() {
+        let server = FakeServer::start(vec![error_response(HttpStatusCode::NOT_FOUND)]).await;
+        let store = development_store(&server, limits(32, 32));
+        let expected = ObjectVersion::opaque("\"never-created\"").expect("ETag");
+
+        let error = store
+            .replace_if_version(&key(), Bytes::from_static(b"value"), &expected)
+            .await
+            .expect_err("a missing CAS target is not found");
+        assert_eq!(error.kind(), ObjectStoreErrorKind::NotFound);
+    }
+
+    #[tokio::test]
     async fn absent_or_malformed_response_etags_fail_integrity_validation() {
         let server = FakeServer::start(vec![
             ranged_response_without_etag(b"value"),
