@@ -147,7 +147,10 @@ Pinned smoke scenarios cover environment, namespace, secret-id, version, KEK-id
 and purpose substitution; wrapped-key, nonce and ciphertext mutation; unknown
 keys; active/decrypt-only rotation; duplicate-material alias refusal; invalid
 UTF-8 after authenticated opening; and the exact multibyte 64 KiB byte boundary.
-Only synthetic repeated-byte KEKs enter the seam.
+Only synthetic repeated-byte KEKs and cfg-only authority bindings enter the
+seam. Its publisher sealer and serving opener are separate production types, so
+the structured target exercises their handoff without giving the opener a seal
+path.
 Each scenario is also a committed binary seed using an Axond-owned stable
 layout: three one-byte scenario/key selectors, little-endian identity and
 version seeds, then the remaining bytes as material. Smoke decodes every file

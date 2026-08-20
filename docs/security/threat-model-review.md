@@ -223,14 +223,24 @@ error payload fires this trigger even when no runtime wiring changes.
 
 The codec reuses publication's `EnvironmentId`. Its read wrapper is not a
 free-form context constructor: `AuthenticatedSecretBinding` has private fields,
-no production test escape, no `Clone`, and is consumed by opening. Production
-creation flows through opaque verified signed deployment-secret-index
-provenance and carries the indexed ciphertext digest, which opening checks
-before KEK lookup. The constructor seam is coordinated with the adjacent
-publication/projection interfaces but runtime hydration wiring remains owned by
-those independent slices. A separate narrow write wrapper represents the
-publisher's create-only reservation; the codec does not claim that it performs
-the object-store reservation itself.
+no production constructor, no `Clone`, and is consumed by opening. This slice
+does not yet contain publication's `VerifiedActiveRevision` or projection's
+validated deployment secret-index entry, so it makes no claim that the runtime
+provenance handoff is wired. The integration slice must add the only production
+minting path from those two verified types. Tests and fuzzing alone can create a
+synthetic binding. The binding still carries the indexed ciphertext digest,
+which opening checks before KEK lookup.
+
+Write and read capabilities are separate concrete types. A serving
+`BlobSecretOpener` owns a `KekDecryptRing`; neither type contains an active key,
+random generator, publication binding, or seal method. A publisher-only
+`BlobSecretSealer` owns exactly one active encryption KEK and an opaque
+`BlobSecretPublicationBinding`; it has no open method. That publication binding
+also has no production constructor in this slice: the integration publisher
+must mint it only after a create-only exact-`SecretRef` reservation. The codec
+does not claim that it performs that object-store reservation itself. Raw KEK
+buffers remain exact-length, zeroizing, bounded, duplicate-material checked,
+and atomically admitted before an immutable decrypt ring replaces an old one.
 
 AES-KW authenticates the wrapped key but has no AAD. The isolation claim belongs
 to opening the complete object: AES-GCM material AAD binds environment,

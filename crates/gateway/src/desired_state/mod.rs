@@ -154,7 +154,7 @@ pub use revision::{
     RevisionManifest, ValidationError,
 };
 #[allow(unused_imports)]
-pub use secret_binding::AuthenticatedSecretBinding;
+pub use secret_binding::{AuthenticatedSecretBinding, BlobSecretPublicationBinding};
 #[allow(unused_imports)]
 pub use secrets::{
     ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,

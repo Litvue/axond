@@ -267,15 +267,21 @@ fixed 32-byte DEK without a nonce; because AES-KW has no AAD, caller-context
 binding is asserted only for the complete object after material authentication.
 The environment value is the publication protocol's single `EnvironmentId`,
 not a codec-local spelling. Opening consumes an opaque
-`AuthenticatedSecretBinding` minted only from verified signed active-revision,
-deployment-object, and secret-index provenance; it also checks the indexed
-ciphertext digest before selecting a KEK. Sealing accepts a distinct narrow
-create-only publication binding, so read authority cannot be reused as write
-authority.
+`AuthenticatedSecretBinding` and checks its indexed ciphertext digest before
+selecting a KEK. This crypto slice intentionally provides no production
+constructor for that binding: the integration slice must mint it only after a
+signed active revision, its content-addressed deployment object, and the exact
+deployment secret-index entry have all been verified. Tests and fuzzing alone
+have synthetic constructors. The same is true of the distinct create-only
+publication binding; its production minting belongs beside immutable publisher
+reservation enforcement.
 Plaintext is capped at 64 KiB, and the strict decoder rejects alternate CBOR
-spellings and oversized objects before allocation. One active KEK encrypts; up
-to seven explicitly retained decrypt-only keys permit rolling rotation, while
-duplicate ids or aliased raw key bytes refuse the whole ring. The legacy v1
+spellings and oversized objects before allocation. A serving
+`BlobSecretOpener` owns only a bounded `KekDecryptRing` and has no sealing API or
+publication authority. A publisher-only `BlobSecretSealer` owns one active KEK
+and one opaque create-only binding and has no opening API. Up to eight
+decrypt-only keys permit rolling rotation, while duplicate ids or aliased raw
+key bytes refuse the whole ring atomically. The legacy v1
 Postgres envelope is a separate unchanged format and is never guessed from blob
 bytes.
 

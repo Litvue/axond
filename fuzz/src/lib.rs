@@ -84,9 +84,7 @@ pub struct BlobSecretCryptoInput<'a> {
 }
 
 impl<'a> BlobSecretCryptoInput<'a> {
-    fn prefix(
-        u: &mut arbitrary::Unstructured<'a>,
-    ) -> arbitrary::Result<(u8, u8, u8, u64, u16)> {
+    fn prefix(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<(u8, u8, u8, u64, u16)> {
         Ok((
             u.arbitrary()?,
             u.arbitrary()?,
