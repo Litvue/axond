@@ -50,6 +50,7 @@ mod desired_state;
 mod error;
 mod key_material;
 mod mint;
+mod namespace;
 // The request-path middleware primitive (#355). The production chain is empty
 // until typed policy delivery registers content middleware.
 #[allow(dead_code)]

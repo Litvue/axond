@@ -4,7 +4,10 @@ Date: 2026-08-20
 
 ## Status
 
-Accepted, not yet implemented.
+Accepted; implementation in progress. Typed namespace identity, canonical
+namespace-prefixed inference routes, and authorization against existing
+one-namespace static/token grants are implemented. Set/all grant projection,
+blob-backed desired state, migration, and topology qualification remain open.
 
 Supersedes the PostgreSQL-only stateful control plane and the durable
 tenant/project/workload-principal hierarchy selected by

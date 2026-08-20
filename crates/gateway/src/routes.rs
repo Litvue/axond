@@ -32,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Extension, RawQuery, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -65,6 +65,7 @@ use crate::desired_state::policy::BufferedResponseRoute;
 use crate::error::GatewayError;
 use crate::middleware::{CoreBudgetHold, MiddlewareChain, MiddlewareExecution};
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
+use crate::namespace::NamespaceId;
 use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
@@ -81,7 +82,43 @@ pub fn router(state: AppState) -> Router {
         return unconverged_router("no projected serving snapshot").merge(diagnostic_router(state));
     }
     let minting_enabled = state.config().gateway_minting.is_some();
-    mount(route_specs(minting_enabled), state)
+    let mode = state.config().config.mode;
+    let specs = route_specs(minting_enabled);
+    let global = mount(
+        specs
+            .iter()
+            .copied()
+            .filter(|spec| !spec.namespace_scoped)
+            .collect(),
+        state.clone(),
+        RouteAuthority::Global,
+    );
+    let canonical = mount(
+        specs
+            .iter()
+            .copied()
+            .filter(|spec| spec.namespace_scoped)
+            .collect(),
+        state.clone(),
+        RouteAuthority::Namespaced,
+    );
+    let router = global.merge(Router::new().nest("/namespaces/{namespace}", canonical));
+
+    // The direct provider mount is the compatibility surface existing
+    // stateless deployments already use. Stateful serving has no implicit
+    // namespace: it exposes only the canonical path-selected surface.
+    if mode == crate::config::Mode::Stateless {
+        router.merge(mount(
+            specs
+                .into_iter()
+                .filter(|spec| spec.namespace_scoped)
+                .collect(),
+            state,
+            RouteAuthority::Legacy,
+        ))
+    } else {
+        router
+    }
 }
 
 /// The replica diagnostics alone, for a process that serves no inference.
@@ -96,10 +133,17 @@ pub fn diagnostic_router(state: AppState) -> Router {
         .into_iter()
         .filter(|spec| spec.auth == AuthPosture::Diagnostic)
         .collect();
-    mount(specs, state)
+    mount(specs, state, RouteAuthority::Global)
 }
 
-fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RouteAuthority {
+    Global,
+    Legacy,
+    Namespaced,
+}
+
+fn mount(specs: Vec<RouteSpec>, state: AppState, authority: RouteAuthority) -> Router {
     // The inbound body bound is declared rather than inherited: axum's own
     // default would otherwise be the process's real memory ceiling per request.
     let max_request_bytes = state.0.admission.limits().max_request_bytes;
@@ -133,7 +177,7 @@ fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
             };
             let route = if spec.auth.requires_a_credential() {
                 route.layer(from_fn_with_state(
-                    (state.clone(), spec.capability),
+                    (state.clone(), spec.capability, authority),
                     authenticate_middleware,
                 ))
             } else {
@@ -244,8 +288,10 @@ impl AuthPosture {
 
 /// A route's complete registration: adding a route requires declaring its
 /// authentication posture here rather than silently omitting the layer.
+#[derive(Clone, Copy)]
 struct RouteSpec {
     path: &'static str,
+    namespace_scoped: bool,
     auth: AuthPosture,
     capability: Option<Capability>,
     router: fn() -> MethodRouter<AppState>,
@@ -257,54 +303,63 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
     let mut routes = vec![
         RouteSpec {
             path: "/healthz",
+            namespace_scoped: false,
             auth: AuthPosture::LivenessProbe,
             capability: None,
             router: || get(healthz),
         },
         RouteSpec {
             path: "/readyz",
+            namespace_scoped: false,
             auth: AuthPosture::LivenessProbe,
             capability: None,
             router: || get(readyz),
         },
         RouteSpec {
             path: "/v1/models",
+            namespace_scoped: true,
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Models),
             router: || get(list_models),
         },
         RouteSpec {
             path: "/v1/credentials",
+            namespace_scoped: true,
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Credentials),
             router: || get(list_credentials),
         },
         RouteSpec {
             path: "/admin/v1/status",
+            namespace_scoped: false,
             auth: AuthPosture::Diagnostic,
             capability: Some(Capability::Status),
             router: || get(replica_status),
         },
         RouteSpec {
             path: "/v1/chat/completions",
+            namespace_scoped: true,
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Chat),
             router: || post(chat_completions),
         },
         RouteSpec {
             path: "/v1/messages",
+            namespace_scoped: true,
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Messages),
             router: || post(native_messages),
         },
         RouteSpec {
             path: "/v1/embeddings",
+            namespace_scoped: true,
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Embeddings),
             router: || post(embeddings),
         },
         RouteSpec {
             path: "/v1/responses",
+            namespace_scoped: true,
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Responses),
             router: || post(responses),
@@ -313,6 +368,7 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
     if minting_enabled {
         routes.push(RouteSpec {
             path: "/v1/tokens",
+            namespace_scoped: true,
             auth: AuthPosture::Authenticated,
             capability: None,
             router: || post(mint_tokens),
@@ -954,13 +1010,13 @@ async fn authenticate(
 /// `401` first; a valid caller on a replica with no active projected revision
 /// gets the typed `503` convergence refusal before the handler runs.
 async fn authenticate_middleware(
-    State((state, capability)): State<(AppState, Option<Capability>)>,
+    State((state, capability, authority)): State<(AppState, Option<Capability>, RouteAuthority)>,
     headers: HeaderMap,
     mut request: Request,
     next: Next,
 ) -> Result<Response, GatewayError> {
     let snapshot = state.config();
-    let caller = authenticate(&snapshot, &headers).await?;
+    let mut caller = authenticate(&snapshot, &headers).await?;
     if let Some(jti) = &caller.jti {
         match state.0.revocation.is_revoked(jti).await {
             Ok(true) => {
@@ -981,6 +1037,41 @@ async fn authenticate_middleware(
             }
         }
     }
+    // The path selects the namespace. Perform this intersection after inbound
+    // authentication but before convergence disclosure or any handler
+    // extractor: anonymous callers receive `401`, and an existing namespace
+    // outside the grant is indistinguishable from an absent namespace.
+    if authority == RouteAuthority::Namespaced {
+        let path = request
+            .extensions()
+            .get::<OriginalUri>()
+            .map_or_else(|| request.uri().path(), |original| original.path());
+        let namespace = namespace_from_canonical_path(path)?;
+        let grant = caller
+            .namespace_grant()
+            .map_err(|_| GatewayError::NamespaceNotAuthorized)?;
+        let authorized = grant.permits(&namespace);
+        let exists = snapshot.config.namespace(namespace.as_str()).is_some();
+        if !(authorized && exists) {
+            debug!(
+                namespace = %namespace,
+                subject = %caller.subject,
+                signer_kid = ?caller.signer_kid,
+                "namespace route denied"
+            );
+            return Err(GatewayError::NamespaceNotAuthorized);
+        }
+
+        // Downstream code reads one effective namespace from the caller
+        // context. Replacing it here makes the path authoritative when a later
+        // grant implementation permits a set or all namespaces.
+        caller.namespace = namespace.to_string();
+        request.extensions_mut().insert(namespace);
+    }
+    // Route capability is evaluated only after the canonical path has selected
+    // the effective namespace. That ordering prevents an outside-grant path
+    // from learning whether its requested wire is servable in the caller's
+    // original namespace and prepares this boundary for set/all grants.
     if let Some(capability) = capability
         && let Some(scope) = caller.scope.as_ref()
         && (!scope.contains(&capability)
@@ -1018,6 +1109,20 @@ async fn authenticate_middleware(
     request.extensions_mut().insert(snapshot);
     request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
+}
+
+/// Parse the raw namespace segment from the original URI. A nested axum router
+/// may rewrite the active URI; accepting a decoded equivalent such as `%61cme`
+/// would give one namespace several URL spellings and make routing ambiguous.
+fn namespace_from_canonical_path(path: &str) -> Result<NamespaceId, GatewayError> {
+    let rest = path
+        .strip_prefix("/namespaces/")
+        .ok_or(GatewayError::InvalidNamespace)?;
+    let (namespace, suffix) = rest.split_once('/').ok_or(GatewayError::InvalidNamespace)?;
+    if suffix.is_empty() {
+        return Err(GatewayError::InvalidNamespace);
+    }
+    NamespaceId::parse(namespace).map_err(|_| GatewayError::InvalidNamespace)
 }
 
 fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capability) -> bool {
@@ -3576,6 +3681,13 @@ namespace = "platform"
     }
 
     fn test_state_with_base_url(base_url: &str) -> AppState {
+        let (cfg, env) = test_config_with_base_url(base_url);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget))
+            .expect("credentials resolve")
+    }
+
+    fn test_config_with_base_url(base_url: &str) -> (Config, HashMap<String, String>) {
         let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -3614,14 +3726,36 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
 "#
         ))
         .unwrap();
-        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
         let mut env = env_with([("AXOND_PLATFORM_OPENAI", "sk-platform-test")]);
         env.insert(
             "JWT_SECRET".to_owned(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         );
-        AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget))
-            .expect("credentials resolve")
+        (cfg, env)
+    }
+
+    fn stateful_test_state() -> AppState {
+        let (mut config, env) = test_config_with_base_url("https://api.openai.com/v1");
+        // The config was validated in its ordinary stateless source posture.
+        // This test changes only the process authority after parsing so it can
+        // exercise the route graph of a compiled stateful serving snapshot;
+        // convergence tests own the separate bootstrap/projection validation.
+        config.mode = crate::config::Mode::Stateful;
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        AppState::new_with_observability(
+            config,
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            ReplicaObservability {
+                status: observed_registry(),
+                revision: Some(converged_replica()),
+                catalogue: None,
+            },
+        )
+        .expect("compiled stateful serving snapshot")
     }
 
     /// A deployment whose `gpt-4o` alias is bound to a catalogue offering the
@@ -5156,13 +5290,217 @@ max_ttl = "15m"
         }
     }
 
+    #[test]
+    fn canonical_namespace_routes_preserve_every_provider_suffix() {
+        let paths: Vec<_> = route_specs(true)
+            .into_iter()
+            .filter(|spec| spec.namespace_scoped)
+            .map(|spec| spec.path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/v1/models",
+                "/v1/credentials",
+                "/v1/chat/completions",
+                "/v1/messages",
+                "/v1/embeddings",
+                "/v1/responses",
+                "/v1/tokens",
+            ]
+        );
+        for suffix in paths {
+            let canonical = format!("/namespaces/platform{suffix}");
+            assert_eq!(
+                canonical.strip_prefix("/namespaces/platform").unwrap(),
+                suffix
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn minting_route_is_absent_without_boot_minting_config() {
+    async fn every_canonical_namespace_route_authenticates_first() {
+        for spec in route_specs(true)
+            .into_iter()
+            .filter(|spec| spec.namespace_scoped)
+        {
+            let method = if matches!(spec.path, "/v1/models" | "/v1/credentials") {
+                Method::GET
+            } else {
+                Method::POST
+            };
+            let state = if spec.path == "/v1/tokens" {
+                minting_state()
+            } else {
+                test_state()
+            };
+            let response = router(state)
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/namespaces/ghost{}", spec.path))
+                        .header("content-type", "application/json")
+                        .body(Body::from("not-json"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} disclosed namespace or body handling before authentication",
+                spec.path
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "unauthorized", "{}", spec.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_route_uses_the_authorized_path_namespace() {
         let response = router(test_state())
-            .oneshot(Request::post("/v1/tokens").body(Body::from("{}")).unwrap())
+            .oneshot(
+                Request::get("/namespaces/platform/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn stateful_serving_never_mounts_an_implicit_legacy_namespace() {
+        let app = router(stateful_test_state());
+        let authorized = |path: &'static str| {
+            Request::get(path)
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {CALLER_SECRET}"),
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let legacy = app.clone().oneshot(authorized("/v1/models")).await.unwrap();
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+
+        let canonical = app
+            .oneshot(authorized("/namespaces/platform/v1/models"))
+            .await
+            .unwrap();
+        assert_eq!(canonical.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn absent_and_outside_grant_namespaces_have_one_non_enumerating_response() {
+        let app = router(status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+            catalogue: None,
+        }));
+        let answer = |namespace: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(format!("/namespaces/{namespace}/v1/models"))
+                            .header(
+                                axum::http::header::AUTHORIZATION,
+                                format!("Bearer {OPERATOR_KEY}"),
+                            )
+                            // A header cannot select or override a namespace.
+                            .header("x-axond-namespace", "platform")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (status, body)
+            }
+        };
+
+        // `tenant` exists in STATUS_CONFIG but is outside the operator key's
+        // one-namespace inference grant. `ghost` does not exist at all.
+        let outside_grant = answer("tenant").await;
+        let absent = answer("ghost").await;
+        assert_eq!(outside_grant, absent);
+        assert_eq!(outside_grant.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&outside_grant.1).unwrap(),
+            json!({
+                "error": {
+                    "type": "namespace_not_authorized",
+                    "message": "the authenticated grant does not authorize the selected namespace"
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn noncanonical_namespace_encoding_is_a_typed_refusal_after_authentication() {
+        let response = router(test_state())
+            .oneshot(
+                Request::get("/namespaces/%70latform/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_namespace");
+    }
+
+    #[tokio::test]
+    async fn namespace_mismatch_precedes_body_parsing_and_convergence_disclosure() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: Some(Arc::new(RevisionStatus::new(Box::new(
+                crate::convergence::SystemClock,
+            )))),
+            catalogue: None,
+        });
+        let response = router(state)
+            .oneshot(
+                Request::post("/namespaces/tenant/v1/chat/completions")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_KEY}"),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "namespace_not_authorized");
+    }
+
+    #[tokio::test]
+    async fn minting_route_is_absent_without_boot_minting_config() {
+        for path in ["/v1/tokens", "/namespaces/platform/v1/tokens"] {
+            let response = router(test_state())
+                .oneshot(Request::post(path).body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     #[tokio::test]

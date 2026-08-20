@@ -16,6 +16,7 @@ use crate::aliases::AliasScope;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProjectedPrincipal};
 use crate::desired_state::WorkloadKey;
 use crate::key_material::{self, KeyMaterialError};
+use crate::namespace::{InvalidNamespaceId, NamespaceGrant, NamespaceId};
 
 macro_rules! define_capabilities {
     ($($capability:ident),+ $(,)?) => {
@@ -125,6 +126,15 @@ pub struct InboundKey {
 }
 
 impl InboundKey {
+    /// The flat namespace grant authentication produced for inference.
+    ///
+    /// Existing credentials name one namespace. Parsing at this boundary keeps
+    /// legacy config storage independent from ADR 0062's public URL contract;
+    /// malformed legacy names fail closed when used on a canonical route.
+    pub fn namespace_grant(&self) -> Result<NamespaceGrant, InvalidNamespaceId> {
+        NamespaceId::parse(&self.namespace).map(NamespaceGrant::one)
+    }
+
     /// Whether this principal holds the operator's own authority over the whole
     /// deployment, rather than authority over one namespace.
     ///
