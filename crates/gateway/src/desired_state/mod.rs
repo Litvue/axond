@@ -75,6 +75,7 @@ pub mod mutation;
 pub mod policy;
 pub mod pricing;
 pub mod providers;
+pub mod publication;
 pub mod resource;
 pub mod revision;
 pub mod secrets;
@@ -139,6 +140,11 @@ pub use pricing::{
 };
 #[allow(unused_imports)]
 pub use providers::{PROVIDER_SCHEMA, Provider, ProviderBody, ProviderError, Providers};
+#[allow(unused_imports)]
+pub use publication::{
+    BlobPublication, BlobPublicationError, BlobPublicationRequest, EnvironmentId, ExpectedHead,
+    HeadDocument, ImmutableObject, ImmutableObjectKind, PublicationOutcome,
+};
 #[allow(unused_imports)]
 pub use resource::{
     BlobError, BlobKind, BlobRef, ResourceBody, ResourceKind, ResourceRef, ResourceScope,
