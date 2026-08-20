@@ -28,6 +28,8 @@ on:
           - provider_stream
           - provider_error
           - catalog_import
+          - blob_secret_envelope
+          - blob_secret_crypto
 
 permissions:
   contents: read
@@ -57,9 +59,9 @@ jobs:
           set -euo pipefail
           case "${REQUESTED}" in
             all)
-              targets='["config_toml", "token_verify", "credentials_query", "sse_decode", "provider_stream", "provider_error", "catalog_import"]'
+              targets='["config_toml", "token_verify", "credentials_query", "sse_decode", "provider_stream", "provider_error", "catalog_import", "blob_secret_envelope", "blob_secret_crypto"]'
               ;;
-            config_toml | token_verify | credentials_query | sse_decode | provider_stream | provider_error | catalog_import)
+            config_toml | token_verify | credentials_query | sse_decode | provider_stream | provider_error | catalog_import | blob_secret_envelope | blob_secret_crypto)
               targets="[\"${REQUESTED}\"]"
               ;;
             *) echo "unknown fuzz target ${REQUESTED}" >&2; exit 1 ;;
@@ -151,7 +153,7 @@ jobs:
           cargo fuzz run --target x86_64-unknown-linux-gnu \
             "${{ matrix.target }}" "corpus/${{ matrix.target }}" -- \
             -max_total_time="${SECONDS_PER_TARGET}" \
-            -max_len=65536 \
+            -max_len=67584 \
             -rss_limit_mb=2048 \
             -malloc_limit_mb=1024 \
             -timeout=25 \

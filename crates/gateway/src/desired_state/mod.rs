@@ -69,6 +69,7 @@
 pub mod access;
 pub mod canonical;
 pub mod credentials;
+mod environment;
 pub mod ids;
 pub mod models;
 pub mod mutation;
@@ -78,6 +79,7 @@ pub mod pricing;
 pub mod providers;
 pub mod resource;
 pub mod revision;
+mod secret_binding;
 pub mod secrets;
 pub mod tenancy;
 
@@ -106,6 +108,8 @@ pub use credentials::{
     CredentialError, Credentials, PROVIDER_CREDENTIAL_SCHEMA, ProviderCredential,
     ProviderCredentialBody,
 };
+#[allow(unused_imports)]
+pub use environment::{EnvironmentId, InvalidEnvironmentId};
 #[allow(unused_imports)]
 pub use ids::{
     AuditEventId, InvalidId, InvalidSlug, InvalidUuid7, MutationId, PrincipalId, ProjectId,
@@ -157,6 +161,8 @@ pub use revision::{
     BodySkew, DesiredState, IntegrityError, LoadedRevision, ManifestEntry, RevisionCandidate,
     RevisionManifest, ValidationError,
 };
+#[allow(unused_imports)]
+pub use secret_binding::{AuthenticatedSecretBinding, BlobSecretPublicationBinding};
 #[allow(unused_imports)]
 pub use secrets::{
     ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,

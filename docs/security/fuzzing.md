@@ -1,11 +1,12 @@
 # Fuzzing
 
-Axond parses input it does not control on four paths: an operator's
+Axond parses input it does not control on five paths: an operator's
 configuration file at boot and on every reload, a caller's credential and query
 string on every request, everything a *provider* sends back — the SSE stream
 relayed to a tenant byte for byte and the failure body an error response is
-classified from — and the models.dev catalogue a background refresh imports
-unattended. All four are fuzzed continuously — a scheduled
+classified from — the models.dev catalogue a background refresh imports
+unattended, and immutable sealed-secret objects hydrated from blob storage. All
+five are fuzzed continuously — a scheduled
 coverage-guided run for exploration, and a bounded deterministic replay on every
 pull request so the result is required CI evidence rather than a dashboard
 nobody reads.
@@ -28,6 +29,8 @@ feature, and what that costs.
 | `provider_stream` | The provider stream decoders: OpenAI chat and Responses, Azure AI Foundry, Anthropic translated into OpenAI chunks, and a native Anthropic relay | Every streamed response, once framed |
 | `provider_error` | `ProviderError::from_upstream` and `ProviderError::transport`, and the classification, retry, and health judgements built on them | Every non-2xx or failed upstream call |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission over the last-known-good catalogue | The scheduled catalogue refresh, unattended |
+| `blob_secret_envelope` | The v2 fixed-array canonical-CBOR sealed-secret decoder | Snapshot compilation after an authenticated blob manifest names immutable ciphertext |
+| `blob_secret_crypto` | Bounded synthetic v2 seal/open, context substitution, mutation, and rotation | Cryptographic invariants need structured valid objects that raw parser mutations rarely produce |
 
 Every target asserts the same three properties, because they are what the
 gateway relies on.
@@ -127,6 +130,33 @@ run against a document a third party publishes:
   modality, nothing a caller can mistake for an observed answer. A *stated*
   wrapper of the wrong shape is still a refusal, and the fuzz corpus carries
   both shapes so a future default cannot appear unnoticed.
+
+The raw blob-secret target adds the properties required before ciphertext
+reaches a key: the complete object is bounded before decoding; only the
+six-element schema-2 array and minimal definite CBOR lengths are accepted;
+material nonce, RFC 3394 wrapped-DEK, KEK-id, and ciphertext lengths stay exact;
+and an accepted object re-encodes byte-for-byte to its input. Coverage-guided
+bytes are never decoded or transformed by the harness. Binary corpus seeds pin
+acceptance and every refusal class: oversized, truncated, shape, compatibility,
+noncanonical, KEK id, fixed field, ciphertext, and trailing data. The bounded
+smoke maps every raw seed filename to one exact outcome and fails on an added,
+removed, renamed, or reclassified file.
+
+`blob_secret_crypto` complements parser mutation with structured bounded inputs.
+Pinned smoke scenarios cover environment, namespace, secret-id, version, KEK-id
+and purpose substitution; wrapped-key, nonce and ciphertext mutation; unknown
+keys; active/decrypt-only rotation; duplicate-material alias refusal; invalid
+UTF-8 after authenticated opening; and the exact multibyte 64 KiB byte boundary.
+Only synthetic repeated-byte KEKs and cfg-only authority bindings enter the
+seam. Its publisher sealer and serving opener are separate production types, so
+the structured target exercises their handoff without giving the opener a seal
+path.
+Each scenario is also a committed binary seed using an Axond-owned stable
+layout: three one-byte scenario/key selectors, little-endian identity and
+version seeds, then the remaining bytes as material. Smoke decodes every file
+through `BlobSecretCryptoInput::arbitrary_take_rest` and asserts its exact named
+outcome. Separate seeds pin empty material, invalid input UTF-8, and exact/over
+multibyte 64 KiB boundaries.
 
 Runs are hermetic: the seam the targets call builds its verifiers from a
 configuration compiled into the binary with synthetic key material, so a fuzz run

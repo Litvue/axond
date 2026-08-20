@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use arbitrary::{Arbitrary, Unstructured};
 use axond_fuzz::{
-    CapabilityField, CatalogEdit, CatalogInput, CostField, LifecycleValue, MetaField,
-    ProviderStreamInput, SseInput, StreamShape, TokenInput,
+    BlobSecretCryptoInput, CapabilityField, CatalogEdit, CatalogInput, CostField, LifecycleValue,
+    MetaField, ProviderStreamInput, SseInput, StreamShape, TokenInput,
 };
 
 /// Live heap the whole replay may hold at once. The parsers under test are
@@ -51,7 +51,7 @@ const PER_INPUT_BUDGET: Duration = Duration::from_secs(2);
 const TOTAL_BUDGET: Duration = Duration::from_secs(60);
 
 /// How large the oversized derivation of each seed is.
-const OVERSIZED_BYTES: usize = 64 * 1024;
+const OVERSIZED_BYTES: usize = 66 * 1024;
 
 /// How many outcome classes the freshly-minted token scenarios must reach.
 /// [`EXPECTED_MINTED_CLASSES`] pins which ones; this is the floor for the rest.
@@ -171,6 +171,16 @@ const TARGETS: &[Target] = &[
         run: replay_catalog_import,
         minimum_classes: 6,
     },
+    Target {
+        name: "blob_secret_envelope",
+        run: replay_blob_secret_envelope,
+        minimum_classes: 10,
+    },
+    Target {
+        name: "blob_secret_crypto",
+        run: replay_blob_secret_crypto,
+        minimum_classes: 1,
+    },
 ];
 
 /// Chunk boundaries the SSE seeds are replayed on. Coprime with nothing in
@@ -280,29 +290,94 @@ fn replay_flat_v2_body(data: &[u8]) -> Vec<&'static str> {
     vec![axond_fuzz::flat_v2_body_target(data)]
 }
 
-fn assert_flat_v2_seed_contract() {
-    let corpus = seeds("flat_v2_body");
+fn replay_blob_secret_envelope(data: &[u8]) -> Vec<&'static str> {
+    vec![axond_fuzz::blob_secret_envelope(data)]
+}
+
+fn replay_blob_secret_crypto(data: &[u8]) -> Vec<&'static str> {
+    BlobSecretCryptoInput::arbitrary_take_rest(Unstructured::new(data))
+        .map(|input| vec![axond_fuzz::blob_secret_crypto(&input)])
+        .unwrap_or_default()
+}
+
+const EXPECTED_BLOB_CRYPTO_CLASSES: &[&str] = &[
+    "roundtrip",
+    "wrong_environment",
+    "wrong_namespace",
+    "wrong_reference",
+    "wrong_version",
+    "wrong_purpose",
+    "wrapped_mutation",
+    "nonce_mutation",
+    "ciphertext_mutation",
+    "unknown_key",
+    "rotation",
+    "alias_rejected",
+    "invalid_utf8_refused",
+    "stored_id_mutation",
+];
+
+const EXPECTED_BLOB_ENVELOPE_SEEDS: &[(&str, &str)] = &[
+    ("accepted.cbor", "accepted"),
+    ("ciphertext.cbor", "ciphertext"),
+    ("compatibility.cbor", "compatibility"),
+    ("fixed-field.cbor", "fixed_field"),
+    ("kek-id.cbor", "kek_id"),
+    ("noncanonical.cbor", "noncanonical"),
+    ("oversized.cbor", "oversized"),
+    ("shape.cbor", "shape"),
+    ("trailing.cbor", "trailing"),
+    ("truncated.cbor", "truncated"),
+];
+
+const EXPECTED_BLOB_CRYPTO_SEEDS: &[(&str, &str)] = &[
+    ("00-roundtrip.bin", "roundtrip"),
+    ("01-wrong-environment.bin", "wrong_environment"),
+    ("02-wrong-namespace.bin", "wrong_namespace"),
+    ("03-wrong-reference.bin", "wrong_reference"),
+    ("04-wrong-version.bin", "wrong_version"),
+    ("05-wrong-purpose.bin", "wrong_purpose"),
+    ("06-wrapped-mutation.bin", "wrapped_mutation"),
+    ("07-nonce-mutation.bin", "nonce_mutation"),
+    ("08-ciphertext-mutation.bin", "ciphertext_mutation"),
+    ("09-unknown-key.bin", "unknown_key"),
+    ("10-rotation.bin", "rotation"),
+    ("11-alias-rejected.bin", "alias_rejected"),
+    ("12-invalid-utf8-refused.bin", "invalid_utf8_refused"),
+    ("13-stored-id-mutation.bin", "stored_id_mutation"),
+    ("boundary-empty.bin", "empty_refused"),
+    ("boundary-input-not-utf8.bin", "input_not_utf8"),
+    ("boundary-multibyte-limit.bin", "roundtrip"),
+    ("boundary-multibyte-over-limit.bin", "oversized_refused"),
+];
+
+fn assert_exact_seed_outcomes(
+    target: &str,
+    expected: &[(&str, &str)],
+    replay: fn(&[u8]) -> Vec<&'static str>,
+) {
+    let corpus = seeds(target);
     assert_eq!(
         corpus.len(),
-        EXPECTED_FLAT_V2_SEED_CLASSES.len(),
-        "the flat-v2 corpus and its exact outcome table differ in size"
+        expected.len(),
+        "{target}: every raw seed must have exactly one filename pin"
     );
-    for (seed, bytes) in &corpus {
-        let expected = EXPECTED_FLAT_V2_SEED_CLASSES
+    for (filename, bytes) in corpus {
+        let (_, expected_class) = expected
             .iter()
-            .find(|(filename, _)| filename == seed)
-            .map(|(_, outcome)| *outcome)
-            .unwrap_or_else(|| panic!("flat-v2 seed `{seed}` has no expected outcome entry"));
-        let actual = axond_fuzz::flat_v2_body_target(bytes);
+            .find(|(name, _)| *name == filename)
+            .unwrap_or_else(|| panic!("{target}/{filename} has no exact outcome pin"));
+        let classes = replay(&bytes);
         assert_eq!(
-            actual, expected,
-            "flat-v2 seed `{seed}` reached `{actual}` rather than `{expected}`"
+            classes.as_slice(),
+            &[*expected_class],
+            "{target}/{filename} no longer reaches its exact named outcome"
         );
     }
-    for (seed, _) in EXPECTED_FLAT_V2_SEED_CLASSES {
+    for (filename, _) in expected {
         assert!(
-            corpus.iter().any(|(filename, _)| filename == seed),
-            "flat-v2 outcome table names missing seed `{seed}`"
+            seed_directory(target).join(filename).is_file(),
+            "{target}/{filename} is pinned but absent"
         );
     }
 }
@@ -842,7 +917,22 @@ fn main() {
     // input carrying it, not a decoder disclosing it.
     axond_fuzz::assert_disclosure_check_survives_escaping();
     println!("provider_error: an escaped canary is read as the input that carried it");
-    assert_flat_v2_seed_contract();
+    assert_exact_seed_outcomes(
+        "flat_v2_body",
+        EXPECTED_FLAT_V2_SEED_CLASSES,
+        replay_flat_v2_body,
+    );
+    assert_exact_seed_outcomes(
+        "blob_secret_envelope",
+        EXPECTED_BLOB_ENVELOPE_SEEDS,
+        replay_blob_secret_envelope,
+    );
+    assert_exact_seed_outcomes(
+        "blob_secret_crypto",
+        EXPECTED_BLOB_CRYPTO_SEEDS,
+        replay_blob_secret_crypto,
+    );
+    println!("flat-v2 and blob secret corpora: every filename reaches its exact pinned outcome");
     let mut inputs = 0_usize;
     for target in TARGETS {
         let mut target_inputs = 0_usize;
@@ -1020,6 +1110,63 @@ fn main() {
         catalog_classes.values().sum::<usize>(),
         catalog_classes.len(),
         catalog_classes
+            .iter()
+            .map(|(class, count)| format!("{class}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    let mut crypto_classes = BTreeMap::new();
+    for (scenario, expected) in EXPECTED_BLOB_CRYPTO_CLASSES.iter().enumerate() {
+        let input = BlobSecretCryptoInput {
+            material: b"synthetic-provider-key",
+            scenario: u8::try_from(scenario).expect("bounded scenario"),
+            primary_seed: 0x11,
+            secondary_seed: 0x22,
+            identity_seed: 7,
+            version_seed: 3,
+        };
+        let class = axond_fuzz::blob_secret_crypto(&input);
+        assert_eq!(class, *expected, "blob crypto scenario {scenario}");
+        *crypto_classes.entry(class).or_default() += 1;
+        inputs += 1;
+    }
+    for (label, material, expected) in [
+        ("empty", Vec::new(), "empty_refused"),
+        (
+            "multibyte-limit",
+            "é".repeat(axond_fuzz_seam::BLOB_SECRET_MAX_PLAINTEXT_BYTES / 2)
+                .into_bytes(),
+            "roundtrip",
+        ),
+        (
+            "multibyte-over-limit",
+            format!(
+                "{}x",
+                "é".repeat(axond_fuzz_seam::BLOB_SECRET_MAX_PLAINTEXT_BYTES / 2)
+            )
+            .into_bytes(),
+            "oversized_refused",
+        ),
+    ] {
+        let input = BlobSecretCryptoInput {
+            material: &material,
+            scenario: 0,
+            primary_seed: 0x33,
+            secondary_seed: 0x44,
+            identity_seed: 9,
+            version_seed: 1,
+        };
+        let class = axond_fuzz::blob_secret_crypto(&input);
+        assert_eq!(class, expected, "blob crypto boundary {label}");
+        *crypto_classes.entry(class).or_default() += 1;
+        inputs += 1;
+    }
+    println!(
+        "blob_secret_crypto (pinned scenarios): {} scenarios, {} outcome classes: {}",
+        crypto_classes.values().sum::<usize>(),
+        crypto_classes.len(),
+        crypto_classes
             .iter()
             .map(|(class, count)| format!("{class}={count}"))
             .collect::<Vec<_>>()

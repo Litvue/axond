@@ -118,6 +118,22 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "blob_secret_envelope"
+path = "fuzz_targets/blob_secret_envelope.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob_secret_crypto"
+path = "fuzz_targets/blob_secret_crypto.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
 # Fuzzing wants optimized code with debug assertions and overflow checks on: a
 # release profile that silently wraps an arithmetic bug is a missed finding.
 [profile.release]

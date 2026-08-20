@@ -24,6 +24,7 @@ readme = "README.md"
 gateway-core = { path = "crates/gateway-core", version = "0.3.40" }
 gateway-transport = { path = "crates/gateway-transport", version = "0.3.40" }
 
+aes-kw = { version = "=0.3.1", default-features = false, features = ["zeroize"] }
 anyhow = "1"
 arc-swap = "1.7"
 async-trait = "0.1"
