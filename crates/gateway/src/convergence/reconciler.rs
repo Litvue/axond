@@ -50,7 +50,7 @@ use super::settings::ConvergenceSettings;
 use super::status::{Clock, Rejection, RevisionReport, RevisionStatus, SnapshotSource};
 use crate::backends::BackendFailure;
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
-use crate::desired_state::{LoadedRevision, RevisionId};
+use crate::desired_state::{FlatNamespaces, LoadedRevision, ResourceKind, RevisionId};
 use crate::policy::{ActivationRefusal, PolicyView};
 use crate::state::{AppState, ConfigSnapshot};
 use crate::telemetry;
@@ -915,6 +915,13 @@ impl Reconciler {
         let Some(revision) = restored else {
             return Err(Self::uncached(source));
         };
+        if credential_bearing_flat_v2(&revision) {
+            tracing::warn!(
+                revision = %revision.id(),
+                "the signed cache contains flat-v2 credentials; cold restoration is refused until an authenticated monotonic revision/tombstone floor exists"
+            );
+            return Err(Self::uncached(source));
+        }
         let started = self.clock.now();
         let id = self
             .publish(revision, SnapshotSource::LastKnownGood, started)
@@ -968,6 +975,20 @@ impl Reconciler {
         );
         reason
     }
+}
+
+fn credential_bearing_flat_v2(revision: &LoadedRevision) -> bool {
+    if !revision
+        .state()
+        .resources()
+        .any(|resource| resource.reference.kind == ResourceKind::Namespace)
+    {
+        return false;
+    }
+    FlatNamespaces::of(revision.state())
+        .expect("an assembled flat-v2 revision has already passed namespace validation")
+        .namespaces()
+        .any(|(_, namespace)| !namespace.credentials().is_empty())
 }
 
 /// A [`Clock`] that shares one implementation between the reconciler and the

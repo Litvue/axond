@@ -703,11 +703,15 @@ Backoff clears on the first success.
 
 ## During a control-plane outage
 
-A **new** replica normally compiles the durable head. If the control plane or
-SecretStore is unavailable, the encrypted compiled-serving sibling of the
-signed last-known-good cache can restore the last admitted snapshot instead.
-The signed desired-state file alone is intentionally insufficient: it contains
-references, not usable credential material.
+A **new** replica normally compiles the durable head. For the legacy state model,
+or for credential-free flat-v2 state, the encrypted compiled-serving sibling of
+the signed last-known-good cache can restore the last admitted snapshot when the
+control plane is unavailable. Credential-bearing flat-v2 state is deliberately
+ineligible for compiled-cache persistence and cold restoration until an
+authenticated monotonic revision/tombstone floor exists. The signed desired-state
+file alone is insufficient because it contains references, not usable credential
+material; refusing it also prevents an older authentic revision from reviving a
+credential withdrawn by a newer revision.
 
 ### The signed last-known-good cache
 
@@ -731,7 +735,10 @@ What to know about it operationally:
   envelopes and credential references. The separate `.serving` sibling is an
   authenticated AES-GCM envelope containing only the already-admitted material
   needed for cold recovery; it is not readable without the cache key and is
-  written only after publication.
+  written only after publication. This build does not write that sibling for a
+  credential-bearing flat-v2 snapshot, and refuses an authentic legacy sibling
+  that contains flat-v2 credential material. Credential-free flat-v2 snapshots
+  remain eligible.
 - **It may be stale.** A replica reports `source = last-known-good` exactly so
   this is visible. Once the control plane returns, the replica converges to
   desired state normally and stops reporting the cache as its source.

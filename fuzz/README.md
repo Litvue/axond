@@ -10,6 +10,7 @@ storage. This project fuzzes all five, on the parsers the process actually runs.
 | `config_toml` | `Config::from_toml_str` and the whole validation graph | Boot and every `SIGHUP` reload re-parse a file the gateway does not control |
 | `token_verify` | `axt1.` JWS decoding, key selection, signature, and every claim check | A minted token is the one credential an attacker can shape freely |
 | `credentials_query` | `GET /v1/credentials/status?namespaces=…` parsing | Hand-rolled percent-decoding, so malformed escapes, duplicate keys, empty values, and oversized inputs all land here |
+| `flat_v2_body` | Deployment, namespace, and inbound-grant v2 durable body decoding | Signed object-store and LKG hydration must distinguish malformed state from forward schema skew without panics or unbounded parsing |
 | `sse_decode` | `SseDecoder` on arbitrary bodies split at arbitrary chunk boundaries | A stream arrives in whatever pieces the network produced, and an event, a delimiter, or a character can straddle two of them |
 | `provider_stream` | The OpenAI, Foundry, and Anthropic stream decoders — translated and native | They interpret provider JSON mid-relay, where a panic loses a live response |
 | `provider_error` | `ProviderError::from_upstream`, `::transport`, and the classification behind them | An upstream failure body decides whether the gateway retries, fails over, or opens a circuit |
@@ -35,6 +36,22 @@ The properties each target asserts live in [`src/lib.rs`](./src/lib.rs) and
 refusal is a typed value the gateway could answer with, and what it accepts
 stays inside the bounds the request path relies on — including that a signature
 from one namespace's signer never verifies into another.
+
+The `flat_v2_body` smoke replay pins every committed filename to one exact
+semantic outcome through the same `flat_v2_body_target` entrypoint libFuzzer
+uses. The table is intentionally exhaustive in both directions, so adding,
+removing, or renaming a seed requires updating the asserted contract:
+
+| Seed | Expected outcome |
+| --- | --- |
+| `deployment-missing-field.json` | `incompatible` |
+| `deployment-unknown-field.json` | `incompatible` |
+| `deployment-unknown-variant.json` | `incompatible` |
+| `deployment-valid.json` | `accepted` |
+| `grant-semantic-invalid.json` | `invalid` |
+| `grant-valid.json` | `accepted` |
+| `namespace-valid.json` | `accepted` |
+| `namespace-wrong-schema-shape.json` | `incompatible` |
 
 The wire targets add what a relay depends on: the decoder never holds more than
 its limit and never retains a complete event, decoding never expands its input,

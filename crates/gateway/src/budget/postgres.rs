@@ -636,6 +636,9 @@ impl BudgetStore for PostgresBudget {
         let Some(governing) = self.settings.caps(POLICY_STORE, &key.namespace) else {
             return Admission::Denied(Denial::StoreUnavailable);
         };
+        let Some(caps) = governing.caps else {
+            return Admission::Allowed(Reservation::unheld());
+        };
         let reservation = Reservation {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
@@ -646,10 +649,7 @@ impl BudgetStore for PostgresBudget {
         // under the generation it is replacing. A denial drops the guard.
         let hold = PolicyHold::take(&self.settings.ceilings, reservation.generation);
         match self
-            .run(async |client| {
-                self.try_hold(client, key, &reservation, governing.caps)
-                    .await
-            })
+            .run(async |client| self.try_hold(client, key, &reservation, caps).await)
             .await
         {
             Ok(None) => {
@@ -674,7 +674,7 @@ impl BudgetStore for PostgresBudget {
                 &e,
                 Some(Uncertain {
                     hold,
-                    reservation_ttl: governing.caps.reservation_ttl,
+                    reservation_ttl: caps.reservation_ttl,
                 }),
             ),
         }

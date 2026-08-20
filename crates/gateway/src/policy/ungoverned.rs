@@ -53,7 +53,15 @@ pub(crate) fn denied(condition: Unenforceable, store: &'static str, namespace: &
 /// Every `axond.policy.store` a denial is reported under: the responsibility
 /// first, because two of them share a backend.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const STORES: &[&str] = &[BUDGET_REDIS, BUDGET_POSTGRES, RATE_LIMIT_REDIS];
+pub(crate) const STORES: &[&str] = &[
+    BUDGET_IN_MEMORY,
+    BUDGET_REDIS,
+    BUDGET_POSTGRES,
+    RATE_LIMIT_REDIS,
+];
+
+/// The spend store, when it is the per-replica in-memory backend.
+pub(crate) const BUDGET_IN_MEMORY: &str = "budget:in_memory";
 
 /// The spend store, when it is Redis.
 pub(crate) const BUDGET_REDIS: &str = "budget:redis";

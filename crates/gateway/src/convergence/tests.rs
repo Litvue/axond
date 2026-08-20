@@ -132,6 +132,45 @@ impl Replica {
         Self::build(store, "openai", Some(cache))
     }
 
+    /// A replica using the production v1/flat-v2 projection selector and a
+    /// fail-closed stateful bootstrap.
+    fn flat(store: &Arc<InMemoryControlPlane>, cache: Option<LastKnownGood>) -> Self {
+        let bootstrap = super::compile::testing::stateful_bootstrap();
+        let process_env = std::collections::HashMap::new();
+        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+        let state = AppState::new(
+            bootstrap.clone(),
+            &process_env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("the stateful bootstrap is safely unready");
+        let clock = ManualClock::new();
+        let secrets = super::secrets::testing::permissive();
+        let ledger = Arc::clone(secrets.ledger());
+        let compiler = Arc::new(RevisionCompiler::with_secrets(
+            bootstrap,
+            process_env,
+            StateModelProjection,
+            secrets,
+        ));
+        let reconciler = Arc::new(Reconciler::new(
+            Arc::clone(store) as Arc<dyn ControlPlaneStore>,
+            compiler,
+            Arc::new(state.clone()),
+            settings(),
+            cache,
+            Arc::new(clock.clone()),
+        ));
+        Self {
+            store: Arc::clone(store),
+            state,
+            clock,
+            reconciler,
+            ledger,
+        }
+    }
+
     /// A replica that has a cache to fall back to and a secret store that is
     /// down: the cold-boot case where the cache cannot rescue the boot.
     fn with_cache_and_unresolvable_secrets(
@@ -1141,6 +1180,52 @@ async fn a_revision_this_build_cannot_read_is_refused_as_an_incompatibility() {
     assert_eq!(replica.served_aliases(), serving);
 }
 
+/// ADR 0062 bodies take the same operational path as every other newer schema:
+/// hydration reports incompatibility, reconciliation keeps the active snapshot,
+/// and the reason never degrades to storage corruption.
+#[tokio::test]
+async fn a_newer_flat_namespace_schema_is_refused_as_an_incompatibility() {
+    let store = control_plane();
+    let first = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let replica = Replica::serving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let serving = replica.served_aliases();
+
+    let second = publish(
+        &store,
+        "flat-v2",
+        ExpectedRevision::Exactly(first),
+        fixtures::flat_namespace_state(),
+    )
+    .await;
+    store.rewrite_version_as_published(second, fixtures::incompatible_flat_namespace());
+
+    let outcome = replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Rejected { revision, reason }
+                if revision == Some(second) && reason == "incompatible"
+        ),
+        "{outcome:?}"
+    );
+    let report = replica.report();
+    assert_eq!(report.active, Some(first));
+    assert_eq!(report.desired, Some(second));
+    assert_eq!(replica.generation(), 1);
+    assert_eq!(replica.served_aliases(), serving);
+    assert_eq!(
+        report.last_rejection.expect("rejection is reported").reason,
+        "incompatible"
+    );
+}
+
 /// The pricing half of the same promise: a revision whose approved book this
 /// build cannot bill is refused whole, and the replica keeps billing at the
 /// prices it already converged onto rather than at none.
@@ -1390,6 +1475,188 @@ async fn a_replica_whose_control_plane_is_down_does_not_hot_loop() {
 
     let _ = stop.send(());
     task.await.expect("the loop stops");
+}
+
+/// Flat-v2 credentials deliberately have no cross-restart LKG in this wave.
+/// The signed desired-state sibling remains useful evidence, but it cannot be
+/// compiled into serving state while the control plane is unavailable because
+/// there is no monotonic revocation/tombstone floor to compare it against.
+#[tokio::test]
+async fn a_credential_bearing_flat_v2_signed_cache_is_not_a_cross_restart_lkg() {
+    let store = control_plane();
+    let first = publish(
+        &store,
+        "flat-credential-a",
+        ExpectedRevision::Empty,
+        fixtures::flat_namespace_state_with_active_credential(),
+    )
+    .await;
+    let path = cache_path("flat-credential-no-cross-restart");
+    let cache = LastKnownGood::new(&path, KEY).expect("a long enough key");
+    let warm = Replica::flat(&store, Some(cache));
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert_eq!(warm.report().active, Some(first));
+    assert!(
+        path.exists(),
+        "the signed desired-state record remains available"
+    );
+    assert!(
+        !LastKnownGood::new(&path, KEY)
+            .unwrap()
+            .compiled_path()
+            .exists(),
+        "new builds never persist credential-bearing flat-v2 compiled state"
+    );
+
+    store.set_unavailable(true);
+    let cold = Replica::flat(
+        &store,
+        Some(LastKnownGood::new(&path, KEY).expect("a long enough key")),
+    );
+    let error = cold
+        .reconciler
+        .bootstrap()
+        .await
+        .expect_err("the signed record cannot restore flat-v2 credentials");
+    assert!(
+        matches!(error, BootstrapError::Unavailable { .. }),
+        "{error}"
+    );
+    assert_eq!(cold.generation(), 0);
+    assert_eq!(cold.report().active, None);
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// A previous build may already have persisted revision A. If revision B
+/// tombstones its credential but replacing the compiled file fails, a restart
+/// must refuse A even though its envelope still authenticates.
+#[tokio::test]
+async fn a_stale_flat_v2_credential_cache_cannot_restore_after_a_tombstone_write_failure() {
+    let store = control_plane();
+    let first = publish(
+        &store,
+        "flat-credential-a",
+        ExpectedRevision::Empty,
+        fixtures::flat_namespace_state_with_active_credential(),
+    )
+    .await;
+    let path = cache_path("flat-credential-stale-after-tombstone");
+    let cache = LastKnownGood::new(&path, KEY).expect("a long enough key");
+    let warm = Replica::flat(
+        &store,
+        Some(LastKnownGood::new(&path, KEY).expect("a long enough key")),
+    );
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let old_bytes = cache
+        .encode_compiled_unchecked(&warm.state.config(), first)
+        .expect("the test models an authentic record written by the previous build");
+    cache
+        .write_compiled(&old_bytes)
+        .expect("revision A legacy compiled record writes");
+
+    let second = publish(
+        &store,
+        "flat-credential-tombstone-b",
+        ExpectedRevision::Exactly(first),
+        fixtures::flat_namespace_state_with_tombstoned_credential(),
+    )
+    .await;
+    let compiled_path = cache.compiled_path();
+    let compiled_temporary = compiled_path.with_file_name(format!(
+        "{}.tmp",
+        compiled_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("test cache filename is UTF-8")
+    ));
+    std::fs::create_dir(&compiled_temporary)
+        .expect("a directory at the atomic temporary path forces a deterministic write failure");
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert_eq!(warm.report().active, Some(second));
+    assert_eq!(
+        warm.generation(),
+        2,
+        "revision B is serving despite cache I/O failure"
+    );
+
+    let stale = cache
+        .load_compiled()
+        .expect("revision A's envelope remains authentic")
+        .expect("the stale compiled record remains on disk");
+    let error = match crate::state::ConfigSnapshot::from_cached_serving(
+        super::compile::testing::stateful_bootstrap(),
+        &std::collections::HashMap::new(),
+        stale,
+    ) {
+        Ok(_) => panic!("revision A restored after revision B tombstoned its credential"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("not eligible for cold restoration"),
+        "{error}"
+    );
+
+    // The signed sibling advanced to credential-free B, so a control-plane
+    // outage can recover B without ever serving stale A.
+    store.set_unavailable(true);
+    let cold = Replica::flat(
+        &store,
+        Some(LastKnownGood::new(&path, KEY).expect("a long enough key")),
+    );
+    assert_eq!(
+        cold.reconciler
+            .bootstrap()
+            .await
+            .expect("credential-free tombstone revision B is safe to restore"),
+        second
+    );
+    assert_eq!(cold.report().active, Some(second));
+
+    let _ = std::fs::remove_dir(compiled_temporary);
+    let _ = std::fs::remove_file(cache.compiled_path());
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_credential_free_flat_v2_cache_remains_eligible_for_cold_restoration() {
+    let store = control_plane();
+    let published = publish(
+        &store,
+        "flat-credential-free",
+        ExpectedRevision::Empty,
+        fixtures::flat_namespace_state(),
+    )
+    .await;
+    let path = cache_path("flat-credential-free-cold-restore");
+    let warm = Replica::flat(
+        &store,
+        Some(LastKnownGood::new(&path, KEY).expect("a long enough key")),
+    );
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(
+        LastKnownGood::new(&path, KEY).unwrap().compiled_exists(),
+        "credential-free flat-v2 compiled state remains persistable"
+    );
+    store.set_unavailable(true);
+    let cold = Replica::flat(
+        &store,
+        Some(LastKnownGood::new(&path, KEY).expect("a long enough key")),
+    );
+    assert_eq!(cold.reconciler.bootstrap().await.unwrap(), published);
+    assert_eq!(cold.report().active, Some(published));
+
+    let cache = LastKnownGood::new(&path, KEY).unwrap();
+    let _ = std::fs::remove_file(cache.compiled_path());
+    let _ = std::fs::remove_file(path);
 }
 
 /// A replica that boots while the control plane is unreachable serves its signed

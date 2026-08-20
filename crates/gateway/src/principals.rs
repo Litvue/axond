@@ -123,6 +123,7 @@ pub struct InboundKey {
     pub max_request_microdollars: Option<u64>,
     pub can_mint: bool,
     pub jti: Option<String>,
+    pub namespace_grant: Option<NamespaceGrant>,
 }
 
 impl InboundKey {
@@ -132,7 +133,10 @@ impl InboundKey {
     /// legacy config storage independent from ADR 0062's public URL contract;
     /// malformed legacy names fail closed when used on a canonical route.
     pub fn namespace_grant(&self) -> Result<NamespaceGrant, InvalidNamespaceId> {
-        NamespaceId::parse(&self.namespace).map(NamespaceGrant::one)
+        self.namespace_grant.clone().map_or_else(
+            || NamespaceId::parse(&self.namespace).map(NamespaceGrant::one),
+            Ok,
+        )
     }
 
     /// Whether this principal holds the operator's own authority over the whole
@@ -718,7 +722,7 @@ impl PrincipalStore for TokenVerifier {
             ));
         }
         Ok(Some(InboundKey {
-            namespace,
+            namespace: namespace.clone(),
             subject,
             authority: PrincipalAuthority::MintedToken,
             signer_kid: Some(verifier.kid.clone()),
@@ -728,6 +732,11 @@ impl PrincipalStore for TokenVerifier {
             // Token claims can never confer the ability to mint another token.
             can_mint: false,
             jti: claims.jti,
+            // Legacy minted tokens may carry namespace labels that predate the
+            // canonical one-segment ADR 0062 grammar. Keep verification lazy:
+            // the namespaced route parses and intersects this label, while
+            // legacy v1 routes continue to accept the token exactly as minted.
+            namespace_grant: None,
         }))
     }
 }
@@ -761,37 +770,35 @@ pub struct ConfigPrincipals {
 /// separate shape-owning store so a malformed `axw1.` credential cannot fall
 /// through to a different authority, just as minted `axt1.` tokens cannot.
 pub struct ProjectedPrincipals {
-    entries: Arc<[ProjectedPrincipalEntry]>,
-}
-
-struct ProjectedPrincipalEntry {
-    digest: crate::desired_state::Checksum,
-    caller: InboundKey,
+    entries: Arc<std::collections::HashMap<crate::desired_state::Checksum, InboundKey>>,
 }
 
 impl ProjectedPrincipals {
     pub(crate) fn new(projected: Vec<ProjectedPrincipal>) -> Self {
         let entries = projected
             .into_iter()
-            .map(|principal| ProjectedPrincipalEntry {
-                digest: principal.digest,
-                caller: InboundKey {
-                    namespace: principal.namespace,
-                    subject: principal.subject,
-                    authority: PrincipalAuthority::WorkloadKey,
-                    signer_kid: None,
-                    // A durable workload key is an explicit inference
-                    // credential for its projected namespace. Capabilities are
-                    // not an administrative role: the key is namespace-bound
-                    // and does not acquire token minting authority.
-                    scope: None,
-                    alias_scope: None,
-                    max_request_microdollars: None,
-                    can_mint: false,
-                    jti: None,
-                },
+            .map(|principal| {
+                (
+                    principal.digest,
+                    InboundKey {
+                        namespace: principal.namespace,
+                        subject: principal.subject,
+                        authority: PrincipalAuthority::WorkloadKey,
+                        signer_kid: None,
+                        // A durable workload key is an explicit inference
+                        // credential for its projected namespace. Capabilities are
+                        // not an administrative role: the key is namespace-bound
+                        // and does not acquire token minting authority.
+                        scope: None,
+                        alias_scope: None,
+                        max_request_microdollars: None,
+                        can_mint: false,
+                        jti: None,
+                        namespace_grant: principal.grant,
+                    },
+                )
             })
-            .collect::<Vec<_>>()
+            .collect::<std::collections::HashMap<_, _>>()
             .into();
         Self { entries }
     }
@@ -823,11 +830,7 @@ impl PrincipalStore for ProjectedPrincipals {
             return Ok(None);
         };
         let digest = key.digest();
-        Ok(self
-            .entries
-            .iter()
-            .find(|entry| constant_time_eq(entry.digest.as_bytes(), digest.as_bytes()))
-            .map(|entry| entry.caller.clone()))
+        Ok(self.entries.get(&digest).cloned())
     }
 }
 
@@ -1053,6 +1056,7 @@ mod tests {
                 max_request_microdollars: None,
                 can_mint: false,
                 jti: None,
+                namespace_grant: None,
             },
         }]))
     }
@@ -1358,6 +1362,54 @@ max_ttl = "15m"
         assert_eq!(principal.subject, "caller-1");
         assert_eq!(principal.signer_kid.as_deref(), Some("ed-test"));
         assert_eq!(principal.max_request_microdollars, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_minted_namespace_labels_are_parsed_only_by_namespaced_routes() {
+        for namespace in ["acme/core", "team.a"] {
+            let config = Config::from_toml_str(&format!(
+                r#"
+[[namespace]]
+id = "{namespace}"
+default = true
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "{namespace}"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "ed-test"
+alg = "EdDSA"
+env = "ED_PUBLIC"
+namespaces = ["{namespace}"]
+max_ttl = "15m"
+"#,
+            ))
+            .expect("legacy v1 namespace config remains valid");
+            let env = HashMap::from([
+                ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+                ("ED_PUBLIC".to_owned(), BASE64.encode(ED_PUBLIC_RAW)),
+            ]);
+            let verifier = TokenVerifier::build(&config, &env)
+                .unwrap()
+                .expect("verifier");
+            let principal = verifier
+                .resolve(&Presented {
+                    credential: &signed_token(valid_claims_for(namespace)),
+                })
+                .await
+                .expect("legacy token authenticates")
+                .expect("principal");
+            assert_eq!(principal.namespace, namespace);
+            assert!(principal.namespace_grant.is_none());
+            assert!(
+                principal.namespace_grant().is_err(),
+                "only the canonical namespaced route rejects the legacy label"
+            );
+        }
     }
 
     #[tokio::test]

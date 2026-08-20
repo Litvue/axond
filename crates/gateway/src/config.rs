@@ -27,7 +27,9 @@ use crate::backends::catalog_refresh::{Bootstrap, RefreshSchedule};
 use crate::backends::catalog_store::postgres::CatalogStoreSettings;
 use crate::backends::control_plane::ControlPlaneBackend;
 use crate::convergence::backoff::BackoffPolicy;
-use crate::desired_state::policy::{PolicyBody, PolicyGeneration};
+use crate::desired_state::policy::{
+    BufferedResponseRoute, ContentMiddlewareRegistration, PolicyBody, PolicyGeneration,
+};
 use crate::desired_state::{ProjectId, SecretRef, TenantId};
 use crate::principals::Capability;
 use crate::usage::journal::{Capacity, CapacityPolicy, ConsumerId};
@@ -758,17 +760,58 @@ pub struct Namespace {
     #[serde(skip)]
     #[allow(dead_code)]
     pub project: Option<ProjectIdentity>,
-    /// The policy document governing this namespace, as a revision published it;
-    /// `None` when the bootstrap file's limits govern it (#150).
+    /// The optional exact distributed spend/concurrency policy governing this
+    /// namespace, as a revision published it. `None` is valid for a flat-v2
+    /// namespace that requests static policy only; bootstrap-file limits govern
+    /// file-declared namespaces (#150).
     ///
     /// Never read from TOML, for the same reason [`Namespace::project`] is not: a
     /// file cannot claim a generation, and the values it *can* state live in
     /// `[budget]` and `[rate_limit]`.
     #[serde(skip)]
     pub policy: Option<NamespacePolicy>,
+    /// Static namespace policy projected from ADR 0062 independently of any
+    /// distributed spend/concurrency request.
+    #[serde(skip)]
+    pub static_policy: Option<NamespaceStaticPolicy>,
 }
 
-/// A published policy document, and the generation it is enforced under.
+impl Namespace {
+    pub fn content_middleware(&self) -> &[ContentMiddlewareRegistration] {
+        self.static_policy.as_ref().map_or_else(
+            || {
+                self.policy
+                    .as_ref()
+                    .map_or(&[] as &[ContentMiddlewareRegistration], |policy| {
+                        policy.body.content_middleware()
+                    })
+            },
+            |policy| policy.content_middleware.as_slice(),
+        )
+    }
+
+    pub fn buffered_response_routes(&self) -> &[BufferedResponseRoute] {
+        self.static_policy.as_ref().map_or_else(
+            || {
+                self.policy
+                    .as_ref()
+                    .map_or(&[] as &[BufferedResponseRoute], |policy| {
+                        policy.body.buffered_response_routes()
+                    })
+            },
+            |policy| policy.buffered_response_routes.as_slice(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NamespaceStaticPolicy {
+    pub content_middleware: Vec<ContentMiddlewareRegistration>,
+    pub buffered_response_routes: Vec<BufferedResponseRoute>,
+}
+
+/// A published exact distributed policy document, and the generation it is
+/// enforced under.
 ///
 /// Carried on the namespace rather than resolved per request so that one
 /// compiled snapshot answers "what governs this namespace, under which
@@ -2403,6 +2446,7 @@ pub(crate) struct ProjectedPrincipal {
     pub(crate) namespace: String,
     pub(crate) subject: String,
     pub(crate) digest: crate::desired_state::Checksum,
+    pub(crate) grant: Option<crate::namespace::NamespaceGrant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2757,7 +2801,14 @@ impl Config {
         // unreachable configuration.
         let mut owned: HashSet<(Option<&str>, &str)> = HashSet::new();
 
+        let mut projected_digests = HashSet::new();
         for principal in &self.projected_principals {
+            if !projected_digests.insert(principal.digest) {
+                return Err(ConfigError::Invalid(format!(
+                    "projected inbound principal digest {} is declared more than once",
+                    principal.digest
+                )));
+            }
             if principal.subject.trim().is_empty() {
                 return Err(ConfigError::Invalid(
                     "a projected inbound principal must have a non-empty subject".into(),
@@ -2768,6 +2819,20 @@ impl Config {
                     "projected inbound principal `{}` references undefined namespace `{}`",
                     principal.subject, principal.namespace
                 )));
+            }
+            if let Some(granted) = principal
+                .grant
+                .as_ref()
+                .and_then(crate::namespace::NamespaceGrant::namespaces)
+            {
+                for namespace in granted {
+                    if !namespaces.contains_key(namespace.as_str()) {
+                        return Err(ConfigError::Invalid(format!(
+                            "projected inbound principal `{}` grants undefined namespace `{namespace}`",
+                            principal.subject
+                        )));
+                    }
+                }
             }
         }
         for model in &self.model {
@@ -4705,6 +4770,7 @@ audience = "test"
                     allow_platform_fallback: false,
                     project: Some(projected(index as u64 + 1)),
                     policy: None,
+                    static_policy: None,
                 }));
             config.validate_compiled()
         };
@@ -4753,6 +4819,7 @@ audience = "test"
                 allow_platform_fallback: false,
                 project: None,
                 policy: None,
+                static_policy: None,
             }));
         declared
             .validate_compiled()
@@ -6055,11 +6122,13 @@ dsn_env = "AXOND_REDIS_URL"
             allow_platform_fallback: false,
             project: None,
             policy: None,
+            static_policy: None,
         });
         config.projected_principals.push(ProjectedPrincipal {
             namespace: "platform".to_owned(),
             subject: "workload".to_owned(),
             digest: crate::desired_state::Checksum::of(b"axw1.dddddd"),
+            grant: None,
         });
         config
             .validate_compiled()

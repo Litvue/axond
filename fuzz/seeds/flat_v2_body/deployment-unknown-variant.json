@@ -1,0 +1,1 @@
+D{"schema":"axond.deployment.v2","providers":[{"id":"shared","kind":"future-provider","base_url":"https://provider.example/v1"}],"catalogue":[],"middleware":[],"trust":[],"secrets":[]}

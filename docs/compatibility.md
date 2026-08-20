@@ -435,22 +435,24 @@ in `/namespaces/{namespace}/v1`; Anthropic clients that append `/v1/messages`
 use one ending in `/namespaces/{namespace}`. Redirects are not a migration
 mechanism for authenticated or streaming `POST` requests.
 
-The first runtime slice implements the canonical routes and checks each path
-namespace against the current static-key or `axt1` token's one-namespace grant.
+The runtime implements the canonical routes and checks each path namespace
+against its authenticated grant. Existing static keys and `axt1` tokens retain
+one-namespace grants; v2 desired state can project digest-backed workload grants
+over one namespace, a bounded set, or all namespaces.
 Stateless mode also retains the legacy direct `/v1/*` mount by default for
 compatibility; it dispatches directly and never redirects. Stateful serving
 does not mount that alias and therefore never infers an inference namespace.
-Making the stateless alias explicitly configurable/opt-in, adding set/all
-namespace token grants, and scheduling the alias's removal remain follow-up
-work. PostgreSQL configuration remains readable until the offline
+Making the stateless alias explicitly configurable/opt-in, extending signed
+token claims beyond one namespace, and scheduling the alias's removal remain
+follow-up work. PostgreSQL configuration remains readable until the offline
 PostgreSQL-to-blob export and verification path has shipped for one release;
 there is no dual-write mode.
 
-Typed namespace identity, path selection, and authorization against existing
-one-namespace credentials are now runtime contracts. Blob publication, flat
-namespace desired-state projection, set/all grants, configurable legacy aliases,
-migration tooling, and topology qualification remain migration commitments. The
-complete sequence and qualification reset are in the
+Typed namespace identity, path selection, complete flat namespace projection,
+and single/set/all digest-backed workload grants are now runtime contracts. Blob
+publication/runtime wiring, configurable legacy aliases, signed-token grant
+expansion, migration tooling, and topology qualification remain migration
+commitments. The complete sequence and qualification reset are in the
 [namespace control-plane migration plan](./maintainers/namespace-control-plane-migration.md).
 
 ## Supported releases and who owns each matrix

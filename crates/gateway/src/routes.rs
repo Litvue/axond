@@ -1383,13 +1383,7 @@ fn stream_delivery(
     };
     let enabled = cfg
         .namespace(namespace)
-        .and_then(|namespace| namespace.policy.as_ref())
-        .is_some_and(|policy| {
-            policy
-                .body
-                .buffered_response_routes()
-                .contains(&policy_route)
-        });
+        .is_some_and(|namespace| namespace.buffered_response_routes().contains(&policy_route));
     if enabled {
         return Ok(if mutates_response {
             StreamDelivery::PolicyBuffered
@@ -3511,6 +3505,7 @@ mod tests {
             max_request_microdollars: None,
             can_mint: false,
             jti: None,
+            namespace_grant: None,
         };
         let args = |price| RecordArgs {
             identity: &identity,
@@ -6182,6 +6177,7 @@ min_iat = {}
             max_request_microdollars: None,
             can_mint: false,
             jti: None,
+            namespace_grant: None,
         };
         let response = list_models(Extension(snapshot), Extension(caller))
             .await
@@ -6440,6 +6436,7 @@ targets = [{ provider = "openai", model = "o3", price = { input_microdollars_per
                     max_request_microdollars: None,
                     can_mint: false,
                     jti: None,
+                    namespace_grant: None,
                 },
             )
             .await
@@ -9333,6 +9330,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             max_request_microdollars: Some(50),
             can_mint: false,
             jti: None,
+            namespace_grant: None,
         };
         let body = json!({
             "model": "gpt-4o",
@@ -9925,6 +9923,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             max_request_microdollars: Some(1),
             can_mint: false,
             jti: None,
+            namespace_grant: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 
@@ -9965,6 +9964,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             max_request_microdollars: Some(10_000),
             can_mint: false,
             jti: None,
+            namespace_grant: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 

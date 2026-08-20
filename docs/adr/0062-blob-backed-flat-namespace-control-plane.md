@@ -4,13 +4,16 @@ Date: 2026-08-20
 
 ## Status
 
-Accepted; implementation in progress. The provider-neutral object-store and
-authenticated publication domain contracts are implemented, as are typed
-namespace identity, canonical namespace-prefixed inference routes, and
-authorization against existing one-namespace static/token grants. Runtime
-convergence, set/all grant projection, blob-backed secret resolution, migration,
-and topology qualification remain open; blob-backed serving remains fail-closed
-until those slices land.
+Accepted; implementation in progress. Typed namespace identity, canonical
+namespace-prefixed inference routes, complete flat namespace desired-state
+resources, deployment-scoped single/set/all workload grants, the
+provider-neutral object-store contract, and authenticated blob publication
+contracts now compile into recoverable serving snapshots. Deployment resources
+carry a signed secret index, static policy compiles without a coordination
+backend, and exact shared caps remain explicit. Runtime convergence, blob-backed
+secret resolution, administrative trust activation, migration, and topology
+qualification remain open; blob-backed serving remains fail-closed until those
+slices land.
 
 Supersedes the PostgreSQL-only stateful control plane and the durable
 tenant/project/workload-principal hierarchy selected by
@@ -244,13 +247,20 @@ snapshot for their whole lifetime.
 
 Warm replicas keep serving during an object-store outage. Administration and
 convergence pause. A cold replica may restore an authenticated local
-last-known-good snapshot; without either object storage or a valid local cache
-it remains healthy-but-unready and serves no inference.
+last-known-good snapshot only when that snapshot contains no flat-v2 provider
+credentials. Credential-bearing flat-v2 snapshots deliberately do not cross a
+restart until the cache is checked against an authenticated monotonic
+revision/tombstone floor; otherwise a stale but authentic cache could resurrect
+material revoked by a newer revision whose cache write failed. Without object
+storage or an eligible local cache, the replica remains healthy-but-unready and
+serves no inference.
 
 The optional local cache is a recovery copy, never the desired-state authority.
 It is not an additional external service and may use a VM disk or per-replica
 persistent volume. A deployment that does not retain it makes no cold-start
-outage claim.
+outage claim. This projection slice retains cold recovery for credential-free
+flat-v2 state; credential-bearing recovery is a later integration gate, not a
+claim inferred from the cache format alone.
 
 ### Secrets remain encrypted and off the request path
 
@@ -259,6 +269,16 @@ manifest, audit entry, log, or administrative response. The minimal deployment
 receives a bootstrap key from an environment variable or mounted secret and
 uses per-version envelope encryption bound to the deployment, namespace owner,
 and exact secret reference. A KMS or external secret manager is optional.
+
+The signed deployment resource is authoritative for non-secret secret metadata.
+Each index entry binds an owner namespace, exact `SecretRef` and version,
+ciphertext digest, and lifecycle state. A namespace credential is valid only
+when that exact active entry exists and names the same namespace. Two
+credentials in one namespace may share an exact reference; an exact reference
+cannot have two index rows, and versions of one secret cannot move between
+namespace owners. Resolution receives this complete typed binding rather than
+an ownerless reference. Only the validated flat-state index can mint the opaque
+request consumed by resolution; raw request construction is unavailable.
 
 The native v2 object is a deterministic canonical-CBOR fixed array containing
 only schema `2`, scheme `aes256-kw.aes256-gcm.envelope.v2`, stable KEK id, RFC
@@ -310,7 +330,14 @@ material is owned and zeroized with the compiled snapshot as required by
 Object storage does not implement distributed counters or transactional
 request journaling. The blob-only deployment supports static namespace policy,
 per-replica admission, revisioned token epochs, and usage attribution, but not
-an implied exact fleet-wide counter.
+an implied exact fleet-wide counter. A namespace therefore carries static
+policy independently of an optional exact-enforcement block. Omitting exact
+enforcement activates on the blob-only topology, even when another namespace
+in the same process uses an optional shared exact backend; the shared budget and
+lease stores bypass that namespace rather than treating its absent document as
+an ungoverned failure. Requesting exact spend and concurrency caps preserves
+the existing fail-closed backend and storage-layout checks and is refused unless
+configured shared backends enforce every value for that exact namespace.
 
 The following remain optional responsibility-specific backends:
 
@@ -324,6 +351,12 @@ The following remain optional responsibility-specific backends:
 Selecting one of those capabilities raises only that responsibility's tier and
 request-path availability coupling. It does not make PostgreSQL or Redis a
 requirement of stateful namespace management.
+
+Deployment-scoped administrative trust remains part of the target authority,
+but it is security state and cannot be accepted as inert configuration. Until
+one snapshot can activate trust for both administrative authentication and
+flat-namespace authorization and recover it through LKG atomically, this build
+rejects every nonempty durable trust list.
 
 ### State tier
 

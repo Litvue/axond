@@ -572,6 +572,8 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
         ValidationError::TenantScopedDependency { from, .. } => {
             ("tenant_scoped_dependency", Some(*from))
         }
+        ValidationError::MixedStateModels => ("mixed_state_models", None),
+        ValidationError::Namespace(_) => ("flat_namespace", None),
         ValidationError::Tenancy(_) => ("tenancy", None),
         // #243's credential records validate by their own rules; the resource is
         // named by the inner error's message, and the material never is.

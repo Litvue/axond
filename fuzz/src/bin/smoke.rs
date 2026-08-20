@@ -65,6 +65,20 @@ const MINIMUM_RESIGNED_CLASSES: usize = 10;
 /// [`EXPECTED_CATALOG_CLASSES`] pins which ones.
 const MINIMUM_CATALOG_EDIT_CLASSES: usize = 6;
 
+/// Every committed flat-v2 body seed and the semantic class it exists to pin.
+/// The guard below requires an exact filename match in both directions: adding,
+/// deleting, or renaming a seed requires an explicit decision here.
+const EXPECTED_FLAT_V2_SEED_CLASSES: &[(&str, &str)] = &[
+    ("deployment-missing-field.json", "incompatible"),
+    ("deployment-unknown-field.json", "incompatible"),
+    ("deployment-unknown-variant.json", "incompatible"),
+    ("deployment-valid.json", "accepted"),
+    ("grant-semantic-invalid.json", "invalid"),
+    ("grant-valid.json", "accepted"),
+    ("namespace-valid.json", "accepted"),
+    ("namespace-wrong-schema-shape.json", "incompatible"),
+];
+
 #[global_allocator]
 static ALLOCATOR: Capped = Capped;
 
@@ -122,6 +136,11 @@ const TARGETS: &[Target] = &[
         name: "credentials_query",
         run: replay_credentials_query,
         minimum_classes: 4,
+    },
+    Target {
+        name: "flat_v2_body",
+        run: replay_flat_v2_body,
+        minimum_classes: 3,
     },
     Target {
         // Below what the corpus reaches today (8), because part of that count
@@ -271,6 +290,10 @@ fn replay_config_toml(data: &[u8]) -> Vec<&'static str> {
 
 fn replay_credentials_query(data: &[u8]) -> Vec<&'static str> {
     vec![axond_fuzz::credentials_query(data)]
+}
+
+fn replay_flat_v2_body(data: &[u8]) -> Vec<&'static str> {
+    vec![axond_fuzz::flat_v2_body_target(data)]
 }
 
 fn replay_blob_secret_envelope(data: &[u8]) -> Vec<&'static str> {
@@ -1183,6 +1206,11 @@ fn main() {
     // input carrying it, not a decoder disclosing it.
     axond_fuzz::assert_disclosure_check_survives_escaping();
     println!("provider_error: an escaped canary is read as the input that carried it");
+    assert_exact_seed_outcomes(
+        "flat_v2_body",
+        EXPECTED_FLAT_V2_SEED_CLASSES,
+        replay_flat_v2_body,
+    );
     assert_exact_seed_outcomes(
         "blob_secret_envelope",
         EXPECTED_BLOB_ENVELOPE_SEEDS,

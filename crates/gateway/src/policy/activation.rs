@@ -595,7 +595,7 @@ fn fenced(active: PolicyGeneration, candidate: PolicyGeneration) -> String {
 mod tests {
     use super::*;
     use crate::config::NamespacePolicy;
-    use crate::desired_state::fixtures::tenant_id;
+    use crate::desired_state::fixtures::{resource_id, tenant_id};
     use crate::policy::fixtures::{body, detailed, generation, stored_zero_cap};
     use crate::policy::view::tests::{governed, stateful_config, stateless_config};
 
@@ -632,6 +632,30 @@ mod tests {
         let activation = plan(&empty(), &view(&document, 1), shared()).expect("enforceable");
         assert_eq!(activation.live(), [scope()]);
         assert!(activation.draining().is_empty());
+    }
+
+    #[test]
+    fn namespace_scoped_documents_use_backend_layout_and_drain_checks() {
+        let namespace_scope = PolicyScope::Namespace(resource_id(91));
+        let first = detailed(namespace_scope, 1, 1_000, None, 300, 8, 60, 0);
+        let lowered = detailed(namespace_scope, 2, 100, None, 300, 4, 60, 0);
+
+        let unsupported = plan(
+            &empty(),
+            &view(&first, 1),
+            BackendSupport::of(&stateful_config()),
+        )
+        .expect_err("namespace policy needs the same shared backends as v1");
+        assert!(matches!(unsupported, ActivationRefusal::Unsupported { .. }));
+
+        let activation = plan(&view(&first, 1), &view(&lowered, 2), shared())
+            .expect("a supported tightening activates with a drain");
+        assert_eq!(activation.draining().len(), 1);
+
+        let with_scope_cap = detailed(namespace_scope, 3, 100, Some(10_000), 300, 4, 60, 0);
+        let migration = plan(&view(&lowered, 2), &view(&with_scope_cap, 3), shared())
+            .expect_err("changing the durable scope layout requires migration");
+        assert!(matches!(migration, ActivationRefusal::Migration { .. }));
     }
 
     #[test]
@@ -767,6 +791,77 @@ mod tests {
     }
 
     #[test]
+    fn flat_static_policy_needs_no_shared_backend_but_exact_caps_still_do() {
+        let mut blob_only = stateful_config();
+        blob_only.budget.backend = BudgetBackend::None;
+        blob_only.budget.dsn_env = None;
+        blob_only.namespace.push(crate::config::Namespace {
+            id: "acme".to_owned(),
+            default: true,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+            static_policy: Some(crate::config::NamespaceStaticPolicy::default()),
+        });
+        let support = BackendSupport::of(&blob_only);
+        plan(&empty(), &PolicyView::of(&blob_only), support)
+            .expect("static flat-v2 policy activates in a blob-only deployment");
+        assert!(
+            PolicyView::of(&blob_only).policy("acme").budget.is_none(),
+            "absence of exact caps must not fabricate per-replica enforcement"
+        );
+
+        let exact = detailed(
+            PolicyScope::Namespace(resource_id(91)),
+            1,
+            1_000,
+            None,
+            300,
+            8,
+            60,
+            0,
+        );
+        blob_only.namespace[0].policy = Some(NamespacePolicy {
+            generation: generation(&exact, 1),
+            body: exact,
+        });
+        let refusal = plan(&empty(), &PolicyView::of(&blob_only), support)
+            .expect_err("requested exact caps fail closed without shared backends");
+        assert_eq!(refusal.reason(), "unsupported");
+    }
+
+    #[test]
+    fn mixed_flat_static_only_and_exact_namespaces_use_shared_backends_selectively() {
+        let mut mixed = stateful_config();
+        mixed.rate_limit.backend = RateLimitBackend::Redis;
+        mixed.rate_limit.dsn_env = Some("GW_RATE_LIMIT_REDIS".to_owned());
+        mixed.namespace.push(crate::config::Namespace {
+            id: "static-only".to_owned(),
+            default: true,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+            static_policy: Some(crate::config::NamespaceStaticPolicy::default()),
+        });
+        let exact = body(PolicyScope::Namespace(resource_id(92)), 1, 1_000);
+        mixed.namespace.push(crate::config::Namespace {
+            id: "exact".to_owned(),
+            default: false,
+            allow_platform_fallback: false,
+            project: None,
+            policy: Some(NamespacePolicy {
+                body: exact.clone(),
+                generation: generation(&exact, 1),
+            }),
+            static_policy: Some(crate::config::NamespaceStaticPolicy::default()),
+        });
+
+        let activation = plan(&empty(), &PolicyView::of(&mixed), shared())
+            .expect("a shared backend is required only by the exact namespace");
+        assert_eq!(activation.live(), [PolicyScope::Namespace(resource_id(92))]);
+    }
+
+    #[test]
     fn a_document_withdrawn_from_a_namespace_that_is_still_served_is_refused() {
         let document = body(scope(), 1, 1_000);
         let mut without = stateful_config();
@@ -776,6 +871,7 @@ mod tests {
             allow_platform_fallback: false,
             project: None,
             policy: None,
+            static_policy: None,
         });
         let refusal = plan(&view(&document, 1), &PolicyView::of(&without), shared())
             .expect_err("a served namespace cannot lose its policy");
@@ -1057,6 +1153,7 @@ mod tests {
             allow_platform_fallback: false,
             project: None,
             policy: None,
+            static_policy: None,
         });
 
         plan(&empty(), &PolicyView::of(&candidate), shared())

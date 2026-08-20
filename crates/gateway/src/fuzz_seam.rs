@@ -71,6 +71,10 @@ use crate::backends::models_dev::{
 };
 use crate::budget::NoBudget;
 use crate::config::{Config, Model};
+use crate::desired_state::{
+    CanonicalValue, DeploymentBody, InboundGrantBody, NamespaceBody, ResourceBody, ResourceId,
+    ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, Slug, Uuid7,
+};
 use crate::mint::{MintAlgorithm, MintRequest};
 use crate::principals::{
     Presented, PrincipalStore, PrincipalStoreError, TokenVerificationError, TokenVerifier,
@@ -309,6 +313,61 @@ pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection> {
         }),
         Err(config::ConfigError::Load(message)) => Err(Rejection::Load(message)),
         Err(config::ConfigError::Invalid(message)) => Err(Rejection::Invalid(message)),
+    }
+}
+
+/// Parse one durable ADR 0062 body from untrusted JSON.
+///
+/// The first byte selects deployment (`D`), namespace (`N`), or inbound grant
+/// (`G`); the remaining bytes are the canonical body represented as JSON. The
+/// outcome classes are intentionally bounded for seed-replay coverage.
+pub fn flat_v2_body(input: &[u8]) -> &'static str {
+    let Some((&selector, body)) = input.split_first() else {
+        return "empty";
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return "invalid_json";
+    };
+    let namespace_deployment = (selector == b'N')
+        .then(|| {
+            let id = ResourceId::parse(json.get("deployment_id")?.as_str()?).ok()?;
+            let version = ResourceVersionNumber::new(json.get("deployment_version")?.as_u64()?)?;
+            Some(ResourceRef::new(ResourceKind::Deployment, id, version))
+        })
+        .flatten();
+    let Ok(body) = CanonicalValue::try_from_json(&json) else {
+        return "noncanonical_json";
+    };
+    let resource_id =
+        ResourceId::new(Uuid7::from_parts(1, 0, 1).expect("fixed fuzz resource id is valid"));
+    let kind = match selector {
+        b'D' => ResourceKind::Deployment,
+        b'N' => ResourceKind::Namespace,
+        b'G' => ResourceKind::InboundGrant,
+        _ => return "unknown_selector",
+    };
+    let mut resource = ResourceVersion::new(
+        ResourceRef::new(kind, resource_id, ResourceVersionNumber::FIRST),
+        ResourceScope::Deployment,
+        Slug::parse("fuzz-body").expect("fixed fuzz slug is valid"),
+        ResourceBody::Inline(body),
+    );
+    if kind == ResourceKind::Namespace {
+        let Some(deployment) = namespace_deployment else {
+            return "invalid";
+        };
+        resource = resource.depending_on([deployment]);
+    }
+    let outcome = match kind {
+        ResourceKind::Deployment => DeploymentBody::read(&resource).map(|_| ()),
+        ResourceKind::Namespace => NamespaceBody::read(&resource).map(|_| ()),
+        ResourceKind::InboundGrant => InboundGrantBody::read(&resource).map(|_| ()),
+        _ => unreachable!(),
+    };
+    match outcome {
+        Ok(()) => "accepted",
+        Err(error) if error.is_incompatible() => "incompatible",
+        Err(_) => "invalid",
     }
 }
 

@@ -743,6 +743,7 @@ impl fmt::Display for PolicyEpoch {
 /// deployment-wide limits are the bootstrap file's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PolicyScope {
+    Namespace(ResourceId),
     Tenant(TenantId),
     Project {
         tenant: TenantId,
@@ -751,15 +752,16 @@ pub enum PolicyScope {
 }
 
 impl PolicyScope {
-    pub const fn tenant(self) -> TenantId {
+    pub const fn tenant(self) -> Option<TenantId> {
         match self {
-            Self::Tenant(tenant) | Self::Project { tenant, .. } => tenant,
+            Self::Namespace(_) => None,
+            Self::Tenant(tenant) | Self::Project { tenant, .. } => Some(tenant),
         }
     }
 
     pub const fn project(self) -> Option<ProjectId> {
         match self {
-            Self::Tenant(_) => None,
+            Self::Namespace(_) | Self::Tenant(_) => None,
             Self::Project { project, .. } => Some(project),
         }
     }
@@ -770,6 +772,7 @@ impl PolicyScope {
     /// are one fact rather than two that could disagree.
     pub const fn resource_scope(self) -> ResourceScope {
         match self {
+            Self::Namespace(_) => ResourceScope::Deployment,
             Self::Tenant(tenant) => ResourceScope::Tenant(tenant),
             Self::Project { tenant, project } => ResourceScope::Project { tenant, project },
         }
@@ -783,6 +786,7 @@ impl PolicyScope {
     /// within one revision.
     pub const fn resource_id(self) -> ResourceId {
         match self {
+            Self::Namespace(namespace) => namespace,
             Self::Tenant(tenant) => ResourceId::new(tenant.uuid()),
             Self::Project { project, .. } => ResourceId::new(project.uuid()),
         }
@@ -792,7 +796,7 @@ impl PolicyScope {
     /// tenant, and nothing above a tenant.
     pub const fn fallback(self) -> Option<Self> {
         match self {
-            Self::Tenant(_) => None,
+            Self::Namespace(_) | Self::Tenant(_) => None,
             Self::Project { tenant, .. } => Some(Self::Tenant(tenant)),
         }
     }
@@ -801,6 +805,7 @@ impl PolicyScope {
 impl fmt::Display for PolicyScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Namespace(namespace) => write!(f, "the policy of namespace resource {namespace}"),
             Self::Tenant(tenant) => write!(f, "the policy of tenant {tenant}"),
             Self::Project { tenant, project } => {
                 write!(f, "the policy of project {project} in tenant {tenant}")
@@ -1335,10 +1340,6 @@ impl Canonical for PolicyBody {
         // zero cap would mean a cap of zero.
         let mut fields = vec![
             (SCHEMA_FIELD, CanonicalValue::string(Self::SCHEMA)),
-            (
-                TENANT_ID_FIELD,
-                CanonicalValue::string(self.scope.tenant().to_string()),
-            ),
             (EPOCH_FIELD, CanonicalValue::integer(self.epoch.get())),
             (
                 BUDGET_LIMIT_FIELD,
@@ -1361,6 +1362,15 @@ impl Canonical for PolicyBody {
                 CanonicalValue::integer(self.revocation.minimum_token_epoch),
             ),
         ];
+        match self.scope {
+            PolicyScope::Namespace(namespace) => fields.push((
+                "namespace_resource_id",
+                CanonicalValue::string(namespace.to_string()),
+            )),
+            PolicyScope::Tenant(tenant) | PolicyScope::Project { tenant, .. } => {
+                fields.push((TENANT_ID_FIELD, CanonicalValue::string(tenant.to_string())))
+            }
+        }
         if let Some(project) = self.scope.project() {
             fields.push((
                 PROJECT_ID_FIELD,
@@ -1630,12 +1640,15 @@ pub struct PolicyContent(Checksum);
 impl PolicyContent {
     fn of(body: &PolicyBody) -> Self {
         let mut bytes = Vec::new();
-        for text in [
-            body.scope.tenant().to_string(),
-            body.scope
-                .project()
-                .map_or_else(String::new, |project| project.to_string()),
-        ] {
+        let (kind, owner, child) = match body.scope {
+            PolicyScope::Namespace(namespace) => (0_u8, namespace.to_string(), String::new()),
+            PolicyScope::Tenant(tenant) => (1, tenant.to_string(), String::new()),
+            PolicyScope::Project { tenant, project } => {
+                (2, tenant.to_string(), project.to_string())
+            }
+        };
+        bytes.push(kind);
+        for text in [owner, child] {
             bytes.extend_from_slice(&(text.len() as u64).to_be_bytes());
             bytes.extend_from_slice(text.as_bytes());
         }

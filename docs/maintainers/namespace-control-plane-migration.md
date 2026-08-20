@@ -1,8 +1,11 @@
 # Namespace and blob control-plane migration plan
 
-Status: accepted architecture; Stage 1 is in progress. Typed namespace identity,
-canonical routes, and authorization against existing one-namespace credentials
-are implemented. Set/all grant projection and later stages remain open.
+Status: accepted architecture; Stages 1 and 2 are in progress. Typed namespace
+identity, canonical routes, complete flat namespace resources, namespace-native
+policy/middleware values, deployment-scoped single/set/all workload grants, and
+the signed deployment secret index are implemented. Static policy is independent
+of optional exact shared enforcement. Blob-store runtime wiring, atomic durable
+trust activation, and later stages remain open.
 
 Audience: maintainers planning the transition selected by
 [ADR 0062](../adr/0062-blob-backed-flat-namespace-control-plane.md). This is not
@@ -128,6 +131,21 @@ middleware registrations, and administrative trust at deployment scope. A
 namespace pins immutable deployment resource versions; a deployment resource
 change does not become half-active in one namespace.
 
+The deployment resource's secret index binds owner namespace, exact secret
+reference/version, ciphertext digest, and lifecycle. Namespace credentials
+reference those entries; the resolver receives the complete namespace-bound
+request. The blob-envelope slice owns ciphertext verification and unwrapping,
+not this projection. Nonempty deployment trust is rejected until trust can be
+activated in administrative auth, namespace authorization, and recovery as one
+snapshot; never treat accepted-but-unused trust as migration compatibility.
+
+Namespace policy has two layers. Middleware selection, buffered-route posture,
+token epoch, and other static values compile in a blob-only deployment. Exact
+fleet-wide spend/concurrency is an optional block and must retain the existing
+backend capability, layout-migration, tightening, and drain checks. Exporters
+must omit that block when the source does not promise exact distributed
+enforcement; they must not invent per-replica caps.
+
 Authentication produces a grant. The path produces the selected namespace.
 The authorization step intersects them and places only the authorized path
 namespace in request context. Every downstream key—credentials, aliases,
@@ -233,6 +251,12 @@ The exporter must either retain a narrowly bounded compatibility verifier for a
 documented window or require those credentials to rotate; it cannot claim to
 export key material it does not possess. Existing signed last-known-good caches
 use the old snapshot schema and must be regenerated after cutover.
+Compiled LKG layout 6 can represent flat static policy and namespace-bound
+secret metadata, but this build neither writes nor cold-restores a
+credential-bearing flat-v2 compiled cache. Recovery remains refused until an
+authenticated monotonic revision/tombstone floor can prove that cached material
+has not since been withdrawn. Credential-free flat-v2 snapshots remain eligible;
+layout 5 and earlier are rejected before deserialization.
 
 Cutover uses one authority at a time. Rollback before any blob mutation may
 return to the quiesced PostgreSQL revision. After blob writes begin, returning

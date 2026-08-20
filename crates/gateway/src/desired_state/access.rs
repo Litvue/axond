@@ -89,6 +89,9 @@ const KEY_DIGEST_FIELD: &str = "key_digest";
 /// authorize against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Surface {
+    Deployment,
+    Namespace,
+    InboundGrant,
     /// The tenants themselves: creating, renaming, disabling, deleting.
     Tenant,
     /// Projects within a tenant — namespaces, in the running gateway's terms.
@@ -123,6 +126,9 @@ impl Surface {
     /// Every surface, so an authorization matrix can be asserted exhaustively
     /// rather than sampled.
     pub const ALL: &'static [Self] = &[
+        Self::Deployment,
+        Self::Namespace,
+        Self::InboundGrant,
         Self::Tenant,
         Self::Project,
         Self::Principal,
@@ -146,6 +152,9 @@ impl Surface {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Deployment => "deployment",
+            Self::Namespace => "namespace",
+            Self::InboundGrant => "inbound-grant",
             Self::Tenant => "tenant",
             Self::Project => "project",
             Self::Principal => "principal",
@@ -163,6 +172,9 @@ impl Surface {
     /// The surface a resource kind is administered through.
     pub const fn of(kind: ResourceKind) -> Self {
         match kind {
+            ResourceKind::Deployment => Self::Deployment,
+            ResourceKind::Namespace => Self::Namespace,
+            ResourceKind::InboundGrant => Self::InboundGrant,
             ResourceKind::Tenant => Self::Tenant,
             ResourceKind::Project => Self::Project,
             ResourceKind::Identity => Self::Principal,
@@ -365,6 +377,10 @@ impl Role {
             // Runs the deployment: no other cell is narrowed, because the role
             // exists to be the one that is not.
             (Self::PlatformAdmin, _) => Action::ALL,
+            // V1 hierarchy roles never acquire authority over the v2 flat
+            // model. Deployment grants are authentication declarations, not
+            // durable principals to which a tenant role can attach.
+            (_, Surface::Deployment | Surface::Namespace | Surface::InboundGrant) => NONE,
             // Its own tenant is readable and renameable; its existence is not
             // its own to decide.
             (Self::TenantAdmin, Surface::Tenant) => &[Action::Read, Action::Update],
@@ -1695,6 +1711,13 @@ mod tests {
                     } else {
                         match role {
                             Role::PlatformAdmin => true,
+                            _ if matches!(
+                                surface,
+                                Surface::Deployment | Surface::Namespace | Surface::InboundGrant
+                            ) =>
+                            {
+                                false
+                            }
                             Role::TenantAdmin => match surface {
                                 Surface::Tenant => {
                                     matches!(action, Action::Read | Action::Update)

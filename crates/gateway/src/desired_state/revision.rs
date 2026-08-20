@@ -31,6 +31,7 @@ use super::credentials::{CredentialError, Credentials};
 use super::ids::{AuditEventId, MutationId, ResourceId, RevisionId, Slug};
 use super::models::{ModelEnablementBody, ModelError, ModelValidationMode, Models};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
+use super::namespaces::{FlatNamespaces, NamespaceStateError};
 use super::policy::{PolicyError, PolicySet};
 use super::pricing::{PriceBooks, PricingError};
 use super::providers::{ProviderError, Providers};
@@ -102,6 +103,10 @@ pub enum ValidationError {
     CrossTenantReference { from: ResourceRef, to: ResourceRef },
     #[error("deployment-scoped {from} depends on tenant-scoped {to}")]
     TenantScopedDependency { from: ResourceRef, to: ResourceRef },
+    #[error("a revision cannot mix flat namespace v2 resources with the v1 hierarchy")]
+    MixedStateModels,
+    #[error("this revision's flat namespace state is not valid: {0}")]
+    Namespace(#[from] NamespaceStateError),
     #[error("this revision's tenancy is not valid: {0}")]
     Tenancy(#[from] TenancyError),
     #[error("this revision's provider credentials are not valid: {0}")]
@@ -231,6 +236,16 @@ impl DesiredState {
         self.resources.is_empty()
     }
 
+    /// Whether this complete revision uses ADR 0062's flat v2 state model.
+    pub fn is_flat_namespace_v2(&self) -> bool {
+        self.resources.values().any(|resource| {
+            matches!(
+                resource.reference.kind,
+                ResourceKind::Deployment | ResourceKind::Namespace | ResourceKind::InboundGrant
+            )
+        })
+    }
+
     /// Check every invariant a durable store is allowed to assume.
     ///
     /// Validation is the domain's job, not the database's: #165 stores what this
@@ -340,6 +355,25 @@ impl DesiredState {
             // An orphan blob is either a caller mistake or storage that will
             // never be reclaimed, and both are worth refusing while it is cheap.
             return Err(ValidationError::UnreferencedBlob { digest: *digest });
+        }
+
+        let has_v2 = self.resources.values().any(|resource| {
+            matches!(
+                resource.reference.kind,
+                ResourceKind::Deployment | ResourceKind::Namespace | ResourceKind::InboundGrant
+            )
+        });
+        if has_v2 {
+            if self.resources.values().any(|resource| {
+                !matches!(
+                    resource.reference.kind,
+                    ResourceKind::Deployment | ResourceKind::Namespace | ResourceKind::InboundGrant
+                )
+            }) {
+                return Err(ValidationError::MixedStateModels);
+            }
+            FlatNamespaces::of(self)?;
+            return Ok(());
         }
 
         // Last, because these are the only steps that read a *body*: everything
@@ -621,6 +655,8 @@ impl RevisionManifest {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BodySkew {
     #[error(transparent)]
+    Namespace(NamespaceStateError),
+    #[error(transparent)]
     Tenancy(TenancyError),
     #[error(transparent)]
     Credential(CredentialError),
@@ -645,6 +681,12 @@ impl From<ModelError> for ValidationError {
 impl From<TenancyError> for BodySkew {
     fn from(error: TenancyError) -> Self {
         Self::Tenancy(error)
+    }
+}
+
+impl From<NamespaceStateError> for BodySkew {
+    fn from(error: NamespaceStateError) -> Self {
+        Self::Namespace(error)
     }
 }
 
@@ -680,8 +722,11 @@ impl From<Box<PricingError>> for BodySkew {
 
 impl BodySkew {
     /// The resource the refusal is about, whichever schema refused it.
-    pub const fn reference(&self) -> ResourceRef {
+    pub fn reference(&self) -> ResourceRef {
         match self {
+            Self::Namespace(error) => error
+                .reference()
+                .expect("only a resource-specific namespace incompatibility becomes BodySkew"),
             Self::Tenancy(error) => error.reference(),
             Self::Credential(error) => error.reference(),
             Self::Policy(error) => error.reference(),
@@ -773,6 +818,9 @@ impl IntegrityError {
     /// contradict each other". See [`TenancyError::is_incompatible`].
     fn classify(error: ValidationError) -> Self {
         match error {
+            ValidationError::Namespace(namespace) if namespace.is_incompatible() => {
+                Self::Incompatible(BodySkew::Namespace(namespace))
+            }
             ValidationError::Tenancy(tenancy) if tenancy.is_incompatible() => {
                 Self::Incompatible(BodySkew::Tenancy(tenancy))
             }

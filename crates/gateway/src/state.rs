@@ -34,11 +34,11 @@ use crate::backends::health::BackendHealth;
 use crate::backends::secrets::SecretMaterial;
 use crate::budget::BudgetStore;
 use crate::config::{
-    CatalogBinding, Config, GatewayVerifierAlgorithm, Namespace, NamespacePolicy, ProjectIdentity,
-    ProjectedPrincipal, ProviderKind,
+    CatalogBinding, Config, GatewayVerifierAlgorithm, Namespace, NamespacePolicy,
+    NamespaceStaticPolicy, ProjectIdentity, ProjectedPrincipal, ProviderKind,
 };
 use crate::convergence::SystemClock;
-use crate::convergence::secrets::{MaterialLedger, ResolvedSecrets};
+use crate::convergence::secrets::{MaterialLedger, ResolvedSecretBinding, ResolvedSecrets};
 use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
 use crate::desired_state::mutation::Actor;
@@ -382,6 +382,8 @@ pub(crate) struct CachedNamespace {
     pub(crate) allow_platform_fallback: bool,
     pub(crate) project: Option<CachedProjectIdentity>,
     pub(crate) policy: Option<CachedPolicy>,
+    pub(crate) static_policy: Option<CachedStaticPolicy>,
+    pub(crate) token_epoch: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -393,8 +395,7 @@ pub(crate) struct CachedProjectIdentity {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CachedPolicy {
-    pub(crate) tenant: String,
-    pub(crate) project: Option<String>,
+    pub(crate) scope: CachedPolicyScope,
     pub(crate) epoch: u64,
     pub(crate) subject_limit_microdollars: u64,
     pub(crate) namespace_limit_microdollars: Option<u64>,
@@ -405,6 +406,21 @@ pub(crate) struct CachedPolicy {
     pub(crate) content_middleware: Vec<CachedContentMiddleware>,
     #[serde(default)]
     pub(crate) buffered_response_routes: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CachedStaticPolicy {
+    pub(crate) content_middleware: Vec<CachedContentMiddleware>,
+    pub(crate) buffered_response_routes: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CachedPolicyScope {
+    Namespace { resource: String },
+    Tenant { tenant: String },
+    Project { tenant: String, project: String },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -469,15 +485,31 @@ pub(crate) struct CachedPrincipal {
     pub(crate) namespace: String,
     pub(crate) subject: String,
     pub(crate) digest: String,
+    #[serde(default)]
+    pub(crate) all_namespaces: bool,
+    #[serde(default)]
+    pub(crate) namespaces: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct CachedSecret {
     pub(crate) reference: String,
+    pub(crate) binding: CachedSecretBinding,
     /// This field is only present inside the encrypted cache payload. It must
     /// never be written to the signed desired-state cache or an unencrypted
     /// diagnostic.
     pub(crate) material: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CachedSecretBinding {
+    Legacy,
+    Namespace {
+        owner_namespace: String,
+        ciphertext_digest: String,
+        lifecycle: String,
+    },
 }
 
 impl Drop for CachedSecret {
@@ -526,6 +558,21 @@ pub(crate) struct CachedPriceTarget {
 }
 
 impl ConfigSnapshot {
+    /// Whether this snapshot is flat-v2 and carries provider credential
+    /// material.
+    ///
+    /// Such snapshots are deliberately ineligible for cross-restart recovery
+    /// until an authenticated monotonic revision/tombstone floor can prove that
+    /// cached material has not since been revoked.
+    pub(crate) fn credential_bearing_flat_v2(&self) -> bool {
+        self.config.credential.iter().any(|credential| {
+            credential.secret.is_some()
+                && self.config.namespace.iter().any(|namespace| {
+                    namespace.id == credential.namespace && namespace.static_policy.is_some()
+                })
+        })
+    }
+
     /// Capture the exact projection needed to rebuild a serving snapshot after
     /// a process restart. The caller encrypts the returned structure before it
     /// reaches disk; the cache writer explicitly zeroizes the temporary copy
@@ -547,8 +594,20 @@ impl ConfigSnapshot {
                         project: identity.project.to_string(),
                     }),
                     policy: namespace.policy.as_ref().map(|policy| CachedPolicy {
-                        tenant: policy.body.scope().tenant().to_string(),
-                        project: policy.body.scope().project().map(|id| id.to_string()),
+                        scope: match policy.body.scope() {
+                            PolicyScope::Namespace(resource) => CachedPolicyScope::Namespace {
+                                resource: resource.to_string(),
+                            },
+                            PolicyScope::Tenant(tenant) => CachedPolicyScope::Tenant {
+                                tenant: tenant.to_string(),
+                            },
+                            PolicyScope::Project { tenant, project } => {
+                                CachedPolicyScope::Project {
+                                    tenant: tenant.to_string(),
+                                    project: project.to_string(),
+                                }
+                            }
+                        },
                         epoch: policy.body.epoch().get(),
                         subject_limit_microdollars: policy
                             .body
@@ -594,6 +653,44 @@ impl ConfigSnapshot {
                             .map(|route| route.as_str().to_owned())
                             .collect(),
                     }),
+                    static_policy: namespace.static_policy.as_ref().map(|policy| {
+                        CachedStaticPolicy {
+                            content_middleware: policy
+                                .content_middleware
+                                .iter()
+                                .map(|registration| CachedContentMiddleware {
+                                    id: registration.id().to_owned(),
+                                    scopes: registration.scopes().to_vec(),
+                                    failure_posture: registration.failure_posture(),
+                                    max_duration_milliseconds: registration
+                                        .max_duration_milliseconds(),
+                                    guardrail: registration.guardrail().map(|guardrail| {
+                                        CachedContentGuardrail {
+                                            key_env: guardrail.key_env().to_owned(),
+                                            key_fingerprint: self
+                                                .middleware
+                                                .guardrail_key_fingerprint(&namespace.id)
+                                                .expect(
+                                                    "a compiled guardrail has a key fingerprint",
+                                                )
+                                                .to_owned(),
+                                            rules: guardrail.rules().to_vec(),
+                                        }
+                                    }),
+                                })
+                                .collect(),
+                            buffered_response_routes: policy
+                                .buffered_response_routes
+                                .iter()
+                                .map(|route| route.as_str().to_owned())
+                                .collect(),
+                        }
+                    }),
+                    token_epoch: config
+                        .gateway_token_epoch
+                        .iter()
+                        .find(|epoch| epoch.namespace == namespace.id && epoch.subject.is_none())
+                        .map(|epoch| epoch.min_iat),
                 })
                 .collect(),
             providers: config
@@ -650,6 +747,17 @@ impl ConfigSnapshot {
                     namespace: principal.namespace.clone(),
                     subject: principal.subject.clone(),
                     digest: principal.digest.to_string(),
+                    all_namespaces: principal
+                        .grant
+                        .as_ref()
+                        .is_some_and(crate::namespace::NamespaceGrant::is_all),
+                    namespaces: principal
+                        .grant
+                        .as_ref()
+                        .and_then(crate::namespace::NamespaceGrant::namespaces)
+                        .into_iter()
+                        .flat_map(|namespaces| namespaces.iter().map(ToString::to_string))
+                        .collect(),
                 })
                 .collect(),
             secrets: self
@@ -659,6 +767,16 @@ impl ConfigSnapshot {
                 .filter_map(|reference| {
                     self.secrets.get(reference).map(|material| CachedSecret {
                         reference: reference.to_string(),
+                        binding: match material.binding() {
+                            ResolvedSecretBinding::Legacy => CachedSecretBinding::Legacy,
+                            ResolvedSecretBinding::Namespace(request) => {
+                                CachedSecretBinding::Namespace {
+                                    owner_namespace: request.owner().to_string(),
+                                    ciphertext_digest: request.ciphertext_digest().to_string(),
+                                    lifecycle: request.lifecycle().as_str().to_owned(),
+                                }
+                            }
+                        },
                         material: material.expose().to_owned(),
                     })
                 })
@@ -675,13 +793,34 @@ impl ConfigSnapshot {
         env: &HashMap<String, String>,
         cached: CachedServingSnapshot,
     ) -> Result<(RevisionId, Self), String> {
+        let flat_v2 = cached.flat_v2();
+        if cached.credential_bearing_flat_v2() {
+            return Err(
+                "credential-bearing flat-v2 compiled snapshots are not eligible for cold restoration until an authenticated monotonic revision/tombstone floor exists"
+                    .to_owned(),
+            );
+        }
         verify_cached_guardrail_keys(&cached, env)?;
         let revision = RevisionId::parse(&cached.revision).map_err(|error| error.to_string())?;
-        bootstrap.namespace = cached
+        let restored_namespaces = cached
             .namespaces
             .into_iter()
             .map(|namespace| cached_namespace(namespace, revision))
             .collect::<Result<Vec<_>, _>>()?;
+        bootstrap.namespace = restored_namespaces
+            .iter()
+            .map(|(namespace, _)| namespace.clone())
+            .collect();
+        bootstrap.gateway_token_epoch = restored_namespaces
+            .into_iter()
+            .filter_map(|(namespace, minimum_token_epoch)| {
+                minimum_token_epoch.map(|min_iat| crate::config::GatewayTokenEpoch {
+                    namespace: namespace.id,
+                    subject: None,
+                    min_iat,
+                })
+            })
+            .collect();
         bootstrap.provider = cached
             .providers
             .into_iter()
@@ -751,27 +890,83 @@ impl ConfigSnapshot {
             .into_iter()
             .map(|principal| {
                 Ok(ProjectedPrincipal {
-                    namespace: principal.namespace,
+                    namespace: principal.namespace.clone(),
                     subject: principal.subject,
                     digest: Checksum::parse(&principal.digest)
                         .map_err(|error| error.to_string())?,
+                    grant: if principal.all_namespaces {
+                        Some(crate::namespace::NamespaceGrant::all())
+                    } else if principal.namespaces.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            crate::namespace::NamespaceGrant::set(
+                                principal
+                                    .namespaces
+                                    .iter()
+                                    .map(|namespace| {
+                                        crate::namespace::NamespaceId::parse(namespace)
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map_err(|error| error.to_string())?,
+                            )
+                            .map_err(|error| error.to_string())?,
+                        )
+                    },
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
         bootstrap
             .validate_compiled()
             .map_err(|error| error.to_string())?;
+        let mut expected_secret_owners = HashMap::new();
+        if flat_v2 {
+            for credential in &bootstrap.credential {
+                let Some(reference) = credential.secret else {
+                    continue;
+                };
+                if let Some(first) =
+                    expected_secret_owners.insert(reference, credential.namespace.clone())
+                    && first != credential.namespace
+                {
+                    return Err(format!(
+                        "compiled cache shares secret {reference} between namespaces `{first}` and `{}`",
+                        credential.namespace
+                    ));
+                }
+            }
+        }
         let materials = cached
             .secrets
             .into_iter()
             .map(|mut secret| {
                 let reference =
                     SecretRef::parse(&secret.reference).map_err(|error| error.to_string())?;
+                if flat_v2 && !expected_secret_owners.contains_key(&reference) {
+                    return Err(format!(
+                        "compiled cache contains unreferenced secret {reference}"
+                    ));
+                }
+                let binding = match secret.binding {
+                    CachedSecretBinding::Legacy => ResolvedSecretBinding::Legacy,
+                    CachedSecretBinding::Namespace { .. } => {
+                        return Err(format!(
+                            "compiled cache carries namespace-bound secret {reference}; flat-v2 credential material is not eligible for cold restoration"
+                        ));
+                    }
+                };
                 let material = std::mem::take(&mut secret.material);
-                Ok((reference, SecretMaterial::new(material)))
+                Ok((reference, SecretMaterial::new(material), binding))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let secrets = ResolvedSecrets::from_cached(MaterialLedger::new(), materials);
+        if flat_v2 && materials.len() != expected_secret_owners.len() {
+            return Err(format!(
+                "compiled cache contains {} secret materials for {} referenced versions",
+                materials.len(),
+                expected_secret_owners.len()
+            ));
+        }
+        let secrets = ResolvedSecrets::from_cached(MaterialLedger::new(), materials)?;
         let mut snapshot = Self::build_compiled_with(bootstrap, env, cached.generation, secrets)
             .map_err(|error| error.to_string())?;
         if let Some(pricing) = cached.pricing {
@@ -790,10 +985,18 @@ fn verify_cached_guardrail_keys(
             || namespace.id.clone(),
             |project| format!("{}/{}", project.tenant, project.project),
         );
-        let Some(policy) = &namespace.policy else {
-            continue;
-        };
-        for registration in &policy.content_middleware {
+        let registrations = namespace
+            .static_policy
+            .as_ref()
+            .map(|policy| policy.content_middleware.as_slice())
+            .or_else(|| {
+                namespace
+                    .policy
+                    .as_ref()
+                    .map(|policy| policy.content_middleware.as_slice())
+            })
+            .unwrap_or_default();
+        for registration in registrations {
             let Some(guardrail) = &registration.guardrail else {
                 continue;
             };
@@ -811,7 +1014,56 @@ fn verify_cached_guardrail_keys(
     Ok(())
 }
 
+fn restore_cached_middleware(
+    registrations: Vec<CachedContentMiddleware>,
+) -> Result<Vec<crate::desired_state::ContentMiddlewareRegistration>, String> {
+    registrations
+        .into_iter()
+        .map(|registration| {
+            let middleware = crate::desired_state::ContentMiddlewareRegistration::new(
+                registration.id,
+                registration.scopes,
+                registration.failure_posture,
+                registration.max_duration_milliseconds,
+            )
+            .map_err(|error| error.to_string())?;
+            let Some(guardrail) = registration.guardrail else {
+                return Ok(middleware);
+            };
+            let guardrail = crate::desired_state::policy::ContentGuardrailRegistration::new(
+                guardrail.key_env,
+                guardrail.rules,
+            )
+            .map_err(|error| error.to_string())?;
+            middleware
+                .with_guardrail(guardrail)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+fn restore_cached_buffered_routes(routes: &[String]) -> Result<Vec<BufferedResponseRoute>, String> {
+    routes
+        .iter()
+        .map(|route| BufferedResponseRoute::parse(route).map_err(|error| error.to_string()))
+        .collect()
+}
+
 impl CachedServingSnapshot {
+    fn flat_v2(&self) -> bool {
+        self.namespaces
+            .iter()
+            .any(|namespace| namespace.static_policy.is_some())
+    }
+
+    fn credential_bearing_flat_v2(&self) -> bool {
+        self.flat_v2()
+            && self
+                .credentials
+                .iter()
+                .any(|credential| credential.secret.is_some())
+    }
+
     pub(crate) fn zeroize_secrets(&mut self) {
         for secret in &mut self.secrets {
             secret.material.zeroize();
@@ -819,7 +1071,11 @@ impl CachedServingSnapshot {
     }
 }
 
-fn cached_namespace(namespace: CachedNamespace, revision: RevisionId) -> Result<Namespace, String> {
+fn cached_namespace(
+    namespace: CachedNamespace,
+    revision: RevisionId,
+) -> Result<(Namespace, Option<u64>), String> {
+    let has_static_policy = namespace.static_policy.is_some();
     let project = namespace
         .project
         .map(|identity| -> Result<ProjectIdentity, String> {
@@ -831,48 +1087,24 @@ fn cached_namespace(namespace: CachedNamespace, revision: RevisionId) -> Result<
         .transpose()?;
     let policy = namespace
         .policy
-        .map(|policy| -> Result<NamespacePolicy, String> {
-            let tenant = TenantId::parse(&policy.tenant).map_err(|error| error.to_string())?;
-            let project = policy
-                .project
-                .as_deref()
-                .map(ProjectId::parse)
-                .transpose()
-                .map_err(|error| error.to_string())?;
-            let scope = match project {
-                Some(project) => PolicyScope::Project { tenant, project },
-                None => PolicyScope::Tenant(tenant),
+        .map(|policy| -> Result<(NamespacePolicy, u64), String> {
+            let scope = match policy.scope {
+                CachedPolicyScope::Namespace { resource } => PolicyScope::Namespace(
+                    crate::desired_state::ResourceId::parse(&resource)
+                        .map_err(|error| error.to_string())?,
+                ),
+                CachedPolicyScope::Tenant { tenant } => PolicyScope::Tenant(
+                    TenantId::parse(&tenant).map_err(|error| error.to_string())?,
+                ),
+                CachedPolicyScope::Project { tenant, project } => PolicyScope::Project {
+                    tenant: TenantId::parse(&tenant).map_err(|error| error.to_string())?,
+                    project: ProjectId::parse(&project).map_err(|error| error.to_string())?,
+                },
             };
-            let content_middleware = policy
-                .content_middleware
-                .into_iter()
-                .map(|registration| {
-                    let middleware = crate::desired_state::ContentMiddlewareRegistration::new(
-                        registration.id,
-                        registration.scopes,
-                        registration.failure_posture,
-                        registration.max_duration_milliseconds,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    let Some(guardrail) = registration.guardrail else {
-                        return Ok(middleware);
-                    };
-                    let guardrail =
-                        crate::desired_state::policy::ContentGuardrailRegistration::new(
-                            guardrail.key_env,
-                            guardrail.rules,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    middleware
-                        .with_guardrail(guardrail)
-                        .map_err(|error| error.to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let buffered_response_routes = policy
-                .buffered_response_routes
-                .iter()
-                .map(|route| BufferedResponseRoute::parse(route).map_err(|error| error.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
+            let minimum_token_epoch = policy.minimum_token_epoch;
+            let content_middleware = restore_cached_middleware(policy.content_middleware)?;
+            let buffered_response_routes =
+                restore_cached_buffered_routes(&policy.buffered_response_routes)?;
             let body = PolicyBody::new(
                 scope,
                 PolicyEpoch::new(policy.epoch).map_err(|error| error.to_string())?,
@@ -891,16 +1123,53 @@ fn cached_namespace(namespace: CachedNamespace, revision: RevisionId) -> Result<
             .with_buffered_response_routes(buffered_response_routes)
             .map_err(|error| error.to_string())?;
             let generation = body.generation(revision);
-            Ok(NamespacePolicy { body, generation })
+            Ok((NamespacePolicy { body, generation }, minimum_token_epoch))
         })
         .transpose()?;
-    Ok(Namespace {
-        id: namespace.id,
-        default: namespace.default,
-        allow_platform_fallback: namespace.allow_platform_fallback,
-        project,
-        policy,
-    })
+    let static_policy = namespace
+        .static_policy
+        .map(|policy| {
+            Ok::<_, String>(NamespaceStaticPolicy {
+                content_middleware: restore_cached_middleware(policy.content_middleware)?,
+                buffered_response_routes: restore_cached_buffered_routes(
+                    &policy.buffered_response_routes,
+                )?,
+            })
+        })
+        .transpose()?;
+    let policy_token_epoch = policy.as_ref().and_then(|(_, minimum)| {
+        matches!(
+            policy.as_ref().map(|(policy, _)| policy.body.scope()),
+            Some(PolicyScope::Namespace(_))
+        )
+        .then_some(*minimum)
+    });
+    if has_static_policy && namespace.token_epoch.is_none() {
+        return Err(format!(
+            "compiled cache omits the token epoch for flat-v2 namespace `{}`",
+            namespace.id
+        ));
+    }
+    if let (Some(explicit), Some(policy)) = (namespace.token_epoch, policy_token_epoch)
+        && explicit != policy
+    {
+        return Err(format!(
+            "compiled cache gives namespace `{}` conflicting token epochs {explicit} and {policy}",
+            namespace.id
+        ));
+    }
+    let minimum_token_epoch = namespace.token_epoch.or(policy_token_epoch);
+    Ok((
+        Namespace {
+            id: namespace.id,
+            default: namespace.default,
+            allow_platform_fallback: namespace.allow_platform_fallback,
+            project,
+            policy: policy.map(|(policy, _)| policy),
+            static_policy,
+        },
+        minimum_token_epoch,
+    ))
 }
 
 fn cached_pricing(pricing: &PricingSnapshot) -> CachedPricing {
@@ -1260,6 +1529,7 @@ impl ConfigSnapshot {
                     max_request_microdollars: None,
                     can_mint: k.can_mint,
                     jti: None,
+                    namespace_grant: None,
                 },
             });
             gateway_key_fingerprints
@@ -1798,7 +2068,7 @@ mod tests {
     use crate::availability::{AvailabilityKey, AvailabilityRecord, ScopeRef, TargetRef};
     use crate::budget::NoBudget;
     use crate::desired_state::ContentMiddlewareRegistration;
-    use crate::desired_state::fixtures::{policy_body, revision_id, tenant_id};
+    use crate::desired_state::fixtures::{policy_body, revision_id, secret_ref, tenant_id};
     use crate::desired_state::policy::{ContentGuardrailRegistration, PolicyScope};
     use crate::desired_state::{TenantId, Uuid7};
     use crate::usage::UsageSink;
@@ -1994,6 +2264,63 @@ namespace = "platform"
             error.contains("not compiled into this axond build"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn legacy_cache_restores_one_tenant_key_shared_across_namespaces() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let snapshot =
+            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 7).expect("snapshot compiles");
+        let revision = revision_id(7);
+        let reference = secret_ref(991);
+        let mut cached = snapshot.cached_serving(revision);
+        let mut sibling = cached.namespaces[0].clone();
+        sibling.id = "sibling".to_owned();
+        sibling.default = false;
+        cached.namespaces.push(sibling);
+        cached.credentials = ["platform", "sibling"]
+            .into_iter()
+            .map(|namespace| CachedCredential {
+                namespace: namespace.to_owned(),
+                provider: "openai".to_owned(),
+                env: None,
+                id: Some("tenant-default".to_owned()),
+                weight: 1,
+                secret: Some(reference.to_string()),
+            })
+            .collect();
+        cached.secrets.push(CachedSecret {
+            reference: reference.to_string(),
+            binding: CachedSecretBinding::Legacy,
+            material: "shared-provider-key".to_owned(),
+        });
+
+        let (_, restored) =
+            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
+                .expect("legacy shared tenant material remains recoverable");
+        assert_eq!(restored.config.credential.len(), 2);
+        assert!(restored.secrets.get(reference).is_some());
+    }
+
+    #[test]
+    fn legacy_cache_restores_staged_material_not_in_the_serving_pool() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let snapshot =
+            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 7).expect("snapshot compiles");
+        let revision = revision_id(7);
+        let reference = secret_ref(992);
+        let mut cached = snapshot.cached_serving(revision);
+        cached.secrets.push(CachedSecret {
+            reference: reference.to_string(),
+            binding: CachedSecretBinding::Legacy,
+            material: "staged-provider-key".to_owned(),
+        });
+
+        let (_, restored) =
+            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
+                .expect("legacy staged material remains recoverable");
+        assert!(restored.secrets.get(reference).is_some());
+        assert_eq!(restored.cached_serving(revision).secrets.len(), 1);
     }
 
     #[tokio::test]
@@ -2635,6 +2962,7 @@ namespace = "platform"
             namespace: "platform".to_owned(),
             subject: crate::desired_state::fixtures::principal_id(33).to_string(),
             digest: crate::desired_state::Checksum::of(key.as_bytes()),
+            grant: None,
         }];
         let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
         let snapshot = ConfigSnapshot::build(config, &env, 0)
