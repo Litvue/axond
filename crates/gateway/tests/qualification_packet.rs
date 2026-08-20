@@ -262,7 +262,7 @@ fn validate_recovery_stage(
         return Err("the recovery stage executable differs from the record binary".to_owned());
     }
     match stage.driver.as_deref() {
-        Some("stateful-integration") => {
+        Some("stateful-integration" | "restore-drill") => {
             let executed = stage
                 .executed_binary_sha256
                 .as_deref()
@@ -279,13 +279,6 @@ fn validate_recovery_stage(
                 return Err(
                     "the process-backed recovery stage is not bound to the record binary"
                         .to_owned(),
-                );
-            }
-        }
-        Some("restore-drill") => {
-            if stage.executed_binary_sha256.is_some() || stage.execution_bound.is_some() {
-                return Err(
-                    "restore-drill stages must not claim process-driver provenance".to_owned(),
                 );
             }
         }
@@ -633,7 +626,17 @@ fn evidenced_recovery_stages_require_raw_schema_and_exact_binary_identity() {
     stage.artifact_schema_version = Some(RECOVERY_RESULT_SCHEMA_VERSION);
     stage.binary_sha256 = Some(binary_sha256.clone());
     stage.driver = Some("restore-drill".to_owned());
+    stage.executed_binary_sha256 = Some(binary_sha256.clone());
+    stage.execution_bound = Some(true);
     assert!(validate_recovery_stage(&stage, &binary_sha256).is_ok());
+
+    let mut restore_without_execution = stage.clone();
+    restore_without_execution.executed_binary_sha256 = None;
+    assert!(validate_recovery_stage(&restore_without_execution, &binary_sha256).is_err());
+
+    let mut unbound_restore = stage.clone();
+    unbound_restore.execution_bound = Some(false);
+    assert!(validate_recovery_stage(&unbound_restore, &binary_sha256).is_err());
 
     let mut missing_schema = stage.clone();
     missing_schema.artifact_schema_version = None;
@@ -1523,7 +1526,7 @@ fn synthetic_closed_packet() -> (packet::Packet, BTreeMap<String, packet::Record
                     stage.driver = Some(driver.clone());
                     stage.artifact_schema_version = Some(RECOVERY_RESULT_SCHEMA_VERSION);
                     stage.binary_sha256 = Some(record.binary.sha256.clone());
-                    if driver == "stateful-integration" {
+                    if matches!(driver.as_str(), "stateful-integration" | "restore-drill") {
                         stage.executed_binary_sha256 = Some(record.binary.sha256.clone());
                         stage.execution_bound = Some(true);
                     } else {
