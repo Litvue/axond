@@ -80,6 +80,7 @@ pub mod providers;
 pub mod publication;
 mod publication_auth;
 pub mod resource;
+pub mod resource_document;
 pub mod revision;
 mod secret_binding;
 pub mod secrets;
@@ -172,6 +173,8 @@ pub use resource::{
     BlobError, BlobKind, BlobRef, ResourceBody, ResourceKind, ResourceRef, ResourceScope,
     ResourceVersion, ResourceVersionNumber,
 };
+#[allow(unused_imports)]
+pub use resource_document::{BlobResourceDocument, BlobResourceDocumentError};
 #[allow(unused_imports)]
 pub use revision::{
     BodySkew, DesiredState, IntegrityError, LoadedRevision, ManifestEntry, RevisionCandidate,
