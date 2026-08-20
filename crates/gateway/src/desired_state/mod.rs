@@ -143,17 +143,17 @@ pub use pricing::{
 pub use providers::{PROVIDER_SCHEMA, Provider, ProviderBody, ProviderError, Providers};
 #[allow(unused_imports)]
 pub use publication::{
-    BlobPublication, BlobPublicationError, BlobPublicationRequest, EnvironmentId, ExpectedHead,
-    HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus, ImmutableObject,
-    ImmutableObjectKind, PublicationActorBinding, PublicationAuthorization,
-    PublicationGrantBinding, PublicationOutcome, PublicationSequenceGuard,
-    VerifiedRevisionManifest,
+    ActivationReadyRevision, BlobPublication, BlobPublicationError, BlobPublicationRequest,
+    EnvironmentId, ExpectedHead, HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus,
+    ImmutableObject, ImmutableObjectKind, PublicationActorBinding, PublicationAuthorization,
+    PublicationGrantBinding, PublicationHeadState, PublicationOutcome, PublicationSequenceGuard,
+    VerifiedActiveRevision, VerifiedRevisionManifest,
 };
 #[allow(unused_imports)]
 pub use publication_auth::{
-    ED25519_V1_ALGORITHM, InvalidPublicationKeyId, PublicationAuthenticationError,
-    PublicationKeyId, PublicationSignatureAlgorithm, PublicationSigner, PublicationTrustStore,
-    TrustedPublicationKey,
+    ED25519_V1_ALGORITHM, InvalidPublicationKeyId, MAX_PUBLICATION_TRUST_KEYS,
+    PublicationAuthenticationError, PublicationKeyId, PublicationSignatureAlgorithm,
+    PublicationSigner, PublicationTrustStore, TrustedPublicationKey,
 };
 #[allow(unused_imports)]
 pub use resource::{

@@ -15,7 +15,7 @@ actually runs.
 | `provider_stream` | The OpenAI, Foundry, and Anthropic stream decoders — translated and native | They interpret provider JSON mid-relay, where a panic loses a live response |
 | `provider_error` | `ProviderError::from_upstream`, `::transport`, and the classification behind them | An upstream failure body decides whether the gateway retries, fails over, or opens a circuit |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission | A third party publishes it, a background refresh imports it unattended, and what it says about prices and capabilities feeds routing and spend decisions |
-| `publication_parsers` | Bounded signed environment-head JSON and deterministic signed revision-manifest CBOR | Object storage is outside the process trust boundary; malformed, unsigned, replayed, or unauthenticated durable bytes must fail closed without panic, unbounded allocation, or format ambiguity |
+| `publication_parsers` | Signed head tuple guard, history manifest verification, active-revision matching, and final version fence | Object storage is outside the process trust boundary; malformed, unsigned, replayed, equivocated, orphaned, or unauthenticated durable bytes must fail closed without panic, unbounded allocation, or format ambiguity |
 
 The properties each target asserts live in [`src/lib.rs`](./src/lib.rs) and
 [`src/wire.rs`](./src/wire.rs): a parser returns rather than panicking, a
@@ -89,9 +89,13 @@ asserts, it asserts:
   (`drift-limit-type.json`). The corpus carries both so the two cannot quietly
   collapse into one.
 
-The publication target passes every arbitrary input to both durable parsers and
-their real Ed25519 verification paths, then asserts deterministic acceptance or
-a typed, non-empty refusal. The committed key is synthetic verification-only
+The publication target passes arbitrary bytes to both durable parsers and a
+structured probe whose expected digest, sequence, environment, parent, accepted
+head tuple, and observed/current object versions mutate independently. It drives
+the public tuple guard, authenticated history wrapper, active wrapper, and final
+activation fence through their real Ed25519 verification paths, then asserts
+deterministic acceptance or a typed, non-empty refusal. The committed key is
+synthetic verification-only
 material; no matching production credential exists. Valid CBOR is
 committed as lowercase hex behind a `manifest-hex:` prefix because its leading
 bytes are not UTF-8; canonical head JSON uses `head-json:` so the corpus file's
@@ -104,8 +108,12 @@ harness, because the general 64 KiB derivation is intentionally smaller than
 that format's 1 MiB production bound.
 
 The seed set includes accepted signed v2 fixtures as well as unsigned v2,
-cross-environment, unknown-schema/algorithm, malformed-signature, sequence, and
-object-count refusals. Blob schema 1 was unsigned and is intentionally an
+cross-environment, unknown-schema/algorithm, malformed-signature, sequence,
+object-count, digest mismatch, same-sequence equivocation, and signed-orphan
+activation refusals. Every committed publication seed is pinned to its exact
+direct outcome in the bounded smoke runner. The signed JSON and CBOR fixtures
+are also asserted as direct golden bytes in publication unit tests. Blob schema
+1 was unsigned and is intentionally an
 unknown-schema refusal; it is not a compatibility path.
 
 Runs are hermetic. The seam the targets call

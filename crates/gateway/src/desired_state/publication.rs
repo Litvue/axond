@@ -7,8 +7,7 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -252,8 +251,12 @@ pub enum HeadDocumentError {
     Authentication(#[from] PublicationAuthenticationError),
     #[error("head sequence {actual} is below the accepted sequence floor {minimum}")]
     Rollback { minimum: u64, actual: u64 },
+    #[error("head sequence {sequence} names a different revision than the accepted head")]
+    Equivocation { sequence: u64 },
     #[error("the environment head is absent below the accepted sequence floor {minimum}")]
     MissingBelowFloor { minimum: u64 },
+    #[error("the persisted publication-head state belongs to a different environment")]
+    PersistedStateEnvironmentMismatch,
     #[error("head JSON is not in its deterministic encoding")]
     NonCanonical,
 }
@@ -396,7 +399,6 @@ impl HeadDocument {
     fn verify(
         bytes: &[u8],
         expected_environment: &EnvironmentId,
-        minimum_sequence: u64,
         trust: &PublicationTrustStore,
     ) -> Result<Self, HeadDocumentError> {
         if bytes.len() > MAX_HEAD_DOCUMENT_BYTES {
@@ -419,12 +421,6 @@ impl HeadDocument {
         }
         if wire.sequence == 0 {
             return Err(HeadDocumentError::ZeroSequence);
-        }
-        if wire.sequence < minimum_sequence {
-            return Err(HeadDocumentError::Rollback {
-                minimum: minimum_sequence,
-                actual: wire.sequence,
-            });
         }
         if wire.integrity.algorithm != HEAD_INTEGRITY_ALGORITHM {
             return Err(HeadDocumentError::UnknownIntegrityAlgorithm);
@@ -477,30 +473,98 @@ fn append_length_prefixed(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(value);
 }
 
-/// Shared monotonic floor for one process's view of a publication environment.
+/// Persistable last-known-good identity of one authenticated environment head.
 ///
-/// A verified observation raises the floor. A later valid-but-older head, or a
-/// missing head after any sequence was observed, is a typed rollback refusal.
-#[derive(Debug, Clone)]
-pub struct PublicationSequenceGuard {
+/// Sequence alone is insufficient: retaining the digest makes a signed second
+/// head at the same sequence a typed equivocation rather than an accepted replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationHeadState {
     environment: EnvironmentId,
-    minimum: Arc<AtomicU64>,
+    sequence: u64,
+    active_revision: Checksum,
 }
 
-impl PublicationSequenceGuard {
-    pub fn new(environment: EnvironmentId, minimum_sequence: u64) -> Self {
-        Self {
-            environment,
-            minimum: Arc::new(AtomicU64::new(minimum_sequence)),
+impl PublicationHeadState {
+    pub fn new(
+        environment: EnvironmentId,
+        sequence: u64,
+        active_revision: Checksum,
+    ) -> Result<Self, HeadDocumentError> {
+        if sequence == 0 {
+            return Err(HeadDocumentError::ZeroSequence);
         }
+        Ok(Self {
+            environment,
+            sequence,
+            active_revision,
+        })
     }
 
     pub fn environment(&self) -> &EnvironmentId {
         &self.environment
     }
 
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn active_revision(&self) -> Checksum {
+        self.active_revision
+    }
+}
+
+/// Shared monotonic `(sequence, active_revision)` guard for one environment.
+///
+/// Reads are untrusted observations: rollback and same-sequence equivocation
+/// fail closed. A successful conditional write is different evidence. Its
+/// success remains truthful if another writer has already advanced the shared
+/// guard, but it still cannot contradict the accepted digest at its own sequence.
+#[derive(Debug, Clone)]
+pub struct PublicationSequenceGuard {
+    environment: EnvironmentId,
+    accepted: Arc<Mutex<Option<PublicationHeadState>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommittedObservation {
+    Current,
+    Superseded,
+}
+
+impl PublicationSequenceGuard {
+    pub fn new(environment: EnvironmentId) -> Self {
+        Self {
+            environment,
+            accepted: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn from_last_known_good(
+        environment: EnvironmentId,
+        state: PublicationHeadState,
+    ) -> Result<Self, HeadDocumentError> {
+        if state.environment != environment {
+            return Err(HeadDocumentError::PersistedStateEnvironmentMismatch);
+        }
+        Ok(Self {
+            environment,
+            accepted: Arc::new(Mutex::new(Some(state))),
+        })
+    }
+
+    pub fn environment(&self) -> &EnvironmentId {
+        &self.environment
+    }
+
+    pub fn last_known_good(&self) -> Option<PublicationHeadState> {
+        self.accepted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn minimum_sequence(&self) -> u64 {
-        self.minimum.load(Ordering::Acquire)
+        self.last_known_good().map_or(0, |state| state.sequence)
     }
 
     pub fn verify_head(
@@ -508,40 +572,79 @@ impl PublicationSequenceGuard {
         bytes: &[u8],
         trust: &PublicationTrustStore,
     ) -> Result<HeadDocument, HeadDocumentError> {
-        let head = HeadDocument::verify(bytes, &self.environment, self.minimum_sequence(), trust)?;
-        self.observe(head.sequence())?;
+        let head = HeadDocument::verify(bytes, &self.environment, trust)?;
+        self.observe_read(head.sequence(), head.active_revision())?;
         Ok(head)
     }
 
-    fn observe(&self, sequence: u64) -> Result<(), HeadDocumentError> {
-        loop {
-            let floor = self.minimum_sequence();
-            if sequence < floor {
+    fn observe_read(
+        &self,
+        sequence: u64,
+        active_revision: Checksum,
+    ) -> Result<(), HeadDocumentError> {
+        let mut accepted = self
+            .accepted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = accepted.as_ref() {
+            if sequence < current.sequence {
                 return Err(HeadDocumentError::Rollback {
-                    minimum: floor,
+                    minimum: current.sequence,
                     actual: sequence,
                 });
             }
-            if sequence == floor
-                || self
-                    .minimum
-                    .compare_exchange(floor, sequence, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
+            if sequence == current.sequence && active_revision != current.active_revision {
+                return Err(HeadDocumentError::Equivocation { sequence });
+            }
+            if sequence == current.sequence {
                 return Ok(());
             }
         }
+        *accepted = Some(PublicationHeadState {
+            environment: self.environment.clone(),
+            sequence,
+            active_revision,
+        });
+        Ok(())
+    }
+
+    fn observe_committed(
+        &self,
+        sequence: u64,
+        active_revision: Checksum,
+    ) -> Result<CommittedObservation, HeadDocumentError> {
+        let mut accepted = self
+            .accepted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = accepted.as_ref() {
+            if sequence < current.sequence {
+                return Ok(CommittedObservation::Superseded);
+            }
+            if sequence == current.sequence && active_revision != current.active_revision {
+                return Err(HeadDocumentError::Equivocation { sequence });
+            }
+            if sequence == current.sequence {
+                return Ok(CommittedObservation::Current);
+            }
+        }
+        *accepted = Some(PublicationHeadState {
+            environment: self.environment.clone(),
+            sequence,
+            active_revision,
+        });
+        Ok(CommittedObservation::Current)
     }
 
     /// Verify that an absent head is compatible with the sequence floor.
     /// Absence is valid only before this process or its persisted recovery state
     /// has authenticated any publication for the environment.
     pub fn verify_absent(&self) -> Result<(), HeadDocumentError> {
-        let minimum = self.minimum_sequence();
-        if minimum == 0 {
-            Ok(())
-        } else {
-            Err(HeadDocumentError::MissingBelowFloor { minimum })
+        match self.last_known_good() {
+            None => Ok(()),
+            Some(accepted) => Err(HeadDocumentError::MissingBelowFloor {
+                minimum: accepted.sequence,
+            }),
         }
     }
 }
@@ -919,7 +1022,7 @@ impl VerifiedRevisionManifest {
         self.0.sequence
     }
 
-    pub const fn authorization(&self) -> PublicationAuthorization {
+    fn authorization(&self) -> PublicationAuthorization {
         self.0.authorization
     }
 
@@ -927,15 +1030,74 @@ impl VerifiedRevisionManifest {
         self.0.idempotency_binding
     }
 
-    pub const fn desired_state_checksum(&self) -> Checksum {
+    fn desired_state_checksum(&self) -> Checksum {
         self.0.desired_state_checksum
     }
 
-    pub fn objects(&self) -> impl ExactSizeIterator<Item = (ImmutableObjectKind, Checksum)> + '_ {
+    fn objects(&self) -> impl ExactSizeIterator<Item = (ImmutableObjectKind, Checksum)> + '_ {
         self.0
             .objects
             .iter()
             .map(|reference| (reference.kind, reference.digest))
+    }
+}
+
+/// An authenticated manifest proven to be the current environment head at a
+/// strong object-store read and tied to that read's opaque version fence.
+///
+/// Unlike [`VerifiedRevisionManifest`], this wrapper is eligible for hydration.
+/// It has no public constructor: only [`BlobPublication::read_active_revision`]
+/// can establish that the signed manifest won head CAS and remained current
+/// through the final fence read.
+#[derive(Debug)]
+pub struct VerifiedActiveRevision {
+    manifest: VerifiedRevisionManifest,
+    revision: Checksum,
+    observed_head_version: ObjectVersion,
+    observed_head_digest: Checksum,
+}
+
+impl VerifiedActiveRevision {
+    pub fn environment(&self) -> &EnvironmentId {
+        self.manifest.environment()
+    }
+
+    pub const fn revision(&self) -> Checksum {
+        self.revision
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.manifest.sequence()
+    }
+
+    pub fn authorization(&self) -> PublicationAuthorization {
+        self.manifest.authorization()
+    }
+
+    pub fn desired_state_checksum(&self) -> Checksum {
+        self.manifest.desired_state_checksum()
+    }
+
+    pub fn objects(&self) -> impl ExactSizeIterator<Item = (ImmutableObjectKind, Checksum)> + '_ {
+        self.manifest.objects()
+    }
+
+    pub fn observed_head_version(&self) -> &ObjectVersion {
+        &self.observed_head_version
+    }
+}
+
+/// Single-use evidence that a [`VerifiedActiveRevision`] still matched the
+/// exact current head version immediately before local snapshot activation.
+///
+/// Future runtime activation accepts this type, not a history manifest or an
+/// unfenced active revision. It is deliberately not `Clone`.
+#[derive(Debug)]
+pub struct ActivationReadyRevision(VerifiedActiveRevision);
+
+impl ActivationReadyRevision {
+    pub fn active_revision(&self) -> &VerifiedActiveRevision {
+        &self.0
     }
 }
 
@@ -1216,6 +1378,8 @@ impl IdempotencyHistoryStatus {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BlobPublicationError {
     #[error(transparent)]
+    Authentication(#[from] PublicationAuthenticationError),
+    #[error(transparent)]
     Store(#[from] ObjectStoreError),
     #[error("stored environment head is invalid: {0}")]
     Head(HeadDocumentError),
@@ -1236,6 +1400,8 @@ pub enum BlobPublicationError {
     HistoryLimitExceeded { limit: usize },
     #[error("environment head sequence is exhausted")]
     SequenceOverflow,
+    #[error("the active revision changed while it was being fenced for activation")]
+    ActiveHeadChanged,
 }
 
 impl From<HeadDocumentError> for BlobPublicationError {
@@ -1254,6 +1420,7 @@ impl From<RevisionManifestError> for BlobPublicationError {
 struct ReadHead {
     document: HeadDocument,
     version: ObjectVersion,
+    body_digest: Checksum,
 }
 
 /// Provider-neutral immutable publisher over an [`ObjectStore`].
@@ -1286,16 +1453,22 @@ impl<S: ObjectStore> BlobPublication<S> {
         history_limit: IdempotencyHistoryLimit,
         signer: Arc<PublicationSigner>,
         trust: PublicationTrustStore,
-        minimum_sequence: u64,
-    ) -> Result<Self, PublicationAuthenticationError> {
+        last_known_good: Option<PublicationHeadState>,
+    ) -> Result<Self, BlobPublicationError> {
         // Refuse a publisher whose active signer is absent from bootstrap
         // trust. This prevents successful writes that no replica can verify.
         let challenge = b"axond.publication.bootstrap-trust.v1\0";
         let signature = signer.sign(challenge);
         trust.verify(&signature, challenge)?;
+        let sequence_guard = match last_known_good {
+            Some(state) => {
+                PublicationSequenceGuard::from_last_known_good(environment.clone(), state)?
+            }
+            None => PublicationSequenceGuard::new(environment.clone()),
+        };
         Ok(Self {
             store,
-            sequence_guard: PublicationSequenceGuard::new(environment.clone(), minimum_sequence),
+            sequence_guard,
             environment,
             history_limit,
             signer,
@@ -1309,6 +1482,67 @@ impl<S: ObjectStore> BlobPublication<S> {
 
     pub const fn history_limit(&self) -> IdempotencyHistoryLimit {
         self.history_limit
+    }
+
+    pub fn last_known_good_head(&self) -> Option<PublicationHeadState> {
+        self.sequence_guard.last_known_good()
+    }
+
+    /// Read, authenticate, and fence the current head and its exact manifest.
+    ///
+    /// The second strong head read prevents an orphaned manifest, a body from a
+    /// failed conditional request, or a head replaced during manifest loading
+    /// from crossing into hydration as active state.
+    pub async fn read_active_revision(
+        &self,
+    ) -> Result<Option<VerifiedActiveRevision>, BlobPublicationError> {
+        let Some(first_head) = self.read_head().await? else {
+            return Ok(None);
+        };
+        let manifest = self
+            .read_manifest(
+                first_head.document.active_revision,
+                first_head.document.sequence,
+            )
+            .await?;
+        let Some(fenced_head) = self.read_head().await? else {
+            return Err(BlobPublicationError::ActiveHeadChanged);
+        };
+        if fenced_head.version != first_head.version
+            || fenced_head.body_digest != first_head.body_digest
+            || &fenced_head.document.environment != manifest.environment()
+            || fenced_head.document.active_revision != first_head.document.active_revision
+            || fenced_head.document.sequence != first_head.document.sequence
+        {
+            return Err(BlobPublicationError::ActiveHeadChanged);
+        }
+        Ok(Some(VerifiedActiveRevision {
+            revision: fenced_head.document.active_revision,
+            observed_head_version: fenced_head.version,
+            observed_head_digest: fenced_head.body_digest,
+            manifest,
+        }))
+    }
+
+    /// Consume a hydrated active revision and re-read its exact head fence at
+    /// the activation boundary. Only the returned single-use wrapper is eligible
+    /// for local snapshot activation.
+    pub async fn fence_for_activation(
+        &self,
+        active: VerifiedActiveRevision,
+    ) -> Result<ActivationReadyRevision, BlobPublicationError> {
+        let Some(current) = self.read_head().await? else {
+            return Err(BlobPublicationError::ActiveHeadChanged);
+        };
+        if current.version != active.observed_head_version
+            || current.body_digest != active.observed_head_digest
+            || &current.document.environment != active.environment()
+            || current.document.active_revision != active.revision
+            || current.document.sequence != active.sequence()
+        {
+            return Err(BlobPublicationError::ActiveHeadChanged);
+        }
+        Ok(ActivationReadyRevision(active))
     }
 
     /// Report whether the complete retained history fits inside the configured
@@ -1435,7 +1669,11 @@ impl<S: ObjectStore> BlobPublication<S> {
 
         match final_write {
             Ok(_) => {
-                self.sequence_guard.observe(sequence)?;
+                // A successful native conditional write is authoritative commit
+                // evidence. If another writer has already advanced this shared
+                // guard, the older commit is still a truthful success. The guard
+                // continues to reject a different digest at this same sequence.
+                self.sequence_guard.observe_committed(sequence, revision)?;
                 Ok(PublicationOutcome {
                     revision,
                     sequence,
@@ -1468,6 +1706,7 @@ impl<S: ObjectStore> BlobPublication<S> {
             .await
         {
             Ok(value) => Ok(Some(ReadHead {
+                body_digest: Checksum::of(&value.bytes),
                 document: self.sequence_guard.verify_head(&value.bytes, &self.trust)?,
                 version: value.version,
             })),
@@ -1673,101 +1912,250 @@ fn fuzz_trust() -> PublicationTrustStore {
 }
 
 #[cfg(fuzzing)]
-pub(crate) fn fuzz_decode_head(bytes: &[u8]) -> Result<(), (&'static str, String)> {
-    let environment = EnvironmentId::parse("production-us-east").expect("fixed environment");
-    HeadDocument::verify(bytes, &environment, 0, &fuzz_trust())
-        .map(|_| ())
-        .map_err(|error| {
-            let code = match &error {
-                HeadDocumentError::Oversized { .. } => "head_oversized",
-                HeadDocumentError::Malformed => "head_malformed",
-                HeadDocumentError::Unsigned => "head_unsigned",
-                HeadDocumentError::UnknownSchema { .. } => "head_unknown_schema",
-                HeadDocumentError::InvalidEnvironment => "head_invalid_environment",
-                HeadDocumentError::EnvironmentMismatch => "head_environment_mismatch",
-                HeadDocumentError::InvalidDigest => "head_invalid_digest",
-                HeadDocumentError::ZeroSequence => "head_zero_sequence",
-                HeadDocumentError::UnknownIntegrityAlgorithm => "head_unknown_integrity_algorithm",
-                HeadDocumentError::InvalidIntegrityDigest => "head_invalid_integrity_digest",
-                HeadDocumentError::IntegrityMismatch => "head_integrity_mismatch",
-                HeadDocumentError::Authentication(error) => match error {
-                    PublicationAuthenticationError::UnknownSignatureSchema { .. } => {
-                        "head_unknown_signature_schema"
-                    }
-                    PublicationAuthenticationError::UnknownAlgorithm => "head_unknown_algorithm",
-                    PublicationAuthenticationError::UnknownKey => "head_unknown_key",
-                    PublicationAuthenticationError::InvalidSignatureEncoding => {
-                        "head_invalid_signature_encoding"
-                    }
-                    PublicationAuthenticationError::InvalidSignature => "head_invalid_signature",
-                    _ => "head_invalid_authentication",
-                },
-                HeadDocumentError::Rollback { .. } => "head_rollback",
-                HeadDocumentError::MissingBelowFloor { .. } => "head_missing_below_floor",
-                HeadDocumentError::NonCanonical => "head_non_canonical",
-            };
-            (code, error.to_string())
-        })
+fn fuzz_head_error(error: HeadDocumentError) -> (&'static str, String) {
+    let code = match &error {
+        HeadDocumentError::Oversized { .. } => "head_oversized",
+        HeadDocumentError::Malformed => "head_malformed",
+        HeadDocumentError::Unsigned => "head_unsigned",
+        HeadDocumentError::UnknownSchema { .. } => "head_unknown_schema",
+        HeadDocumentError::InvalidEnvironment => "head_invalid_environment",
+        HeadDocumentError::EnvironmentMismatch => "head_environment_mismatch",
+        HeadDocumentError::InvalidDigest => "head_invalid_digest",
+        HeadDocumentError::ZeroSequence => "head_zero_sequence",
+        HeadDocumentError::UnknownIntegrityAlgorithm => "head_unknown_integrity_algorithm",
+        HeadDocumentError::InvalidIntegrityDigest => "head_invalid_integrity_digest",
+        HeadDocumentError::IntegrityMismatch => "head_integrity_mismatch",
+        HeadDocumentError::Authentication(error) => match error {
+            PublicationAuthenticationError::UnknownSignatureSchema { .. } => {
+                "head_unknown_signature_schema"
+            }
+            PublicationAuthenticationError::UnknownAlgorithm => "head_unknown_algorithm",
+            PublicationAuthenticationError::UnknownKey => "head_unknown_key",
+            PublicationAuthenticationError::InvalidSignatureEncoding => {
+                "head_invalid_signature_encoding"
+            }
+            PublicationAuthenticationError::InvalidSignature => "head_invalid_signature",
+            _ => "head_invalid_authentication",
+        },
+        HeadDocumentError::Rollback { .. } => "head_rollback",
+        HeadDocumentError::Equivocation { .. } => "head_equivocation",
+        HeadDocumentError::MissingBelowFloor { .. } => "head_missing_below_floor",
+        HeadDocumentError::PersistedStateEnvironmentMismatch => {
+            "head_persisted_environment_mismatch"
+        }
+        HeadDocumentError::NonCanonical => "head_non_canonical",
+    };
+    (code, error.to_string())
 }
 
 #[cfg(fuzzing)]
-pub(crate) fn fuzz_decode_revision_manifest(bytes: &[u8]) -> Result<(), (&'static str, String)> {
-    let environment = EnvironmentId::parse("production-us-east").expect("fixed environment");
-    BlobRevisionManifest::decode_and_verify(bytes, &environment, Checksum::of(bytes), &fuzz_trust())
+fn fuzz_manifest_error(error: RevisionManifestError) -> (&'static str, String) {
+    let code = match &error {
+        RevisionManifestError::Oversized { .. } => "manifest_oversized",
+        RevisionManifestError::Malformed => "manifest_malformed",
+        RevisionManifestError::Unsigned => "manifest_unsigned",
+        RevisionManifestError::UnknownSchema { .. } => "manifest_unknown_schema",
+        RevisionManifestError::InvalidEnvironment => "manifest_invalid_environment",
+        RevisionManifestError::EnvironmentMismatch => "manifest_environment_mismatch",
+        RevisionManifestError::InvalidMutation => "manifest_invalid_mutation",
+        RevisionManifestError::UnknownMutationKind { .. } => "manifest_unknown_mutation_kind",
+        RevisionManifestError::DigestMismatch => "manifest_digest_mismatch",
+        RevisionManifestError::Authentication(error) => match error {
+            PublicationAuthenticationError::UnknownSignatureSchema { .. } => {
+                "manifest_unknown_signature_schema"
+            }
+            PublicationAuthenticationError::UnknownAlgorithm => "manifest_unknown_algorithm",
+            PublicationAuthenticationError::UnknownKey => "manifest_unknown_key",
+            PublicationAuthenticationError::InvalidSignatureEncoding => {
+                "manifest_invalid_signature_encoding"
+            }
+            PublicationAuthenticationError::InvalidSignature => "manifest_invalid_signature",
+            _ => "manifest_invalid_authentication",
+        },
+        RevisionManifestError::ZeroSequence => "manifest_zero_sequence",
+        RevisionManifestError::SequenceMismatch { .. } => "manifest_sequence_mismatch",
+        RevisionManifestError::ParentBeforeFirstSequence => "manifest_parent_before_first_sequence",
+        RevisionManifestError::MissingParentAfterFirstSequence { .. } => {
+            "manifest_missing_parent_after_first_sequence"
+        }
+        RevisionManifestError::TooManyObjects { .. } => "manifest_too_many_objects",
+        RevisionManifestError::NonCanonicalObjects => "manifest_non_canonical_objects",
+    };
+    (code, error.to_string())
+}
+
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_decode_head(
+    bytes: &[u8],
+    expected_environment: &str,
+    accepted: Option<(u64, [u8; 32])>,
+) -> Result<(), (&'static str, String)> {
+    let environment = EnvironmentId::parse(expected_environment.to_owned()).map_err(|error| {
+        (
+            "head_expected_environment_invalid",
+            format!("expected environment is invalid: {error}"),
+        )
+    })?;
+    let guard = match accepted {
+        Some((sequence, revision)) if sequence > 0 => {
+            PublicationSequenceGuard::from_last_known_good(
+                environment.clone(),
+                PublicationHeadState::new(
+                    environment.clone(),
+                    sequence,
+                    Checksum::from_bytes(revision),
+                )
+                .expect("a non-zero fuzz sequence forms persisted state"),
+            )
+            .expect("the fuzz state uses the expected environment")
+        }
+        _ => PublicationSequenceGuard::new(environment),
+    };
+    guard
+        .verify_head(bytes, &fuzz_trust())
         .map(|_| ())
-        .map_err(|error| {
-            let code = match &error {
-                RevisionManifestError::Oversized { .. } => "manifest_oversized",
-                RevisionManifestError::Malformed => "manifest_malformed",
-                RevisionManifestError::Unsigned => "manifest_unsigned",
-                RevisionManifestError::UnknownSchema { .. } => "manifest_unknown_schema",
-                RevisionManifestError::InvalidEnvironment => "manifest_invalid_environment",
-                RevisionManifestError::EnvironmentMismatch => "manifest_environment_mismatch",
-                RevisionManifestError::InvalidMutation => "manifest_invalid_mutation",
-                RevisionManifestError::UnknownMutationKind { .. } => {
-                    "manifest_unknown_mutation_kind"
-                }
-                RevisionManifestError::DigestMismatch => "manifest_digest_mismatch",
-                RevisionManifestError::Authentication(error) => match error {
-                    PublicationAuthenticationError::UnknownSignatureSchema { .. } => {
-                        "manifest_unknown_signature_schema"
-                    }
-                    PublicationAuthenticationError::UnknownAlgorithm => {
-                        "manifest_unknown_algorithm"
-                    }
-                    PublicationAuthenticationError::UnknownKey => "manifest_unknown_key",
-                    PublicationAuthenticationError::InvalidSignatureEncoding => {
-                        "manifest_invalid_signature_encoding"
-                    }
-                    PublicationAuthenticationError::InvalidSignature => {
-                        "manifest_invalid_signature"
-                    }
-                    _ => "manifest_invalid_authentication",
-                },
-                RevisionManifestError::ZeroSequence => "manifest_zero_sequence",
-                RevisionManifestError::SequenceMismatch { .. } => "manifest_sequence_mismatch",
-                RevisionManifestError::ParentBeforeFirstSequence => {
-                    "manifest_parent_before_first_sequence"
-                }
-                RevisionManifestError::MissingParentAfterFirstSequence { .. } => {
-                    "manifest_missing_parent_after_first_sequence"
-                }
-                RevisionManifestError::TooManyObjects { .. } => "manifest_too_many_objects",
-                RevisionManifestError::NonCanonicalObjects => "manifest_non_canonical_objects",
-            };
-            (code, error.to_string())
-        })
+        .map_err(fuzz_head_error)
+}
+
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_decode_revision_manifest(
+    bytes: &[u8],
+    expected_environment: &str,
+    expected_digest: [u8; 32],
+    expected_sequence: u64,
+    expected_parent: Option<[u8; 32]>,
+) -> Result<(), (&'static str, String)> {
+    let environment = EnvironmentId::parse(expected_environment.to_owned()).map_err(|error| {
+        (
+            "manifest_expected_environment_invalid",
+            format!("expected environment is invalid: {error}"),
+        )
+    })?;
+    let manifest = VerifiedRevisionManifest::verify(
+        bytes,
+        &environment,
+        Checksum::from_bytes(expected_digest),
+        expected_sequence,
+        &fuzz_trust(),
+    )
+    .map_err(fuzz_manifest_error)?;
+    if manifest.parent().map(|digest| *digest.as_bytes()) != expected_parent {
+        return Err((
+            "manifest_parent_mismatch",
+            "revision manifest parent does not match the independently expected link".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(fuzzing)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fuzz_verify_active_revision(
+    head_bytes: &[u8],
+    manifest_bytes: &[u8],
+    current_head_bytes: &[u8],
+    expected_environment: &str,
+    expected_digest: [u8; 32],
+    expected_sequence: u64,
+    expected_parent: Option<[u8; 32]>,
+    accepted: Option<(u64, [u8; 32])>,
+    observed_version: &str,
+    current_version: &str,
+) -> Result<(), (&'static str, String)> {
+    let environment = EnvironmentId::parse(expected_environment.to_owned()).map_err(|error| {
+        (
+            "active_expected_environment_invalid",
+            format!("expected environment is invalid: {error}"),
+        )
+    })?;
+    let guard = match accepted {
+        Some((sequence, revision)) if sequence > 0 => {
+            PublicationSequenceGuard::from_last_known_good(
+                environment.clone(),
+                PublicationHeadState::new(
+                    environment.clone(),
+                    sequence,
+                    Checksum::from_bytes(revision),
+                )
+                .expect("a non-zero fuzz sequence forms persisted state"),
+            )
+            .expect("the fuzz state uses the expected environment")
+        }
+        _ => PublicationSequenceGuard::new(environment.clone()),
+    };
+    let head = guard
+        .verify_head(head_bytes, &fuzz_trust())
+        .map_err(fuzz_head_error)?;
+    let manifest = VerifiedRevisionManifest::verify(
+        manifest_bytes,
+        &environment,
+        Checksum::from_bytes(expected_digest),
+        expected_sequence,
+        &fuzz_trust(),
+    )
+    .map_err(fuzz_manifest_error)?;
+    if manifest.parent().map(|digest| *digest.as_bytes()) != expected_parent {
+        return Err((
+            "active_parent_mismatch",
+            "active revision parent does not match the independently expected link".to_owned(),
+        ));
+    }
+    if head.active_revision() != Checksum::from_bytes(expected_digest)
+        || head.sequence() != expected_sequence
+        || head.environment() != manifest.environment()
+    {
+        return Err((
+            "active_orphan",
+            "authenticated manifest is not the exact revision selected by the head".to_owned(),
+        ));
+    }
+    let observed_head_version =
+        ObjectVersion::opaque(observed_version.to_owned()).map_err(|_| {
+            (
+                "active_invalid_observed_version",
+                "observed head version is invalid".to_owned(),
+            )
+        })?;
+    let active = VerifiedActiveRevision {
+        manifest,
+        revision: head.active_revision(),
+        observed_head_version,
+        observed_head_digest: Checksum::of(head_bytes),
+    };
+    let current = guard
+        .verify_head(current_head_bytes, &fuzz_trust())
+        .map_err(fuzz_head_error)?;
+    let current_version = ObjectVersion::opaque(current_version.to_owned()).map_err(|_| {
+        (
+            "active_invalid_current_version",
+            "current head version is invalid".to_owned(),
+        )
+    })?;
+    if current_version != active.observed_head_version
+        || Checksum::of(current_head_bytes) != active.observed_head_digest
+        || current.active_revision() != active.revision()
+        || current.sequence() != active.sequence()
+        || current.environment() != active.environment()
+    {
+        return Err((
+            "active_head_changed",
+            "active head changed before activation".to_owned(),
+        ));
+    }
+    let ready = ActivationReadyRevision(active);
+    let _ = ready.active_revision().objects().count();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use ring::rand::SystemRandom;
     use ring::signature::Ed25519KeyPair;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
 
     use crate::backends::object_store::{
         InMemoryObjectStore, ObjectStoreLimits, ObjectStoreOperation, ObjectValue,
@@ -1839,7 +2227,7 @@ mod tests {
     }
 
     fn verify_head(bytes: &[u8]) -> Result<HeadDocument, HeadDocumentError> {
-        HeadDocument::verify(bytes, &environment(), 0, &trust())
+        HeadDocument::verify(bytes, &environment(), &trust())
     }
 
     fn request(
@@ -1864,7 +2252,7 @@ mod tests {
             IdempotencyHistoryLimit::new(NonZeroUsize::new(32).expect("non-zero history")),
             signer(),
             trust(),
-            0,
+            None,
         )
         .expect("trusted test publisher")
     }
@@ -2011,6 +2399,7 @@ mod tests {
         inner: InMemoryObjectStore,
         replacements: Arc<AtomicUsize>,
         barrier: Arc<Barrier>,
+        candidate_heads: Arc<Mutex<Vec<Bytes>>>,
     }
 
     impl RacingStore {
@@ -2019,7 +2408,15 @@ mod tests {
                 inner: InMemoryObjectStore::new(limits()),
                 replacements: Arc::new(AtomicUsize::new(0)),
                 barrier: Arc::new(Barrier::new(2)),
+                candidate_heads: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn candidate_heads(&self) -> Vec<Bytes> {
+            self.candidate_heads
+                .lock()
+                .expect("candidate-head lock")
+                .clone()
         }
     }
 
@@ -2051,12 +2448,89 @@ mod tests {
             bytes: Bytes,
             expected: &ObjectVersion,
         ) -> Result<ObjectVersion, ObjectStoreError> {
+            if RecordingFaultStore::is_head(key) {
+                self.candidate_heads
+                    .lock()
+                    .expect("candidate-head lock")
+                    .push(bytes.clone());
+            }
             if RecordingFaultStore::is_head(key)
                 && self.replacements.fetch_add(1, Ordering::SeqCst) < 2
             {
                 self.barrier.wait().await;
             }
             self.inner.replace_if_version(key, bytes, expected).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct DelayedSuccessfulCasStore {
+        inner: InMemoryObjectStore,
+        delay_next_head_replace: Arc<AtomicBool>,
+        committed: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl DelayedSuccessfulCasStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryObjectStore::new(limits()),
+                delay_next_head_replace: Arc::new(AtomicBool::new(false)),
+                committed: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+            }
+        }
+
+        fn delay_next_head_replace(&self) {
+            self.delay_next_head_replace.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_until_committed(&self) {
+            self.committed.notified().await;
+        }
+
+        fn release_response(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for DelayedSuccessfulCasStore {
+        fn name(&self) -> &'static str {
+            "delayed-successful-cas"
+        }
+
+        fn limits(&self) -> ObjectStoreLimits {
+            self.inner.limits()
+        }
+
+        async fn get(&self, key: &ObjectKey) -> Result<ObjectValue, ObjectStoreError> {
+            self.inner.get(key).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &ObjectKey,
+            bytes: Bytes,
+        ) -> Result<ObjectVersion, ObjectStoreError> {
+            self.inner.put_if_absent(key, bytes).await
+        }
+
+        async fn replace_if_version(
+            &self,
+            key: &ObjectKey,
+            bytes: Bytes,
+            expected: &ObjectVersion,
+        ) -> Result<ObjectVersion, ObjectStoreError> {
+            let result = self.inner.replace_if_version(key, bytes, expected).await;
+            if result.is_ok()
+                && RecordingFaultStore::is_head(key)
+                && self.delay_next_head_replace.swap(false, Ordering::SeqCst)
+            {
+                self.committed.notify_one();
+                self.release.notified().await;
+            }
+            result
         }
     }
 
@@ -2158,7 +2632,7 @@ mod tests {
 
         let other_environment = EnvironmentId::parse("staging-us-east").expect("environment");
         assert_eq!(
-            HeadDocument::verify(&encoded, &other_environment, 0, &trust()),
+            HeadDocument::verify(&encoded, &other_environment, &trust()),
             Err(HeadDocumentError::EnvironmentMismatch)
         );
 
@@ -2177,7 +2651,7 @@ mod tests {
         let wrong_trust =
             PublicationTrustStore::new([wrong_signer.trusted_key()]).expect("wrong-key trust");
         assert_eq!(
-            HeadDocument::verify(&encoded, &environment(), 0, &wrong_trust),
+            HeadDocument::verify(&encoded, &environment(), &wrong_trust),
             Err(HeadDocumentError::Authentication(
                 PublicationAuthenticationError::InvalidSignature
             ))
@@ -2214,10 +2688,33 @@ mod tests {
             ))
         );
 
-        let guard = PublicationSequenceGuard::new(environment(), 0);
+        let guard = PublicationSequenceGuard::new(environment());
         guard
             .verify_head(&encoded, &trust())
             .expect("first verified observation");
+        let equivocated = HeadDocument::sign(
+            environment(),
+            Checksum::of(b"different-revision-seven"),
+            7,
+            &signer,
+        )
+        .expect("signed same-sequence candidate")
+        .encode();
+        assert_eq!(
+            guard.verify_head(&equivocated, &trust()),
+            Err(HeadDocumentError::Equivocation { sequence: 7 })
+        );
+        let persisted = guard
+            .last_known_good()
+            .expect("accepted tuple is persistable with last-known-good state");
+        assert_eq!(persisted.sequence(), 7);
+        assert_eq!(persisted.active_revision(), head.active_revision());
+        let restored = PublicationSequenceGuard::from_last_known_good(environment(), persisted)
+            .expect("matching persisted environment");
+        assert_eq!(
+            restored.verify_head(&equivocated, &trust()),
+            Err(HeadDocumentError::Equivocation { sequence: 7 })
+        );
         let older = HeadDocument::sign(environment(), Checksum::of(b"revision-six"), 6, &signer)
             .expect("signed older head")
             .encode();
@@ -2232,6 +2729,13 @@ mod tests {
             guard.verify_absent(),
             Err(HeadDocumentError::MissingBelowFloor { minimum: 7 })
         );
+        assert!(matches!(
+            PublicationSequenceGuard::from_last_known_good(
+                EnvironmentId::parse("staging-us-east").expect("other environment"),
+                restored.last_known_good().expect("restored state"),
+            ),
+            Err(HeadDocumentError::PersistedStateEnvironmentMismatch)
+        ));
     }
 
     #[test]
@@ -2471,7 +2975,7 @@ mod tests {
             )
             .expect("signed rotation head")
             .encode();
-            HeadDocument::verify(&head, &environment(), sequence, &overlap)
+            HeadDocument::verify(&head, &environment(), &overlap)
                 .expect("both rotation keys verify during overlap");
         }
 
@@ -2484,9 +2988,11 @@ mod tests {
                 IdempotencyHistoryLimit::new(NonZeroUsize::new(32).expect("non-zero history")),
                 first,
                 only_next,
-                0,
+                None,
             ),
-            Err(PublicationAuthenticationError::UnknownKey)
+            Err(BlobPublicationError::Authentication(
+                PublicationAuthenticationError::UnknownKey
+            ))
         ));
     }
 
@@ -2541,6 +3047,8 @@ mod tests {
 
     #[test]
     fn signed_publication_fixture_is_stable() {
+        const GOLDEN_HEAD_JSON: &[u8] = br#"{"schema_version":2,"environment":"production-us-east","active_revision":"sha256:6ea3fd50ccba76800b4abb561a493444e25e4d96ceaf320380463486305cd21b","sequence":1,"integrity":{"algorithm":"sha256","digest":"sha256:b2c01593dcda9f6366e29e8d0c8f21762fd76644235d0317930d2c00c876589f"},"signature":{"schema_version":1,"algorithm":"ed25519.v1","key_id":"publication-test-key","value":"9o1bl3TuB5OPRqIh9EUCx+oYtganaIM4juQxYXCcneKhzgdQvTBx1hrhKWRvjdwCCQIEmdOqUZWboAAZB3kjBw=="}}"#;
+        const GOLDEN_MANIFEST_HEX: &str = "89027270726f64756374696f6e2d75732d65617374f601845820c0991cc807e3413f06bd2bf4c5bbf7ada90a7fd582e6118e3977eb14c6c472da582002b4c82550fcdb3c92a64dddaf432431d799c2344b1d267fcc4382399b2b810478286d75745f30303030303030302d303030372d373030302d383030302d30303030303030303030303701582073da978fc920dc227620f34471456278f98757153bf1370d38c379d1483457385820b9ad48944f82c957434b2b685f84dba072cc3f374cf0bb0dc37099314667658081820058206c55db91b286de87672c4c31249a66c81d7846dae704175c0b5384ea38fc562084016a656432353531392e7631747075626c69636174696f6e2d746573742d6b657958402c0a2f1309f14bc1f7a230e673c41c186151a75856b045a241fa449a3607197b785624156a193298604af4e4e0e5d92e33668418658e1413a9f35e309e82ea0e";
         let manifest = BlobRevisionManifest::sign(
             environment(),
             None,
@@ -2556,9 +3064,15 @@ mod tests {
         )
         .expect("fixture manifest");
         let manifest = manifest.encode().expect("fixture manifest bytes");
+        let manifest_hex = manifest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(manifest_hex, GOLDEN_MANIFEST_HEX);
         let head = HeadDocument::sign(environment(), Checksum::of(&manifest), 1, &signer())
             .expect("fixture head")
             .encode();
+        assert_eq!(head.as_ref(), GOLDEN_HEAD_JSON);
         assert!(verify_head(&head).is_ok());
         assert!(
             VerifiedRevisionManifest::verify(
@@ -2571,7 +3085,7 @@ mod tests {
             .is_ok()
         );
         assert_eq!(
-            HeadDocument::verify(&head, &environment(), 0, &trust())
+            HeadDocument::verify(&head, &environment(), &trust())
                 .expect("verified fixture head")
                 .encode(),
             head
@@ -2696,6 +3210,12 @@ mod tests {
             .get(&unreachable_key)
             .await
             .expect("immutable upload remains safely unreachable");
+        let active = publication
+            .read_active_revision()
+            .await
+            .expect("the current head still fences")
+            .expect("the first revision remains active");
+        assert_eq!(active.revision(), first.revision);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2750,6 +3270,201 @@ mod tests {
                 .count(),
             1
         );
+
+        let current = store
+            .inner
+            .get(&environment_head_key(&environment()))
+            .await
+            .expect("winning head");
+        let candidates = store.candidate_heads();
+        assert_eq!(candidates.len(), 2, "both signed CAS bodies were captured");
+        let losing = candidates
+            .iter()
+            .find(|candidate| candidate.as_ref() != current.bytes.as_ref())
+            .expect("one attempted head lost CAS");
+        let losing_head = HeadDocument::verify(losing, &environment(), &trust())
+            .expect("the losing candidate is still authentically signed");
+        let winner = verify_head(&current.bytes).expect("winning head is signed");
+        assert_eq!(losing_head.sequence(), winner.sequence());
+        assert_ne!(losing_head.active_revision(), winner.active_revision());
+
+        let persisted = publication
+            .last_known_good_head()
+            .expect("winner tuple is retained for last-known-good recovery");
+        assert_eq!(persisted.active_revision(), winner.active_revision());
+        let replay_guard = PublicationSequenceGuard::from_last_known_good(environment(), persisted)
+            .expect("persisted winner state");
+        assert_eq!(
+            replay_guard.verify_head(losing, &trust()),
+            Err(HeadDocumentError::Equivocation {
+                sequence: winner.sequence(),
+            })
+        );
+
+        let losing_manifest = store
+            .inner
+            .get(&revision_manifest_key(losing_head.active_revision()))
+            .await
+            .expect("losing immutable manifest remains stored");
+        VerifiedRevisionManifest::verify(
+            &losing_manifest.bytes,
+            &environment(),
+            losing_head.active_revision(),
+            losing_head.sequence(),
+            &trust(),
+        )
+        .expect("a signed CAS loser remains valid history, but not active state");
+        let active = publication
+            .read_active_revision()
+            .await
+            .expect("current active read")
+            .expect("active revision");
+        assert_eq!(active.revision(), winner.active_revision());
+        assert_ne!(active.revision(), losing_head.active_revision());
+    }
+
+    #[tokio::test]
+    async fn committed_winner_returns_success_after_shared_guard_observes_a_newer_head() {
+        let store = Arc::new(DelayedSuccessfulCasStore::new());
+        let publication = publisher(Arc::clone(&store));
+        let first = publication
+            .publish(request(
+                ExpectedHead::Empty,
+                "first",
+                b"state-1",
+                immutable(b"namespace-1"),
+            ))
+            .await
+            .expect("first publication");
+
+        store.delay_next_head_replace();
+        let delayed = tokio::spawn({
+            let publication = publication.clone();
+            async move {
+                publication
+                    .publish(request(
+                        ExpectedHead::Revision(first.revision),
+                        "delayed-second",
+                        b"state-2",
+                        immutable(b"namespace-2"),
+                    ))
+                    .await
+            }
+        });
+        store.wait_until_committed().await;
+
+        let committed_second = verify_head(
+            &store
+                .inner
+                .get(&environment_head_key(&environment()))
+                .await
+                .expect("second head committed before its response")
+                .bytes,
+        )
+        .expect("committed second head");
+        let third = publication
+            .publish(request(
+                ExpectedHead::Revision(committed_second.active_revision()),
+                "third",
+                b"state-3",
+                immutable(b"namespace-3"),
+            ))
+            .await
+            .expect("newer publication advances the shared guard");
+        assert_eq!(third.sequence, 3);
+
+        store.release_response();
+        let second = delayed
+            .await
+            .expect("delayed publisher task")
+            .expect("its already-durable CAS remains truthful success");
+        assert_eq!(second.sequence, 2);
+        assert_eq!(second.revision, committed_second.active_revision());
+        let accepted = publication
+            .last_known_good_head()
+            .expect("newest tuple remains accepted");
+        assert_eq!(accepted.sequence(), 3);
+        assert_eq!(accepted.active_revision(), third.revision);
+    }
+
+    #[tokio::test]
+    async fn only_the_current_fenced_head_can_cross_from_history_into_activation() {
+        let store = Arc::new(InMemoryObjectStore::new(limits()));
+        let publication = publisher(Arc::clone(&store));
+
+        let orphan = BlobRevisionManifest::sign(
+            environment(),
+            None,
+            1,
+            authorization(),
+            Checksum::of(b"orphan-idempotency"),
+            Checksum::of(b"orphan-state"),
+            Vec::new(),
+            &signer(),
+        )
+        .expect("signed orphan manifest")
+        .encode()
+        .expect("orphan bytes");
+        let orphan_revision = Checksum::of(&orphan);
+        store
+            .put_if_absent(&revision_manifest_key(orphan_revision), orphan.clone())
+            .await
+            .expect("orphan immutable upload");
+        VerifiedRevisionManifest::verify(&orphan, &environment(), orphan_revision, 1, &trust())
+            .expect("the orphan is authenticated history material");
+        assert!(
+            publication
+                .read_active_revision()
+                .await
+                .expect("absent head is a valid empty environment")
+                .is_none(),
+            "a signed orphan cannot manufacture an active wrapper"
+        );
+
+        let first = publication
+            .publish(request(
+                ExpectedHead::Empty,
+                "active-first",
+                b"state-1",
+                immutable(b"namespace-1"),
+            ))
+            .await
+            .expect("first active publication");
+        let active = publication
+            .read_active_revision()
+            .await
+            .expect("active revision read")
+            .expect("active revision");
+        assert_eq!(active.revision(), first.revision);
+
+        let second = publication
+            .publish(request(
+                ExpectedHead::Revision(first.revision),
+                "active-second",
+                b"state-2",
+                immutable(b"namespace-2"),
+            ))
+            .await
+            .expect("head advances before the old candidate activates");
+        assert_eq!(second.sequence, 2);
+        assert_eq!(
+            publication
+                .fence_for_activation(active)
+                .await
+                .expect_err("a stale observed version cannot activate"),
+            BlobPublicationError::ActiveHeadChanged
+        );
+
+        let current = publication
+            .read_active_revision()
+            .await
+            .expect("current active revision")
+            .expect("current head");
+        let activation = publication
+            .fence_for_activation(current)
+            .await
+            .expect("unchanged exact version is activation-ready");
+        assert_eq!(activation.active_revision().revision(), second.revision);
     }
 
     #[tokio::test]
@@ -2947,7 +3662,7 @@ mod tests {
             IdempotencyHistoryLimit::new(NonZeroUsize::new(1).expect("non-zero history")),
             signer(),
             trust(),
-            0,
+            None,
         )
         .expect("trusted bounded publisher");
         let searchable = bounded

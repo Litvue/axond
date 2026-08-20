@@ -154,10 +154,13 @@ period.
 Before hydration, both head and manifest must pass the authenticated blob-v2
 contract from ADR 0062. Bootstrap trust is verification-only on replicas; an
 administrative publisher must prove its selected Ed25519 signer is present in
-that trust set before it can write. Convergence consumes
-`VerifiedRevisionManifest`, never raw or merely parsed CBOR. It persists the
-highest authenticated environment sequence beside last-known-good state and
-refuses a signed older or missing head below that floor. Unsigned blob v2 and
+that bounded trust set before it can write. `VerifiedRevisionManifest` is only
+authenticated history evidence. Convergence hydrates a `VerifiedActiveRevision`
+selected by the current strongly read head and activates only after consuming a
+final unchanged-version fence. It persists the highest authenticated
+`(sequence, active_revision)` tuple beside last-known-good state and refuses a
+signed older or missing head as rollback and a different digest at the same
+sequence as equivocation. Unsigned blob v2 and
 the unsigned schema-1 prototype are not migration inputs. PostgreSQL export
 must create newly signed blob-v2 documents while leaving the PostgreSQL journal
 format unchanged.

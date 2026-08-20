@@ -201,6 +201,7 @@ revision.
 
 Serving replicas bootstrap with a verification-only key set. Publishers hold a
 private signer and refuse to start unless that signer is in the same trust set.
+Bootstrap trust is bounded to 64 keys total, including rotation overlap.
 Unknown key ids, algorithms, signature schemas, malformed signatures, and
 invalid signatures are distinct typed refusals. Raw actor/grant inputs and raw
 idempotency keys are domain-separated digests in durable metadata; signing key
@@ -211,12 +212,24 @@ manifest, or last-known-good record depends on it.
 
 There is deliberately no public parse-only manifest API. Untrusted bytes can
 become a `VerifiedRevisionManifest` only after content-address, canonical-form,
-environment, sequence/parent shape, and signature verification. Hydration and
-future runtime wiring consume that verified type. A per-environment monotonic
-sequence guard raises its floor after every verified read and successful write;
-a valid older head or an absent head below that floor is rollback, not recovery.
-The floor must be persisted beside the last-known-good record for rollback
-resistance across process restarts.
+environment, sequence/parent shape, and signature verification, but that type is
+history evidence only: a valid signature does not prove that its candidate won
+head CAS. Hydration requires `VerifiedActiveRevision`, which is produced only by
+reading a verified head with its opaque `ObjectVersion`, loading the exact
+environment/revision/sequence manifest it selects, and strongly re-reading an
+unchanged head/version fence. Immediately before local snapshot activation the
+fence is read again and consumed as a non-cloneable `ActivationReadyRevision`.
+Neither an orphaned immutable manifest nor a signed body retained from a failed
+conditional request can manufacture either active wrapper.
+
+The per-environment guard retains `(sequence, active_revision)`, not sequence
+alone. A valid older head or an absent head below that state is rollback; a
+different digest at the same sequence is typed equivocation. The complete tuple
+must be persisted beside the last-known-good record for rollback and
+equivocation resistance across restart. A successful native conditional write
+is authoritative commit evidence: it still returns truthful success if another
+writer has already advanced the shared guard to a newer sequence, while a
+same-sequence digest contradiction remains an error.
 
 ### Publication is immutable upload followed by one CAS
 
@@ -237,6 +250,16 @@ The head never references an object that was not successfully written. A crash
 before the final compare-and-swap leaves unreachable immutable objects, not a
 partial revision. A losing concurrent publisher receives a typed conflict,
 re-reads, and rebuilds; it never retries a stale head update as last-writer-wins.
+
+The storage trust boundary requires strong exact-key reads, opaque versions that
+change on every successful write, and native create/replace preconditions with a
+single winner. Providers, proxies, or diagnostics may retain failed conditional
+request bodies, but those bytes are untrusted input: activation accepts only the
+body currently returned for the head key with its matching version fence. A
+captured signed loser replayed at the winner's sequence is equivocation, and an
+older committed body replayed after advancement is rollback. A store that lies
+about conditional-write success or serves a version token for different bytes
+violates the adapter contract and must be treated as an integrity failure.
 
 Administrative mutations are declarative. Callers choose stable resource IDs
 and send an expected revision and idempotency key. The immutable revision binds

@@ -15,6 +15,8 @@ pub const PUBLICATION_SIGNATURE_SCHEMA: u64 = 1;
 pub const ED25519_V1_ALGORITHM: &str = "ed25519.v1";
 const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 const ED25519_SIGNATURE_BYTES: usize = 64;
+/// Maximum number of overlapping publication verification keys accepted at boot.
+pub const MAX_PUBLICATION_TRUST_KEYS: usize = 64;
 
 /// A bounded, non-secret identifier for one publication verification key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -124,6 +126,11 @@ impl PublicationTrustStore {
     ) -> Result<Self, PublicationAuthenticationError> {
         let mut indexed = BTreeMap::new();
         for key in keys {
+            if indexed.len() == MAX_PUBLICATION_TRUST_KEYS {
+                return Err(PublicationAuthenticationError::TooManyKeys {
+                    limit: MAX_PUBLICATION_TRUST_KEYS,
+                });
+            }
             let key_id = key.key_id.clone();
             if indexed.insert(key_id.clone(), key).is_some() {
                 return Err(PublicationAuthenticationError::DuplicateKey { key_id });
@@ -283,6 +290,8 @@ impl PublicationSignature {
 pub enum PublicationAuthenticationError {
     #[error("publication trust must contain at least one verification key")]
     EmptyTrustStore,
+    #[error("publication trust exceeds the {limit}-key limit")]
+    TooManyKeys { limit: usize },
     #[error("publication trust contains duplicate key identifier `{key_id}`")]
     DuplicateKey { key_id: PublicationKeyId },
     #[error("publication key identifier is invalid")]
@@ -301,4 +310,31 @@ pub enum PublicationAuthenticationError {
     InvalidSignatureEncoding,
     #[error("publication signature is invalid")]
     InvalidSignature,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(index: usize) -> TrustedPublicationKey {
+        TrustedPublicationKey::ed25519_v1(
+            PublicationKeyId::parse(format!("test-key-{index:03}"))
+                .expect("bounded synthetic key id"),
+            &[index as u8; ED25519_PUBLIC_KEY_BYTES],
+        )
+        .expect("fixed-width synthetic public key")
+    }
+
+    #[test]
+    fn trust_store_accepts_its_limit_and_refuses_one_more_key() {
+        PublicationTrustStore::new((0..MAX_PUBLICATION_TRUST_KEYS).map(key))
+            .expect("the documented trust bound is accepted");
+        assert_eq!(
+            PublicationTrustStore::new((0..=MAX_PUBLICATION_TRUST_KEYS).map(key))
+                .expect_err("one key over the trust bound must fail closed"),
+            PublicationAuthenticationError::TooManyKeys {
+                limit: MAX_PUBLICATION_TRUST_KEYS,
+            }
+        );
+    }
 }

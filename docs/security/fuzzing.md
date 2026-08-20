@@ -29,7 +29,7 @@ feature, and what that costs.
 | `provider_stream` | The provider stream decoders: OpenAI chat and Responses, Azure AI Foundry, Anthropic translated into OpenAI chunks, and a native Anthropic relay | Every streamed response, once framed |
 | `provider_error` | `ProviderError::from_upstream` and `ProviderError::transport`, and the classification, retry, and health judgements built on them | Every non-2xx or failed upstream call |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission over the last-known-good catalogue | The scheduled catalogue refresh, unattended |
-| `publication_parsers` | Signed `PublicationSequenceGuard::verify_head` and deterministic CBOR `VerifiedRevisionManifest` verification | Stateful convergence and administrative publication read durable object-store bytes |
+| `publication_parsers` | Signed tuple-guard verification, deterministic CBOR history verification, `VerifiedActiveRevision`, and final activation fencing | Stateful convergence and administrative publication read durable object-store bytes |
 
 Every target asserts the same three properties, because they are what the
 gateway relies on.
@@ -130,19 +130,27 @@ run against a document a third party publishes:
   wrapper of the wrong shape is still a refusal, and the fuzz corpus carries
   both shapes so a future default cannot appear unnoticed.
 
-The publication target drives the production parsers for both mutable head JSON
-and immutable revision-manifest CBOR, including real Ed25519 verification under
-a committed synthetic public key. It requires deterministic outcomes, non-empty
-typed refusals, accepted signed canonical fixtures, explicit oversized refusals,
-and the schema, environment, integrity, signing algorithm/key/schema, signature,
-sequence, CBOR-length, and object-count bounds. Seeds pin unsigned v2 refusal,
-cross-environment replay, modified signatures, and unknown algorithms in
-addition to malformed input. Manifest corpus files use a documented
+The publication target drives the production tuple guard, mutable head JSON,
+immutable revision-manifest CBOR, active wrapper, and unchanged-version
+activation fence, including real Ed25519 verification under a committed
+synthetic public key. Structured mutations independently select expected digest,
+sequence, environment, parent, prior accepted tuple, and observed/current object
+versions, making digest mismatch, rollback, equivocation, orphan, and changed
+fence outcomes reachable without forging a signature. It requires deterministic
+outcomes, non-empty typed refusals, accepted signed canonical fixtures, explicit
+oversized refusals, and the schema, environment, integrity, signing
+algorithm/key/schema, signature, sequence, CBOR-length, and object-count bounds.
+Every committed publication seed has an exact expected outcome pin. Seeds include
+unsigned v2, cross-environment replay, modified signatures, unknown algorithms,
+same-sequence/different-revision equivocation, digest mismatch, and a valid signed
+orphan that cannot become active. Manifest corpus files use a documented
 `manifest-hex:` envelope so the
 committed seed remains reviewable even though valid deterministic CBOR begins
 with non-UTF-8 bytes; canonical JSON uses `head-json:` so the corpus line ending
 is not treated as stored content. The harness removes those envelopes before
-invoking the real parsers, while arbitrary fuzzer bytes reach both unchanged.
+invoking the real parsers. `publication-probe:` seeds combine fixed signed golden
+documents with independently selected verification/fence expectations; arbitrary
+fuzzer bytes also decode into independently mutable probe fields.
 The committed `manifest-oversized` sentinel expands under the smoke allocator
 cap to one byte beyond the 1 MiB production ceiling, which the general 64 KiB
 seed derivation cannot reach.
