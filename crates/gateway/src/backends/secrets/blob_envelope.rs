@@ -8,29 +8,32 @@
 //! A stored object is one deterministic canonical-CBOR fixed array:
 //!
 //! ```text
-//! [1, "aes256-gcm.envelope.v2", kek_id,
-//!  dek_nonce, wrapped_dek, material_nonce, ciphertext]
+//! [2, "aes256-kw.aes256-gcm.envelope.v2", kek_id,
+//!  wrapped_dek, material_nonce, ciphertext]
 //! ```
 //!
 //! The deployment environment, namespace owner, and exact [`SecretRef`] are
 //! intentionally absent. They come from an authenticated desired-state
 //! manifest and are authenticated as binary, length-prefixed additional data
-//! for both AEAD operations. Copying an object to another environment,
-//! namespace, secret id, or version therefore cannot make it open.
+//! for the material AEAD. The fixed 32-byte DEK is wrapped with nonce-free RFC
+//! 3394 AES-256-KW. Copying an object to another environment, namespace, secret
+//! id, version, or KEK id therefore cannot make the complete object open.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use aes_kw::{KeyInit as _, KwAes256};
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
+use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
-use secrecy::zeroize::Zeroize;
+use secrecy::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::SecretMaterial;
 use crate::desired_state::secrets::SecretRef;
 use crate::namespace::NamespaceId;
 
 /// The scheme identifier stored in every v2 blob envelope.
-pub const SCHEME: &str = "aes256-gcm.envelope.v2";
+pub const SCHEME: &str = "aes256-kw.aes256-gcm.envelope.v2";
 
 /// AES-256 key size, for key-encryption keys and per-secret data keys.
 pub const KEY_BYTES: usize = 32;
@@ -39,23 +42,26 @@ pub const KEY_BYTES: usize = 32;
 pub const MAX_PLAINTEXT_BYTES: usize = 64 * 1024;
 
 const TAG_BYTES: usize = 16;
-const WRAPPED_DEK_BYTES: usize = KEY_BYTES + TAG_BYTES;
+const AES_KW_INTEGRITY_BYTES: usize = 8;
+const WRAPPED_DEK_BYTES: usize = KEY_BYTES + AES_KW_INTEGRITY_BYTES;
 const MAX_CIPHERTEXT_BYTES: usize = MAX_PLAINTEXT_BYTES + TAG_BYTES;
 const MAX_KEK_ID_BYTES: usize = 64;
 const MAX_ENVIRONMENT_ID_BYTES: usize = 63;
-const FIELD_COUNT: u8 = 7;
-const SCHEMA_VERSION: u8 = 1;
+const FIELD_COUNT: u8 = 6;
+const SCHEMA_VERSION: u8 = 2;
 const AAD_DOMAIN: &[u8] = b"axond.secret.envelope.v2\0";
+
+/// Maximum number of KEKs admitted at one time, including the active key.
+pub const MAX_KEK_RING_KEYS: usize = 8;
 
 /// Maximum canonical encoded object size, including the largest legal KEK id.
 ///
 /// Kept as a literal expression over format fields so a format edit cannot
 /// silently invalidate the pre-parse allocation bound.
-pub const MAX_SEALED_BYTES: usize = 1 // seven-element array
+pub const MAX_SEALED_BYTES: usize = 1 // six-element array
     + 1 // schema version
-    + 1 + SCHEME.len() // scheme text
+    + 2 + SCHEME.len() // scheme text (u8 length argument)
     + 2 + MAX_KEK_ID_BYTES // KEK id text (one-byte length argument)
-    + 1 + NONCE_LEN // DEK nonce
     + 2 + WRAPPED_DEK_BYTES // wrapped DEK
     + 1 + NONCE_LEN // material nonce
     + 5 + MAX_CIPHERTEXT_BYTES; // ciphertext (u32 length argument at the ceiling)
@@ -177,48 +183,56 @@ impl fmt::Display for KekId {
 
 /// A consumed, zeroizing bootstrap KEK.
 ///
-/// Construction accepts exactly 32 bytes. There is no byte accessor, formatter,
-/// serializer, or clone; conversion into a ring copies the bytes into `ring`'s
-/// opaque key and zeroizes this staging buffer immediately.
-pub struct KekMaterial([u8; KEY_BYTES]);
+/// Construction accepts exactly 32 bytes in an already-zeroizing owned buffer.
+/// There is no public byte accessor, formatter, serializer, or clone. Ring
+/// construction consumes and zeroizes this staging value after expanding it.
+pub(super) struct KekMaterial(Zeroizing<[u8; KEY_BYTES]>);
 
 impl KekMaterial {
-    pub fn from_array(bytes: [u8; KEY_BYTES]) -> Self {
-        Self(bytes)
+    #[cfg(test)]
+    fn from_array(bytes: [u8; KEY_BYTES]) -> Self {
+        Self(Zeroizing::new(bytes))
     }
 
     /// Consume a dynamically sized bootstrap value, refusing any non-AES-256
-    /// length and zeroizing the consumed buffer on both success and failure.
-    pub fn from_bytes(mut bytes: Vec<u8>) -> Result<Self, KekRingError> {
+    /// length. The caller cannot accidentally pass a non-zeroizing owner.
+    pub(super) fn from_owned(bytes: Zeroizing<Vec<u8>>) -> Result<Self, KekRingError> {
         if bytes.len() != KEY_BYTES {
-            let found = bytes.len();
-            bytes.zeroize();
-            return Err(KekRingError::KeyLength { found });
+            return Err(KekRingError::KeyLength { found: bytes.len() });
         }
         let mut exact = [0_u8; KEY_BYTES];
         exact.copy_from_slice(&bytes);
-        bytes.zeroize();
-        Ok(Self(exact))
+        Ok(Self(Zeroizing::new(exact)))
     }
 
-    fn into_key(mut self) -> Result<LessSafeKey, KekRingError> {
-        let result = UnboundKey::new(&AES_256_GCM, &self.0)
-            .map(LessSafeKey::new)
-            .map_err(|_| KekRingError::KeyRejected);
-        self.0.zeroize();
-        result
+    fn fingerprint(&self) -> KekFingerprint {
+        let value = digest(&SHA256, self.0.as_ref());
+        let mut fingerprint = [0_u8; 32];
+        fingerprint.copy_from_slice(value.as_ref());
+        KekFingerprint(fingerprint)
     }
-}
 
-impl Drop for KekMaterial {
-    fn drop(&mut self) {
-        self.0.zeroize();
+    fn into_key(self) -> Result<KwAes256, KekRingError> {
+        KwAes256::new_from_slice(self.0.as_ref()).map_err(|_| KekRingError::KeyRejected)
     }
 }
 
 impl fmt::Debug for KekMaterial {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("KekMaterial(<redacted>)")
+    }
+}
+
+/// SHA-256 equality token used only while building a ring.
+///
+/// It is deliberately private, has no formatter or accessor, and is zeroized
+/// even though a KEK fingerprint is not itself key material.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct KekFingerprint([u8; 32]);
+
+impl Drop for KekFingerprint {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -230,23 +244,47 @@ pub enum KekRingError {
     KeyRejected,
     #[error("the key ring already contains that KEK identifier")]
     DuplicateId,
+    #[error("different KEK identifiers must not alias the same key material")]
+    DuplicateMaterial,
+    #[error("a key ring contains more than the {maximum}-key limit")]
+    TooMany { maximum: usize },
 }
 
 /// Authenticated identity supplied alongside an immutable ciphertext object.
 ///
 /// This type has no formatter so a caller cannot accidentally render the AAD.
 #[derive(Clone, Copy)]
-pub struct BlobSecretContext<'a> {
-    pub environment: &'a EnvironmentId,
-    pub namespace: &'a NamespaceId,
-    pub reference: &'a SecretRef,
+pub(super) struct BlobSecretContext<'a> {
+    environment: &'a EnvironmentId,
+    namespace: &'a NamespaceId,
+    reference: &'a SecretRef,
+}
+
+impl<'a> BlobSecretContext<'a> {
+    /// Construct context only after the publisher or hydrator has validated the
+    /// authenticated manifest and its immutable object reference.
+    ///
+    /// Keeping fields private prevents ad-hoc struct literals. Callers inside
+    /// the secrets backend must make the authentication boundary explicit here.
+    pub(super) const fn from_authenticated_manifest(
+        environment: &'a EnvironmentId,
+        namespace: &'a NamespaceId,
+        reference: &'a SecretRef,
+    ) -> Self {
+        Self {
+            environment,
+            namespace,
+            reference,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum AadPurpose {
-    WrapDek = 1,
-    Material = 2,
+    Material = 1,
+    #[cfg(any(test, fuzzing))]
+    InvalidTestDomain = 255,
 }
 
 /// A strict parser refusal. No variant carries rejected bytes or text.
@@ -297,7 +335,6 @@ pub enum BlobEnvelopeError {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SealedBlobSecret {
     kek_id: KekId,
-    dek_nonce: [u8; NONCE_LEN],
     wrapped_dek: [u8; WRAPPED_DEK_BYTES],
     material_nonce: [u8; NONCE_LEN],
     ciphertext: Vec<u8>,
@@ -328,7 +365,6 @@ impl SealedBlobSecret {
         encoded.push(SCHEMA_VERSION);
         encode_text(&mut encoded, SCHEME);
         encode_text(&mut encoded, self.kek_id.as_str());
-        encode_bytes(&mut encoded, &self.dek_nonce);
         encode_bytes(&mut encoded, &self.wrapped_dek);
         encode_bytes(&mut encoded, &self.material_nonce);
         encode_bytes(&mut encoded, &self.ciphertext);
@@ -348,14 +384,12 @@ impl SealedBlobSecret {
         let kek_text = reader.text(MAX_KEK_ID_BYTES)?;
         let kek_text = std::str::from_utf8(kek_text).map_err(|_| CodecError::KekId)?;
         let kek_id = KekId::parse(kek_text).map_err(|_| CodecError::KekId)?;
-        let dek_nonce = reader.bytes_exact::<NONCE_LEN>()?;
         let wrapped_dek = reader.bytes_exact::<WRAPPED_DEK_BYTES>()?;
         let material_nonce = reader.bytes_exact::<NONCE_LEN>()?;
         let ciphertext = reader.bytes_bounded(TAG_BYTES + 1, MAX_CIPHERTEXT_BYTES)?;
         reader.finish()?;
         let sealed = Self {
             kek_id,
-            dek_nonce,
             wrapped_dek,
             material_nonce,
             ciphertext: ciphertext.to_vec(),
@@ -374,9 +408,9 @@ impl SealedBlobSecret {
 /// New objects always name `active`. Opening selects the exact stored id, so a
 /// rolling KEK rotation can retain old keys without ever encrypting new material
 /// under them.
-pub struct KekRing {
+pub(super) struct KekRing {
     active: KekId,
-    keys: BTreeMap<KekId, LessSafeKey>,
+    keys: BTreeMap<KekId, KwAes256>,
     rng: SystemRandom,
 }
 
@@ -391,34 +425,60 @@ impl fmt::Debug for KekRing {
 }
 
 impl KekRing {
-    pub fn new(active: KekId, material: KekMaterial) -> Result<Self, KekRingError> {
-        let key = material.into_key()?;
+    /// Atomically populate one active key and a bounded decrypt-only set.
+    ///
+    /// Every identifier and raw-material fingerprint is validated before any
+    /// expanded key is retained. There is intentionally no mutating add API: a
+    /// failed reload leaves the previous complete ring untouched.
+    pub(super) fn from_entries(
+        active: (KekId, KekMaterial),
+        decrypt_only: Vec<(KekId, KekMaterial)>,
+    ) -> Result<Self, KekRingError> {
+        let count = decrypt_only
+            .len()
+            .checked_add(1)
+            .ok_or(KekRingError::TooMany {
+                maximum: MAX_KEK_RING_KEYS,
+            })?;
+        if count > MAX_KEK_RING_KEYS {
+            return Err(KekRingError::TooMany {
+                maximum: MAX_KEK_RING_KEYS,
+            });
+        }
+
+        let active_id = active.0.clone();
+        assert_zeroize_on_drop::<KwAes256>();
+        let mut entries = Vec::with_capacity(count);
+        entries.push(active);
+        entries.extend(decrypt_only);
+
+        let mut ids = BTreeSet::new();
+        let mut fingerprints = BTreeSet::new();
+        for (id, material) in &entries {
+            if !ids.insert(id.clone()) {
+                return Err(KekRingError::DuplicateId);
+            }
+            if !fingerprints.insert(material.fingerprint()) {
+                return Err(KekRingError::DuplicateMaterial);
+            }
+        }
+
         let mut keys = BTreeMap::new();
-        keys.insert(active.clone(), key);
+        for (id, material) in entries {
+            keys.insert(id, material.into_key()?);
+        }
         Ok(Self {
-            active,
+            active: active_id,
             keys,
             rng: SystemRandom::new(),
         })
     }
 
-    pub fn add_decrypt_only(
-        &mut self,
-        id: KekId,
-        material: KekMaterial,
-    ) -> Result<(), KekRingError> {
-        if self.keys.contains_key(&id) {
-            return Err(KekRingError::DuplicateId);
-        }
-        self.keys.insert(id, material.into_key()?);
-        Ok(())
-    }
-
-    pub fn active_id(&self) -> &KekId {
+    pub(super) fn active_id(&self) -> &KekId {
         &self.active
     }
 
-    pub fn seal(
+    pub(super) fn seal(
         &self,
         context: BlobSecretContext<'_>,
         material: &SecretMaterial,
@@ -426,26 +486,22 @@ impl KekRing {
         let plaintext = material.expose().as_bytes();
         validate_plaintext(plaintext)?;
         let mut dek = [0_u8; KEY_BYTES];
-        let mut dek_nonce = [0_u8; NONCE_LEN];
         let mut material_nonce = [0_u8; NONCE_LEN];
-        if self.rng.fill(&mut dek).is_err()
-            || self.rng.fill(&mut dek_nonce).is_err()
-            || self.rng.fill(&mut material_nonce).is_err()
-        {
+        if self.rng.fill(&mut dek).is_err() || self.rng.fill(&mut material_nonce).is_err() {
             dek.zeroize();
             return Err(BlobEnvelopeError::Random);
         }
-        let result = self.seal_with_parts(context, plaintext, dek, dek_nonce, material_nonce);
+        let result = self.seal_with_parts(context, plaintext, dek, material_nonce);
         dek.zeroize();
         result
     }
 
-    pub fn open(
+    pub(super) fn open(
         &self,
         context: BlobSecretContext<'_>,
         sealed: &SealedBlobSecret,
     ) -> Result<SecretMaterial, BlobEnvelopeError> {
-        self.open_with_purposes(context, sealed, AadPurpose::WrapDek, AadPurpose::Material)
+        self.open_with_purpose(context, sealed, AadPurpose::Material)
     }
 
     fn seal_with_parts(
@@ -453,7 +509,6 @@ impl KekRing {
         context: BlobSecretContext<'_>,
         plaintext: &[u8],
         mut dek: [u8; KEY_BYTES],
-        dek_nonce: [u8; NONCE_LEN],
         material_nonce: [u8; NONCE_LEN],
     ) -> Result<SealedBlobSecret, BlobEnvelopeError> {
         let result = (|| {
@@ -463,20 +518,9 @@ impl KekRing {
                 .get(&self.active)
                 .ok_or(BlobEnvelopeError::UnknownKek)?;
 
-            let mut wrapped_dek = dek.to_vec();
-            if active_key
-                .seal_in_place_append_tag(
-                    Nonce::assume_unique_for_key(dek_nonce),
-                    Aad::from(aad(AadPurpose::WrapDek, context, &self.active)),
-                    &mut wrapped_dek,
-                )
-                .is_err()
-            {
-                wrapped_dek.zeroize();
-                return Err(BlobEnvelopeError::Unopenable);
-            }
-            let wrapped_dek: [u8; WRAPPED_DEK_BYTES] = wrapped_dek
-                .try_into()
+            let mut wrapped_dek = [0_u8; WRAPPED_DEK_BYTES];
+            active_key
+                .wrap_key(&dek, &mut wrapped_dek)
                 .map_err(|_| BlobEnvelopeError::Unopenable)?;
 
             let data_key = UnboundKey::new(&AES_256_GCM, &dek)
@@ -496,7 +540,6 @@ impl KekRing {
             }
             Ok(SealedBlobSecret {
                 kek_id: self.active.clone(),
-                dek_nonce,
                 wrapped_dek,
                 material_nonce,
                 ciphertext,
@@ -506,32 +549,22 @@ impl KekRing {
         result
     }
 
-    fn open_with_purposes(
+    fn open_with_purpose(
         &self,
         context: BlobSecretContext<'_>,
         sealed: &SealedBlobSecret,
-        dek_purpose: AadPurpose,
         material_purpose: AadPurpose,
     ) -> Result<SecretMaterial, BlobEnvelopeError> {
         let kek = self
             .keys
             .get(&sealed.kek_id)
             .ok_or(BlobEnvelopeError::UnknownKek)?;
-        let mut wrapped = sealed.wrapped_dek.to_vec();
-        let opened_dek = kek
-            .open_in_place(
-                Nonce::assume_unique_for_key(sealed.dek_nonce),
-                Aad::from(aad(dek_purpose, context, &sealed.kek_id)),
-                &mut wrapped,
-            )
-            .map_err(|_| BlobEnvelopeError::Unopenable);
-        let data_key = opened_dek.and_then(|dek| {
-            UnboundKey::new(&AES_256_GCM, dek)
-                .map(LessSafeKey::new)
-                .map_err(|_| BlobEnvelopeError::Unopenable)
-        });
-        wrapped.zeroize();
-        let data_key = data_key?;
+        let mut dek = Zeroizing::new([0_u8; KEY_BYTES]);
+        kek.unwrap_key(&sealed.wrapped_dek, dek.as_mut())
+            .map_err(|_| BlobEnvelopeError::Unopenable)?;
+        let data_key = UnboundKey::new(&AES_256_GCM, dek.as_ref())
+            .map(LessSafeKey::new)
+            .map_err(|_| BlobEnvelopeError::Unopenable)?;
 
         let mut ciphertext = sealed.ciphertext.clone();
         let opened = data_key
@@ -548,6 +581,226 @@ impl KekRing {
             });
         ciphertext.zeroize();
         opened
+    }
+}
+
+/// Exercise bounded seal/open invariants with committed synthetic material.
+///
+/// This seam is absent from normal and published builds. Its numeric scenarios
+/// are interpreted here, beside the private fields they mutate, so fuzzing does
+/// not widen the publisher-facing API.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_seal_open(
+    material: &[u8],
+    scenario: u8,
+    primary_seed: u8,
+    secondary_seed: u8,
+    identity_seed: u64,
+    version_seed: u16,
+) -> &'static str {
+    use crate::desired_state::ids::{SecretId, Uuid7};
+    use crate::desired_state::secrets::SecretVersion;
+
+    fn fuzz_material(seed: u8) -> KekMaterial {
+        KekMaterial::from_owned(Zeroizing::new(vec![seed; KEY_BYTES]))
+            .expect("the fuzz seam always supplies exactly 32 bytes")
+    }
+
+    let environment = EnvironmentId::parse("fuzz-environment").expect("static environment");
+    let namespace = NamespaceId::parse("fuzz-namespace").expect("static namespace");
+    let secret = SecretId::new(
+        Uuid7::from_parts(
+            identity_seed & ((1_u64 << 48) - 1),
+            version_seed & 0x0fff,
+            identity_seed.rotate_left(17),
+        )
+        .expect("bounded UUIDv7 parts"),
+    );
+    let version = SecretVersion::new(u64::from(version_seed) + 1).expect("one-based version");
+    let reference = SecretRef::new(secret, version);
+    let context =
+        BlobSecretContext::from_authenticated_manifest(&environment, &namespace, &reference);
+
+    if scenario % 14 == 11 {
+        let result = KekRing::from_entries(
+            (KekId::parse("active").unwrap(), fuzz_material(primary_seed)),
+            vec![(KekId::parse("alias").unwrap(), fuzz_material(primary_seed))],
+        );
+        assert!(matches!(result, Err(KekRingError::DuplicateMaterial)));
+        return "alias_rejected";
+    }
+
+    let ring = KekRing::from_entries(
+        (KekId::parse("active").unwrap(), fuzz_material(primary_seed)),
+        Vec::new(),
+    )
+    .expect("one synthetic KEK");
+
+    if scenario % 14 == 12 {
+        let raw = if std::str::from_utf8(material).is_err() {
+            material
+        } else {
+            &[0xff, 0xfe][..]
+        };
+        let raw = if raw.is_empty() { &[0xff][..] } else { raw };
+        let raw = &raw[..raw.len().min(MAX_PLAINTEXT_BYTES)];
+        let sealed = ring
+            .seal_with_parts(context, raw, [0x5a; KEY_BYTES], [0xa5; NONCE_LEN])
+            .expect("bounded non-UTF-8 fixture seals");
+        assert_eq!(
+            ring.open(context, &sealed).err(),
+            Some(BlobEnvelopeError::Unopenable)
+        );
+        return "invalid_utf8_refused";
+    }
+
+    let Ok(text) = std::str::from_utf8(material) else {
+        return "input_not_utf8";
+    };
+    let secret_material = SecretMaterial::new(text.to_owned());
+    if material.is_empty() {
+        assert_eq!(
+            ring.seal(context, &secret_material),
+            Err(BlobEnvelopeError::EmptyMaterial)
+        );
+        return "empty_refused";
+    }
+    if material.len() > MAX_PLAINTEXT_BYTES {
+        assert_eq!(
+            ring.seal(context, &secret_material),
+            Err(BlobEnvelopeError::MaterialTooLarge)
+        );
+        return "oversized_refused";
+    }
+
+    let mut sealed = ring
+        .seal(context, &secret_material)
+        .expect("bounded UTF-8 material seals");
+    match scenario % 14 {
+        0 => {
+            assert_eq!(ring.open(context, &sealed).unwrap().expose(), text);
+            "roundtrip"
+        }
+        1 => {
+            let wrong = EnvironmentId::parse("other-environment").unwrap();
+            let wrong_context =
+                BlobSecretContext::from_authenticated_manifest(&wrong, &namespace, &reference);
+            assert_eq!(
+                ring.open(wrong_context, &sealed).err(),
+                Some(BlobEnvelopeError::Unopenable)
+            );
+            "wrong_environment"
+        }
+        2 => {
+            let wrong = NamespaceId::parse("other-namespace").unwrap();
+            let wrong_context =
+                BlobSecretContext::from_authenticated_manifest(&environment, &wrong, &reference);
+            assert_eq!(
+                ring.open(wrong_context, &sealed).err(),
+                Some(BlobEnvelopeError::Unopenable)
+            );
+            "wrong_namespace"
+        }
+        3 => {
+            let other = SecretRef::new(
+                SecretId::new(Uuid7::from_parts(1, 1, identity_seed ^ 1).unwrap()),
+                version,
+            );
+            let wrong_context =
+                BlobSecretContext::from_authenticated_manifest(&environment, &namespace, &other);
+            assert_eq!(
+                ring.open(wrong_context, &sealed).err(),
+                Some(BlobEnvelopeError::Unopenable)
+            );
+            "wrong_reference"
+        }
+        4 => {
+            let other = SecretRef::new(secret, version.next());
+            let wrong_context =
+                BlobSecretContext::from_authenticated_manifest(&environment, &namespace, &other);
+            assert_eq!(
+                ring.open(wrong_context, &sealed).err(),
+                Some(BlobEnvelopeError::Unopenable)
+            );
+            "wrong_version"
+        }
+        5 => {
+            assert_eq!(
+                ring.open_with_purpose(context, &sealed, AadPurpose::InvalidTestDomain)
+                    .err(),
+                Some(BlobEnvelopeError::Unopenable)
+            );
+            "wrong_purpose"
+        }
+        6 => {
+            sealed.wrapped_dek[usize::from(version_seed) % WRAPPED_DEK_BYTES] ^= 1;
+            assert_eq!(
+                ring.open(context, &sealed).err(),
+                Some(BlobEnvelopeError::Unopenable)
+            );
+            "wrapped_mutation"
+        }
+        7 => {
+            sealed.material_nonce[usize::from(version_seed) % NONCE_LEN] ^= 1;
+            assert_eq!(
+                ring.open(context, &sealed).err(),
+                Some(BlobEnvelopeError::Unopenable)
+            );
+            "nonce_mutation"
+        }
+        8 => {
+            let offset = usize::from(version_seed) % sealed.ciphertext.len();
+            sealed.ciphertext[offset] ^= 1;
+            assert_eq!(
+                ring.open(context, &sealed).err(),
+                Some(BlobEnvelopeError::Unopenable)
+            );
+            "ciphertext_mutation"
+        }
+        9 => {
+            let unknown_seed = primary_seed.wrapping_add(1);
+            let unknown = KekRing::from_entries(
+                (
+                    KekId::parse("unknown").unwrap(),
+                    fuzz_material(unknown_seed),
+                ),
+                Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                unknown.open(context, &sealed).err(),
+                Some(BlobEnvelopeError::UnknownKek)
+            );
+            "unknown_key"
+        }
+        10 => {
+            let mut new_seed = secondary_seed;
+            if new_seed == primary_seed {
+                new_seed = new_seed.wrapping_add(1);
+            }
+            let rotated = KekRing::from_entries(
+                (KekId::parse("new").unwrap(), fuzz_material(new_seed)),
+                vec![(KekId::parse("active").unwrap(), fuzz_material(primary_seed))],
+            )
+            .unwrap();
+            assert_eq!(rotated.open(context, &sealed).unwrap().expose(), text);
+            let new_sealed = rotated.seal(context, &secret_material).unwrap();
+            assert_eq!(new_sealed.kek_id().as_str(), "new");
+            assert_eq!(
+                ring.open(context, &new_sealed).err(),
+                Some(BlobEnvelopeError::UnknownKek)
+            );
+            "rotation"
+        }
+        13 => {
+            sealed.kek_id = KekId::parse("other-id").unwrap();
+            assert_eq!(
+                ring.open(context, &sealed).err(),
+                Some(BlobEnvelopeError::UnknownKek)
+            );
+            "stored_id_mutation"
+        }
+        11 | 12 | 14..=u8::MAX => unreachable!("scenario reduced modulo 14"),
     }
 }
 
@@ -588,11 +841,13 @@ fn encoded_size(kek_id_len: usize, ciphertext_len: usize) -> usize {
     1 + 1
         + cbor_item_size(SCHEME.len())
         + cbor_item_size(kek_id_len)
-        + cbor_item_size(NONCE_LEN)
         + cbor_item_size(WRAPPED_DEK_BYTES)
         + cbor_item_size(NONCE_LEN)
         + cbor_item_size(ciphertext_len)
 }
+
+#[inline(always)]
+fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
 
 fn cbor_item_size(payload: usize) -> usize {
     cbor_length_size(payload) + payload
@@ -781,7 +1036,11 @@ mod tests {
     }
 
     fn kek_ring(id_text: &str, byte: u8) -> KekRing {
-        KekRing::new(id(id_text), KekMaterial::from_array([byte; KEY_BYTES])).expect("KEK fixture")
+        KekRing::from_entries(
+            (id(id_text), KekMaterial::from_array([byte; KEY_BYTES])),
+            Vec::new(),
+        )
+        .expect("KEK fixture")
     }
 
     fn fixture() -> (EnvironmentId, NamespaceId, SecretRef) {
@@ -797,11 +1056,7 @@ mod tests {
         namespace: &'a NamespaceId,
         reference: &'a SecretRef,
     ) -> BlobSecretContext<'a> {
-        BlobSecretContext {
-            environment,
-            namespace,
-            reference,
-        }
+        BlobSecretContext::from_authenticated_manifest(environment, namespace, reference)
     }
 
     fn deterministic_sealed() -> (
@@ -818,7 +1073,6 @@ mod tests {
                 context(&environment, &namespace, &reference),
                 PLAINTEXT.as_bytes(),
                 [0x22; KEY_BYTES],
-                [0x33; NONCE_LEN],
                 [0x44; NONCE_LEN],
             )
             .expect("deterministic seal");
@@ -839,7 +1093,7 @@ mod tests {
         let encoded = sealed.to_canonical_cbor();
         assert_eq!(
             hex(&encoded),
-            "8701766165733235362d67636d2e656e76656c6f70652e76326f7072696d6172792d323032362d30384c3333333333333333333333335830a6a17064e8b0570e909ac94f8509c10a24ea2d16a8fba78eda682ba781aca80828a4c8f7a69a4efe1c4218d72ed1dfc14c4444444444444444444444445830e176cb178a4697ebd6882a524dabbea574fbde7cafdf901e5e2847781fae1410eddb1ba39355ad66efc151350fdfe8ae"
+            "860278206165733235362d6b772e6165733235362d67636d2e656e76656c6f70652e76326f7072696d6172792d323032362d3038582887ca1088b05590d44c4f867da9ccf5f78ee09ffa6b0b193be942fcdeead5ec3558b9a2f43e1a683e4c4444444444444444444444445830e176cb178a4697ebd6882a524dabbea574fbde7cafdf901e5e2847781fae1410e06da89c43a4e140a0cb961dbce26adb"
         );
         let decoded = SealedBlobSecret::from_canonical_cbor(&encoded).unwrap();
         assert_eq!(decoded, sealed);
@@ -869,13 +1123,12 @@ mod tests {
                 Err(BlobEnvelopeError::Unopenable)
             ));
         }
-        let right = context(&environment, &namespace, &reference);
         assert!(matches!(
-            ring.open_with_purposes(right, &sealed, AadPurpose::Material, AadPurpose::Material),
-            Err(BlobEnvelopeError::Unopenable)
-        ));
-        assert!(matches!(
-            ring.open_with_purposes(right, &sealed, AadPurpose::WrapDek, AadPurpose::WrapDek),
+            ring.open_with_purpose(
+                context(&environment, &namespace, &reference),
+                &sealed,
+                AadPurpose::InvalidTestDomain,
+            ),
             Err(BlobEnvelopeError::Unopenable)
         ));
     }
@@ -890,14 +1143,16 @@ mod tests {
                 &SecretMaterial::new(PLAINTEXT.to_owned()),
             )
             .unwrap();
-        let mut rotated = kek_ring("new", 0x22);
+        let rotated_without_old = kek_ring("new", 0x22);
         assert!(matches!(
-            rotated.open(context(&environment, &namespace, &reference), &sealed),
+            rotated_without_old.open(context(&environment, &namespace, &reference), &sealed),
             Err(BlobEnvelopeError::UnknownKek)
         ));
-        rotated
-            .add_decrypt_only(id("old"), KekMaterial::from_array([0x11; KEY_BYTES]))
-            .unwrap();
+        let rotated = KekRing::from_entries(
+            (id("new"), KekMaterial::from_array([0x22; KEY_BYTES])),
+            vec![(id("old"), KekMaterial::from_array([0x11; KEY_BYTES]))],
+        )
+        .unwrap();
         assert_eq!(
             rotated
                 .open(context(&environment, &namespace, &reference), &sealed)
@@ -916,10 +1171,7 @@ mod tests {
             old.open(context(&environment, &namespace, &reference), &newly_sealed),
             Err(BlobEnvelopeError::UnknownKek)
         ));
-        assert_eq!(
-            rotated.add_decrypt_only(id("old"), KekMaterial::from_array([0x33; KEY_BYTES])),
-            Err(KekRingError::DuplicateId)
-        );
+        assert_eq!(rotated.keys.len(), 2);
     }
 
     #[test]
@@ -935,10 +1187,16 @@ mod tests {
 
     #[test]
     fn a_stored_kek_id_is_itself_authenticated() {
-        let (mut ring, environment, namespace, reference, sealed) = deterministic_sealed();
-        ring.add_decrypt_only(
-            id("secondary-2026-08"),
-            KekMaterial::from_array([0x11; KEY_BYTES]),
+        let (_, environment, namespace, reference, sealed) = deterministic_sealed();
+        let ring = KekRing::from_entries(
+            (
+                id("primary-2026-08"),
+                KekMaterial::from_array([0x11; KEY_BYTES]),
+            ),
+            vec![(
+                id("secondary-2026-08"),
+                KekMaterial::from_array([0x12; KEY_BYTES]),
+            )],
         )
         .unwrap();
         let mut changed = sealed;
@@ -979,13 +1237,13 @@ mod tests {
         );
 
         let mut nonminimal_scheme = encoded.clone();
-        nonminimal_scheme.splice(2..3, [0x78, u8::try_from(SCHEME.len()).unwrap()]);
+        nonminimal_scheme.splice(2..4, [0x79, 0, u8::try_from(SCHEME.len()).unwrap()]);
         assert_eq!(
             SealedBlobSecret::from_canonical_cbor(&nonminimal_scheme),
             Err(CodecError::NonCanonical)
         );
 
-        let kek_header = 2 + 1 + SCHEME.len();
+        let kek_header = 2 + cbor_length_size(SCHEME.len()) + SCHEME.len();
         let kek_len = encoded[kek_header] & 0x1f;
         let mut nonminimal_kek = encoded.clone();
         nonminimal_kek.splice(kek_header..=kek_header, [0x78, kek_len]);
@@ -1063,20 +1321,54 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_limit_is_a_utf8_byte_limit() {
+        let ring = kek_ring("primary", 0x11);
+        let (environment, namespace, reference) = fixture();
+        let context = context(&environment, &namespace, &reference);
+        let exact = "é".repeat(MAX_PLAINTEXT_BYTES / 2);
+        assert_eq!(exact.len(), MAX_PLAINTEXT_BYTES);
+        let sealed = ring
+            .seal(context, &SecretMaterial::new(exact.clone()))
+            .expect("exact multibyte byte limit");
+        assert_eq!(ring.open(context, &sealed).unwrap().expose(), exact);
+
+        let over = format!("{exact}x");
+        assert_eq!(over.len(), MAX_PLAINTEXT_BYTES + 1);
+        assert_eq!(
+            ring.seal(context, &SecretMaterial::new(over)),
+            Err(BlobEnvelopeError::MaterialTooLarge)
+        );
+    }
+
+    #[test]
+    fn authenticated_non_utf8_plaintext_is_still_refused() {
+        let ring = kek_ring("primary", 0x11);
+        let (environment, namespace, reference) = fixture();
+        let context = context(&environment, &namespace, &reference);
+        let sealed = ring
+            .seal_with_parts(context, &[0xff, 0xfe], [0x22; KEY_BYTES], [0x44; NONCE_LEN])
+            .expect("test-only raw bytes can be sealed");
+        assert_eq!(
+            ring.open(context, &sealed).err(),
+            Some(BlobEnvelopeError::Unopenable)
+        );
+    }
+
+    #[test]
     fn exact_key_and_identifier_bounds_are_enforced() {
         assert_eq!(
-            KekMaterial::from_bytes(vec![0; KEY_BYTES - 1]).unwrap_err(),
+            KekMaterial::from_owned(Zeroizing::new(vec![0; KEY_BYTES - 1])).unwrap_err(),
             KekRingError::KeyLength {
                 found: KEY_BYTES - 1
             }
         );
         assert_eq!(
-            KekMaterial::from_bytes(vec![0; KEY_BYTES + 1]).unwrap_err(),
+            KekMaterial::from_owned(Zeroizing::new(vec![0; KEY_BYTES + 1])).unwrap_err(),
             KekRingError::KeyLength {
                 found: KEY_BYTES + 1
             }
         );
-        KekMaterial::from_bytes(vec![0; KEY_BYTES]).expect("exact AES-256 key");
+        KekMaterial::from_owned(Zeroizing::new(vec![0; KEY_BYTES])).expect("exact AES-256 key");
         assert!(KekId::parse(&"k".repeat(MAX_KEK_ID_BYTES)).is_ok());
         assert!(matches!(
             KekId::parse(&"k".repeat(MAX_KEK_ID_BYTES + 1)),
@@ -1088,6 +1380,57 @@ mod tests {
     }
 
     #[test]
+    fn ring_population_is_bounded_atomic_and_rejects_key_aliases() {
+        let decrypt_only = (1..MAX_KEK_RING_KEYS)
+            .map(|index| {
+                (
+                    id(&format!("decrypt-{index}")),
+                    KekMaterial::from_array([u8::try_from(index).unwrap(); KEY_BYTES]),
+                )
+            })
+            .collect();
+        let widest = KekRing::from_entries(
+            (id("active"), KekMaterial::from_array([0; KEY_BYTES])),
+            decrypt_only,
+        )
+        .expect("the exact ring bound");
+        assert_eq!(widest.keys.len(), MAX_KEK_RING_KEYS);
+
+        let too_many = (1..=MAX_KEK_RING_KEYS)
+            .map(|index| {
+                (
+                    id(&format!("decrypt-{index}")),
+                    KekMaterial::from_array([u8::try_from(index).unwrap(); KEY_BYTES]),
+                )
+            })
+            .collect();
+        assert!(matches!(
+            KekRing::from_entries(
+                (id("active"), KekMaterial::from_array([0; KEY_BYTES])),
+                too_many,
+            ),
+            Err(KekRingError::TooMany {
+                maximum: MAX_KEK_RING_KEYS
+            })
+        ));
+
+        assert!(matches!(
+            KekRing::from_entries(
+                (id("same"), KekMaterial::from_array([1; KEY_BYTES])),
+                vec![(id("same"), KekMaterial::from_array([2; KEY_BYTES]))],
+            ),
+            Err(KekRingError::DuplicateId)
+        ));
+        assert!(matches!(
+            KekRing::from_entries(
+                (id("first"), KekMaterial::from_array([3; KEY_BYTES])),
+                vec![(id("alias"), KekMaterial::from_array([3; KEY_BYTES]))],
+            ),
+            Err(KekRingError::DuplicateMaterial)
+        ));
+    }
+
+    #[test]
     fn context_is_not_stored_and_nothing_sensitive_is_rendered() {
         let (ring, environment, namespace, reference, sealed) = deterministic_sealed();
         let encoded = sealed.to_canonical_cbor();
@@ -1095,7 +1438,9 @@ mod tests {
             environment.as_str().as_bytes(),
             namespace.as_str().as_bytes(),
             reference.to_string().as_bytes(),
+            reference.secret.uuid().as_bytes(),
             PLAINTEXT.as_bytes(),
+            &[0x11; KEY_BYTES],
         ] {
             assert!(
                 !encoded.windows(absent.len()).any(|window| window == absent),
@@ -1122,15 +1467,11 @@ mod tests {
         let (environment, namespace, reference) = fixture();
         let context = context(&environment, &namespace, &reference);
         let kek = id("primary-2026-08");
-        let wrapping = aad(AadPurpose::WrapDek, context, &kek);
         let material = aad(AadPurpose::Material, context, &kek);
-        assert_eq!(&wrapping[..AAD_DOMAIN.len()], AAD_DOMAIN);
-        assert_eq!(wrapping[AAD_DOMAIN.len()], AadPurpose::WrapDek as u8);
+        assert_eq!(&material[..AAD_DOMAIN.len()], AAD_DOMAIN);
         assert_eq!(material[AAD_DOMAIN.len()], AadPurpose::Material as u8);
-        assert_eq!(wrapping.len(), material.len());
-        assert_ne!(wrapping, material);
         assert_eq!(
-            hex(&wrapping),
+            hex(&material),
             "61786f6e642e7365637265742e656e76656c6f70652e76320001000970726f642d65617374000961636d652d70726f64000000000001700080000000000000010000000000000003000f7072696d6172792d323032362d3038"
         );
     }

@@ -204,13 +204,25 @@ The namespace-native blob envelope adds
 `every_stored_byte_is_authenticated_or_a_strict_codec_field`,
 `canonical_cbor_is_the_only_accepted_spelling`,
 `every_truncation_and_oversized_object_is_refused`, and
-`context_is_not_stored_and_nothing_sensitive_is_rendered`. Together they pin
-the v2 wire format, owner/reference omission, every AAD dimension, strict
-canonical decoding, allocation ceilings, key rotation, mutation refusal, and
-non-rendering errors. The `blob_secret_envelope` fuzz target continuously drives
-that production decoder. A change to its fixed array, AAD bytes, key-selection
-rule, bound, or error payload fires this trigger even when no runtime wiring
-changes.
+`context_is_not_stored_and_nothing_sensitive_is_rendered`, plus the ring-bound,
+duplicate-material, invalid-UTF-8, multibyte-byte-limit, and frozen-v1 tests.
+Together they pin schema 2, RFC 3394 AES-256-KW, owner/reference omission,
+material-AAD dimensions, strict canonical decoding, allocation and ring
+ceilings, key rotation, mutation refusal, zeroizing bootstrap ownership, legacy
+compatibility, and non-rendering errors. `blob_secret_envelope` drives raw bytes
+directly through the production decoder; `blob_secret_crypto` drives bounded
+synthetic seal/open and rotation scenarios. A change to the fixed array, AAD
+bytes, wrap primitive, key-selection rule, bound, key lifetime, context
+constructor, publisher immutability rule, or error payload fires this trigger
+even when no runtime wiring changes.
+
+AES-KW authenticates the wrapped key but has no AAD. The isolation claim belongs
+to opening the complete object: AES-GCM material AAD binds environment,
+namespace, exact reference, purpose, and KEK id. Do not claim that the wrapped
+DEK alone authenticates caller context. Drop-time zeroization covers owned
+bootstrap buffers and the RustCrypto AES-KW schedule, but cannot prove removal
+from registers, optimizer/library copies, crash dumps, or swap; retiring a KEK
+requires restarting replicas with it absent when process-wide eviction matters.
 
 Request-content redaction is held by
 `deterministic_redaction_round_trips_buffered_and_split_openai_sse_output`,

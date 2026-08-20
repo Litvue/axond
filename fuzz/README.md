@@ -15,6 +15,7 @@ storage. This project fuzzes all five, on the parsers the process actually runs.
 | `provider_error` | `ProviderError::from_upstream`, `::transport`, and the classification behind them | An upstream failure body decides whether the gateway retries, fails over, or opens a circuit |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission | A third party publishes it, a background refresh imports it unattended, and what it says about prices and capabilities feeds routing and spend decisions |
 | `blob_secret_envelope` | The v2 bounded canonical-CBOR fixed-array decoder | Authenticated desired state names immutable bytes, but the storage object itself is untrusted until strict parsing and AEAD opening succeed |
+| `blob_secret_crypto` | Structured bounded v2 sealing, opening, context substitution, rotation, and mutation | Valid cryptographic states are too sparse for raw byte mutation alone |
 
 The properties each target asserts live in [`src/lib.rs`](./src/lib.rs) and
 [`src/wire.rs`](./src/wire.rs): a parser returns rather than panicking, a

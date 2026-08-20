@@ -545,4 +545,29 @@ mod tests {
         assert!(rendered.contains("AXOND_KEK"));
         assert!(!rendered.contains("BwcH"), "{rendered}");
     }
+
+    #[test]
+    fn legacy_v1_frozen_golden_still_opens() {
+        // Frozen evidence that the independent blob format did not alter the
+        // deployed Postgres row envelope or its AES-GCM wrapping semantics.
+        let sealed = SealedSecret {
+            scheme: SCHEME.to_owned(),
+            kek: KekRef("AXOND_KEK".to_owned()),
+            wrapped_dek: STANDARD
+                .decode("j9Mf9Jsh6R/tPvj8OFQgn5FzUOe31tWRSKmDOaDHWgWsWQPTtGMLya6A0UTNe3TX")
+                .unwrap(),
+            dek_nonce: STANDARD.decode("1DcIMcvVqTF4+Omj").unwrap(),
+            ciphertext: STANDARD
+                .decode("iGd/Kcd0hyNS9aFdeSoA4lTfEm5wvIGugV4MIOhfAMggAA==")
+                .unwrap(),
+            nonce: STANDARD.decode("Pb1inXPPEQe3b5TM").unwrap(),
+        };
+        assert_eq!(
+            kek("AXOND_KEK", 7)
+                .open(owner(), &reference(), &sealed)
+                .unwrap()
+                .expose(),
+            PLAINTEXT
+        );
+    }
 }

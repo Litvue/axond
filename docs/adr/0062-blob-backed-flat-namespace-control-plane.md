@@ -258,16 +258,25 @@ uses per-version envelope encryption bound to the deployment, namespace owner,
 and exact secret reference. A KMS or external secret manager is optional.
 
 The native v2 object is a deterministic canonical-CBOR fixed array containing
-only schema `1`, scheme `aes256-gcm.envelope.v2`, stable KEK id, DEK nonce,
-wrapped DEK, material nonce, and ciphertext. Environment, namespace, and exact
-secret reference are authenticated caller context rather than stored fields.
-Binary length-prefixed AAD uses distinct purpose bytes for DEK wrapping and
-material encryption and binds the environment id, `NamespaceId`, secret UUID,
-version, and KEK id. KEKs and DEKs are AES-256 keys, plaintext is capped at 64
-KiB, and the strict decoder rejects alternate CBOR spellings and oversized
-objects before allocation. One active KEK encrypts; explicitly retained
-decrypt-only keys permit rolling rotation. The legacy v1 Postgres envelope is a
-separate unchanged format and is never guessed from blob bytes.
+only schema `2`, scheme `aes256-kw.aes256-gcm.envelope.v2`, stable KEK id, RFC
+3394 wrapped DEK, material nonce, and ciphertext. Environment, namespace, and
+exact secret reference are authenticated caller context rather than stored
+fields. Binary length-prefixed material AAD binds its purpose, environment id,
+`NamespaceId`, secret UUID, version, and KEK id. RFC 3394 AES-256-KW wraps the
+fixed 32-byte DEK without a nonce; because AES-KW has no AAD, caller-context
+binding is asserted only for the complete object after material authentication.
+Plaintext is capped at 64 KiB, and the strict decoder rejects alternate CBOR
+spellings and oversized objects before allocation. One active KEK encrypts; up
+to seven explicitly retained decrypt-only keys permit rolling rotation, while
+duplicate ids or aliased raw key bytes refuse the whole ring. The legacy v1
+Postgres envelope is a separate unchanged format and is never guessed from blob
+bytes.
+
+Publication must reserve an exact `SecretRef` create-only and report a conflict
+if any value already occupies it; changing bytes always requires a new version.
+The object-store contract already refuses overwriting an immutable object key,
+but the reference index and publisher that enforce this stronger rule are a
+follow-up slice and are not claimed by the codec alone.
 
 Staging or rotation creates a new sealed version. Activation, disablement, and
 revocation publish namespace or deployment revisions that change references;

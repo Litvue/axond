@@ -69,16 +69,22 @@ material stays in the secret store; see
 that guarantees and how it is tested.
 
 The namespace-native blob format is a separate v2 envelope; the legacy
-Postgres v1 envelope is unchanged. A blob object stores only the wrapping
-scheme, stable KEK id, nonces, wrapped data key, and ciphertext. Authenticated
-desired state supplies the environment id, namespace, and exact secret
-reference, and AES-256-GCM binds those values through binary length-prefixed AAD
-in distinct DEK-wrapping and material-encryption domains. The parser accepts one
-bounded canonical-CBOR fixed-array spelling, never a generic CBOR extension.
-Bootstrap KEKs are exactly 32 bytes; a ring has one active encryption key and
-may retain explicitly decrypt-only keys for rolling rotation. This codec is an
-off-request-path building block: blob publication and snapshot-time resolution
-must be wired before it can serve a credential.
+Postgres v1 envelope is unchanged and has a frozen opening vector. Schema 2
+stores only `aes256-kw.aes256-gcm.envelope.v2`, the stable KEK id, a 40-byte RFC
+3394 wrapped data key, one material nonce, and ciphertext. Authenticated desired
+state supplies the environment id, namespace, and exact secret reference;
+AES-256-GCM binds those values and the KEK id through binary length-prefixed
+material AAD. RFC 3394 wraps the fixed 32-byte DEK without a nonce and does not
+independently authenticate caller context. The parser accepts one bounded
+six-element canonical-CBOR spelling, never a generic CBOR extension.
+Bootstrap KEKs are exactly 32 bytes in zeroizing owned buffers. A complete ring
+has one active encryption key, no more than seven decrypt-only keys, and no ids
+that alias the same raw key. This codec is an off-request-path building block:
+create-only publication, exact-reference uniqueness, and snapshot-time
+resolution must be wired before it can serve a credential. Dropping keys is
+best-effort memory hygiene, not proof against registers, crash dumps, swap, or
+library-internal expanded-key copies; restart replicas to evict a retired KEK
+from the process boundary.
 
 Restrict files and environment access to the service identity. Rotate by
 overlapping distinct keys, moving callers, then removing the old key. See the

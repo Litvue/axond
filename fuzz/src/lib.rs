@@ -25,7 +25,6 @@
 
 mod wire;
 
-use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use arbitrary::Arbitrary;
@@ -46,15 +45,14 @@ const CATALOG_REFUSAL_BYTES: usize = 4096;
 
 /// Untrusted immutable blob ciphertext: strict fixed-array canonical CBOR.
 ///
-/// Human-reviewable committed seeds may use `hex:<lowercase hex>`; every other
-/// input is passed through byte-for-byte, including all coverage-guided input.
+/// Coverage-guided bytes and committed binary seeds reach the production
+/// parser byte-for-byte; the harness performs no seed decoding or transformation.
 pub fn blob_secret_envelope(data: &[u8]) -> &'static str {
-    let input = decode_hex_seed(data);
-    match axond_fuzz_seam::blob_secret_envelope_cbor(&input) {
+    match axond_fuzz_seam::blob_secret_envelope_cbor(data) {
         Ok(canonical) => {
             assert_eq!(
                 canonical.as_slice(),
-                input.as_ref(),
+                data,
                 "the strict decoder accepted a second spelling"
             );
             assert!(
@@ -67,33 +65,26 @@ pub fn blob_secret_envelope(data: &[u8]) -> &'static str {
     }
 }
 
-fn decode_hex_seed(data: &[u8]) -> Cow<'_, [u8]> {
-    let Some(encoded) = data.strip_prefix(b"hex:") else {
-        return Cow::Borrowed(data);
-    };
-    let encoded = encoded.strip_suffix(b"\n").unwrap_or(encoded);
-    if encoded.len() % 2 != 0 {
-        return Cow::Borrowed(data);
-    }
-    let mut decoded = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.chunks_exact(2) {
-        let Some(high) = hex_nibble(pair[0]) else {
-            return Cow::Borrowed(data);
-        };
-        let Some(low) = hex_nibble(pair[1]) else {
-            return Cow::Borrowed(data);
-        };
-        decoded.push(high << 4 | low);
-    }
-    Cow::Owned(decoded)
+/// Structured, bounded crypto operations complement the raw parser target.
+#[derive(Debug, Arbitrary)]
+pub struct BlobSecretCryptoInput<'a> {
+    pub material: &'a [u8],
+    pub scenario: u8,
+    pub primary_seed: u8,
+    pub secondary_seed: u8,
+    pub identity_seed: u64,
+    pub version_seed: u16,
 }
 
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
+pub fn blob_secret_crypto(input: &BlobSecretCryptoInput<'_>) -> &'static str {
+    axond_fuzz_seam::blob_secret_seal_open(
+        input.material,
+        input.scenario,
+        input.primary_seed,
+        input.secondary_seed,
+        input.identity_seed,
+        input.version_seed,
+    )
 }
 
 /// A refusal must carry an operator-facing reason. An empty one would reach a

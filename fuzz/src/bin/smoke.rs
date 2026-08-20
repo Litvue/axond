@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use arbitrary::{Arbitrary, Unstructured};
 use axond_fuzz::{
-    CapabilityField, CatalogEdit, CatalogInput, CostField, LifecycleValue, MetaField,
-    ProviderStreamInput, SseInput, StreamShape, TokenInput,
+    BlobSecretCryptoInput, CapabilityField, CatalogEdit, CatalogInput, CostField, LifecycleValue,
+    MetaField, ProviderStreamInput, SseInput, StreamShape, TokenInput,
 };
 
 /// Live heap the whole replay may hold at once. The parsers under test are
@@ -155,7 +155,12 @@ const TARGETS: &[Target] = &[
     Target {
         name: "blob_secret_envelope",
         run: replay_blob_secret_envelope,
-        minimum_classes: 5,
+        minimum_classes: 10,
+    },
+    Target {
+        name: "blob_secret_crypto",
+        run: replay_blob_secret_crypto,
+        minimum_classes: 1,
     },
 ];
 
@@ -265,6 +270,29 @@ fn replay_credentials_query(data: &[u8]) -> Vec<&'static str> {
 fn replay_blob_secret_envelope(data: &[u8]) -> Vec<&'static str> {
     vec![axond_fuzz::blob_secret_envelope(data)]
 }
+
+fn replay_blob_secret_crypto(data: &[u8]) -> Vec<&'static str> {
+    BlobSecretCryptoInput::arbitrary_take_rest(Unstructured::new(data))
+        .map(|input| vec![axond_fuzz::blob_secret_crypto(&input)])
+        .unwrap_or_default()
+}
+
+const EXPECTED_BLOB_CRYPTO_CLASSES: &[&str] = &[
+    "roundtrip",
+    "wrong_environment",
+    "wrong_namespace",
+    "wrong_reference",
+    "wrong_version",
+    "wrong_purpose",
+    "wrapped_mutation",
+    "nonce_mutation",
+    "ciphertext_mutation",
+    "unknown_key",
+    "rotation",
+    "alias_rejected",
+    "invalid_utf8_refused",
+    "stored_id_mutation",
+];
 
 /// The token target takes a structured input, so a seed file is replayed twice:
 /// the way libFuzzer replays it, decoded through `Arbitrary` — which reaches the
@@ -978,6 +1006,63 @@ fn main() {
         catalog_classes.values().sum::<usize>(),
         catalog_classes.len(),
         catalog_classes
+            .iter()
+            .map(|(class, count)| format!("{class}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    let mut crypto_classes = BTreeMap::new();
+    for (scenario, expected) in EXPECTED_BLOB_CRYPTO_CLASSES.iter().enumerate() {
+        let input = BlobSecretCryptoInput {
+            material: b"synthetic-provider-key",
+            scenario: u8::try_from(scenario).expect("bounded scenario"),
+            primary_seed: 0x11,
+            secondary_seed: 0x22,
+            identity_seed: 7,
+            version_seed: 3,
+        };
+        let class = axond_fuzz::blob_secret_crypto(&input);
+        assert_eq!(class, *expected, "blob crypto scenario {scenario}");
+        *crypto_classes.entry(class).or_default() += 1;
+        inputs += 1;
+    }
+    for (label, material, expected) in [
+        ("empty", Vec::new(), "empty_refused"),
+        (
+            "multibyte-limit",
+            "é".repeat(axond_fuzz_seam::BLOB_SECRET_MAX_PLAINTEXT_BYTES / 2)
+                .into_bytes(),
+            "roundtrip",
+        ),
+        (
+            "multibyte-over-limit",
+            format!(
+                "{}x",
+                "é".repeat(axond_fuzz_seam::BLOB_SECRET_MAX_PLAINTEXT_BYTES / 2)
+            )
+            .into_bytes(),
+            "oversized_refused",
+        ),
+    ] {
+        let input = BlobSecretCryptoInput {
+            material: &material,
+            scenario: 0,
+            primary_seed: 0x33,
+            secondary_seed: 0x44,
+            identity_seed: 9,
+            version_seed: 1,
+        };
+        let class = axond_fuzz::blob_secret_crypto(&input);
+        assert_eq!(class, expected, "blob crypto boundary {label}");
+        *crypto_classes.entry(class).or_default() += 1;
+        inputs += 1;
+    }
+    println!(
+        "blob_secret_crypto (pinned scenarios): {} scenarios, {} outcome classes: {}",
+        crypto_classes.values().sum::<usize>(),
+        crypto_classes.len(),
+        crypto_classes
             .iter()
             .map(|(class, count)| format!("{class}={count}"))
             .collect::<Vec<_>>()

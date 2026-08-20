@@ -129,11 +129,13 @@ synthetic key material and an `.invalid` audience. No target opens a socket, rea
 a file, or holds real key material, which is also what makes the corpora
 publishable.
 
-The sealed-secret target does not open ciphertext and holds no KEK. It drives
-the production bounded canonical-CBOR decoder, requires accepted bytes to
-re-encode identically, and maps refusals to static classes with no rejected-byte
-payload. Its readable `hex:` seeds are synthetic golden bytes; coverage-guided
-inputs without that seed prefix pass through unchanged.
+The raw sealed-secret target does not open ciphertext or hold a KEK. Every
+coverage-guided byte reaches the production bounded canonical-CBOR decoder
+unchanged; accepted bytes must re-encode identically, and refusals map to static
+classes with no rejected-byte payload. Its committed binary corpus includes the
+valid format and every parser refusal class. A separate structured target uses
+only committed synthetic KEKs to drive bounded seal/open, context substitution,
+rotation, key-alias rejection, mutation, unknown-key, and UTF-8 boundaries.
 
 ### State tier
 

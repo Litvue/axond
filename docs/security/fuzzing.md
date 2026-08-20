@@ -30,6 +30,7 @@ feature, and what that costs.
 | `provider_error` | `ProviderError::from_upstream` and `ProviderError::transport`, and the classification, retry, and health judgements built on them | Every non-2xx or failed upstream call |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission over the last-known-good catalogue | The scheduled catalogue refresh, unattended |
 | `blob_secret_envelope` | The v2 fixed-array canonical-CBOR sealed-secret decoder | Snapshot compilation after an authenticated blob manifest names immutable ciphertext |
+| `blob_secret_crypto` | Bounded synthetic v2 seal/open, context substitution, mutation, and rotation | Cryptographic invariants need structured valid objects that raw parser mutations rarely produce |
 
 Every target asserts the same three properties, because they are what the
 gateway relies on.
@@ -130,14 +131,21 @@ run against a document a third party publishes:
   wrapper of the wrong shape is still a refusal, and the fuzz corpus carries
   both shapes so a future default cannot appear unnoticed.
 
-The blob-secret target adds the properties required before ciphertext reaches a
-key: the complete object is bounded before decoding; only the seven-element v2
-array and minimal definite CBOR lengths are accepted; nonce, wrapped-DEK, KEK-id,
-and ciphertext lengths stay inside their exact limits; and an accepted object
-re-encodes byte-for-byte to its input. Human-readable `hex:` corpus seeds pin a
-valid golden object, truncation, non-minimal lengths, unknown versions, wrong
-shape, and trailing bytes. Fixed derivations mutate and exceed the sealed-object
-ceiling, so both the acceptance path and its allocation refusal remain live.
+The raw blob-secret target adds the properties required before ciphertext
+reaches a key: the complete object is bounded before decoding; only the
+six-element schema-2 array and minimal definite CBOR lengths are accepted;
+material nonce, RFC 3394 wrapped-DEK, KEK-id, and ciphertext lengths stay exact;
+and an accepted object re-encodes byte-for-byte to its input. Coverage-guided
+bytes are never decoded or transformed by the harness. Binary corpus seeds pin
+acceptance and every refusal class: oversized, truncated, shape, compatibility,
+noncanonical, KEK id, fixed field, ciphertext, and trailing data.
+
+`blob_secret_crypto` complements parser mutation with structured bounded inputs.
+Pinned smoke scenarios cover environment, namespace, secret-id, version, KEK-id
+and purpose substitution; wrapped-key, nonce and ciphertext mutation; unknown
+keys; active/decrypt-only rotation; duplicate-material alias refusal; invalid
+UTF-8 after authenticated opening; and the exact multibyte 64 KiB byte boundary.
+Only synthetic repeated-byte KEKs enter the seam.
 
 Runs are hermetic: the seam the targets call builds its verifiers from a
 configuration compiled into the binary with synthetic key material, so a fuzz run

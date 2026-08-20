@@ -29,6 +29,7 @@ on:
           - provider_error
           - catalog_import
           - blob_secret_envelope
+          - blob_secret_crypto
 
 permissions:
   contents: read
@@ -58,9 +59,9 @@ jobs:
           set -euo pipefail
           case "${REQUESTED}" in
             all)
-              targets='["config_toml", "token_verify", "credentials_query", "sse_decode", "provider_stream", "provider_error", "catalog_import", "blob_secret_envelope"]'
+              targets='["config_toml", "token_verify", "credentials_query", "sse_decode", "provider_stream", "provider_error", "catalog_import", "blob_secret_envelope", "blob_secret_crypto"]'
               ;;
-            config_toml | token_verify | credentials_query | sse_decode | provider_stream | provider_error | catalog_import | blob_secret_envelope)
+            config_toml | token_verify | credentials_query | sse_decode | provider_stream | provider_error | catalog_import | blob_secret_envelope | blob_secret_crypto)
               targets="[\"${REQUESTED}\"]"
               ;;
             *) echo "unknown fuzz target ${REQUESTED}" >&2; exit 1 ;;
