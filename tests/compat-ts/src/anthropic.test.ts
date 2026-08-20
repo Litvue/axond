@@ -15,6 +15,7 @@ import Anthropic, { AuthenticationError } from "@anthropic-ai/sdk";
 import { MESSAGES, fixtureJson } from "./fakeUpstream.js";
 import {
   GATEWAY_KEY,
+  NAMESPACE,
   UPSTREAM_ANTHROPIC_KEY,
   start,
   type Harness,
@@ -30,11 +31,30 @@ interface MessageFixture {
 }
 
 let harness: Harness;
-let client: Anthropic;
+
+interface SdkMount {
+  readonly name: string;
+  /** Anthropic itself appends `/v1/messages` to this base. */
+  readonly suffix: string;
+}
+
+const SDK_MOUNTS: readonly SdkMount[] = [
+  { name: "canonical namespace", suffix: `/namespaces/${NAMESPACE}` },
+  { name: "legacy stateless", suffix: "" },
+];
+
+function sdkClient(mount: SdkMount): Anthropic {
+  return new Anthropic({ baseURL: `${harness.baseUrl}${mount.suffix}`, apiKey: GATEWAY_KEY });
+}
+
+function sdkTest(name: string, body: (mount: SdkMount) => Promise<void>): void {
+  for (const mount of SDK_MOUNTS) {
+    test(`${mount.name}: ${name}`, () => body(mount));
+  }
+}
 
 before(async () => {
   harness = await start();
-  client = new Anthropic({ baseURL: harness.baseUrl, apiKey: GATEWAY_KEY });
 });
 
 after(async () => {
@@ -42,7 +62,8 @@ after(async () => {
   await harness?.stop();
 });
 
-test("a buffered message preserves thinking and tool-use blocks", async () => {
+sdkTest("a buffered message preserves thinking and tool-use blocks", async (mount) => {
+  const client = sdkClient(mount);
   const message = await client.messages.create({
     model: "messages-golden",
     max_tokens: 1024,
@@ -71,9 +92,14 @@ test("a buffered message preserves thinking and tool-use blocks", async () => {
   assert.equal(sent.apiKey, UPSTREAM_ANTHROPIC_KEY);
   assert.notEqual(sent.apiKey, GATEWAY_KEY);
   assert.ok(sent.anthropicVersion, "the anthropic-version header did not survive");
+  assert.deepEqual(sent.body["messages"], [
+    { role: "user", content: "Weather in Paris?" },
+  ]);
+  assert.deepEqual(sent.body["thinking"], { type: "enabled", budget_tokens: 1024 });
 });
 
-test("a streamed message reassembles thinking and tool use", async () => {
+sdkTest("a streamed message reassembles thinking and tool use", async (mount) => {
+  const client = sdkClient(mount);
   const final = await client.messages
     .stream({
       model: "messages-golden",
@@ -96,9 +122,21 @@ test("a streamed message reassembles thinking and tool use", async () => {
   assert.deepEqual(toolUse.input, { location: "Paris, France" });
   assert.equal(final.stop_reason, "tool_use");
   assert.deepEqual([final.usage.input_tokens, final.usage.output_tokens], [41, 63]);
+
+  // The SDK appends `/v1/messages` exactly once to both base forms. Axond then
+  // strips the outer namespace mount and its normal `/v1` route mount before
+  // provider dispatch, leaving the provider-native suffix and body intact.
+  const sent = harness.upstream.lastRequest();
+  assert.equal(sent.path, "/messages");
+  assert.equal(sent.model, MESSAGES);
+  assert.equal(sent.body["stream"], true);
+  assert.deepEqual(sent.body["messages"], [
+    { role: "user", content: "Weather in Paris?" },
+  ]);
 });
 
-test("a declared tool round-trips to the upstream unchanged", async () => {
+sdkTest("a declared tool round-trips to the upstream unchanged", async (mount) => {
+  const client = sdkClient(mount);
   const tools = [
     {
       name: "get_weather",
@@ -119,9 +157,9 @@ test("a declared tool round-trips to the upstream unchanged", async () => {
   assert.deepEqual(harness.upstream.lastRequest().body["tools"], tools);
 });
 
-test("an unknown gateway key is rejected", async () => {
+sdkTest("an unknown gateway key is rejected", async (mount) => {
   const stranger = new Anthropic({
-    baseURL: harness.baseUrl,
+    baseURL: `${harness.baseUrl}${mount.suffix}`,
     apiKey: "not-a-gateway-key",
     maxRetries: 0,
   });
