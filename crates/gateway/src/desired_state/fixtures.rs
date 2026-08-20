@@ -20,6 +20,7 @@ use super::models::{
 use super::mutation::{
     Actor, AuditEvent, ExpectedRevision, IdempotencyKey, Mutation, MutationKind,
 };
+use super::namespaces::{DeploymentBody, InboundGrantBody, NamespaceBody, NamespacePolicySpec};
 use super::policy::{
     BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
 };
@@ -36,6 +37,7 @@ use super::revision::{DesiredState, RevisionCandidate};
 use super::secrets::{SecretOwner, SecretRef, SecretVersion};
 use super::tenancy::{DisplayName, ProjectBody, TenantBody};
 use crate::backends::catalog::{CatalogContentId, ProviderId};
+use crate::namespace::{NamespaceGrant, NamespaceId};
 
 /// How many resource versions [`state`] contains.
 pub(crate) const DESIRED_STATE_RESOURCES: usize = 5;
@@ -74,6 +76,64 @@ pub(crate) fn secret_ref_at(seed: u64, version: u64) -> SecretRef {
         secret_id(seed),
         SecretVersion::new(version).expect("fixture secret version"),
     )
+}
+
+/// A minimal valid ADR 0062 revision used at hydration/recovery seams.
+pub(crate) fn flat_namespace_state() -> DesiredState {
+    let deployment =
+        DeploymentBody::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            .expect("empty shared deployment authority is valid");
+    let deployment = deployment.version(
+        resource_id(950),
+        Slug::parse("deployment").expect("fixture slug"),
+    );
+    let namespace = NamespaceBody::new(
+        NamespaceId::parse("acme").expect("fixture namespace"),
+        true,
+        false,
+        deployment.reference,
+        Vec::new(),
+        Vec::new(),
+        NamespacePolicySpec {
+            epoch: 1,
+            exact: None,
+            middleware: Vec::new(),
+            buffered_response_routes: Vec::new(),
+        },
+        1,
+    )
+    .expect("minimal namespace is valid")
+    .version(resource_id(951), Slug::parse("acme").expect("fixture slug"));
+    let grant = InboundGrantBody::new(
+        Checksum::of(b"flat-namespace-grant"),
+        NamespaceGrant::all(),
+        Some("fixture".to_owned()),
+    )
+    .expect("fixture grant")
+    .version(
+        resource_id(952),
+        Slug::parse("fixture").expect("fixture slug"),
+    );
+    let mut state = DesiredState::new();
+    state.insert(deployment).expect("deployment is unique");
+    state.insert(namespace).expect("namespace is unique");
+    state.insert(grant).expect("grant is unique");
+    state.validate().expect("flat namespace fixture is valid");
+    state
+}
+
+/// The namespace row above with a self-consistent newer-schema field.
+pub(crate) fn incompatible_flat_namespace() -> ResourceVersion {
+    let mut namespace = flat_namespace_state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::Namespace)
+        .cloned()
+        .expect("fixture contains a namespace");
+    let ResourceBody::Inline(CanonicalValue::Map(fields)) = &mut namespace.body else {
+        unreachable!("flat namespace fixture body is inline")
+    };
+    fields.push(("future_enforcement".to_owned(), CanonicalValue::Bool(true)));
+    namespace
 }
 
 /// The provider a credential seeded by `seed` authenticates to.

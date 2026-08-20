@@ -134,14 +134,15 @@ pub struct PolicyView {
 impl PolicyView {
     /// Derive the view a configuration describes.
     ///
-    /// Stateless: every namespace is governed by the file. Stateful: a namespace
-    /// is governed by the document a revision published for it
-    /// ([`Namespace::policy`](crate::config::Namespace::policy)) and by nothing
-    /// otherwise — the file governs none of them, because a stateful bootstrap
-    /// cannot declare one.
+    /// Stateless: every namespace is governed by the file. Stateful: exact
+    /// distributed spend/concurrency enforcement comes only from the optional
+    /// document a revision published for it
+    /// ([`Namespace::policy`](crate::config::Namespace::policy)); the file
+    /// governs none of them, because a stateful bootstrap cannot declare one.
     ///
-    /// "By nothing" denies rather than admits, but a replica does not reach that
-    /// state by activating a revision:
+    /// When shared enforcement backends are configured, "by nothing" denies
+    /// rather than admits, but a replica does not reach that state by activating
+    /// a revision:
     /// [`plan`](super::activation::plan) refuses a candidate that would serve an
     /// ungoverned namespace, so the denial is what a *bootstrap* view can
     /// describe before any document exists, not something a publication
@@ -155,6 +156,7 @@ impl PolicyView {
             .iter()
             .filter(|namespace| {
                 namespace.project.is_some()
+                    || namespace.static_policy.is_some()
                     || matches!(
                         namespace.policy.as_ref().map(|policy| policy.body.scope()),
                         Some(PolicyScope::Namespace(_))
@@ -341,6 +343,7 @@ dsn_env = "GW_BUDGET_REDIS"
                 project: crate::desired_state::fixtures::project_id(1),
             }),
             policy,
+            static_policy: None,
         }
     }
 

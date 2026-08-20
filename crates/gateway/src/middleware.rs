@@ -365,13 +365,7 @@ impl MiddlewarePlan {
         let mut by_namespace = BTreeMap::new();
         let mut guardrail_key_fingerprints = BTreeMap::new();
         for namespace in &config.namespace {
-            let registrations = namespace
-                .policy
-                .as_ref()
-                .map(|policy| policy.body.content_middleware());
-            let Some(registrations) = registrations else {
-                continue;
-            };
+            let registrations = namespace.content_middleware();
             if registrations.is_empty() {
                 continue;
             }

@@ -109,6 +109,54 @@ impl InMemoryControlPlane {
         self.locked().versions.insert(version.reference, version);
     }
 
+    /// Replace one row as a newer build would have published it, including the
+    /// manifest checksums that prove the rewritten bytes are internally
+    /// consistent. This models schema skew rather than storage corruption.
+    pub(crate) fn rewrite_version_as_published(
+        &self,
+        revision: RevisionId,
+        version: ResourceVersion,
+    ) {
+        let mut storage = self.locked();
+        let reference = version.reference;
+        let content = version
+            .content_checksum()
+            .expect("the in-memory schema-skew fixture is canonical");
+        storage.versions.insert(reference, version);
+        let references = storage
+            .manifests
+            .get(&revision)
+            .expect("the rewritten revision exists")
+            .references()
+            .collect::<Vec<_>>();
+        let mut state = DesiredState::new();
+        for reference in references {
+            state
+                .insert(
+                    storage
+                        .versions
+                        .get(&reference)
+                        .cloned()
+                        .expect("the manifest's row exists"),
+                )
+                .expect("manifest references are unique");
+        }
+        let checksum = state
+            .checksum()
+            .expect("the in-memory schema-skew fixture is canonical");
+        let manifest = storage
+            .manifests
+            .get_mut(&revision)
+            .expect("the rewritten revision exists");
+        manifest
+            .entries
+            .iter_mut()
+            .find(|entry| entry.reference == reference)
+            .expect("the rewritten row is in the manifest")
+            .content = content;
+        manifest.checksum = checksum;
+    }
+
     /// Rewrite a manifest's recorded checksum, as a corrupted column would.
     pub(crate) fn corrupt_checksum(&self, id: RevisionId, checksum: Checksum) {
         if let Some(manifest) = self.locked().manifests.get_mut(&id) {

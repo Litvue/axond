@@ -155,6 +155,32 @@ pub fn config_toml(data: &[u8]) -> &'static str {
     outcome
 }
 
+/// Untrusted canonical JSON for deployment, namespace, and inbound-grant v2
+/// bodies. Durable schema skew must remain a typed incompatibility and malformed
+/// storage must remain an ordinary refusal; neither may panic.
+pub fn flat_v2_body(data: &[u8]) -> &'static str {
+    let first = axond_fuzz_seam::flat_v2_body(data);
+    assert!(
+        matches!(
+            first,
+            "empty"
+                | "invalid_json"
+                | "noncanonical_json"
+                | "unknown_selector"
+                | "accepted"
+                | "incompatible"
+                | "invalid"
+        ),
+        "flat-v2 seam returned an unbounded outcome class: {first}"
+    );
+    assert_eq!(
+        first,
+        axond_fuzz_seam::flat_v2_body(data),
+        "the same durable body was classified differently"
+    );
+    first
+}
+
 /// An untrusted `GET /v1/credentials/status?...` query string: malformed
 /// percent-encoding, duplicate keys, empty values, and oversized inputs.
 pub fn credentials_query(data: &[u8]) -> &'static str {

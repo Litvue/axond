@@ -789,6 +789,7 @@ mod tests {
             allow_platform_fallback: false,
             project: None,
             policy: None,
+            static_policy: None,
         });
         let compiler = RevisionCompiler::with_secrets(
             bootstrap,

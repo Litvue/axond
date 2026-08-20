@@ -5,7 +5,7 @@ use super::credentials::RuntimeProjection;
 use super::policy::PolicyProjection;
 use crate::config::{
     CatalogBinding, Config, Credential, GatewayTokenEpoch, Model, Namespace, NamespacePolicy,
-    Provider, Target,
+    NamespaceStaticPolicy, Provider, Target,
 };
 use crate::desired_state::policy::{
     BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
@@ -100,51 +100,57 @@ impl RevisionProjection for FlatNamespaceProjection {
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let policy_body = PolicyBody::new(
-                PolicyScope::Namespace(reference.id),
-                PolicyEpoch::new(body.policy().epoch).map_err(|error| {
-                    ProjectionError::Incomplete {
-                        detail: format!(
-                            "namespace `{namespace}` has invalid policy epoch: {error}"
-                        ),
-                    }
-                })?,
-                BudgetPolicy::stored(
-                    body.policy().subject_limit_microdollars,
-                    body.policy().namespace_limit_microdollars,
-                    body.policy().reservation_ttl_seconds,
-                )
-                .map_err(|error| ProjectionError::Incomplete {
-                    detail: format!("namespace `{namespace}` has invalid budget policy: {error}"),
-                })?,
-                ConcurrencyPolicy::new(
-                    body.policy().max_in_flight_per_subject,
-                    body.policy().lease_ttl_seconds,
-                )
-                .map_err(|error| ProjectionError::Incomplete {
-                    detail: format!(
-                        "namespace `{namespace}` has invalid concurrency policy: {error}"
-                    ),
-                })?,
-                RevocationPolicy::new(body.token_epoch()),
-            )
-            .with_content_middleware(middleware)
-            .map_err(|error| ProjectionError::Incomplete {
-                detail: format!("namespace `{namespace}` has invalid middleware: {error}"),
-            })?
-            .with_buffered_response_routes(body.policy().buffered_response_routes.clone())
-            .map_err(|error| ProjectionError::Incomplete {
-                detail: format!("namespace `{namespace}` has invalid buffering policy: {error}"),
-            })?;
-            let generation = policy_body.generation(source);
+            let exact_policy = body
+                .policy()
+                .exact
+                .as_ref()
+                .map(|exact| {
+                    let policy_body = PolicyBody::new(
+                        PolicyScope::Namespace(reference.id),
+                        PolicyEpoch::new(body.policy().epoch).map_err(|error| {
+                            ProjectionError::Incomplete {
+                                detail: format!(
+                                    "namespace `{namespace}` has invalid policy epoch: {error}"
+                                ),
+                            }
+                        })?,
+                        BudgetPolicy::stored(
+                            exact.subject_limit_microdollars,
+                            exact.namespace_limit_microdollars,
+                            exact.reservation_ttl_seconds,
+                        )
+                        .map_err(|error| ProjectionError::Incomplete {
+                            detail: format!(
+                                "namespace `{namespace}` has invalid budget policy: {error}"
+                            ),
+                        })?,
+                        ConcurrencyPolicy::new(
+                            exact.max_in_flight_per_subject,
+                            exact.lease_ttl_seconds,
+                        )
+                        .map_err(|error| ProjectionError::Incomplete {
+                            detail: format!(
+                                "namespace `{namespace}` has invalid concurrency policy: {error}"
+                            ),
+                        })?,
+                        RevocationPolicy::new(body.token_epoch()),
+                    );
+                    let generation = policy_body.generation(source);
+                    Ok(NamespacePolicy {
+                        body: policy_body,
+                        generation,
+                    })
+                })
+                .transpose()?;
             config.namespace.push(Namespace {
                 id: namespace.clone(),
                 default: body.is_default(),
                 allow_platform_fallback: body.allow_platform_fallback(),
                 project: None,
-                policy: Some(NamespacePolicy {
-                    body: policy_body,
-                    generation,
+                policy: exact_policy,
+                static_policy: Some(NamespaceStaticPolicy {
+                    content_middleware: middleware,
+                    buffered_response_routes: body.policy().buffered_response_routes.clone(),
                 }),
             });
             config.gateway_token_epoch.push(GatewayTokenEpoch {
@@ -226,18 +232,25 @@ impl RevisionProjection for FlatNamespaceProjection {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
     use gateway_core::{MiddlewareFailurePosture, MiddlewareScope, ModelPrice};
 
     use super::*;
+    use crate::backends::secrets::{SecretError, SecretMaterial, SecretResolver};
+    use crate::backends::{Capabilities, Capability};
     use crate::convergence::compile::testing::{revision_with, stateful_bootstrap};
+    use crate::convergence::secrets::{MaterialLedger, SecretMaterialization};
     use crate::convergence::{CandidateCompiler, RevisionCompiler};
     use crate::desired_state::fixtures;
     use crate::desired_state::{
-        Canonical, Checksum, ContentMiddlewareRegistration, DeploymentBody, FlatProviderKind,
-        InboundGrantBody, NamespaceAlias, NamespaceBody, NamespaceCredential, NamespacePolicySpec,
+        Canonical, Checksum, ContentMiddlewareRegistration, DeploymentBody,
+        DeploymentSecretIndexEntry, FlatProviderKind, InboundGrantBody, NamespaceAlias,
+        NamespaceBody, NamespaceCredential, NamespaceExactEnforcement, NamespacePolicySpec,
         NamespaceProvider, NamespaceTarget, ResourceKind, ResourceRef, ResourceVersionNumber,
-        SecretRef, Slug,
+        SecretLifecycle, SecretOwner, SecretRef, Slug,
     };
     use crate::namespace::{NamespaceGrant, NamespaceId};
 
@@ -249,11 +262,13 @@ mod tests {
         (
             NamespacePolicySpec {
                 epoch: token_epoch,
-                subject_limit_microdollars: 50_000,
-                namespace_limit_microdollars: Some(500_000),
-                reservation_ttl_seconds: 60,
-                max_in_flight_per_subject: 8,
-                lease_ttl_seconds: 30,
+                exact: Some(NamespaceExactEnforcement {
+                    subject_limit_microdollars: 50_000,
+                    namespace_limit_microdollars: Some(500_000),
+                    reservation_ttl_seconds: 60,
+                    max_in_flight_per_subject: 8,
+                    lease_ttl_seconds: 30,
+                }),
                 middleware: Vec::new(),
                 buffered_response_routes: Vec::new(),
             },
@@ -270,6 +285,13 @@ mod tests {
     }
 
     fn deployment(middleware: Vec<ContentMiddlewareRegistration>) -> DeploymentBody {
+        deployment_with_secrets(middleware, Vec::new())
+    }
+
+    fn deployment_with_secrets(
+        middleware: Vec<ContentMiddlewareRegistration>,
+        secrets: Vec<DeploymentSecretIndexEntry>,
+    ) -> DeploymentBody {
         DeploymentBody::new(
             vec![NamespaceProvider {
                 id: slug("shared"),
@@ -279,6 +301,7 @@ mod tests {
             Vec::new(),
             middleware,
             Vec::new(),
+            secrets,
         )
         .unwrap()
     }
@@ -362,6 +385,59 @@ mod tests {
         InboundGrantBody::new(Checksum::of(&[seed]), grant, subject.map(str::to_owned)).unwrap()
     }
 
+    struct RecordingResolver {
+        calls: AtomicUsize,
+        owner: NamespaceId,
+        reference: SecretRef,
+        digest: Checksum,
+    }
+
+    #[async_trait]
+    impl SecretResolver for RecordingResolver {
+        fn name(&self) -> &'static str {
+            "recording-namespace-resolver"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::new(&[Capability::EnvelopeEncryption])
+        }
+
+        async fn resolve(
+            &self,
+            _owner: SecretOwner,
+            _reference: &SecretRef,
+        ) -> Result<SecretMaterial, SecretError> {
+            panic!("flat-v2 must never use the legacy owner resolver")
+        }
+
+        async fn exists(
+            &self,
+            _owner: SecretOwner,
+            _reference: &SecretRef,
+        ) -> Result<bool, SecretError> {
+            panic!("flat-v2 must never use the legacy owner lookup")
+        }
+
+        async fn resolve_namespace(
+            &self,
+            request: &crate::desired_state::NamespaceSecretRequest,
+        ) -> Result<SecretMaterial, SecretError> {
+            assert_eq!(request.owner(), &self.owner);
+            assert_eq!(request.reference(), self.reference);
+            assert_eq!(request.ciphertext_digest(), self.digest);
+            assert_eq!(request.lifecycle(), SecretLifecycle::Active);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SecretMaterial::new("test-material".to_owned()))
+        }
+
+        async fn exists_namespace(
+            &self,
+            _request: &crate::desired_state::NamespaceSecretRequest,
+        ) -> Result<bool, SecretError> {
+            Ok(true)
+        }
+    }
+
     #[tokio::test]
     async fn two_namespaces_compile_with_isolated_aliases_and_token_epochs() {
         let state = state_with(vec![grant(
@@ -439,7 +515,18 @@ mod tests {
         };
         let mut state = DesiredState::new();
         state
-            .insert(deployment(Vec::new()).version(fixtures::resource_id(50), slug("deployment")))
+            .insert(
+                deployment_with_secrets(
+                    Vec::new(),
+                    vec![DeploymentSecretIndexEntry::new(
+                        NamespaceId::parse("acme").unwrap(),
+                        reference,
+                        Checksum::of(b"ciphertext-acme-primary"),
+                        SecretLifecycle::Active,
+                    )],
+                )
+                .version(fixtures::resource_id(50), slug("deployment")),
+            )
             .unwrap();
         state
             .insert(
@@ -496,6 +583,23 @@ mod tests {
         assert_eq!(plan.source, crate::credentials::CredentialSource::Platform);
 
         let mut cached = snapshot.cached_serving(revision.id());
+        match &cached.secrets[0].binding {
+            crate::state::CachedSecretBinding::Namespace {
+                owner_namespace,
+                ciphertext_digest,
+                lifecycle,
+            } => {
+                assert_eq!(owner_namespace, "acme");
+                assert_eq!(
+                    ciphertext_digest,
+                    &Checksum::of(b"ciphertext-acme-primary").to_string()
+                );
+                assert_eq!(lifecycle, "active");
+            }
+            crate::state::CachedSecretBinding::Legacy => {
+                panic!("flat-v2 cache material must retain namespace authority")
+            }
+        }
         let (_, restored) = crate::state::ConfigSnapshot::from_cached_serving(
             stateful_bootstrap(),
             &HashMap::new(),
@@ -508,6 +612,53 @@ mod tests {
                 .is_present(&restored.config, "globex", "shared"),
             "credential-bearing LKG restores platform fallback"
         );
+        let mut foreign_owner = cached.clone();
+        let crate::state::CachedSecretBinding::Namespace {
+            owner_namespace, ..
+        } = &mut foreign_owner.secrets[0].binding
+        else {
+            unreachable!()
+        };
+        *owner_namespace = "globex".to_owned();
+        let error = match crate::state::ConfigSnapshot::from_cached_serving(
+            stateful_bootstrap(),
+            &HashMap::new(),
+            foreign_owner,
+        ) {
+            Ok(_) => panic!("a signed cache cannot move material to a foreign namespace"),
+            Err(error) => error,
+        };
+        assert!(error.contains("credential belongs to `acme`"), "{error}");
+
+        let mut tombstoned = cached.clone();
+        let crate::state::CachedSecretBinding::Namespace { lifecycle, .. } =
+            &mut tombstoned.secrets[0].binding
+        else {
+            unreachable!()
+        };
+        *lifecycle = "tombstoned".to_owned();
+        let error = match crate::state::ConfigSnapshot::from_cached_serving(
+            stateful_bootstrap(),
+            &HashMap::new(),
+            tombstoned,
+        ) {
+            Ok(_) => panic!("withdrawn cached material cannot reactivate"),
+            Err(error) => error,
+        };
+        assert!(error.contains("cannot restore Tombstoned"), "{error}");
+
+        let mut ownerless = cached.clone();
+        ownerless.secrets[0].binding = crate::state::CachedSecretBinding::Legacy;
+        let error = match crate::state::ConfigSnapshot::from_cached_serving(
+            stateful_bootstrap(),
+            &HashMap::new(),
+            ownerless,
+        ) {
+            Ok(_) => panic!("flat-v2 cached material cannot lose authority metadata"),
+            Err(error) => error,
+        };
+        assert!(error.contains("omits namespace authority"), "{error}");
+
         cached.secrets.clear();
         let error = match crate::state::ConfigSnapshot::from_cached_serving(
             stateful_bootstrap(),
@@ -517,13 +668,80 @@ mod tests {
             Ok(_) => panic!("an LKG missing credential material must be rejected"),
             Err(error) => error,
         };
-        assert!(error.contains("did not resolve"), "{error}");
+        assert!(
+            error.contains("0 secret materials for 1 referenced versions"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_secret_resolution_is_typed_and_deduplicated() {
+        let owner = NamespaceId::parse("acme").unwrap();
+        let reference = SecretRef::first(fixtures::secret_id(9));
+        let digest = Checksum::of(b"ciphertext-acme-primary");
+        let credential = |id: &str| NamespaceCredential {
+            id: slug(id),
+            provider: slug("shared"),
+            secret: reference,
+            weight: 1,
+        };
+        let mut state = DesiredState::new();
+        state
+            .insert(
+                deployment_with_secrets(
+                    Vec::new(),
+                    vec![DeploymentSecretIndexEntry::new(
+                        owner.clone(),
+                        reference,
+                        digest,
+                        SecretLifecycle::Active,
+                    )],
+                )
+                .version(fixtures::resource_id(50), slug("deployment")),
+            )
+            .unwrap();
+        state
+            .insert(
+                namespace_with(
+                    "acme",
+                    true,
+                    false,
+                    "shared",
+                    "gpt-acme",
+                    vec![credential("primary"), credential("secondary")],
+                    1,
+                )
+                .version(fixtures::resource_id(1), slug("acme")),
+            )
+            .unwrap();
+        state
+            .insert(
+                grant(NamespaceGrant::all(), None, 1)
+                    .version(fixtures::resource_id(10), slug("grant")),
+            )
+            .unwrap();
+        state.validate().unwrap();
+
+        let resolver = Arc::new(RecordingResolver {
+            calls: AtomicUsize::new(0),
+            owner,
+            reference,
+            digest,
+        });
+        let materialization = SecretMaterialization::new(
+            Arc::clone(&resolver) as Arc<dyn SecretResolver>,
+            MaterialLedger::new(),
+        );
+        let resolved = materialization.resolve(&state).await.unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn flat_policy_middleware_and_recovery_stay_namespace_native() {
         let base = namespace("acme", true, "shared", "gpt-acme", 303);
         let mut policy = base.policy().clone();
+        policy.exact = None;
         let middleware = ContentMiddlewareRegistration::new(
             "test.policy-marker",
             [MiddlewareScope::Request],
@@ -572,6 +790,10 @@ mod tests {
                 .middleware("acme")
                 .has_scope(MiddlewareScope::Request)
         );
+        assert!(
+            snapshot.config.namespace[0].policy.is_none(),
+            "blob-only static policy must not fabricate exact distributed caps"
+        );
 
         let cached = snapshot.cached_serving(revision.id());
         let (_, restored) = crate::state::ConfigSnapshot::from_cached_serving(
@@ -587,6 +809,7 @@ mod tests {
                 .has_scope(MiddlewareScope::Request)
         );
         assert!(restored.config.namespace[0].project.is_none());
+        assert!(restored.config.namespace[0].policy.is_none());
     }
 
     #[test]
@@ -668,10 +891,17 @@ mod tests {
             base_url: "https://zeta.example/v1".to_owned(),
         };
         let mut providers = vec![first_provider, second_provider];
-        let first =
-            DeploymentBody::new(providers.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let first = DeploymentBody::new(
+            providers.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
         providers.reverse();
-        let rebuilt = DeploymentBody::new(providers, Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let rebuilt =
+            DeploymentBody::new(providers, Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
         assert_eq!(first.checksum().unwrap(), rebuilt.checksum().unwrap());
     }
 

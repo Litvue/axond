@@ -123,6 +123,11 @@ const TARGETS: &[Target] = &[
         minimum_classes: 4,
     },
     Target {
+        name: "flat_v2_body",
+        run: replay_flat_v2_body,
+        minimum_classes: 3,
+    },
+    Target {
         // Below what the corpus reaches today (8), because part of that count
         // comes from arbitrary `Minted` decodings whose lifetime claims are
         // compared against the wall clock: pinning the floor at the observed
@@ -255,6 +260,10 @@ fn replay_config_toml(data: &[u8]) -> Vec<&'static str> {
 
 fn replay_credentials_query(data: &[u8]) -> Vec<&'static str> {
     vec![axond_fuzz::credentials_query(data)]
+}
+
+fn replay_flat_v2_body(data: &[u8]) -> Vec<&'static str> {
+    vec![axond_fuzz::flat_v2_body(data)]
 }
 
 /// The token target takes a structured input, so a seed file is replayed twice:

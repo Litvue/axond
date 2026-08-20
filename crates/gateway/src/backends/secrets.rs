@@ -54,6 +54,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 use super::{BackendFailure, BackendKind, Capabilities, Capability, FailureCategory};
 use crate::desired_state::ids::SecretId;
+use crate::desired_state::namespaces::NamespaceSecretRequest;
 use crate::desired_state::secrets::{
     ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,
 };
@@ -310,23 +311,30 @@ pub trait SecretResolver: Send + Sync {
     /// to tell a foreign reference from one that was never stored.
     async fn exists(&self, owner: SecretOwner, reference: &SecretRef) -> Result<bool, SecretError>;
 
-    /// Resolve material owned by ADR 0062's deployment scope.
+    /// Resolve one ADR 0062 ciphertext through its authoritative namespace
+    /// binding.
     ///
     /// Existing tenant/project stores fail closed by default. Blob-backed
-    /// implementations override this method without fabricating a tenant owner.
-    async fn resolve_deployment(
+    /// implementations override this method and must verify the request's owner,
+    /// exact reference, ciphertext digest, and lifecycle before unwrapping.
+    async fn resolve_namespace(
         &self,
-        reference: &SecretRef,
+        request: &NamespaceSecretRequest,
     ) -> Result<SecretMaterial, SecretError> {
         Err(SecretError::Denied {
             backend: self.name(),
             message: format!(
-                "deployment-scoped secret {reference} is not supported by this backend"
+                "namespace-bound secret {} for `{}` is not supported by this backend",
+                request.reference(),
+                request.owner()
             ),
         })
     }
 
-    async fn exists_deployment(&self, _reference: &SecretRef) -> Result<bool, SecretError> {
+    async fn exists_namespace(
+        &self,
+        _request: &NamespaceSecretRequest,
+    ) -> Result<bool, SecretError> {
         Ok(false)
     }
 }

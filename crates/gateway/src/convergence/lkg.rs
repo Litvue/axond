@@ -514,7 +514,7 @@ const COMPILED_MAGIC: &[u8] = b"axond.compiled-serving\0";
 // rules, and a non-secret resolved-key fingerprint. Keep this byte in lockstep
 // with every payload shape change: an older build must reject a newer cache
 // before serde can ignore a field it does not understand.
-const COMPILED_RECORD_VERSION: u8 = 5;
+const COMPILED_RECORD_VERSION: u8 = 6;
 
 fn compiled_key(key: &[u8]) -> [u8; 32] {
     let mut context = ring::digest::Context::new(&SHA256);
@@ -1016,20 +1016,20 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
     #[test]
     fn compiled_serving_cache_rejects_an_older_layout_before_deserializing_it() {
         assert_eq!(
-            COMPILED_RECORD_VERSION, 5,
-            "v2 scope/grant cache shape bump"
+            COMPILED_RECORD_VERSION, 6,
+            "namespace-bound secret and static-policy cache shape bump"
         );
         let (snapshot, _, _) = serving_snapshot();
         let cache = cache("compiled-serving-old-layout");
         let mut bytes = cache
             .encode_compiled(&snapshot, fixtures::revision_id(9))
             .expect("compiled cache encodes");
-        bytes[COMPILED_MAGIC.len()] = 4;
+        bytes[COMPILED_MAGIC.len()] = 5;
         cache
             .write_compiled(&bytes)
             .expect("old-layout fixture writes");
 
-        let expected = "unsupported layout version 4".to_owned();
+        let expected = "unsupported layout version 5".to_owned();
         assert!(matches!(
             cache.load_compiled(),
             Err(LastKnownGoodError::CompiledMalformed { detail, .. })
@@ -1076,6 +1076,53 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         assert!(
             integrity.is_incompatible(),
             "a body this build cannot read is a version skew, not damage: {integrity}"
+        );
+        let _ = fs::remove_file(cache.path());
+    }
+
+    #[test]
+    fn a_cached_newer_namespace_schema_takes_the_incompatible_path() {
+        let cache = cache("newer-flat-namespace");
+        let valid_state = fixtures::flat_namespace_state();
+        let readable = revision(9, valid_state.clone());
+        let incompatible_namespace = fixtures::incompatible_flat_namespace();
+        let mut incompatible_state = DesiredState::new();
+        for resource in valid_state.resources() {
+            incompatible_state
+                .insert(if resource.reference.kind == ResourceKind::Namespace {
+                    incompatible_namespace.clone()
+                } else {
+                    resource.clone()
+                })
+                .unwrap();
+        }
+        let mut manifest = readable.manifest().clone();
+        manifest
+            .entries
+            .iter_mut()
+            .find(|entry| entry.reference == incompatible_namespace.reference)
+            .unwrap()
+            .content = incompatible_namespace.content_checksum().unwrap();
+        manifest.checksum = incompatible_state.checksum().unwrap();
+        cache
+            .export_unassembled(&manifest, &incompatible_state)
+            .expect("authentic newer-schema cache writes");
+
+        let error = cache
+            .load()
+            .expect_err("this build must refuse the newer namespace schema");
+        let LastKnownGoodError::Integrity(integrity) = error else {
+            panic!("newer namespace schema must fail during assembly: {error}");
+        };
+        assert!(integrity.is_incompatible(), "{integrity}");
+        assert!(
+            matches!(
+                integrity,
+                IntegrityError::Incompatible(crate::desired_state::revision::BodySkew::Namespace(
+                    _
+                ))
+            ),
+            "the incompatible body retains its namespace type"
         );
         let _ = fs::remove_file(cache.path());
     }

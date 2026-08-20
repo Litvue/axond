@@ -125,9 +125,10 @@ pub use mutation::{
 };
 #[allow(unused_imports)]
 pub use namespaces::{
-    DeploymentBody, DeploymentCatalogueEntry, DeploymentProvider, DeploymentTrust, FlatNamespaces,
-    FlatProviderKind, InboundGrantBody, NamespaceAlias, NamespaceBody, NamespaceCredential,
-    NamespacePolicySpec, NamespaceProvider, NamespaceStateError, NamespaceTarget,
+    DeploymentBody, DeploymentCatalogueEntry, DeploymentProvider, DeploymentSecretIndexEntry,
+    DeploymentTrust, FlatNamespaces, FlatProviderKind, InboundGrantBody, NamespaceAlias,
+    NamespaceBody, NamespaceCredential, NamespaceExactEnforcement, NamespacePolicySpec,
+    NamespaceProvider, NamespaceSecretRequest, NamespaceStateError, NamespaceTarget,
 };
 #[allow(unused_imports)]
 pub use policy::{

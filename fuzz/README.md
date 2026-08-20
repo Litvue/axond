@@ -10,6 +10,7 @@ the process actually runs.
 | `config_toml` | `Config::from_toml_str` and the whole validation graph | Boot and every `SIGHUP` reload re-parse a file the gateway does not control |
 | `token_verify` | `axt1.` JWS decoding, key selection, signature, and every claim check | A minted token is the one credential an attacker can shape freely |
 | `credentials_query` | `GET /v1/credentials/status?namespaces=…` parsing | Hand-rolled percent-decoding, so malformed escapes, duplicate keys, empty values, and oversized inputs all land here |
+| `flat_v2_body` | Deployment, namespace, and inbound-grant v2 durable body decoding | Signed object-store and LKG hydration must distinguish malformed state from forward schema skew without panics or unbounded parsing |
 | `sse_decode` | `SseDecoder` on arbitrary bodies split at arbitrary chunk boundaries | A stream arrives in whatever pieces the network produced, and an event, a delimiter, or a character can straddle two of them |
 | `provider_stream` | The OpenAI, Foundry, and Anthropic stream decoders — translated and native | They interpret provider JSON mid-relay, where a panic loses a live response |
 | `provider_error` | `ProviderError::from_upstream`, `::transport`, and the classification behind them | An upstream failure body decides whether the gateway retries, fails over, or opens a circuit |

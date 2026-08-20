@@ -791,6 +791,46 @@ mod tests {
     }
 
     #[test]
+    fn flat_static_policy_needs_no_shared_backend_but_exact_caps_still_do() {
+        let mut blob_only = stateful_config();
+        blob_only.budget.backend = BudgetBackend::None;
+        blob_only.budget.dsn_env = None;
+        blob_only.namespace.push(crate::config::Namespace {
+            id: "acme".to_owned(),
+            default: true,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+            static_policy: Some(crate::config::NamespaceStaticPolicy::default()),
+        });
+        let support = BackendSupport::of(&blob_only);
+        plan(&empty(), &PolicyView::of(&blob_only), support)
+            .expect("static flat-v2 policy activates in a blob-only deployment");
+        assert!(
+            PolicyView::of(&blob_only).policy("acme").budget.is_none(),
+            "absence of exact caps must not fabricate per-replica enforcement"
+        );
+
+        let exact = detailed(
+            PolicyScope::Namespace(resource_id(91)),
+            1,
+            1_000,
+            None,
+            300,
+            8,
+            60,
+            0,
+        );
+        blob_only.namespace[0].policy = Some(NamespacePolicy {
+            generation: generation(&exact, 1),
+            body: exact,
+        });
+        let refusal = plan(&empty(), &PolicyView::of(&blob_only), support)
+            .expect_err("requested exact caps fail closed without shared backends");
+        assert_eq!(refusal.reason(), "unsupported");
+    }
+
+    #[test]
     fn a_document_withdrawn_from_a_namespace_that_is_still_served_is_refused() {
         let document = body(scope(), 1, 1_000);
         let mut without = stateful_config();
@@ -800,6 +840,7 @@ mod tests {
             allow_platform_fallback: false,
             project: None,
             policy: None,
+            static_policy: None,
         });
         let refusal = plan(&view(&document, 1), &PolicyView::of(&without), shared())
             .expect_err("a served namespace cannot lose its policy");
@@ -1081,6 +1122,7 @@ mod tests {
             allow_platform_fallback: false,
             project: None,
             policy: None,
+            static_policy: None,
         });
 
         plan(&empty(), &PolicyView::of(&candidate), shared())

@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backends::secrets::{SecretError, SecretMaterial, SecretResolver};
 use crate::desired_state::credentials::Credentials;
+use crate::desired_state::namespaces::NamespaceSecretRequest;
 use crate::desired_state::secrets::{SecretOwner, SecretRef};
 use crate::desired_state::{DesiredState, ResourceRef};
 
@@ -65,6 +66,7 @@ impl MaterialLedger {
         self: &Arc<Self>,
         reference: SecretRef,
         material: SecretMaterial,
+        binding: ResolvedSecretBinding,
     ) -> RetainedMaterial {
         *self
             .held
@@ -75,6 +77,7 @@ impl MaterialLedger {
         RetainedMaterial(Arc::new(Retained {
             reference,
             material,
+            binding,
             ledger: Arc::clone(self),
         }))
     }
@@ -132,7 +135,16 @@ pub struct RetainedMaterial(Arc<Retained>);
 struct Retained {
     reference: SecretRef,
     material: SecretMaterial,
+    binding: ResolvedSecretBinding,
     ledger: Arc<MaterialLedger>,
+}
+
+/// The authority metadata retained beside plaintext and copied into encrypted
+/// compiled recovery state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedSecretBinding {
+    Legacy,
+    Namespace(NamespaceSecretRequest),
 }
 
 /// Deregistration happens here rather than at any call site, so a snapshot that
@@ -160,6 +172,10 @@ impl RetainedMaterial {
     /// test can assert.
     pub fn holders(&self) -> usize {
         Arc::strong_count(&self.0)
+    }
+
+    pub(crate) fn binding(&self) -> &ResolvedSecretBinding {
+        &self.0.binding
     }
 }
 
@@ -194,15 +210,20 @@ impl ResolvedSecrets {
     /// zeroization semantics.
     pub(crate) fn from_cached(
         ledger: Arc<MaterialLedger>,
-        materials: impl IntoIterator<Item = (SecretRef, SecretMaterial)>,
-    ) -> Self {
+        materials: impl IntoIterator<Item = (SecretRef, SecretMaterial, ResolvedSecretBinding)>,
+    ) -> Result<Self, String> {
         let mut resolved = Self::default();
-        for (reference, material) in materials {
+        for (reference, material, binding) in materials {
+            if resolved.materials.contains_key(&reference) {
+                return Err(format!(
+                    "compiled cache declares secret {reference} more than once"
+                ));
+            }
             resolved
                 .materials
-                .insert(reference, ledger.retain(reference, material));
+                .insert(reference, ledger.retain(reference, material, binding));
         }
-        resolved
+        Ok(resolved)
     }
 
     /// The material for an exact version, or `None` if this candidate did not
@@ -303,9 +324,11 @@ impl SecretMaterialization {
             let material = self
                 .unwrap_one(credential.body.owner(), reference, credential.reference)
                 .await?;
-            resolved
-                .materials
-                .insert(reference, self.ledger.retain(reference, material));
+            resolved.materials.insert(
+                reference,
+                self.ledger
+                    .retain(reference, material, ResolvedSecretBinding::Legacy),
+            );
         }
         Ok(resolved)
     }
@@ -331,13 +354,21 @@ impl SecretMaterialization {
                             .to_owned(),
                     ));
                 };
+                let request = flat
+                    .secret_request(namespace.namespace(), reference)
+                    .expect("validated flat credentials have one exact secret binding");
                 let material = resolver
-                    .resolve_deployment(&reference)
+                    .resolve_namespace(&request)
                     .await
                     .map_err(|error| secret_error(*holder, reference, error.to_string()))?;
-                resolved
-                    .materials
-                    .insert(reference, self.ledger.retain(reference, material));
+                resolved.materials.insert(
+                    reference,
+                    self.ledger.retain(
+                        reference,
+                        material,
+                        ResolvedSecretBinding::Namespace(request),
+                    ),
+                );
             }
         }
         Ok(resolved)
@@ -425,14 +456,17 @@ pub(crate) mod testing {
             Ok(true)
         }
 
-        async fn resolve_deployment(
+        async fn resolve_namespace(
             &self,
-            _reference: &SecretRef,
+            _request: &NamespaceSecretRequest,
         ) -> Result<SecretMaterial, SecretError> {
             Ok(SecretMaterial::new(MATERIAL.to_owned()))
         }
 
-        async fn exists_deployment(&self, _reference: &SecretRef) -> Result<bool, SecretError> {
+        async fn exists_namespace(
+            &self,
+            _request: &NamespaceSecretRequest,
+        ) -> Result<bool, SecretError> {
             Ok(true)
         }
     }

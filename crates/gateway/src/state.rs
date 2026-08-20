@@ -34,11 +34,11 @@ use crate::backends::health::BackendHealth;
 use crate::backends::secrets::SecretMaterial;
 use crate::budget::BudgetStore;
 use crate::config::{
-    CatalogBinding, Config, GatewayVerifierAlgorithm, Namespace, NamespacePolicy, ProjectIdentity,
-    ProjectedPrincipal, ProviderKind,
+    CatalogBinding, Config, GatewayVerifierAlgorithm, Namespace, NamespacePolicy,
+    NamespaceStaticPolicy, ProjectIdentity, ProjectedPrincipal, ProviderKind,
 };
 use crate::convergence::SystemClock;
-use crate::convergence::secrets::{MaterialLedger, ResolvedSecrets};
+use crate::convergence::secrets::{MaterialLedger, ResolvedSecretBinding, ResolvedSecrets};
 use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
 use crate::desired_state::mutation::Actor;
@@ -51,11 +51,13 @@ use crate::desired_state::pricing::{
 };
 use crate::desired_state::tenancy::DisplayName;
 use crate::desired_state::{
-    AuthorizationSnapshot, Checksum, ResourceId, ResourceKind, ResourceRef, ResourceVersionNumber,
+    AuthorizationSnapshot, Checksum, NamespaceSecretRequest, ResourceId, ResourceKind, ResourceRef,
+    ResourceVersionNumber, SecretLifecycle,
 };
 use crate::desired_state::{ProjectId, RevisionId, SecretRef, TenantId, WorkloadKey};
 use crate::key_material::{self, KeyMaterialError};
 use crate::middleware::{MiddlewareChain, MiddlewarePlan, MiddlewarePlanError, MiddlewareRuntime};
+use crate::namespace::NamespaceId;
 use crate::policy::PolicyRuntime;
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
@@ -382,6 +384,8 @@ pub(crate) struct CachedNamespace {
     pub(crate) allow_platform_fallback: bool,
     pub(crate) project: Option<CachedProjectIdentity>,
     pub(crate) policy: Option<CachedPolicy>,
+    pub(crate) static_policy: Option<CachedStaticPolicy>,
+    pub(crate) token_epoch: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -403,6 +407,13 @@ pub(crate) struct CachedPolicy {
     pub(crate) minimum_token_epoch: u64,
     pub(crate) content_middleware: Vec<CachedContentMiddleware>,
     #[serde(default)]
+    pub(crate) buffered_response_routes: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CachedStaticPolicy {
+    pub(crate) content_middleware: Vec<CachedContentMiddleware>,
     pub(crate) buffered_response_routes: Vec<String>,
 }
 
@@ -485,10 +496,22 @@ pub(crate) struct CachedPrincipal {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct CachedSecret {
     pub(crate) reference: String,
+    pub(crate) binding: CachedSecretBinding,
     /// This field is only present inside the encrypted cache payload. It must
     /// never be written to the signed desired-state cache or an unencrypted
     /// diagnostic.
     pub(crate) material: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CachedSecretBinding {
+    Legacy,
+    Namespace {
+        owner_namespace: String,
+        ciphertext_digest: String,
+        lifecycle: String,
+    },
 }
 
 impl Drop for CachedSecret {
@@ -617,6 +640,44 @@ impl ConfigSnapshot {
                             .map(|route| route.as_str().to_owned())
                             .collect(),
                     }),
+                    static_policy: namespace.static_policy.as_ref().map(|policy| {
+                        CachedStaticPolicy {
+                            content_middleware: policy
+                                .content_middleware
+                                .iter()
+                                .map(|registration| CachedContentMiddleware {
+                                    id: registration.id().to_owned(),
+                                    scopes: registration.scopes().to_vec(),
+                                    failure_posture: registration.failure_posture(),
+                                    max_duration_milliseconds: registration
+                                        .max_duration_milliseconds(),
+                                    guardrail: registration.guardrail().map(|guardrail| {
+                                        CachedContentGuardrail {
+                                            key_env: guardrail.key_env().to_owned(),
+                                            key_fingerprint: self
+                                                .middleware
+                                                .guardrail_key_fingerprint(&namespace.id)
+                                                .expect(
+                                                    "a compiled guardrail has a key fingerprint",
+                                                )
+                                                .to_owned(),
+                                            rules: guardrail.rules().to_vec(),
+                                        }
+                                    }),
+                                })
+                                .collect(),
+                            buffered_response_routes: policy
+                                .buffered_response_routes
+                                .iter()
+                                .map(|route| route.as_str().to_owned())
+                                .collect(),
+                        }
+                    }),
+                    token_epoch: config
+                        .gateway_token_epoch
+                        .iter()
+                        .find(|epoch| epoch.namespace == namespace.id && epoch.subject.is_none())
+                        .map(|epoch| epoch.min_iat),
                 })
                 .collect(),
             providers: config
@@ -693,6 +754,16 @@ impl ConfigSnapshot {
                 .filter_map(|reference| {
                     self.secrets.get(reference).map(|material| CachedSecret {
                         reference: reference.to_string(),
+                        binding: match material.binding() {
+                            ResolvedSecretBinding::Legacy => CachedSecretBinding::Legacy,
+                            ResolvedSecretBinding::Namespace(request) => {
+                                CachedSecretBinding::Namespace {
+                                    owner_namespace: request.owner().to_string(),
+                                    ciphertext_digest: request.ciphertext_digest().to_string(),
+                                    lifecycle: request.lifecycle().as_str().to_owned(),
+                                }
+                            }
+                        },
                         material: material.expose().to_owned(),
                     })
                 })
@@ -828,17 +899,93 @@ impl ConfigSnapshot {
         bootstrap
             .validate_compiled()
             .map_err(|error| error.to_string())?;
+        let flat_namespaces = bootstrap
+            .namespace
+            .iter()
+            .map(|namespace| (namespace.id.clone(), namespace.static_policy.is_some()))
+            .collect::<HashMap<_, _>>();
+        let mut expected_secret_owners = HashMap::new();
+        for credential in &bootstrap.credential {
+            let Some(reference) = credential.secret else {
+                continue;
+            };
+            if let Some(first) =
+                expected_secret_owners.insert(reference, credential.namespace.clone())
+                && first != credential.namespace
+            {
+                return Err(format!(
+                    "compiled cache shares secret {reference} between namespaces `{first}` and `{}`",
+                    credential.namespace
+                ));
+            }
+        }
         let materials = cached
             .secrets
             .into_iter()
             .map(|mut secret| {
                 let reference =
                     SecretRef::parse(&secret.reference).map_err(|error| error.to_string())?;
+                let expected_owner = expected_secret_owners.get(&reference).ok_or_else(|| {
+                    format!("compiled cache contains unreferenced secret {reference}")
+                })?;
+                let binding = match &secret.binding {
+                    CachedSecretBinding::Legacy => {
+                        if flat_namespaces.get(expected_owner).copied() == Some(true) {
+                            return Err(format!(
+                                "compiled cache omits namespace authority for flat-v2 secret {reference}"
+                            ));
+                        }
+                        ResolvedSecretBinding::Legacy
+                    }
+                    CachedSecretBinding::Namespace {
+                        owner_namespace,
+                        ciphertext_digest,
+                        lifecycle,
+                    } => {
+                        let owner = NamespaceId::parse(owner_namespace)
+                            .map_err(|error| error.to_string())?;
+                        if owner.as_str() != expected_owner {
+                            return Err(format!(
+                                "compiled cache binds secret {reference} to namespace `{owner}` but its credential belongs to `{expected_owner}`"
+                            ));
+                        }
+                        if flat_namespaces.get(expected_owner).copied() != Some(true) {
+                            return Err(format!(
+                                "compiled cache applies flat-v2 authority to legacy secret {reference}"
+                            ));
+                        }
+                        let digest = Checksum::parse(ciphertext_digest)
+                            .map_err(|error| error.to_string())?;
+                        let lifecycle = SecretLifecycle::parse(lifecycle).ok_or_else(|| {
+                            format!(
+                                "compiled cache declares unsupported lifecycle `{lifecycle}` for secret {reference}"
+                            )
+                        })?;
+                        if lifecycle != SecretLifecycle::Active {
+                            return Err(format!(
+                                "compiled cache cannot restore {lifecycle:?} secret {reference}"
+                            ));
+                        }
+                        ResolvedSecretBinding::Namespace(NamespaceSecretRequest::new(
+                            owner,
+                            reference,
+                            digest,
+                            lifecycle,
+                        ))
+                    }
+                };
                 let material = std::mem::take(&mut secret.material);
-                Ok((reference, SecretMaterial::new(material)))
+                Ok((reference, SecretMaterial::new(material), binding))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let secrets = ResolvedSecrets::from_cached(MaterialLedger::new(), materials);
+        if materials.len() != expected_secret_owners.len() {
+            return Err(format!(
+                "compiled cache contains {} secret materials for {} referenced versions",
+                materials.len(),
+                expected_secret_owners.len()
+            ));
+        }
+        let secrets = ResolvedSecrets::from_cached(MaterialLedger::new(), materials)?;
         let mut snapshot = Self::build_compiled_with(bootstrap, env, cached.generation, secrets)
             .map_err(|error| error.to_string())?;
         if let Some(pricing) = cached.pricing {
@@ -858,12 +1005,16 @@ fn verify_cached_guardrail_keys(
             |project| format!("{}/{}", project.tenant, project.project),
         );
         let registrations = namespace
-            .policy
+            .static_policy
             .as_ref()
-            .map(|policy| policy.content_middleware.as_slice());
-        let Some(registrations) = registrations else {
-            continue;
-        };
+            .map(|policy| policy.content_middleware.as_slice())
+            .or_else(|| {
+                namespace
+                    .policy
+                    .as_ref()
+                    .map(|policy| policy.content_middleware.as_slice())
+            })
+            .unwrap_or_default();
         for registration in registrations {
             let Some(guardrail) = &registration.guardrail else {
                 continue;
@@ -882,6 +1033,41 @@ fn verify_cached_guardrail_keys(
     Ok(())
 }
 
+fn restore_cached_middleware(
+    registrations: Vec<CachedContentMiddleware>,
+) -> Result<Vec<crate::desired_state::ContentMiddlewareRegistration>, String> {
+    registrations
+        .into_iter()
+        .map(|registration| {
+            let middleware = crate::desired_state::ContentMiddlewareRegistration::new(
+                registration.id,
+                registration.scopes,
+                registration.failure_posture,
+                registration.max_duration_milliseconds,
+            )
+            .map_err(|error| error.to_string())?;
+            let Some(guardrail) = registration.guardrail else {
+                return Ok(middleware);
+            };
+            let guardrail = crate::desired_state::policy::ContentGuardrailRegistration::new(
+                guardrail.key_env,
+                guardrail.rules,
+            )
+            .map_err(|error| error.to_string())?;
+            middleware
+                .with_guardrail(guardrail)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+fn restore_cached_buffered_routes(routes: &[String]) -> Result<Vec<BufferedResponseRoute>, String> {
+    routes
+        .iter()
+        .map(|route| BufferedResponseRoute::parse(route).map_err(|error| error.to_string()))
+        .collect()
+}
+
 impl CachedServingSnapshot {
     pub(crate) fn zeroize_secrets(&mut self) {
         for secret in &mut self.secrets {
@@ -894,6 +1080,7 @@ fn cached_namespace(
     namespace: CachedNamespace,
     revision: RevisionId,
 ) -> Result<(Namespace, Option<u64>), String> {
+    let has_static_policy = namespace.static_policy.is_some();
     let project = namespace
         .project
         .map(|identity| -> Result<ProjectIdentity, String> {
@@ -920,36 +1107,9 @@ fn cached_namespace(
                 },
             };
             let minimum_token_epoch = policy.minimum_token_epoch;
-            let content_middleware = policy
-                .content_middleware
-                .into_iter()
-                .map(|registration| {
-                    let middleware = crate::desired_state::ContentMiddlewareRegistration::new(
-                        registration.id,
-                        registration.scopes,
-                        registration.failure_posture,
-                        registration.max_duration_milliseconds,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    let Some(guardrail) = registration.guardrail else {
-                        return Ok(middleware);
-                    };
-                    let guardrail =
-                        crate::desired_state::policy::ContentGuardrailRegistration::new(
-                            guardrail.key_env,
-                            guardrail.rules,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    middleware
-                        .with_guardrail(guardrail)
-                        .map_err(|error| error.to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let buffered_response_routes = policy
-                .buffered_response_routes
-                .iter()
-                .map(|route| BufferedResponseRoute::parse(route).map_err(|error| error.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
+            let content_middleware = restore_cached_middleware(policy.content_middleware)?;
+            let buffered_response_routes =
+                restore_cached_buffered_routes(&policy.buffered_response_routes)?;
             let body = PolicyBody::new(
                 scope,
                 PolicyEpoch::new(policy.epoch).map_err(|error| error.to_string())?,
@@ -971,13 +1131,39 @@ fn cached_namespace(
             Ok((NamespacePolicy { body, generation }, minimum_token_epoch))
         })
         .transpose()?;
-    let minimum_token_epoch = policy.as_ref().and_then(|(_, minimum)| {
+    let static_policy = namespace
+        .static_policy
+        .map(|policy| {
+            Ok::<_, String>(NamespaceStaticPolicy {
+                content_middleware: restore_cached_middleware(policy.content_middleware)?,
+                buffered_response_routes: restore_cached_buffered_routes(
+                    &policy.buffered_response_routes,
+                )?,
+            })
+        })
+        .transpose()?;
+    let policy_token_epoch = policy.as_ref().and_then(|(_, minimum)| {
         matches!(
             policy.as_ref().map(|(policy, _)| policy.body.scope()),
             Some(PolicyScope::Namespace(_))
         )
         .then_some(*minimum)
     });
+    if has_static_policy && namespace.token_epoch.is_none() {
+        return Err(format!(
+            "compiled cache omits the token epoch for flat-v2 namespace `{}`",
+            namespace.id
+        ));
+    }
+    if let (Some(explicit), Some(policy)) = (namespace.token_epoch, policy_token_epoch)
+        && explicit != policy
+    {
+        return Err(format!(
+            "compiled cache gives namespace `{}` conflicting token epochs {explicit} and {policy}",
+            namespace.id
+        ));
+    }
+    let minimum_token_epoch = namespace.token_epoch.or(policy_token_epoch);
     Ok((
         Namespace {
             id: namespace.id,
@@ -985,6 +1171,7 @@ fn cached_namespace(
             allow_platform_fallback: namespace.allow_platform_fallback,
             project,
             policy: policy.map(|(policy, _)| policy),
+            static_policy,
         },
         minimum_token_epoch,
     ))

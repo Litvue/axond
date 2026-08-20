@@ -655,6 +655,8 @@ impl RevisionManifest {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BodySkew {
     #[error(transparent)]
+    Namespace(NamespaceStateError),
+    #[error(transparent)]
     Tenancy(TenancyError),
     #[error(transparent)]
     Credential(CredentialError),
@@ -679,6 +681,12 @@ impl From<ModelError> for ValidationError {
 impl From<TenancyError> for BodySkew {
     fn from(error: TenancyError) -> Self {
         Self::Tenancy(error)
+    }
+}
+
+impl From<NamespaceStateError> for BodySkew {
+    fn from(error: NamespaceStateError) -> Self {
+        Self::Namespace(error)
     }
 }
 
@@ -714,8 +722,11 @@ impl From<Box<PricingError>> for BodySkew {
 
 impl BodySkew {
     /// The resource the refusal is about, whichever schema refused it.
-    pub const fn reference(&self) -> ResourceRef {
+    pub fn reference(&self) -> ResourceRef {
         match self {
+            Self::Namespace(error) => error
+                .reference()
+                .expect("only a resource-specific namespace incompatibility becomes BodySkew"),
             Self::Tenancy(error) => error.reference(),
             Self::Credential(error) => error.reference(),
             Self::Policy(error) => error.reference(),
@@ -807,6 +818,9 @@ impl IntegrityError {
     /// contradict each other". See [`TenancyError::is_incompatible`].
     fn classify(error: ValidationError) -> Self {
         match error {
+            ValidationError::Namespace(namespace) if namespace.is_incompatible() => {
+                Self::Incompatible(BodySkew::Namespace(namespace))
+            }
             ValidationError::Tenancy(tenancy) if tenancy.is_incompatible() => {
                 Self::Incompatible(BodySkew::Tenancy(tenancy))
             }

@@ -1141,6 +1141,52 @@ async fn a_revision_this_build_cannot_read_is_refused_as_an_incompatibility() {
     assert_eq!(replica.served_aliases(), serving);
 }
 
+/// ADR 0062 bodies take the same operational path as every other newer schema:
+/// hydration reports incompatibility, reconciliation keeps the active snapshot,
+/// and the reason never degrades to storage corruption.
+#[tokio::test]
+async fn a_newer_flat_namespace_schema_is_refused_as_an_incompatibility() {
+    let store = control_plane();
+    let first = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let replica = Replica::serving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let serving = replica.served_aliases();
+
+    let second = publish(
+        &store,
+        "flat-v2",
+        ExpectedRevision::Exactly(first),
+        fixtures::flat_namespace_state(),
+    )
+    .await;
+    store.rewrite_version_as_published(second, fixtures::incompatible_flat_namespace());
+
+    let outcome = replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Rejected { revision, reason }
+                if revision == Some(second) && reason == "incompatible"
+        ),
+        "{outcome:?}"
+    );
+    let report = replica.report();
+    assert_eq!(report.active, Some(first));
+    assert_eq!(report.desired, Some(second));
+    assert_eq!(replica.generation(), 1);
+    assert_eq!(replica.served_aliases(), serving);
+    assert_eq!(
+        report.last_rejection.expect("rejection is reported").reason,
+        "incompatible"
+    );
+}
+
 /// The pricing half of the same promise: a revision whose approved book this
 /// build cannot bill is refused whole, and the replica keeps billing at the
 /// prices it already converged onto rather than at none.

@@ -1383,13 +1383,7 @@ fn stream_delivery(
     };
     let enabled = cfg
         .namespace(namespace)
-        .and_then(|namespace| namespace.policy.as_ref())
-        .is_some_and(|policy| {
-            policy
-                .body
-                .buffered_response_routes()
-                .contains(&policy_route)
-        });
+        .is_some_and(|namespace| namespace.buffered_response_routes().contains(&policy_route));
     if enabled {
         return Ok(if mutates_response {
             StreamDelivery::PolicyBuffered

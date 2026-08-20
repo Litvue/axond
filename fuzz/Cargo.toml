@@ -79,6 +79,14 @@ doc = false
 bench = false
 
 [[bin]]
+name = "flat_v2_body"
+path = "fuzz_targets/flat_v2_body.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "sse_decode"
 path = "fuzz_targets/sse_decode.rs"
 required-features = ["libfuzzer"]

@@ -17,7 +17,7 @@ use super::policy::{
 };
 use super::{
     Canonical, CanonicalValue, Checksum, ResourceBody, ResourceId, ResourceKind, ResourceRef,
-    ResourceScope, ResourceVersion, ResourceVersionNumber, SecretRef, Slug,
+    ResourceScope, ResourceVersion, ResourceVersionNumber, SecretLifecycle, SecretRef, Slug,
 };
 
 const DEPLOYMENT_SCHEMA: &str = "axond.deployment.v2";
@@ -29,6 +29,7 @@ const MAX_TOTAL_GRANTED_NAMESPACES: usize = 262_144;
 const MAX_PROVIDERS: usize = 64;
 const MAX_CATALOGUE_ENTRIES: usize = 4_096;
 const MAX_TRUST_ENTRIES: usize = 64;
+const MAX_SECRET_INDEX_ENTRIES: usize = 8_192;
 const MAX_CREDENTIALS: usize = 128;
 const MAX_ALIASES: usize = 256;
 const MAX_TARGETS: usize = 16;
@@ -60,12 +61,39 @@ pub struct DeploymentTrust {
     pub jwks_url: String,
 }
 
+/// Non-secret metadata binding one immutable ciphertext object to its owner.
+///
+/// The ciphertext digest is an integrity/addressing claim consumed by the
+/// blob-envelope implementation. This projection slice never reads ciphertext
+/// or performs cryptography; it only makes the ownership and exact-version
+/// boundary impossible to omit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentSecretIndexEntry {
+    owner: NamespaceId,
+    reference: SecretRef,
+    ciphertext_digest: Checksum,
+    lifecycle: SecretLifecycle,
+}
+
+/// The complete typed request a namespace-aware secret resolver must answer.
+///
+/// Keeping this distinct from [`SecretRef`] prevents a blob resolver from
+/// accidentally implementing deployment-wide, ownerless lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceSecretRequest {
+    owner: NamespaceId,
+    reference: SecretRef,
+    ciphertext_digest: Checksum,
+    lifecycle: SecretLifecycle,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentBody {
     providers: Vec<DeploymentProvider>,
     catalogue: Vec<DeploymentCatalogueEntry>,
     middleware: Vec<ContentMiddlewareRegistration>,
     trust: Vec<DeploymentTrust>,
+    secrets: Vec<DeploymentSecretIndexEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,13 +144,23 @@ pub struct NamespaceAlias {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespacePolicySpec {
     pub epoch: u64,
+    pub exact: Option<NamespaceExactEnforcement>,
+    pub middleware: Vec<String>,
+    pub buffered_response_routes: Vec<BufferedResponseRoute>,
+}
+
+/// Optional fleet-wide enforcement requested by a namespace.
+///
+/// Presence means all spend and concurrency values must be enforced exactly by
+/// shared backends. Absence is the blob-only posture: static policy still
+/// applies, but no Redis/Postgres dependency is implied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceExactEnforcement {
     pub subject_limit_microdollars: u64,
     pub namespace_limit_microdollars: Option<u64>,
     pub reservation_ttl_seconds: u64,
     pub max_in_flight_per_subject: u64,
     pub lease_ttl_seconds: u64,
-    pub middleware: Vec<String>,
-    pub buffered_response_routes: Vec<BufferedResponseRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +235,23 @@ impl NamespaceStateError {
     pub const fn is_incompatible(&self) -> bool {
         matches!(self, Self::Incompatible { .. })
     }
+
+    pub const fn reference(&self) -> Option<ResourceRef> {
+        match self {
+            Self::Kind { reference }
+            | Self::Scope { reference }
+            | Self::Body { reference, .. }
+            | Self::Incompatible { reference, .. } => Some(*reference),
+            Self::DuplicateGrantDigest { second, .. } => Some(*second),
+            Self::UnknownGrantNamespace { grant, .. } => Some(*grant),
+            Self::DeploymentCount { .. }
+            | Self::MissingDeployment { .. }
+            | Self::DuplicateNamespace { .. }
+            | Self::AggregateBound { .. }
+            | Self::DefaultCount { .. }
+            | Self::NoInboundGrants => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -212,6 +267,7 @@ impl DeploymentBody {
         mut catalogue: Vec<DeploymentCatalogueEntry>,
         mut middleware: Vec<ContentMiddlewareRegistration>,
         mut trust: Vec<DeploymentTrust>,
+        mut secrets: Vec<DeploymentSecretIndexEntry>,
     ) -> Result<Self, String> {
         providers.sort_by(|left, right| left.id.cmp(&right.id));
         catalogue.sort_by(|left, right| {
@@ -219,11 +275,15 @@ impl DeploymentBody {
         });
         middleware.sort_by(|left, right| left.id().cmp(right.id()));
         trust.sort_by(|left, right| left.id.cmp(&right.id));
+        secrets.sort_by(|left, right| {
+            (&left.owner, left.reference).cmp(&(&right.owner, right.reference))
+        });
         let body = Self {
             providers,
             catalogue,
             middleware,
             trust,
+            secrets,
         };
         body.validate()?;
         Ok(body)
@@ -243,6 +303,10 @@ impl DeploymentBody {
 
     pub fn trust(&self) -> &[DeploymentTrust] {
         &self.trust
+    }
+
+    pub fn secrets(&self) -> &[DeploymentSecretIndexEntry] {
+        &self.secrets
     }
 
     pub fn version(&self, id: ResourceId, slug: Slug) -> ResourceVersion {
@@ -281,9 +345,14 @@ impl DeploymentBody {
             MAX_MIDDLEWARE,
         )?;
         bound("trust entries", self.trust.len(), MAX_TRUST_ENTRIES)?;
+        bound(
+            "secret index entries",
+            self.secrets.len(),
+            MAX_SECRET_INDEX_ENTRIES,
+        )?;
         let providers = unique_slugs("provider", self.providers.iter().map(|p| &p.id))?;
         for provider in &self.providers {
-            if !absolute_origin(&provider.base_url) {
+            if !absolute_http_url(&provider.base_url) {
                 return Err(format!(
                     "provider `{}` does not declare an absolute HTTP(S) origin",
                     provider.id
@@ -319,7 +388,7 @@ impl DeploymentBody {
         }
         unique_slugs("trust entry", self.trust.iter().map(|entry| &entry.id))?;
         for entry in &self.trust {
-            if !absolute_origin(&entry.issuer) || !absolute_origin(&entry.jwks_url) {
+            if !absolute_http_url(&entry.issuer) || !absolute_http_url(&entry.jwks_url) {
                 return Err(format!(
                     "trust entry `{}` must declare absolute HTTP(S) issuer and JWKS URLs",
                     entry.id
@@ -332,7 +401,104 @@ impl DeploymentBody {
                 ));
             }
         }
+        if !self.trust.is_empty() {
+            return Err(
+                "deployment trust activation is not implemented; `trust` must remain empty until active admin authorization and LKG projection land"
+                    .to_owned(),
+            );
+        }
+        let mut exact_references = BTreeMap::new();
+        let mut secret_owners = BTreeMap::new();
+        for entry in &self.secrets {
+            if let Some(first_owner) = exact_references.insert(entry.reference, &entry.owner) {
+                return Err(format!(
+                    "secret index reference {} is declared more than once (owners `{first_owner}` and `{}`)",
+                    entry.reference, entry.owner
+                ));
+            }
+            if let Some(first_owner) = secret_owners.insert(entry.reference.secret, &entry.owner)
+                && first_owner != &entry.owner
+            {
+                return Err(format!(
+                    "secret {} has versions assigned to both `{first_owner}` and `{}`",
+                    entry.reference.secret, entry.owner
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+impl DeploymentSecretIndexEntry {
+    pub fn new(
+        owner: NamespaceId,
+        reference: SecretRef,
+        ciphertext_digest: Checksum,
+        lifecycle: SecretLifecycle,
+    ) -> Self {
+        Self {
+            owner,
+            reference,
+            ciphertext_digest,
+            lifecycle,
+        }
+    }
+
+    pub fn owner(&self) -> &NamespaceId {
+        &self.owner
+    }
+
+    pub const fn reference(&self) -> SecretRef {
+        self.reference
+    }
+
+    pub const fn ciphertext_digest(&self) -> Checksum {
+        self.ciphertext_digest
+    }
+
+    pub const fn lifecycle(&self) -> SecretLifecycle {
+        self.lifecycle
+    }
+
+    pub fn request(&self) -> NamespaceSecretRequest {
+        NamespaceSecretRequest {
+            owner: self.owner.clone(),
+            reference: self.reference,
+            ciphertext_digest: self.ciphertext_digest,
+            lifecycle: self.lifecycle,
+        }
+    }
+}
+
+impl NamespaceSecretRequest {
+    pub fn new(
+        owner: NamespaceId,
+        reference: SecretRef,
+        ciphertext_digest: Checksum,
+        lifecycle: SecretLifecycle,
+    ) -> Self {
+        Self {
+            owner,
+            reference,
+            ciphertext_digest,
+            lifecycle,
+        }
+    }
+
+    pub fn owner(&self) -> &NamespaceId {
+        &self.owner
+    }
+
+    pub const fn reference(&self) -> SecretRef {
+        self.reference
+    }
+
+    pub const fn ciphertext_digest(&self) -> Checksum {
+        self.ciphertext_digest
+    }
+
+    pub const fn lifecycle(&self) -> SecretLifecycle {
+        self.lifecycle
     }
 }
 
@@ -435,16 +601,17 @@ impl NamespaceBody {
             self.policy.middleware.len(),
             MAX_MIDDLEWARE,
         )?;
-        if self.policy.epoch == 0
-            || self.policy.subject_limit_microdollars == 0
-            || self.policy.namespace_limit_microdollars == Some(0)
-            || self.policy.reservation_ttl_seconds == 0
-            || self.policy.max_in_flight_per_subject == 0
-            || self.policy.lease_ttl_seconds == 0
+        if self.policy.epoch == 0 {
+            return Err("policy epoch must be non-zero".into());
+        }
+        if let Some(exact) = &self.policy.exact
+            && (exact.subject_limit_microdollars == 0
+                || exact.namespace_limit_microdollars == Some(0)
+                || exact.reservation_ttl_seconds == 0
+                || exact.max_in_flight_per_subject == 0
+                || exact.lease_ttl_seconds == 0)
         {
-            return Err(
-                "policy epoch, caps, duration, and concurrency bounds must be non-zero".into(),
-            );
+            return Err("exact enforcement caps and durations must be non-zero".into());
         }
         unique_slugs("credential", self.credentials.iter().map(|c| &c.id))?;
         for credential in &self.credentials {
@@ -641,6 +808,20 @@ impl FlatNamespaces {
     pub fn grants(&self) -> impl ExactSizeIterator<Item = &(ResourceRef, InboundGrantBody)> {
         self.grants.iter()
     }
+
+    /// The validated namespace-bound request for one credential reference.
+    pub fn secret_request(
+        &self,
+        namespace: &NamespaceId,
+        reference: SecretRef,
+    ) -> Option<NamespaceSecretRequest> {
+        self.deployment()
+            .1
+            .secrets()
+            .iter()
+            .find(|entry| entry.owner() == namespace && entry.reference() == reference)
+            .map(DeploymentSecretIndexEntry::request)
+    }
 }
 
 impl Canonical for DeploymentBody {
@@ -679,6 +860,7 @@ struct StoredDeployment {
     catalogue: Vec<StoredCatalogueEntry>,
     middleware: Vec<StoredMiddleware>,
     trust: Vec<StoredTrust>,
+    secrets: Vec<StoredSecretIndexEntry>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -721,6 +903,15 @@ struct StoredTrust {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StoredSecretIndexEntry {
+    owner_namespace: String,
+    secret: String,
+    ciphertext_digest: String,
+    lifecycle: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredCredential {
     id: String,
     provider: String,
@@ -753,13 +944,19 @@ struct StoredTarget {
 #[serde(deny_unknown_fields)]
 struct StoredPolicy {
     epoch: u64,
+    exact: Option<StoredExactEnforcement>,
+    middleware: Vec<String>,
+    buffered_response_routes: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredExactEnforcement {
     subject_limit_microdollars: u64,
     namespace_limit_microdollars: Option<u64>,
     reservation_ttl_seconds: u64,
     max_in_flight_per_subject: u64,
     lease_ttl_seconds: u64,
-    middleware: Vec<String>,
-    buffered_response_routes: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -819,6 +1016,16 @@ impl DeploymentBody {
                     jwks_url: entry.jwks_url.clone(),
                 })
                 .collect(),
+            secrets: self
+                .secrets
+                .iter()
+                .map(|entry| StoredSecretIndexEntry {
+                    owner_namespace: entry.owner.to_string(),
+                    secret: entry.reference.to_string(),
+                    ciphertext_digest: entry.ciphertext_digest.to_string(),
+                    lifecycle: entry.lifecycle.to_string(),
+                })
+                .collect(),
         }
     }
 }
@@ -865,11 +1072,17 @@ impl NamespaceBody {
                 .collect(),
             policy: StoredPolicy {
                 epoch: self.policy.epoch,
-                subject_limit_microdollars: self.policy.subject_limit_microdollars,
-                namespace_limit_microdollars: self.policy.namespace_limit_microdollars,
-                reservation_ttl_seconds: self.policy.reservation_ttl_seconds,
-                max_in_flight_per_subject: self.policy.max_in_flight_per_subject,
-                lease_ttl_seconds: self.policy.lease_ttl_seconds,
+                exact: self
+                    .policy
+                    .exact
+                    .as_ref()
+                    .map(|exact| StoredExactEnforcement {
+                        subject_limit_microdollars: exact.subject_limit_microdollars,
+                        namespace_limit_microdollars: exact.namespace_limit_microdollars,
+                        reservation_ttl_seconds: exact.reservation_ttl_seconds,
+                        max_in_flight_per_subject: exact.max_in_flight_per_subject,
+                        lease_ttl_seconds: exact.lease_ttl_seconds,
+                    }),
                 middleware: self.policy.middleware.clone(),
                 buffered_response_routes: self
                     .policy
@@ -945,7 +1158,27 @@ impl StoredDeployment {
                 })
             })
             .collect::<Result<Vec<_>, NamespaceStateError>>()?;
-        DeploymentBody::new(providers, catalogue, middleware, trust)
+        let secrets = self
+            .secrets
+            .into_iter()
+            .map(|entry| {
+                Ok(DeploymentSecretIndexEntry::new(
+                    NamespaceId::parse(&entry.owner_namespace)
+                        .map_err(|error| body_error(reference, error))?,
+                    SecretRef::parse(&entry.secret)
+                        .map_err(|error| body_error(reference, error))?,
+                    Checksum::parse(&entry.ciphertext_digest)
+                        .map_err(|error| body_error(reference, error))?,
+                    SecretLifecycle::parse(&entry.lifecycle).ok_or_else(|| {
+                        incompatible_error(
+                            reference,
+                            format!("unknown secret lifecycle variant `{}`", entry.lifecycle),
+                        )
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>, NamespaceStateError>>()?;
+        DeploymentBody::new(providers, catalogue, middleware, trust, secrets)
             .map_err(|error| body_error(reference, error))
     }
 }
@@ -1026,11 +1259,13 @@ impl StoredNamespace {
             aliases,
             NamespacePolicySpec {
                 epoch: self.policy.epoch,
-                subject_limit_microdollars: self.policy.subject_limit_microdollars,
-                namespace_limit_microdollars: self.policy.namespace_limit_microdollars,
-                reservation_ttl_seconds: self.policy.reservation_ttl_seconds,
-                max_in_flight_per_subject: self.policy.max_in_flight_per_subject,
-                lease_ttl_seconds: self.policy.lease_ttl_seconds,
+                exact: self.policy.exact.map(|exact| NamespaceExactEnforcement {
+                    subject_limit_microdollars: exact.subject_limit_microdollars,
+                    namespace_limit_microdollars: exact.namespace_limit_microdollars,
+                    reservation_ttl_seconds: exact.reservation_ttl_seconds,
+                    max_in_flight_per_subject: exact.max_in_flight_per_subject,
+                    lease_ttl_seconds: exact.lease_ttl_seconds,
+                }),
                 middleware: self.policy.middleware,
                 buffered_response_routes: self
                     .policy
@@ -1154,16 +1389,19 @@ fn read_inline(
         return Err(body_error(resource.reference, "body must be an inline map"));
     };
     let Some(index) = fields.iter().position(|(key, _)| key == "schema") else {
-        return Err(body_error(resource.reference, "body has no schema"));
+        return Err(incompatible_error(
+            resource.reference,
+            "body has no schema identifier",
+        ));
     };
     let (_, CanonicalValue::String(found)) = fields.remove(index) else {
         return Err(body_error(resource.reference, "schema must be text"));
     };
     if found != schema {
-        return Err(NamespaceStateError::Incompatible {
-            reference: resource.reference,
-            detail: format!("expected `{schema}`, found `{found}`"),
-        });
+        return Err(incompatible_error(
+            resource.reference,
+            format!("expected `{schema}`, found `{found}`"),
+        ));
     }
     Ok(CanonicalValue::Map(fields))
 }
@@ -1174,8 +1412,16 @@ fn deserialize_v2<T: for<'de> Deserialize<'de>>(
 ) -> Result<T, NamespaceStateError> {
     serde_json::from_value(json_from_canonical(value, reference)?).map_err(|error| {
         let detail = error.to_string();
-        if detail.contains("unknown field") {
-            NamespaceStateError::Incompatible { reference, detail }
+        if [
+            "unknown field",
+            "unknown variant",
+            "missing field",
+            "invalid type",
+        ]
+        .iter()
+        .any(|marker| detail.contains(marker))
+        {
+            incompatible_error(reference, detail)
         } else {
             body_error(reference, detail)
         }
@@ -1229,6 +1475,16 @@ fn body_error(reference: ResourceRef, error: impl std::fmt::Display) -> Namespac
     }
 }
 
+fn incompatible_error(
+    reference: ResourceRef,
+    error: impl std::fmt::Display,
+) -> NamespaceStateError {
+    NamespaceStateError::Incompatible {
+        reference,
+        detail: error.to_string(),
+    }
+}
+
 fn bound(label: &str, count: usize, max: usize) -> Result<(), String> {
     if count > max {
         Err(format!(
@@ -1265,6 +1521,33 @@ fn validate_namespace_references(
             return Err(format!(
                 "credential `{}` references unknown deployment provider `{}`",
                 credential.id, credential.provider
+            ));
+        }
+        let Some(binding) = deployment
+            .secrets()
+            .iter()
+            .find(|binding| binding.reference() == credential.secret)
+        else {
+            return Err(format!(
+                "credential `{}` references {}, which is absent from the deployment secret index",
+                credential.id, credential.secret
+            ));
+        };
+        if binding.owner() != namespace.namespace() {
+            return Err(format!(
+                "credential `{}` in namespace `{}` references {}, which the deployment secret index binds to `{}`",
+                credential.id,
+                namespace.namespace(),
+                credential.secret,
+                binding.owner()
+            ));
+        }
+        if binding.lifecycle() != SecretLifecycle::Active {
+            return Err(format!(
+                "credential `{}` references {}, whose deployment secret index lifecycle is `{}` rather than `active`",
+                credential.id,
+                credential.secret,
+                binding.lifecycle()
             ));
         }
     }
@@ -1319,12 +1602,29 @@ fn unique_slugs<'a>(
     Ok(seen)
 }
 
-fn absolute_origin(value: &str) -> bool {
-    value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"))
-        .and_then(|rest| rest.split('/').next())
-        .is_some_and(|host| !host.is_empty() && !host.contains(char::is_whitespace))
+fn absolute_http_url(value: &str) -> bool {
+    let Some(authority_and_path) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() || authority.contains(['\\', '@']) {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 fn validate_selector(value: &str) -> Result<(), String> {
@@ -1351,6 +1651,10 @@ mod tests {
     }
 
     fn deployment() -> DeploymentBody {
+        deployment_with_secrets(Vec::new())
+    }
+
+    fn deployment_with_secrets(secrets: Vec<DeploymentSecretIndexEntry>) -> DeploymentBody {
         DeploymentBody::new(
             vec![DeploymentProvider {
                 id: slug("shared"),
@@ -1370,12 +1674,8 @@ mod tests {
                 )
                 .unwrap(),
             ],
-            vec![DeploymentTrust {
-                id: slug("admin"),
-                issuer: "https://issuer.example".to_owned(),
-                audience: "axond-admin".to_owned(),
-                jwks_url: "https://issuer.example/jwks".to_owned(),
-            }],
+            Vec::new(),
+            secrets,
         )
         .unwrap()
     }
@@ -1412,17 +1712,58 @@ mod tests {
             }],
             NamespacePolicySpec {
                 epoch: 1,
-                subject_limit_microdollars: 1,
-                namespace_limit_microdollars: Some(2),
-                reservation_ttl_seconds: 3,
-                max_in_flight_per_subject: 4,
-                lease_ttl_seconds: 5,
+                exact: Some(NamespaceExactEnforcement {
+                    subject_limit_microdollars: 1,
+                    namespace_limit_microdollars: Some(2),
+                    reservation_ttl_seconds: 3,
+                    max_in_flight_per_subject: 4,
+                    lease_ttl_seconds: 5,
+                }),
                 middleware: vec!["test.marker".to_owned()],
                 buffered_response_routes: Vec::new(),
             },
             6,
         )
         .unwrap()
+    }
+
+    fn namespace_with_credentials(
+        id: &str,
+        credentials: Vec<NamespaceCredential>,
+    ) -> NamespaceBody {
+        let base = namespace();
+        NamespaceBody::new(
+            NamespaceId::parse(id).unwrap(),
+            true,
+            base.allow_platform_fallback(),
+            deployment_ref(),
+            credentials,
+            base.aliases().to_vec(),
+            base.policy().clone(),
+            base.token_epoch(),
+        )
+        .unwrap()
+    }
+
+    fn state_for(
+        deployment: DeploymentBody,
+        namespace: NamespaceBody,
+    ) -> super::super::DesiredState {
+        let mut state = super::super::DesiredState::new();
+        state
+            .insert(deployment.version(fixtures::resource_id(90), slug("deployment")))
+            .unwrap();
+        state
+            .insert(namespace.version(fixtures::resource_id(91), slug("namespace")))
+            .unwrap();
+        state
+            .insert(
+                InboundGrantBody::new(Checksum::of(b"grant"), NamespaceGrant::all(), None)
+                    .unwrap()
+                    .version(fixtures::resource_id(92), slug("grant")),
+            )
+            .unwrap();
+        state
     }
 
     fn map_count(value: &CanonicalValue) -> usize {
@@ -1505,6 +1846,56 @@ mod tests {
     }
 
     #[test]
+    fn unknown_variants_and_namespace_shape_skew_are_typed_incompatible() {
+        let mut deployment = deployment().version(fixtures::resource_id(90), slug("deployment"));
+        let ResourceBody::Inline(CanonicalValue::Map(fields)) = &mut deployment.body else {
+            unreachable!()
+        };
+        let (_, CanonicalValue::List(providers)) = fields
+            .iter_mut()
+            .find(|(field, _)| field == "providers")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let CanonicalValue::Map(provider) = &mut providers[0] else {
+            unreachable!()
+        };
+        provider
+            .iter_mut()
+            .find(|(field, _)| field == "kind")
+            .unwrap()
+            .1 = CanonicalValue::string("future-provider");
+        assert!(matches!(
+            DeploymentBody::read(&deployment),
+            Err(NamespaceStateError::Incompatible { .. })
+        ));
+
+        for shape in ["missing", "wrong_type"] {
+            let mut namespace = namespace().version(fixtures::resource_id(91), slug("acme"));
+            let ResourceBody::Inline(CanonicalValue::Map(fields)) = &mut namespace.body else {
+                unreachable!()
+            };
+            let policy = fields
+                .iter()
+                .position(|(field, _)| field == "policy")
+                .unwrap();
+            if shape == "missing" {
+                fields.remove(policy);
+            } else {
+                fields[policy].1 = CanonicalValue::string("future-policy-shape");
+            }
+            assert!(
+                matches!(
+                    NamespaceBody::read(&namespace),
+                    Err(NamespaceStateError::Incompatible { .. })
+                ),
+                "{shape} namespace policy was not classified as schema skew"
+            );
+        }
+    }
+
+    #[test]
     fn stored_grant_sets_must_already_be_canonical() {
         let grant = InboundGrantBody::new(
             Checksum::of(b"grant"),
@@ -1561,10 +1952,167 @@ mod tests {
             Err(NamespaceStateError::AggregateBound { .. })
         ));
         let mut invalid = namespace();
-        invalid.policy.subject_limit_microdollars = 0;
+        invalid
+            .policy
+            .exact
+            .as_mut()
+            .unwrap()
+            .subject_limit_microdollars = 0;
         assert!(invalid.validate().unwrap_err().contains("non-zero"));
         invalid = namespace();
-        invalid.policy.namespace_limit_microdollars = Some(0);
+        invalid
+            .policy
+            .exact
+            .as_mut()
+            .unwrap()
+            .namespace_limit_microdollars = Some(0);
         assert!(invalid.validate().unwrap_err().contains("non-zero"));
+    }
+
+    #[test]
+    fn deployment_secret_index_enforces_owner_lifecycle_and_shared_reference_rules() {
+        let reference = SecretRef::first(fixtures::secret_id(9));
+        let credential = |id: &str| NamespaceCredential {
+            id: slug(id),
+            provider: slug("shared"),
+            secret: reference,
+            weight: 1,
+        };
+        let entry = |owner: &str, lifecycle| {
+            DeploymentSecretIndexEntry::new(
+                NamespaceId::parse(owner).unwrap(),
+                reference,
+                Checksum::of(b"ciphertext"),
+                lifecycle,
+            )
+        };
+
+        let foreign = state_for(
+            deployment_with_secrets(vec![entry("acme", SecretLifecycle::Active)]),
+            namespace_with_credentials("globex", vec![credential("primary")]),
+        );
+        let error = FlatNamespaces::of(&foreign).expect_err("foreign references fail closed");
+        assert!(error.to_string().contains("binds to `acme`"), "{error}");
+
+        let tombstoned = state_for(
+            deployment_with_secrets(vec![entry("acme", SecretLifecycle::Tombstoned)]),
+            namespace_with_credentials("acme", vec![credential("primary")]),
+        );
+        let error =
+            FlatNamespaces::of(&tombstoned).expect_err("tombstoned material cannot activate");
+        assert!(
+            error.to_string().contains("rather than `active`"),
+            "{error}"
+        );
+
+        let shared = state_for(
+            deployment_with_secrets(vec![entry("acme", SecretLifecycle::Active)]),
+            namespace_with_credentials(
+                "acme",
+                vec![credential("primary"), credential("secondary")],
+            ),
+        );
+        FlatNamespaces::of(&shared)
+            .expect("credentials in one namespace may intentionally share an exact reference");
+    }
+
+    #[test]
+    fn deployment_secret_index_rejects_duplicate_and_cross_owner_versions() {
+        let reference = SecretRef::first(fixtures::secret_id(9));
+        let entry = |owner: &str, reference| {
+            DeploymentSecretIndexEntry::new(
+                NamespaceId::parse(owner).unwrap(),
+                reference,
+                Checksum::of(reference.to_string().as_bytes()),
+                SecretLifecycle::Active,
+            )
+        };
+        let duplicate = DeploymentBody::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![entry("acme", reference), entry("acme", reference)],
+        )
+        .expect_err("an exact reference has one authoritative index row");
+        assert!(duplicate.contains("declared more than once"), "{duplicate}");
+
+        let cross_owner = DeploymentBody::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                entry("acme", reference),
+                entry("globex", reference.rotated()),
+            ],
+        )
+        .expect_err("all versions of one secret retain one owner namespace");
+        assert!(cross_owner.contains("assigned to both"), "{cross_owner}");
+    }
+
+    #[test]
+    fn deployment_trust_is_rejected_until_runtime_activation_is_atomic() {
+        let error = DeploymentBody::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![DeploymentTrust {
+                id: slug("admin"),
+                issuer: "https://issuer.example/oidc".to_owned(),
+                audience: "axond-admin".to_owned(),
+                jwks_url: "https://issuer.example/jwks".to_owned(),
+            }],
+            Vec::new(),
+        )
+        .expect_err("inert durable trust must never be accepted");
+        assert!(
+            error.contains("trust activation is not implemented"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn deployment_urls_require_strict_http_authorities() {
+        for rejected in [
+            "provider.example/v1",
+            "ftp://provider.example/v1",
+            "https:///v1",
+            "https://user@provider.example/v1",
+            "https://@provider.example/v1",
+            "https://provider.example\\ambiguous/v1",
+            "https://provider.example/v1?tenant=acme",
+            "https://provider.example/v1#fragment",
+        ] {
+            let error = DeploymentBody::new(
+                vec![DeploymentProvider {
+                    id: slug("shared"),
+                    kind: FlatProviderKind::OpenaiCompatible,
+                    base_url: rejected.to_owned(),
+                }],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("malformed provider authority must fail closed");
+            assert!(
+                error.contains("absolute HTTP(S) origin"),
+                "{rejected}: {error}"
+            );
+        }
+
+        DeploymentBody::new(
+            vec![DeploymentProvider {
+                id: slug("shared"),
+                kind: FlatProviderKind::OpenaiCompatible,
+                base_url: "https://provider.example/v1".to_owned(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("an HTTPS authority with a path remains a valid provider base URL");
     }
 }
