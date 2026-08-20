@@ -35,6 +35,14 @@ the implemented legacy/optional stateful backend during that transition.
 lands; it does not ask for a PostgreSQL DSN or treat syntax validation as runtime
 readiness.
 
+The Kubernetes contract rehearsal is
+[`production-stateful-blob`](../../deploy/kubernetes/overlays/production-stateful-blob):
+its StatefulSet retains the signed per-replica recovery cache on PVCs while the
+desired-state head and immutable revisions remain in object storage. The overlay
+contains no Postgres migration Job, DSN, secret-store KEK, or relational egress
+rule. It remains fail-closed and is not an inference-readiness claim until the
+blob control-plane, convergence, and blob-secret runtime adapters are wired.
+
 For local Azurite, the native
 `https://localhost:10000/account/container` (or loopback-IP equivalent) is
 accepted without an exception and is the shape used with workload-identity/OAuth

@@ -23,6 +23,12 @@ no durable per-replica storage. The remaining boundary is qualification: these
 serving and recovery paths need retained fleet-load, rollout, and long-soak
 evidence before they become a production-readiness claim.
 
+The separate blob-only StatefulSet/PVC deployment contract is narrower: it
+selects object storage for desired-state and revision data and retains the
+signed per-replica last-known-good cache, but the runtime adapter is not wired
+at this head. Its manifest and preflight checks must remain fail-closed; this
+page does not count it as inference-ready.
+
 - [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) — the two
   operating modes and what each one owns.
 - [Control-plane revision journal](./control-plane-journal.md) — the durable

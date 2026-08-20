@@ -1,0 +1,9 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: axond
+  namespace: axond
+spec:
+  # Keep the recovery fleet operable while an unconverged replica is unready.
+  minAvailable: 2
+  unhealthyPodEvictionPolicy: AlwaysAllow

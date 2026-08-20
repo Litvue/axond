@@ -1,0 +1,31 @@
+# Contract-only blob-backed StatefulSet option.
+#
+# This overlay deliberately starts from the production posture rather than the
+# relational stateful component. It removes the Recreate Deployment, keeps the
+# caller-facing Service fail-closed on /readyz, and supplies only the durable
+# object-store and per-ordinal recovery shape. The gateway runtime at this
+# revision does not construct the object-store admin/convergence path; the
+# manifest is therefore not an inference-readiness claim until that wiring lands.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../production
+  - statefulset.yaml
+  - headless-service.yaml
+  - serviceaccount.yaml
+patches:
+  - path: delete-deployment.yaml
+  - path: config-cache.yaml
+  - path: pdb.yaml
+  - path: networkpolicy.yaml
+    target:
+      group: networking.k8s.io
+      version: v1
+      kind: NetworkPolicy
+      name: axond-allow
+images:
+  - name: ghcr.io/litvue/axond
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: axond

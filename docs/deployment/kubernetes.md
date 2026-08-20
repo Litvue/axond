@@ -129,9 +129,10 @@ ops/pin-image-digest.sh --print 0.3.40 # x-release-please-version, prints the di
 ops/pin-image-digest.sh 0.3.40 # x-release-please-version, rewrites the overlays
 ```
 
-Both production overlays are rewritten, and a bare `--check` answers for both:
-the stateful one pins its migration Job itself, so a helper blind to it would
-report a resolved fleet while that Job still named an image no node can pull.
+All production overlay kustomizations are rewritten, and a bare `--check`
+answers for all of them: the stateful ones pin their own workload images, so a
+helper blind to one would report a resolved fleet while that workload still
+named an image no node can pull.
 That is the answer a repository gate wants. Name an overlay when you are rolling
 one out and want an answer about it — an unresolved sentinel in an overlay you
 are not applying is not a reason to fail your rollout.
@@ -409,6 +410,56 @@ For the operator sequence around these checks — including the deliberately
 unready probe contract, first-install migration ordering, desired-state rollback,
 and a compatible image rollback — use the
 [stateful Kubernetes deployment runbook](../operations/stateful-deployment-runbook.md).
+
+### Blob-only StatefulSet option
+
+`deploy/kubernetes/overlays/production-stateful-blob` is a separate, narrower
+opt-in shape for the ADR 0062 blob-backed stateful model. It is intentionally
+not layered on `components/stateful`: that component carries the legacy
+Postgres migration Job and database egress rules. The blob overlay instead
+renders only a StatefulSet, the headless identity Service, a dedicated
+`axond-blob` ServiceAccount, and the production network boundary with no
+Postgres or Redis allowance.
+
+Its mounted bootstrap selects:
+
+- `[control_plane] backend = "object-storage"` with a credential-free HTTPS
+  container URL, deployment environment id, and `workload-identity` auth;
+- `[convergence].cache_path = "/var/lib/axond/last-known-good.snapshot"` and
+  `cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"`; and
+- no `dsn_env`, `[secret_store]`, catalog Postgres store, or migration Job.
+
+Each ordinal receives one retained `ReadWriteOnce` PVC at `/var/lib/axond`.
+The PVC is only the per-replica authenticated recovery copy; desired-state
+heads, immutable revisions, and resource blobs remain in object storage. Bind
+the dedicated ServiceAccount to an identity limited to the configured
+environment container, and supply `axond-secrets` with only
+`GW_ADMIN_BREAKGLASS` and the canonical padded-base64 32-byte
+`GW_LAST_KNOWN_GOOD_KEY`. Do not put either value in this repository's
+ConfigMap.
+
+This is a deployment contract slice, not an inference-readiness claim at this
+commit. The Rust runtime still constructs the legacy Postgres stateful surface;
+blob-backed administration, publication, convergence, and blob-secret runtime
+wiring are absent. `axond check preflight` must therefore fail the `serving`
+check for this configuration, and operators must not treat a rendered or
+running Pod as inference-ready until that check changes with the runtime
+implementation. The existing
+`deploy/kubernetes/overlays/production-stateful` Recreate/Postgres path and the
+legacy `production-stateful-persistent` qualification path are unchanged.
+
+The manifest gate checks the retained PVC policy, cache path/key, dedicated
+identity, absence of relational dependencies, and sentinel digest on the
+rendered output. It has no cluster drill yet because the blob runtime is
+deliberately fail-closed; run the static checks before a future runtime-backed
+qualification is added:
+
+```bash
+overlay=deploy/kubernetes/overlays/production-stateful-blob
+ops/pin-image-digest.sh --check overlays/production-stateful-blob
+kubectl kustomize "$overlay" >/tmp/axond-stateful-blob.yaml
+python3 ops/check-deploy-manifests.py --self-test
+```
 
 ## Configuration and secrets
 

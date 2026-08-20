@@ -1,0 +1,44 @@
+# The blob contract has no in-cluster database or cache backend. Keep DNS,
+# public HTTPS (for the object-store and provider endpoints), and telemetry;
+# remove the production overlay's relational-backend allowances and keep the
+# administrative listener behind the explicit Pod-label boundary.
+- op: replace
+  path: /spec/ingress
+  value:
+    - from:
+        - podSelector:
+            matchLabels:
+              axond.dev/admin-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+- op: replace
+  path: /spec/egress
+  value:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+      ports:
+        - protocol: TCP
+          port: 4318

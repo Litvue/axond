@@ -57,6 +57,7 @@ PRODUCTION_STATEFUL = ROOT / "deploy/kubernetes/overlays/production-stateful"
 PRODUCTION_STATEFUL_PERSISTENT = (
     ROOT / "deploy/kubernetes/overlays/production-stateful-persistent"
 )
+PRODUCTION_STATEFUL_BLOB = ROOT / "deploy/kubernetes/overlays/production-stateful-blob"
 KUBERNETES_DOC = ROOT / "docs/deployment/kubernetes.md"
 STATEFUL_DOC = ROOT / "docs/deployment/stateful-backends.md"
 RECOVERY_DOC = ROOT / "docs/operations/backup-and-recovery.md"
@@ -1130,6 +1131,82 @@ def check_stateful_persistent(documents: list[Document]) -> list[str]:
     return failures
 
 
+def check_stateful_blob(documents: list[Document]) -> list[str]:
+    """The blob-only option has durable PVCs but no relational dependency.
+
+    The generic StatefulSet checks protect the recovery shape. This additional
+    boundary is deliberately rendered-output based: inheriting a Postgres
+    migration Job, database egress rule, or DSN through a Kustomize parent must
+    fail even when the blob ConfigMap itself looks correct.
+    """
+    label = "overlays/production-stateful-blob"
+    failures = [
+        failure.replace(
+            "overlays/production-stateful-persistent", label
+        )
+        for failure in check_stateful_persistent(documents)
+    ]
+    if of_kind(documents, "Job"):
+        failures.append(
+            f"{label}: blob-only stateful deployment must not render a migration Job; "
+            "object storage has no relational schema to migrate"
+        )
+    if of_kind(documents, "Deployment"):
+        failures.append(
+            f"{label}: blob-only stateful deployment must replace the Recreate Deployment "
+            "with its StatefulSet"
+        )
+
+    config = gateway_config(documents)
+    control_plane = config.get("control_plane", {})
+    if control_plane.get("backend") != "object-storage":
+        failures.append(
+            f"{label}: [control_plane].backend must be `object-storage`, not a relational backend"
+        )
+    for field in ("environment_id", "container_url", "authentication"):
+        if not control_plane.get(field):
+            failures.append(
+                f"{label}: [control_plane].{field} is required for the blob contract"
+            )
+    if control_plane.get("authentication") != "workload-identity":
+        failures.append(
+            f"{label}: [control_plane].authentication must be `workload-identity`"
+        )
+    for field in ("dsn_env", "schema", "migrate"):
+        if field in control_plane:
+            failures.append(
+                f"{label}: [control_plane].{field} is a Postgres-only field and must not be present"
+            )
+    if "secret_store" in config:
+        failures.append(
+            f"{label}: the legacy [secret_store] section must not be present in the blob-only overlay"
+        )
+
+    rendered = yaml.safe_dump(documents, sort_keys=True).lower()
+    for forbidden in ("postgres", "redis", "gw_control_plane_dsn", "gw_secret_store_kek"):
+        if forbidden in rendered:
+            failures.append(
+                f"{label}: rendered manifests contain forbidden relational dependency marker "
+                f"{forbidden!r}"
+            )
+
+    service_accounts = [
+        account
+        for account in of_kind(documents, "ServiceAccount")
+        if account["metadata"].get("name") == "axond-blob"
+    ]
+    if len(service_accounts) != 1:
+        failures.append(
+            f"{label}: exactly one dedicated axond-blob ServiceAccount must be rendered"
+        )
+    pod = one(documents, "StatefulSet")["spec"]["template"]["spec"]
+    if pod.get("serviceAccountName") != "axond-blob":
+        failures.append(
+            f"{label}: the StatefulSet must use the dedicated axond-blob ServiceAccount"
+        )
+    return failures
+
+
 def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
     """The stateful overlay's behaviour has a cluster proof, and CI runs it.
 
@@ -1238,6 +1315,7 @@ def check_documented() -> list[str]:
         "deploy/kubernetes/overlays/production",
         "deploy/kubernetes/overlays/production-stateful",
         "deploy/kubernetes/overlays/production-stateful-persistent",
+        "deploy/kubernetes/overlays/production-stateful-blob",
         "deploy/kubernetes/components/autoscaling",
         "deploy/kubernetes/components/stateful",
         "ops/pin-image-digest.sh",
@@ -1245,6 +1323,15 @@ def check_documented() -> list[str]:
     ):
         if path not in page:
             failures.append(f"docs/deployment/kubernetes.md: {path} is not documented")
+    for phrase in (
+        "object-storage",
+        "not an inference-readiness claim",
+        "GW_LAST_KNOWN_GOOD_KEY",
+    ):
+        if phrase not in page:
+            failures.append(
+                f"docs/deployment/kubernetes.md: blob-only StatefulSet contract is missing {phrase!r}"
+            )
     return failures
 
 
@@ -1299,7 +1386,12 @@ def check_digest_scope() -> list[str]:
         overlays = ROOT / "deploy/kubernetes/overlays"
         copied = root / "deploy/kubernetes/overlays"
         copied.mkdir(parents=True)
-        for overlay in ("production", "production-stateful", "production-stateful-persistent"):
+        for overlay in (
+            "production",
+            "production-stateful",
+            "production-stateful-persistent",
+            "production-stateful-blob",
+        ):
             (copied / overlay).mkdir()
             shutil.copy(
                 overlays / overlay / "kustomization.yaml", copied / overlay / "kustomization.yaml"
@@ -1311,6 +1403,11 @@ def check_digest_scope() -> list[str]:
         persistent_pinned = copied / "production-stateful-persistent/kustomization.yaml"
         persistent_pinned.write_text(
             persistent_pinned.read_text(encoding="utf-8").replace(SENTINEL_DIGEST, resolved),
+            encoding="utf-8",
+        )
+        blob_pinned = copied / "production-stateful-blob/kustomization.yaml"
+        blob_pinned.write_text(
+            blob_pinned.read_text(encoding="utf-8").replace(SENTINEL_DIGEST, resolved),
             encoding="utf-8",
         )
 
@@ -1332,6 +1429,7 @@ def check_digest_scope() -> list[str]:
             ),
             (("overlays/production-stateful",), 0, "the named overlay is unresolved"),
             (("overlays/production-stateful-persistent",), 1, "the named overlay is resolved"),
+            (("overlays/production-stateful-blob",), 1, "the named overlay is resolved"),
             (("overlays/nowhere",), 0, "the named overlay does not exist"),
         )
         for arguments, forbidden, because in expectations:
@@ -1350,6 +1448,7 @@ def gate(
     autoscaled: list[Document],
     stateful: list[Document],
     stateful_persistent: list[Document],
+    stateful_blob: list[Document],
 ) -> list[str]:
     return [
         *check_stateful(stateful),
@@ -1396,6 +1495,26 @@ def gate(
         *check_disruption_budget(
             stateful_persistent, "overlays/production-stateful-persistent"
         ),
+        *check_stateful_blob(stateful_blob),
+        *check_termination_budget(stateful_blob, "overlays/production-stateful-blob"),
+        *check_resources(stateful_blob, "overlays/production-stateful-blob"),
+        *check_service_port(stateful_blob, "overlays/production-stateful-blob"),
+        *check_topology_spread(stateful_blob, "overlays/production-stateful-blob"),
+        *check_namespaces(stateful_blob, "overlays/production-stateful-blob"),
+        *check_example_secret(
+            stateful_blob, base, "overlays/production-stateful-blob"
+        ),
+        *check_network_policies(
+            stateful_blob,
+            "overlays/production-stateful-blob",
+            pod_labels(stateful_blob),
+        ),
+        *check_telemetry_egress(
+            stateful_blob,
+            TELEMETRY_SOURCE.read_text(encoding="utf-8"),
+            "overlays/production-stateful-blob",
+        ),
+        *check_disruption_budget(stateful_blob, "overlays/production-stateful-blob"),
         *check_image_pinning(base, production),
         *check_termination_budget(base, "base"),
         *check_termination_budget(production, "overlays/production"),
@@ -1422,14 +1541,42 @@ def self_test() -> int:
     autoscaled = render(PRODUCTION, (AUTOSCALING,))
     stateful = render(PRODUCTION_STATEFUL)
     stateful_persistent = render(PRODUCTION_STATEFUL_PERSISTENT)
+    stateful_blob = render(PRODUCTION_STATEFUL_BLOB)
     failures: list[str] = []
 
     def expect_failure(name: str, produced: list[str]) -> None:
         if not produced:
             failures.append(f"self-test: {name} did not fail on a manifest it must reject")
 
-    if gate(base, production, autoscaled, stateful, stateful_persistent):
+    if gate(base, production, autoscaled, stateful, stateful_persistent, stateful_blob):
         failures.append("self-test: the committed manifests must pass the gate")
+
+    blob_with_postgres = copy.deepcopy(stateful_blob)
+    blob_config = one(blob_with_postgres, "ConfigMap")
+    blob_config["data"]["axond.toml"] += "\n# GW_CONTROL_PLANE_DSN\n"
+    expect_failure(
+        "the blob-only option acquiring a Postgres dependency",
+        check_stateful_blob(blob_with_postgres),
+    )
+
+    blob_bad_cache = copy.deepcopy(stateful_blob)
+    blob_cache_config = one(blob_bad_cache, "ConfigMap")
+    blob_cache_config["data"]["axond.toml"] = blob_cache_config["data"][
+        "axond.toml"
+    ].replace("GW_LAST_KNOWN_GOOD_KEY", "GW_WRONG_CACHE_KEY")
+    expect_failure(
+        "the blob-only option wiring the wrong cache key",
+        check_stateful_blob(blob_bad_cache),
+    )
+
+    blob_deleted_pvc = copy.deepcopy(stateful_blob)
+    one(blob_deleted_pvc, "StatefulSet")["spec"]["persistentVolumeClaimRetentionPolicy"][
+        "whenDeleted"
+    ] = "Delete"
+    expect_failure(
+        "the blob-only option deleting a replica cache with the workload",
+        check_stateful_blob(blob_deleted_pvc),
+    )
 
     persistent_deployment = copy.deepcopy(stateful_persistent)
     persistent_deployment.append(
@@ -1997,6 +2144,7 @@ def main(argv: list[str]) -> int:
             render(PRODUCTION, (AUTOSCALING,)),
             render(PRODUCTION_STATEFUL),
             render(PRODUCTION_STATEFUL_PERSISTENT),
+            render(PRODUCTION_STATEFUL_BLOB),
         ),
         *check_component_layering(
             (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")

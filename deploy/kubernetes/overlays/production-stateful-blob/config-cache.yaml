@@ -1,0 +1,44 @@
+# Blob-backed stateful bootstrap. The desired-state head, immutable revision
+# objects, and resource blobs live in the configured object-store container;
+# the PVC holds only this replica's authenticated recovery copies.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: axond-config
+  namespace: axond
+data:
+  axond.toml: |
+    # This is an opt-in contract rehearsal, not an inference-readiness claim.
+    # The object-storage runtime adapter is not wired in this release and
+    # preflight must continue to fail closed until it is.
+    mode = "stateful"
+
+    [server]
+    bind = "0.0.0.0:8080"
+
+    [convergence]
+    cache_path = "/var/lib/axond/last-known-good.snapshot"
+    cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"
+
+    [control_plane]
+    backend = "object-storage"
+    environment_id = "prod-us-east"
+    container_url = "https://axondstate.blob.core.windows.net/control-plane"
+    authentication = "workload-identity"
+    connect_timeout_ms = 5000
+    operation_timeout_ms = 30000
+
+    [[admin_breakglass]]
+    env = "GW_ADMIN_BREAKGLASS"
+    id = "breakglass"
+
+    [admission]
+    max_request_bytes = 1_048_576
+    max_in_flight = 32
+    max_in_flight_streams = 16
+    max_in_flight_per_tenant = 0
+    max_tenants = 256
+    queue_capacity = 0
+    queue_wait_ms = 0
+    max_stream_duration_ms = 900_000
+    max_stream_bytes = 33_554_432

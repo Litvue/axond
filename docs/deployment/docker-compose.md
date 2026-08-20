@@ -91,6 +91,13 @@ enables:
 - Redis-backed in-flight rate limits;
 - Postgres durable usage with schema creation at boot.
 
+This Compose profile remains the legacy Redis/Postgres quickstart. It does not
+represent the blob-only StatefulSet option: Compose has no stable per-ordinal
+PVC/workload-identity boundary here, and the blob-backed runtime wiring is not
+present at this commit. Use the Kubernetes blob overlay only as the explicit
+contract rehearsal described in the [Kubernetes deployment guide](kubernetes.md#blob-only-statefulset-option),
+and do not infer inference readiness from a Compose or blob-overlay boot.
+
 Exercise the request path:
 
 ```bash

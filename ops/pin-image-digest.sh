@@ -34,6 +34,7 @@ overlays=(
   "${repo_root}/deploy/kubernetes/overlays/production/kustomization.yaml"
   "${repo_root}/deploy/kubernetes/overlays/production-stateful/kustomization.yaml"
   "${repo_root}/deploy/kubernetes/overlays/production-stateful-persistent/kustomization.yaml"
+  "${repo_root}/deploy/kubernetes/overlays/production-stateful-blob/kustomization.yaml"
 )
 image="${AXOND_IMAGE:-ghcr.io/litvue/axond}"
 sentinel="sha256:0000000000000000000000000000000000000000000000000000000000000000"

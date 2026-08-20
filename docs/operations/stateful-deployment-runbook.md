@@ -25,6 +25,13 @@ The persistent deployment boundary is qualified by
 qualifies the signed desired-state and encrypted compiled-serving cache contents
 that the PVC retains.
 
+The separate `production-stateful-blob` overlay is not covered by this
+Postgres runbook. It is a manifest-only contract rehearsal for the blob-backed
+model: its PVC/cache and object-store references are checked statically, but
+the current runtime has no blob administration/convergence wiring, so it makes
+no inference-readiness claim and must remain fail-closed until that wiring is
+implemented and separately qualified.
+
 This distinction is important during an incident: Kubernetes availability and
 inference availability are not claims this overlay makes today. The procedure
 below treats the migration Job, Pod state, and the direct administrative

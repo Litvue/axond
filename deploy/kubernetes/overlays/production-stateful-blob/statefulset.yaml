@@ -1,0 +1,114 @@
+# Durable per-replica workload for the blob-backed stateful contract.
+#
+# The PVC retains signed recovery copies across Pod replacement. It is not the
+# desired-state authority: revisions and resource blobs remain in object
+# storage, and a stale or edited cache must fail authentication.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: axond
+  namespace: axond
+spec:
+  serviceName: axond-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  # Explicit replacement keeps the per-ordinal recovery boundary reviewable.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: axond
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: axond
+    spec:
+      serviceAccountName: axond-blob
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: axond
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: axond
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: axond
+          image: ghcr.io/litvue/axond:0.3.40 # x-release-please-version
+          imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          env:
+            - name: AXOND_CONFIG
+              value: /etc/axond/axond.toml
+          envFrom:
+            - secretRef:
+                name: axond-secrets
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/axond
+              readOnly: true
+            - name: last-known-good
+              mountPath: /var/lib/axond
+              readOnly: false
+      volumes:
+        - name: config
+          configMap:
+            name: axond-config
+  volumeClaimTemplates:
+    - metadata:
+        name: last-known-good
+        labels:
+          app.kubernetes.io/name: axond
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
