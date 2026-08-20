@@ -595,7 +595,7 @@ fn fenced(active: PolicyGeneration, candidate: PolicyGeneration) -> String {
 mod tests {
     use super::*;
     use crate::config::NamespacePolicy;
-    use crate::desired_state::fixtures::tenant_id;
+    use crate::desired_state::fixtures::{resource_id, tenant_id};
     use crate::policy::fixtures::{body, detailed, generation, stored_zero_cap};
     use crate::policy::view::tests::{governed, stateful_config, stateless_config};
 
@@ -632,6 +632,30 @@ mod tests {
         let activation = plan(&empty(), &view(&document, 1), shared()).expect("enforceable");
         assert_eq!(activation.live(), [scope()]);
         assert!(activation.draining().is_empty());
+    }
+
+    #[test]
+    fn namespace_scoped_documents_use_backend_layout_and_drain_checks() {
+        let namespace_scope = PolicyScope::Namespace(resource_id(91));
+        let first = detailed(namespace_scope, 1, 1_000, None, 300, 8, 60, 0);
+        let lowered = detailed(namespace_scope, 2, 100, None, 300, 4, 60, 0);
+
+        let unsupported = plan(
+            &empty(),
+            &view(&first, 1),
+            BackendSupport::of(&stateful_config()),
+        )
+        .expect_err("namespace policy needs the same shared backends as v1");
+        assert!(matches!(unsupported, ActivationRefusal::Unsupported { .. }));
+
+        let activation = plan(&view(&first, 1), &view(&lowered, 2), shared())
+            .expect("a supported tightening activates with a drain");
+        assert_eq!(activation.draining().len(), 1);
+
+        let with_scope_cap = detailed(namespace_scope, 3, 100, Some(10_000), 300, 4, 60, 0);
+        let migration = plan(&view(&lowered, 2), &view(&with_scope_cap, 3), shared())
+            .expect_err("changing the durable scope layout requires migration");
+        assert!(matches!(migration, ActivationRefusal::Migration { .. }));
     }
 
     #[test]

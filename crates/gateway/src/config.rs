@@ -12,7 +12,7 @@
 //! gate a booting one does. The environment is read at *reload* time, so a
 //! credential env-var added after boot resolves without a restart.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -66,11 +66,6 @@ pub struct Config {
     pub admin_oidc: Option<AdminOidc>,
     #[serde(default)]
     pub namespace: Vec<Namespace>,
-    /// Complete namespace-native policy values projected from ADR 0062 state.
-    /// Kept separate from v1's tenant/project `NamespacePolicy` so the flat
-    /// model never fabricates hierarchy merely to reuse the serving runtime.
-    #[serde(skip)]
-    pub(crate) flat_namespace_policy: BTreeMap<String, crate::desired_state::NamespacePolicySpec>,
     #[serde(default)]
     pub provider: Vec<Provider>,
     #[serde(default)]
@@ -2501,22 +2496,14 @@ impl Config {
         // unreachable configuration.
         let mut owned: HashSet<(Option<&str>, &str)> = HashSet::new();
 
-        for (namespace, policy) in &self.flat_namespace_policy {
-            let Some(declared) = namespaces.get(namespace.as_str()) else {
+        let mut projected_digests = HashSet::new();
+        for principal in &self.projected_principals {
+            if !projected_digests.insert(principal.digest) {
                 return Err(ConfigError::Invalid(format!(
-                    "flat policy references undefined namespace `{namespace}`"
-                )));
-            };
-            if declared.policy.is_some() {
-                return Err(ConfigError::Invalid(format!(
-                    "namespace `{namespace}` has both v1 and flat v2 policy"
+                    "projected inbound principal digest {} is declared more than once",
+                    principal.digest
                 )));
             }
-            crate::middleware::validate_content_middleware(&policy.middleware)
-                .map_err(|error| ConfigError::Invalid(error.to_string()))?;
-        }
-
-        for principal in &self.projected_principals {
             if principal.subject.trim().is_empty() {
                 return Err(ConfigError::Invalid(
                     "a projected inbound principal must have a non-empty subject".into(),

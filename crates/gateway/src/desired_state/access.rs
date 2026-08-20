@@ -89,6 +89,7 @@ const KEY_DIGEST_FIELD: &str = "key_digest";
 /// authorize against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Surface {
+    Deployment,
     Namespace,
     InboundGrant,
     /// The tenants themselves: creating, renaming, disabling, deleting.
@@ -125,6 +126,7 @@ impl Surface {
     /// Every surface, so an authorization matrix can be asserted exhaustively
     /// rather than sampled.
     pub const ALL: &'static [Self] = &[
+        Self::Deployment,
         Self::Namespace,
         Self::InboundGrant,
         Self::Tenant,
@@ -150,6 +152,7 @@ impl Surface {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Deployment => "deployment",
             Self::Namespace => "namespace",
             Self::InboundGrant => "inbound-grant",
             Self::Tenant => "tenant",
@@ -169,6 +172,7 @@ impl Surface {
     /// The surface a resource kind is administered through.
     pub const fn of(kind: ResourceKind) -> Self {
         match kind {
+            ResourceKind::Deployment => Self::Deployment,
             ResourceKind::Namespace => Self::Namespace,
             ResourceKind::InboundGrant => Self::InboundGrant,
             ResourceKind::Tenant => Self::Tenant,
@@ -376,7 +380,7 @@ impl Role {
             // V1 hierarchy roles never acquire authority over the v2 flat
             // model. Deployment grants are authentication declarations, not
             // durable principals to which a tenant role can attach.
-            (_, Surface::Namespace | Surface::InboundGrant) => NONE,
+            (_, Surface::Deployment | Surface::Namespace | Surface::InboundGrant) => NONE,
             // Its own tenant is readable and renameable; its existence is not
             // its own to decide.
             (Self::TenantAdmin, Surface::Tenant) => &[Action::Read, Action::Update],
@@ -1707,7 +1711,11 @@ mod tests {
                     } else {
                         match role {
                             Role::PlatformAdmin => true,
-                            _ if matches!(surface, Surface::Namespace | Surface::InboundGrant) => {
+                            _ if matches!(
+                                surface,
+                                Surface::Deployment | Surface::Namespace | Surface::InboundGrant
+                            ) =>
+                            {
                                 false
                             }
                             Role::TenantAdmin => match surface {

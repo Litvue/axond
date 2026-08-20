@@ -309,6 +309,26 @@ pub trait SecretResolver: Send + Sync {
     /// reference, so probing is not a way to enumerate another tenant's secrets or
     /// to tell a foreign reference from one that was never stored.
     async fn exists(&self, owner: SecretOwner, reference: &SecretRef) -> Result<bool, SecretError>;
+
+    /// Resolve material owned by ADR 0062's deployment scope.
+    ///
+    /// Existing tenant/project stores fail closed by default. Blob-backed
+    /// implementations override this method without fabricating a tenant owner.
+    async fn resolve_deployment(
+        &self,
+        reference: &SecretRef,
+    ) -> Result<SecretMaterial, SecretError> {
+        Err(SecretError::Denied {
+            backend: self.name(),
+            message: format!(
+                "deployment-scoped secret {reference} is not supported by this backend"
+            ),
+        })
+    }
+
+    async fn exists_deployment(&self, _reference: &SecretRef) -> Result<bool, SecretError> {
+        Ok(false)
+    }
 }
 
 /// Storing, rotating, and administering material.

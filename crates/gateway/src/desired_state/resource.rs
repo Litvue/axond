@@ -34,6 +34,7 @@ use super::ids::{ProjectId, ResourceId, Slug, TenantId};
 /// attaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResourceKind {
+    Deployment,
     Namespace,
     InboundGrant,
     Tenant,
@@ -51,6 +52,7 @@ pub enum ResourceKind {
 impl ResourceKind {
     /// Every kind, so exhaustiveness is testable rather than assumed.
     pub const ALL: &'static [Self] = &[
+        Self::Deployment,
         Self::Namespace,
         Self::InboundGrant,
         Self::Tenant,
@@ -67,6 +69,7 @@ impl ResourceKind {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Deployment => "deployment",
             Self::Namespace => "namespace",
             Self::InboundGrant => "inbound-grant",
             Self::Tenant => "tenant",
@@ -108,7 +111,11 @@ impl ResourceKind {
     ///   no ordinary resource can be authored outside a tenant by accident.
     pub const fn permits(self, scope: &ResourceScope) -> bool {
         match self {
-            Self::Namespace | Self::InboundGrant | Self::Tenant | Self::CatalogModel => {
+            Self::Deployment
+            | Self::Namespace
+            | Self::InboundGrant
+            | Self::Tenant
+            | Self::CatalogModel => {
                 matches!(scope, ResourceScope::Deployment)
             }
             Self::Price => matches!(
@@ -566,7 +573,8 @@ mod tests {
         for kind in ResourceKind::ALL {
             if matches!(
                 kind,
-                ResourceKind::Namespace
+                ResourceKind::Deployment
+                    | ResourceKind::Namespace
                     | ResourceKind::InboundGrant
                     | ResourceKind::Tenant
                     | ResourceKind::Project

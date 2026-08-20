@@ -368,13 +368,7 @@ impl MiddlewarePlan {
             let registrations = namespace
                 .policy
                 .as_ref()
-                .map(|policy| policy.body.content_middleware())
-                .or_else(|| {
-                    config
-                        .flat_namespace_policy
-                        .get(&namespace.id)
-                        .map(|policy| policy.middleware.as_slice())
-                });
+                .map(|policy| policy.body.content_middleware());
             let Some(registrations) = registrations else {
                 continue;
             };

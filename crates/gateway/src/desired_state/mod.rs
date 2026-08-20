@@ -125,9 +125,9 @@ pub use mutation::{
 };
 #[allow(unused_imports)]
 pub use namespaces::{
-    FlatNamespaces, FlatProviderKind, InboundGrantBody, NamespaceAlias, NamespaceBody,
-    NamespaceCredential, NamespacePolicySpec, NamespaceProvider, NamespaceStateError,
-    NamespaceTarget,
+    DeploymentBody, DeploymentCatalogueEntry, DeploymentProvider, DeploymentTrust, FlatNamespaces,
+    FlatProviderKind, InboundGrantBody, NamespaceAlias, NamespaceBody, NamespaceCredential,
+    NamespacePolicySpec, NamespaceProvider, NamespaceStateError, NamespaceTarget,
 };
 #[allow(unused_imports)]
 pub use policy::{

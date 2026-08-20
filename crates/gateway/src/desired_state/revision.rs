@@ -241,7 +241,7 @@ impl DesiredState {
         self.resources.values().any(|resource| {
             matches!(
                 resource.reference.kind,
-                ResourceKind::Namespace | ResourceKind::InboundGrant
+                ResourceKind::Deployment | ResourceKind::Namespace | ResourceKind::InboundGrant
             )
         })
     }
@@ -360,14 +360,14 @@ impl DesiredState {
         let has_v2 = self.resources.values().any(|resource| {
             matches!(
                 resource.reference.kind,
-                ResourceKind::Namespace | ResourceKind::InboundGrant
+                ResourceKind::Deployment | ResourceKind::Namespace | ResourceKind::InboundGrant
             )
         });
         if has_v2 {
             if self.resources.values().any(|resource| {
                 !matches!(
                     resource.reference.kind,
-                    ResourceKind::Namespace | ResourceKind::InboundGrant
+                    ResourceKind::Deployment | ResourceKind::Namespace | ResourceKind::InboundGrant
                 )
             }) {
                 return Err(ValidationError::MixedStateModels);

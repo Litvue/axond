@@ -1,15 +1,50 @@
 //! Compiling ADR 0062 flat namespace resources into the existing serving config.
 
 use super::compile::{ProjectionError, RevisionProjection};
+use super::credentials::RuntimeProjection;
+use super::policy::PolicyProjection;
 use crate::config::{
-    CatalogBinding, Config, Credential, GatewayTokenEpoch, Model, Namespace, Provider, Target,
+    CatalogBinding, Config, Credential, GatewayTokenEpoch, Model, Namespace, NamespacePolicy,
+    Provider, Target,
+};
+use crate::desired_state::policy::{
+    BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
 };
 use crate::desired_state::{DesiredState, FlatNamespaces, RevisionId};
-use crate::namespace::NamespaceGrant;
 
 /// The v2 projection. It never consults or translates the v1 tenancy graph.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FlatNamespaceProjection;
+
+/// Production projection router for the mutually exclusive durable models.
+///
+/// Selection is derived from the validated revision itself, never from a boot
+/// flag that could make one replica interpret the same revision differently.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StateModelProjection;
+
+impl RevisionProjection for StateModelProjection {
+    fn name(&self) -> &'static str {
+        "state-model"
+    }
+
+    fn projects_inbound_principals(&self) -> bool {
+        true
+    }
+
+    fn project(
+        &self,
+        bootstrap: &Config,
+        state: &DesiredState,
+        source: RevisionId,
+    ) -> Result<Config, ProjectionError> {
+        if state.is_flat_namespace_v2() {
+            FlatNamespaceProjection.project(bootstrap, state, source)
+        } else {
+            PolicyProjection::over(RuntimeProjection).project(bootstrap, state, source)
+        }
+    }
+}
 
 impl RevisionProjection for FlatNamespaceProjection {
     fn name(&self) -> &'static str {
@@ -24,48 +59,103 @@ impl RevisionProjection for FlatNamespaceProjection {
         &self,
         bootstrap: &Config,
         state: &DesiredState,
-        _source: RevisionId,
+        source: RevisionId,
     ) -> Result<Config, ProjectionError> {
         let flat = FlatNamespaces::of(state).map_err(|error| ProjectionError::Incomplete {
             detail: error.to_string(),
         })?;
         let mut config = bootstrap.clone();
         config.namespace.clear();
-        config.flat_namespace_policy.clear();
         config.provider.clear();
         config.credential.clear();
         config.model.clear();
         config.gateway_token_epoch.clear();
         config.projected_principals.clear();
 
-        for (_, body) in flat.namespaces() {
+        let (_, deployment) = flat.deployment();
+        for provider in deployment.providers() {
+            config.provider.push(Provider {
+                id: provider.id.to_string(),
+                kind: provider.kind.into(),
+                base_url: provider.base_url.clone(),
+            });
+        }
+
+        for (reference, body) in flat.namespaces() {
             let namespace = body.namespace().to_string();
+            let middleware = body
+                .policy()
+                .middleware
+                .iter()
+                .map(|selection| {
+                    deployment
+                        .middleware()
+                        .iter()
+                        .find(|registration| registration.id() == selection)
+                        .cloned()
+                        .ok_or_else(|| ProjectionError::Incomplete {
+                            detail: format!(
+                                "namespace `{namespace}` selects missing middleware `{selection}`"
+                            ),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let policy_body = PolicyBody::new(
+                PolicyScope::Namespace(reference.id),
+                PolicyEpoch::new(body.policy().epoch).map_err(|error| {
+                    ProjectionError::Incomplete {
+                        detail: format!(
+                            "namespace `{namespace}` has invalid policy epoch: {error}"
+                        ),
+                    }
+                })?,
+                BudgetPolicy::stored(
+                    body.policy().subject_limit_microdollars,
+                    body.policy().namespace_limit_microdollars,
+                    body.policy().reservation_ttl_seconds,
+                )
+                .map_err(|error| ProjectionError::Incomplete {
+                    detail: format!("namespace `{namespace}` has invalid budget policy: {error}"),
+                })?,
+                ConcurrencyPolicy::new(
+                    body.policy().max_in_flight_per_subject,
+                    body.policy().lease_ttl_seconds,
+                )
+                .map_err(|error| ProjectionError::Incomplete {
+                    detail: format!(
+                        "namespace `{namespace}` has invalid concurrency policy: {error}"
+                    ),
+                })?,
+                RevocationPolicy::new(body.token_epoch()),
+            )
+            .with_content_middleware(middleware)
+            .map_err(|error| ProjectionError::Incomplete {
+                detail: format!("namespace `{namespace}` has invalid middleware: {error}"),
+            })?
+            .with_buffered_response_routes(body.policy().buffered_response_routes.clone())
+            .map_err(|error| ProjectionError::Incomplete {
+                detail: format!("namespace `{namespace}` has invalid buffering policy: {error}"),
+            })?;
+            let generation = policy_body.generation(source);
             config.namespace.push(Namespace {
                 id: namespace.clone(),
                 default: body.is_default(),
                 allow_platform_fallback: body.allow_platform_fallback(),
                 project: None,
-                policy: None,
+                policy: Some(NamespacePolicy {
+                    body: policy_body,
+                    generation,
+                }),
             });
             config.gateway_token_epoch.push(GatewayTokenEpoch {
                 namespace: namespace.clone(),
                 subject: None,
                 min_iat: body.token_epoch(),
             });
-            config
-                .flat_namespace_policy
-                .insert(namespace.clone(), body.policy().clone());
-            for provider in body.providers() {
-                config.provider.push(Provider {
-                    id: runtime_provider(&namespace, provider.id.as_str()),
-                    kind: provider.kind.into(),
-                    base_url: provider.base_url.clone(),
-                });
-            }
             for credential in body.credentials() {
                 config.credential.push(Credential {
                     namespace: namespace.clone(),
-                    provider: runtime_provider(&namespace, credential.provider.as_str()),
+                    provider: credential.provider.to_string(),
                     env: None,
                     secret: Some(credential.secret),
                     id: Some(credential.id.to_string()),
@@ -89,7 +179,7 @@ impl RevisionProjection for FlatNamespaceProjection {
                                 ),
                             })?;
                         Ok(Target {
-                            provider: runtime_provider(&namespace, target.provider.as_str()),
+                            provider: target.provider.to_string(),
                             model: target.model.clone(),
                             price: target.price,
                             catalog,
@@ -126,21 +216,11 @@ impl RevisionProjection for FlatNamespaceProjection {
                         .subject()
                         .map_or_else(|| reference.to_string(), str::to_owned),
                     digest: grant.digest(),
-                    grant: Some(match grant.grant() {
-                        NamespaceGrant::All => NamespaceGrant::all(),
-                        NamespaceGrant::Set(namespaces) => {
-                            NamespaceGrant::set(namespaces.iter().cloned())
-                                .expect("validated bounded namespace set")
-                        }
-                    }),
+                    grant: Some(grant.grant().clone()),
                 });
         }
         Ok(config)
     }
-}
-
-fn runtime_provider(namespace: &str, provider: &str) -> String {
-    format!("{provider}@{namespace}")
 }
 
 #[cfg(test)]
@@ -154,9 +234,10 @@ mod tests {
     use crate::convergence::{CandidateCompiler, RevisionCompiler};
     use crate::desired_state::fixtures;
     use crate::desired_state::{
-        Canonical, Checksum, ContentMiddlewareRegistration, FlatProviderKind, InboundGrantBody,
-        NamespaceAlias, NamespaceBody, NamespaceCredential, NamespacePolicySpec, NamespaceProvider,
-        NamespaceTarget, SecretRef, Slug,
+        Canonical, Checksum, ContentMiddlewareRegistration, DeploymentBody, FlatProviderKind,
+        InboundGrantBody, NamespaceAlias, NamespaceBody, NamespaceCredential, NamespacePolicySpec,
+        NamespaceProvider, NamespaceTarget, ResourceKind, ResourceRef, ResourceVersionNumber,
+        SecretRef, Slug,
     };
     use crate::namespace::{NamespaceGrant, NamespaceId};
 
@@ -167,6 +248,7 @@ mod tests {
     fn policy(token_epoch: u64) -> (NamespacePolicySpec, u64) {
         (
             NamespacePolicySpec {
+                epoch: token_epoch,
                 subject_limit_microdollars: 50_000,
                 namespace_limit_microdollars: Some(500_000),
                 reservation_ttl_seconds: 60,
@@ -179,6 +261,28 @@ mod tests {
         )
     }
 
+    fn deployment_ref() -> ResourceRef {
+        ResourceRef::new(
+            ResourceKind::Deployment,
+            fixtures::resource_id(50),
+            ResourceVersionNumber::FIRST,
+        )
+    }
+
+    fn deployment(middleware: Vec<ContentMiddlewareRegistration>) -> DeploymentBody {
+        DeploymentBody::new(
+            vec![NamespaceProvider {
+                id: slug("shared"),
+                kind: FlatProviderKind::OpenaiCompatible,
+                base_url: "https://shared.example/v1".to_owned(),
+            }],
+            Vec::new(),
+            middleware,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
     fn namespace(
         id: &str,
         default: bool,
@@ -186,17 +290,25 @@ mod tests {
         model: &str,
         epoch: u64,
     ) -> NamespaceBody {
+        namespace_with(id, default, false, provider, model, Vec::new(), epoch)
+    }
+
+    fn namespace_with(
+        id: &str,
+        default: bool,
+        allow_platform_fallback: bool,
+        provider: &str,
+        model: &str,
+        credentials: Vec<NamespaceCredential>,
+        epoch: u64,
+    ) -> NamespaceBody {
         let (policy, token_epoch) = policy(epoch);
         NamespaceBody::new(
             NamespaceId::parse(id).unwrap(),
             default,
-            false,
-            vec![NamespaceProvider {
-                id: slug(provider),
-                kind: FlatProviderKind::OpenaiCompatible,
-                base_url: format!("https://{id}.example/v1"),
-            }],
-            Vec::new(),
+            allow_platform_fallback,
+            deployment_ref(),
+            credentials,
             vec![NamespaceAlias {
                 name: slug("fast"),
                 targets: vec![NamespaceTarget {
@@ -220,6 +332,9 @@ mod tests {
 
     fn state_with(grants: Vec<InboundGrantBody>) -> DesiredState {
         let mut state = DesiredState::new();
+        state
+            .insert(deployment(Vec::new()).version(fixtures::resource_id(50), slug("deployment")))
+            .unwrap();
         state
             .insert(
                 namespace("acme", true, "shared", "gpt-acme", 101)
@@ -297,24 +412,131 @@ mod tests {
         assert_eq!(active.concurrency.unwrap().max_in_flight_per_subject, 8);
     }
 
+    #[test]
+    fn production_projection_selects_flat_v2_from_the_revision() {
+        let state = state_with(vec![grant(NamespaceGrant::all(), None, 1)]);
+        let config = StateModelProjection
+            .project(&stateful_bootstrap(), &state, fixtures::revision_id(4))
+            .unwrap();
+        assert_eq!(config.namespace.len(), 2);
+        assert!(config.namespace.iter().all(|namespace| {
+            namespace.project.is_none()
+                && matches!(
+                    namespace.policy.as_ref().map(|policy| policy.body.scope()),
+                    Some(PolicyScope::Namespace(_))
+                )
+        }));
+    }
+
+    #[tokio::test]
+    async fn shared_provider_ids_enable_explicit_platform_credential_fallback() {
+        let reference = SecretRef::first(fixtures::secret_id(9));
+        let credential = NamespaceCredential {
+            id: slug("primary"),
+            provider: slug("shared"),
+            secret: reference,
+            weight: 1,
+        };
+        let mut state = DesiredState::new();
+        state
+            .insert(deployment(Vec::new()).version(fixtures::resource_id(50), slug("deployment")))
+            .unwrap();
+        state
+            .insert(
+                namespace_with(
+                    "acme",
+                    true,
+                    false,
+                    "shared",
+                    "gpt-acme",
+                    vec![credential],
+                    1,
+                )
+                .version(fixtures::resource_id(1), slug("acme")),
+            )
+            .unwrap();
+        state
+            .insert(
+                namespace_with("globex", false, true, "shared", "gpt-globex", Vec::new(), 1)
+                    .version(fixtures::resource_id(2), slug("globex")),
+            )
+            .unwrap();
+        state
+            .insert(
+                grant(NamespaceGrant::all(), None, 1)
+                    .version(fixtures::resource_id(10), slug("grant")),
+            )
+            .unwrap();
+        let revision = revision_with(state);
+
+        let without_resolver =
+            match RevisionCompiler::new(stateful_bootstrap(), HashMap::new(), StateModelProjection)
+                .compile(&revision, 1)
+                .await
+            {
+                Ok(_) => panic!("credential-bearing v2 state must fail closed without material"),
+                Err(error) => error,
+            };
+        assert_eq!(without_resolver.reason(), "secret");
+
+        let snapshot = RevisionCompiler::with_secrets(
+            stateful_bootstrap(),
+            HashMap::new(),
+            StateModelProjection,
+            crate::convergence::secrets::testing::permissive(),
+        )
+        .compile(&revision, 2)
+        .await
+        .unwrap();
+        assert_eq!(snapshot.config.provider[0].id, "shared");
+        let plan = snapshot
+            .credentials
+            .plan(&snapshot.config, "globex", "shared")
+            .expect("globex explicitly borrows the default namespace pool");
+        assert_eq!(plan.source, crate::credentials::CredentialSource::Platform);
+
+        let mut cached = snapshot.cached_serving(revision.id());
+        let (_, restored) = crate::state::ConfigSnapshot::from_cached_serving(
+            stateful_bootstrap(),
+            &HashMap::new(),
+            cached.clone(),
+        )
+        .unwrap();
+        assert!(
+            restored
+                .credentials
+                .is_present(&restored.config, "globex", "shared"),
+            "credential-bearing LKG restores platform fallback"
+        );
+        cached.secrets.clear();
+        let error = match crate::state::ConfigSnapshot::from_cached_serving(
+            stateful_bootstrap(),
+            &HashMap::new(),
+            cached,
+        ) {
+            Ok(_) => panic!("an LKG missing credential material must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("did not resolve"), "{error}");
+    }
+
     #[tokio::test]
     async fn flat_policy_middleware_and_recovery_stay_namespace_native() {
         let base = namespace("acme", true, "shared", "gpt-acme", 303);
         let mut policy = base.policy().clone();
-        policy.middleware.push(
-            ContentMiddlewareRegistration::new(
-                "test.policy-marker",
-                [MiddlewareScope::Request],
-                MiddlewareFailurePosture::FailClosed,
-                25,
-            )
-            .unwrap(),
-        );
+        let middleware = ContentMiddlewareRegistration::new(
+            "test.policy-marker",
+            [MiddlewareScope::Request],
+            MiddlewareFailurePosture::FailClosed,
+            25,
+        )
+        .unwrap();
+        policy.middleware.push(middleware.id().to_owned());
         let body = NamespaceBody::new(
             base.namespace().clone(),
             true,
             false,
-            base.providers().to_vec(),
+            deployment_ref(),
             Vec::new(),
             base.aliases().to_vec(),
             policy,
@@ -322,6 +544,11 @@ mod tests {
         )
         .unwrap();
         let mut state = DesiredState::new();
+        state
+            .insert(
+                deployment(vec![middleware]).version(fixtures::resource_id(50), slug("deployment")),
+            )
+            .unwrap();
         state
             .insert(body.version(fixtures::resource_id(1), slug("acme")))
             .unwrap();
@@ -430,37 +657,21 @@ mod tests {
 
     #[test]
     fn namespace_resources_canonicalize_set_like_fields_deterministically() {
-        let first_base = namespace("acme", true, "alpha", "gpt-a", 10);
+        let first_provider = NamespaceProvider {
+            id: slug("alpha"),
+            kind: FlatProviderKind::OpenaiCompatible,
+            base_url: "https://alpha.example/v1".to_owned(),
+        };
         let second_provider = NamespaceProvider {
             id: slug("zeta"),
             kind: FlatProviderKind::Anthropic,
             base_url: "https://zeta.example/v1".to_owned(),
         };
-        let mut providers = first_base.providers().to_vec();
-        providers.push(second_provider.clone());
-        let first = NamespaceBody::new(
-            first_base.namespace().clone(),
-            first_base.is_default(),
-            first_base.allow_platform_fallback(),
-            providers.clone(),
-            first_base.credentials().to_vec(),
-            first_base.aliases().to_vec(),
-            first_base.policy().clone(),
-            first_base.token_epoch(),
-        )
-        .unwrap();
+        let mut providers = vec![first_provider, second_provider];
+        let first =
+            DeploymentBody::new(providers.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
         providers.reverse();
-        let rebuilt = NamespaceBody::new(
-            first_base.namespace().clone(),
-            first_base.is_default(),
-            first_base.allow_platform_fallback(),
-            providers,
-            first_base.credentials().to_vec(),
-            first_base.aliases().to_vec(),
-            first_base.policy().clone(),
-            first_base.token_epoch(),
-        )
-        .unwrap();
+        let rebuilt = DeploymentBody::new(providers, Vec::new(), Vec::new(), Vec::new()).unwrap();
         assert_eq!(first.checksum().unwrap(), rebuilt.checksum().unwrap());
     }
 
@@ -477,7 +688,7 @@ mod tests {
             base.namespace().clone(),
             base.is_default(),
             base.allow_platform_fallback(),
-            base.providers().to_vec(),
+            deployment_ref(),
             vec![credential],
             base.aliases().to_vec(),
             base.policy().clone(),

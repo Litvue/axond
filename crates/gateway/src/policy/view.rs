@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::config::{Config, Mode};
-use crate::desired_state::NamespacePolicySpec;
 use crate::desired_state::policy::{PolicyBody, PolicyGeneration, PolicyScope};
 
 /// What a scope may spend, and how long an unsettled hold survives.
@@ -102,23 +101,6 @@ impl ActivePolicy {
             generation: Some(generation),
         }
     }
-
-    fn flat(body: &NamespacePolicySpec) -> Self {
-        Self {
-            budget: Some(BudgetCaps {
-                subject_microdollars: body.subject_limit_microdollars,
-                namespace_microdollars: body.namespace_limit_microdollars,
-                reservation_ttl: Duration::from_secs(body.reservation_ttl_seconds),
-            }),
-            concurrency: Some(ConcurrencyCaps {
-                max_in_flight_per_subject: body.max_in_flight_per_subject,
-                lease_ttl: Duration::from_secs(body.lease_ttl_seconds),
-            }),
-            // Flat policies are complete values in one immutable namespace
-            // resource. They do not borrow v1's scope generations.
-            generation: None,
-        }
-    }
 }
 
 /// One published document, as the view holds it.
@@ -173,7 +155,10 @@ impl PolicyView {
             .iter()
             .filter(|namespace| {
                 namespace.project.is_some()
-                    || config.flat_namespace_policy.contains_key(&namespace.id)
+                    || matches!(
+                        namespace.policy.as_ref().map(|policy| policy.body.scope()),
+                        Some(PolicyScope::Namespace(_))
+                    )
             })
             .map(|namespace| namespace.id.clone())
             .collect();
@@ -191,9 +176,6 @@ impl PolicyView {
                         .namespaces
                         .push(namespace.id.clone());
                     ActivePolicy::published(&policy.body, policy.generation)
-                }
-                None if config.flat_namespace_policy.contains_key(&namespace.id) => {
-                    ActivePolicy::flat(&config.flat_namespace_policy[&namespace.id])
                 }
                 None if stateful => ActivePolicy::default(),
                 None => bootstrap,

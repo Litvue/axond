@@ -131,7 +131,10 @@ impl<'de> Deserialize<'de> for NamespaceId {
 /// without making the URL subordinate to a token claim: the path still selects
 /// exactly one namespace. Set/all token-claim projection is a later slice.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NamespaceGrant {
+pub struct NamespaceGrant(GrantKind);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GrantKind {
     All,
     Set(BTreeSet<NamespaceId>),
 }
@@ -148,7 +151,7 @@ impl NamespaceGrant {
     pub const MAX_NAMESPACES: usize = 64;
 
     pub fn one(namespace: NamespaceId) -> Self {
-        Self::Set(BTreeSet::from([namespace]))
+        Self(GrantKind::Set(BTreeSet::from([namespace])))
     }
 
     pub fn set(
@@ -164,24 +167,28 @@ impl NamespaceGrant {
                 max: Self::MAX_NAMESPACES,
             });
         }
-        Ok(Self::Set(namespaces))
+        Ok(Self(GrantKind::Set(namespaces)))
     }
 
     pub const fn all() -> Self {
-        Self::All
+        Self(GrantKind::All)
+    }
+
+    pub const fn is_all(&self) -> bool {
+        matches!(self.0, GrantKind::All)
     }
 
     pub fn permits(&self, namespace: &NamespaceId) -> bool {
-        match self {
-            Self::All => true,
-            Self::Set(namespaces) => namespaces.contains(namespace),
+        match &self.0 {
+            GrantKind::All => true,
+            GrantKind::Set(namespaces) => namespaces.contains(namespace),
         }
     }
 
     pub fn namespaces(&self) -> Option<&BTreeSet<NamespaceId>> {
-        match self {
-            Self::All => None,
-            Self::Set(namespaces) => Some(namespaces),
+        match &self.0 {
+            GrantKind::All => None,
+            GrantKind::Set(namespaces) => Some(namespaces),
         }
     }
 }

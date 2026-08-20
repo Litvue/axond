@@ -1389,11 +1389,7 @@ fn stream_delivery(
                 .body
                 .buffered_response_routes()
                 .contains(&policy_route)
-        })
-        || cfg
-            .flat_namespace_policy
-            .get(namespace)
-            .is_some_and(|policy| policy.buffered_response_routes.contains(&policy_route));
+        });
     if enabled {
         return Ok(if mutates_response {
             StreamDelivery::PolicyBuffered

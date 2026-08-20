@@ -281,6 +281,9 @@ impl SecretMaterialization {
     /// Versions are deduplicated: two credentials pinning one version resolve it
     /// once and share the buffer.
     pub async fn resolve(&self, state: &DesiredState) -> Result<ResolvedSecrets, ProjectionError> {
+        if state.is_flat_namespace_v2() {
+            return self.resolve_flat(state).await;
+        }
         let credentials = Credentials::of(state).map_err(|error| ProjectionError::Body {
             reference: error.reference(),
             detail: error.to_string(),
@@ -303,6 +306,39 @@ impl SecretMaterialization {
             resolved
                 .materials
                 .insert(reference, self.ledger.retain(reference, material));
+        }
+        Ok(resolved)
+    }
+
+    async fn resolve_flat(&self, state: &DesiredState) -> Result<ResolvedSecrets, ProjectionError> {
+        let flat = crate::desired_state::FlatNamespaces::of(state).map_err(|error| {
+            ProjectionError::Incomplete {
+                detail: error.to_string(),
+            }
+        })?;
+        let mut resolved = ResolvedSecrets::default();
+        for (holder, namespace) in flat.namespaces() {
+            for credential in namespace.credentials() {
+                let reference = credential.secret;
+                if resolved.materials.contains_key(&reference) {
+                    continue;
+                }
+                let Some(resolver) = &self.resolver else {
+                    return Err(secret_error(
+                        *holder,
+                        reference,
+                        "this process has no deployment-scoped secret resolver configured"
+                            .to_owned(),
+                    ));
+                };
+                let material = resolver
+                    .resolve_deployment(&reference)
+                    .await
+                    .map_err(|error| secret_error(*holder, reference, error.to_string()))?;
+                resolved
+                    .materials
+                    .insert(reference, self.ledger.retain(reference, material));
+            }
         }
         Ok(resolved)
     }
@@ -386,6 +422,17 @@ pub(crate) mod testing {
             _owner: SecretOwner,
             _reference: &SecretRef,
         ) -> Result<bool, SecretError> {
+            Ok(true)
+        }
+
+        async fn resolve_deployment(
+            &self,
+            _reference: &SecretRef,
+        ) -> Result<SecretMaterial, SecretError> {
+            Ok(SecretMaterial::new(MATERIAL.to_owned()))
+        }
+
+        async fn exists_deployment(&self, _reference: &SecretRef) -> Result<bool, SecretError> {
             Ok(true)
         }
     }

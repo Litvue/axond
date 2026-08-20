@@ -514,7 +514,7 @@ const COMPILED_MAGIC: &[u8] = b"axond.compiled-serving\0";
 // rules, and a non-secret resolved-key fingerprint. Keep this byte in lockstep
 // with every payload shape change: an older build must reject a newer cache
 // before serde can ignore a field it does not understand.
-const COMPILED_RECORD_VERSION: u8 = 4;
+const COMPILED_RECORD_VERSION: u8 = 5;
 
 fn compiled_key(key: &[u8]) -> [u8; 32] {
     let mut context = ring::digest::Context::new(&SHA256);
@@ -1015,17 +1015,21 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
 
     #[test]
     fn compiled_serving_cache_rejects_an_older_layout_before_deserializing_it() {
+        assert_eq!(
+            COMPILED_RECORD_VERSION, 5,
+            "v2 scope/grant cache shape bump"
+        );
         let (snapshot, _, _) = serving_snapshot();
         let cache = cache("compiled-serving-old-layout");
         let mut bytes = cache
             .encode_compiled(&snapshot, fixtures::revision_id(9))
             .expect("compiled cache encodes");
-        bytes[COMPILED_MAGIC.len()] = COMPILED_RECORD_VERSION - 1;
+        bytes[COMPILED_MAGIC.len()] = 4;
         cache
             .write_compiled(&bytes)
             .expect("old-layout fixture writes");
 
-        let expected = format!("unsupported layout version {}", COMPILED_RECORD_VERSION - 1);
+        let expected = "unsupported layout version 4".to_owned();
         assert!(matches!(
             cache.load_compiled(),
             Err(LastKnownGoodError::CompiledMalformed { detail, .. })

@@ -96,7 +96,7 @@ pub use credentials::{CredentialProjection, RuntimeProjection};
 #[allow(unused_imports)]
 pub use lkg::{LastKnownGood, LastKnownGoodError};
 #[allow(unused_imports)]
-pub use namespaces::FlatNamespaceProjection;
+pub use namespaces::{FlatNamespaceProjection, StateModelProjection};
 #[allow(unused_imports)]
 pub use policy::PolicyProjection;
 #[allow(unused_imports)]

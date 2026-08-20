@@ -772,8 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_stateful_projection_compiles_a_projected_workload_principal() {
-        let projection =
-            crate::convergence::PolicyProjection::over(crate::convergence::RuntimeProjection);
+        let projection = crate::convergence::StateModelProjection;
         assert!(
             projection.projects_inbound_principals(),
             "the production projection must expose its durable principal capability"

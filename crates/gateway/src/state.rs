@@ -382,22 +382,6 @@ pub(crate) struct CachedNamespace {
     pub(crate) allow_platform_fallback: bool,
     pub(crate) project: Option<CachedProjectIdentity>,
     pub(crate) policy: Option<CachedPolicy>,
-    #[serde(default)]
-    pub(crate) flat_policy: Option<CachedFlatPolicy>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CachedFlatPolicy {
-    pub(crate) subject_limit_microdollars: u64,
-    pub(crate) namespace_limit_microdollars: Option<u64>,
-    pub(crate) reservation_ttl_seconds: u64,
-    pub(crate) max_in_flight_per_subject: u64,
-    pub(crate) lease_ttl_seconds: u64,
-    pub(crate) minimum_token_epoch: u64,
-    pub(crate) content_middleware: Vec<CachedContentMiddleware>,
-    #[serde(default)]
-    pub(crate) buffered_response_routes: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -409,8 +393,7 @@ pub(crate) struct CachedProjectIdentity {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CachedPolicy {
-    pub(crate) tenant: String,
-    pub(crate) project: Option<String>,
+    pub(crate) scope: CachedPolicyScope,
     pub(crate) epoch: u64,
     pub(crate) subject_limit_microdollars: u64,
     pub(crate) namespace_limit_microdollars: Option<u64>,
@@ -421,6 +404,14 @@ pub(crate) struct CachedPolicy {
     pub(crate) content_middleware: Vec<CachedContentMiddleware>,
     #[serde(default)]
     pub(crate) buffered_response_routes: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CachedPolicyScope {
+    Namespace { resource: String },
+    Tenant { tenant: String },
+    Project { tenant: String, project: String },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -567,8 +558,20 @@ impl ConfigSnapshot {
                         project: identity.project.to_string(),
                     }),
                     policy: namespace.policy.as_ref().map(|policy| CachedPolicy {
-                        tenant: policy.body.scope().tenant().to_string(),
-                        project: policy.body.scope().project().map(|id| id.to_string()),
+                        scope: match policy.body.scope() {
+                            PolicyScope::Namespace(resource) => CachedPolicyScope::Namespace {
+                                resource: resource.to_string(),
+                            },
+                            PolicyScope::Tenant(tenant) => CachedPolicyScope::Tenant {
+                                tenant: tenant.to_string(),
+                            },
+                            PolicyScope::Project { tenant, project } => {
+                                CachedPolicyScope::Project {
+                                    tenant: tenant.to_string(),
+                                    project: project.to_string(),
+                                }
+                            }
+                        },
                         epoch: policy.body.epoch().get(),
                         subject_limit_microdollars: policy
                             .body
@@ -614,52 +617,6 @@ impl ConfigSnapshot {
                             .map(|route| route.as_str().to_owned())
                             .collect(),
                     }),
-                    flat_policy: config
-                        .flat_namespace_policy
-                        .get(&namespace.id)
-                        .map(|policy| CachedFlatPolicy {
-                            subject_limit_microdollars: policy.subject_limit_microdollars,
-                            namespace_limit_microdollars: policy.namespace_limit_microdollars,
-                            reservation_ttl_seconds: policy.reservation_ttl_seconds,
-                            max_in_flight_per_subject: policy.max_in_flight_per_subject,
-                            lease_ttl_seconds: policy.lease_ttl_seconds,
-                            minimum_token_epoch: config
-                                .gateway_token_epoch
-                                .iter()
-                                .find(|epoch| {
-                                    epoch.namespace == namespace.id && epoch.subject.is_none()
-                                })
-                                .map_or(0, |epoch| epoch.min_iat),
-                            content_middleware: policy
-                                .middleware
-                                .iter()
-                                .map(|registration| CachedContentMiddleware {
-                                    id: registration.id().to_owned(),
-                                    scopes: registration.scopes().to_vec(),
-                                    failure_posture: registration.failure_posture(),
-                                    max_duration_milliseconds: registration
-                                        .max_duration_milliseconds(),
-                                    guardrail: registration.guardrail().map(|guardrail| {
-                                        CachedContentGuardrail {
-                                            key_env: guardrail.key_env().to_owned(),
-                                            key_fingerprint: self
-                                                .middleware
-                                                .guardrail_key_fingerprint(&namespace.id)
-                                                .expect(
-                                                    "a compiled guardrail has a key fingerprint",
-                                                )
-                                                .to_owned(),
-                                            rules: guardrail.rules().to_vec(),
-                                        }
-                                    }),
-                                })
-                                .collect(),
-                            buffered_response_routes: policy
-                                .buffered_response_routes
-                                .iter()
-                                .map(|route| route.as_str().to_owned())
-                                .collect(),
-                        }),
                 })
                 .collect(),
             providers: config
@@ -716,10 +673,10 @@ impl ConfigSnapshot {
                     namespace: principal.namespace.clone(),
                     subject: principal.subject.clone(),
                     digest: principal.digest.to_string(),
-                    all_namespaces: matches!(
-                        principal.grant,
-                        Some(crate::namespace::NamespaceGrant::All)
-                    ),
+                    all_namespaces: principal
+                        .grant
+                        .as_ref()
+                        .is_some_and(crate::namespace::NamespaceGrant::is_all),
                     namespaces: principal
                         .grant
                         .as_ref()
@@ -763,17 +720,10 @@ impl ConfigSnapshot {
             .iter()
             .map(|(namespace, _)| namespace.clone())
             .collect();
-        bootstrap.flat_namespace_policy = restored_namespaces
-            .iter()
-            .filter_map(|(namespace, flat)| {
-                flat.as_ref()
-                    .map(|(policy, _)| (namespace.id.clone(), policy.clone()))
-            })
-            .collect();
         bootstrap.gateway_token_epoch = restored_namespaces
             .into_iter()
-            .filter_map(|(namespace, flat)| {
-                flat.map(|(_, min_iat)| crate::config::GatewayTokenEpoch {
+            .filter_map(|(namespace, minimum_token_epoch)| {
+                minimum_token_epoch.map(|min_iat| crate::config::GatewayTokenEpoch {
                     namespace: namespace.id,
                     subject: None,
                     min_iat,
@@ -910,13 +860,7 @@ fn verify_cached_guardrail_keys(
         let registrations = namespace
             .policy
             .as_ref()
-            .map(|policy| policy.content_middleware.as_slice())
-            .or_else(|| {
-                namespace
-                    .flat_policy
-                    .as_ref()
-                    .map(|policy| policy.content_middleware.as_slice())
-            });
+            .map(|policy| policy.content_middleware.as_slice());
         let Some(registrations) = registrations else {
             continue;
         };
@@ -949,13 +893,7 @@ impl CachedServingSnapshot {
 fn cached_namespace(
     namespace: CachedNamespace,
     revision: RevisionId,
-) -> Result<
-    (
-        Namespace,
-        Option<(crate::desired_state::NamespacePolicySpec, u64)>,
-    ),
-    String,
-> {
+) -> Result<(Namespace, Option<u64>), String> {
     let project = namespace
         .project
         .map(|identity| -> Result<ProjectIdentity, String> {
@@ -967,18 +905,21 @@ fn cached_namespace(
         .transpose()?;
     let policy = namespace
         .policy
-        .map(|policy| -> Result<NamespacePolicy, String> {
-            let tenant = TenantId::parse(&policy.tenant).map_err(|error| error.to_string())?;
-            let project = policy
-                .project
-                .as_deref()
-                .map(ProjectId::parse)
-                .transpose()
-                .map_err(|error| error.to_string())?;
-            let scope = match project {
-                Some(project) => PolicyScope::Project { tenant, project },
-                None => PolicyScope::Tenant(tenant),
+        .map(|policy| -> Result<(NamespacePolicy, u64), String> {
+            let scope = match policy.scope {
+                CachedPolicyScope::Namespace { resource } => PolicyScope::Namespace(
+                    crate::desired_state::ResourceId::parse(&resource)
+                        .map_err(|error| error.to_string())?,
+                ),
+                CachedPolicyScope::Tenant { tenant } => PolicyScope::Tenant(
+                    TenantId::parse(&tenant).map_err(|error| error.to_string())?,
+                ),
+                CachedPolicyScope::Project { tenant, project } => PolicyScope::Project {
+                    tenant: TenantId::parse(&tenant).map_err(|error| error.to_string())?,
+                    project: ProjectId::parse(&project).map_err(|error| error.to_string())?,
+                },
             };
+            let minimum_token_epoch = policy.minimum_token_epoch;
             let content_middleware = policy
                 .content_middleware
                 .into_iter()
@@ -1027,65 +968,25 @@ fn cached_namespace(
             .with_buffered_response_routes(buffered_response_routes)
             .map_err(|error| error.to_string())?;
             let generation = body.generation(revision);
-            Ok(NamespacePolicy { body, generation })
+            Ok((NamespacePolicy { body, generation }, minimum_token_epoch))
         })
         .transpose()?;
-    let flat_policy = namespace
-        .flat_policy
-        .map(|policy| -> Result<_, String> {
-            let content_middleware = policy
-                .content_middleware
-                .into_iter()
-                .map(|registration| {
-                    let middleware = crate::desired_state::ContentMiddlewareRegistration::new(
-                        registration.id,
-                        registration.scopes,
-                        registration.failure_posture,
-                        registration.max_duration_milliseconds,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    let Some(guardrail) = registration.guardrail else {
-                        return Ok(middleware);
-                    };
-                    middleware
-                        .with_guardrail(
-                            crate::desired_state::policy::ContentGuardrailRegistration::new(
-                                guardrail.key_env,
-                                guardrail.rules,
-                            )
-                            .map_err(|error| error.to_string())?,
-                        )
-                        .map_err(|error| error.to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let buffered_response_routes = policy
-                .buffered_response_routes
-                .iter()
-                .map(|route| BufferedResponseRoute::parse(route).map_err(|error| error.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((
-                crate::desired_state::NamespacePolicySpec {
-                    subject_limit_microdollars: policy.subject_limit_microdollars,
-                    namespace_limit_microdollars: policy.namespace_limit_microdollars,
-                    reservation_ttl_seconds: policy.reservation_ttl_seconds,
-                    max_in_flight_per_subject: policy.max_in_flight_per_subject,
-                    lease_ttl_seconds: policy.lease_ttl_seconds,
-                    middleware: content_middleware,
-                    buffered_response_routes,
-                },
-                policy.minimum_token_epoch,
-            ))
-        })
-        .transpose()?;
+    let minimum_token_epoch = policy.as_ref().and_then(|(_, minimum)| {
+        matches!(
+            policy.as_ref().map(|(policy, _)| policy.body.scope()),
+            Some(PolicyScope::Namespace(_))
+        )
+        .then_some(*minimum)
+    });
     Ok((
         Namespace {
             id: namespace.id,
             default: namespace.default,
             allow_platform_fallback: namespace.allow_platform_fallback,
             project,
-            policy,
+            policy: policy.map(|(policy, _)| policy),
         },
-        flat_policy,
+        minimum_token_epoch,
     ))
 }
 
