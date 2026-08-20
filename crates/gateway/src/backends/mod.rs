@@ -11,7 +11,7 @@
 //! stateful operating modes"; `docs/maintainers/backend-contracts.md` maps these
 //! contracts to it).
 //!
-//! Eight contracts exist. This module owns the four that are
+//! Eight responsibility contracts exist. This module owns the four that are
 //! control-plane-shaped, and it names the four request-path seams that already
 //! ship so the boundary between them is reviewable in one place:
 //!
@@ -42,6 +42,8 @@
 //! The catalogue store's background refresher and convergence reader are both
 //! intentionally off the request path. Requests receive a concrete immutable
 //! snapshot; they never retain a store handle or cause a catalogue query.
+//! [`object_store::ObjectStore`] is a provider-neutral storage primitive for a
+//! future control-plane implementation, not a ninth business responsibility.
 
 pub mod catalog;
 pub mod catalog_pins;
@@ -52,6 +54,7 @@ pub mod catalog_store;
 pub mod control_plane;
 pub mod health;
 pub mod models_dev;
+pub mod object_store;
 pub mod secrets;
 
 #[cfg(test)]

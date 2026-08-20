@@ -1172,8 +1172,8 @@ def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> lis
             )
     for contract, lost in (
         (
-            "401 unauthorized",
-            "an anonymous inference probe would no longer prove auth-first refusal",
+            "/namespaces/platform/v1/chat/completions 401 unauthorized",
+            "the canonical anonymous inference probe would no longer prove auth-first refusal",
         ),
         (
             "503 inference_unavailable",
@@ -1219,6 +1219,7 @@ def check_stateful_persistent_drill(
     for assertion in (
         "three retained PVC-backed ordinals",
         "survives Pod replacement",
+        "/namespaces/platform/v1/chat/completions remains authentication-first",
     ):
         if assertion not in drill:
             failures.append(
@@ -1925,6 +1926,17 @@ def self_test() -> int:
                 workflow, kubernetes_page, stateful_drill.replace(counterfactual, "runs")
             ),
         )
+    canonical_stateful_probe = "/namespaces/platform/v1/chat/completions 401 unauthorized"
+    expect_failure(
+        "stateful drill using a legacy inference probe",
+        check_stateful_drill(
+            workflow,
+            kubernetes_page,
+            stateful_drill.replace(
+                canonical_stateful_probe, "/v1/chat/completions 401 unauthorized"
+            ),
+        ),
+    )
 
     persistent_drill = STATEFUL_PERSISTENT_DRILL.read_text(encoding="utf-8")
     if check_stateful_persistent_drill(workflow, kubernetes_page, persistent_drill):
@@ -1954,7 +1966,11 @@ def self_test() -> int:
             unasserted_persistent, kubernetes_page, persistent_drill
         ),
     )
-    for assertion in ("three retained PVC-backed ordinals", "survives Pod replacement"):
+    for assertion in (
+        "three retained PVC-backed ordinals",
+        "survives Pod replacement",
+        "/namespaces/platform/v1/chat/completions remains authentication-first",
+    ):
         expect_failure(
             f"persistent drill without {assertion!r}",
             check_stateful_persistent_drill(

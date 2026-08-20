@@ -9,6 +9,7 @@ evidence and known limitations; the reusable process lives in the
 | Criterion | Status | Evidence |
 | --- | --- | --- |
 | Required routes, failover, credential pools, identity, controls, telemetry, and durable usage are implemented | Met | Compatibility contract, ADRs, unit/integration tests, SDK compatibility, stateful tests, Tier 0 gate, and stream soak. |
+| Blob-backed flat-namespace stateful-v2 qualification | Pending | ADR 0062 is accepted but not implemented. PostgreSQL stateful-v1 records are historical compatibility evidence and cannot satisfy this gate. |
 | Public source repository | Met | `https://github.com/Litvue/axond`. |
 | Cross-platform release archives | Met | The [latest GitHub release](https://github.com/Litvue/axond/releases/latest) contains Linux x86-64 and ARM64 GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, and provenance. |
 | Public OCI image | Met | The versioned `ghcr.io/litvue/axond` image for each release is public, published as a `linux/amd64` + `linux/arm64` index, smoke-tested per architecture, signed keylessly, and attested: provenance on every manifest including the index, SBOM on the per-architecture children. |
@@ -71,10 +72,15 @@ operational consequences.
 
 ## Release gates
 
-The required CI aggregate covers:
+`CI Success` is a software-change gate, not a production-qualification gate.
+It can be green while the blob-backed stateful-v2 release gates above remain
+pending; skipped PostgreSQL stateful-v1 lanes do not satisfy or replace them.
+
+The required pull-request CI aggregate covers:
 
 - formatting, clippy, workspace tests, and rustdoc with warnings denied;
-- Redis/Postgres integration tests;
+- deterministic unit/integration tests and short stateless fault, rollout, and
+  endurance coverage that do not require PostgreSQL;
 - provider SDK compatibility;
 - dependency and license policy;
 - crates.io package/publish dry runs;
@@ -82,6 +88,15 @@ The required CI aggregate covers:
 - a boot-and-serve smoke of every released binary target, on a runner of that
   target's own platform;
 - Docker image and Compose quickstart smoke tests.
+
+The historical PostgreSQL stateful-v1 tests, restore/PITR, recovery record,
+stateful endurance, and Kubernetes stateful/PVC drills are excluded from pull
+requests, pushes, merge queues, and schedules. They remain manually available
+only when `run_legacy_postgres_qualification=true` is explicitly supplied. Their
+result is compatibility evidence for the shipped stateful-v1 implementation,
+not production evidence for ADR 0062. Blob-backed publication, namespace
+isolation, recovery, secret lifecycle, migration, and endurance gates must be
+implemented and directly evidenced before stateful-v2 can be release-qualified.
 
 Release jobs add archive/image SBOMs, provenance attestations, cosign signing,
 native per-architecture archive smoke — the same binary smoke against the exact

@@ -258,10 +258,10 @@ probe() { curl -s -o "${workdir}/body" -w '%{http_code}' "$@"; }
 [[ "$(probe http://127.0.0.1:18444/healthz)" == 200 ]] || fail "/healthz did not answer 200"
 [[ "$(probe http://127.0.0.1:18444/readyz)" == 503 ]] || fail "/readyz did not remain fail-closed"
 code="$(probe -X POST -H 'content-type: application/json' -d '{}' \
-  http://127.0.0.1:18444/v1/chat/completions)"
+  http://127.0.0.1:18444/namespaces/platform/v1/chat/completions)"
 [[ "$code" == 401 ]] || fail "anonymous inference answered ${code}, not 401"
 grep -q '"unauthorized"' "${workdir}/body" || fail "anonymous inference was not typed unauthorized"
-ok "replacement remains live, unready, and authentication-first"
+ok "/namespaces/platform/v1/chat/completions remains authentication-first after replacement"
 
 printf '%s\n' ''
 printf '%s\n' 'stateful persistent drill passed: the persistent overlay migrates once,'
