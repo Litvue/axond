@@ -1064,9 +1064,9 @@ impl VerifiedRevisionManifest {
 /// strong object-store read and tied to that read's opaque version fence.
 ///
 /// Unlike [`VerifiedRevisionManifest`], this wrapper is eligible for hydration.
-/// It has no public constructor: only [`BlobPublication::read_active_revision`]
-/// can establish that the signed manifest won head CAS and remained current
-/// through the final fence read.
+/// It has no public constructor: only [`BlobReader::read_active_revision`] and
+/// [`BlobPublication::read_active_revision`] can establish that the signed
+/// manifest won head CAS and remained current through the final fence read.
 #[derive(Debug)]
 pub struct VerifiedActiveRevision {
     manifest: VerifiedRevisionManifest,
@@ -1524,6 +1524,181 @@ fn verify_activation_snapshot(
     Ok(ActivationReadyRevision(active))
 }
 
+async fn read_head<S: ObjectStore>(
+    store: &S,
+    environment: &EnvironmentId,
+    sequence_guard: &PublicationSequenceGuard,
+    trust: &PublicationTrustStore,
+) -> Result<Option<ReadHead>, BlobPublicationError> {
+    match store.get(&environment_head_key(environment)).await {
+        Ok(value) => authenticate_read_head(&value.bytes, value.version, sequence_guard, trust)
+            .map(Some)
+            .map_err(Into::into),
+        Err(error) if error.kind() == ObjectStoreErrorKind::NotFound => {
+            sequence_guard.verify_absent()?;
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn read_manifest<S: ObjectStore>(
+    store: &S,
+    environment: &EnvironmentId,
+    trust: &PublicationTrustStore,
+    digest: Checksum,
+    expected_sequence: u64,
+) -> Result<VerifiedRevisionManifest, BlobPublicationError> {
+    let key = revision_manifest_key(digest);
+    let value = store.get(&key).await?;
+    Ok(VerifiedRevisionManifest::verify(
+        &value.bytes,
+        environment,
+        digest,
+        expected_sequence,
+        trust,
+    )?)
+}
+
+async fn read_active_revision<S: ObjectStore>(
+    store: &S,
+    environment: &EnvironmentId,
+    sequence_guard: &PublicationSequenceGuard,
+    trust: &PublicationTrustStore,
+) -> Result<Option<VerifiedActiveRevision>, BlobPublicationError> {
+    let Some(first_head) = read_head(store, environment, sequence_guard, trust).await? else {
+        return Ok(None);
+    };
+    let manifest_revision = first_head.document.active_revision;
+    let manifest = read_manifest(
+        store,
+        environment,
+        trust,
+        manifest_revision,
+        first_head.document.sequence,
+    )
+    .await?;
+    let fenced_head = read_head(store, environment, sequence_guard, trust).await?;
+    verify_active_revision_snapshot(first_head, manifest_revision, manifest, fenced_head).map(Some)
+}
+
+async fn read_immutable_object<S: ObjectStore>(
+    store: &S,
+    kind: ImmutableObjectKind,
+    digest: Checksum,
+) -> Result<ImmutableObject, BlobPublicationError> {
+    let key = kind.key(digest);
+    let value = store.get(&key).await?;
+    let limit = store.limits().max_read_bytes();
+    if value.bytes.len() > limit {
+        return Err(ObjectStoreError::PayloadTooLarge {
+            key,
+            operation: ObjectStoreOperation::Get,
+            observed: value.bytes.len(),
+            limit,
+        }
+        .into());
+    }
+    let actual = Checksum::of(&value.bytes);
+    if actual != digest {
+        return Err(BlobPublicationError::ImmutableDigestMismatch {
+            kind,
+            expected: digest,
+            actual,
+        });
+    }
+    Ok(ImmutableObject {
+        kind,
+        bytes: value.bytes,
+    })
+}
+
+async fn fence_for_activation<S: ObjectStore>(
+    store: &S,
+    environment: &EnvironmentId,
+    sequence_guard: &PublicationSequenceGuard,
+    trust: &PublicationTrustStore,
+    active: VerifiedActiveRevision,
+) -> Result<ActivationReadyRevision, BlobPublicationError> {
+    let current = read_head(store, environment, sequence_guard, trust).await?;
+    verify_activation_snapshot(active, current)
+}
+
+/// Provider-neutral authenticated reader over an [`ObjectStore`].
+///
+/// This trust boundary contains public verification material only. It cannot
+/// sign a head or manifest and exposes no administrative mutation operation.
+pub struct BlobReader<S> {
+    store: Arc<S>,
+    environment: EnvironmentId,
+    trust: PublicationTrustStore,
+    sequence_guard: PublicationSequenceGuard,
+}
+
+impl<S> Clone for BlobReader<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            environment: self.environment.clone(),
+            trust: self.trust.clone(),
+            sequence_guard: self.sequence_guard.clone(),
+        }
+    }
+}
+
+impl<S: ObjectStore> BlobReader<S> {
+    pub fn new(store: Arc<S>, environment: EnvironmentId, trust: PublicationTrustStore) -> Self {
+        let sequence_guard = PublicationSequenceGuard::new(environment.clone());
+        Self {
+            store,
+            environment,
+            trust,
+            sequence_guard,
+        }
+    }
+
+    pub fn environment(&self) -> &EnvironmentId {
+        &self.environment
+    }
+
+    /// Read, authenticate, and fence the current head and its exact manifest.
+    pub async fn read_active_revision(
+        &self,
+    ) -> Result<Option<VerifiedActiveRevision>, BlobPublicationError> {
+        read_active_revision(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+        )
+        .await
+    }
+
+    /// Read one immutable publication object by its typed content address.
+    pub async fn read_immutable_object(
+        &self,
+        kind: ImmutableObjectKind,
+        digest: Checksum,
+    ) -> Result<ImmutableObject, BlobPublicationError> {
+        read_immutable_object(self.store.as_ref(), kind, digest).await
+    }
+
+    /// Re-read the exact selecting head immediately before local activation.
+    pub async fn fence_for_activation(
+        &self,
+        active: VerifiedActiveRevision,
+    ) -> Result<ActivationReadyRevision, BlobPublicationError> {
+        fence_for_activation(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+            active,
+        )
+        .await
+    }
+}
+
 /// Provider-neutral immutable publisher over an [`ObjectStore`].
 pub struct BlobPublication<S> {
     store: Arc<S>,
@@ -1604,16 +1779,13 @@ impl<S: ObjectStore> BlobPublication<S> {
     pub async fn read_active_revision(
         &self,
     ) -> Result<Option<VerifiedActiveRevision>, BlobPublicationError> {
-        let Some(first_head) = self.read_head().await? else {
-            return Ok(None);
-        };
-        let manifest_revision = first_head.document.active_revision;
-        let manifest = self
-            .read_manifest(manifest_revision, first_head.document.sequence)
-            .await?;
-        let fenced_head = self.read_head().await?;
-        verify_active_revision_snapshot(first_head, manifest_revision, manifest, fenced_head)
-            .map(Some)
+        read_active_revision(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+        )
+        .await
     }
 
     /// Read one immutable publication object by its typed content address.
@@ -1633,30 +1805,7 @@ impl<S: ObjectStore> BlobPublication<S> {
         kind: ImmutableObjectKind,
         digest: Checksum,
     ) -> Result<ImmutableObject, BlobPublicationError> {
-        let key = kind.key(digest);
-        let value = self.store.get(&key).await?;
-        let limit = self.store.limits().max_read_bytes();
-        if value.bytes.len() > limit {
-            return Err(ObjectStoreError::PayloadTooLarge {
-                key,
-                operation: ObjectStoreOperation::Get,
-                observed: value.bytes.len(),
-                limit,
-            }
-            .into());
-        }
-        let actual = Checksum::of(&value.bytes);
-        if actual != digest {
-            return Err(BlobPublicationError::ImmutableDigestMismatch {
-                kind,
-                expected: digest,
-                actual,
-            });
-        }
-        Ok(ImmutableObject {
-            kind,
-            bytes: value.bytes,
-        })
+        read_immutable_object(self.store.as_ref(), kind, digest).await
     }
 
     /// Consume a hydrated active revision and re-read its exact head fence at
@@ -1666,8 +1815,14 @@ impl<S: ObjectStore> BlobPublication<S> {
         &self,
         active: VerifiedActiveRevision,
     ) -> Result<ActivationReadyRevision, BlobPublicationError> {
-        let current = self.read_head().await?;
-        verify_activation_snapshot(active, current)
+        fence_for_activation(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+            active,
+        )
+        .await
     }
 
     /// Report whether the complete retained history fits inside the configured
@@ -1825,25 +1980,13 @@ impl<S: ObjectStore> BlobPublication<S> {
     }
 
     async fn read_head(&self) -> Result<Option<ReadHead>, BlobPublicationError> {
-        match self
-            .store
-            .get(&environment_head_key(&self.environment))
-            .await
-        {
-            Ok(value) => authenticate_read_head(
-                &value.bytes,
-                value.version,
-                &self.sequence_guard,
-                &self.trust,
-            )
-            .map(Some)
-            .map_err(Into::into),
-            Err(error) if error.kind() == ObjectStoreErrorKind::NotFound => {
-                self.sequence_guard.verify_absent()?;
-                Ok(None)
-            }
-            Err(error) => Err(error.into()),
-        }
+        read_head(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+        )
+        .await
     }
 
     async fn read_manifest(
@@ -1851,15 +1994,14 @@ impl<S: ObjectStore> BlobPublication<S> {
         digest: Checksum,
         expected_sequence: u64,
     ) -> Result<VerifiedRevisionManifest, BlobPublicationError> {
-        let key = revision_manifest_key(digest);
-        let value = self.store.get(&key).await?;
-        Ok(VerifiedRevisionManifest::verify(
-            &value.bytes,
+        read_manifest(
+            self.store.as_ref(),
             &self.environment,
+            &self.trust,
             digest,
             expected_sequence,
-            &self.trust,
-        )?)
+        )
+        .await
     }
 
     fn idempotency_binding(
