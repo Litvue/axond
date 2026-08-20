@@ -142,12 +142,12 @@ snapshot fails readiness rather than serving partial state.
 | `schema` | string | connection default | **Postgres only.** PostgreSQL journal schema. A single unqualified identifier; rejected for `object-storage`. |
 | `migrate` | boolean | `false` | **Postgres only.** Whether a booting replica may apply pending migrations. Even an explicit `false` is rejected for `object-storage`, preventing an ambiguous mixed contract. |
 | `environment_id` | string | — | **Object storage only; required.** Stable environment object-key segment: at most 128 bytes, lowercase ASCII letters/digits with internal `-`, `_`, or `.`, and alphanumeric boundaries. |
-| `container_url` | absolute URL | — | **Object storage only; required.** Credential-free container URL with exactly one unescaped container path segment. The explicit loopback-only Azurite exception also accepts its native `account/container` pair. Production requires HTTPS. User info, query strings (including SAS), and fragments are rejected. |
+| `container_url` | absolute URL | — | **Object storage only; required.** Credential-free container URL with exactly one unescaped container path segment. A loopback Azurite endpoint also accepts its native `account/container` pair over HTTPS or explicitly enabled HTTP. Production requires HTTPS. User info, query strings (including SAS), and fragments are rejected. |
 | `authentication` | `workload-identity` | — | **Object storage only; required.** The adapter obtains short-lived credentials from its workload identity chain. Tokens, account keys, client secrets, and SAS values cannot be represented in this section. |
 | `max_object_bytes` | integer | `16777216` | **Object storage only.** Absolute object ceiling; 1 byte through 64 MiB. |
-| `max_read_bytes` | integer | `16777216` | **Object storage only.** Streaming read ceiling; 1 byte through 64 MiB and no greater than `max_object_bytes`. |
-| `max_write_bytes` | integer | `16777216` | **Object storage only.** Conditional-write ceiling; 1 byte through 64 MiB and no greater than `max_object_bytes`. |
-| `allow_loopback_http` | boolean | `false` | **Object storage only.** Development/Azurite escape hatch. It is accepted only for an `http://localhost` or loopback-IP endpoint and cannot weaken remote TLS. |
+| `max_read_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Streaming read ceiling; 1 byte through 64 MiB and no greater than `max_object_bytes`. An explicit incoherent value is rejected rather than lowered. |
+| `max_write_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Conditional-write ceiling; 1 byte through 64 MiB and no greater than `max_read_bytes`, so this deployment can read every object it acknowledges writing. An explicit incoherent value is rejected rather than lowered. |
+| `allow_loopback_http` | boolean | `false` | **Object storage only.** Insecure development/Azurite escape hatch. It is accepted only for an `http://localhost` or loopback-IP endpoint and cannot weaken remote TLS. Native HTTPS Azurite needs no exception. |
 | `connect_timeout_ms` | integer | `5000` | Bound on establishing a backend connection. `0` is rejected. |
 | `operation_timeout_ms` | integer | `30000` | Bound on one control-plane operation. `0` is rejected. |
 
@@ -171,6 +171,9 @@ This slice validates and retains that contract but does **not** wire it into
 configuration for the target topology, not a claim that blob-backed stateful
 serving is deployable. The checked repository example is
 [`ops/compose/axond.blob-contract.toml`](../ops/compose/axond.blob-contract.toml).
+`axond check preflight` therefore validates its references and syntax but fails
+the serving-posture check explicitly; it never asks this backend for a PostgreSQL
+DSN or reports the configuration contract as deployment readiness.
 
 PostgreSQL compatibility is unchanged: omit `backend`, keep `dsn_env`, and keep
 the existing `[secret_store]` section. Object storage rejects that legacy

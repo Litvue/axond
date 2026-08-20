@@ -372,7 +372,11 @@ fn validate_object_storage_container_url(
             )
         })?
         .collect::<Vec<_>>();
-    let expected_segments = if allow_loopback_http { 1..=2 } else { 1..=1 };
+    // Azurite's native endpoint is `/account/container` over either HTTP or
+    // HTTPS. Segment shape follows the endpoint, not the insecure-transport
+    // exception: OAuth/workload-identity Azurite specifically requires HTTPS
+    // and therefore does not set `allow_loopback_http`.
+    let expected_segments = if loopback { 1..=2 } else { 1..=1 };
     if !expected_segments.contains(&segments.len())
         || segments
             .iter()
@@ -414,10 +418,21 @@ fn reject_env_override_collision(key: &str, name: &str) -> Result<(), ConfigErro
 /// The configuration deliberately has no bearer-token, account-key, client
 /// secret, or SAS variant. Workload identity is resolved by the production
 /// adapter's credential chain and this enum records only that choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectStorageAuthentication {
     WorkloadIdentity,
+}
+
+impl<'de> Deserialize<'de> for ObjectStorageAuthentication {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        match name.as_ref() {
+            "workload-identity" => Ok(Self::WorkloadIdentity),
+            _ => Err(serde::de::Error::custom(
+                "unsupported object-storage authentication; expected `workload-identity`",
+            )),
+        }
+    }
 }
 
 const DEFAULT_OBJECT_STORAGE_BOUND_BYTES: usize = 16 * 1024 * 1024;
@@ -519,6 +534,13 @@ impl<'de> Deserialize<'de> for ControlPlane {
             || raw.max_read_bytes.is_some()
             || raw.max_write_bytes.is_some()
             || raw.allow_loopback_http.is_some();
+        let max_object_bytes = raw
+            .max_object_bytes
+            .unwrap_or_else(default_object_storage_bound_bytes);
+        // An omitted operation bound follows a deliberately lowered absolute
+        // object ceiling. An explicit value is retained so validation can reject
+        // incoherence instead of silently rewriting what the operator supplied.
+        let derived_operation_bound = default_object_storage_bound_bytes().min(max_object_bytes);
         Ok(Self {
             backend: raw.backend,
             dsn_env: raw.dsn_env,
@@ -527,15 +549,9 @@ impl<'de> Deserialize<'de> for ControlPlane {
             environment_id: raw.environment_id,
             container_url: raw.container_url,
             authentication: raw.authentication,
-            max_object_bytes: raw
-                .max_object_bytes
-                .unwrap_or_else(default_object_storage_bound_bytes),
-            max_read_bytes: raw
-                .max_read_bytes
-                .unwrap_or_else(default_object_storage_bound_bytes),
-            max_write_bytes: raw
-                .max_write_bytes
-                .unwrap_or_else(default_object_storage_bound_bytes),
+            max_object_bytes,
+            max_read_bytes: raw.max_read_bytes.unwrap_or(derived_operation_bound),
+            max_write_bytes: raw.max_write_bytes.unwrap_or(derived_operation_bound),
             allow_loopback_http: raw.allow_loopback_http.unwrap_or(false),
             connect_timeout_ms: raw.connect_timeout_ms,
             operation_timeout_ms: raw.operation_timeout_ms,
@@ -3248,12 +3264,12 @@ impl Config {
                         )));
                     }
                 }
-                if control_plane.max_read_bytes > control_plane.max_object_bytes
-                    || control_plane.max_write_bytes > control_plane.max_object_bytes
+                if control_plane.max_write_bytes > control_plane.max_read_bytes
+                    || control_plane.max_read_bytes > control_plane.max_object_bytes
                 {
                     return Err(ConfigError::Invalid(
-                        "`[control_plane] max_read_bytes` and `max_write_bytes` must not exceed \
-                         `max_object_bytes`"
+                        "`[control_plane]` object bounds must satisfy `max_write_bytes <= \
+                         max_read_bytes <= max_object_bytes`"
                             .into(),
                     ));
                 }
@@ -6276,6 +6292,36 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    fn control_plane_discriminator_refusals_never_echo_the_supplied_value() {
+        const SECRET: &str = "bearer-material-that-must-not-render";
+        for (configured, expected) in [
+            (
+                BLOB_STATEFUL.replace(
+                    "backend = \"object-storage\"",
+                    &format!("backend = \"{SECRET}\""),
+                ),
+                "expected `object-storage` or `postgres`",
+            ),
+            (
+                BLOB_STATEFUL.replace(
+                    "authentication = \"workload-identity\"",
+                    &format!("authentication = \"{SECRET}\""),
+                ),
+                "expected `workload-identity`",
+            ),
+        ] {
+            let rendered = Config::from_toml_str(&configured)
+                .expect_err("an unsupported discriminator must fail closed")
+                .to_string();
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(
+                !rendered.contains(SECRET),
+                "config diagnostics disclosed a supplied discriminator: {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn object_storage_requires_credential_free_https_container_urls() {
         for (replacement, expected) in [
             (
@@ -6312,6 +6358,21 @@ dsn_env = "AXOND_REDIS_URL"
 
     #[test]
     fn loopback_http_requires_an_explicit_development_exception() {
+        let https = BLOB_STATEFUL.replace(
+            "https://axondstate.blob.core.windows.net/control-plane",
+            "https://127.0.0.1:10000/devstoreaccount1/control-plane",
+        );
+        Config::from_toml_str(&https)
+            .expect("native account/container Azurite over HTTPS supports workload identity");
+
+        let redundant_exception = https.replace(
+            "authentication = \"workload-identity\"",
+            "authentication = \"workload-identity\"\nallow_loopback_http = true",
+        );
+        let error = Config::from_toml_str(&redundant_exception)
+            .expect_err("the insecure-HTTP exception must not apply to HTTPS");
+        assert!(error.to_string().contains("only valid with an `http://`"));
+
         let loopback = BLOB_STATEFUL.replace(
             "https://axondstate.blob.core.windows.net/control-plane",
             "http://127.0.0.1:10000/devstoreaccount1/control-plane",
@@ -6380,7 +6441,59 @@ dsn_env = "AXOND_REDIS_URL"
             "authentication = \"workload-identity\"\nmax_object_bytes = 1024\nmax_read_bytes = 1025",
         );
         let error = Config::from_toml_str(&incoherent).expect_err("read exceeds object cap");
-        assert!(error.to_string().contains("must not exceed"), "{error}");
+        assert!(error.to_string().contains("must satisfy"), "{error}");
+
+        let unreadable_write = BLOB_STATEFUL.replace(
+            "authentication = \"workload-identity\"",
+            "authentication = \"workload-identity\"\nmax_object_bytes = 1024\nmax_read_bytes = 512\nmax_write_bytes = 513",
+        );
+        let error = Config::from_toml_str(&unreadable_write)
+            .expect_err("a deployment must be able to read every object it writes");
+        assert!(
+            error
+                .to_string()
+                .contains("max_write_bytes <= max_read_bytes <= max_object_bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn omitted_object_operation_bounds_follow_a_lowered_object_ceiling() {
+        let lowered = BLOB_STATEFUL.replace(
+            "authentication = \"workload-identity\"",
+            "authentication = \"workload-identity\"\nmax_object_bytes = 1024",
+        );
+        let control_plane = Config::from_toml_str(&lowered)
+            .expect("omitted operation bounds derive from the object ceiling")
+            .control_plane
+            .expect("control plane");
+        assert_eq!(control_plane.max_object_bytes, 1024);
+        assert_eq!(control_plane.max_read_bytes, 1024);
+        assert_eq!(control_plane.max_write_bytes, 1024);
+
+        for field in ["max_read_bytes", "max_write_bytes"] {
+            let explicit = lowered.replace(
+                "max_object_bytes = 1024",
+                &format!("max_object_bytes = 1024\n{field} = {DEFAULT_OBJECT_STORAGE_BOUND_BYTES}"),
+            );
+            let error = Config::from_toml_str(&explicit)
+                .expect_err("an explicit bound must be validated, not silently lowered");
+            assert!(
+                error.to_string().contains("must satisfy"),
+                "{field}: {error}"
+            );
+        }
+
+        let explicit_coherent = lowered.replace(
+            "max_object_bytes = 1024",
+            "max_object_bytes = 1024\nmax_read_bytes = 768\nmax_write_bytes = 512",
+        );
+        let control_plane = Config::from_toml_str(&explicit_coherent)
+            .expect("explicit coherent operation bounds remain authoritative")
+            .control_plane
+            .expect("control plane");
+        assert_eq!(control_plane.max_read_bytes, 768);
+        assert_eq!(control_plane.max_write_bytes, 512);
     }
 
     #[test]

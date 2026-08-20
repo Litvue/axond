@@ -62,9 +62,10 @@ use crate::desired_state::{
 /// implementation, so adding a store is a reviewable change rather than a
 /// config string that happened to parse.
 ///
-/// [`ControlPlaneBackend::parse`] is the only resolution path: deserialization
-/// delegates to it, so a TOML value and a programmatic lookup accept exactly the
-/// same names and produce exactly the same explanation when they do not.
+/// [`ControlPlaneBackend::parse`] is the only resolution path. Configuration
+/// deserialization delegates to it but deliberately replaces a refusal with a
+/// fixed message: an operator may accidentally put credential material in a
+/// discriminator, and config-load diagnostics are copied into logs and tickets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ControlPlaneBackend {
     /// Preferred ADR 0062 backend: immutable objects plus one CAS-updated head.
@@ -77,7 +78,11 @@ pub enum ControlPlaneBackend {
 impl<'de> serde::Deserialize<'de> for ControlPlaneBackend {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let name = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        Self::parse(&name).map_err(serde::de::Error::custom)
+        Self::parse(&name).map_err(|_| {
+            serde::de::Error::custom(
+                "unsupported control-plane backend; expected `object-storage` or `postgres`",
+            )
+        })
     }
 }
 
@@ -529,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialization_resolves_through_parse() {
+    fn deserialization_resolves_supported_values_without_echoing_refusals() {
         assert_eq!(
             serde_json::from_str::<ControlPlaneBackend>("\"postgres\"").unwrap(),
             ControlPlaneBackend::Postgres
@@ -538,16 +543,23 @@ mod tests {
             serde_json::from_str::<ControlPlaneBackend>("\"object-storage\"").unwrap(),
             ControlPlaneBackend::ObjectStorage
         );
-        // One resolution path, so a configured value is refused with the same
-        // explanation a programmatic lookup gets — including for a near miss.
-        for name in ["redis", "in-memory", "postgresql", "sqlite"] {
+        // The accepted set is still parse's accepted set, but a configured
+        // refusal cannot echo the supplied scalar: it may be a credential an
+        // operator put in the wrong field.
+        for name in [
+            "redis",
+            "in-memory",
+            "postgresql",
+            "sqlite",
+            "super-secret-backend-token",
+        ] {
             let refusal = serde_json::from_str::<ControlPlaneBackend>(&format!("\"{name}\""))
                 .expect_err("only postgres is a durable control plane")
                 .to_string();
-            let expected = ControlPlaneBackend::parse(name).unwrap_err().to_string();
             assert!(
-                refusal.contains(&expected),
-                "`{name}` was refused as `{refusal}` instead of `{expected}`"
+                refusal.contains("expected `object-storage` or `postgres`")
+                    && !refusal.contains(name),
+                "configured discriminator `{name}` was not safely refused: {refusal}"
             );
         }
     }

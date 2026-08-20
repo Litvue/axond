@@ -2,8 +2,9 @@
 #
 # This file is parsed by configuration tests, but is not yet a runnable Compose
 # deployment: object-store publication, convergence, and encrypted-secret
-# runtime wiring remain pending. It intentionally names no PostgreSQL service,
-# DSN, schema, migration switch, account key, access token, or SAS query.
+# runtime wiring remain pending, and `axond check preflight` fails its serving
+# posture until they land. It intentionally names no PostgreSQL service, DSN,
+# schema, migration switch, account key, access token, or SAS query.
 
 mode = "stateful"
 
