@@ -44,6 +44,9 @@ spec:
               app.kubernetes.io/name: axond
       securityContext:
         runAsNonRoot: true
+        # Distroless `:nonroot` uses UID/GID 65532; this lets that process
+        # write the PVC-backed recovery cache on root-owned CSI volumes.
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:

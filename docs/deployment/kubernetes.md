@@ -430,9 +430,11 @@ Its mounted bootstrap selects:
 - no `dsn_env`, `[secret_store]`, catalog Postgres store, or migration Job.
 
 Each ordinal receives one retained `ReadWriteOnce` PVC at `/var/lib/axond`.
-The PVC is only the per-replica authenticated recovery copy; desired-state
-heads, immutable revisions, and resource blobs remain in object storage. Bind
-the dedicated ServiceAccount to an identity limited to the configured
+The Pod security context sets `fsGroup: 65532`, the documented distroless
+`:nonroot` group, so the non-root image can write its recovery cache on
+root-owned CSI volumes. The PVC is only the per-replica authenticated recovery
+copy; desired-state heads, immutable revisions, and resource blobs remain in
+object storage. Bind the dedicated ServiceAccount to an identity limited to the configured
 environment container, and supply `axond-secrets` with only
 `GW_ADMIN_BREAKGLASS` and the canonical padded-base64 32-byte
 `GW_LAST_KNOWN_GOOD_KEY`. Do not put either value in this repository's

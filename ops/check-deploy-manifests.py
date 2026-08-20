@@ -76,6 +76,8 @@ IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
 # deploying whatever bytes a tag happens to point at today.
 SENTINEL_DIGEST = "sha256:" + "0" * 64
 SELECTOR = {"app.kubernetes.io/name": "axond"}
+# gcr.io/distroless/static-debian12:nonroot's documented nonroot UID/GID.
+DISTROLESS_NONROOT_GROUP = 65532
 PRIVATE_RANGES = {"169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 # The Redis release that added `SET … PXAT`, which the revocation write uses and
 # which is therefore what the documented floor has to say.
@@ -1182,6 +1184,15 @@ def check_stateful_blob(documents: list[Document]) -> list[str]:
             f"{label}: the legacy [secret_store] section must not be present in the blob-only overlay"
         )
 
+    pod_security_context = one(documents, "StatefulSet")["spec"][
+        "template"
+    ]["spec"].get("securityContext", {})
+    if pod_security_context.get("fsGroup") != DISTROLESS_NONROOT_GROUP:
+        failures.append(
+            f"{label}: pod securityContext.fsGroup must be the distroless nonroot group "
+            f"{DISTROLESS_NONROOT_GROUP} so the writable PVC is usable by the image"
+        )
+
     rendered = yaml.safe_dump(documents, sort_keys=True).lower()
     for forbidden in ("postgres", "redis", "gw_control_plane_dsn", "gw_secret_store_kek"):
         if forbidden in rendered:
@@ -1576,6 +1587,14 @@ def self_test() -> int:
     expect_failure(
         "the blob-only option deleting a replica cache with the workload",
         check_stateful_blob(blob_deleted_pvc),
+    )
+
+    blob_missing_fs_group = copy.deepcopy(stateful_blob)
+    blob_pod = one(blob_missing_fs_group, "StatefulSet")["spec"]["template"]["spec"]
+    blob_pod["securityContext"].pop("fsGroup", None)
+    expect_failure(
+        "the blob-only option without the distroless nonroot fsGroup",
+        check_stateful_blob(blob_missing_fs_group),
     )
 
     persistent_deployment = copy.deepcopy(stateful_persistent)
