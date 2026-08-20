@@ -171,7 +171,7 @@ mod tests {
             assert!(
                 matches!(
                     NamespaceId::parse(input),
-                    Err(InvalidNamespaceId::Character { .. })
+                    Err(InvalidNamespaceId::Character)
                 ),
                 "`{input}` must not have an alternate URL interpretation"
             );
@@ -179,7 +179,7 @@ mod tests {
         for input in ["-acme", "acme-", "_acme", "acme_"] {
             assert!(matches!(
                 NamespaceId::parse(input),
-                Err(InvalidNamespaceId::Boundary { .. })
+                Err(InvalidNamespaceId::Boundary)
             ));
         }
     }
