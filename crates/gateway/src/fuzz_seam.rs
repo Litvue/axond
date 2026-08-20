@@ -109,6 +109,13 @@ pub enum Rejection {
     Unavailable,
 }
 
+/// A typed refusal from one durable publication-document parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDocumentRejection {
+    pub code: &'static str,
+    pub message: String,
+}
+
 /// The bounded reason behind a seam rejection, so a fuzzed import can be admitted
 /// over a last-known-good catalogue the same way the refresh admits one.
 ///
@@ -171,6 +178,94 @@ pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection> {
         Err(config::ConfigError::Invalid(message)) => Err(Rejection::Invalid(message)),
     }
 }
+
+/// Decode an untrusted object-store environment head through the production
+/// bounded JSON parser.
+pub fn publication_head_document(input: &[u8]) -> Result<(), StoredDocumentRejection> {
+    publication_head_document_with_state(input, "production-us-east", 0, [0; 32])
+}
+
+/// Exercise the public tuple guard with an independently selected environment
+/// and process-observed `(sequence, active_revision)` tuple.
+///
+/// This is an in-memory domain seam. The current runtime does not persist or
+/// restore the tuple through its production last-known-good cache.
+pub fn publication_head_document_with_state(
+    input: &[u8],
+    expected_environment: &str,
+    accepted_sequence: u64,
+    accepted_revision: [u8; 32],
+) -> Result<(), StoredDocumentRejection> {
+    let accepted = (accepted_sequence > 0).then_some((accepted_sequence, accepted_revision));
+    desired_state::publication::fuzz_decode_head(input, expected_environment, accepted)
+        .map_err(|(code, message)| StoredDocumentRejection { code, message })
+}
+
+/// Decode an untrusted immutable revision manifest through the production
+/// deterministic CBOR parser.
+pub fn publication_revision_manifest(input: &[u8]) -> Result<(), StoredDocumentRejection> {
+    publication_revision_manifest_with_expectations(
+        input,
+        "production-us-east",
+        *desired_state::Checksum::of(input).as_bytes(),
+        1,
+        None,
+    )
+}
+
+/// Verify a history manifest against independently selected link expectations.
+pub fn publication_revision_manifest_with_expectations(
+    input: &[u8],
+    expected_environment: &str,
+    expected_digest: [u8; 32],
+    expected_sequence: u64,
+    expected_parent: Option<[u8; 32]>,
+) -> Result<(), StoredDocumentRejection> {
+    desired_state::publication::fuzz_decode_revision_manifest(
+        input,
+        expected_environment,
+        expected_digest,
+        expected_sequence,
+        expected_parent,
+    )
+    .map_err(|(code, message)| StoredDocumentRejection { code, message })
+}
+
+/// Exercise the production active-revision and final-fence helpers without
+/// exposing constructors for either security wrapper.
+#[allow(clippy::too_many_arguments)]
+pub fn publication_active_revision(
+    head: &[u8],
+    manifest: &[u8],
+    current_head: &[u8],
+    expected_environment: &str,
+    expected_digest: [u8; 32],
+    expected_sequence: u64,
+    expected_parent: Option<[u8; 32]>,
+    accepted_sequence: u64,
+    accepted_revision: [u8; 32],
+    observed_version: &str,
+    current_version: &str,
+) -> Result<(), StoredDocumentRejection> {
+    let accepted = (accepted_sequence > 0).then_some((accepted_sequence, accepted_revision));
+    desired_state::publication::fuzz_verify_active_revision(
+        head,
+        manifest,
+        current_head,
+        expected_environment,
+        expected_digest,
+        expected_sequence,
+        expected_parent,
+        accepted,
+        observed_version,
+        current_version,
+    )
+    .map_err(|(code, message)| StoredDocumentRejection { code, message })
+}
+
+pub const PUBLICATION_HEAD_MAX_BYTES: usize = desired_state::publication::MAX_HEAD_DOCUMENT_BYTES;
+pub const PUBLICATION_MANIFEST_MAX_BYTES: usize =
+    desired_state::publication::MAX_REVISION_MANIFEST_BYTES;
 
 /// Parse the `namespaces` filter out of an untrusted `GET
 /// /v1/credentials/status` query string, percent-decoding included.

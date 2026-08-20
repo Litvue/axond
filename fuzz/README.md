@@ -1,9 +1,10 @@
 # Fuzzing Axond
 
-Axond parses four kinds of untrusted input: what an operator's configuration
+Axond parses five kinds of untrusted input: what an operator's configuration
 file says, what a caller puts in a request, what a provider sends back, and what
-an upstream catalogue publishes. This project fuzzes all four, on the parsers
-the process actually runs.
+an upstream catalogue publishes, plus durable publication documents read back
+from object storage. This project fuzzes all five, on the parsers the process
+actually runs.
 
 | Target | What it drives | Why |
 | --- | --- | --- |
@@ -14,6 +15,7 @@ the process actually runs.
 | `provider_stream` | The OpenAI, Foundry, and Anthropic stream decoders — translated and native | They interpret provider JSON mid-relay, where a panic loses a live response |
 | `provider_error` | `ProviderError::from_upstream`, `::transport`, and the classification behind them | An upstream failure body decides whether the gateway retries, fails over, or opens a circuit |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission | A third party publishes it, a background refresh imports it unattended, and what it says about prices and capabilities feeds routing and spend decisions |
+| `publication_parsers` | Signed head tuple guard, history manifest verification, active-revision matching, and final version fence | Object storage is outside the process trust boundary; malformed, unsigned, replayed, equivocated, orphaned, or unauthenticated durable bytes must fail closed without panic, unbounded allocation, or format ambiguity |
 
 The properties each target asserts live in [`src/lib.rs`](./src/lib.rs) and
 [`src/wire.rs`](./src/wire.rs): a parser returns rather than panicking, a
@@ -86,6 +88,40 @@ asserts, it asserts:
   wrapper of the wrong shape still refuses the whole import
   (`drift-limit-type.json`). The corpus carries both so the two cannot quietly
   collapse into one.
+
+The publication target passes arbitrary bytes to both durable parsers and a
+structured probe whose expected digest, sequence, environment, parent, accepted
+head tuple, and observed/current object versions mutate independently. It drives
+the process-local tuple guard and authenticated history wrapper, then invokes the
+same private production helpers used by `read_active_revision` and
+`fence_for_activation` to construct the active and final wrappers. No activation
+comparison or security-wrapper constructor is duplicated in the fuzz seam. The
+target follows their real Ed25519 verification paths, then asserts
+deterministic acceptance or a typed, non-empty refusal. The committed key is
+synthetic verification-only
+material; no matching production credential exists. Valid CBOR is
+committed as lowercase hex behind a `manifest-hex:` prefix because its leading
+bytes are not UTF-8; canonical head JSON uses `head-json:` so the corpus file's
+required line ending is not mistaken for stored content. The shared target body
+decodes those reviewable envelopes before calling the production parsers.
+Inputs without either prefix, including all ordinary coverage-guided mutations,
+are passed through unchanged. The committed `manifest-oversized` sentinel
+expands to exactly one byte beyond the manifest ceiling inside the capped smoke
+harness, because the general 64 KiB derivation is intentionally smaller than
+that format's 1 MiB production bound.
+
+Supplying an accepted head tuple covers only the domain API's in-memory
+export/restore seam. It does not show that the current production last-known-good
+cache persists the tuple, and no cross-restart guarantee is claimed here.
+
+The seed set includes accepted signed v2 fixtures as well as unsigned v2,
+cross-environment, unknown-schema/algorithm, malformed-signature, sequence,
+object-count, digest mismatch, same-sequence equivocation, changed activation
+fence, and signed-orphan refusals. Every committed publication seed is pinned to its exact
+direct outcome in the bounded smoke runner. The signed JSON and CBOR fixtures
+are also asserted as direct golden bytes in publication unit tests. Blob schema
+1 was unsigned and is intentionally an
+unknown-schema refusal; it is not a compatibility path.
 
 Runs are hermetic. The seam the targets call
 ([`crates/gateway/src/fuzz_seam.rs`](../crates/gateway/src/fuzz_seam.rs)) builds

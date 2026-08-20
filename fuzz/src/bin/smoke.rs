@@ -64,6 +64,147 @@ const MINIMUM_RESIGNED_CLASSES: usize = 10;
 /// [`EXPECTED_CATALOG_CLASSES`] pins which ones.
 const MINIMUM_CATALOG_EDIT_CLASSES: usize = 6;
 
+/// Exact direct outcome of every committed publication seed. Derived mutations
+/// remain coverage inputs, while these pins ensure each named security vector
+/// still reaches the refusal or acceptance it documents.
+const EXPECTED_PUBLICATION_SEED_CLASSES: &[(&str, &[&str])] = &[
+    (
+        "cross-environment-head.json",
+        &["head_environment_mismatch", "manifest_malformed"],
+    ),
+    (
+        "digest-mismatch-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_guard_accepted",
+            "manifest_digest_mismatch",
+            "manifest_digest_mismatch",
+        ],
+    ),
+    (
+        "fence-changed-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_guard_accepted",
+            "manifest_verified",
+            "active_head_changed",
+        ],
+    ),
+    (
+        "duplicate-objects-manifest.hex",
+        &["head_malformed", "manifest_non_canonical_objects"],
+    ),
+    (
+        "invalid-signature-head.json",
+        &["head_invalid_signature", "manifest_malformed"],
+    ),
+    (
+        "malformed-head.json",
+        &["head_malformed", "manifest_malformed"],
+    ),
+    (
+        "malformed-manifest.hex",
+        &["head_malformed", "manifest_malformed"],
+    ),
+    (
+        "overflow-sequence-head.json",
+        &["head_malformed", "manifest_malformed"],
+    ),
+    (
+        "oversized-manifest",
+        &["head_oversized", "manifest_oversized"],
+    ),
+    (
+        "same-sequence-equivocation-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_equivocation",
+            "manifest_verified",
+            "head_equivocation",
+        ],
+    ),
+    (
+        "signed-orphan-activation-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_guard_accepted",
+            "manifest_verified",
+            "active_orphan",
+        ],
+    ),
+    (
+        "signed-orphan-manifest.hex",
+        &["head_malformed", "manifest_accepted"],
+    ),
+    (
+        "tampered-signature-manifest.hex",
+        &["head_malformed", "manifest_invalid_signature"],
+    ),
+    (
+        "too-many-objects-manifest.hex",
+        &["head_malformed", "manifest_too_many_objects"],
+    ),
+    (
+        "unknown-algorithm-head.json",
+        &["head_unknown_algorithm", "manifest_malformed"],
+    ),
+    (
+        "unknown-algorithm-manifest.hex",
+        &["head_malformed", "manifest_unknown_algorithm"],
+    ),
+    (
+        "unknown-key-head.json",
+        &["head_unknown_key", "manifest_malformed"],
+    ),
+    (
+        "unknown-schema-head.json",
+        &["head_unknown_schema", "manifest_malformed"],
+    ),
+    (
+        "unknown-schema-manifest.hex",
+        &["head_malformed", "manifest_unknown_schema"],
+    ),
+    (
+        "unknown-signature-schema-head.json",
+        &["head_unknown_signature_schema", "manifest_malformed"],
+    ),
+    (
+        "unknown-signature-schema-manifest.hex",
+        &["head_malformed", "manifest_unknown_signature_schema"],
+    ),
+    (
+        "unsigned-head-v2.json",
+        &["head_unsigned", "manifest_malformed"],
+    ),
+    (
+        "unsigned-manifest.hex",
+        &["head_malformed", "manifest_unsigned"],
+    ),
+    (
+        "valid-active-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_guard_accepted",
+            "manifest_verified",
+            "active_verified",
+        ],
+    ),
+    ("valid-head.json", &["head_accepted", "manifest_malformed"]),
+    (
+        "valid-manifest.hex",
+        &["head_malformed", "manifest_accepted"],
+    ),
+    (
+        "zero-sequence-manifest.hex",
+        &["head_malformed", "manifest_zero_sequence"],
+    ),
+];
+
 #[global_allocator]
 static ALLOCATOR: Capped = Capped;
 
@@ -150,6 +291,11 @@ const TARGETS: &[Target] = &[
     Target {
         name: "catalog_import",
         run: replay_catalog_import,
+        minimum_classes: 6,
+    },
+    Target {
+        name: "publication_parsers",
+        run: replay_publication_parsers,
         minimum_classes: 6,
     },
 ];
@@ -255,6 +401,10 @@ fn replay_config_toml(data: &[u8]) -> Vec<&'static str> {
 
 fn replay_credentials_query(data: &[u8]) -> Vec<&'static str> {
     vec![axond_fuzz::credentials_query(data)]
+}
+
+fn replay_publication_parsers(data: &[u8]) -> Vec<&'static str> {
+    axond_fuzz::publication_parsers(data)
 }
 
 /// The token target takes a structured input, so a seed file is replayed twice:
@@ -748,6 +898,20 @@ fn seeds(target: &str) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+fn assert_publication_seed_outcome(seed: &str, bytes: &[u8]) {
+    let expected = EXPECTED_PUBLICATION_SEED_CLASSES
+        .iter()
+        .find(|(name, _)| *name == seed)
+        .unwrap_or_else(|| panic!("publication seed {seed} has no explicit expected outcome"))
+        .1;
+    let actual = axond_fuzz::publication_parsers(bytes);
+    assert_eq!(
+        actual.as_slice(),
+        expected,
+        "publication seed {seed} no longer reaches its pinned verification outcome"
+    );
+}
+
 /// The fixed derivations of a seed: prefixes, single-byte flips, and one
 /// oversized repetition. All computed from the seed, so nothing here is random.
 fn derivations(seed: &[u8]) -> Vec<(String, Vec<u8>)> {
@@ -797,6 +961,9 @@ fn main() {
         let mut target_inputs = 0_usize;
         let mut classes: BTreeMap<&'static str, usize> = BTreeMap::new();
         for (seed, bytes) in seeds(target.name) {
+            if target.name == "publication_parsers" {
+                assert_publication_seed_outcome(&seed, &bytes);
+            }
             for (label, input) in
                 std::iter::once(("seed".to_owned(), bytes.clone())).chain(derivations(&bytes))
             {
@@ -832,6 +999,17 @@ fn main() {
             classes.len()
         );
     }
+    for (seed, _) in EXPECTED_PUBLICATION_SEED_CLASSES {
+        assert!(
+            seed_directory("publication_parsers").join(seed).is_file(),
+            "publication outcome pin {seed} names no committed seed"
+        );
+    }
+    assert_eq!(
+        seeds("publication_parsers").len(),
+        EXPECTED_PUBLICATION_SEED_CLASSES.len(),
+        "publication seeds and explicit outcome pins must remain one-to-one"
+    );
     // The guard below refuses to skip a pinned seed. Prove it fires before
     // trusting it, the same way `ops/check-docs.py --self-test` does.
     assert_pinning_guard_fires();
