@@ -544,8 +544,12 @@ for the exact selecting head, and activation requires the non-cloneable wrapper
 returned by a final unchanged-head validation. Signed orphan manifests, crash
 uploads, losing CAS bodies, and failed-condition payloads therefore remain
 unreachable even if an intermediary retains and later replays their bytes. The
-last-known-good record persists both sequence and active digest; sequence alone
-would not detect equivocation. Publication trust is bounded to 64 keys.
+domain guard exports both sequence and active digest because sequence alone
+would not detect equivocation, but this slice retains that tuple only in memory
+and does not modify or claim integration with the production last-known-good
+cache. Cross-restart rollback/equivocation resistance remains unqualified until
+the authenticated blob LKG runtime slice persists and restores the bound tuple.
+Publication trust is bounded to 64 keys.
 
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),

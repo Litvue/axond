@@ -222,14 +222,18 @@ fence is read again and consumed as a non-cloneable `ActivationReadyRevision`.
 Neither an orphaned immutable manifest nor a signed body retained from a failed
 conditional request can manufacture either active wrapper.
 
-The per-environment guard retains `(sequence, active_revision)`, not sequence
-alone. A valid older head or an absent head below that state is rollback; a
-different digest at the same sequence is typed equivocation. The complete tuple
-must be persisted beside the last-known-good record for rollback and
-equivocation resistance across restart. A successful native conditional write
-is authoritative commit evidence: it still returns truthful success if another
-writer has already advanced the shared guard to a newer sequence, while a
-same-sequence digest contradiction remains an error.
+The per-process, per-environment guard retains `(sequence, active_revision)`,
+not sequence alone. A valid older head or an absent head below that state is
+rollback; a different digest at the same sequence is typed equivocation. This
+protocol slice can export the tuple and initialize another in-memory guard, but
+it does not connect that seam to the existing production last-known-good cache.
+It therefore makes no cross-restart rollback or equivocation-resistance claim.
+The later authenticated blob LKG runtime slice must bind, persist, and restore
+the complete tuple beside its authenticated snapshot before that claim becomes
+valid; the legacy LKG format is unchanged here. A successful native conditional
+write is authoritative commit evidence: it still returns truthful success if
+another writer has already advanced the shared guard to a newer sequence, while
+a same-sequence digest contradiction remains an error.
 
 ### Publication is immutable upload followed by one CAS
 
@@ -314,9 +318,12 @@ swaps the compiled snapshot. Requests capture one namespace view from that
 snapshot for their whole lifetime.
 
 Warm replicas keep serving during an object-store outage. Administration and
-convergence pause. A cold replica may restore an authenticated local
-last-known-good snapshot; without either object storage or a valid local cache
-it remains healthy-but-unready and serves no inference.
+convergence pause. The target runtime allows a cold replica to restore an
+authenticated local last-known-good snapshot; without either object storage or
+a valid local cache it remains healthy-but-unready and serves no inference. This
+publication protocol slice does not yet wire its head tuple into that cache, so
+the cold-start path and cross-restart tuple guarantees remain work for the
+authenticated blob LKG runtime slice.
 
 The optional local cache is a recovery copy, never the desired-state authority.
 It is not an additional external service and may use a VM disk or per-replica

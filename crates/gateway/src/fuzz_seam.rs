@@ -186,7 +186,10 @@ pub fn publication_head_document(input: &[u8]) -> Result<(), StoredDocumentRejec
 }
 
 /// Exercise the public tuple guard with an independently selected environment
-/// and last-known-good `(sequence, active_revision)` observation.
+/// and process-observed `(sequence, active_revision)` tuple.
+///
+/// This is an in-memory domain seam. The current runtime does not persist or
+/// restore the tuple through its production last-known-good cache.
 pub fn publication_head_document_with_state(
     input: &[u8],
     expected_environment: &str,
@@ -228,7 +231,8 @@ pub fn publication_revision_manifest_with_expectations(
     .map_err(|(code, message)| StoredDocumentRejection { code, message })
 }
 
-/// Exercise active-revision construction and its final unchanged-head fence.
+/// Exercise the production active-revision and final-fence helpers without
+/// exposing constructors for either security wrapper.
 #[allow(clippy::too_many_arguments)]
 pub fn publication_active_revision(
     head: &[u8],

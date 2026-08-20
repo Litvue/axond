@@ -83,6 +83,16 @@ const EXPECTED_PUBLICATION_SEED_CLASSES: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "fence-changed-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_guard_accepted",
+            "manifest_verified",
+            "active_head_changed",
+        ],
+    ),
+    (
         "duplicate-objects-manifest.hex",
         &["head_malformed", "manifest_non_canonical_objects"],
     ),

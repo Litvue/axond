@@ -157,18 +157,22 @@ administrative publisher must prove its selected Ed25519 signer is present in
 that bounded trust set before it can write. `VerifiedRevisionManifest` is only
 authenticated history evidence. Convergence hydrates a `VerifiedActiveRevision`
 selected by the current strongly read head and activates only after consuming a
-final unchanged-version fence. It persists the highest authenticated
-`(sequence, active_revision)` tuple beside last-known-good state and refuses a
-signed older or missing head as rollback and a different digest at the same
-sequence as equivocation. Unsigned blob v2 and
+final unchanged-version fence. The domain API exports and restores the highest
+authenticated `(sequence, active_revision)` tuple between in-memory guard
+instances, refusing a signed older or missing head as rollback and a different
+digest at the same sequence as equivocation. This is not production LKG runtime
+integration: the existing cache is untouched, and no cross-restart protection
+is claimed until the authenticated blob LKG slice persists and restores the
+tuple with its snapshot. Unsigned blob v2 and
 the unsigned schema-1 prototype are not migration inputs. PostgreSQL export
 must create newly signed blob-v2 documents while leaving the PostgreSQL journal
 format unchanged.
 
-Replica convergence conditionally reads the head, verifies all immutable
-objects, compiles a snapshot, and swaps it atomically. Warm serving continues
-during storage loss. Cold start succeeds from object storage or an authenticated
-local last-known-good cache and otherwise remains unready.
+The target replica convergence conditionally reads the head, verifies all
+immutable objects, compiles a snapshot, and swaps it atomically. Warm serving
+continues during storage loss. Cold start from an authenticated blob-backed
+last-known-good cache is a later runtime slice; this protocol change alone does
+not enable it and otherwise remains unready without object storage.
 
 Rollback always publishes a new monotonic revision containing earlier resource
 content. It never rewinds or edits the head's history.

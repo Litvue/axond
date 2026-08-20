@@ -255,8 +255,8 @@ pub enum HeadDocumentError {
     Equivocation { sequence: u64 },
     #[error("the environment head is absent below the accepted sequence floor {minimum}")]
     MissingBelowFloor { minimum: u64 },
-    #[error("the persisted publication-head state belongs to a different environment")]
-    PersistedStateEnvironmentMismatch,
+    #[error("the supplied observed publication-head state belongs to a different environment")]
+    ObservedStateEnvironmentMismatch,
     #[error("head JSON is not in its deterministic encoding")]
     NonCanonical,
 }
@@ -473,10 +473,15 @@ fn append_length_prefixed(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(value);
 }
 
-/// Persistable last-known-good identity of one authenticated environment head.
+/// Exportable in-memory identity of one authenticated environment head.
 ///
 /// Sequence alone is insufficient: retaining the digest makes a signed second
 /// head at the same sequence a typed equivocation rather than an accepted replay.
+/// This domain value is not wired to the production last-known-good cache in
+/// this protocol slice. Exporting it and supplying it to a new guard proves only
+/// the future runtime integration seam; it does not provide cross-restart
+/// rollback or equivocation resistance until an authenticated blob-cache slice
+/// durably persists and restores it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationHeadState {
     environment: EnvironmentId,
@@ -519,6 +524,8 @@ impl PublicationHeadState {
 /// fail closed. A successful conditional write is different evidence. Its
 /// success remains truthful if another writer has already advanced the shared
 /// guard, but it still cannot contradict the accepted digest at its own sequence.
+/// The guard has no durable backing in this slice; clones share process memory
+/// only.
 #[derive(Debug, Clone)]
 pub struct PublicationSequenceGuard {
     environment: EnvironmentId,
@@ -539,12 +546,17 @@ impl PublicationSequenceGuard {
         }
     }
 
-    pub fn from_last_known_good(
+    /// Build an in-memory guard from state supplied by a trusted caller.
+    ///
+    /// No production cache supplies this value yet. A future runtime must bind
+    /// it to the authenticated blob last-known-good record before using this
+    /// seam across process restart.
+    pub fn from_observed_state(
         environment: EnvironmentId,
         state: PublicationHeadState,
     ) -> Result<Self, HeadDocumentError> {
         if state.environment != environment {
-            return Err(HeadDocumentError::PersistedStateEnvironmentMismatch);
+            return Err(HeadDocumentError::ObservedStateEnvironmentMismatch);
         }
         Ok(Self {
             environment,
@@ -556,15 +568,20 @@ impl PublicationSequenceGuard {
         &self.environment
     }
 
-    pub fn last_known_good(&self) -> Option<PublicationHeadState> {
+    /// Export the highest tuple observed by this in-memory guard.
+    ///
+    /// The caller receives a domain value only; this method performs no durable
+    /// write and is not connected to the legacy production LKG cache.
+    pub fn observed_state(&self) -> Option<PublicationHeadState> {
         self.accepted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
+    /// Return this in-memory guard's current sequence floor.
     pub fn minimum_sequence(&self) -> u64 {
-        self.last_known_good().map_or(0, |state| state.sequence)
+        self.observed_state().map_or(0, |state| state.sequence)
     }
 
     pub fn verify_head(
@@ -637,10 +654,10 @@ impl PublicationSequenceGuard {
     }
 
     /// Verify that an absent head is compatible with the sequence floor.
-    /// Absence is valid only before this process or its persisted recovery state
-    /// has authenticated any publication for the environment.
+    /// Absence is valid only before this in-memory guard has authenticated any
+    /// publication or was explicitly initialized from trusted observed state.
     pub fn verify_absent(&self) -> Result<(), HeadDocumentError> {
-        match self.last_known_good() {
+        match self.observed_state() {
             None => Ok(()),
             Some(accepted) => Err(HeadDocumentError::MissingBelowFloor {
                 minimum: accepted.sequence,
@@ -1400,6 +1417,10 @@ pub enum BlobPublicationError {
     HistoryLimitExceeded { limit: usize },
     #[error("environment head sequence is exhausted")]
     SequenceOverflow,
+    #[error(
+        "the authenticated manifest is not the exact revision selected by the environment head"
+    )]
+    ActiveManifestMismatch,
     #[error("the active revision changed while it was being fenced for activation")]
     ActiveHeadChanged,
 }
@@ -1421,6 +1442,79 @@ struct ReadHead {
     document: HeadDocument,
     version: ObjectVersion,
     body_digest: Checksum,
+}
+
+fn authenticate_read_head(
+    bytes: &[u8],
+    version: ObjectVersion,
+    guard: &PublicationSequenceGuard,
+    trust: &PublicationTrustStore,
+) -> Result<ReadHead, HeadDocumentError> {
+    Ok(ReadHead {
+        document: guard.verify_head(bytes, trust)?,
+        version,
+        body_digest: Checksum::of(bytes),
+    })
+}
+
+/// Establish that an authenticated manifest is the exact revision selected by
+/// an unchanged, strongly read environment head.
+///
+/// This is the single production implementation used by both
+/// [`BlobPublication::read_active_revision`] and the fuzz seam. Keeping wrapper
+/// construction here prevents tests or fuzzing from drifting into a weaker
+/// activation contract.
+fn verify_active_revision_snapshot(
+    first_head: ReadHead,
+    manifest_revision: Checksum,
+    manifest: VerifiedRevisionManifest,
+    fenced_head: Option<ReadHead>,
+) -> Result<VerifiedActiveRevision, BlobPublicationError> {
+    if first_head.document.active_revision != manifest_revision
+        || first_head.document.sequence != manifest.sequence()
+        || first_head.document.environment() != manifest.environment()
+    {
+        return Err(BlobPublicationError::ActiveManifestMismatch);
+    }
+    let Some(fenced_head) = fenced_head else {
+        return Err(BlobPublicationError::ActiveHeadChanged);
+    };
+    if fenced_head.version != first_head.version
+        || fenced_head.body_digest != first_head.body_digest
+        || fenced_head.document.environment() != manifest.environment()
+        || fenced_head.document.active_revision != manifest_revision
+        || fenced_head.document.sequence != manifest.sequence()
+    {
+        return Err(BlobPublicationError::ActiveHeadChanged);
+    }
+    Ok(VerifiedActiveRevision {
+        manifest,
+        revision: manifest_revision,
+        observed_head_version: fenced_head.version,
+        observed_head_digest: fenced_head.body_digest,
+    })
+}
+
+/// Reify the final unchanged-head fence immediately before local activation.
+///
+/// This is the only constructor for [`ActivationReadyRevision`] and is shared
+/// by the production async method and its fuzz seam.
+fn verify_activation_snapshot(
+    active: VerifiedActiveRevision,
+    current: Option<ReadHead>,
+) -> Result<ActivationReadyRevision, BlobPublicationError> {
+    let Some(current) = current else {
+        return Err(BlobPublicationError::ActiveHeadChanged);
+    };
+    if current.version != active.observed_head_version
+        || current.body_digest != active.observed_head_digest
+        || current.document.environment() != active.environment()
+        || current.document.active_revision != active.revision
+        || current.document.sequence != active.sequence()
+    {
+        return Err(BlobPublicationError::ActiveHeadChanged);
+    }
+    Ok(ActivationReadyRevision(active))
 }
 
 /// Provider-neutral immutable publisher over an [`ObjectStore`].
@@ -1453,16 +1547,18 @@ impl<S: ObjectStore> BlobPublication<S> {
         history_limit: IdempotencyHistoryLimit,
         signer: Arc<PublicationSigner>,
         trust: PublicationTrustStore,
-        last_known_good: Option<PublicationHeadState>,
+        initial_observed_state: Option<PublicationHeadState>,
     ) -> Result<Self, BlobPublicationError> {
         // Refuse a publisher whose active signer is absent from bootstrap
         // trust. This prevents successful writes that no replica can verify.
         let challenge = b"axond.publication.bootstrap-trust.v1\0";
         let signature = signer.sign(challenge);
         trust.verify(&signature, challenge)?;
-        let sequence_guard = match last_known_good {
+        // `initial_observed_state` is a domain integration seam only. This
+        // protocol slice has no production runtime that persists or restores it.
+        let sequence_guard = match initial_observed_state {
             Some(state) => {
-                PublicationSequenceGuard::from_last_known_good(environment.clone(), state)?
+                PublicationSequenceGuard::from_observed_state(environment.clone(), state)?
             }
             None => PublicationSequenceGuard::new(environment.clone()),
         };
@@ -1484,8 +1580,13 @@ impl<S: ObjectStore> BlobPublication<S> {
         self.history_limit
     }
 
-    pub fn last_known_good_head(&self) -> Option<PublicationHeadState> {
-        self.sequence_guard.last_known_good()
+    /// Export the tuple retained by this process's publication guard.
+    ///
+    /// This performs no durable write and is not integrated with the production
+    /// last-known-good cache. Cross-restart protection is intentionally not
+    /// claimed by this protocol slice.
+    pub fn observed_head_state(&self) -> Option<PublicationHeadState> {
+        self.sequence_guard.observed_state()
     }
 
     /// Read, authenticate, and fence the current head and its exact manifest.
@@ -1499,29 +1600,13 @@ impl<S: ObjectStore> BlobPublication<S> {
         let Some(first_head) = self.read_head().await? else {
             return Ok(None);
         };
+        let manifest_revision = first_head.document.active_revision;
         let manifest = self
-            .read_manifest(
-                first_head.document.active_revision,
-                first_head.document.sequence,
-            )
+            .read_manifest(manifest_revision, first_head.document.sequence)
             .await?;
-        let Some(fenced_head) = self.read_head().await? else {
-            return Err(BlobPublicationError::ActiveHeadChanged);
-        };
-        if fenced_head.version != first_head.version
-            || fenced_head.body_digest != first_head.body_digest
-            || &fenced_head.document.environment != manifest.environment()
-            || fenced_head.document.active_revision != first_head.document.active_revision
-            || fenced_head.document.sequence != first_head.document.sequence
-        {
-            return Err(BlobPublicationError::ActiveHeadChanged);
-        }
-        Ok(Some(VerifiedActiveRevision {
-            revision: fenced_head.document.active_revision,
-            observed_head_version: fenced_head.version,
-            observed_head_digest: fenced_head.body_digest,
-            manifest,
-        }))
+        let fenced_head = self.read_head().await?;
+        verify_active_revision_snapshot(first_head, manifest_revision, manifest, fenced_head)
+            .map(Some)
     }
 
     /// Consume a hydrated active revision and re-read its exact head fence at
@@ -1531,18 +1616,8 @@ impl<S: ObjectStore> BlobPublication<S> {
         &self,
         active: VerifiedActiveRevision,
     ) -> Result<ActivationReadyRevision, BlobPublicationError> {
-        let Some(current) = self.read_head().await? else {
-            return Err(BlobPublicationError::ActiveHeadChanged);
-        };
-        if current.version != active.observed_head_version
-            || current.body_digest != active.observed_head_digest
-            || &current.document.environment != active.environment()
-            || current.document.active_revision != active.revision
-            || current.document.sequence != active.sequence()
-        {
-            return Err(BlobPublicationError::ActiveHeadChanged);
-        }
-        Ok(ActivationReadyRevision(active))
+        let current = self.read_head().await?;
+        verify_activation_snapshot(active, current)
     }
 
     /// Report whether the complete retained history fits inside the configured
@@ -1705,11 +1780,14 @@ impl<S: ObjectStore> BlobPublication<S> {
             .get(&environment_head_key(&self.environment))
             .await
         {
-            Ok(value) => Ok(Some(ReadHead {
-                body_digest: Checksum::of(&value.bytes),
-                document: self.sequence_guard.verify_head(&value.bytes, &self.trust)?,
-                version: value.version,
-            })),
+            Ok(value) => authenticate_read_head(
+                &value.bytes,
+                value.version,
+                &self.sequence_guard,
+                &self.trust,
+            )
+            .map(Some)
+            .map_err(Into::into),
             Err(error) if error.kind() == ObjectStoreErrorKind::NotFound => {
                 self.sequence_guard.verify_absent()?;
                 Ok(None)
@@ -1940,9 +2018,7 @@ fn fuzz_head_error(error: HeadDocumentError) -> (&'static str, String) {
         HeadDocumentError::Rollback { .. } => "head_rollback",
         HeadDocumentError::Equivocation { .. } => "head_equivocation",
         HeadDocumentError::MissingBelowFloor { .. } => "head_missing_below_floor",
-        HeadDocumentError::PersistedStateEnvironmentMismatch => {
-            "head_persisted_environment_mismatch"
-        }
+        HeadDocumentError::ObservedStateEnvironmentMismatch => "head_observed_environment_mismatch",
         HeadDocumentError::NonCanonical => "head_non_canonical",
     };
     (code, error.to_string())
@@ -1998,14 +2074,14 @@ pub(crate) fn fuzz_decode_head(
     })?;
     let guard = match accepted {
         Some((sequence, revision)) if sequence > 0 => {
-            PublicationSequenceGuard::from_last_known_good(
+            PublicationSequenceGuard::from_observed_state(
                 environment.clone(),
                 PublicationHeadState::new(
                     environment.clone(),
                     sequence,
                     Checksum::from_bytes(revision),
                 )
-                .expect("a non-zero fuzz sequence forms persisted state"),
+                .expect("a non-zero fuzz sequence forms observed state"),
             )
             .expect("the fuzz state uses the expected environment")
         }
@@ -2070,22 +2146,33 @@ pub(crate) fn fuzz_verify_active_revision(
     })?;
     let guard = match accepted {
         Some((sequence, revision)) if sequence > 0 => {
-            PublicationSequenceGuard::from_last_known_good(
+            PublicationSequenceGuard::from_observed_state(
                 environment.clone(),
                 PublicationHeadState::new(
                     environment.clone(),
                     sequence,
                     Checksum::from_bytes(revision),
                 )
-                .expect("a non-zero fuzz sequence forms persisted state"),
+                .expect("a non-zero fuzz sequence forms observed state"),
             )
             .expect("the fuzz state uses the expected environment")
         }
         _ => PublicationSequenceGuard::new(environment.clone()),
     };
-    let head = guard
-        .verify_head(head_bytes, &fuzz_trust())
-        .map_err(fuzz_head_error)?;
+    let observed_head_version =
+        ObjectVersion::opaque(observed_version.to_owned()).map_err(|_| {
+            (
+                "active_invalid_observed_version",
+                "observed head version is invalid".to_owned(),
+            )
+        })?;
+    let first_head = authenticate_read_head(
+        head_bytes,
+        observed_head_version.clone(),
+        &guard,
+        &fuzz_trust(),
+    )
+    .map_err(fuzz_head_error)?;
     let manifest = VerifiedRevisionManifest::verify(
         manifest_bytes,
         &environment,
@@ -2100,49 +2187,51 @@ pub(crate) fn fuzz_verify_active_revision(
             "active revision parent does not match the independently expected link".to_owned(),
         ));
     }
-    if head.active_revision() != Checksum::from_bytes(expected_digest)
-        || head.sequence() != expected_sequence
-        || head.environment() != manifest.environment()
-    {
-        return Err((
+    // Model the unchanged strong reread performed by `read_active_revision`.
+    // Wrapper construction and all head/manifest comparisons stay in the
+    // production helper used by that method.
+    let fenced_head =
+        authenticate_read_head(head_bytes, observed_head_version, &guard, &fuzz_trust())
+            .map_err(fuzz_head_error)?;
+    let active = verify_active_revision_snapshot(
+        first_head,
+        Checksum::from_bytes(expected_digest),
+        manifest,
+        Some(fenced_head),
+    )
+    .map_err(|error| match error {
+        BlobPublicationError::ActiveManifestMismatch => (
             "active_orphan",
             "authenticated manifest is not the exact revision selected by the head".to_owned(),
-        ));
-    }
-    let observed_head_version =
-        ObjectVersion::opaque(observed_version.to_owned()).map_err(|_| {
-            (
-                "active_invalid_observed_version",
-                "observed head version is invalid".to_owned(),
-            )
-        })?;
-    let active = VerifiedActiveRevision {
-        manifest,
-        revision: head.active_revision(),
-        observed_head_version,
-        observed_head_digest: Checksum::of(head_bytes),
-    };
-    let current = guard
-        .verify_head(current_head_bytes, &fuzz_trust())
-        .map_err(fuzz_head_error)?;
+        ),
+        BlobPublicationError::ActiveHeadChanged => (
+            "active_head_changed",
+            "active head changed while its manifest was loaded".to_owned(),
+        ),
+        _ => (
+            "active_verification_failed",
+            "active revision verification failed closed".to_owned(),
+        ),
+    })?;
     let current_version = ObjectVersion::opaque(current_version.to_owned()).map_err(|_| {
         (
             "active_invalid_current_version",
             "current head version is invalid".to_owned(),
         )
     })?;
-    if current_version != active.observed_head_version
-        || Checksum::of(current_head_bytes) != active.observed_head_digest
-        || current.active_revision() != active.revision()
-        || current.sequence() != active.sequence()
-        || current.environment() != active.environment()
-    {
-        return Err((
+    let current =
+        authenticate_read_head(current_head_bytes, current_version, &guard, &fuzz_trust())
+            .map_err(fuzz_head_error)?;
+    let ready = verify_activation_snapshot(active, Some(current)).map_err(|error| match error {
+        BlobPublicationError::ActiveHeadChanged => (
             "active_head_changed",
             "active head changed before activation".to_owned(),
-        ));
-    }
-    let ready = ActivationReadyRevision(active);
+        ),
+        _ => (
+            "active_verification_failed",
+            "active revision verification failed closed".to_owned(),
+        ),
+    })?;
     let _ = ready.active_revision().objects().count();
     Ok(())
 }
@@ -2704,13 +2793,16 @@ mod tests {
             guard.verify_head(&equivocated, &trust()),
             Err(HeadDocumentError::Equivocation { sequence: 7 })
         );
-        let persisted = guard
-            .last_known_good()
-            .expect("accepted tuple is persistable with last-known-good state");
-        assert_eq!(persisted.sequence(), 7);
-        assert_eq!(persisted.active_revision(), head.active_revision());
-        let restored = PublicationSequenceGuard::from_last_known_good(environment(), persisted)
-            .expect("matching persisted environment");
+        // This export/import crosses only two in-memory guard instances. It is
+        // an integration seam for a later authenticated blob LKG runtime slice,
+        // not evidence that today's production cache persists the tuple.
+        let observed = guard
+            .observed_state()
+            .expect("accepted tuple is exportable in memory");
+        assert_eq!(observed.sequence(), 7);
+        assert_eq!(observed.active_revision(), head.active_revision());
+        let restored = PublicationSequenceGuard::from_observed_state(environment(), observed)
+            .expect("matching observed environment");
         assert_eq!(
             restored.verify_head(&equivocated, &trust()),
             Err(HeadDocumentError::Equivocation { sequence: 7 })
@@ -2730,11 +2822,11 @@ mod tests {
             Err(HeadDocumentError::MissingBelowFloor { minimum: 7 })
         );
         assert!(matches!(
-            PublicationSequenceGuard::from_last_known_good(
+            PublicationSequenceGuard::from_observed_state(
                 EnvironmentId::parse("staging-us-east").expect("other environment"),
-                restored.last_known_good().expect("restored state"),
+                restored.observed_state().expect("in-memory restored state"),
             ),
-            Err(HeadDocumentError::PersistedStateEnvironmentMismatch)
+            Err(HeadDocumentError::ObservedStateEnvironmentMismatch)
         ));
     }
 
@@ -3288,12 +3380,12 @@ mod tests {
         assert_eq!(losing_head.sequence(), winner.sequence());
         assert_ne!(losing_head.active_revision(), winner.active_revision());
 
-        let persisted = publication
-            .last_known_good_head()
-            .expect("winner tuple is retained for last-known-good recovery");
-        assert_eq!(persisted.active_revision(), winner.active_revision());
-        let replay_guard = PublicationSequenceGuard::from_last_known_good(environment(), persisted)
-            .expect("persisted winner state");
+        let observed = publication
+            .observed_head_state()
+            .expect("winner tuple is retained by the in-memory guard");
+        assert_eq!(observed.active_revision(), winner.active_revision());
+        let replay_guard = PublicationSequenceGuard::from_observed_state(environment(), observed)
+            .expect("matching in-memory winner state");
         assert_eq!(
             replay_guard.verify_head(losing, &trust()),
             Err(HeadDocumentError::Equivocation {
@@ -3381,8 +3473,8 @@ mod tests {
         assert_eq!(second.sequence, 2);
         assert_eq!(second.revision, committed_second.active_revision());
         let accepted = publication
-            .last_known_good_head()
-            .expect("newest tuple remains accepted");
+            .observed_head_state()
+            .expect("newest tuple remains accepted in memory");
         assert_eq!(accepted.sequence(), 3);
         assert_eq!(accepted.active_revision(), third.revision);
     }

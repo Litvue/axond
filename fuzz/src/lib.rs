@@ -226,13 +226,19 @@ fn committed_publication_probe(data: &[u8]) -> Option<OwnedPublicationProbe> {
         decode_lower_hex(b"8186ec1d7c710b53f58b647abd6dbf8b39c22dc89af8ca729b9a47a8254ebb6b")?
             .try_into()
             .ok()?;
-    let (expected_digest, accepted_sequence, accepted_revision, manifest) = match scenario {
-        b"valid-active" => (valid_digest, 0, [0; 32], valid_manifest),
-        b"same-sequence-equivocation" => (valid_digest, 1, orphan_digest, valid_manifest),
-        b"signed-orphan-activation" => (orphan_digest, 0, [0; 32], orphan_manifest),
-        b"digest-mismatch" => ([0; 32], 0, [0; 32], valid_manifest),
-        _ => return None,
-    };
+    let (expected_digest, accepted_sequence, accepted_revision, manifest, current_version) =
+        match scenario {
+            b"valid-active" => (valid_digest, 0, [0; 32], valid_manifest, "version-1"),
+            b"fence-changed" => (valid_digest, 0, [0; 32], valid_manifest, "version-2"),
+            b"same-sequence-equivocation" => {
+                (valid_digest, 1, orphan_digest, valid_manifest, "version-1")
+            }
+            b"signed-orphan-activation" => {
+                (orphan_digest, 0, [0; 32], orphan_manifest, "version-1")
+            }
+            b"digest-mismatch" => ([0; 32], 0, [0; 32], valid_manifest, "version-1"),
+            _ => return None,
+        };
     Some(OwnedPublicationProbe {
         expected_environment: "production-us-east".to_owned(),
         expected_digest,
@@ -241,7 +247,7 @@ fn committed_publication_probe(data: &[u8]) -> Option<OwnedPublicationProbe> {
         accepted_sequence,
         accepted_revision,
         observed_version: "version-1".to_owned(),
-        current_version: "version-1".to_owned(),
+        current_version: current_version.to_owned(),
         current_head: head.clone(),
         head,
         manifest,

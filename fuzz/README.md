@@ -92,8 +92,11 @@ asserts, it asserts:
 The publication target passes arbitrary bytes to both durable parsers and a
 structured probe whose expected digest, sequence, environment, parent, accepted
 head tuple, and observed/current object versions mutate independently. It drives
-the public tuple guard, authenticated history wrapper, active wrapper, and final
-activation fence through their real Ed25519 verification paths, then asserts
+the process-local tuple guard and authenticated history wrapper, then invokes the
+same private production helpers used by `read_active_revision` and
+`fence_for_activation` to construct the active and final wrappers. No activation
+comparison or security-wrapper constructor is duplicated in the fuzz seam. The
+target follows their real Ed25519 verification paths, then asserts
 deterministic acceptance or a typed, non-empty refusal. The committed key is
 synthetic verification-only
 material; no matching production credential exists. Valid CBOR is
@@ -107,10 +110,14 @@ expands to exactly one byte beyond the manifest ceiling inside the capped smoke
 harness, because the general 64 KiB derivation is intentionally smaller than
 that format's 1 MiB production bound.
 
+Supplying an accepted head tuple covers only the domain API's in-memory
+export/restore seam. It does not show that the current production last-known-good
+cache persists the tuple, and no cross-restart guarantee is claimed here.
+
 The seed set includes accepted signed v2 fixtures as well as unsigned v2,
 cross-environment, unknown-schema/algorithm, malformed-signature, sequence,
-object-count, digest mismatch, same-sequence equivocation, and signed-orphan
-activation refusals. Every committed publication seed is pinned to its exact
+object-count, digest mismatch, same-sequence equivocation, changed activation
+fence, and signed-orphan refusals. Every committed publication seed is pinned to its exact
 direct outcome in the bounded smoke runner. The signed JSON and CBOR fixtures
 are also asserted as direct golden bytes in publication unit tests. Blob schema
 1 was unsigned and is intentionally an
