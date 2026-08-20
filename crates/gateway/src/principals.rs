@@ -123,6 +123,7 @@ pub struct InboundKey {
     pub max_request_microdollars: Option<u64>,
     pub can_mint: bool,
     pub jti: Option<String>,
+    pub namespace_grant: Option<NamespaceGrant>,
 }
 
 impl InboundKey {
@@ -132,7 +133,10 @@ impl InboundKey {
     /// legacy config storage independent from ADR 0062's public URL contract;
     /// malformed legacy names fail closed when used on a canonical route.
     pub fn namespace_grant(&self) -> Result<NamespaceGrant, InvalidNamespaceId> {
-        NamespaceId::parse(&self.namespace).map(NamespaceGrant::one)
+        self.namespace_grant.clone().map_or_else(
+            || NamespaceId::parse(&self.namespace).map(NamespaceGrant::one),
+            Ok,
+        )
     }
 
     /// Whether this principal holds the operator's own authority over the whole
@@ -718,7 +722,7 @@ impl PrincipalStore for TokenVerifier {
             ));
         }
         Ok(Some(InboundKey {
-            namespace,
+            namespace: namespace.clone(),
             subject,
             authority: PrincipalAuthority::MintedToken,
             signer_kid: Some(verifier.kid.clone()),
@@ -728,6 +732,13 @@ impl PrincipalStore for TokenVerifier {
             // Token claims can never confer the ability to mint another token.
             can_mint: false,
             jti: claims.jti,
+            namespace_grant: Some(NamespaceGrant::one(
+                NamespaceId::parse(&namespace).map_err(|_| {
+                    PrincipalStoreError::Forbidden(TokenVerificationError::UnknownNamespace {
+                        namespace,
+                    })
+                })?,
+            )),
         }))
     }
 }
@@ -789,6 +800,7 @@ impl ProjectedPrincipals {
                     max_request_microdollars: None,
                     can_mint: false,
                     jti: None,
+                    namespace_grant: principal.grant,
                 },
             })
             .collect::<Vec<_>>()
@@ -1053,6 +1065,7 @@ mod tests {
                 max_request_microdollars: None,
                 can_mint: false,
                 jti: None,
+                namespace_grant: None,
             },
         }]))
     }

@@ -70,6 +70,7 @@ pub mod backoff;
 pub mod compile;
 pub mod credentials;
 pub mod lkg;
+pub mod namespaces;
 pub mod policy;
 pub mod pricing;
 pub mod principals;
@@ -94,6 +95,8 @@ pub use compile::{
 pub use credentials::{CredentialProjection, RuntimeProjection};
 #[allow(unused_imports)]
 pub use lkg::{LastKnownGood, LastKnownGoodError};
+#[allow(unused_imports)]
+pub use namespaces::FlatNamespaceProjection;
 #[allow(unused_imports)]
 pub use policy::PolicyProjection;
 #[allow(unused_imports)]

@@ -365,10 +365,20 @@ impl MiddlewarePlan {
         let mut by_namespace = BTreeMap::new();
         let mut guardrail_key_fingerprints = BTreeMap::new();
         for namespace in &config.namespace {
-            let Some(policy) = &namespace.policy else {
+            let registrations = namespace
+                .policy
+                .as_ref()
+                .map(|policy| policy.body.content_middleware())
+                .or_else(|| {
+                    config
+                        .flat_namespace_policy
+                        .get(&namespace.id)
+                        .map(|policy| policy.middleware.as_slice())
+                });
+            let Some(registrations) = registrations else {
                 continue;
             };
-            if policy.body.content_middleware().is_empty() {
+            if registrations.is_empty() {
                 continue;
             }
             // Projected namespaces keep a durable identity across an operator
@@ -380,7 +390,7 @@ impl MiddlewarePlan {
             );
             let chain = registry
                 .compile(
-                    policy.body.content_middleware(),
+                    registrations,
                     &MiddlewareBuildContext {
                         namespace: &namespace_identity,
                         env,
@@ -391,9 +401,7 @@ impl MiddlewarePlan {
                     namespace: namespace.id.clone(),
                     source,
                 })?;
-            if let Some(guardrail) = policy
-                .body
-                .content_middleware()
+            if let Some(guardrail) = registrations
                 .iter()
                 .find(|registration| registration.id() == "axond.redact")
                 .and_then(ContentMiddlewareRegistration::guardrail)

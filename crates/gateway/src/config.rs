@@ -12,7 +12,7 @@
 //! gate a booting one does. The environment is read at *reload* time, so a
 //! credential env-var added after boot resolves without a restart.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -66,6 +66,11 @@ pub struct Config {
     pub admin_oidc: Option<AdminOidc>,
     #[serde(default)]
     pub namespace: Vec<Namespace>,
+    /// Complete namespace-native policy values projected from ADR 0062 state.
+    /// Kept separate from v1's tenant/project `NamespacePolicy` so the flat
+    /// model never fabricates hierarchy merely to reuse the serving runtime.
+    #[serde(skip)]
+    pub(crate) flat_namespace_policy: BTreeMap<String, crate::desired_state::NamespacePolicySpec>,
     #[serde(default)]
     pub provider: Vec<Provider>,
     #[serde(default)]
@@ -2141,6 +2146,7 @@ pub(crate) struct ProjectedPrincipal {
     pub(crate) namespace: String,
     pub(crate) subject: String,
     pub(crate) digest: crate::desired_state::Checksum,
+    pub(crate) grant: Option<crate::namespace::NamespaceGrant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2495,6 +2501,21 @@ impl Config {
         // unreachable configuration.
         let mut owned: HashSet<(Option<&str>, &str)> = HashSet::new();
 
+        for (namespace, policy) in &self.flat_namespace_policy {
+            let Some(declared) = namespaces.get(namespace.as_str()) else {
+                return Err(ConfigError::Invalid(format!(
+                    "flat policy references undefined namespace `{namespace}`"
+                )));
+            };
+            if declared.policy.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "namespace `{namespace}` has both v1 and flat v2 policy"
+                )));
+            }
+            crate::middleware::validate_content_middleware(&policy.middleware)
+                .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        }
+
         for principal in &self.projected_principals {
             if principal.subject.trim().is_empty() {
                 return Err(ConfigError::Invalid(
@@ -2506,6 +2527,20 @@ impl Config {
                     "projected inbound principal `{}` references undefined namespace `{}`",
                     principal.subject, principal.namespace
                 )));
+            }
+            if let Some(granted) = principal
+                .grant
+                .as_ref()
+                .and_then(crate::namespace::NamespaceGrant::namespaces)
+            {
+                for namespace in granted {
+                    if !namespaces.contains_key(namespace.as_str()) {
+                        return Err(ConfigError::Invalid(format!(
+                            "projected inbound principal `{}` grants undefined namespace `{namespace}`",
+                            principal.subject
+                        )));
+                    }
+                }
             }
         }
         for model in &self.model {
@@ -5694,6 +5729,7 @@ dsn_env = "AXOND_REDIS_URL"
             namespace: "platform".to_owned(),
             subject: "workload".to_owned(),
             digest: crate::desired_state::Checksum::of(b"axw1.dddddd"),
+            grant: None,
         });
         config
             .validate_compiled()

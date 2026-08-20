@@ -131,15 +131,58 @@ impl<'de> Deserialize<'de> for NamespaceId {
 /// without making the URL subordinate to a token claim: the path still selects
 /// exactly one namespace. Set/all token-claim projection is a later slice.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NamespaceGrant(BTreeSet<NamespaceId>);
+pub enum NamespaceGrant {
+    All,
+    Set(BTreeSet<NamespaceId>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidNamespaceGrant {
+    #[error("a namespace grant must name at least one namespace")]
+    Empty,
+    #[error("a namespace grant names {count} namespaces, over the {max}-namespace limit")]
+    TooMany { count: usize, max: usize },
+}
 
 impl NamespaceGrant {
+    pub const MAX_NAMESPACES: usize = 64;
+
     pub fn one(namespace: NamespaceId) -> Self {
-        Self(BTreeSet::from([namespace]))
+        Self::Set(BTreeSet::from([namespace]))
+    }
+
+    pub fn set(
+        namespaces: impl IntoIterator<Item = NamespaceId>,
+    ) -> Result<Self, InvalidNamespaceGrant> {
+        let namespaces = namespaces.into_iter().collect::<BTreeSet<_>>();
+        if namespaces.is_empty() {
+            return Err(InvalidNamespaceGrant::Empty);
+        }
+        if namespaces.len() > Self::MAX_NAMESPACES {
+            return Err(InvalidNamespaceGrant::TooMany {
+                count: namespaces.len(),
+                max: Self::MAX_NAMESPACES,
+            });
+        }
+        Ok(Self::Set(namespaces))
+    }
+
+    pub const fn all() -> Self {
+        Self::All
     }
 
     pub fn permits(&self, namespace: &NamespaceId) -> bool {
-        self.0.contains(namespace)
+        match self {
+            Self::All => true,
+            Self::Set(namespaces) => namespaces.contains(namespace),
+        }
+    }
+
+    pub fn namespaces(&self) -> Option<&BTreeSet<NamespaceId>> {
+        match self {
+            Self::All => None,
+            Self::Set(namespaces) => Some(namespaces),
+        }
     }
 }
 
@@ -226,5 +269,21 @@ mod tests {
         let globex = NamespaceId::parse("globex").unwrap();
         assert!(NamespaceGrant::one(acme.clone()).permits(&acme));
         assert!(!NamespaceGrant::one(acme).permits(&globex));
+    }
+
+    #[test]
+    fn set_and_all_grants_are_bounded_and_explicit() {
+        let acme = NamespaceId::parse("acme").unwrap();
+        let globex = NamespaceId::parse("globex").unwrap();
+        let set = NamespaceGrant::set([globex.clone(), acme.clone(), acme.clone()]).unwrap();
+        assert!(set.permits(&acme));
+        assert!(set.permits(&globex));
+        assert_eq!(set.namespaces().unwrap().len(), 2);
+        assert!(NamespaceGrant::all().permits(&acme));
+        assert!(NamespaceGrant::all().namespaces().is_none());
+        assert_eq!(
+            NamespaceGrant::set(Vec::new()),
+            Err(InvalidNamespaceGrant::Empty)
+        );
     }
 }

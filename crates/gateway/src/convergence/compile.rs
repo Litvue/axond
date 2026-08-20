@@ -467,8 +467,13 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
         // stateful targets must prove the exact callable id is covered by the
         // effective approved book; otherwise the request path would interpret
         // a missing book as file pricing.
-        let pricing = self.pricing(revision)?;
-        let config = if self.bootstrap.mode == crate::config::Mode::Stateful {
+        let flat_v2 = revision.state().is_flat_namespace_v2();
+        let pricing = if flat_v2 {
+            None
+        } else {
+            self.pricing(revision)?
+        };
+        let config = if self.bootstrap.mode == crate::config::Mode::Stateful && !flat_v2 {
             super::serving::project(
                 config,
                 revision.state(),
@@ -515,7 +520,7 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
             None => snapshot,
             Some(pricing) => snapshot.with_pricing(pricing),
         };
-        let snapshot = if self.bootstrap.mode == crate::config::Mode::Stateful {
+        let snapshot = if self.bootstrap.mode == crate::config::Mode::Stateful && !flat_v2 {
             let authorization = crate::desired_state::AuthorizationSnapshot::of(revision.state())
                 .map_err(|error| CompileError::Projection {
                 revision: id,
@@ -529,7 +534,7 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
         } else {
             snapshot
         };
-        let Some(evidence) = self.availability.as_ref() else {
+        let Some(evidence) = self.availability.as_ref().filter(|_| !flat_v2) else {
             return Ok(snapshot);
         };
         let projected = evidence

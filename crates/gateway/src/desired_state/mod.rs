@@ -72,6 +72,7 @@ pub mod credentials;
 pub mod ids;
 pub mod models;
 pub mod mutation;
+pub mod namespaces;
 pub mod policy;
 pub mod pricing;
 pub mod providers;
@@ -121,6 +122,12 @@ pub use models::{
 pub use mutation::{
     Actor, AuditEvent, ExpectedRevision, IdempotencyKey, InvalidActor, InvalidIdempotencyKey,
     Mutation, MutationKind,
+};
+#[allow(unused_imports)]
+pub use namespaces::{
+    FlatNamespaces, FlatProviderKind, InboundGrantBody, NamespaceAlias, NamespaceBody,
+    NamespaceCredential, NamespacePolicySpec, NamespaceProvider, NamespaceStateError,
+    NamespaceTarget,
 };
 #[allow(unused_imports)]
 pub use policy::{
