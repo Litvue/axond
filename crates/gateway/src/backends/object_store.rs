@@ -273,8 +273,6 @@ pub trait ObjectStore: Send + Sync {
 /// serve the control-plane contract, but cannot make a physical-erasure claim.
 #[async_trait]
 pub trait ObjectStoreMaintenance: Send + Sync {
-    fn name(&self) -> &'static str;
-
     async fn delete_if_version(
         &self,
         key: &ObjectKey,
@@ -431,10 +429,6 @@ impl ObjectStore for InMemoryObjectStore {
 
 #[async_trait]
 impl ObjectStoreMaintenance for InMemoryObjectStore {
-    fn name(&self) -> &'static str {
-        "in-memory"
-    }
-
     async fn delete_if_version(
         &self,
         key: &ObjectKey,

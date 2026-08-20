@@ -303,10 +303,6 @@ impl ObjectStore for AzureBlobObjectStore {
 
 #[async_trait]
 impl ObjectStoreMaintenance for AzureBlobObjectStore {
-    fn name(&self) -> &'static str {
-        "azure-blob"
-    }
-
     async fn delete_if_version(
         &self,
         key: &ObjectKey,
