@@ -32,10 +32,11 @@ publication, convergence, and encrypted-secret wiring are still pending in
 this slice. Do not deploy this example with `axond serve` yet. PostgreSQL remains
 the implemented legacy/optional stateful backend during that transition.
 
-For local Azurite only, `http://localhost` or a loopback IP requires an explicit
-`allow_loopback_http = true`. The flag defaults off and cannot permit HTTP to a
-remote host. Production URLs must use HTTPS and contain no username, password,
-query/SAS token, or fragment.
+For local Azurite only, `http://localhost` or an IPv4/IPv6 loopback IP requires
+an explicit `allow_loopback_http = true`; its native `account/container` path is
+accepted. The flag defaults off and cannot permit HTTP to a remote host.
+Production URLs must use HTTPS and contain no username, password, query/SAS
+token, or fragment.
 
 The remainder of this guide covers the **stateless** operating mode: TOML owns
 every resource, and a backend below is an opt-in for one capability. "Stateful

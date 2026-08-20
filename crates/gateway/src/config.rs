@@ -335,8 +335,12 @@ fn validate_object_storage_container_url(
     let host = url.host_str().ok_or_else(|| {
         ConfigError::Invalid("`[control_plane] container_url` must include a host".into())
     })?;
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host
+    let address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let loopback = address.eq_ignore_ascii_case("localhost")
+        || address
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback());
     match url.scheme() {
@@ -360,18 +364,26 @@ fn validate_object_storage_container_url(
             ));
         }
     }
-    let path = url.path();
-    let container = path.strip_prefix('/').unwrap_or(path);
-    if container.is_empty()
-        || container.contains('/')
-        || container.contains('%')
-        || path.ends_with('/')
+    let segments = url
+        .path_segments()
+        .ok_or_else(|| {
+            ConfigError::Invalid(
+                "`[control_plane] container_url` must contain object-key path segments".into(),
+            )
+        })?
+        .collect::<Vec<_>>();
+    let expected_segments = if allow_loopback_http { 1..=2 } else { 1..=1 };
+    if !expected_segments.contains(&segments.len())
+        || segments
+            .iter()
+            .any(|segment| segment.is_empty() || segment.contains('%'))
     {
         return Err(ConfigError::Invalid(
-            "`[control_plane] container_url` path must contain exactly one unescaped container object-key segment"
+            "`[control_plane] container_url` path must contain one unescaped container segment, or an Azurite account/container pair"
                 .into(),
         ));
     }
+    let container = segments[segments.len() - 1];
     crate::backends::object_store::ObjectKey::parse(container.to_owned()).map_err(|error| {
         ConfigError::Invalid(format!(
             "`[control_plane] container_url` has an invalid container object-key segment: {error}"
@@ -6284,7 +6296,7 @@ dsn_env = "AXOND_REDIS_URL"
             ),
             (
                 "https://axondstate.blob.core.windows.net/one/two",
-                "exactly one unescaped container",
+                "one unescaped container segment",
             ),
         ] {
             let toml = BLOB_STATEFUL.replace(
@@ -6302,7 +6314,7 @@ dsn_env = "AXOND_REDIS_URL"
     fn loopback_http_requires_an_explicit_development_exception() {
         let loopback = BLOB_STATEFUL.replace(
             "https://axondstate.blob.core.windows.net/control-plane",
-            "http://127.0.0.1:10000/devstoreaccount1",
+            "http://127.0.0.1:10000/devstoreaccount1/control-plane",
         );
         let error = Config::from_toml_str(&loopback).expect_err("HTTP cannot default on");
         assert!(error.to_string().contains("allow_loopback_http = true"));
@@ -6312,6 +6324,12 @@ dsn_env = "AXOND_REDIS_URL"
             "authentication = \"workload-identity\"\nallow_loopback_http = true",
         );
         Config::from_toml_str(&explicit).expect("explicit loopback Azurite is valid");
+
+        let ipv6 = explicit.replace(
+            "http://127.0.0.1:10000/devstoreaccount1/control-plane",
+            "http://[::1]:10000/devstoreaccount1/control-plane",
+        );
+        Config::from_toml_str(&ipv6).expect("IPv6 loopback Azurite is valid");
 
         let remote = BLOB_STATEFUL
             .replace(
