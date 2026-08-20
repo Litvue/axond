@@ -4,7 +4,12 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted
+Accepted, partially superseded by
+[ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
+
+Pinned offering identity, ordered aliases, wire-family validation, and atomic
+snapshot activation remain in force. Tenant defaults and project overrides are
+replaced by one complete namespace-owned model and alias view.
 
 Types the entitlement half of the stateful mode chosen in
 [ADR 0027](./0027-stateless-and-stateful-operating-modes.md), inside the tenancy

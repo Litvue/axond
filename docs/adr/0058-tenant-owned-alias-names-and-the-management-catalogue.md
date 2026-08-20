@@ -4,7 +4,12 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted
+Accepted, partially superseded by
+[ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
+
+Alias-name isolation and the distinction between serving and management views
+remain in force. Namespace ownership replaces tenant ownership, and consumers
+own every tenant/project mapping outside Axond.
 
 Completes the tenant-facing half of
 [ADR 0042](./0042-model-enablement-and-alias-contracts.md): 0042 types what a

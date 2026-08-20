@@ -4,7 +4,13 @@ Date: 2026-08-12
 
 ## Status
 
-Accepted
+Accepted for the PostgreSQL control-plane backend, partially superseded by
+[ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
+
+Preflight remains required. Forward-only PostgreSQL DDL and its migration Job
+are no longer requirements of the preferred stateful deployment; the blob
+backend instead preflights protocol version, credentials, object limits, and a
+live native conditional-write probe.
 
 Implements the operational half of the stateful mode chosen in
 [ADR 0027](./0027-stateless-and-stateful-operating-modes.md), and keeps the

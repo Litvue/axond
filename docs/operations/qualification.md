@@ -4,6 +4,15 @@ What has actually been measured about running Axond in production, what has only
 been declared or harnessed, and what has not yet been retained — in one place, so the difference
 between a merged harness and an answered question stays visible.
 
+> **Architecture transition:**
+> [ADR 0062](../adr/0062-blob-backed-flat-namespace-control-plane.md) accepts a
+> blob-backed flat-namespace stateful-v2 topology. Do not dispatch the current
+> PostgreSQL stateful-v1 cohort as production evidence for that target. The
+> manifests and historical records below remain truthful for their source and
+> topology; the
+> [migration plan](../maintainers/namespace-control-plane-migration.md) defines
+> how every slice must be re-cut before qualification restarts.
+
 Production qualification ([#156](https://github.com/Litvue/axond/issues/156))
 decomposes into six slices. They landed, and will land, at different depths:
 

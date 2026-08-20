@@ -4,7 +4,14 @@ Date: 2026-08-12
 
 ## Status
 
-Accepted
+Accepted, partially superseded by
+[ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
+
+ADR 0062 replaces this record's PostgreSQL-only stateful control plane and its
+tenant/project/workload-principal durable domain with blob-backed flat
+namespaces and grants. Stateless-by-default, one authority per dimension,
+immutable request snapshots, atomic candidate activation, and warm serving
+during control-plane loss remain in force.
 
 Supersedes the permanent-config-ownership rule of
 [ADR 0017](./0017-state-tiers-and-optional-backends.md) ("One dimension, one

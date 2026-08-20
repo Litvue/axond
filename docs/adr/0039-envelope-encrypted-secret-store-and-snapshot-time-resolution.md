@@ -4,7 +4,14 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted
+Accepted, partially superseded by
+[ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
+
+Envelope encryption, exact-version references, snapshot-time resolution,
+non-disclosure, and snapshot-owned plaintext remain in force. PostgreSQL is no
+longer the preferred durable secret implementation; ADR 0062 stores immutable
+sealed secret versions in object storage and makes external secret managers
+optional.
 
 Implements the runtime half of
 [ADR 0034](./0034-typed-provider-credentials-and-secret-lifecycle.md), at the

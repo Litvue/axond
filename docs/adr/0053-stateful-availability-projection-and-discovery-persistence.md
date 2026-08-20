@@ -4,7 +4,12 @@ Date: 2026-08-12
 
 ## Status
 
-Accepted
+Accepted, partially superseded by
+[ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
+
+Derived availability, immutable snapshot evaluation, and retained discovery
+inputs remain in force. Their durable owner is a flat namespace revision in
+object storage rather than PostgreSQL tenant/project projections.
 
 Fills the contract of
 [ADR 0038](./0038-derived-availability-and-discovery-evaluation.md) with the

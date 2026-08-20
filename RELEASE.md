@@ -44,6 +44,11 @@ and publishes crates.io last because registry versions are immutable.
   cosign signatures cover the published image manifests only.
 - `/readyz` reports a serving, boot-validated process; it does not continuously
   probe providers, Redis, or Postgres.
+- The implemented stateful control plane is PostgreSQL-backed and is not the
+  accepted production target. [ADR 0062](./docs/adr/0062-blob-backed-flat-namespace-control-plane.md)
+  selects a blob-backed flat-namespace stateful-v2 design; it is not implemented
+  or qualified yet, and the current PostgreSQL qualification cohort must not be
+  presented as evidence for it.
 - Cross-provider request translation is intentionally not supported. OpenAI and
   Anthropic aliases must use their native wire families.
 - Every `/v1/responses` request, initial calls included, pins to the alias's
