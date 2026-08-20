@@ -200,6 +200,7 @@ lifecycle: `one_secret_belongs_to_one_owner`,
 
 The namespace-native blob envelope adds
 `deterministic_crypto_and_codec_golden_vector`,
+`axond_owns_rfc3394_aes256_key_wrap_vectors`,
 `context_and_purpose_are_cryptographic_boundaries`,
 `every_stored_byte_is_authenticated_or_a_strict_codec_field`,
 `canonical_cbor_is_the_only_accepted_spelling`,
@@ -209,12 +210,27 @@ duplicate-material, invalid-UTF-8, multibyte-byte-limit, and frozen-v1 tests.
 Together they pin schema 2, RFC 3394 AES-256-KW, owner/reference omission,
 material-AAD dimensions, strict canonical decoding, allocation and ring
 ceilings, key rotation, mutation refusal, zeroizing bootstrap ownership, legacy
-compatibility, and non-rendering errors. `blob_secret_envelope` drives raw bytes
-directly through the production decoder; `blob_secret_crypto` drives bounded
-synthetic seal/open and rotation scenarios. A change to the fixed array, AAD
-bytes, wrap primitive, key-selection rule, bound, key lifetime, context
-constructor, publisher immutability rule, or error payload fires this trigger
-even when no runtime wiring changes.
+compatibility, and non-rendering errors. The RFC test is Axond-owned: it asserts
+the section 4.6 AES-256 wrap and unwrap values and a corrupted-wrap integrity
+failure whose output buffer is cleared. `blob_secret_envelope` drives raw bytes
+directly through the production decoder and pins every committed filename to
+its exact parser outcome. `blob_secret_crypto` drives bounded synthetic
+seal/open and rotation scenarios; every scenario and byte-boundary case has a
+stable encoded corpus file replayed through `arbitrary_take_rest` with an exact
+outcome. A change to the fixed array, AAD bytes, wrap primitive, key-selection
+rule, bound, key lifetime, authority wrapper, publisher immutability rule, or
+error payload fires this trigger even when no runtime wiring changes.
+
+The codec reuses publication's `EnvironmentId`. Its read wrapper is not a
+free-form context constructor: `AuthenticatedSecretBinding` has private fields,
+no production test escape, no `Clone`, and is consumed by opening. Production
+creation flows through opaque verified signed deployment-secret-index
+provenance and carries the indexed ciphertext digest, which opening checks
+before KEK lookup. The constructor seam is coordinated with the adjacent
+publication/projection interfaces but runtime hydration wiring remains owned by
+those independent slices. A separate narrow write wrapper represents the
+publisher's create-only reservation; the codec does not claim that it performs
+the object-store reservation itself.
 
 AES-KW authenticates the wrapped key but has no AAD. The isolation claim belongs
 to opening the complete object: AES-GCM material AAD binds environment,

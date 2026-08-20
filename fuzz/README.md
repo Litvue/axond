@@ -17,6 +17,13 @@ storage. This project fuzzes all five, on the parsers the process actually runs.
 | `blob_secret_envelope` | The v2 bounded canonical-CBOR fixed-array decoder | Authenticated desired state names immutable bytes, but the storage object itself is untrusted until strict parsing and AEAD opening succeed |
 | `blob_secret_crypto` | Structured bounded v2 sealing, opening, context substitution, rotation, and mutation | Valid cryptographic states are too sparse for raw byte mutation alone |
 
+Every `blob_secret_envelope` filename is pinned to one exact parser outcome.
+The crypto corpus owns a stable binary layout: scenario, primary and secondary
+key seed bytes, little-endian identity and version seeds, then the remaining
+bytes as material. It commits one file per crypto scenario plus empty,
+non-UTF-8, exact-multibyte-limit, and over-limit boundaries; smoke decodes each
+with `BlobSecretCryptoInput::arbitrary_take_rest` and asserts the exact outcome.
+
 The properties each target asserts live in [`src/lib.rs`](./src/lib.rs) and
 [`src/wire.rs`](./src/wire.rs): a parser returns rather than panicking, a
 refusal is a typed value the gateway could answer with, and what it accepts
@@ -136,9 +143,10 @@ are there because the other assertions are relative, and a parser that returned
 nothing at all would satisfy them. Then it replays every seed plus fixed
 derivations — truncations, single-byte flips, one oversized repetition — a set
 of tokens minted at replay time, and a set of catalogue edits applied at replay
-time. The token scenarios and the catalogue scenarios are each pinned to the
-outcome they exist for by name, so a check that stopped being reachable fails the
-lane rather than being covered for by another scenario's class. It fails on a
+time. The token scenarios, catalogue scenarios, and both blob-secret corpora are
+each pinned to the outcome they exist for by name, so a check that stopped being
+reachable fails the lane rather than being covered for by another scenario's
+class. It fails on a
 panic, on an input slower than its
 budget, or on an allocation past a hard cap enforced by the binary's own global
 allocator. It also fails if the corpus stops reaching a spread of outcome

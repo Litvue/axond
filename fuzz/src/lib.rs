@@ -66,7 +66,14 @@ pub fn blob_secret_envelope(data: &[u8]) -> &'static str {
 }
 
 /// Structured, bounded crypto operations complement the raw parser target.
-#[derive(Debug, Arbitrary)]
+///
+/// The committed corpus owns a stable binary layout: scenario, primary seed,
+/// secondary seed, little-endian `u64` identity seed, little-endian `u16`
+/// version seed, then all remaining bytes as material. Implementing the layout
+/// here keeps seed meaning stable across derive-macro changes and lets smoke
+/// replay every file through [`Arbitrary::arbitrary_take_rest`] exactly as the
+/// coverage-guided target does.
+#[derive(Debug)]
 pub struct BlobSecretCryptoInput<'a> {
     pub material: &'a [u8],
     pub scenario: u8,
@@ -74,6 +81,52 @@ pub struct BlobSecretCryptoInput<'a> {
     pub secondary_seed: u8,
     pub identity_seed: u64,
     pub version_seed: u16,
+}
+
+impl<'a> BlobSecretCryptoInput<'a> {
+    fn prefix(
+        u: &mut arbitrary::Unstructured<'a>,
+    ) -> arbitrary::Result<(u8, u8, u8, u64, u16)> {
+        Ok((
+            u.arbitrary()?,
+            u.arbitrary()?,
+            u.arbitrary()?,
+            u.arbitrary()?,
+            u.arbitrary()?,
+        ))
+    }
+}
+
+impl<'a> Arbitrary<'a> for BlobSecretCryptoInput<'a> {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let (scenario, primary_seed, secondary_seed, identity_seed, version_seed) =
+            Self::prefix(u)?;
+        Ok(Self {
+            material: u.arbitrary()?,
+            scenario,
+            primary_seed,
+            secondary_seed,
+            identity_seed,
+            version_seed,
+        })
+    }
+
+    fn arbitrary_take_rest(mut u: arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let (scenario, primary_seed, secondary_seed, identity_seed, version_seed) =
+            Self::prefix(&mut u)?;
+        Ok(Self {
+            material: u.take_rest(),
+            scenario,
+            primary_seed,
+            secondary_seed,
+            identity_seed,
+            version_seed,
+        })
+    }
+
+    fn size_hint(_depth: usize) -> (usize, Option<usize>) {
+        (13, None)
+    }
 }
 
 pub fn blob_secret_crypto(input: &BlobSecretCryptoInput<'_>) -> &'static str {

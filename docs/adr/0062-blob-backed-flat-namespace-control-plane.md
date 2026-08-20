@@ -265,6 +265,13 @@ fields. Binary length-prefixed material AAD binds its purpose, environment id,
 `NamespaceId`, secret UUID, version, and KEK id. RFC 3394 AES-256-KW wraps the
 fixed 32-byte DEK without a nonce; because AES-KW has no AAD, caller-context
 binding is asserted only for the complete object after material authentication.
+The environment value is the publication protocol's single `EnvironmentId`,
+not a codec-local spelling. Opening consumes an opaque
+`AuthenticatedSecretBinding` minted only from verified signed active-revision,
+deployment-object, and secret-index provenance; it also checks the indexed
+ciphertext digest before selecting a KEK. Sealing accepts a distinct narrow
+create-only publication binding, so read authority cannot be reused as write
+authority.
 Plaintext is capped at 64 KiB, and the strict decoder rejects alternate CBOR
 spellings and oversized objects before allocation. One active KEK encrypts; up
 to seven explicitly retained decrypt-only keys permit rolling rotation, while

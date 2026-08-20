@@ -294,6 +294,71 @@ const EXPECTED_BLOB_CRYPTO_CLASSES: &[&str] = &[
     "stored_id_mutation",
 ];
 
+const EXPECTED_BLOB_ENVELOPE_SEEDS: &[(&str, &str)] = &[
+    ("accepted.cbor", "accepted"),
+    ("ciphertext.cbor", "ciphertext"),
+    ("compatibility.cbor", "compatibility"),
+    ("fixed-field.cbor", "fixed_field"),
+    ("kek-id.cbor", "kek_id"),
+    ("noncanonical.cbor", "noncanonical"),
+    ("oversized.cbor", "oversized"),
+    ("shape.cbor", "shape"),
+    ("trailing.cbor", "trailing"),
+    ("truncated.cbor", "truncated"),
+];
+
+const EXPECTED_BLOB_CRYPTO_SEEDS: &[(&str, &str)] = &[
+    ("00-roundtrip.bin", "roundtrip"),
+    ("01-wrong-environment.bin", "wrong_environment"),
+    ("02-wrong-namespace.bin", "wrong_namespace"),
+    ("03-wrong-reference.bin", "wrong_reference"),
+    ("04-wrong-version.bin", "wrong_version"),
+    ("05-wrong-purpose.bin", "wrong_purpose"),
+    ("06-wrapped-mutation.bin", "wrapped_mutation"),
+    ("07-nonce-mutation.bin", "nonce_mutation"),
+    ("08-ciphertext-mutation.bin", "ciphertext_mutation"),
+    ("09-unknown-key.bin", "unknown_key"),
+    ("10-rotation.bin", "rotation"),
+    ("11-alias-rejected.bin", "alias_rejected"),
+    ("12-invalid-utf8-refused.bin", "invalid_utf8_refused"),
+    ("13-stored-id-mutation.bin", "stored_id_mutation"),
+    ("boundary-empty.bin", "empty_refused"),
+    ("boundary-input-not-utf8.bin", "input_not_utf8"),
+    ("boundary-multibyte-limit.bin", "roundtrip"),
+    ("boundary-multibyte-over-limit.bin", "oversized_refused"),
+];
+
+fn assert_exact_seed_outcomes(
+    target: &str,
+    expected: &[(&str, &str)],
+    replay: fn(&[u8]) -> Vec<&'static str>,
+) {
+    let corpus = seeds(target);
+    assert_eq!(
+        corpus.len(),
+        expected.len(),
+        "{target}: every raw seed must have exactly one filename pin"
+    );
+    for (filename, bytes) in corpus {
+        let (_, expected_class) = expected
+            .iter()
+            .find(|(name, _)| *name == filename)
+            .unwrap_or_else(|| panic!("{target}/{filename} has no exact outcome pin"));
+        let classes = replay(&bytes);
+        assert_eq!(
+            classes.as_slice(),
+            &[*expected_class],
+            "{target}/{filename} no longer reaches its exact named outcome"
+        );
+    }
+    for (filename, _) in expected {
+        assert!(
+            seed_directory(target).join(filename).is_file(),
+            "{target}/{filename} is pinned but absent"
+        );
+    }
+}
+
 /// The token target takes a structured input, so a seed file is replayed twice:
 /// the way libFuzzer replays it, decoded through `Arbitrary` — which reaches the
 /// freshly-minted claims a committed seed cannot carry, because a seed's `exp`
@@ -829,6 +894,17 @@ fn main() {
     // input carrying it, not a decoder disclosing it.
     axond_fuzz::assert_disclosure_check_survives_escaping();
     println!("provider_error: an escaped canary is read as the input that carried it");
+    assert_exact_seed_outcomes(
+        "blob_secret_envelope",
+        EXPECTED_BLOB_ENVELOPE_SEEDS,
+        replay_blob_secret_envelope,
+    );
+    assert_exact_seed_outcomes(
+        "blob_secret_crypto",
+        EXPECTED_BLOB_CRYPTO_SEEDS,
+        replay_blob_secret_crypto,
+    );
+    println!("blob secret corpora: every filename reaches its exact pinned outcome");
     let mut inputs = 0_usize;
     for target in TARGETS {
         let mut target_inputs = 0_usize;

@@ -138,7 +138,9 @@ material nonce, RFC 3394 wrapped-DEK, KEK-id, and ciphertext lengths stay exact;
 and an accepted object re-encodes byte-for-byte to its input. Coverage-guided
 bytes are never decoded or transformed by the harness. Binary corpus seeds pin
 acceptance and every refusal class: oversized, truncated, shape, compatibility,
-noncanonical, KEK id, fixed field, ciphertext, and trailing data.
+noncanonical, KEK id, fixed field, ciphertext, and trailing data. The bounded
+smoke maps every raw seed filename to one exact outcome and fails on an added,
+removed, renamed, or reclassified file.
 
 `blob_secret_crypto` complements parser mutation with structured bounded inputs.
 Pinned smoke scenarios cover environment, namespace, secret-id, version, KEK-id
@@ -146,6 +148,12 @@ and purpose substitution; wrapped-key, nonce and ciphertext mutation; unknown
 keys; active/decrypt-only rotation; duplicate-material alias refusal; invalid
 UTF-8 after authenticated opening; and the exact multibyte 64 KiB byte boundary.
 Only synthetic repeated-byte KEKs enter the seam.
+Each scenario is also a committed binary seed using an Axond-owned stable
+layout: three one-byte scenario/key selectors, little-endian identity and
+version seeds, then the remaining bytes as material. Smoke decodes every file
+through `BlobSecretCryptoInput::arbitrary_take_rest` and asserts its exact named
+outcome. Separate seeds pin empty material, invalid input UTF-8, and exact/over
+multibyte 64 KiB boundaries.
 
 Runs are hermetic: the seam the targets call builds its verifiers from a
 configuration compiled into the binary with synthetic key material, so a fuzz run
