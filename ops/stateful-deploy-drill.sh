@@ -300,11 +300,11 @@ probe() { curl -s -o "${workdir}/body" -w '%{http_code}' "$@"; }
 ok "/healthz 200, /readyz 503"
 
 code="$(probe -X POST -H 'content-type: application/json' -d '{}' \
-  http://127.0.0.1:18443/v1/chat/completions)"
+  http://127.0.0.1:18443/namespaces/platform/v1/chat/completions)"
 [[ "$code" == 401 ]] || fail "anonymous inference answered ${code}, not 401"
 grep -q '"unauthorized"' "${workdir}/body" ||
   fail "the anonymous refusal is not the typed unauthorized error: $(cat "${workdir}/body")"
-ok "/v1/chat/completions 401 unauthorized before convergence"
+ok "/namespaces/platform/v1/chat/completions 401 unauthorized before convergence"
 
 # The administrative surface is authenticated, so an unauthenticated probe is
 # what proves it is *there*: a typed admin error is the surface answering, and it

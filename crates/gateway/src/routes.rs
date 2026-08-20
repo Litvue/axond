@@ -5980,7 +5980,11 @@ min_iat = {}
         )
         .expect("bootstrap state");
         let response = router(state)
-            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/namespaces/platform/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
