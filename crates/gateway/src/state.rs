@@ -793,6 +793,7 @@ impl ConfigSnapshot {
         env: &HashMap<String, String>,
         cached: CachedServingSnapshot,
     ) -> Result<(RevisionId, Self), String> {
+        let flat_v2 = cached.flat_v2();
         if cached.credential_bearing_flat_v2() {
             return Err(
                 "credential-bearing flat-v2 compiled snapshots are not eligible for cold restoration until an authenticated monotonic revision/tombstone floor exists"
@@ -919,18 +920,20 @@ impl ConfigSnapshot {
             .validate_compiled()
             .map_err(|error| error.to_string())?;
         let mut expected_secret_owners = HashMap::new();
-        for credential in &bootstrap.credential {
-            let Some(reference) = credential.secret else {
-                continue;
-            };
-            if let Some(first) =
-                expected_secret_owners.insert(reference, credential.namespace.clone())
-                && first != credential.namespace
-            {
-                return Err(format!(
-                    "compiled cache shares secret {reference} between namespaces `{first}` and `{}`",
-                    credential.namespace
-                ));
+        if flat_v2 {
+            for credential in &bootstrap.credential {
+                let Some(reference) = credential.secret else {
+                    continue;
+                };
+                if let Some(first) =
+                    expected_secret_owners.insert(reference, credential.namespace.clone())
+                    && first != credential.namespace
+                {
+                    return Err(format!(
+                        "compiled cache shares secret {reference} between namespaces `{first}` and `{}`",
+                        credential.namespace
+                    ));
+                }
             }
         }
         let materials = cached
@@ -939,7 +942,7 @@ impl ConfigSnapshot {
             .map(|mut secret| {
                 let reference =
                     SecretRef::parse(&secret.reference).map_err(|error| error.to_string())?;
-                if !expected_secret_owners.contains_key(&reference) {
+                if flat_v2 && !expected_secret_owners.contains_key(&reference) {
                     return Err(format!(
                         "compiled cache contains unreferenced secret {reference}"
                     ));
@@ -956,7 +959,7 @@ impl ConfigSnapshot {
                 Ok((reference, SecretMaterial::new(material), binding))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        if materials.len() != expected_secret_owners.len() {
+        if flat_v2 && materials.len() != expected_secret_owners.len() {
             return Err(format!(
                 "compiled cache contains {} secret materials for {} referenced versions",
                 materials.len(),
@@ -1047,13 +1050,18 @@ fn restore_cached_buffered_routes(routes: &[String]) -> Result<Vec<BufferedRespo
 }
 
 impl CachedServingSnapshot {
+    fn flat_v2(&self) -> bool {
+        self.namespaces
+            .iter()
+            .any(|namespace| namespace.static_policy.is_some())
+    }
+
     fn credential_bearing_flat_v2(&self) -> bool {
-        self.credentials.iter().any(|credential| {
-            credential.secret.is_some()
-                && self.namespaces.iter().any(|namespace| {
-                    namespace.id == credential.namespace && namespace.static_policy.is_some()
-                })
-        })
+        self.flat_v2()
+            && self
+                .credentials
+                .iter()
+                .any(|credential| credential.secret.is_some())
     }
 
     pub(crate) fn zeroize_secrets(&mut self) {
@@ -2060,7 +2068,7 @@ mod tests {
     use crate::availability::{AvailabilityKey, AvailabilityRecord, ScopeRef, TargetRef};
     use crate::budget::NoBudget;
     use crate::desired_state::ContentMiddlewareRegistration;
-    use crate::desired_state::fixtures::{policy_body, revision_id, tenant_id};
+    use crate::desired_state::fixtures::{policy_body, revision_id, secret_ref, tenant_id};
     use crate::desired_state::policy::{ContentGuardrailRegistration, PolicyScope};
     use crate::desired_state::{TenantId, Uuid7};
     use crate::usage::UsageSink;
@@ -2256,6 +2264,63 @@ namespace = "platform"
             error.contains("not compiled into this axond build"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn legacy_cache_restores_one_tenant_key_shared_across_namespaces() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let snapshot =
+            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 7).expect("snapshot compiles");
+        let revision = revision_id(7);
+        let reference = secret_ref(991);
+        let mut cached = snapshot.cached_serving(revision);
+        let mut sibling = cached.namespaces[0].clone();
+        sibling.id = "sibling".to_owned();
+        sibling.default = false;
+        cached.namespaces.push(sibling);
+        cached.credentials = ["platform", "sibling"]
+            .into_iter()
+            .map(|namespace| CachedCredential {
+                namespace: namespace.to_owned(),
+                provider: "openai".to_owned(),
+                env: None,
+                id: Some("tenant-default".to_owned()),
+                weight: 1,
+                secret: Some(reference.to_string()),
+            })
+            .collect();
+        cached.secrets.push(CachedSecret {
+            reference: reference.to_string(),
+            binding: CachedSecretBinding::Legacy,
+            material: "shared-provider-key".to_owned(),
+        });
+
+        let (_, restored) =
+            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
+                .expect("legacy shared tenant material remains recoverable");
+        assert_eq!(restored.config.credential.len(), 2);
+        assert!(restored.secrets.get(reference).is_some());
+    }
+
+    #[test]
+    fn legacy_cache_restores_staged_material_not_in_the_serving_pool() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let snapshot =
+            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 7).expect("snapshot compiles");
+        let revision = revision_id(7);
+        let reference = secret_ref(992);
+        let mut cached = snapshot.cached_serving(revision);
+        cached.secrets.push(CachedSecret {
+            reference: reference.to_string(),
+            binding: CachedSecretBinding::Legacy,
+            material: "staged-provider-key".to_owned(),
+        });
+
+        let (_, restored) =
+            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
+                .expect("legacy staged material remains recoverable");
+        assert!(restored.secrets.get(reference).is_some());
+        assert_eq!(restored.cached_serving(revision).secrets.len(), 1);
     }
 
     #[tokio::test]
