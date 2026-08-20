@@ -782,7 +782,12 @@ pub const CATALOG: &[MetricSpec] = &[
             // operator problems.
             Label::closed(
                 "axond.policy.store",
-                &["budget:redis", "budget:postgres", "rate_limit:redis"],
+                &[
+                    "budget:in_memory",
+                    "budget:redis",
+                    "budget:postgres",
+                    "rate_limit:redis",
+                ],
             ),
         ],
     },

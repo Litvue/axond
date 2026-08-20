@@ -194,6 +194,11 @@ pub struct InMemoryBudget {
     namespace_count: usize,
     floor: usize,
     unavailable: UnavailablePolicy,
+    /// The production builder supplies the live policy view so a stateful
+    /// static-only namespace can bypass exact budget accounting. Direct test
+    /// constructors leave this unset and retain their legacy per-replica
+    /// behavior.
+    shared: Option<SharedSettings>,
     ledger_state: Mutex<LedgerState>,
 }
 
@@ -302,8 +307,30 @@ impl InMemoryBudget {
             namespace_count,
             floor,
             unavailable,
+            shared: None,
             ledger_state: Mutex::new(LedgerState::default()),
         }
+    }
+
+    fn with_shared_settings(
+        limit_microdollars: u64,
+        idle_ttl: Duration,
+        reservation_ttl: Duration,
+        max_subjects: usize,
+        unavailable: UnavailablePolicy,
+        namespace_count: usize,
+        shared: SharedSettings,
+    ) -> Self {
+        let mut budget = Self::with_settings_and_policy(
+            limit_microdollars,
+            idle_ttl,
+            reservation_ttl,
+            max_subjects,
+            unavailable,
+            namespace_count,
+        );
+        budget.shared = Some(shared);
+        budget
     }
 
     #[cfg(test)]
@@ -431,6 +458,22 @@ impl BudgetStore for InMemoryBudget {
     }
 
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+        if let Some(shared) = &self.shared {
+            let Some(governing) =
+                shared.caps(crate::policy::ungoverned::BUDGET_IN_MEMORY, &key.namespace)
+            else {
+                // A missing policy is not a store outage and must not inherit
+                // the configured fail-open stance: admitting an ungoverned
+                // stateful namespace would serve traffic without a policy.
+                return Admission::Denied(Denial::StoreUnavailable);
+            };
+            if governing.caps.is_none() {
+                // Flat-v2 static-only namespaces intentionally have no exact
+                // budget. An unheld reservation keeps them out of the local
+                // ledger entirely, just like the shared stores' bypass.
+                return Admission::Allowed(Reservation::unheld());
+            }
+        }
         let mut state = self.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.ledgers.contains_key(key) {
             let free = self.max_subjects.saturating_sub(state.ledgers.len());
@@ -742,13 +785,14 @@ pub async fn build(
         // `validate_budget` already refuses a namespace cap on these two, so
         // reaching them here means no namespace cap was asked for.
         BudgetBackend::None => Ok(Box::new(NoBudget)),
-        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_settings_and_policy(
+        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_shared_settings(
             config.limit_microdollars,
             Duration::from_secs(config.idle_ttl_seconds),
             Duration::from_secs(config.reservation_ttl_seconds),
             config.max_subjects,
             config.on_unavailable.into(),
             namespace_count,
+            settings,
         ))),
         BudgetBackend::Redis => {
             let url = dsn(config, "redis", env)?;
@@ -933,6 +977,67 @@ mod tests {
             budget.reserve(&key(), u64::MAX).await,
             Admission::Allowed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn built_in_memory_budget_bypasses_a_flat_static_only_namespace() {
+        let config = BudgetConfig {
+            backend: BudgetBackend::InMemory,
+            limit_microdollars: 1,
+            ..BudgetConfig::default()
+        };
+        let budget = build(
+            &config,
+            &HashMap::new(),
+            1,
+            Ceilings::fixed(crate::policy::ActivePolicy::static_only()),
+        )
+        .await
+        .expect("the in-memory backend has no connection to open");
+
+        assert_eq!(
+            budget
+                .reserve(
+                    &BudgetKey {
+                        namespace: "static-only".into(),
+                        subject: "caller".into(),
+                    },
+                    2,
+                )
+                .await,
+            Admission::Allowed(Reservation::unheld())
+        );
+    }
+
+    #[tokio::test]
+    async fn built_in_memory_budget_denies_an_ungoverned_namespace() {
+        let config = BudgetConfig {
+            backend: BudgetBackend::InMemory,
+            limit_microdollars: 1_000,
+            on_unavailable: StoreUnavailable::Allow,
+            ..BudgetConfig::default()
+        };
+        let budget = build(
+            &config,
+            &HashMap::new(),
+            1,
+            Ceilings::fixed(crate::policy::ActivePolicy::default()),
+        )
+        .await
+        .expect("the in-memory backend has no connection to open");
+
+        assert_eq!(
+            budget
+                .reserve(
+                    &BudgetKey {
+                        namespace: "ungoverned".into(),
+                        subject: "caller".into(),
+                    },
+                    1,
+                )
+                .await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
     }
 
     #[test]
