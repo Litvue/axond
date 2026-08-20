@@ -77,9 +77,10 @@ AES-256-GCM binds those values and the KEK id through binary length-prefixed
 material AAD. RFC 3394 wraps the fixed 32-byte DEK without a nonce and does not
 independently authenticate caller context. The parser accepts one bounded
 six-element canonical-CBOR spelling, never a generic CBOR extension.
-Bootstrap KEKs are exactly 32 bytes in zeroizing owned buffers. A complete ring
-has one active encryption key, no more than seven decrypt-only keys, and no ids
-that alias the same raw key. This codec is an off-request-path building block:
+Bootstrap KEKs are exactly 32 bytes in zeroizing owned buffers. A publisher has
+one active encryption key, while a serving decrypt-only ring admits no more
+than eight retired keys; neither set may contain ids that alias the same raw
+key. This codec is an off-request-path building block:
 create-only publication, exact-reference uniqueness, and snapshot-time
 resolution must be wired before it can serve a credential. Dropping keys is
 best-effort memory hygiene, not proof against registers, crash dumps, swap, or
