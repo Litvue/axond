@@ -152,6 +152,11 @@ const TARGETS: &[Target] = &[
         run: replay_catalog_import,
         minimum_classes: 6,
     },
+    Target {
+        name: "publication_parsers",
+        run: replay_publication_parsers,
+        minimum_classes: 6,
+    },
 ];
 
 /// Chunk boundaries the SSE seeds are replayed on. Coprime with nothing in
@@ -255,6 +260,10 @@ fn replay_config_toml(data: &[u8]) -> Vec<&'static str> {
 
 fn replay_credentials_query(data: &[u8]) -> Vec<&'static str> {
     vec![axond_fuzz::credentials_query(data)]
+}
+
+fn replay_publication_parsers(data: &[u8]) -> Vec<&'static str> {
+    axond_fuzz::publication_parsers(data)
 }
 
 /// The token target takes a structured input, so a seed file is replayed twice:

@@ -109,6 +109,13 @@ pub enum Rejection {
     Unavailable,
 }
 
+/// A typed refusal from one durable publication-document parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDocumentRejection {
+    pub code: &'static str,
+    pub message: String,
+}
+
 /// The bounded reason behind a seam rejection, so a fuzzed import can be admitted
 /// over a last-known-good catalogue the same way the refresh admits one.
 ///
@@ -171,6 +178,24 @@ pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection> {
         Err(config::ConfigError::Invalid(message)) => Err(Rejection::Invalid(message)),
     }
 }
+
+/// Decode an untrusted object-store environment head through the production
+/// bounded JSON parser.
+pub fn publication_head_document(input: &[u8]) -> Result<(), StoredDocumentRejection> {
+    desired_state::publication::fuzz_decode_head(input)
+        .map_err(|(code, message)| StoredDocumentRejection { code, message })
+}
+
+/// Decode an untrusted immutable revision manifest through the production
+/// deterministic CBOR parser.
+pub fn publication_revision_manifest(input: &[u8]) -> Result<(), StoredDocumentRejection> {
+    desired_state::publication::fuzz_decode_revision_manifest(input)
+        .map_err(|(code, message)| StoredDocumentRejection { code, message })
+}
+
+pub const PUBLICATION_HEAD_MAX_BYTES: usize = desired_state::publication::MAX_HEAD_DOCUMENT_BYTES;
+pub const PUBLICATION_MANIFEST_MAX_BYTES: usize =
+    desired_state::publication::MAX_REVISION_MANIFEST_BYTES;
 
 /// Parse the `namespaces` filter out of an untrusted `GET
 /// /v1/credentials/status` query string, percent-decoding included.

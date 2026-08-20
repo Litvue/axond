@@ -25,6 +25,7 @@
 
 mod wire;
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use arbitrary::Arbitrary;
@@ -99,6 +100,103 @@ fn assert_typed(rejection: &Rejection) -> &'static str {
         // The seam resolves no store, so this is unreachable by construction.
         Rejection::Unavailable => panic!("the stateless seam reported a store as unavailable"),
     }
+}
+
+/// Stored publication documents are raw bytes. Human-reviewable manifest seeds
+/// use this prefix followed by lowercase hex because deterministic CBOR begins
+/// with non-UTF-8 bytes; arbitrary inputs without the prefix reach both parsers
+/// unchanged.
+const MANIFEST_HEX_PREFIX: &[u8] = b"manifest-hex:";
+const HEAD_JSON_PREFIX: &[u8] = b"head-json:";
+const OVERSIZED_MANIFEST_SENTINEL: &[u8] = b"manifest-oversized";
+
+fn publication_payload(data: &[u8]) -> Cow<'_, [u8]> {
+    if strip_seed_line_ending(data) == OVERSIZED_MANIFEST_SENTINEL {
+        return Cow::Owned(vec![0; axond_fuzz_seam::PUBLICATION_MANIFEST_MAX_BYTES + 1]);
+    }
+    if let Some(json) = data.strip_prefix(HEAD_JSON_PREFIX) {
+        return Cow::Borrowed(strip_seed_line_ending(json));
+    }
+    let Some(hex) = data.strip_prefix(MANIFEST_HEX_PREFIX) else {
+        return Cow::Borrowed(data);
+    };
+    let hex = strip_seed_line_ending(hex);
+    if !hex.len().is_multiple_of(2) {
+        return Cow::Borrowed(data);
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let Some(decoded) = hex
+        .chunks_exact(2)
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Cow::Borrowed(data);
+    };
+    Cow::Owned(decoded)
+}
+
+fn strip_seed_line_ending(data: &[u8]) -> &[u8] {
+    data.strip_suffix(b"\n")
+        .map(|data| data.strip_suffix(b"\r").unwrap_or(data))
+        .unwrap_or(data)
+}
+
+fn stored_document_class(
+    accepted: &'static str,
+    result: &Result<(), axond_fuzz_seam::StoredDocumentRejection>,
+) -> &'static str {
+    match result {
+        Ok(()) => accepted,
+        Err(rejection) => {
+            assert!(
+                !rejection.code.is_empty(),
+                "stored-document refusal has no code"
+            );
+            assert!(
+                !rejection.message.is_empty(),
+                "stored-document refusal has no message"
+            );
+            rejection.code
+        }
+    }
+}
+
+/// Untrusted object-store bytes: the bounded canonical head JSON parser and the
+/// hand-written deterministic CBOR revision-manifest parser.
+pub fn publication_parsers(data: &[u8]) -> Vec<&'static str> {
+    let payload = publication_payload(data);
+    let head = axond_fuzz_seam::publication_head_document(&payload);
+    let manifest = axond_fuzz_seam::publication_revision_manifest(&payload);
+    assert_eq!(
+        head,
+        axond_fuzz_seam::publication_head_document(&payload),
+        "the same environment head bytes were accepted and refused"
+    );
+    assert_eq!(
+        manifest,
+        axond_fuzz_seam::publication_revision_manifest(&payload),
+        "the same revision manifest bytes were accepted and refused"
+    );
+    if payload.len() > axond_fuzz_seam::PUBLICATION_HEAD_MAX_BYTES {
+        assert!(
+            matches!(&head, Err(error) if error.code == "head_oversized"),
+            "an oversized head bypassed its explicit bound: {head:?}"
+        );
+    }
+    if payload.len() > axond_fuzz_seam::PUBLICATION_MANIFEST_MAX_BYTES {
+        assert!(
+            matches!(&manifest, Err(error) if error.code == "manifest_oversized"),
+            "an oversized manifest bypassed its explicit bound: {manifest:?}"
+        );
+    }
+    vec![
+        stored_document_class("head_accepted", &head),
+        stored_document_class("manifest_accepted", &manifest),
+    ]
 }
 
 /// Untrusted configuration text: what an operator's file, a mounted ConfigMap,

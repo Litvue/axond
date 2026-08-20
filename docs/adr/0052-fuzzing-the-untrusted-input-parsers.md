@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-Axond parses input it does not control on two paths. An operator's TOML is parsed
+Axond parses input it does not control on several paths. An operator's TOML is parsed
 at boot and again on every reload ([ADR 0011](./0011-config-hot-reload.md)), and a
 caller's credential and query string are parsed on every request before anything
 authenticates them ([ADR 0013](./0013-inbound-auth-fails-closed.md),
@@ -20,7 +20,8 @@ denial of service on a request that was never entitled to anything.
 
 [ADR 0014](./0014-compatibility-and-soak-harness.md) built the harness for what
 the *process* does with well-formed traffic. This is the other axis: what a
-parser does with traffic that is not.
+parser does with bytes that are not trusted, including provider, catalogue, and
+durable object-store bytes added to the program after this ADR was accepted.
 
 Coverage-guided fuzzing does not fit the shape of the existing CI. It needs a
 nightly toolchain and sanitizer runtimes, its dependencies are not ones the
@@ -29,9 +30,11 @@ the opposite of what a required pull-request lane can be.
 
 ## Decision
 
-A fuzzing program in two halves, over three targets: `Config::from_toml_str` plus
-its validation graph, `axt1.` token verification, and the credential-query
-parser.
+A fuzzing program in two halves over every registered untrusted-input parser.
+The initial targets were `Config::from_toml_str` plus its validation graph,
+`axt1.` token verification, and the credential-query parser. Provider wire,
+catalogue import, and object-store publication-document parsers use the same
+required replay and scheduled coverage-guided contract as they are added.
 
 ### An out-of-tree workspace, not a workspace member
 
@@ -60,6 +63,8 @@ pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection>
 pub fn credentials_query_namespaces(q: Option<&str>) -> Result<Option<String>, Rejection>
 pub fn verify_token(credential: &str) -> Result<Option<VerifiedToken>, Rejection>
 pub fn catalog_import_over_seed(payload: &[u8], etag: Option<&str>) -> CatalogAdmission
+pub fn publication_head_document(input: &[u8]) -> Result<(), StoredDocumentRejection>
+pub fn publication_revision_manifest(input: &[u8]) -> Result<(), StoredDocumentRejection>
 ```
 
 The catalogue entry point is the shape the rest follow as coverage grows: the

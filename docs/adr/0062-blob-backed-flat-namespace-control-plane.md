@@ -213,6 +213,16 @@ idempotency table or imperative ID allocator; retained history is the initial
 index, and any future compaction must first add immutable idempotency
 checkpoints.
 
+The initial parent walk has an explicit configured revision bound. Until
+immutable idempotency checkpoints ship, that bound must cover the complete
+reachable chain for a genuinely new key: if a parent remains after the bound is
+consumed, the publisher reports the history as exhausted and refuses the novel
+mutation. It never treats the unsearched prefix as proof that a key is absent or
+falls back to an unbounded walk. An exact replay found inside the bounded window
+still returns its original result. Operators must monitor this status and size
+the bound above retained history; garbage collection alone cannot shorten the
+linked chain without a checkpoint.
+
 Rollback publishes a new revision whose resources reproduce an earlier desired
 state. It never rewinds the sequence or edits history. Successful-mutation
 audit is inside the signed, parent-linked revision chain and becomes visible at

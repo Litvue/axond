@@ -1,11 +1,12 @@
 # Fuzzing
 
-Axond parses input it does not control on four paths: an operator's
+Axond parses input it does not control on five paths: an operator's
 configuration file at boot and on every reload, a caller's credential and query
 string on every request, everything a *provider* sends back — the SSE stream
 relayed to a tenant byte for byte and the failure body an error response is
-classified from — and the models.dev catalogue a background refresh imports
-unattended. All four are fuzzed continuously — a scheduled
+classified from — the models.dev catalogue a background refresh imports
+unattended, and durable publication documents read from object storage. All five
+are fuzzed continuously — a scheduled
 coverage-guided run for exploration, and a bounded deterministic replay on every
 pull request so the result is required CI evidence rather than a dashboard
 nobody reads.
@@ -28,6 +29,7 @@ feature, and what that costs.
 | `provider_stream` | The provider stream decoders: OpenAI chat and Responses, Azure AI Foundry, Anthropic translated into OpenAI chunks, and a native Anthropic relay | Every streamed response, once framed |
 | `provider_error` | `ProviderError::from_upstream` and `ProviderError::transport`, and the classification, retry, and health judgements built on them | Every non-2xx or failed upstream call |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission over the last-known-good catalogue | The scheduled catalogue refresh, unattended |
+| `publication_parsers` | `HeadDocument::decode` and the deterministic CBOR revision-manifest decoder | Stateful convergence and administrative publication read durable object-store bytes |
 
 Every target asserts the same three properties, because they are what the
 gateway relies on.
@@ -127,6 +129,19 @@ run against a document a third party publishes:
   modality, nothing a caller can mistake for an observed answer. A *stated*
   wrapper of the wrong shape is still a refusal, and the fuzz corpus carries
   both shapes so a future default cannot appear unnoticed.
+
+The publication target drives the production parsers for both mutable head JSON
+and immutable revision-manifest CBOR. It requires deterministic outcomes,
+non-empty typed refusals, accepted canonical fixtures, explicit oversized
+refusals, and the schema, integrity, sequence, CBOR-length, and object-count
+bounds. Manifest corpus files use a documented `manifest-hex:` envelope so the
+committed seed remains reviewable even though valid deterministic CBOR begins
+with non-UTF-8 bytes; canonical JSON uses `head-json:` so the corpus line ending
+is not treated as stored content. The harness removes those envelopes before
+invoking the real parsers, while arbitrary fuzzer bytes reach both unchanged.
+The committed `manifest-oversized` sentinel expands under the smoke allocator
+cap to one byte beyond the 1 MiB production ceiling, which the general 64 KiB
+seed derivation cannot reach.
 
 Runs are hermetic: the seam the targets call builds its verifiers from a
 configuration compiled into the binary with synthetic key material, so a fuzz run

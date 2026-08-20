@@ -143,7 +143,8 @@ pub use providers::{PROVIDER_SCHEMA, Provider, ProviderBody, ProviderError, Prov
 #[allow(unused_imports)]
 pub use publication::{
     BlobPublication, BlobPublicationError, BlobPublicationRequest, EnvironmentId, ExpectedHead,
-    HeadDocument, ImmutableObject, ImmutableObjectKind, PublicationOutcome,
+    HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus, ImmutableObject,
+    ImmutableObjectKind, PublicationOutcome,
 };
 #[allow(unused_imports)]
 pub use resource::{

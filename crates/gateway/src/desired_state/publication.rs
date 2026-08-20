@@ -332,6 +332,8 @@ pub enum RevisionManifestError {
     SequenceMismatch { expected: u64, actual: u64 },
     #[error("revision manifest sequence 1 must not name a parent")]
     ParentBeforeFirstSequence,
+    #[error("revision manifest sequence {sequence} must name its preceding revision")]
+    MissingParentAfterFirstSequence { sequence: u64 },
     #[error(
         "revision manifest contains {observed} object references, over the {limit}-object limit"
     )]
@@ -608,6 +610,52 @@ pub struct PublicationOutcome {
     pub replayed: bool,
 }
 
+/// The maximum number of retained manifests one publication may inspect for an
+/// idempotency key.
+///
+/// This is an availability bound as well as a resource bound. Until immutable
+/// idempotency checkpoints exist, a novel key is publishable only while the
+/// complete reachable history fits inside this limit. If a parent remains
+/// after the limit is consumed, publication fails closed with
+/// [`BlobPublicationError::HistoryLimitExceeded`]. Exact replays found inside
+/// the bounded window still succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdempotencyHistoryLimit(NonZeroUsize);
+
+impl IdempotencyHistoryLimit {
+    pub const fn new(revisions: NonZeroUsize) -> Self {
+        Self(revisions)
+    }
+
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+/// Whether the retained chain can be searched completely under the configured
+/// idempotency bound.
+///
+/// Operators can inspect this before admitting administrative mutations. An
+/// exhausted status means every genuinely novel mutation will be refused; it
+/// does not authorize pruning or an unbounded fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotencyHistoryStatus {
+    Searchable {
+        retained_revisions: usize,
+        limit: IdempotencyHistoryLimit,
+    },
+    Exhausted {
+        inspected_revisions: usize,
+        limit: IdempotencyHistoryLimit,
+    },
+}
+
+impl IdempotencyHistoryStatus {
+    pub const fn permits_novel_publication(self) -> bool {
+        matches!(self, Self::Searchable { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BlobPublicationError {
     #[error(transparent)]
@@ -654,7 +702,7 @@ struct ReadHead {
 /// Provider-neutral immutable publisher over an [`ObjectStore`].
 pub struct BlobPublication<S> {
     store: Arc<S>,
-    history_limit: NonZeroUsize,
+    history_limit: IdempotencyHistoryLimit,
 }
 
 impl<S> Clone for BlobPublication<S> {
@@ -667,11 +715,56 @@ impl<S> Clone for BlobPublication<S> {
 }
 
 impl<S: ObjectStore> BlobPublication<S> {
-    pub fn new(store: Arc<S>, history_limit: NonZeroUsize) -> Self {
+    pub fn new(store: Arc<S>, history_limit: IdempotencyHistoryLimit) -> Self {
         Self {
             store,
             history_limit,
         }
+    }
+
+    pub const fn history_limit(&self) -> IdempotencyHistoryLimit {
+        self.history_limit
+    }
+
+    /// Report whether the complete retained history fits inside the configured
+    /// idempotency-search bound.
+    ///
+    /// This reads at most [`Self::history_limit`] manifests. Corrupt, missing,
+    /// or unavailable history remains an error; exhaustion is a normal public
+    /// status so an administrative surface can expose it before accepting a
+    /// novel mutation.
+    pub async fn idempotency_history_status(
+        &self,
+        environment: &EnvironmentId,
+    ) -> Result<IdempotencyHistoryStatus, BlobPublicationError> {
+        let head = self.read_head(environment).await?;
+        let mut revision = head
+            .as_ref()
+            .map(|head| (head.document.active_revision, head.document.sequence));
+        let limit = self.history_limit.get();
+        let mut inspected = 0;
+        while inspected < limit {
+            let Some((digest, expected_sequence)) = revision else {
+                return Ok(IdempotencyHistoryStatus::Searchable {
+                    retained_revisions: inspected,
+                    limit: self.history_limit,
+                });
+            };
+            let manifest = self.read_manifest(digest).await?;
+            inspected += 1;
+            revision = Self::verified_parent(&manifest, expected_sequence)?;
+        }
+        Ok(if revision.is_some() {
+            IdempotencyHistoryStatus::Exhausted {
+                inspected_revisions: inspected,
+                limit: self.history_limit,
+            }
+        } else {
+            IdempotencyHistoryStatus::Searchable {
+                retained_revisions: inspected,
+                limit: self.history_limit,
+            }
+        })
     }
 
     pub async fn publish(
@@ -821,13 +914,7 @@ impl<S: ObjectStore> BlobPublication<S> {
                 return Ok(None);
             };
             let manifest = self.read_manifest(digest).await?;
-            if manifest.sequence != expected_sequence {
-                return Err(RevisionManifestError::SequenceMismatch {
-                    expected: expected_sequence,
-                    actual: manifest.sequence,
-                }
-                .into());
-            }
+            let parent = Self::verified_parent(&manifest, expected_sequence)?;
             if manifest.idempotency_key == *key {
                 if manifest.desired_state_checksum != desired_state_checksum {
                     return Err(BlobPublicationError::IdempotencyKeyReuse { key: key.clone() });
@@ -838,18 +925,36 @@ impl<S: ObjectStore> BlobPublication<S> {
                     replayed: true,
                 }));
             }
-            revision = match manifest.parent {
-                Some(_) if manifest.sequence == 1 => {
-                    return Err(RevisionManifestError::ParentBeforeFirstSequence.into());
-                }
-                Some(parent) => Some((parent, manifest.sequence - 1)),
-                None => None,
-            };
+            revision = parent;
         }
         if revision.is_some() {
             Err(BlobPublicationError::HistoryLimitExceeded { limit })
         } else {
             Ok(None)
+        }
+    }
+
+    fn verified_parent(
+        manifest: &BlobRevisionManifest,
+        expected_sequence: u64,
+    ) -> Result<Option<(Checksum, u64)>, BlobPublicationError> {
+        if manifest.sequence != expected_sequence {
+            return Err(RevisionManifestError::SequenceMismatch {
+                expected: expected_sequence,
+                actual: manifest.sequence,
+            }
+            .into());
+        }
+        match manifest.parent {
+            Some(_) if manifest.sequence == 1 => {
+                Err(RevisionManifestError::ParentBeforeFirstSequence.into())
+            }
+            Some(parent) => Ok(Some((parent, manifest.sequence - 1))),
+            None if manifest.sequence == 1 => Ok(None),
+            None => Err(RevisionManifestError::MissingParentAfterFirstSequence {
+                sequence: manifest.sequence,
+            }
+            .into()),
         }
     }
 
@@ -938,6 +1043,52 @@ impl<S: ObjectStore> BlobPublication<S> {
     }
 }
 
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_decode_head(bytes: &[u8]) -> Result<(), (&'static str, String)> {
+    HeadDocument::decode(bytes).map(|_| ()).map_err(|error| {
+        let code = match &error {
+            HeadDocumentError::Oversized { .. } => "head_oversized",
+            HeadDocumentError::Malformed => "head_malformed",
+            HeadDocumentError::UnknownSchema { .. } => "head_unknown_schema",
+            HeadDocumentError::InvalidDigest { .. } => "head_invalid_digest",
+            HeadDocumentError::ZeroSequence => "head_zero_sequence",
+            HeadDocumentError::UnknownIntegrityAlgorithm { .. } => {
+                "head_unknown_integrity_algorithm"
+            }
+            HeadDocumentError::InvalidIntegrityDigest { .. } => "head_invalid_integrity_digest",
+            HeadDocumentError::IntegrityMismatch => "head_integrity_mismatch",
+            HeadDocumentError::NonCanonical => "head_non_canonical",
+        };
+        (code, error.to_string())
+    })
+}
+
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_decode_revision_manifest(bytes: &[u8]) -> Result<(), (&'static str, String)> {
+    BlobRevisionManifest::decode(bytes)
+        .map(|_| ())
+        .map_err(|error| {
+            let code = match &error {
+                RevisionManifestError::Oversized { .. } => "manifest_oversized",
+                RevisionManifestError::Malformed => "manifest_malformed",
+                RevisionManifestError::UnknownSchema { .. } => "manifest_unknown_schema",
+                RevisionManifestError::InvalidIdempotencyKey { .. } => {
+                    "manifest_invalid_idempotency_key"
+                }
+                RevisionManifestError::ZeroSequence => "manifest_zero_sequence",
+                RevisionManifestError::SequenceMismatch { .. } => "manifest_sequence_mismatch",
+                RevisionManifestError::ParentBeforeFirstSequence => {
+                    "manifest_parent_before_first_sequence"
+                }
+                RevisionManifestError::MissingParentAfterFirstSequence { .. } => {
+                    "manifest_missing_parent_after_first_sequence"
+                }
+                RevisionManifestError::TooManyObjects { .. } => "manifest_too_many_objects",
+            };
+            (code, error.to_string())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -988,7 +1139,10 @@ mod tests {
     }
 
     fn publisher<S: ObjectStore>(store: Arc<S>) -> BlobPublication<S> {
-        BlobPublication::new(store, NonZeroUsize::new(32).expect("non-zero history"))
+        BlobPublication::new(
+            store,
+            IdempotencyHistoryLimit::new(NonZeroUsize::new(32).expect("non-zero history")),
+        )
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1244,6 +1398,36 @@ mod tests {
         assert!(matches!(
             HeadDocument::decode(&vec![b'x'; MAX_HEAD_DOCUMENT_BYTES + 1]),
             Err(HeadDocumentError::Oversized { .. })
+        ));
+    }
+
+    #[test]
+    fn revision_parent_shape_fails_closed_at_both_sequence_boundaries() {
+        let manifest = |parent, sequence| BlobRevisionManifest {
+            parent,
+            sequence,
+            idempotency_key: IdempotencyKey::parse("shape-check").expect("valid key"),
+            desired_state_checksum: Checksum::of(b"state"),
+            objects: Vec::new(),
+        };
+        let before_first = BlobPublication::<InMemoryObjectStore>::verified_parent(
+            &manifest(Some(Checksum::of(b"impossible-parent")), 1),
+            1,
+        )
+        .expect_err("sequence one cannot have a parent");
+        assert!(matches!(
+            before_first,
+            BlobPublicationError::Manifest(RevisionManifestError::ParentBeforeFirstSequence)
+        ));
+
+        let missing =
+            BlobPublication::<InMemoryObjectStore>::verified_parent(&manifest(None, 2), 2)
+                .expect_err("later sequences must link to their predecessor");
+        assert!(matches!(
+            missing,
+            BlobPublicationError::Manifest(
+                RevisionManifestError::MissingParentAfterFirstSequence { sequence: 2 }
+            )
         ));
     }
 
@@ -1513,7 +1697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_history_exhaustion_fails_closed() {
+    async fn bounded_history_exhaustion_is_visible_and_fails_novel_writes_closed() {
         let store = Arc::new(InMemoryObjectStore::new(limits()));
         let full = publisher(Arc::clone(&store));
         let first = full
@@ -1528,6 +1712,23 @@ mod tests {
             )
             .await
             .expect("first");
+        let bounded = BlobPublication::new(
+            Arc::clone(&store),
+            IdempotencyHistoryLimit::new(NonZeroUsize::new(1).expect("non-zero history")),
+        );
+        let searchable = bounded
+            .idempotency_history_status(&environment())
+            .await
+            .expect("history at its exact bound remains searchable");
+        assert_eq!(
+            searchable,
+            IdempotencyHistoryStatus::Searchable {
+                retained_revisions: 1,
+                limit: bounded.history_limit(),
+            }
+        );
+        assert!(searchable.permits_novel_publication());
+
         let second = full
             .publish(
                 &environment(),
@@ -1541,10 +1742,35 @@ mod tests {
             .await
             .expect("second");
 
-        let bounded = BlobPublication::new(
-            Arc::clone(&store),
-            NonZeroUsize::new(1).expect("non-zero history"),
+        assert_eq!(bounded.history_limit().get(), 1);
+        let status = bounded
+            .idempotency_history_status(&environment())
+            .await
+            .expect("history status");
+        assert_eq!(
+            status,
+            IdempotencyHistoryStatus::Exhausted {
+                inspected_revisions: 1,
+                limit: bounded.history_limit(),
+            }
         );
+        assert!(!status.permits_novel_publication());
+
+        let replay = bounded
+            .publish(
+                &environment(),
+                request(
+                    ExpectedHead::Empty,
+                    "two",
+                    b"state-2",
+                    immutable(b"namespace-2"),
+                ),
+            )
+            .await
+            .expect("an exact replay inside the window remains available");
+        assert_eq!(replay.revision, second.revision);
+        assert!(replay.replayed);
+
         let error = bounded
             .publish(
                 &environment(),

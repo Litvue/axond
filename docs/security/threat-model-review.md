@@ -520,6 +520,14 @@ assumed: a hand-applied database missing one table's `FORCE ROW LEVEL SECURITY` 
 one `..._isolation` policy is refused by name, so adoption cannot record a history
 whose tenant isolation is not actually in place.
 
+Blob publication formats are held by
+`head_documents_are_deterministic_bounded_and_strict`,
+`bounded_history_exhaustion_is_visible_and_fails_novel_writes_closed`, and the
+`publication_parsers` committed fuzz corpus. Object-store bytes are untrusted on
+read: unknown schemas, malformed or non-canonical encodings, invalid integrity,
+oversized documents, impossible sequence links, and excessive object counts are
+typed fail-closed refusals rather than recovery defaults.
+
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),
 [ADR 0049](../adr/0049-billing-grade-usage-outbox.md),
