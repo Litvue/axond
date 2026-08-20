@@ -636,6 +636,7 @@ impl SharedSettings {
                 budget: Some(caps),
                 concurrency: None,
                 generation: None,
+                static_only: false,
             }),
             unavailable,
         }
@@ -645,8 +646,10 @@ impl SharedSettings {
         self.namespace_scope
     }
 
-    /// The caps governing `namespace` and the generation that stated them, or
-    /// `None` when this replica holds no enforceable policy for it.
+    /// The caps governing `namespace` and the generation that stated them.
+    /// `Some` with `caps = None` is an intentional flat-v2 static-only
+    /// namespace, which bypasses exact budget enforcement. `None` still means
+    /// that a projected namespace has no policy document and must be denied.
     ///
     /// A store that cannot answer "what is the cap here" must not admit: an
     /// unenforced cap and an infinite one are indistinguishable to a caller, and
@@ -663,6 +666,12 @@ impl SharedSettings {
     /// the same backend and the two denials are different operator problems.
     pub(crate) fn caps(&self, store: &'static str, namespace: &str) -> Option<Governing> {
         let policy = self.ceilings.active(namespace);
+        if policy.is_static_only() {
+            return Some(Governing {
+                caps: None,
+                generation: None,
+            });
+        }
         let Some(caps) = policy.budget else {
             // Every one of these denials is counted; the explanation is sampled,
             // because the condition belongs to the published view and repeating
@@ -691,7 +700,7 @@ impl SharedSettings {
             return None;
         }
         Some(Governing {
-            caps,
+            caps: Some(caps),
             generation: policy.generation,
         })
     }
@@ -702,7 +711,7 @@ impl SharedSettings {
 /// caps never bound it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Governing {
-    pub(crate) caps: BudgetCaps,
+    pub(crate) caps: Option<BudgetCaps>,
     pub(crate) generation: Option<PolicyGeneration>,
 }
 
@@ -1059,7 +1068,7 @@ mod tests {
         let first = settings
             .caps(crate::policy::ungoverned::BUDGET_REDIS, "acme/core")
             .expect("the namespace is governed");
-        assert_eq!(first.caps.subject_microdollars, 1_000);
+        assert_eq!(first.caps.expect("governed").subject_microdollars, 1_000);
         assert_eq!(
             first.generation,
             Some(generation(&published_body(1_000, 1), 1))
@@ -1070,7 +1079,7 @@ mod tests {
             .expect("the namespace is governed");
         // The caps and the generation stamped on the hold come from one read, so
         // they always name each other.
-        assert_eq!(second.caps.subject_microdollars, 9_000);
+        assert_eq!(second.caps.expect("governed").subject_microdollars, 9_000);
         assert_eq!(
             second.generation,
             Some(generation(&published_body(9_000, 2), 2))
@@ -1109,6 +1118,27 @@ mod tests {
                 .caps(crate::policy::ungoverned::BUDGET_REDIS, "acme/core")
                 .is_none()
         );
+
+        let static_only = crate::policy::PolicyView::of(&crate::config::Config {
+            namespace: vec![crate::config::Namespace {
+                id: "static-only".to_owned(),
+                default: true,
+                allow_platform_fallback: false,
+                project: None,
+                policy: None,
+                static_policy: Some(crate::config::NamespaceStaticPolicy::default()),
+            }],
+            ..crate::policy::view::tests::stateful_config()
+        });
+        let settings = SharedSettings {
+            ceilings: Ceilings::fixed(static_only.policy("static-only")),
+            namespace_scope: false,
+            unavailable: UnavailablePolicy::Deny,
+        };
+        let governing = settings
+            .caps(crate::policy::ungoverned::BUDGET_REDIS, "static-only")
+            .expect("static-only explicitly bypasses exact budget enforcement");
+        assert!(governing.caps.is_none());
     }
 
     #[tokio::test(start_paused = true)]

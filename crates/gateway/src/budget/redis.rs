@@ -844,7 +844,9 @@ impl BudgetStore for RedisBudget {
         let Some(governing) = self.settings.caps(POLICY_STORE, &key.namespace) else {
             return Admission::Denied(Denial::StoreUnavailable);
         };
-        let caps = governing.caps;
+        let Some(caps) = governing.caps else {
+            return Admission::Allowed(Reservation::unheld());
+        };
         let reservation = Reservation {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,

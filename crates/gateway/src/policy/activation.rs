@@ -831,6 +831,37 @@ mod tests {
     }
 
     #[test]
+    fn mixed_flat_static_only_and_exact_namespaces_use_shared_backends_selectively() {
+        let mut mixed = stateful_config();
+        mixed.rate_limit.backend = RateLimitBackend::Redis;
+        mixed.rate_limit.dsn_env = Some("GW_RATE_LIMIT_REDIS".to_owned());
+        mixed.namespace.push(crate::config::Namespace {
+            id: "static-only".to_owned(),
+            default: true,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+            static_policy: Some(crate::config::NamespaceStaticPolicy::default()),
+        });
+        let exact = body(PolicyScope::Namespace(resource_id(92)), 1, 1_000);
+        mixed.namespace.push(crate::config::Namespace {
+            id: "exact".to_owned(),
+            default: false,
+            allow_platform_fallback: false,
+            project: None,
+            policy: Some(NamespacePolicy {
+                body: exact.clone(),
+                generation: generation(&exact, 1),
+            }),
+            static_policy: Some(crate::config::NamespaceStaticPolicy::default()),
+        });
+
+        let activation = plan(&empty(), &PolicyView::of(&mixed), shared())
+            .expect("a shared backend is required only by the exact namespace");
+        assert_eq!(activation.live(), [PolicyScope::Namespace(resource_id(92))]);
+    }
+
+    #[test]
     fn a_document_withdrawn_from_a_namespace_that_is_still_served_is_refused() {
         let document = body(scope(), 1, 1_000);
         let mut without = stateful_config();

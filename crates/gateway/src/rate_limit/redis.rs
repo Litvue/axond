@@ -430,6 +430,7 @@ impl RedisRateLimiter {
                     lease_ttl,
                 }),
                 generation: None,
+                static_only: false,
             }),
             timeout,
             on_unavailable,
@@ -552,6 +553,9 @@ impl RateLimiter for RedisRateLimiter {
         // runs to completion on these terms even if a publication lands while it
         // is held, and it is counted against the generation that stated them.
         let active = self.ceilings.active(&key.namespace);
+        if active.is_static_only() {
+            return Ok(RateLimitPermit::no_limit());
+        }
         let Some(caps) = active.concurrency else {
             // Sampled, not per request: the namespace is ungoverned until a
             // publication governs it, so the log would otherwise grow with the

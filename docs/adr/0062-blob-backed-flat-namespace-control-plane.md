@@ -329,9 +329,12 @@ request journaling. The blob-only deployment supports static namespace policy,
 per-replica admission, revisioned token epochs, and usage attribution, but not
 an implied exact fleet-wide counter. A namespace therefore carries static
 policy independently of an optional exact-enforcement block. Omitting exact
-enforcement activates on the blob-only topology. Requesting exact spend and
-concurrency caps preserves the existing fail-closed backend and storage-layout
-checks and is refused unless configured shared backends enforce every value.
+enforcement activates on the blob-only topology, even when another namespace
+in the same process uses an optional shared exact backend; the shared budget and
+lease stores bypass that namespace rather than treating its absent document as
+an ungoverned failure. Requesting exact spend and concurrency caps preserves
+the existing fail-closed backend and storage-layout checks and is refused unless
+configured shared backends enforce every value for that exact namespace.
 
 The following remain optional responsibility-specific backends:
 
