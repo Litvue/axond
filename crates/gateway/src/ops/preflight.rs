@@ -5,9 +5,11 @@
 //! not: the listener is already gone, the old replica is already terminating, and
 //! the operator finds out from a crash loop. Most checks here are ones a boot
 //! performs anyway — the config parses and validates, the references it makes
-//! resolve, the control-plane database answers, and its schema is the one this
-//! build writes — run in the order a boot would hit them and reported all at once
-//! rather than one per restart.
+//! resolve, and a selectable runtime backend answers its own compatibility
+//! checks — run in the order a boot would hit them and reported all at once rather
+//! than one per restart. A configuration-only backend whose runtime is not yet
+//! selectable fails the serving-posture check and never falls through to another
+//! backend's connectivity requirements.
 //!
 //! One is stricter than boot on purpose: `Config::load` does not look at the
 //! config file's ownership or mode, and this command fails a config another
@@ -33,6 +35,7 @@ use super::{
     CONTROL_PLANE, control_plane, control_plane_dsn_env, control_plane_error, dsn,
     open_control_plane,
 };
+use crate::backends::control_plane::ControlPlaneBackend;
 use crate::backends::control_plane::schema::{self, SchemaStatus};
 use crate::config::{
     BudgetBackend, Config, Mode, RateLimitBackend, RevocationBackend, UsageSinkKind,
@@ -169,6 +172,19 @@ pub async fn run(config: &Config, config_path: &Path, env: &HashMap<String, Stri
 /// key set, while this command catches an incomplete bootstrap before rollout.
 fn check_serving_posture(report: &mut Report, config: &Config) {
     if config.mode == Mode::Stateless {
+        return;
+    }
+    if config
+        .control_plane
+        .as_ref()
+        .is_some_and(|control_plane| control_plane.backend == ControlPlaneBackend::ObjectStorage)
+    {
+        report.failed(
+            "serving",
+            "the object-storage configuration contract is valid, but blob-backed serving, \
+             publication, convergence, and encrypted-secret runtime wiring are not implemented; \
+             configuration validation alone is not deployment readiness",
+        );
         return;
     }
     let complete_cache = matches!(
@@ -308,7 +324,11 @@ fn check_file_ownership(report: &mut Report, path: &Path) {
 /// be the failure this command exists to catch.
 fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, String>) {
     let mut references: Vec<(String, Reference)> = Vec::new();
-    if let Some(control_plane) = config.control_plane.as_ref() {
+    if let Some(control_plane) = config
+        .control_plane
+        .as_ref()
+        .filter(|control_plane| control_plane.backend == ControlPlaneBackend::Postgres)
+    {
         references.push((
             "[control_plane] dsn_env".to_owned(),
             Reference::Env(control_plane_dsn_env(control_plane)),
@@ -548,6 +568,13 @@ async fn check_control_plane(report: &mut Report, config: &Config, env: &HashMap
         report.skipped(COMPATIBILITY, reason);
         return;
     };
+    if control_plane.backend == ControlPlaneBackend::ObjectStorage {
+        let reason = "the object-storage backend has no relational database or schema; its runtime \
+                      preflight lands with the selectable adapter";
+        report.skipped(CONNECTIVITY, reason);
+        report.skipped(COMPATIBILITY, reason);
+        return;
+    }
     let dsn_env = control_plane_dsn_env(control_plane);
     // Resolved separately from the connection so an unset variable is reported as
     // the reference problem it is, rather than as a failure to connect.
@@ -606,6 +633,19 @@ mod tests {
     use crate::desired_state::Checksum;
     use crate::ops::tests::{stateful_toml, stateless_toml};
     use base64::Engine;
+
+    const BLOB_STATEFUL: &str = r#"
+mode = "stateful"
+
+[control_plane]
+backend = "object-storage"
+environment_id = "prod-us-east"
+container_url = "https://axondstate.blob.core.windows.net/control-plane"
+authentication = "workload-identity"
+
+[[admin_breakglass]]
+env = "GW_BREAKGLASS"
+"#;
 
     /// Fixtures use the temp directory directly, the way the rest of this crate's
     /// file-backed tests do: no dev-dependency is added for a config file.
@@ -820,6 +860,59 @@ mod tests {
             !report.checks.iter().any(|check| check.name == "serving"),
             "stateless mode has no such refusal to report: {report}"
         );
+    }
+
+    #[tokio::test]
+    async fn blob_preflight_never_requests_postgres_or_claims_runtime_readiness() {
+        let path = write("axond-blob.toml", BLOB_STATEFUL);
+        let config = Config::from_toml_str(BLOB_STATEFUL).expect("valid blob contract");
+        let env = HashMap::from([("GW_BREAKGLASS".to_owned(), "breakglass-material".to_owned())]);
+        let report = run(&config, &path, &env).await;
+        assert!(
+            !report.is_ok(),
+            "pending runtime wiring must fail closed: {report}"
+        );
+
+        let serving = report
+            .checks
+            .iter()
+            .find(|check| check.name == "serving")
+            .expect("serving posture is reported");
+        assert!(
+            matches!(
+                &serving.outcome,
+                Outcome::Failed(detail)
+                    if detail.contains("not implemented")
+                        && detail.contains("not deployment readiness")
+            ),
+            "blob config must not be reported as serving-ready: {serving}"
+        );
+
+        let references = report
+            .checks
+            .iter()
+            .find(|check| check.name == "bootstrap references")
+            .expect("bootstrap references are reported");
+        assert!(
+            matches!(references.outcome, Outcome::Passed(_)),
+            "the blob contract has no Postgres reference to resolve: {references}"
+        );
+        for name in ["control-plane database", "control-plane schema"] {
+            let check = report
+                .checks
+                .iter()
+                .find(|check| check.name == name)
+                .expect("legacy relational checks remain explicitly accounted for");
+            assert!(
+                matches!(check.outcome, Outcome::Skipped(_)),
+                "object storage must not run a relational check: {check}"
+            );
+        }
+
+        let rendered = report.to_string();
+        assert!(!rendered.contains("dsn_env"), "{rendered}");
+        assert!(!rendered.contains("GW_CONTROL_PLANE_DSN"), "{rendered}");
+        assert!(!rendered.contains("breakglass-material"), "{rendered}");
     }
 
     #[tokio::test]

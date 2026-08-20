@@ -22,7 +22,7 @@ pub struct NamespaceId(String);
 ///
 /// Refused text is never rendered. Namespace input reaches HTTP errors and log
 /// lines, and a secret pasted into the path must not be echoed back.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidNamespaceId {
     #[error("a namespace identifier must not be empty")]
     Empty,
@@ -38,6 +38,12 @@ pub enum InvalidNamespaceId {
     Character { value: String },
     #[error("a namespace identifier must start and end with an ASCII letter or digit")]
     Boundary { value: String },
+}
+
+impl fmt::Debug for InvalidNamespaceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InvalidNamespaceId(<redacted>)")
+    }
 }
 
 impl NamespaceId {
@@ -245,6 +251,7 @@ mod tests {
         let material = "sk-live-0123456789abcdefghij/secret";
         let error = NamespaceId::parse(material).expect_err("slash is refused");
         assert!(!error.to_string().contains(material));
+        assert!(!format!("{error:?}").contains(material));
     }
 
     #[test]

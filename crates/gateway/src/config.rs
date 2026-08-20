@@ -25,6 +25,7 @@ use crate::aliases::AliasScope;
 use crate::backends::catalog::{InvalidCatalogId, ProviderId};
 use crate::backends::catalog_refresh::{Bootstrap, RefreshSchedule};
 use crate::backends::catalog_store::postgres::CatalogStoreSettings;
+use crate::backends::control_plane::ControlPlaneBackend;
 use crate::convergence::backoff::BackoffPolicy;
 use crate::desired_state::policy::{
     BufferedResponseRoute, ContentMiddlewareRegistration, PolicyBody, PolicyGeneration,
@@ -43,8 +44,8 @@ pub struct Config {
     pub mode: Mode,
     #[serde(default)]
     pub server: Server,
-    /// Stateful bootstrap: the control-plane database's connection *reference*.
-    /// Required by `mode = "stateful"`, rejected in stateless mode.
+    /// Stateful bootstrap: the durable backend's discriminated connection
+    /// contract. Required by `mode = "stateful"`, rejected in stateless mode.
     #[serde(default)]
     pub control_plane: Option<ControlPlane>,
     /// Stateful convergence and its authenticated local last-known-good cache.
@@ -166,9 +167,8 @@ pub enum Mode {
     /// The default, and what every configuration written so far means.
     #[default]
     Stateless,
-    /// A durable Postgres control plane owns tenants, identities, providers,
-    /// credentials, catalogues, prices, aliases, and policy; bootstrap TOML
-    /// shrinks to what a process needs before it can read anything else.
+    /// A durable control plane owns the revisioned serving resources; bootstrap
+    /// TOML shrinks to what a process needs before it can read anything else.
     Stateful,
 }
 
@@ -255,6 +255,149 @@ fn validate_schema_name(key: &str, schema: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// ADR 0062 environment identifiers are object-key segments, not display
+/// names: lowercase ASCII with stable boundaries and a deliberately small
+/// grammar that needs no URL or provider normalization.
+fn validate_object_storage_environment_id(value: &str) -> Result<(), ConfigError> {
+    const MAX_LEN: usize = 128;
+    let trimmed = value.trim();
+    if value != trimmed {
+        return Err(ConfigError::Invalid(
+            "`[control_plane] environment_id` must not contain surrounding whitespace".into(),
+        ));
+    }
+    let value = trimmed;
+    if value.is_empty() {
+        return Err(ConfigError::Invalid(
+            "`[control_plane] environment_id` must not be empty".into(),
+        ));
+    }
+    if value.len() > MAX_LEN {
+        return Err(ConfigError::Invalid(format!(
+            "`[control_plane] environment_id` exceeds the {MAX_LEN}-byte object-key segment limit"
+        )));
+    }
+    let bytes = value.as_bytes();
+    let boundary = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    if !boundary(bytes[0]) || !boundary(bytes[bytes.len() - 1]) {
+        return Err(ConfigError::Invalid(
+            "`[control_plane] environment_id` must begin and end with a lowercase ASCII letter or digit"
+                .into(),
+        ));
+    }
+    if bytes.iter().any(|byte| {
+        !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && !matches!(byte, b'-' | b'_' | b'.')
+    }) {
+        return Err(ConfigError::Invalid(
+            "`[control_plane] environment_id` may contain only lowercase ASCII letters, digits, `-`, `_`, and `.`"
+                .into(),
+        ));
+    }
+    // Keep the configuration grammar tied to the adapter-neutral key contract.
+    crate::backends::object_store::ObjectKey::parse(format!("environments/{value}/head.json"))
+        .map_err(|error| {
+            ConfigError::Invalid(format!(
+                "`[control_plane] environment_id` cannot form an object key: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn validate_object_storage_container_url(
+    raw: &str,
+    allow_loopback_http: bool,
+) -> Result<(), ConfigError> {
+    if raw != raw.trim() {
+        return Err(ConfigError::Invalid(
+            "`[control_plane] container_url` must not contain surrounding whitespace".into(),
+        ));
+    }
+    let url = reqwest::Url::parse(raw).map_err(|_| {
+        ConfigError::Invalid(
+            "`[control_plane] container_url` must be an absolute container URL".into(),
+        )
+    })?;
+    if url.username() != "" || url.password().is_some() {
+        return Err(ConfigError::Invalid(
+            "`[control_plane] container_url` must not contain user information or credentials"
+                .into(),
+        ));
+    }
+    if url.query().is_some() {
+        return Err(ConfigError::Invalid(
+            "`[control_plane] container_url` must not contain a query (including a SAS token)"
+                .into(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(ConfigError::Invalid(
+            "`[control_plane] container_url` must not contain a fragment".into(),
+        ));
+    }
+    let host = url.host_str().ok_or_else(|| {
+        ConfigError::Invalid("`[control_plane] container_url` must include a host".into())
+    })?;
+    let address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let loopback = address.eq_ignore_ascii_case("localhost")
+        || address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    match url.scheme() {
+        "https" if !allow_loopback_http => {}
+        "http" if allow_loopback_http && loopback => {}
+        "https" => {
+            return Err(ConfigError::Invalid(
+                "`[control_plane] allow_loopback_http` is only valid with an `http://` loopback Azurite endpoint"
+                    .into(),
+            ));
+        }
+        "http" => {
+            return Err(ConfigError::Invalid(
+                "`[control_plane] container_url` must use HTTPS; loopback HTTP requires `allow_loopback_http = true` for local development"
+                    .into(),
+            ));
+        }
+        _ => {
+            return Err(ConfigError::Invalid(
+                "`[control_plane] container_url` must use HTTPS".into(),
+            ));
+        }
+    }
+    let segments = url
+        .path_segments()
+        .ok_or_else(|| {
+            ConfigError::Invalid(
+                "`[control_plane] container_url` must contain object-key path segments".into(),
+            )
+        })?
+        .collect::<Vec<_>>();
+    // Azurite's native endpoint is `/account/container` over either HTTP or
+    // HTTPS. Segment shape follows the endpoint, not the insecure-transport
+    // exception: OAuth/workload-identity Azurite specifically requires HTTPS
+    // and therefore does not set `allow_loopback_http`.
+    let expected_segments = if loopback { 1..=2 } else { 1..=1 };
+    if !expected_segments.contains(&segments.len())
+        || segments
+            .iter()
+            .any(|segment| segment.is_empty() || segment.contains('%'))
+    {
+        return Err(ConfigError::Invalid(
+            "`[control_plane] container_url` path must contain one unescaped container segment, or an Azurite account/container pair"
+                .into(),
+        ));
+    }
+    let container = segments[segments.len() - 1];
+    crate::backends::object_store::ObjectKey::parse(container.to_owned()).map_err(|error| {
+        ConfigError::Invalid(format!(
+            "`[control_plane] container_url` has an invalid container object-key segment: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 /// A reference is only a reference if the environment layer leaves it alone.
 fn reject_env_override_collision(key: &str, name: &str) -> Result<(), ConfigError> {
     let Some(field) = name.strip_prefix("AXOND_") else {
@@ -272,20 +415,50 @@ fn reject_env_override_collision(key: &str, name: &str) -> Result<(), ConfigErro
     )))
 }
 
-/// Connectivity to the durable control plane. A DSN is a secret, so — like
-/// every other DSN in this file — it is named rather than inlined.
+/// How an object-store adapter acquires short-lived credentials.
 ///
-/// Parsing this section connects to nothing: the `ControlPlaneStore` that uses
-/// it lands with #141.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// The configuration deliberately has no bearer-token, account-key, client
+/// secret, or SAS variant. Workload identity is resolved by the production
+/// adapter's credential chain and this enum records only that choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStorageAuthentication {
+    WorkloadIdentity,
+}
+
+impl<'de> Deserialize<'de> for ObjectStorageAuthentication {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        match name.as_ref() {
+            "workload-identity" => Ok(Self::WorkloadIdentity),
+            _ => Err(serde::de::Error::custom(
+                "unsupported object-storage authentication; expected `workload-identity`",
+            )),
+        }
+    }
+}
+
+const DEFAULT_OBJECT_STORAGE_BOUND_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OBJECT_STORAGE_BOUND_BYTES: usize = 64 * 1024 * 1024;
+
+fn default_object_storage_bound_bytes() -> usize {
+    DEFAULT_OBJECT_STORAGE_BOUND_BYTES
+}
+
+/// Connectivity to the durable control plane, discriminated by `backend`.
+///
+/// Omitting `backend` preserves the original PostgreSQL configuration contract.
+/// Object storage carries only a credential-free container URL, deployment
+/// identity, bounded operation settings, and an authentication mode. Parsing
+/// connects to nothing; runtime object-store wiring is a separate slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlane {
-    /// Name of the env var holding the control-plane Postgres connection string.
-    #[serde(default)]
+    /// Preferred object storage or the legacy/optional PostgreSQL backend.
+    pub backend: ControlPlaneBackend,
+    /// Name of the env var holding the legacy Postgres connection string.
     pub dsn_env: Option<String>,
     /// The PostgreSQL schema the journal lives in, if not the connection's
     /// default. A plain identifier: it is interpolated into `SET search_path`,
     /// so it is validated here rather than trusted.
-    #[serde(default)]
     pub schema: Option<String>,
     /// Whether a replica may apply pending migrations while booting.
     ///
@@ -294,15 +467,100 @@ pub struct ControlPlane {
     /// replica migrating a database the others are already reading. A boot
     /// always *checks* the schema either way — this only decides whether it may
     /// also change it.
-    #[serde(default)]
     pub migrate: bool,
+    /// Stable object-key segment selecting this deployment environment.
+    pub environment_id: Option<String>,
+    /// Absolute provider container URL. It never includes credentials or a SAS
+    /// query; the adapter authenticates independently.
+    pub container_url: Option<String>,
+    /// Credential acquisition contract for the object-store adapter.
+    pub authentication: Option<ObjectStorageAuthentication>,
+    /// Absolute ceiling for any one object accepted by this deployment.
+    pub max_object_bytes: usize,
+    /// Ceiling enforced while streaming an exact-key read.
+    pub max_read_bytes: usize,
+    /// Ceiling enforced before issuing a conditional write.
+    pub max_write_bytes: usize,
+    /// Explicit local-development exception for Azurite over loopback HTTP.
+    pub allow_loopback_http: bool,
     /// Bound on establishing a control-plane connection.
-    #[serde(default = "default_control_plane_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
-    /// Bound on one control-plane operation, including a migration. Generous by
-    /// inference-path standards: nothing here runs with a request in flight.
-    #[serde(default = "default_control_plane_operation_timeout_ms")]
+    /// Bound on one control-plane operation, including a PostgreSQL migration.
+    /// Generous by inference-path standards: nothing here runs with a request
+    /// in flight.
     pub operation_timeout_ms: u64,
+    // Presence bits retain the distinction between an omitted field and an
+    // explicitly supplied default, so mixed backend contracts fail closed.
+    pub(crate) migrate_explicit: bool,
+    pub(crate) object_storage_fields_explicit: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawControlPlane {
+    #[serde(default)]
+    backend: ControlPlaneBackend,
+    #[serde(default)]
+    dsn_env: Option<String>,
+    #[serde(default)]
+    schema: Option<String>,
+    #[serde(default)]
+    migrate: Option<bool>,
+    #[serde(default)]
+    environment_id: Option<String>,
+    #[serde(default)]
+    container_url: Option<String>,
+    #[serde(default)]
+    authentication: Option<ObjectStorageAuthentication>,
+    #[serde(default)]
+    max_object_bytes: Option<usize>,
+    #[serde(default)]
+    max_read_bytes: Option<usize>,
+    #[serde(default)]
+    max_write_bytes: Option<usize>,
+    #[serde(default)]
+    allow_loopback_http: Option<bool>,
+    #[serde(default = "default_control_plane_connect_timeout_ms")]
+    connect_timeout_ms: u64,
+    #[serde(default = "default_control_plane_operation_timeout_ms")]
+    operation_timeout_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for ControlPlane {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawControlPlane::deserialize(deserializer)?;
+        let object_storage_fields_explicit = raw.environment_id.is_some()
+            || raw.container_url.is_some()
+            || raw.authentication.is_some()
+            || raw.max_object_bytes.is_some()
+            || raw.max_read_bytes.is_some()
+            || raw.max_write_bytes.is_some()
+            || raw.allow_loopback_http.is_some();
+        let max_object_bytes = raw
+            .max_object_bytes
+            .unwrap_or_else(default_object_storage_bound_bytes);
+        // An omitted operation bound follows a deliberately lowered absolute
+        // object ceiling. An explicit value is retained so validation can reject
+        // incoherence instead of silently rewriting what the operator supplied.
+        let derived_operation_bound = default_object_storage_bound_bytes().min(max_object_bytes);
+        Ok(Self {
+            backend: raw.backend,
+            dsn_env: raw.dsn_env,
+            schema: raw.schema,
+            migrate: raw.migrate.unwrap_or(false),
+            environment_id: raw.environment_id,
+            container_url: raw.container_url,
+            authentication: raw.authentication,
+            max_object_bytes,
+            max_read_bytes: raw.max_read_bytes.unwrap_or(derived_operation_bound),
+            max_write_bytes: raw.max_write_bytes.unwrap_or(derived_operation_bound),
+            allow_loopback_http: raw.allow_loopback_http.unwrap_or(false),
+            connect_timeout_ms: raw.connect_timeout_ms,
+            operation_timeout_ms: raw.operation_timeout_ms,
+            migrate_explicit: raw.migrate.is_some(),
+            object_storage_fields_explicit,
+        })
+    }
 }
 
 /// The small process-local surface needed to make a stateful replica recoverable
@@ -2970,9 +3228,9 @@ impl Config {
         keys
     }
 
-    /// A stateful process with no control-plane reference has nothing to serve:
-    /// initial cold boot requires Postgres, and it fails loudly rather than
-    /// serving an empty configuration (ADR 0027).
+    /// A stateful process with no control-plane reference has nothing to serve.
+    /// The backend discriminator makes PostgreSQL and object-storage fields
+    /// mutually exclusive before any adapter sees them.
     fn validate_control_plane(&self) -> Result<(), ConfigError> {
         let Some(control_plane) = &self.control_plane else {
             return Err(ConfigError::Invalid(
@@ -2982,17 +3240,6 @@ impl Config {
                     .into(),
             ));
         };
-        if !control_plane
-            .dsn_env
-            .as_deref()
-            .is_some_and(|dsn_env| !dsn_env.trim().is_empty())
-        {
-            return Err(ConfigError::Invalid(
-                "`[control_plane] dsn_env` must name the env var holding the control-plane Postgres \
-                 connection string"
-                    .into(),
-            ));
-        }
         if control_plane.connect_timeout_ms == 0 {
             return Err(ConfigError::Invalid(
                 "`[control_plane] connect_timeout_ms` must be at least 1".into(),
@@ -3001,24 +3248,123 @@ impl Config {
         if control_plane.operation_timeout_ms == 0 {
             return Err(ConfigError::Invalid(
                 "`[control_plane] operation_timeout_ms` must be at least 1: control-plane \
-                 operations, including migrations, are bounded"
+                 operations are bounded"
                     .into(),
             ));
         }
-        if let Some(schema) = control_plane.schema.as_deref() {
-            validate_schema_name("[control_plane] schema", schema)?;
+        match control_plane.backend {
+            ControlPlaneBackend::Postgres => {
+                if control_plane.object_storage_fields_explicit {
+                    return Err(ConfigError::Invalid(
+                        "`[control_plane] backend = \"postgres\"` rejects object-storage-only \
+                         fields (`environment_id`, `container_url`, `authentication`, object \
+                         bounds, and `allow_loopback_http`)"
+                            .into(),
+                    ));
+                }
+                let dsn_env = control_plane
+                    .dsn_env
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ConfigError::Invalid(
+                            "`[control_plane] dsn_env` must name the env var holding the legacy \
+                             Postgres control-plane connection string"
+                                .into(),
+                        )
+                    })?;
+                if let Some(schema) = control_plane.schema.as_deref() {
+                    validate_schema_name("[control_plane] schema", schema)?;
+                }
+                reject_env_override_collision("[control_plane] dsn_env", dsn_env)
+            }
+            ControlPlaneBackend::ObjectStorage => {
+                if control_plane.dsn_env.is_some()
+                    || control_plane.schema.is_some()
+                    || control_plane.migrate_explicit
+                {
+                    return Err(ConfigError::Invalid(
+                        "`[control_plane] backend = \"object-storage\"` rejects Postgres-only \
+                         fields (`dsn_env`, `schema`, and `migrate`)"
+                            .into(),
+                    ));
+                }
+                let environment_id = control_plane.environment_id.as_deref().ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "`[control_plane] backend = \"object-storage\"` requires \
+                             `environment_id`"
+                            .into(),
+                    )
+                })?;
+                validate_object_storage_environment_id(environment_id)?;
+                let container_url = control_plane.container_url.as_deref().ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "`[control_plane] backend = \"object-storage\"` requires \
+                             `container_url`"
+                            .into(),
+                    )
+                })?;
+                if control_plane.authentication.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "`[control_plane] backend = \"object-storage\"` requires \
+                         `authentication = \"workload-identity\"`"
+                            .into(),
+                    ));
+                }
+                for (field, value) in [
+                    ("max_object_bytes", control_plane.max_object_bytes),
+                    ("max_read_bytes", control_plane.max_read_bytes),
+                    ("max_write_bytes", control_plane.max_write_bytes),
+                ] {
+                    if value == 0 {
+                        return Err(ConfigError::Invalid(format!(
+                            "`[control_plane] {field}` must be at least 1"
+                        )));
+                    }
+                    if value > MAX_OBJECT_STORAGE_BOUND_BYTES {
+                        return Err(ConfigError::Invalid(format!(
+                            "`[control_plane] {field}` exceeds the \
+                             {MAX_OBJECT_STORAGE_BOUND_BYTES}-byte safety limit"
+                        )));
+                    }
+                }
+                if control_plane.max_write_bytes > control_plane.max_read_bytes
+                    || control_plane.max_read_bytes > control_plane.max_object_bytes
+                {
+                    return Err(ConfigError::Invalid(
+                        "`[control_plane]` object bounds must satisfy `max_write_bytes <= \
+                         max_read_bytes <= max_object_bytes`"
+                            .into(),
+                    ));
+                }
+                validate_object_storage_container_url(
+                    container_url,
+                    control_plane.allow_loopback_http,
+                )
+            }
         }
-        reject_env_override_collision(
-            "[control_plane] dsn_env",
-            control_plane.dsn_env.as_deref().unwrap_or_default().trim(),
-        )?;
-        Ok(())
     }
 
     /// Secret material is resolved during snapshot compilation, so a stateful
     /// process needs a store and a KEK *reference* before it can compile
     /// anything. Both are named here; neither is ever a value.
     fn validate_secret_store(&self) -> Result<(), ConfigError> {
+        if self
+            .control_plane
+            .as_ref()
+            .is_some_and(|plane| plane.backend == ControlPlaneBackend::ObjectStorage)
+        {
+            if self.secret_store.is_some() {
+                return Err(ConfigError::Invalid(
+                    "`[secret_store]` is the legacy Postgres secret-store bootstrap and cannot be \
+                     mixed with `[control_plane] backend = \"object-storage\"`; blob secret \
+                     runtime wiring is pending"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        }
         let Some(secret_store) = &self.secret_store else {
             return Err(ConfigError::Invalid(
                 "`mode = \"stateful\"` requires a `[secret_store]` section: a snapshot is only \
@@ -5448,6 +5794,22 @@ kek_env = "GW_SECRET_STORE_KEK"
 env = "GW_ADMIN_BREAKGLASS"
 "#;
 
+    /// The minimum accepted ADR 0062 object-storage bootstrap. Runtime wiring
+    /// intentionally remains a later slice; this proves the configuration does
+    /// not smuggle PostgreSQL into the target topology.
+    const BLOB_STATEFUL: &str = r#"
+mode = "stateful"
+
+[control_plane]
+backend = "object-storage"
+environment_id = "prod-us-east"
+container_url = "https://axondstate.blob.core.windows.net/control-plane"
+authentication = "workload-identity"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+"#;
+
     fn repository_file(relative: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -5804,8 +6166,8 @@ dsn_env = "AXOND_REDIS_URL"
         Config::from_toml_str(&toml).expect("a shared backend may declare the layout");
     }
 
-    /// Cold boot in stateful mode requires Postgres, so a bootstrap without a
-    /// control-plane reference describes a replica with nothing to serve.
+    /// Cold boot in stateful mode requires one complete durable control-plane
+    /// reference, so an incomplete backend contract describes nothing to serve.
     #[test]
     fn stateful_mode_requires_a_complete_control_plane_reference() {
         for (expected, toml) in [
@@ -5857,6 +6219,7 @@ dsn_env = "AXOND_REDIS_URL"
             .control_plane
             .expect("stateful mode requires a control plane");
         assert_eq!(control_plane.schema, None);
+        assert_eq!(control_plane.backend, ControlPlaneBackend::Postgres);
         assert!(
             !control_plane.migrate,
             "a replica must not migrate a database on the way up unless asked"
@@ -5892,9 +6255,343 @@ dsn_env = "AXOND_REDIS_URL"
         .control_plane
         .expect("stateful mode requires a control plane");
         assert_eq!(control_plane.schema.as_deref(), Some("axond_cp"));
+        assert_eq!(control_plane.backend, ControlPlaneBackend::Postgres);
         assert!(control_plane.migrate);
         assert_eq!(control_plane.connect_timeout_ms, 250);
         assert_eq!(control_plane.operation_timeout_ms, 750);
+    }
+
+    #[test]
+    fn object_storage_is_complete_without_a_postgres_dsn() {
+        let config = Config::from_toml_str(BLOB_STATEFUL)
+            .expect("a credential-free object-storage reference is complete");
+        let control_plane = config.control_plane.expect("control plane");
+        assert_eq!(control_plane.backend, ControlPlaneBackend::ObjectStorage);
+        assert_eq!(control_plane.dsn_env, None);
+        assert_eq!(control_plane.schema, None);
+        assert!(!control_plane.migrate);
+        assert_eq!(
+            control_plane.environment_id.as_deref(),
+            Some("prod-us-east")
+        );
+        assert_eq!(
+            control_plane.authentication,
+            Some(ObjectStorageAuthentication::WorkloadIdentity)
+        );
+        assert_eq!(
+            control_plane.max_object_bytes,
+            DEFAULT_OBJECT_STORAGE_BOUND_BYTES
+        );
+        assert!(config.secret_store.is_none());
+    }
+
+    #[test]
+    fn checked_blob_control_plane_example_matches_the_minimal_contract() {
+        let example = repository_file("ops/compose/axond.blob-contract.toml");
+        let config = Config::from_toml_str(&example).expect("checked example must stay valid");
+        assert_eq!(
+            config.control_plane.expect("control plane").backend,
+            ControlPlaneBackend::ObjectStorage
+        );
+        for forbidden in [
+            "dsn_env",
+            "schema =",
+            "migrate =",
+            "access_token",
+            "account_key",
+            "sas_query",
+        ] {
+            assert!(!example.contains(forbidden), "found `{forbidden}`");
+        }
+    }
+
+    #[test]
+    fn control_plane_backends_reject_fields_owned_by_the_other_contract() {
+        for (expected, toml) in [
+            (
+                "Postgres-only fields",
+                BLOB_STATEFUL.replace(
+                    "authentication = \"workload-identity\"",
+                    "authentication = \"workload-identity\"\ndsn_env = \"DO_NOT_READ\"",
+                ),
+            ),
+            (
+                "Postgres-only fields",
+                BLOB_STATEFUL.replace(
+                    "authentication = \"workload-identity\"",
+                    "authentication = \"workload-identity\"\nmigrate = false",
+                ),
+            ),
+            (
+                "object-storage-only fields",
+                STATEFUL.replace(
+                    "dsn_env = \"GW_CONTROL_PLANE_DSN\"",
+                    "dsn_env = \"GW_CONTROL_PLANE_DSN\"\nenvironment_id = \"prod\"",
+                ),
+            ),
+        ] {
+            let error = Config::from_toml_str(&toml).expect_err("mixed backends fail closed");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!error.to_string().contains("DO_NOT_READ"), "{error}");
+        }
+
+        let with_legacy_secret_store = format!(
+            "{BLOB_STATEFUL}\n[secret_store]\ndsn_env = \"LEGACY_DSN\"\nkek_env = \"LEGACY_KEK\"\n"
+        );
+        let error = Config::from_toml_str(&with_legacy_secret_store)
+            .expect_err("the target topology cannot silently add Postgres secrets");
+        assert!(error.to_string().contains("legacy Postgres"), "{error}");
+        assert!(!error.to_string().contains("LEGACY_DSN"), "{error}");
+    }
+
+    #[test]
+    fn object_storage_requires_each_discriminating_setting() {
+        for (line, expected) in [
+            ("environment_id = \"prod-us-east\"\n", "environment_id"),
+            (
+                "container_url = \"https://axondstate.blob.core.windows.net/control-plane\"\n",
+                "container_url",
+            ),
+            ("authentication = \"workload-identity\"\n", "authentication"),
+        ] {
+            let error = Config::from_toml_str(&BLOB_STATEFUL.replace(line, ""))
+                .expect_err("a partial backend contract fails closed");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn control_plane_discriminator_refusals_never_echo_the_supplied_value() {
+        const SECRET: &str = "bearer-material-that-must-not-render";
+        for (configured, expected) in [
+            (
+                BLOB_STATEFUL.replace(
+                    "backend = \"object-storage\"",
+                    &format!("backend = \"{SECRET}\""),
+                ),
+                "expected `object-storage` or `postgres`",
+            ),
+            (
+                BLOB_STATEFUL.replace(
+                    "authentication = \"workload-identity\"",
+                    &format!("authentication = \"{SECRET}\""),
+                ),
+                "expected `workload-identity`",
+            ),
+        ] {
+            let rendered = Config::from_toml_str(&configured)
+                .expect_err("an unsupported discriminator must fail closed")
+                .to_string();
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(
+                !rendered.contains(SECRET),
+                "config diagnostics disclosed a supplied discriminator: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_storage_requires_credential_free_https_container_urls() {
+        for (replacement, expected) in [
+            (
+                "https://user:super-secret@axondstate.blob.core.windows.net/control-plane",
+                "user information or credentials",
+            ),
+            (
+                "https://axondstate.blob.core.windows.net/control-plane?sig=super-secret",
+                "must not contain a query",
+            ),
+            (
+                "https://axondstate.blob.core.windows.net/control-plane#super-secret",
+                "must not contain a fragment",
+            ),
+            (
+                "http://axondstate.blob.core.windows.net/control-plane",
+                "must use HTTPS",
+            ),
+            (
+                "https://axondstate.blob.core.windows.net/one/two",
+                "one unescaped container segment",
+            ),
+        ] {
+            let toml = BLOB_STATEFUL.replace(
+                "https://axondstate.blob.core.windows.net/control-plane",
+                replacement,
+            );
+            let error = Config::from_toml_str(&toml).expect_err("unsafe URL must be refused");
+            let rendered = error.to_string();
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains("super-secret"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn loopback_http_requires_an_explicit_development_exception() {
+        let https = BLOB_STATEFUL.replace(
+            "https://axondstate.blob.core.windows.net/control-plane",
+            "https://127.0.0.1:10000/devstoreaccount1/control-plane",
+        );
+        Config::from_toml_str(&https)
+            .expect("native account/container Azurite over HTTPS supports workload identity");
+
+        let redundant_exception = https.replace(
+            "authentication = \"workload-identity\"",
+            "authentication = \"workload-identity\"\nallow_loopback_http = true",
+        );
+        let error = Config::from_toml_str(&redundant_exception)
+            .expect_err("the insecure-HTTP exception must not apply to HTTPS");
+        assert!(error.to_string().contains("only valid with an `http://`"));
+
+        let loopback = BLOB_STATEFUL.replace(
+            "https://axondstate.blob.core.windows.net/control-plane",
+            "http://127.0.0.1:10000/devstoreaccount1/control-plane",
+        );
+        let error = Config::from_toml_str(&loopback).expect_err("HTTP cannot default on");
+        assert!(error.to_string().contains("allow_loopback_http = true"));
+
+        let explicit = loopback.replace(
+            "authentication = \"workload-identity\"",
+            "authentication = \"workload-identity\"\nallow_loopback_http = true",
+        );
+        Config::from_toml_str(&explicit).expect("explicit loopback Azurite is valid");
+
+        let ipv6 = explicit.replace(
+            "http://127.0.0.1:10000/devstoreaccount1/control-plane",
+            "http://[::1]:10000/devstoreaccount1/control-plane",
+        );
+        Config::from_toml_str(&ipv6).expect("IPv6 loopback Azurite is valid");
+
+        let remote = BLOB_STATEFUL
+            .replace(
+                "https://axondstate.blob.core.windows.net/control-plane",
+                "http://blob.internal/control-plane",
+            )
+            .replace(
+                "authentication = \"workload-identity\"",
+                "authentication = \"workload-identity\"\nallow_loopback_http = true",
+            );
+        let error = Config::from_toml_str(&remote).expect_err("the flag cannot weaken remote TLS");
+        assert!(error.to_string().contains("must use HTTPS"), "{error}");
+    }
+
+    #[test]
+    fn object_storage_bounds_are_nonzero_bounded_and_coherent() {
+        for (field, value, expected) in [
+            ("max_object_bytes", 0, "must be at least 1"),
+            ("max_read_bytes", 0, "must be at least 1"),
+            ("max_write_bytes", 0, "must be at least 1"),
+            (
+                "max_object_bytes",
+                MAX_OBJECT_STORAGE_BOUND_BYTES + 1,
+                "safety limit",
+            ),
+            (
+                "max_read_bytes",
+                MAX_OBJECT_STORAGE_BOUND_BYTES + 1,
+                "safety limit",
+            ),
+            (
+                "max_write_bytes",
+                MAX_OBJECT_STORAGE_BOUND_BYTES + 1,
+                "safety limit",
+            ),
+        ] {
+            let toml = BLOB_STATEFUL.replace(
+                "authentication = \"workload-identity\"",
+                &format!("authentication = \"workload-identity\"\n{field} = {value}"),
+            );
+            let error = Config::from_toml_str(&toml).expect_err("unsafe bound must be refused");
+            assert!(error.to_string().contains(field), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        let incoherent = BLOB_STATEFUL.replace(
+            "authentication = \"workload-identity\"",
+            "authentication = \"workload-identity\"\nmax_object_bytes = 1024\nmax_read_bytes = 1025",
+        );
+        let error = Config::from_toml_str(&incoherent).expect_err("read exceeds object cap");
+        assert!(error.to_string().contains("must satisfy"), "{error}");
+
+        let unreadable_write = BLOB_STATEFUL.replace(
+            "authentication = \"workload-identity\"",
+            "authentication = \"workload-identity\"\nmax_object_bytes = 1024\nmax_read_bytes = 512\nmax_write_bytes = 513",
+        );
+        let error = Config::from_toml_str(&unreadable_write)
+            .expect_err("a deployment must be able to read every object it writes");
+        assert!(
+            error
+                .to_string()
+                .contains("max_write_bytes <= max_read_bytes <= max_object_bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn omitted_object_operation_bounds_follow_a_lowered_object_ceiling() {
+        let lowered = BLOB_STATEFUL.replace(
+            "authentication = \"workload-identity\"",
+            "authentication = \"workload-identity\"\nmax_object_bytes = 1024",
+        );
+        let control_plane = Config::from_toml_str(&lowered)
+            .expect("omitted operation bounds derive from the object ceiling")
+            .control_plane
+            .expect("control plane");
+        assert_eq!(control_plane.max_object_bytes, 1024);
+        assert_eq!(control_plane.max_read_bytes, 1024);
+        assert_eq!(control_plane.max_write_bytes, 1024);
+
+        for field in ["max_read_bytes", "max_write_bytes"] {
+            let explicit = lowered.replace(
+                "max_object_bytes = 1024",
+                &format!("max_object_bytes = 1024\n{field} = {DEFAULT_OBJECT_STORAGE_BOUND_BYTES}"),
+            );
+            let error = Config::from_toml_str(&explicit)
+                .expect_err("an explicit bound must be validated, not silently lowered");
+            assert!(
+                error.to_string().contains("must satisfy"),
+                "{field}: {error}"
+            );
+        }
+
+        let explicit_coherent = lowered.replace(
+            "max_object_bytes = 1024",
+            "max_object_bytes = 1024\nmax_read_bytes = 768\nmax_write_bytes = 512",
+        );
+        let control_plane = Config::from_toml_str(&explicit_coherent)
+            .expect("explicit coherent operation bounds remain authoritative")
+            .control_plane
+            .expect("control plane");
+        assert_eq!(control_plane.max_read_bytes, 768);
+        assert_eq!(control_plane.max_write_bytes, 512);
+    }
+
+    #[test]
+    fn object_storage_rejects_invalid_key_segments_and_secret_fields() {
+        for environment in [
+            "",
+            "Prod",
+            "/prod",
+            "prod/east",
+            "prod east",
+            " prod-us-east ",
+        ] {
+            let toml = BLOB_STATEFUL.replace("prod-us-east", environment);
+            let error = Config::from_toml_str(&toml).expect_err("invalid key segment");
+            assert!(error.to_string().contains("environment_id"), "{error}");
+        }
+
+        for field in ["access_token", "account_key", "sas_query"] {
+            let toml = BLOB_STATEFUL.replace(
+                "authentication = \"workload-identity\"",
+                &format!(
+                    "authentication = \"workload-identity\"\n{field} = \"super-secret-material\""
+                ),
+            );
+            let error = Config::from_toml_str(&toml).expect_err("secret fields are inexpressible");
+            let rendered = error.to_string();
+            assert!(rendered.contains(field), "{rendered}");
+            assert!(!rendered.contains("super-secret-material"), "{rendered}");
+        }
     }
 
     /// A snapshot is only publishable once its credential references are

@@ -181,6 +181,11 @@ const TARGETS: &[Target] = &[
         run: replay_blob_secret_crypto,
         minimum_classes: 1,
     },
+    Target {
+        name: "publication_parsers",
+        run: replay_publication_parsers,
+        minimum_classes: 6,
+    },
 ];
 
 /// Chunk boundaries the SSE seeds are replayed on. Coprime with nothing in
@@ -300,6 +305,10 @@ fn replay_blob_secret_crypto(data: &[u8]) -> Vec<&'static str> {
         .unwrap_or_default()
 }
 
+fn replay_publication_parsers(data: &[u8]) -> Vec<&'static str> {
+    axond_fuzz::publication_parsers(data)
+}
+
 const EXPECTED_BLOB_CRYPTO_CLASSES: &[&str] = &[
     "roundtrip",
     "wrong_environment",
@@ -315,6 +324,145 @@ const EXPECTED_BLOB_CRYPTO_CLASSES: &[&str] = &[
     "alias_rejected",
     "invalid_utf8_refused",
     "stored_id_mutation",
+];
+
+/// Exact direct outcome of every committed publication seed.
+const EXPECTED_PUBLICATION_SEED_CLASSES: &[(&str, &[&str])] = &[
+    (
+        "cross-environment-head.json",
+        &["head_environment_mismatch", "manifest_malformed"],
+    ),
+    (
+        "digest-mismatch-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_guard_accepted",
+            "manifest_digest_mismatch",
+            "manifest_digest_mismatch",
+        ],
+    ),
+    (
+        "fence-changed-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_guard_accepted",
+            "manifest_verified",
+            "active_head_changed",
+        ],
+    ),
+    (
+        "duplicate-objects-manifest.hex",
+        &["head_malformed", "manifest_non_canonical_objects"],
+    ),
+    (
+        "invalid-signature-head.json",
+        &["head_invalid_signature", "manifest_malformed"],
+    ),
+    (
+        "malformed-head.json",
+        &["head_malformed", "manifest_malformed"],
+    ),
+    (
+        "malformed-manifest.hex",
+        &["head_malformed", "manifest_malformed"],
+    ),
+    (
+        "overflow-sequence-head.json",
+        &["head_malformed", "manifest_malformed"],
+    ),
+    (
+        "oversized-manifest",
+        &["head_oversized", "manifest_oversized"],
+    ),
+    (
+        "same-sequence-equivocation-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_equivocation",
+            "manifest_verified",
+            "head_equivocation",
+        ],
+    ),
+    (
+        "signed-orphan-activation-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_guard_accepted",
+            "manifest_verified",
+            "active_orphan",
+        ],
+    ),
+    (
+        "signed-orphan-manifest.hex",
+        &["head_malformed", "manifest_accepted"],
+    ),
+    (
+        "tampered-signature-manifest.hex",
+        &["head_malformed", "manifest_invalid_signature"],
+    ),
+    (
+        "too-many-objects-manifest.hex",
+        &["head_malformed", "manifest_too_many_objects"],
+    ),
+    (
+        "unknown-algorithm-head.json",
+        &["head_unknown_algorithm", "manifest_malformed"],
+    ),
+    (
+        "unknown-algorithm-manifest.hex",
+        &["head_malformed", "manifest_unknown_algorithm"],
+    ),
+    (
+        "unknown-key-head.json",
+        &["head_unknown_key", "manifest_malformed"],
+    ),
+    (
+        "unknown-schema-head.json",
+        &["head_unknown_schema", "manifest_malformed"],
+    ),
+    (
+        "unknown-schema-manifest.hex",
+        &["head_malformed", "manifest_unknown_schema"],
+    ),
+    (
+        "unknown-signature-schema-head.json",
+        &["head_unknown_signature_schema", "manifest_malformed"],
+    ),
+    (
+        "unknown-signature-schema-manifest.hex",
+        &["head_malformed", "manifest_unknown_signature_schema"],
+    ),
+    (
+        "unsigned-head-v2.json",
+        &["head_unsigned", "manifest_malformed"],
+    ),
+    (
+        "unsigned-manifest.hex",
+        &["head_malformed", "manifest_unsigned"],
+    ),
+    (
+        "valid-active-probe.txt",
+        &[
+            "head_malformed",
+            "manifest_malformed",
+            "head_guard_accepted",
+            "manifest_verified",
+            "active_verified",
+        ],
+    ),
+    ("valid-head.json", &["head_accepted", "manifest_malformed"]),
+    (
+        "valid-manifest.hex",
+        &["head_malformed", "manifest_accepted"],
+    ),
+    (
+        "zero-sequence-manifest.hex",
+        &["head_malformed", "manifest_zero_sequence"],
+    ),
 ];
 
 const EXPECTED_BLOB_ENVELOPE_SEEDS: &[(&str, &str)] = &[
@@ -380,6 +528,20 @@ fn assert_exact_seed_outcomes(
             "{target}/{filename} is pinned but absent"
         );
     }
+}
+
+fn assert_publication_seed_outcome(seed: &str, bytes: &[u8]) {
+    let expected = EXPECTED_PUBLICATION_SEED_CLASSES
+        .iter()
+        .find(|(name, _)| *name == seed)
+        .unwrap_or_else(|| panic!("publication seed {seed} has no explicit expected outcome"))
+        .1;
+    let actual = axond_fuzz::publication_parsers(bytes);
+    assert_eq!(
+        actual.as_slice(),
+        expected,
+        "publication seed {seed} no longer reaches its pinned verification outcome"
+    );
 }
 
 /// The token target takes a structured input, so a seed file is replayed twice:
@@ -932,7 +1094,24 @@ fn main() {
         EXPECTED_BLOB_CRYPTO_SEEDS,
         replay_blob_secret_crypto,
     );
-    println!("flat-v2 and blob secret corpora: every filename reaches its exact pinned outcome");
+    let publication_corpus = seeds("publication_parsers");
+    for (seed, bytes) in &publication_corpus {
+        assert_publication_seed_outcome(seed, bytes);
+    }
+    for (seed, _) in EXPECTED_PUBLICATION_SEED_CLASSES {
+        assert!(
+            publication_corpus.iter().any(|(name, _)| name == seed),
+            "publication outcome pin {seed} names no committed seed"
+        );
+    }
+    assert_eq!(
+        publication_corpus.len(),
+        EXPECTED_PUBLICATION_SEED_CLASSES.len(),
+        "publication seeds and explicit outcome pins must remain one-to-one"
+    );
+    println!(
+        "blob secret and publication corpora: every filename reaches its exact pinned outcome"
+    );
     let mut inputs = 0_usize;
     for target in TARGETS {
         let mut target_inputs = 0_usize;

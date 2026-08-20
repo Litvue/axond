@@ -6,11 +6,14 @@ Date: 2026-08-20
 
 Accepted; implementation in progress. Typed namespace identity, canonical
 namespace-prefixed inference routes, complete flat namespace desired-state
-resources, and deployment-scoped single/set/all workload grants now compile
-into recoverable serving snapshots. Deployment resources now carry a signed
-secret index, static policy compiles without a coordination backend, and exact
-shared caps remain explicit. Blob publication/runtime wiring, administrative
-trust activation, migration, and topology qualification remain open.
+resources, deployment-scoped single/set/all workload grants, the
+provider-neutral object-store contract, and authenticated blob publication
+contracts now compile into recoverable serving snapshots. Deployment resources
+carry a signed secret index, static policy compiles without a coordination
+backend, and exact shared caps remain explicit. Runtime convergence, blob-backed
+secret resolution, administrative trust activation, migration, and topology
+qualification remain open; blob-backed serving remains fail-closed until those
+slices land.
 
 Supersedes the PostgreSQL-only stateful control plane and the durable
 tenant/project/workload-principal hierarchy selected by
