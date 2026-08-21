@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/Litvue/axond/compare/v0.4.0...v0.4.1) (2026-08-21)
+
+
+### Documentation
+
+* **deploy:** add Azure Container Apps production path ([e998ba9](https://github.com/Litvue/axond/commit/e998ba977ff4461f8a7af23838de017bf1e43734))
+
 ## [0.4.0](https://github.com/Litvue/axond/compare/v0.3.40...v0.4.0) (2026-08-21)
 
 
