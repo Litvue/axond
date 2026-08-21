@@ -68,15 +68,47 @@ const MINIMUM_CATALOG_EDIT_CLASSES: usize = 6;
 /// Every committed flat-v2 body seed and the semantic class it exists to pin.
 /// The guard below requires an exact filename match in both directions: adding,
 /// deleting, or renaming a seed requires an explicit decision here.
-const EXPECTED_FLAT_V2_SEED_CLASSES: &[(&str, &str)] = &[
-    ("deployment-missing-field.json", "incompatible"),
-    ("deployment-unknown-field.json", "incompatible"),
-    ("deployment-unknown-variant.json", "incompatible"),
-    ("deployment-valid.json", "accepted"),
-    ("grant-semantic-invalid.json", "invalid"),
-    ("grant-valid.json", "accepted"),
-    ("namespace-valid.json", "accepted"),
-    ("namespace-wrong-schema-shape.json", "incompatible"),
+const EXPECTED_FLAT_V2_SEED_CLASSES: &[(&str, &str, &str)] = &[
+    (
+        "deployment-missing-field.json",
+        "incompatible",
+        "d153339a7ce441e9935f70756aaa794cef722d06ca6acda09e68dedb50140199",
+    ),
+    (
+        "deployment-unknown-field.json",
+        "incompatible",
+        "ef87e355b1f975129023d6e539661f0f5a4f1f4be3aa2af76c9a634399e4ca9d",
+    ),
+    (
+        "deployment-unknown-variant.json",
+        "incompatible",
+        "797b26e41d24ca394a39f70cdd28b22a34dc4d706da8950ac7c24b4e0efb5665",
+    ),
+    (
+        "deployment-valid.json",
+        "accepted",
+        "fcec8d1304944fa2c09cb4d890acd9feb34adada66cf011f08cfa0c04d30ac64",
+    ),
+    (
+        "grant-semantic-invalid.json",
+        "invalid",
+        "4bbecd4794c7e241e9c72b71b9d5c660b7defacd2067eff8ac6227e8bf033bb5",
+    ),
+    (
+        "grant-valid.json",
+        "accepted",
+        "6776407f1ac596472b1470ffc5cd59b65686c948f680ccbc1e8a4ae3f620e2de",
+    ),
+    (
+        "namespace-valid.json",
+        "accepted",
+        "4dc578ac7d4073a8183a35123a6760678c2f12df95690a7095d918c6d517c742",
+    ),
+    (
+        "namespace-wrong-schema-shape.json",
+        "incompatible",
+        "f5fac6c616168d08b9faaa121ff9b55a3e26717bd530beaa8cf063c7b215746b",
+    ),
 ];
 
 #[global_allocator]
