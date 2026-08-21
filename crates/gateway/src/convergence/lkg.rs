@@ -58,12 +58,15 @@ use ring::rand::{SecureRandom, SystemRandom};
 use secrecy::zeroize::{Zeroize, Zeroizing};
 
 use crate::desired_state::canonical::CanonicalDecodeError;
+use crate::desired_state::publication::{
+    EnvironmentId as PublicationEnvironmentId, PublicationHeadState,
+};
 use crate::desired_state::revision::{ManifestEntry, RevisionManifest};
 use crate::desired_state::{
-    BlobKind, BlobRef, CanonicalError, CanonicalValue, Checksum, DesiredState, IntegrityError,
-    InvalidId, LoadedRevision, MutationId, ProjectId, ResourceBody, ResourceId, ResourceKind,
-    ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, RevisionId,
-    SerializerVersion, Slug, TenantId,
+    BlobCandidate, BlobKind, BlobRef, BlobRevisionIdentity, CanonicalError, CanonicalValue,
+    Checksum, DesiredState, IntegrityError, InvalidId, LoadedRevision, MutationId, ProjectId,
+    ResourceBody, ResourceId, ResourceKind, ResourceRef, ResourceScope, ResourceVersion,
+    ResourceVersionNumber, RevisionId, SerializerVersion, Slug, TenantId,
 };
 
 /// The domain separator for cache files, so cached-state bytes cannot be
@@ -73,6 +76,13 @@ const MAGIC: &[u8] = b"axond.last-known-good\0";
 /// The cache record layout. A future layout is a new value, and an old file is
 /// then refused by its version rather than misread.
 const RECORD_VERSION: u8 = 1;
+
+/// The blob-native candidate cache is deliberately a sibling file. The legacy
+/// desired-state cache and this cache have different identity contracts: a
+/// PostgreSQL revision is not a blob `(environment, sequence, digest)` and must
+/// never be accepted as one by accident.
+const BLOB_MAGIC: &[u8] = b"axond.blob-last-known-good\0";
+const BLOB_RECORD_VERSION: u8 = 1;
 
 /// The shortest key accepted, in bytes. Shorter material would make the MAC a
 /// formality.
@@ -119,6 +129,20 @@ pub enum LastKnownGoodError {
     Version { path: PathBuf, found: u8 },
     #[error("last-known-good cache `{path}` is malformed: {detail}")]
     Malformed { path: PathBuf, detail: String },
+    #[error("blob candidate cache `{path}` belongs to a different environment")]
+    BlobEnvironmentMismatch { path: PathBuf },
+    #[error(
+        "blob candidate cache `{path}` sequence {actual} is below the persisted floor {minimum}"
+    )]
+    BlobSequenceRollback {
+        path: PathBuf,
+        minimum: u64,
+        actual: u64,
+    },
+    #[error("blob candidate cache `{path}` equivocated at sequence {sequence}")]
+    BlobEquivocation { path: PathBuf, sequence: u64 },
+    #[error("blob candidate cache `{path}` is malformed: {detail}")]
+    BlobMalformed { path: PathBuf, detail: String },
     #[error("last-known-good cache could not be encoded: {0}")]
     Encoding(#[from] CanonicalError),
     #[error("last-known-good cache does not decode as canonical bytes: {0}")]
@@ -154,6 +178,51 @@ impl std::fmt::Debug for LastKnownGood {
         f.debug_struct("LastKnownGood")
             .field("path", &self.path)
             .finish_non_exhaustive()
+    }
+}
+
+/// A blob-native candidate recovered from the signed cache.
+///
+/// The cache restores desired state and the monotonic publication tuple, not an
+/// activation witness. A recovered value must therefore be re-read and fenced
+/// by [`crate::desired_state::BlobReader`] before code can treat it as the
+/// current blob candidate or mint candidate-scoped secret bindings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedBlobCandidate {
+    environment: PublicationEnvironmentId,
+    identity: BlobRevisionIdentity,
+    state: DesiredState,
+}
+
+impl CachedBlobCandidate {
+    pub fn environment(&self) -> &PublicationEnvironmentId {
+        &self.environment
+    }
+
+    pub const fn identity(&self) -> BlobRevisionIdentity {
+        self.identity
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.identity.sequence()
+    }
+
+    pub const fn state(&self) -> &DesiredState {
+        &self.state
+    }
+
+    /// The authenticated tuple to seed a new blob reader's durable floor.
+    pub fn observed_head_state(&self) -> PublicationHeadState {
+        PublicationHeadState::new(
+            self.environment.clone(),
+            self.identity.sequence(),
+            self.identity.digest(),
+        )
+        .expect("a decoded blob cache has a non-zero sequence")
+    }
+
+    pub fn into_parts(self) -> (PublicationEnvironmentId, BlobRevisionIdentity, DesiredState) {
+        (self.environment, self.identity, self.state)
     }
 }
 
@@ -211,6 +280,13 @@ impl LastKnownGood {
     /// encryption envelope independently.
     pub fn compiled_path(&self) -> PathBuf {
         self.path.with_extension("serving")
+    }
+
+    /// The signed blob-native candidate cache. It is separate from the legacy
+    /// revision cache because blob identity includes an environment and a
+    /// monotonic object-store sequence rather than a PostgreSQL revision id.
+    pub fn blob_path(&self) -> PathBuf {
+        self.path.with_extension("blob")
     }
 
     /// Whether a compiled-serving record exists. This is only a routing hint;
@@ -411,6 +487,109 @@ impl LastKnownGood {
         self.write_record(revision.manifest(), revision.state())
     }
 
+    /// Atomically persist an authenticated blob-native candidate and its
+    /// sequence floor. The candidate must carry an activation witness for the
+    /// same environment named by the cache record; this prevents a caller from
+    /// accidentally binding state from one object-store environment to another.
+    ///
+    /// A lower sequence can never replace a higher cached sequence, even if the
+    /// lower candidate is otherwise authentic. Equal sequences must name the
+    /// same revision and state, so same-sequence equivocation is fail-closed.
+    pub fn export_blob_candidate(
+        &self,
+        environment: &PublicationEnvironmentId,
+        candidate: &BlobCandidate,
+    ) -> Result<(), LastKnownGoodError> {
+        if candidate.activation().active_revision().environment() != environment {
+            return Err(LastKnownGoodError::BlobEnvironmentMismatch {
+                path: self.blob_path(),
+            });
+        }
+
+        let path = self.blob_path();
+        if let Some(existing) = self.load_blob_candidate(environment)? {
+            let incoming = candidate.identity();
+            if incoming.sequence() < existing.sequence() {
+                return Err(LastKnownGoodError::BlobSequenceRollback {
+                    path,
+                    minimum: existing.sequence(),
+                    actual: incoming.sequence(),
+                });
+            }
+            if incoming.sequence() == existing.sequence()
+                && (incoming.digest() != existing.identity().digest()
+                    || candidate.state() != existing.state())
+            {
+                return Err(LastKnownGoodError::BlobEquivocation {
+                    path,
+                    sequence: incoming.sequence(),
+                });
+            }
+        }
+
+        let record = encode_blob_candidate(environment, candidate.identity(), candidate.state())?;
+        let mut file = Vec::with_capacity(BLOB_MAGIC.len() + 1 + 32 + record.len());
+        file.extend_from_slice(BLOB_MAGIC);
+        file.push(BLOB_RECORD_VERSION);
+        let tag = hmac::sign(&self.key, &blob_signed_bytes(&record));
+        file.extend_from_slice(tag.as_ref());
+        file.extend_from_slice(&record);
+        self.write_atomically_at(&self.blob_path(), &file)
+    }
+
+    /// Load the signed blob-native candidate, or return `None` when this
+    /// replica has never accepted one. Authentication happens before the
+    /// environment, sequence, or desired state is interpreted.
+    pub fn load_blob_candidate(
+        &self,
+        environment: &PublicationEnvironmentId,
+    ) -> Result<Option<CachedBlobCandidate>, LastKnownGoodError> {
+        let path = self.blob_path();
+        let file = match fs::read(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(LastKnownGoodError::Io { path, source }),
+        };
+        let rest =
+            file.strip_prefix(BLOB_MAGIC)
+                .ok_or_else(|| LastKnownGoodError::BlobMalformed {
+                    path: path.clone(),
+                    detail: "the file does not begin with the blob cache marker".to_owned(),
+                })?;
+        let (version, rest) =
+            rest.split_first()
+                .ok_or_else(|| LastKnownGoodError::BlobMalformed {
+                    path: path.clone(),
+                    detail: "the file ends before its layout version".to_owned(),
+                })?;
+        if *version != BLOB_RECORD_VERSION {
+            return Err(LastKnownGoodError::Version {
+                path,
+                found: *version,
+            });
+        }
+        if rest.len() < 32 {
+            return Err(LastKnownGoodError::BlobMalformed {
+                path,
+                detail: "the file ends before its signature".to_owned(),
+            });
+        }
+        let (tag, record) = rest.split_at(32);
+        hmac::verify(&self.key, &blob_signed_bytes(record), tag).map_err(|_| {
+            LastKnownGoodError::Signature {
+                path: self.blob_path(),
+            }
+        })?;
+
+        let cached = decode_blob_candidate(record, &self.blob_path())?;
+        if cached.environment() != environment {
+            return Err(LastKnownGoodError::BlobEnvironmentMismatch {
+                path: self.blob_path(),
+            });
+        }
+        Ok(Some(cached))
+    }
+
     /// Write an authentic cache holding state this build would not assemble: what
     /// a *newer* build's export looks like to an older one, which no code path on
     /// this build can produce.
@@ -567,19 +746,61 @@ fn signed_bytes(record: &[u8]) -> Vec<u8> {
     signed
 }
 
+fn blob_signed_bytes(record: &[u8]) -> Vec<u8> {
+    let mut signed = Vec::with_capacity(BLOB_MAGIC.len() + 1 + record.len());
+    signed.extend_from_slice(BLOB_MAGIC);
+    signed.push(BLOB_RECORD_VERSION);
+    signed.extend_from_slice(record);
+    signed
+}
+
 fn encode(manifest: &RevisionManifest, state: &DesiredState) -> Result<Vec<u8>, CanonicalError> {
     let record = CanonicalValue::map([
         ("manifest", encode_manifest(manifest)?),
-        (
-            "resources",
-            CanonicalValue::List(state.resources().map(encode_resource).collect()),
-        ),
-        (
-            "blobs",
-            CanonicalValue::List(state.blobs().map(encode_blob).collect()),
-        ),
+        ("resources", encode_state_resources(state)),
+        ("blobs", encode_state_blobs(state)),
     ]);
     record.to_canonical_bytes()
+}
+
+fn encode_blob_candidate(
+    environment: &PublicationEnvironmentId,
+    identity: BlobRevisionIdentity,
+    state: &DesiredState,
+) -> Result<Vec<u8>, CanonicalError> {
+    let checksum = state.checksum()?;
+    CanonicalValue::map([
+        ("environment", CanonicalValue::string(environment.as_str())),
+        (
+            "sequence",
+            CanonicalValue::Integer(i128::from(identity.sequence())),
+        ),
+        (
+            "revision",
+            CanonicalValue::Bytes(identity.digest().as_bytes().to_vec()),
+        ),
+        (
+            "checksum",
+            CanonicalValue::Bytes(checksum.as_bytes().to_vec()),
+        ),
+        ("state", encode_state(state)),
+    ])
+    .to_canonical_bytes()
+}
+
+fn encode_state(state: &DesiredState) -> CanonicalValue {
+    CanonicalValue::map([
+        ("resources", encode_state_resources(state)),
+        ("blobs", encode_state_blobs(state)),
+    ])
+}
+
+fn encode_state_resources(state: &DesiredState) -> CanonicalValue {
+    CanonicalValue::List(state.resources().map(encode_resource).collect())
+}
+
+fn encode_state_blobs(state: &DesiredState) -> CanonicalValue {
+    CanonicalValue::List(state.blobs().map(encode_blob).collect())
 }
 
 fn encode_manifest(manifest: &RevisionManifest) -> Result<CanonicalValue, CanonicalError> {
@@ -720,16 +941,132 @@ fn decode(record: &[u8]) -> Result<(RevisionManifest, DesiredState), String> {
     let record = map(&value, "record")?;
     let manifest = decode_manifest(field(record, "manifest")?)?;
 
+    let state = decode_state_fields(record)?;
+    Ok((manifest, state))
+}
+
+fn decode_blob_candidate(
+    record: &[u8],
+    path: &Path,
+) -> Result<CachedBlobCandidate, LastKnownGoodError> {
+    let value = SerializerVersion::default()
+        .decode(record)
+        .map_err(|error| LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+    let fields =
+        map(&value, "blob candidate").map_err(|detail| LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail,
+        })?;
+    let environment = PublicationEnvironmentId::parse(
+        string(
+            field(fields, "environment").map_err(|detail| LastKnownGoodError::BlobMalformed {
+                path: path.to_path_buf(),
+                detail,
+            })?,
+            "blob candidate.environment",
+        )
+        .map_err(|detail| LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail,
+        })?,
+    )
+    .map_err(|_| LastKnownGoodError::BlobMalformed {
+        path: path.to_path_buf(),
+        detail: "blob candidate.environment is invalid".to_owned(),
+    })?;
+    let sequence = unsigned(
+        field(fields, "sequence").map_err(|detail| LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail,
+        })?,
+        "blob candidate.sequence",
+    )
+    .map_err(|detail| LastKnownGoodError::BlobMalformed {
+        path: path.to_path_buf(),
+        detail,
+    })?;
+    if sequence == 0 {
+        return Err(LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail: "blob candidate.sequence must be greater than zero".to_owned(),
+        });
+    }
+    let revision = digest(
+        field(fields, "revision").map_err(|detail| LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail,
+        })?,
+        "blob candidate.revision",
+    )
+    .map_err(|detail| LastKnownGoodError::BlobMalformed {
+        path: path.to_path_buf(),
+        detail,
+    })?;
+    let expected_checksum = digest(
+        field(fields, "checksum").map_err(|detail| LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail,
+        })?,
+        "blob candidate.checksum",
+    )
+    .map_err(|detail| LastKnownGoodError::BlobMalformed {
+        path: path.to_path_buf(),
+        detail,
+    })?;
+    let state_value =
+        field(fields, "state").map_err(|detail| LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail,
+        })?;
+    let state = decode_state(state_value).map_err(|detail| LastKnownGoodError::BlobMalformed {
+        path: path.to_path_buf(),
+        detail,
+    })?;
+    state
+        .validate()
+        .map_err(|error| LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail: format!("blob candidate state is invalid: {error}"),
+        })?;
+    let actual_checksum = state
+        .checksum()
+        .map_err(|error| LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail: format!("blob candidate state has no canonical form: {error}"),
+        })?;
+    if actual_checksum != expected_checksum {
+        return Err(LastKnownGoodError::BlobMalformed {
+            path: path.to_path_buf(),
+            detail: "blob candidate state checksum does not match its record".to_owned(),
+        });
+    }
+    Ok(CachedBlobCandidate {
+        environment,
+        identity: BlobRevisionIdentity::new(sequence, revision),
+        state,
+    })
+}
+
+fn decode_state(value: &CanonicalValue) -> Result<DesiredState, String> {
+    let fields = map(value, "state")?;
+
+    decode_state_fields(fields)
+}
+
+fn decode_state_fields(fields: &[(String, CanonicalValue)]) -> Result<DesiredState, String> {
     let mut state = DesiredState::new();
-    for blob in list(field(record, "blobs")?, "blobs")? {
+    for blob in list(field(fields, "blobs")?, "state.blobs")? {
         state.declare_blob(decode_blob(blob)?);
     }
-    for resource in list(field(record, "resources")?, "resources")? {
+    for resource in list(field(fields, "resources")?, "state.resources")? {
         state
             .insert(decode_resource(resource)?)
             .map_err(|error| format!("resource cannot be restored: {error}"))?;
     }
-    Ok((manifest, state))
+    Ok(state)
 }
 
 fn decode_manifest(value: &CanonicalValue) -> Result<RevisionManifest, String> {
