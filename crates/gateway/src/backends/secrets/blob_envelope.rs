@@ -128,7 +128,7 @@ impl fmt::Display for KekId {
 /// Construction accepts exactly 32 bytes in an already-zeroizing owned buffer.
 /// There is no public byte accessor, formatter, serializer, or clone. Ring
 /// construction consumes and zeroizes this staging value after expanding it.
-pub(super) struct KekMaterial(Zeroizing<[u8; KEY_BYTES]>);
+pub(crate) struct KekMaterial(Zeroizing<[u8; KEY_BYTES]>);
 
 impl KekMaterial {
     #[cfg(test)]
@@ -138,7 +138,7 @@ impl KekMaterial {
 
     /// Consume a dynamically sized bootstrap value, refusing any non-AES-256
     /// length. The caller cannot accidentally pass a non-zeroizing owner.
-    pub(super) fn from_owned(bytes: Zeroizing<Vec<u8>>) -> Result<Self, KekRingError> {
+    pub(crate) fn from_owned(bytes: Zeroizing<Vec<u8>>) -> Result<Self, KekRingError> {
         if bytes.len() != KEY_BYTES {
             return Err(KekRingError::KeyLength { found: bytes.len() });
         }
@@ -352,7 +352,7 @@ impl SealedBlobSecret {
 /// There is no active key and no sealing method. Population validates every id
 /// and non-exported raw-material fingerprint before expanding any key, then
 /// returns one complete immutable ring or an error.
-pub(super) struct KekDecryptRing {
+pub(crate) struct KekDecryptRing {
     keys: BTreeMap<KekId, KwAes256>,
 }
 
@@ -367,7 +367,7 @@ impl fmt::Debug for KekDecryptRing {
 
 impl KekDecryptRing {
     /// Atomically populate one bounded decrypt-only set.
-    pub(super) fn from_entries(entries: Vec<(KekId, KekMaterial)>) -> Result<Self, KekRingError> {
+    pub(crate) fn from_entries(entries: Vec<(KekId, KekMaterial)>) -> Result<Self, KekRingError> {
         if entries.is_empty() {
             return Err(KekRingError::Empty);
         }
@@ -474,14 +474,14 @@ impl BlobSecretOpener {
 /// owns decrypt-only keys. No generic owner/reference lookup is implemented:
 /// every successful resolution must pass through the candidate's exact,
 /// active deployment secret index entry.
-pub(super) struct BlobSecretResolver<S> {
+pub(crate) struct BlobSecretResolver<S> {
     authority: BlobSecretAuthority,
     reader: BlobReader<S>,
     opener: BlobSecretOpener,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(super) enum BlobSecretResolverConstructionError {
+pub(crate) enum BlobSecretResolverConstructionError {
     #[error("blob reader environment does not match the authenticated candidate environment")]
     EnvironmentMismatch,
 }
@@ -489,7 +489,7 @@ pub(super) enum BlobSecretResolverConstructionError {
 impl<S: ObjectStore> BlobSecretResolver<S> {
     /// Build a resolver only for the candidate and environment selected by the
     /// authenticated reader. The decrypt ring is consumed and cannot seal.
-    pub(super) fn new(
+    pub(crate) fn new(
         authority: BlobSecretAuthority,
         reader: BlobReader<S>,
         ring: KekDecryptRing,
@@ -1244,6 +1244,7 @@ impl<'a> CborReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
 
@@ -1251,7 +1252,13 @@ mod tests {
     use base64::Engine as _;
     use bytes::Bytes;
 
+    use crate::backends::control_plane::ControlPlaneStore;
     use crate::backends::object_store::{InMemoryObjectStore, ObjectStore, ObjectStoreLimits};
+    use crate::budget::NoBudget;
+    use crate::convergence::compile::{
+        BlobCandidateCompiler, BlobCandidateRuntime, RevisionCompiler,
+    };
+    use crate::convergence::{ConvergenceSettings, Reconciler, StateModelProjection, SystemClock};
     use crate::desired_state::fixtures::{
         flat_namespace_state_with_active_credential_digest, secret_id,
     };
@@ -1489,6 +1496,239 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            resolver
+                .resolve_namespace(&request.with_reference(secret_reference(954, 1)))
+                .await,
+            Err(SecretError::Denied { .. })
+        ));
+        assert!(matches!(
+            resolver
+                .resolve_namespace(
+                    &request.with_ciphertext_digest(Checksum::of(b"different-ciphertext"))
+                )
+                .await,
+            Err(SecretError::Denied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn candidate_scoped_resolution_uses_the_real_snapshot_compiler() {
+        let store = resolver_object_store();
+        let environment = environment_id("blob-secret-test");
+        let namespace = namespace_id("acme");
+        let reference = secret_reference(953, 1);
+        let sealer = test_sealer("primary", 0x11, &environment, &namespace, reference);
+        let sealed = sealer
+            .seal(&SecretMaterial::new(PLAINTEXT.to_owned()))
+            .expect("sealed fixture material");
+        let encoded = sealed.to_canonical_cbor();
+        let state = flat_namespace_state_with_active_credential_digest(Checksum::of(&encoded));
+        let trust = publish_resolver_state(Arc::clone(&store), &state).await;
+        store
+            .put_if_absent(
+                &crate::desired_state::publication::secret_key(Checksum::of(&encoded)),
+                Bytes::from(encoded),
+            )
+            .await
+            .expect("secret object publication");
+
+        let source = crate::desired_state::BlobRevisionSource::new(
+            BlobReader::new(
+                Arc::clone(&store),
+                PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+                trust.clone(),
+            ),
+            crate::desired_state::BlobHydrationLimits::default(),
+        );
+        let candidate = source
+            .candidate()
+            .await
+            .expect("candidate hydration")
+            .expect("active candidate");
+        let revision = crate::convergence::compile::testing::revision_with(state);
+        let compiler = crate::convergence::RevisionCompiler::new(
+            crate::convergence::compile::testing::stateful_bootstrap(),
+            HashMap::new(),
+            crate::convergence::StateModelProjection,
+        );
+
+        let snapshot = compiler
+            .compile_with_blob_candidate(
+                &revision,
+                candidate,
+                BlobReader::new(
+                    store,
+                    PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+                    trust,
+                ),
+                decrypt_ring(&[("primary", 0x11)]),
+                7,
+            )
+            .await
+            .expect("candidate-scoped material must compile");
+        assert_eq!(snapshot.secrets().len(), 1);
+        assert_eq!(
+            snapshot
+                .secrets()
+                .get(reference)
+                .expect("compiled secret")
+                .expose(),
+            PLAINTEXT
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciler_publishes_through_the_blob_candidate_compiler() {
+        let store = resolver_object_store();
+        let environment = environment_id("blob-secret-test");
+        let namespace = namespace_id("acme");
+        let reference = secret_reference(953, 1);
+        let sealer = test_sealer("primary", 0x11, &environment, &namespace, reference);
+        let sealed = sealer
+            .seal(&SecretMaterial::new(PLAINTEXT.to_owned()))
+            .expect("sealed fixture material");
+        let encoded = sealed.to_canonical_cbor();
+        let digest = Checksum::of(&encoded);
+        let desired = flat_namespace_state_with_active_credential_digest(digest);
+        let trust = publish_resolver_state(Arc::clone(&store), &desired).await;
+        store
+            .put_if_absent(
+                &crate::desired_state::publication::secret_key(digest),
+                Bytes::from(encoded),
+            )
+            .await
+            .expect("secret object publication");
+
+        let control_plane = Arc::new(crate::desired_state::oracle::InMemoryControlPlane::new());
+        let revision = control_plane
+            .publish_revision(crate::desired_state::fixtures::candidate(
+                crate::desired_state::ExpectedRevision::Empty,
+                "blob-runtime",
+                desired,
+            ))
+            .await
+            .expect("the generic control-plane revision is valid")
+            .id;
+
+        let bootstrap = crate::convergence::compile::testing::stateful_bootstrap();
+        let process_env = HashMap::new();
+        let serving = crate::state::AppState::new(
+            bootstrap.clone(),
+            &process_env,
+            crate::usage::UsageFanout::new(Vec::new()),
+            Box::new(NoBudget),
+        )
+        .expect("the stateful serving shell is valid");
+        let delegate = Arc::new(RevisionCompiler::new(
+            bootstrap,
+            process_env,
+            StateModelProjection,
+        ));
+        let reader = BlobReader::new(
+            Arc::clone(&store),
+            PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+            trust,
+        );
+        let runtime = BlobCandidateRuntime::new(
+            reader,
+            crate::desired_state::BlobHydrationLimits::default(),
+            Arc::new(|| Some(decrypt_ring(&[("primary", 0x11)]))),
+        );
+        let compiler = Arc::new(BlobCandidateCompiler::new(delegate, Some(runtime)));
+        let reconciler = Reconciler::new(
+            Arc::clone(&control_plane) as Arc<dyn ControlPlaneStore>,
+            compiler,
+            Arc::new(serving.clone()),
+            ConvergenceSettings::default(),
+            None,
+            Arc::new(SystemClock),
+        );
+
+        let outcome = reconciler.converge_once("blob-candidate-test").await;
+        assert!(matches!(
+            outcome,
+            crate::convergence::Outcome::Published { .. }
+        ));
+        assert_eq!(reconciler.report().active, Some(revision));
+        assert_eq!(serving.config().secrets().len(), 1);
+        assert_eq!(
+            serving
+                .config()
+                .secrets()
+                .get(reference)
+                .expect("candidate secret reached the published snapshot")
+                .expose(),
+            PLAINTEXT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blob_candidate_for_a_different_state_refuses_compilation() {
+        let store = resolver_object_store();
+        let environment = environment_id("blob-secret-test");
+        let namespace = namespace_id("acme");
+        let reference = secret_reference(953, 1);
+        let sealer = test_sealer("primary", 0x11, &environment, &namespace, reference);
+        let sealed = sealer
+            .seal(&SecretMaterial::new(PLAINTEXT.to_owned()))
+            .expect("sealed fixture material");
+        let encoded = sealed.to_canonical_cbor();
+        let candidate_state =
+            flat_namespace_state_with_active_credential_digest(Checksum::of(&encoded));
+        let trust = publish_resolver_state(Arc::clone(&store), &candidate_state).await;
+        store
+            .put_if_absent(
+                &crate::desired_state::publication::secret_key(Checksum::of(&encoded)),
+                Bytes::from(encoded),
+            )
+            .await
+            .expect("secret object publication");
+        let candidate = crate::desired_state::BlobRevisionSource::new(
+            BlobReader::new(
+                Arc::clone(&store),
+                PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+                trust.clone(),
+            ),
+            crate::desired_state::BlobHydrationLimits::default(),
+        )
+        .candidate()
+        .await
+        .expect("candidate hydration")
+        .expect("active candidate");
+
+        let other_state = flat_namespace_state_with_active_credential_digest(Checksum::of(
+            b"different-ciphertext",
+        ));
+        let revision = crate::convergence::compile::testing::revision_with(other_state);
+        let compiler = crate::convergence::RevisionCompiler::new(
+            crate::convergence::compile::testing::stateful_bootstrap(),
+            HashMap::new(),
+            crate::convergence::StateModelProjection,
+        );
+        let error = match compiler
+            .compile_with_blob_candidate(
+                &revision,
+                candidate,
+                BlobReader::new(
+                    store,
+                    PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+                    trust,
+                ),
+                decrypt_ring(&[("primary", 0x11)]),
+                7,
+            )
+            .await
+        {
+            Ok(_) => panic!("a mismatched candidate cannot be published"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the loaded revision"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
