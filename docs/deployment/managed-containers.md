@@ -15,7 +15,7 @@ resource model rather than copying an unverified provider-specific template.
 | Container port | `8080` by default |
 | Config | Read-only TOML mounted into the container |
 | Config selector | `AXOND_CONFIG=/path/to/axond.toml` |
-| Secrets | Environment variables named by the TOML; supported gateway key/verifier values may use files |
+| Secrets | Environment variables named by the TOML (`[[credential]] env = "…"`). Inbound gateway keys and verifier material may use `file =`. Never inline secrets in TOML. |
 | Liveness | `GET /healthz`, no authentication |
 | Readiness | `GET /readyz`, no authentication |
 | Logs | JSON on stdout/stderr |
@@ -27,7 +27,9 @@ resource model rather than copying an unverified provider-specific template.
 1. Verify the release image and resolve it to a digest.
 2. Store `axond.toml` in the platform's config mechanism or bake a separate,
    non-secret config artifact.
-3. Bind every `env` and `dsn_env` reference to the platform secret manager.
+3. Bind every `env` and `dsn_env` reference to the platform secret manager
+   (Azure Key Vault, AWS Secrets Manager, GCP Secret Manager, and similar).
+   The store is the vault of record; Axond only reads the injected name.
 4. Route private or authenticated ingress to port 8080.
 5. Configure `/healthz` and `/readyz` probes.
 6. Preserve streaming responses and choose an idle timeout suitable for model
@@ -54,11 +56,22 @@ shared controls, backend availability is part of admission.
 
 - A mounted-file update can be applied by `[reload] watch = true` when the
   platform updates the file in place or swaps its projected symlink.
-- Environment secret changes require a new task/revision/container.
+- Environment secret changes require a new task/revision/container. Azure
+  Container Apps injects Key Vault secrets at revision start; rotating the
+  vault secret does not mutate process env. Create a new revision.
+- Adding a provider is structure (TOML `[[provider]]` + `[[credential]]`) plus
+  the new env reference, then a replacement instance. It is not a secret-only
+  edit.
 - `[server]`, `[[usage_sink]]`, and `[budget]` changes require a replacement
   instance.
 - A rejected reload leaves the prior snapshot serving; a rejected new revision
   never binds its listener.
+- Do not resolve the secret store on the request path. Axond reads material at
+  boot or reload (stateless) or while compiling a snapshot (stateful).
+
+A worked Azure Container Apps deployment — image pin, Key Vault, probes,
+telemetry, usage, and rotation — is in
+[Production on Azure Container Apps](./azure-container-apps.md).
 
 ## Platform checks
 

@@ -48,6 +48,8 @@ and operate it.
   service unit.
 - [Kubernetes](./deployment/kubernetes.md) — ConfigMap, Secret, Deployment,
   Service, probes, security context, and rollout constraints.
+- [Azure Container Apps](./deployment/azure-container-apps.md) — production
+  replica: GHCR image, Key Vault keys, TOML mount, probes, telemetry, usage.
 - [Managed containers](./deployment/managed-containers.md) — the portable
   contract for ECS/Fargate, Cloud Run, Azure Container Apps, and Nomad.
 - [Stateful backends](./deployment/stateful-backends.md) — Redis/Postgres

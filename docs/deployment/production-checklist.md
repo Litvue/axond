@@ -22,7 +22,7 @@ read the maintainer-facing
 - [ ] Axond is reachable only by intended callers.
 - [ ] `Authorization`, `x-api-key`, and `traceparent` survive every proxy hop.
 - [ ] Proxy buffering is disabled for streamed routes.
-- [ ] Idle and total request timeouts allow expected model-generation duration.
+- [ ] Idle and total request timeouts allow expected model-generation duration. On Azure Container Apps default HTTP ingress this is 240 seconds; longer streams need premium ingress.
 - [ ] A real streamed request has been tested through production ingress.
 - [ ] Clients retry transport failures without blindly replaying committed streams.
 - [ ] `[admission]` ceilings are set deliberately, not left at defaults, and sized to what one replica's memory and descriptor limits can hold.
@@ -36,6 +36,9 @@ read the maintainer-facing
 
 - [ ] TOML contains references, never secret values.
 - [ ] Every declared environment/file reference is present and non-empty.
+- [ ] Provider keys live in the platform secret store (for example Azure Key Vault) and are injected as the env-var names the TOML references.
+- [ ] Key rotation of env-injected secrets is rehearsed as a new revision/task, not as a live env mutation.
+- [ ] Platform authentication in front of Axond is off: Axond owns `Authorization` / `x-api-key`.
 - [ ] At least one static breakglass gateway key is configured.
 - [ ] Gateway keys are unique and mapped to the intended namespaces.
 - [ ] Provider `base_url` values contain a path only, with no query, fragment, credentials, or secret.
