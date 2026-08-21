@@ -359,6 +359,9 @@ overlay, then replaces only the Deployment with:
   `/var/lib/axond`, where `[convergence].cache_path` writes the authenticated
   `last-known-good.snapshot`.
 
+The Pod sets `fsGroup: 65532`, matching the distroless `:nonroot` group, so the
+non-root image can write the cache on root-owned CSI volumes.
+
 The PVC template deliberately omits `storageClassName`, so the cluster's
 default StorageClass must be a durable CSI-backed class. Review that class's
 replication, reclaim, encryption, and snapshot policy before applying this

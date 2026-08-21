@@ -1047,6 +1047,11 @@ def check_stateful_persistent(documents: list[Document]) -> list[str]:
             )
 
     pod = spec["template"]["spec"]
+    if pod.get("securityContext", {}).get("fsGroup") != DISTROLESS_NONROOT_GROUP:
+        failures.append(
+            f"{label}: pod securityContext.fsGroup must be the distroless nonroot group "
+            f"{DISTROLESS_NONROOT_GROUP} so the writable PVC is usable by the image"
+        )
     axond = next(
         (
             container
@@ -1626,6 +1631,15 @@ def self_test() -> int:
     expect_failure(
         "a persistent option deleting a replica cache with the workload",
         check_stateful_persistent(persistent_deleted),
+    )
+
+    persistent_missing_fs_group = copy.deepcopy(stateful_persistent)
+    one(persistent_missing_fs_group, "StatefulSet")["spec"]["template"]["spec"][
+        "securityContext"
+    ].pop("fsGroup", None)
+    expect_failure(
+        "a persistent option leaving the writable PVC without a distroless nonroot group",
+        check_stateful_persistent(persistent_missing_fs_group),
     )
 
     rolling = copy.deepcopy(stateful)
