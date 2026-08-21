@@ -31,11 +31,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::backends::object_store::ObjectStore;
+use crate::backends::secrets::blob_envelope::{
+    BlobSecretResolver, BlobSecretResolverConstructionError, KekDecryptRing,
+};
 use crate::backends::secrets::{SecretError, SecretMaterial, SecretResolver};
 use crate::desired_state::credentials::Credentials;
 use crate::desired_state::namespaces::NamespaceSecretRequest;
 use crate::desired_state::secrets::{SecretOwner, SecretRef};
-use crate::desired_state::{DesiredState, ResourceRef};
+use crate::desired_state::{
+    BlobCandidate, BlobReader, BlobSecretAuthorityError, DesiredState, ResourceRef,
+};
 
 use super::compile::ProjectionError;
 
@@ -260,6 +266,14 @@ pub struct SecretMaterialization {
     ledger: Arc<MaterialLedger>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BlobCandidateSecretError {
+    #[error("the verified blob candidate could not establish a secret authority: {0}")]
+    Authority(#[from] BlobSecretAuthorityError),
+    #[error("the blob candidate secret resolver could not be constructed: {0}")]
+    Resolver(#[from] BlobSecretResolverConstructionError),
+}
+
 impl SecretMaterialization {
     /// A materialization backed by a store.
     pub fn new(resolver: Arc<dyn SecretResolver>, ledger: Arc<MaterialLedger>) -> Self {
@@ -280,6 +294,23 @@ impl SecretMaterialization {
             resolver: None,
             ledger,
         }
+    }
+
+    /// Build the materialization for one verified blob candidate.
+    ///
+    /// The candidate is consumed into its non-cloneable authority before the
+    /// resolver is created. The reader is passed through unchanged, so it keeps
+    /// its trust-only surface and the resolver can only mint requests from the
+    /// candidate's authenticated deployment secret index.
+    pub(crate) fn from_blob_candidate<S: ObjectStore + 'static>(
+        candidate: BlobCandidate,
+        reader: BlobReader<S>,
+        ring: KekDecryptRing,
+        ledger: Arc<MaterialLedger>,
+    ) -> Result<Self, BlobCandidateSecretError> {
+        let authority = candidate.into_secret_authority()?;
+        let resolver = BlobSecretResolver::new(authority, reader, ring)?;
+        Ok(Self::new(Arc::new(resolver), ledger))
     }
 
     /// The store's name, for diagnostics; `None` in a stateless process.

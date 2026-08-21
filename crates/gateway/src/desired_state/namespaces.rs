@@ -494,6 +494,22 @@ impl NamespaceSecretRequest {
             ..self.clone()
         }
     }
+
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn with_reference(&self, reference: SecretRef) -> Self {
+        Self {
+            reference,
+            ..self.clone()
+        }
+    }
+
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn with_ciphertext_digest(&self, ciphertext_digest: Checksum) -> Self {
+        Self {
+            ciphertext_digest,
+            ..self.clone()
+        }
+    }
 }
 
 impl NamespaceBody {
