@@ -24,9 +24,9 @@
 //!
 //! The `smoke` tier is opt-in (`AXOND_STATEFUL_ENDURANCE_SMOKE=1`) because it
 //! is a minute-long qualification rather than ordinary unit/integration work;
-//! CI runs it in a dedicated job. The `soak` tier is twelve hours behind
-//! `AXOND_STATEFUL_ENDURANCE=1`. No twelve-hour envelope is claimed here by
-//! anything but a retained soak artifact.
+//! CI runs it in a dedicated job and it is the packet ship gate. The `soak`
+//! tier is twelve hours behind `AXOND_STATEFUL_ENDURANCE=1` and is scheduled
+//! observational, not a publication requirement.
 
 mod support;
 

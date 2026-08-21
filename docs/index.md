@@ -80,7 +80,7 @@ and operate it.
 - [Recovery qualification](./operations/recovery-qualification.md) — the
   committed outage, cold-boot, convergence, rotation, and restore scenarios, the
   evidence each retains, and the slices the harness still waits on.
-- [Endurance qualification](./operations/endurance.md) — the twelve-hour mixed
+- [Endurance qualification](./operations/endurance.md) — the mixed-workload
   workload, what a long run leaves behind, and the leak and accounting
   properties it gates on.
 - [Stateful endurance qualification](./operations/stateful-endurance.md) — the

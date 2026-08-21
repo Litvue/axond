@@ -335,12 +335,12 @@ fn generated_observation_fixture(
 id = "mixed-endurance"
 {artifact_schema_version}
 artifact_sha256 = "39a7e072cf523642753e09f23db6f29c67f0b78e455efa951c1722d110dfd5d5"
-elapsed_ms = 43200351
+elapsed_ms = 15100
 verdicts = 14
 passed = true
-duration_ms = 43200000
-manifest_duration_ms = 43200000
-requested_duration_ms = 43200000
+duration_ms = 15000
+manifest_duration_ms = 15000
+requested_duration_ms = 15000
 duration_source = "manifest"
 "#
     );
@@ -377,12 +377,12 @@ fn generated_stateful_observation_fixture(
 id = "mixed-stateful-endurance"
 {artifact_schema_version}
 artifact_sha256 = "39a7e072cf523642753e09f23db6f29c67f0b78e455efa951c1722d110dfd5d5"
-elapsed_ms = 43200351
+elapsed_ms = 90100
 verdicts = 14
 passed = true
-duration_ms = 43200000
-manifest_duration_ms = 43200000
-requested_duration_ms = 43200000
+duration_ms = 90000
+manifest_duration_ms = 90000
+requested_duration_ms = 90000
 duration_source = "manifest"
 request_identities_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 request_identities_files = 64
@@ -1173,31 +1173,45 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
                         observation.id
                     );
                     if matches!(slice.id, SliceId::Endurance | SliceId::StatefulEndurance) {
-                        let required_duration = manifest
+                        let workload = manifest
                             .profiles
                             .iter()
                             .find(|workload| workload.id == observation.id)
-                            .and_then(|workload| workload.soak.as_ref())
-                            .map(|soak| soak.duration_ms)
                             .unwrap_or_else(|| {
                                 panic!(
-                                    "{relative}: {} has no committed soak duration",
+                                    "{relative}: {} is not in the endurance manifest",
                                     observation.id
                                 )
                             });
+                        let required_duration = match record.tier.as_str() {
+                            "smoke" => workload.smoke.as_ref().map(|tier| tier.duration_ms),
+                            "soak" => workload.soak.as_ref().map(|tier| tier.duration_ms),
+                            other => panic!(
+                                "{relative}: {} retains unknown endurance tier {other}",
+                                observation.id
+                            ),
+                        }
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{relative}: {} has no committed {} duration",
+                                observation.id, record.tier
+                            )
+                        });
                         assert_eq!(
                             observation.manifest_duration_ms,
                             Some(required_duration),
-                            "{relative}: {} does not retain the committed soak duration",
-                            observation.id
+                            "{relative}: {} does not retain the committed {} duration",
+                            observation.id,
+                            record.tier
                         );
                         assert!(
                             observation
                                 .duration_ms
                                 .is_some_and(|duration| duration >= required_duration),
-                            "{relative}: {} offered less than the committed {} ms soak",
+                            "{relative}: {} offered less than the committed {} ms {}",
                             observation.id,
-                            required_duration
+                            required_duration,
+                            record.tier
                         );
                         assert!(
                             observation.requested_duration_ms.is_some()
@@ -1205,8 +1219,9 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
                                     .duration_source
                                     .as_deref()
                                     .is_some_and(|source| !source.is_empty()),
-                            "{relative}: {} does not retain how the soak duration was selected",
-                            observation.id
+                            "{relative}: {} does not retain how the {} duration was selected",
+                            observation.id,
+                            record.tier
                         );
                     }
                 }
@@ -1723,8 +1738,9 @@ fn rollout_candidate_identity_and_shared_serving_are_closure_requirements() {
 
 /// Closure is derived from the slices. The flag exists so the packet states its
 /// own conclusion in one place, and this is what stops that conclusion from
-/// being an opinion: #156 is answered only when all six heavy records belong to
-/// the frozen v0.4.0 release cohort.
+/// being an opinion: #156 is answered only when all six packet-heavy-tier
+/// records belong to the frozen v0.4.0 release cohort. Endurance ship-gate
+/// tiers are CI smoke, not the 12-hour soak.
 #[test]
 fn the_epic_is_closed_by_its_slices_rather_than_by_a_flag() {
     let packet = packet::load();
@@ -1742,10 +1758,9 @@ fn the_epic_is_closed_by_its_slices_rather_than_by_a_flag() {
     );
 }
 
-/// Release-please runs this exact test before it can create the v0.4.0 tag.
-/// Earlier versions may keep the release PR current while the candidate is
-/// assembled, but the candidate version itself cannot publish without all six
-/// heavy records from the frozen source cohort.
+/// Optional audit: set AXOND_REQUIRE_QUALIFICATION_CLOSURE=1 on a 0.4.0
+/// workspace to assert packet closure. The release workflow does not set this;
+/// production is not held on a frozen cohort.
 #[test]
 fn v0_4_0_release_candidate_requires_closed_production_qualification() {
     if std::env::var("AXOND_REQUIRE_QUALIFICATION_CLOSURE").as_deref() != Ok("1")

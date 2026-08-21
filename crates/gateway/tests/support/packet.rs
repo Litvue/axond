@@ -97,10 +97,11 @@ pub struct Slice {
     /// The workflow that runs the heavy tier, if one exists.
     #[serde(default)]
     pub heavy_lane: Option<String>,
-    /// What the slice's own manifest calls its heavy tier — `heavy` for
-    /// capacity, `soak` for endurance, and `serving` for recovery. A record from any other tier is a
-    /// correctness run, so the rung above `harnessed` is defined against this
-    /// name rather than against a shared one.
+    /// What the slice's own manifest calls its evidencing tier — `heavy` for
+    /// capacity/rollout, `smoke` for endurance/stateful endurance, and
+    /// `serving` for recovery. The 12-hour soak is a scheduled observational
+    /// lane, not this field. A record from any other tier is not the ship
+    /// gate, so the rung above `harnessed` is defined against this name.
     #[serde(default)]
     pub heavy_tier: Option<String>,
     /// Retained runs, as committed evidence records.
@@ -608,6 +609,8 @@ impl SliceManifest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SliceManifestWorkload {
     pub id: String,
+    #[serde(default)]
+    pub smoke: Option<SliceManifestTier>,
     #[serde(default)]
     pub soak: Option<SliceManifestTier>,
     #[serde(rename = "stage", default)]

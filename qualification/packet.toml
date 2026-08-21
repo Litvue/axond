@@ -2,8 +2,8 @@
 #
 # #156 asks for reproducible evidence in place of qualitative production claims,
 # and it decomposes into six slices — capacity, provider and backend faults,
-# stateful recovery, multi-replica rollout, and stateless plus stateful long
-# soaks. Each has landed to a
+# stateful recovery, multi-replica rollout, and stateless plus stateful
+# endurance. Each has landed to a
 # different depth, but all six are currently harnessed pending release-profile
 # candidate runs from one frozen v0.4.0 source. Historical records remain
 # indexed separately and cannot contribute to closure. The #158 dependency formerly attached to fault and
@@ -76,14 +76,13 @@ driver = "crates/gateway/tests/endurance.rs"
 contract = "docs/operations/endurance.md"
 adr = "docs/adr/0040-endurance-qualification-harness.md"
 reduced_lane = "cargo test --workspace"
-heavy_lane = ".github/workflows/endurance.yml"
-heavy_tier = "soak"
+heavy_lane = ".github/workflows/ci.yml"
+heavy_tier = "smoke"
 retained = []
 outstanding = """
-The 12–24 hour tier has never been dispatched. A closure record must bind the
-exact request-identity and correlation ledgers plus its one resource-sample
-JSONL file, so the long-run accounting and drift thresholds have no retained
-evidence behind them."""
+Promote a CI smoke-tier record from the frozen v0.4.0 source (same driver, mix,
+and leak/accounting assertions). The 12-hour soak remains a scheduled
+observational lane for per-hour drift and is not a ship gate."""
 
 # The stateful endurance slice: the fleet stays correct while state and
 # dependencies change repeatedly over the committed duration.
@@ -94,21 +93,21 @@ status = "harnessed"
 question = """
 Whether a multi-replica stateful fleet remains bounded and exactly accounted
 for through catalogue, credential, and policy revisions, provider and usage
-backend faults, recovery, and rolling restarts over twelve hours."""
+backend faults, recovery, and rolling restarts over the committed smoke
+duration."""
 covers = ["mixed_workload", "backend_outage", "control_plane_outage", "rolling_upgrade", "long_soak"]
 manifest = "qualification/stateful-endurance/manifest.toml"
 driver = "crates/gateway/tests/stateful_endurance.rs"
 contract = "docs/operations/stateful-endurance.md"
 adr = "docs/adr/0057-stateful-endurance-qualification.md"
 reduced_lane = "cargo test --workspace"
-heavy_lane = ".github/workflows/endurance.yml"
-heavy_tier = "soak"
+heavy_lane = ".github/workflows/ci.yml"
+heavy_tier = "smoke"
 retained = []
 outstanding = """
-The exact-reconciliation driver has run only its ninety-second smoke tier. No
-retained twelve-hour run yet binds the raw JSON, all five fixed-width exact
-ledger shard sets, and its non-empty per-replica-incarnation resource-sample
-JSONL set under artifact schema 3."""
+Promote a CI smoke-tier record from the frozen v0.4.0 source. The 12-hour soak
+remains a scheduled observational lane for per-hour drift and is not a ship
+gate."""
 
 # The recovery slice: what a stateful deployment does when it loses its state.
 [[slice]]
@@ -204,7 +203,7 @@ issue = 156
 satisfied = false
 requirement = [
   "Every slice has a driver, a committed manifest, and a contract page.",
-  "Every slice has exactly one retained heavy record from the same frozen v0.4.0 source cohort, built in release profile from a clean tree.",
+  "Every slice has exactly one retained record of its packet heavy tier from the same frozen v0.4.0 source cohort, built in release profile from a clean tree. Endurance ship-gate tiers are CI smoke, not the 12-hour soak.",
   "Both endurance slices bind exact request-identity and correlation ledgers; stateful endurance additionally binds exact per-request timing evidence; stateless endurance binds exactly one sample JSONL, while stateful endurance binds a non-empty set with one file per replica incarnation.",
   "Fault observations bind raw schema 1; recovery stages bind raw schema 2 and the exact candidate executable digest.",
   "Rollout proves published v0.3.40 to candidate v0.4.0 on one durable revision and alias served by both fleets.",

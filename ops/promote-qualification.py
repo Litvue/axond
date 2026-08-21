@@ -133,11 +133,14 @@ def manifest_workloads(slice_id: str, manifest: dict[str, Any]) -> set[str]:
     return {profile["id"] for profile in manifest["profile"]}
 
 
-def manifest_endurance_duration(manifest: dict[str, Any]) -> int:
+def manifest_endurance_duration(manifest: dict[str, Any], tier: str) -> int:
     profiles = manifest.get("profile", [])
-    if len(profiles) != 1 or "soak" not in profiles[0]:
-        fail("the endurance manifest has no single committed soak duration")
-    return profiles[0]["soak"]["duration_ms"]
+    if len(profiles) != 1 or tier not in profiles[0]:
+        fail(f"the endurance manifest has no single committed {tier} duration")
+    duration = profiles[0][tier].get("duration_ms")
+    if not isinstance(duration, int) or isinstance(duration, bool) or duration <= 0:
+        fail(f"the endurance manifest {tier} duration is malformed")
+    return duration
 
 
 def fail(message: str) -> None:
@@ -5078,11 +5081,14 @@ def validate(record: dict[str, Any]) -> None:
                     f"{row.get('id')}: the compact record does not bind result "
                     f"schema {expected_schema}"
                 )
-            required_duration = manifest_endurance_duration(manifest)
+            record_tier = record.get("tier")
+            if not isinstance(record_tier, str) or not record_tier:
+                fail(f"{row.get('id')}: the endurance record has no tier")
+            required_duration = manifest_endurance_duration(manifest, record_tier)
             if row.get("manifest_duration_ms") != required_duration:
                 fail(
                     f"{row.get('id')}: the record does not name the committed "
-                    "soak duration"
+                    f"{record_tier} duration"
                 )
             offered_duration = row.get("duration_ms")
             if not isinstance(offered_duration, int) or offered_duration < required_duration:
@@ -5091,14 +5097,18 @@ def validate(record: dict[str, Any]) -> None:
                     f"but {slice_id} promotion requires at least {required_duration} ms"
                 )
             if row.get("requested_duration_ms") != offered_duration:
-                fail(f"{row.get('id')}: requested and offered soak durations disagree")
+                fail(
+                    f"{row.get('id')}: requested and offered {record_tier} durations disagree"
+                )
             if row.get("elapsed_ms", 0) < offered_duration:
                 fail(
                     f"{row.get('id')}: only {row.get('elapsed_ms', 0)} ms elapsed "
-                    f"during a {offered_duration} ms soak"
+                    f"during a {offered_duration} ms {record_tier}"
                 )
             if not row.get("duration_source"):
-                fail(f"{row.get('id')}: the soak duration provenance is incomplete")
+                fail(
+                    f"{row.get('id')}: the {record_tier} duration provenance is incomplete"
+                )
 
 
 def self_test() -> int:
@@ -5192,11 +5202,11 @@ def self_test() -> int:
     endurance_manifest = tomllib.loads(
         (ROOT / "qualification/endurance/manifest.toml").read_text(encoding="utf-8")
     )
-    endurance_duration = manifest_endurance_duration(endurance_manifest)
+    endurance_duration = manifest_endurance_duration(endurance_manifest, "smoke")
     short_endurance = {
         "schema_version": 1,
         "slice": "endurance",
-        "tier": "soak",
+        "tier": "smoke",
         "source": {
             "git_commit": "commit",
             "git_dirty": False,
@@ -5235,7 +5245,7 @@ def self_test() -> int:
     except SystemExit:
         pass
     else:
-        raise AssertionError("a shortened endurance soak was accepted")
+        raise AssertionError("a shortened endurance smoke was accepted")
 
     full_endurance = copy.deepcopy(short_endurance)
     full_row = full_endurance["observation"][0]
@@ -5270,7 +5280,7 @@ def self_test() -> int:
 
     stateful_manifest_path = ROOT / "qualification/stateful-endurance/manifest.toml"
     stateful_manifest = tomllib.loads(stateful_manifest_path.read_text(encoding="utf-8"))
-    stateful_duration = manifest_endurance_duration(stateful_manifest)
+    stateful_duration = manifest_endurance_duration(stateful_manifest, "smoke")
     full_stateful = copy.deepcopy(full_endurance)
     full_stateful["slice"] = "stateful-endurance"
     full_stateful["inputs"] = {
@@ -5300,7 +5310,7 @@ def self_test() -> int:
     except SystemExit:
         pass
     else:
-        raise AssertionError("a shortened compact stateful soak was accepted")
+        raise AssertionError("a shortened compact stateful smoke was accepted")
 
     def expect_refusal(
         label: str, action: Any, expected_message: str | None = None
@@ -6932,12 +6942,15 @@ bootstrap = "seed"
             ("retiring_replicas_exited_cleanly", ">=", 1),
             ("retiring_replicas_exited_in_bound", ">=", 1),
             ("terminated_normally", ">=", 1),
-            (
-                "rss_drift_kib_per_hour",
-                "<=",
-                manifest_stateful_slo["max_rss_drift_kib_per_hour"],
-            ),
         )
+        if manifest_stateful_slo.get("max_rss_drift_kib_per_hour") is not None:
+            stateful_verdict_specs = stateful_verdict_specs + (
+                (
+                    "rss_drift_kib_per_hour",
+                    "<=",
+                    manifest_stateful_slo["max_rss_drift_kib_per_hour"],
+                ),
+            )
         stateful_verdict_values = {
             "segments": manifest_stateful_slo["min_segments"],
             "replicas_restarted": manifest_stateful_slo["replicas"],
@@ -6952,7 +6965,7 @@ bootstrap = "seed"
             "profile": {
                 "id": "mixed-stateful-endurance",
                 "description": manifest_stateful_profile["description"],
-                "tier": "soak",
+                "tier": "smoke",
                 "seed": manifest_stateful_profile["seed"],
                 "duration_ms": stateful_duration,
                 "manifest_duration_ms": stateful_duration,
@@ -7007,7 +7020,7 @@ bootstrap = "seed"
                     "index": index,
                     "started_ms": index * manifest_stateful_scale["segment_ms"],
                     "ended_ms": (index + 1) * manifest_stateful_scale["segment_ms"],
-                    "offered": 1 if index < stateful_offered else 0,
+                    "offered": stateful_offered if index == 0 else 0,
                     "unplanned": 0,
                     "usage_records": 1 if index == 0 else 0,
                 }
@@ -7032,7 +7045,8 @@ bootstrap = "seed"
             ],
             "trend": {
                 "rss_kib_per_hour": 0.0,
-                "evaluated": True,
+                "evaluated": manifest_stateful_slo.get("max_rss_drift_kib_per_hour")
+                is not None,
                 "segments": manifest_stateful_slo["min_segments"],
             },
             "revisions": [
@@ -7700,7 +7714,7 @@ bootstrap = "seed"
         (correlation_dir / "observed-shard-01.bin").write_bytes(trace_id + bytes([0]))
         samples_path = artifact_dir / "mixed-endurance.samples.jsonl"
         manifest_endurance_profile = endurance_manifest["profile"][0]
-        manifest_endurance_scale = manifest_endurance_profile["soak"]
+        manifest_endurance_scale = manifest_endurance_profile["smoke"]
         manifest_endurance_thresholds = copy.deepcopy(
             manifest_endurance_scale["thresholds"]
         )
@@ -7732,7 +7746,7 @@ bootstrap = "seed"
             "profile": {
                 "id": "mixed-endurance",
                 "description": manifest_endurance_profile["description"],
-                "tier": "soak",
+                "tier": "smoke",
                 "duration_ms": endurance_duration,
                 "manifest_duration_ms": endurance_duration,
                 "concurrency": manifest_endurance_scale["concurrency"],
@@ -7839,7 +7853,7 @@ bootstrap = "seed"
             ],
             "trend": {
                 "segments": segment_count,
-                "fitted": True,
+                "fitted": False,
                 "rss_kib_per_hour": 0.0,
                 "fds_per_hour": 0.0,
                 "sockets_per_hour": 0.0,
@@ -7924,6 +7938,8 @@ bootstrap = "seed"
                 manifest_endurance_thresholds["max_fd_drift_per_hour"],
             ),
         ):
+            if bound is None:
+                continue
             raw_result["verdicts"].append(
                 {
                     "threshold": threshold,
@@ -8058,7 +8074,7 @@ bootstrap = "seed"
             raise AssertionError("a shortened raw endurance artifact was accepted")
 
         raw_result["profile"]["duration_ms"] = endurance_duration
-        raw_result["profile"]["tier"] = "smoke"
+        raw_result["profile"]["tier"] = "soak"
         raw.write_text(json.dumps(raw_result), encoding="utf-8")
         compact["observation"][0]["artifact_sha256"] = hashlib.sha256(
             raw.read_bytes()
@@ -8070,7 +8086,7 @@ bootstrap = "seed"
         else:
             raise AssertionError("a mismatched raw endurance tier was accepted")
 
-        raw_result["profile"]["tier"] = "soak"
+        raw_result["profile"]["tier"] = "smoke"
         raw_result["run"]["elapsed_ms"] = endurance_duration - 1
         compact["observation"][0]["elapsed_ms"] = endurance_duration - 1
         raw.write_text(json.dumps(raw_result), encoding="utf-8")

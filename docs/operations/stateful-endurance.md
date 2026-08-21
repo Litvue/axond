@@ -15,8 +15,8 @@ only appear when duration and change happen at once:
 - a tenant that keeps reaching a pool its policy no longer lets it borrow;
 - a circuit that opens for a declared outage and never closes again.
 
-Where this sits in what production qualification has and has not measured — the
-soak tier has not been dispatched — is the
+Where this sits in what production qualification has and has not measured —
+CI smoke is the ship gate; the 12-hour soak is scheduled observational — is the
 [qualification packet](./qualification.md).
 
 ## What the harness runs
