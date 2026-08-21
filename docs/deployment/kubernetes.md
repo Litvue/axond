@@ -90,10 +90,10 @@ kubectl create namespace axond
 kubectl -n axond create secret generic axond-secrets \
   --from-literal=GW_INBOUND_PLATFORM_KEY=... \
   --from-literal=GW_PLATFORM_OPENAI_API_KEY=...
-digest="$(ops/pin-image-digest.sh --print 0.4.0)" # x-release-please-version
+digest="$(ops/pin-image-digest.sh --print 0.4.1)" # x-release-please-version
 SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
   ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
-ops/pin-image-digest.sh 0.4.0 # x-release-please-version
+ops/pin-image-digest.sh 0.4.1 # x-release-please-version
 kubectl apply -k deploy/kubernetes/overlays/production
 kubectl -n axond rollout status deployment/axond
 ```
@@ -125,8 +125,8 @@ the release you verified:
 ```bash
 ops/pin-image-digest.sh --check          # fails while any overlay is unresolved
 ops/pin-image-digest.sh --check overlays/production   # only that overlay
-ops/pin-image-digest.sh --print 0.4.0 # x-release-please-version, prints the digest
-ops/pin-image-digest.sh 0.4.0 # x-release-please-version, rewrites the overlays
+ops/pin-image-digest.sh --print 0.4.1 # x-release-please-version, prints the digest
+ops/pin-image-digest.sh 0.4.1 # x-release-please-version, rewrites the overlays
 ```
 
 Both production overlays are rewritten, and a bare `--check` answers for both:
