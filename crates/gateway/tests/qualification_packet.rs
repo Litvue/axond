@@ -1758,11 +1758,9 @@ fn the_epic_is_closed_by_its_slices_rather_than_by_a_flag() {
     );
 }
 
-/// Release-please runs this exact test before it can create the v0.4.0 tag.
-/// Earlier versions may keep the release PR current while the candidate is
-/// assembled, but the candidate version itself cannot publish without all six
-/// packet-heavy-tier records from the frozen source cohort. Endurance uses the
-/// CI smoke tier; the 12-hour soak is not a publication gate.
+/// Optional audit: set AXOND_REQUIRE_QUALIFICATION_CLOSURE=1 on a 0.4.0
+/// workspace to assert packet closure. The release workflow does not set this;
+/// production is not held on a frozen cohort.
 #[test]
 fn v0_4_0_release_candidate_requires_closed_production_qualification() {
     if std::env::var("AXOND_REQUIRE_QUALIFICATION_CLOSURE").as_deref() != Ok("1")

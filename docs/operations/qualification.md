@@ -117,7 +117,8 @@ Freeze the cohort in this order:
    closure only when the packet test derives no error. These evidence-only
    commits may descend from the frozen source; their records must still name
    the frozen object that produced the candidate binaries.
-5. Merge the release PR only after the pre-tag publication test is green.
+5. Merge the release PR when the candidate is ready to ship. Qualification
+   records may follow; they do not block the tag.
 
 Historical PostgreSQL fault and recovery evidence can be reproduced only by a
 manual `CI` workflow dispatch on the frozen source with
@@ -266,12 +267,10 @@ with the stateful-test and restore-drill lane attribution from the manifest.
 Promotion does not edit the packet; the status and `retained` path remain a
 reviewed change checked by the packet test.
 
-The release workflow runs the packet's dedicated publication test before
-release-please. While the workspace version is below `0.4.0`, the release PR may
-remain open and absorb candidate work. Once the workspace identifies itself as
-`0.4.0`, the workflow refuses to create the tag unless `closure.satisfied` is
-true and the six independently validated records all belong to the frozen
-cohort. This makes qualification a pre-tag gate rather than post-release prose.
+The release workflow does not require packet closure to cut a tag.
+`v0_4_0_release_candidate_requires_closed_production_qualification` remains in
+the suite and runs only when `AXOND_REQUIRE_QUALIFICATION_CLOSURE=1`. Use it to
+audit a cohort; do not hold production on it.
 
 ## Dependency retirements
 
