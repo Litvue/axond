@@ -131,4 +131,5 @@ GW_INBOUND_ACME_KEY=quickstart-acme-key \
 
 Next, choose an [installation path](./installation.md), connect an
 [OpenAI](./clients/openai.md) or [Anthropic](./clients/anthropic.md) client, and
-review the [production checklist](./deployment/production-checklist.md).
+deploy with the [ACA production guide](./deployment/azure-container-apps.md) or
+the [production checklist](./deployment/production-checklist.md).

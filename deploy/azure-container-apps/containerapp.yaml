@@ -1,0 +1,95 @@
+# Azure Container Apps revision spec for a Tier 0 Axond replica.
+# Fill every <placeholder> before `az containerapp create --yaml`.
+#
+# Identity must already have Key Vault Secrets User on the vault. The image
+# digest must be the verified multi-arch index from docs/installation.md.
+
+location: <region>
+name: axond
+type: Microsoft.App/containerApps
+identity:
+  type: UserAssigned
+  userAssignedIdentities:
+    /subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<identity>: {}
+properties:
+  managedEnvironmentId: /subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.App/managedEnvironments/<environment>
+  configuration:
+    activeRevisionsMode: Single
+    secrets:
+      - name: gw-platform-openai
+        keyVaultUrl: https://<vault>.vault.azure.net/secrets/gw-platform-openai
+        identity: /subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<identity>
+      - name: gw-platform-anthropic
+        keyVaultUrl: https://<vault>.vault.azure.net/secrets/gw-platform-anthropic
+        identity: /subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<identity>
+      - name: gw-inbound-platform
+        keyVaultUrl: https://<vault>.vault.azure.net/secrets/gw-inbound-platform
+        identity: /subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<identity>
+      - name: axond-toml
+        keyVaultUrl: https://<vault>.vault.azure.net/secrets/axond-toml
+        identity: /subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<identity>
+    ingress:
+      external: true
+      targetPort: 8080
+      transport: http
+      allowInsecure: false
+  template:
+    terminationGracePeriodSeconds: 30
+    scale:
+      minReplicas: 1
+      maxReplicas: 3
+      rules:
+        - name: http-concurrency
+          http:
+            metadata:
+              concurrentRequests: "16"
+    volumes:
+      - name: config
+        storageType: Secret
+        secrets:
+          - secretRef: axond-toml
+            path: axond.toml
+    containers:
+      - name: axond
+        image: ghcr.io/litvue/axond@sha256:<digest>
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+        env:
+          - name: AXOND_CONFIG
+            value: /etc/axond/axond.toml
+          - name: GW_PLATFORM_OPENAI_API_KEY
+            secretRef: gw-platform-openai
+          - name: GW_PLATFORM_ANTHROPIC_API_KEY
+            secretRef: gw-platform-anthropic
+          - name: GW_INBOUND_PLATFORM_KEY
+            secretRef: gw-inbound-platform
+          # Optional. Unset = JSON logs and usage on stdout only.
+          # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          #   value: https://<collector>:4318
+          # - name: OTEL_EXPORTER_OTLP_PROTOCOL
+          #   value: http/protobuf
+          # - name: AXOND_INSTANCE_ID
+          #   value: axond-aca-0
+        volumeMounts:
+          - volumeName: config
+            mountPath: /etc/axond
+        probes:
+          - type: Startup
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 30
+          - type: Liveness
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+          - type: Readiness
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 3

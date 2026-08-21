@@ -144,17 +144,17 @@ examples are in the [client guides](./docs/index.md#connect-a-client).
 | Environment | Start here |
 | --- | --- |
 | Local evaluation | [Getting started](./docs/getting-started.md) |
-| Docker Compose | [Compose guide](./docs/deployment/docker-compose.md) |
-| Docker or Podman | [Container guide](./docs/deployment/container.md) |
-| Linux VM / bare metal | [systemd guide](./docs/deployment/systemd.md) |
+| Azure Container Apps | [ACA production guide](./docs/deployment/azure-container-apps.md) |
 | Kubernetes | [Kubernetes guide](./docs/deployment/kubernetes.md) |
-| ECS, Cloud Run, Container Apps, Nomad | [Managed-container contract](./docs/deployment/managed-containers.md) |
+| Docker / Compose | [Compose](./docs/deployment/docker-compose.md) · [container](./docs/deployment/container.md) |
+| Linux VM / bare metal | [systemd guide](./docs/deployment/systemd.md) |
+| ECS, Cloud Run, Nomad | [Managed-container contract](./docs/deployment/managed-containers.md) |
 | Redis/Postgres-backed fleet | [Stateful backends](./docs/deployment/stateful-backends.md) |
 
-Axond does not terminate inbound TLS. Put it behind a trusted reverse proxy or
-load balancer, preserve streaming responses, and disable response buffering.
-Use the [production checklist](./docs/deployment/production-checklist.md) before
-exposing it outside a development network.
+Axond does not terminate inbound TLS. Pin a GHCR digest, keep keys in a secret
+store, and mount TOML for structure. Follow the
+[production checklist](./docs/deployment/production-checklist.md) before exposing
+it.
 
 ## State tiers
 

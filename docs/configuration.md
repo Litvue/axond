@@ -392,7 +392,10 @@ still receives the typed `400 unsupported_wire` error.
 
 Explicit `(namespace, provider) → env var` bindings, never inferred from names.
 Several entries for the same pair form that pair's **pool**
-([ADR 0006](./adr/0006-credential-pools-per-namespace-provider.md)).
+([ADR 0006](./adr/0006-credential-pools-per-namespace-provider.md)). Put the
+key in a secret store and inject the named variable; do not inline it. On Azure
+Container Apps that store is Key Vault — see
+[the production guide](./deployment/azure-container-apps.md).
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |

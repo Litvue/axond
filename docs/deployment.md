@@ -32,7 +32,8 @@ Redis/Postgres profile, follow [Getting started](./getting-started.md) and the
 | Docker or Podman | [Container](./deployment/container.md) | Existing container platforms and custom orchestration. |
 | Linux VM / bare metal | [systemd](./deployment/systemd.md) | Static binary behind an existing proxy/load balancer. |
 | Kubernetes | [Kubernetes](./deployment/kubernetes.md) | Horizontally scaled container deployment with ConfigMap/Secret delivery. |
-| Managed containers | [Managed-container contract](./deployment/managed-containers.md) | ECS/Fargate, Cloud Run, Azure Container Apps, Nomad, and similar platforms. |
+| Azure Container Apps | [ACA production](./deployment/azure-container-apps.md) | Worked production path: GHCR digest, Key Vault keys, TOML mount. |
+| Managed containers | [Managed-container contract](./deployment/managed-containers.md) | ECS/Fargate, Cloud Run, Nomad, and other OCI hosts. |
 
 Review [Stateful backends](./deployment/stateful-backends.md) before enabling
 Redis/Postgres and use the
@@ -123,7 +124,13 @@ architecture. It has no `latest` tag and ships no config. Verify and pin a diges
 | `RUST_LOG` | no | `tracing` filter; defaults to `info,axond=info`. |
 | `AXOND_<SECTION>__<KEY>` | no | Scalar override such as `AXOND_SERVER__BIND=0.0.0.0:9090`. |
 
-TOML owns structure; scalar overrides are for deployment adaptation.
+TOML owns structure; scalar overrides are for deployment adaptation. Secret
+*values* never belong in the file: `env = "NAME"` or, for inbound keys, `file =
+"/run/secrets/..."`. Azure Key Vault (or any platform store) injects those
+references at process start. Changing an env-injected secret is a new
+revision. Reloading re-reads process env and referenced files; it cannot see a
+secret the platform has not yet placed. Provider `[[credential]]` is env-only
+today. Do not look up Key Vault on the request path.
 
 ## Health and readiness
 
