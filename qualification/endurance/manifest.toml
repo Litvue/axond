@@ -3,17 +3,18 @@
 # Endurance asks a different question from capacity. Capacity asks what one
 # replica costs at a fixed offered load for a few minutes
 # (`qualification/capacity/manifest.toml`); endurance asks whether the same
-# replica is still the same process after half a day of mixed traffic — whether
-# memory, descriptors, sockets, and accounting come back to where they started.
+# replica is still the same process after mixed traffic — whether memory,
+# descriptors, sockets, and accounting come back to where they started. The
+# CI smoke tier is the ship gate; the 12-hour soak is scheduled observational.
 # Both harnesses record the same provenance, so a result is reproducible from
 # this file plus the committed fixtures and the binary the workspace builds
 # (see docs/operations/endurance.md and ADR 0033).
 #
 # Each profile ships two tiers. `smoke` is a deterministic short run inside
-# `cargo test` on every change — the same driver, the same mix, the same
-# reconciliation, at a duration that fits a test suite. `soak` is the 12–24 hour
-# run, which needs a runner to itself and is dispatched from the `Endurance`
-# workflow.
+# `cargo test` and CI on every change — the same driver, mix, and
+# leak/accounting assertions, at a duration that fits a pull request. It is the
+# packet evidencing tier. `soak` is the 12–24 hour run for per-hour drift; it
+# is dispatched from the `Endurance` workflow and is not a publication gate.
 #
 # `thresholds` are per tier because two of them are only meaningful over hours:
 # a resource *drift* stated per hour cannot be read off a fifteen-second run

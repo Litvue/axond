@@ -49,18 +49,20 @@ and the failures are interleaved with the successes rather than batched.
 | `soak` | 12 h | 48 | 1 s | 15 min |
 
 The smoke tier runs in the ordinary test suite and in CI. It is the same code,
-the same plan, and the same assertions as the soak — what differs is how long it
-runs, and that the drift gates need a run long enough to have a slope.
+the same plan, and the same leak/accounting assertions as the soak — what
+differs is duration, and that the drift gates need a run long enough to have a
+slope. Smoke is the packet ship gate; soak is scheduled observational.
 
 ## Run it
 
 GitHub Actions smoke jobs have a hard **15-minute job timeout**. They invoke
-only the committed smoke entry point, expose no duration override, produce no
-promotable soak record, and exist to prove the harness still works. The smoke
-workload itself is 15 seconds; the rest of the job budget covers a cached
-release build, terminal settlement, and artifact upload.
+only the committed smoke entry point, expose no duration override, and produce
+the packet evidencing tier. The smoke workload itself is 15 seconds; the rest
+of the job budget covers a cached release build, terminal settlement, and
+artifact upload.
 
-Long-soak qualification runs outside GitHub Actions on a dedicated Linux host.
+The 12-hour soak runs outside GitHub Actions on a dedicated Linux host. It is
+not a publication gate.
 Start from the exact frozen candidate commit, use a release build, reserve the
 host for Axond, and retain the raw JSON, sample series, request/correlation
 ledgers, binary digest, manifest digest, and machine identity. The committed

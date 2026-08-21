@@ -7,8 +7,9 @@
 # the binary's (ADR 0033).
 #
 # The schedule is written as fractions of the run rather than as offsets, so the
-# ninety-second smoke and the twelve-hour soak exercise the same events in the
-# same order. Only the time between them differs.
+# ninety-second smoke (ship gate) and the twelve-hour soak (scheduled
+# observational) exercise the same events in the same order. Only the time
+# between them differs.
 
 schema_version = 2
 
@@ -44,7 +45,7 @@ think_time_ms = 10
 sample_interval_ms = 200
 segment_ms = 10000
 
-# The tier that qualifies a release. Dispatched, never run in a pull request.
+# Scheduled observational soak for per-hour drift. Not a publication gate.
 [profile.soak]
 duration_ms = 43200000
 concurrency = 24

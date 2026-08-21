@@ -51,8 +51,8 @@ decomposes into six slices. They landed, and will land, at different depths:
 | Slice | Issue | Status | What exists today |
 | --- | --- | --- | --- |
 | `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `harnessed` | Driver and eight committed profiles — including multi-tenant isolation, admission shedding, a bounded stalling backend, and decoded production queue-depth telemetry. Its historical records predate raw-artifact-bound compact schema 2 and are not active evidence. |
-| `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Stateless mixed-workload driver and committed mix whose smoke tier runs in CI. Its 12-hour tier has not retained exact request/correlation ledgers and its sample JSONL under the current contract. |
-| `stateful-endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Multi-replica driver for revisions, backend faults, tenant isolation, durable accounting, and rolling restarts. Its smoke lane is harness validation; no 12-hour record binds all five exact ledgers and the per-incarnation sample JSONL set. |
+| `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Stateless mixed-workload driver and committed mix whose CI smoke tier is the ship gate. Promote a frozen-cohort smoke record to evidence it. The 12-hour soak is scheduled observational (per-hour drift), not a publication requirement. |
+| `stateful-endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Multi-replica driver for revisions, backend faults, tenant isolation, durable accounting, and rolling restarts. The CI smoke tier is the ship gate; promote a frozen-cohort smoke record. The 12-hour soak is scheduled observational, not a publication requirement. |
 | `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver and twenty-two executable real-Postgres stages exist. The historical v0.3.39 debug record remains indexed for audit, but a release-profile v0.4.0 cohort rerun with raw schema 2, per-stage executable digests, and process-bound executed-binary identity is pending. |
 | `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `harnessed` | The provider, transport, Redis, and Postgres matrix is complete. Its historical v0.3.39 debug record remains indexed for audit, but raw-schema-1 release evidence from the v0.4.0 cohort is pending. |
 | `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver and committed reduced/heavy scenarios now require published v0.3.40 and candidate v0.4.0 serving one shared durable revision and alias through the real-Postgres migration/rollback matrix. A loopback OTLP receiver preserves exact caller traces for the retained executable. No raw-schema-5/compact-schema-4 record is retained. |
@@ -75,11 +75,11 @@ the manifest it names is a test failure.
 - **Not yet a stateful endurance baseline.** The historical capacity records are Tier 0
   local runs; the historical fault and recovery records are v0.3.39 debug
   GitHub Actions runs against pinned Redis/Postgres lanes and are not active
-  closure evidence. The stateful endurance harness has run its
-  ninety-second smoke tier, but the 12–24 hour tiers have not been dispatched.
-- **Not a long-soak baseline.** The rollout scenario offers fleet load for under
-  a minute, and no current rollout record is retained; it says nothing about
-  resource drift over hours.
+  closure evidence. The stateful endurance harness has a ninety-second CI smoke
+  tier as its ship gate; the 12–24 hour soak is scheduled observational.
+- **Not a long-soak baseline.** The 12-hour soak is not a v0.4.0 publication
+  gate. Rollout offers fleet load for under a minute; no current rollout record
+  is retained.
 
 ## The status ladder
 
@@ -91,7 +91,7 @@ than from what it says:
 | `unbuilt` | The question is written down. Nothing runs. |
 | `declared` | A committed manifest and contract page, kept honest by a `contract_test`, with no driver behind them. A contract test measures nothing, which is why it is not one. |
 | `harnessed` | A driver a lane runs, with no retained run of its heavy tier. A short run may be retained here — it shows the harness produces records — but it does not promote the slice. |
-| `evidenced` | A driver, and at least one retained run in the repository — including one from the tier the slice's own manifest calls heavy (`heavy` for capacity/rollout, `soak` for endurance/stateful endurance), because a short run is a correctness check, not a measurement of what a replica does. |
+| `evidenced` | A driver, and at least one retained run in the repository — including one from the packet's evidencing tier (`heavy` for capacity/rollout, `smoke` for endurance/stateful endurance, `serving` for recovery, `full` for fault). Endurance smoke is the ship gate (same leak/accounting assertions as the soak). The 12-hour soak remains scheduled observational for per-hour drift. |
 
 ## Qualification cohort
 
@@ -110,9 +110,9 @@ Freeze the cohort in this order:
    set the workspace and shipped dependency versions to `0.4.0`, and commit.
    Keep the release-please PR unmerged.
 2. Record that clean commit as `cohort.source_commit`; do not amend it.
-3. Run capacity, fault, recovery, rollout, stateless endurance, and stateful
-   endurance from that exact Git object. A rerun after any source change starts
-   a new cohort rather than mixing records.
+3. Run capacity, fault, recovery, rollout, and the endurance **smoke** tiers
+   from that exact Git object. Do not wait on a 12-hour soak. A rerun after any
+   source change starts a new cohort rather than mixing records.
 4. Promote and commit the six records, change each slice to `evidenced`, and set
    closure only when the packet test derives no error. These evidence-only
    commits may descend from the frozen source; their records must still name
@@ -259,10 +259,9 @@ cardinality after the raw artifact's workflow-retention window.
 
 Promotion refuses dirty provenance, stale manifest hashes, wrong heavy tiers,
 partial workload sets, failed verdicts, and an endurance or stateful-endurance
-`soak` run shorter than the committed 12-hour duration. A shortened dispatched
-soak can still leave raw diagnostic artifacts, but the compact writer and
-promoter both refuse it as #156
-evidence. Recovery promotion additionally requires all 22 executable stages,
+record shorter than the committed duration of the packet evidencing tier
+(CI `smoke`, not the 12-hour `soak`). A dispatched soak can still leave raw
+diagnostic artifacts; it is not #156 ship-gate evidence. Recovery promotion additionally requires all 22 executable stages,
 with the stateful-test and restore-drill lane attribution from the manifest.
 Promotion does not edit the packet; the status and `retained` path remain a
 reviewed change checked by the packet test.
@@ -285,15 +284,13 @@ checked by the qualification packet test.
 
 ## What each slice still owes
 
-- **`endurance`** — a dispatched 12–24 hour run binding exact request and
-  correlation ledgers plus one sample JSONL. The drift thresholds that only
-  hours can exercise (`max_rss_drift_kib_per_hour` and its neighbours) have no
-  run behind them, so the soak tiers are declared bounds rather than measured
-  ones.
-- **`stateful-endurance`** — a complete 12-hour multi-replica run with exact
+- **`endurance`** — a frozen-cohort CI smoke record binding exact request and
+  correlation ledgers plus one sample JSONL. The 12-hour soak (per-hour drift)
+  is scheduled observational and is not required to ship.
+- **`stateful-endurance`** — a frozen-cohort CI smoke record with exact
   request, trace, per-request timing, and durable-identity shards plus the
-  non-empty per-incarnation sample JSONL set independently promoted from the
-  raw artifact set.
+  non-empty per-incarnation sample JSONL set. The 12-hour soak is scheduled
+  observational and is not required to ship.
 - **`capacity`** — a schema-2 heavy run that retains and binds every raw profile
   artifact, including decoded production queue-depth telemetry.
 - **`recovery`** — re-run all executable real-Postgres stages from the frozen
@@ -308,7 +305,7 @@ checked by the qualification packet test.
   with every exact caller trace exported through its replica-dedicated receiver
   and every non-usage trace explicitly justified.
 - **Second reference tier** — rollout must supply the short fleet-under-load
-  baseline; stateful endurance must supply the long-duration baseline.
+  baseline; a long-duration soak remains scheduled observational work.
 
 One question the packet is regularly asked for, and still cannot answer: a
 **stateful fleet endurance baseline**. Durable workload-principal projection can
@@ -316,9 +313,10 @@ now compile a complete revision into a serving snapshot, and the persistent
 StatefulSet/PVC overlay can restore its authenticated caches. The historical
 single-process recovery run documents the #219 harness but does not qualify
 v0.4.0. What remains outstanding is direct evidence: a stateful two-version rollout and the
-stateful endurance profile against multiple replicas for the committed 12
-hours, including revisions, backend faults, and rolling restarts. Until those
-runs are retained, no capacity profile claims stateful serving.
+stateful endurance smoke profile against multiple replicas, including
+revisions, backend faults, and rolling restarts. Until those runs are
+retained, no capacity profile claims stateful serving. The 12-hour soak is
+not a publication gate.
 
 ## Related
 

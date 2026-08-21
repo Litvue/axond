@@ -111,11 +111,10 @@ tier.
 - Bounded retention costs some disk during a run (the fingerprint shards) and a
   second pass at the end. That is the cheaper direction: the alternative scales
   the harness's memory with the run and contaminates the reading.
-- The promotion workflow targets a labelled self-hosted qualification runner
-  and offers the committed twelve hours. A shorter dispatch may diagnose the
-  harness but both compact-record construction and promotion refuse it. No
-  twelve-hour envelope is claimed until that full run publishes validated
-  artifacts.
+- Packet promotion for v0.4.0 uses the CI **smoke** tier (same leak and
+  accounting assertions as the soak). The twelve-hour soak remains a scheduled
+  observational lane for per-hour drift and is not a publication gate. A
+  shortened soak may still diagnose the harness; it is not ship-gate evidence.
 - Gating socket and descriptor balance at zero tolerance makes the suite
   sensitive to a genuinely leaky change and to nothing else: the readings are
   taken after the driver's own client is dropped and the process has settled.

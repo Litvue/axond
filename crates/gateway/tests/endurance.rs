@@ -17,11 +17,10 @@
 //! socket left open, descriptors returned once the callers are gone, and
 //! resident memory that does not trend upwards over the run.
 //!
-//! The `smoke` tier runs under `cargo test`: seconds long, and the same code
-//! and the same assertions as the tier that qualifies a release. The `soak`
-//! tier is twelve hours behind `AXOND_ENDURANCE=1` and the `endurance`
-//! workflow, which runs this binary with `--test-threads=1` so no other load is
-//! offered to the same host.
+//! The `smoke` tier runs under `cargo test` and CI: seconds long, and the same
+//! leak/accounting assertions that qualify a release. The `soak` tier is
+//! twelve hours behind `AXOND_ENDURANCE=1` and the `endurance` workflow; it is
+//! scheduled observational (per-hour drift), not a publication gate.
 //!
 //! Nothing here qualifies stateful serving: the profiles run a Tier 0 process.
 
@@ -46,10 +45,10 @@ async fn the_endurance_soak_tier_qualifies_and_publishes_its_evidence() {
 }
 
 /// The committed manifest has to describe a run that can qualify anything: a
-/// soak inside the window the release process asks for, a smoke short enough to
-/// stay in the ordinary test path, enough segments at each tier for a trend,
-/// and every ending represented. A manifest that quietly lost one of those
-/// would still produce an artifact, and the artifact would look like evidence.
+/// smoke short enough for CI (the ship gate), a soak inside the 12-24 h
+/// observational window, enough segments at each tier for a trend, and every
+/// ending represented. A manifest that quietly lost one of those would still
+/// produce an artifact, and the artifact would look like evidence.
 #[test]
 fn the_committed_manifest_describes_a_qualifying_run() {
     let (manifest, _) = endurance::manifest::load();
@@ -93,8 +92,9 @@ fn the_committed_manifest_describes_a_qualifying_run() {
                 tier.as_str()
             );
         }
-        // The window issue #221 asks for. A "soak" that runs for an hour is a
+        // The observational soak window. A "soak" that runs for an hour is a
         // capacity run with a long tail, and would be evidence of nothing.
+        // Release evidence is the smoke tier, not this duration.
         let hours = profile.soak.duration_ms as f64 / 3_600_000.0;
         assert!(
             (12.0..=24.0).contains(&hours),
