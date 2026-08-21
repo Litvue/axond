@@ -486,6 +486,14 @@ impl NamespaceSecretRequest {
     pub(crate) const fn lifecycle(&self) -> SecretLifecycle {
         self.lifecycle
     }
+
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn with_lifecycle(&self, lifecycle: SecretLifecycle) -> Self {
+        Self {
+            lifecycle,
+            ..self.clone()
+        }
+    }
 }
 
 impl NamespaceBody {

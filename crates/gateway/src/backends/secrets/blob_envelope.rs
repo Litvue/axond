@@ -23,15 +23,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use aes_kw::{KeyInit as _, KwAes256};
+use async_trait::async_trait;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 use secrecy::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use super::SecretMaterial;
+use super::{
+    Capabilities, ENVELOPE_CAPABILITIES, SecretError, SecretMaterial, SecretOwner, SecretResolver,
+};
+use crate::backends::object_store::{ObjectStore, ObjectStoreError};
+use crate::desired_state::namespaces::NamespaceSecretRequest;
 use crate::desired_state::secrets::SecretRef;
 use crate::desired_state::{
-    AuthenticatedSecretBinding, BlobSecretPublicationBinding, Checksum, EnvironmentId,
+    ActivationReadyRevision, AuthenticatedSecretBinding, BlobPublicationError, BlobReader,
+    BlobSecretAuthority, BlobSecretBindingError, BlobSecretPublicationBinding, Checksum,
+    EnvironmentId, ImmutableObjectKind,
 };
 use crate::namespace::NamespaceId;
 
@@ -457,6 +464,173 @@ impl BlobSecretOpener {
             });
         ciphertext.zeroize();
         opened
+    }
+}
+
+/// Candidate-scoped, read-only resolver for immutable blob secret objects.
+///
+/// The authority is consumed at construction and retains the authenticated
+/// candidate's activation witness. The reader is trust-only and the opener
+/// owns decrypt-only keys. No generic owner/reference lookup is implemented:
+/// every successful resolution must pass through the candidate's exact,
+/// active deployment secret index entry.
+pub(super) struct BlobSecretResolver<S> {
+    authority: BlobSecretAuthority,
+    reader: BlobReader<S>,
+    opener: BlobSecretOpener,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(super) enum BlobSecretResolverConstructionError {
+    #[error("blob reader environment does not match the authenticated candidate environment")]
+    EnvironmentMismatch,
+}
+
+impl<S: ObjectStore> BlobSecretResolver<S> {
+    /// Build a resolver only for the candidate and environment selected by the
+    /// authenticated reader. The decrypt ring is consumed and cannot seal.
+    pub(super) fn new(
+        authority: BlobSecretAuthority,
+        reader: BlobReader<S>,
+        ring: KekDecryptRing,
+    ) -> Result<Self, BlobSecretResolverConstructionError> {
+        if authority.environment().as_str() != reader.environment().as_str() {
+            return Err(BlobSecretResolverConstructionError::EnvironmentMismatch);
+        }
+        Ok(Self {
+            authority,
+            reader,
+            opener: BlobSecretOpener::new(ring),
+        })
+    }
+
+    /// The activation witness remains owned by the resolver for the lifetime
+    /// of the candidate-scoped resolver.
+    pub(super) const fn activation(&self) -> &ActivationReadyRevision {
+        self.authority.activation()
+    }
+
+    async fn resolve_indexed(
+        &self,
+        request: &NamespaceSecretRequest,
+    ) -> Result<SecretMaterial, SecretError> {
+        let binding = self
+            .authority
+            .bind(request)
+            .map_err(|error| binding_error(request.reference(), error))?;
+        let digest = binding.ciphertext_digest();
+        let object = self
+            .reader
+            .read_immutable_object(ImmutableObjectKind::Secret, digest)
+            .await
+            .map_err(|error| object_error(request.reference(), error))?;
+        let sealed = SealedBlobSecret::from_canonical_cbor(&object.bytes).map_err(|_| {
+            SecretError::Corrupt {
+                detail: "authenticated blob secret object is malformed".to_owned(),
+            }
+        })?;
+        self.opener
+            .open(binding, &sealed)
+            .map_err(|error| open_error(request.reference(), sealed.kek_id(), error))
+    }
+}
+
+fn binding_error(reference: SecretRef, error: BlobSecretBindingError) -> SecretError {
+    match error {
+        BlobSecretBindingError::Inactive { lifecycle } => SecretError::Lifecycle {
+            reference,
+            state: lifecycle,
+        },
+        BlobSecretBindingError::Undeclared | BlobSecretBindingError::Mismatch => {
+            SecretError::Denied {
+                backend: "blob-secrets",
+                message: "namespace secret request is not authorized by the candidate".to_owned(),
+            }
+        }
+    }
+}
+
+fn object_error(reference: SecretRef, error: BlobPublicationError) -> SecretError {
+    match error {
+        BlobPublicationError::Store(ObjectStoreError::NotFound { .. }) => SecretError::Corrupt {
+            detail: "authenticated blob secret object is missing".to_owned(),
+        },
+        BlobPublicationError::Store(ObjectStoreError::Unavailable { .. }) => {
+            SecretError::Unavailable {
+                backend: "blob-object-store",
+                message: "blob object store unavailable while reading candidate secret".to_owned(),
+            }
+        }
+        BlobPublicationError::Store(ObjectStoreError::Integrity { .. })
+        | BlobPublicationError::Store(ObjectStoreError::PayloadTooLarge { .. })
+        | BlobPublicationError::Store(ObjectStoreError::PreconditionFailed { .. })
+        | BlobPublicationError::Authentication(_)
+        | BlobPublicationError::Head(_)
+        | BlobPublicationError::Manifest(_)
+        | BlobPublicationError::ImmutableCollision { .. }
+        | BlobPublicationError::ImmutableDigestMismatch { .. }
+        | BlobPublicationError::Conflict { .. }
+        | BlobPublicationError::AmbiguousUnavailable
+        | BlobPublicationError::IdempotencyKeyReuse
+        | BlobPublicationError::HistoryLimitExceeded { .. }
+        | BlobPublicationError::SequenceOverflow
+        | BlobPublicationError::ActiveManifestMismatch
+        | BlobPublicationError::ActiveHeadChanged => SecretError::Corrupt {
+            detail: format!("authenticated blob secret object could not be read for {reference}"),
+        },
+    }
+}
+
+fn open_error(reference: SecretRef, kek: &KekId, error: BlobEnvelopeError) -> SecretError {
+    match error {
+        BlobEnvelopeError::UnknownKek | BlobEnvelopeError::Unopenable => SecretError::Unwrap {
+            reference,
+            kek: super::KekRef(kek.as_str().to_owned()),
+        },
+        BlobEnvelopeError::EmptyMaterial
+        | BlobEnvelopeError::MaterialTooLarge
+        | BlobEnvelopeError::Random
+        | BlobEnvelopeError::Codec(_) => SecretError::Corrupt {
+            detail: "authenticated blob secret object could not be opened".to_owned(),
+        },
+    }
+}
+
+#[async_trait]
+impl<S: ObjectStore> SecretResolver for BlobSecretResolver<S> {
+    fn name(&self) -> &'static str {
+        "blob-secrets"
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        ENVELOPE_CAPABILITIES
+    }
+
+    async fn resolve(
+        &self,
+        _owner: SecretOwner,
+        _reference: &SecretRef,
+    ) -> Result<SecretMaterial, SecretError> {
+        Err(SecretError::Denied {
+            backend: self.name(),
+            message: "blob secret resolution requires an authenticated namespace candidate"
+                .to_owned(),
+        })
+    }
+
+    async fn exists(
+        &self,
+        _owner: SecretOwner,
+        _reference: &SecretRef,
+    ) -> Result<bool, SecretError> {
+        Ok(false)
+    }
+
+    async fn resolve_namespace(
+        &self,
+        request: &NamespaceSecretRequest,
+    ) -> Result<SecretMaterial, SecretError> {
+        self.resolve_indexed(request).await
     }
 }
 
@@ -1070,8 +1244,26 @@ impl<'a> CborReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
     use super::*;
-    use crate::desired_state::fixtures::secret_id;
+    use base64::Engine as _;
+    use bytes::Bytes;
+
+    use crate::backends::object_store::{InMemoryObjectStore, ObjectStore, ObjectStoreLimits};
+    use crate::desired_state::fixtures::{
+        flat_namespace_state_with_active_credential_digest, secret_id,
+    };
+    use crate::desired_state::publication::{
+        BlobPublication, BlobPublicationRequest, EnvironmentId as PublicationEnvironmentId,
+        ExpectedHead, IdempotencyHistoryLimit, ImmutableObject, PublicationActorBinding,
+        PublicationAuthorization, PublicationGrantBinding,
+    };
+    use crate::desired_state::{
+        Canonical, DesiredState, IdempotencyKey, MutationId, MutationKind, PublicationKeyId,
+        PublicationSigner, PublicationTrustStore, ResourceScope, Uuid7,
+    };
 
     const PLAINTEXT: &str = "synthetic-provider-key-never-log";
 
@@ -1148,6 +1340,199 @@ mod tests {
             reference,
             Checksum::of(&sealed.to_canonical_cbor()),
         )
+    }
+
+    const TEST_SIGNING_KEY_PKCS8_BASE64: &str = "MFMCAQEwBQYDK2VwBCIEIOn86WlkmKxquZ/ElW4lZfyxCVYnoaMnF56WoS4ICpKVoSMDIQDViT8X5LpD1A7O4sdlRada5GwjyvH2eAJ+ZiyfboLSBQ==";
+
+    fn resolver_object_store() -> Arc<InMemoryObjectStore> {
+        Arc::new(InMemoryObjectStore::new(
+            ObjectStoreLimits::for_max_object_bytes(
+                NonZeroUsize::new(2 * 1024 * 1024).expect("non-zero object limit"),
+            ),
+        ))
+    }
+
+    fn publication_signer() -> Arc<PublicationSigner> {
+        let pkcs8 = base64::engine::general_purpose::STANDARD
+            .decode(TEST_SIGNING_KEY_PKCS8_BASE64)
+            .expect("fixed test signing key");
+        Arc::new(
+            PublicationSigner::from_ed25519_pkcs8(
+                PublicationKeyId::parse("blob-secret-test-key").expect("valid key id"),
+                &pkcs8,
+            )
+            .expect("valid test signer"),
+        )
+    }
+
+    fn resolver_resource_objects(state: &DesiredState) -> Vec<ImmutableObject> {
+        state
+            .resources()
+            .map(|resource| ImmutableObject {
+                kind: if resource.scope == ResourceScope::Deployment {
+                    ImmutableObjectKind::DeploymentResource
+                } else {
+                    ImmutableObjectKind::NamespaceResource
+                },
+                bytes: Bytes::from(
+                    resource
+                        .canonical()
+                        .to_canonical_bytes()
+                        .expect("canonical resource"),
+                ),
+            })
+            .collect()
+    }
+
+    async fn publish_resolver_state(
+        store: Arc<InMemoryObjectStore>,
+        state: &DesiredState,
+    ) -> PublicationTrustStore {
+        let signer = publication_signer();
+        let trust = PublicationTrustStore::new([signer.trusted_key()]).expect("test trust");
+        BlobPublication::new(
+            store,
+            PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+            IdempotencyHistoryLimit::new(NonZeroUsize::new(8).expect("non-zero history")),
+            signer,
+            trust.clone(),
+            None,
+        )
+        .expect("trusted publisher")
+        .publish(BlobPublicationRequest {
+            expected: ExpectedHead::Empty,
+            authorization: PublicationAuthorization::new(
+                PublicationActorBinding::of(b"blob-secret-test-actor"),
+                PublicationGrantBinding::of(b"blob-secret-test-grant"),
+                MutationId::new(Uuid7::from_parts(44, 0, 44).expect("valid mutation id")),
+                MutationKind::Create,
+            ),
+            idempotency_key: IdempotencyKey::parse("blob-secret-test")
+                .expect("valid idempotency key"),
+            desired_state_checksum: state.checksum().expect("state checksum"),
+            objects: resolver_resource_objects(state),
+        })
+        .await
+        .expect("state publication");
+        trust
+    }
+
+    #[tokio::test]
+    async fn resolver_reads_only_the_candidate_indexed_secret_object() {
+        let store = resolver_object_store();
+        let environment = environment_id("blob-secret-test");
+        let namespace = namespace_id("acme");
+        let reference = secret_reference(953, 1);
+        let sealer = test_sealer("primary", 0x11, &environment, &namespace, reference);
+        let sealed = sealer
+            .seal(&SecretMaterial::new(PLAINTEXT.to_owned()))
+            .expect("sealed fixture material");
+        let encoded = sealed.to_canonical_cbor();
+        let digest = Checksum::of(&encoded);
+        let state = flat_namespace_state_with_active_credential_digest(digest);
+        let trust = publish_resolver_state(Arc::clone(&store), &state).await;
+        store
+            .put_if_absent(
+                &crate::desired_state::publication::secret_key(digest),
+                Bytes::from(encoded),
+            )
+            .await
+            .expect("secret object publication");
+
+        let source = crate::desired_state::BlobRevisionSource::new(
+            BlobReader::new(
+                Arc::clone(&store),
+                PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+                trust,
+            ),
+            crate::desired_state::BlobHydrationLimits::default(),
+        );
+        let authority = source
+            .candidate()
+            .await
+            .expect("candidate hydration")
+            .expect("active candidate")
+            .into_secret_authority()
+            .expect("flat namespace authority");
+        let request = authority
+            .namespaces()
+            .secret_request(&namespace, reference)
+            .expect("indexed secret");
+        let resolver = BlobSecretResolver::new(
+            authority,
+            BlobReader::new(
+                Arc::clone(&store),
+                PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+                PublicationTrustStore::new([publication_signer().trusted_key()])
+                    .expect("test trust"),
+            ),
+            decrypt_ring(&[("primary", 0x11)]),
+        );
+
+        // The reader trust store is only used for immutable object digest
+        // validation here; the resolver still requires an exact environment
+        // match at construction.
+        assert!(resolver.is_ok());
+        let resolver = resolver.expect("matching candidate reader");
+        assert_eq!(
+            resolver.resolve_namespace(&request).await.unwrap().expose(),
+            PLAINTEXT
+        );
+        assert!(matches!(
+            resolver
+                .resolve_namespace(
+                    &request.with_lifecycle(crate::desired_state::SecretLifecycle::Staged)
+                )
+                .await,
+            Err(SecretError::Lifecycle {
+                state: crate::desired_state::SecretLifecycle::Staged,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_a_reader_for_another_environment() {
+        let store = resolver_object_store();
+        let environment = environment_id("blob-secret-test");
+        let namespace = namespace_id("acme");
+        let reference = secret_reference(953, 1);
+        let sealer = test_sealer("primary", 0x11, &environment, &namespace, reference);
+        let sealed = sealer
+            .seal(&SecretMaterial::new(PLAINTEXT.to_owned()))
+            .expect("sealed fixture material");
+        let state = flat_namespace_state_with_active_credential_digest(Checksum::of(
+            &sealed.to_canonical_cbor(),
+        ));
+        let trust = publish_resolver_state(Arc::clone(&store), &state).await;
+        let authority = crate::desired_state::BlobRevisionSource::new(
+            BlobReader::new(
+                Arc::clone(&store),
+                PublicationEnvironmentId::parse("blob-secret-test").expect("valid environment"),
+                trust.clone(),
+            ),
+            crate::desired_state::BlobHydrationLimits::default(),
+        )
+        .candidate()
+        .await
+        .expect("candidate hydration")
+        .expect("active candidate")
+        .into_secret_authority()
+        .expect("flat namespace authority");
+
+        assert!(matches!(
+            BlobSecretResolver::new(
+                authority,
+                BlobReader::new(
+                    store,
+                    PublicationEnvironmentId::parse("other-environment")
+                        .expect("valid environment"),
+                    trust,
+                ),
+                decrypt_ring(&[("primary", 0x11)]),
+            ),
+            Err(BlobSecretResolverConstructionError::EnvironmentMismatch)
+        ));
     }
 
     fn deterministic_sealed() -> (

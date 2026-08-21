@@ -128,18 +128,32 @@ pub(crate) fn flat_namespace_state() -> DesiredState {
 /// A flat-v2 revision whose active provider credential resolves through the
 /// deployment secret index.
 pub(crate) fn flat_namespace_state_with_active_credential() -> DesiredState {
-    flat_namespace_credential_state(SecretLifecycle::Active, true)
+    flat_namespace_state_with_active_credential_digest(Checksum::of(b"fixture-ciphertext"))
+}
+
+/// The active-credential fixture with a caller-selected immutable ciphertext
+/// address. Blob resolver tests seal a real object first, then use its digest
+/// in the authenticated deployment index.
+pub(crate) fn flat_namespace_state_with_active_credential_digest(
+    ciphertext_digest: Checksum,
+) -> DesiredState {
+    flat_namespace_credential_state(SecretLifecycle::Active, true, ciphertext_digest)
 }
 
 /// The successor to [`flat_namespace_state_with_active_credential`]: the
 /// credential is withdrawn and its exact indexed ciphertext is tombstoned.
 pub(crate) fn flat_namespace_state_with_tombstoned_credential() -> DesiredState {
-    flat_namespace_credential_state(SecretLifecycle::Tombstoned, false)
+    flat_namespace_credential_state(
+        SecretLifecycle::Tombstoned,
+        false,
+        Checksum::of(b"fixture-ciphertext"),
+    )
 }
 
 fn flat_namespace_credential_state(
     lifecycle: SecretLifecycle,
     include_credential: bool,
+    ciphertext_digest: Checksum,
 ) -> DesiredState {
     let version = if include_credential {
         ResourceVersionNumber::FIRST
@@ -159,7 +173,7 @@ fn flat_namespace_credential_state(
         vec![DeploymentSecretIndexEntry::new(
             NamespaceId::parse("acme").expect("fixture namespace"),
             reference,
-            Checksum::of(b"fixture-ciphertext"),
+            ciphertext_digest,
             lifecycle,
         )],
     )

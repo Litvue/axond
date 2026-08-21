@@ -10,10 +10,13 @@ use std::collections::BTreeMap;
 
 use crate::backends::object_store::ObjectStore;
 
+use super::namespaces::{FlatNamespaces, NamespaceSecretRequest};
+use super::secret_binding::AuthenticatedSecretBinding;
 use super::{
     ActivationReadyRevision, BlobPublicationError, BlobReader, BlobRef, BlobResourceDocument,
-    BlobResourceDocumentError, Canonical, CanonicalError, Checksum, DesiredState,
-    ImmutableObjectKind, ResourceRef, ValidationError,
+    BlobResourceDocumentError, Canonical, CanonicalError, Checksum, DesiredState, EnvironmentId,
+    ImmutableObjectKind, InvalidEnvironmentId, NamespaceStateError, ResourceRef, SecretLifecycle,
+    ValidationError,
 };
 
 /// Resource bounds applied while hydrating one authenticated blob revision.
@@ -79,6 +82,15 @@ pub enum BlobRevisionError {
     Limit(#[from] BlobHydrationLimit),
 }
 
+/// Why a validated blob candidate could not become a namespace secret authority.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BlobSecretAuthorityError {
+    #[error(transparent)]
+    Namespace(#[from] NamespaceStateError),
+    #[error(transparent)]
+    Environment(#[from] InvalidEnvironmentId),
+}
+
 /// Blob-native identity of one authenticated active revision.
 ///
 /// This is intentionally distinct from the PostgreSQL journal's `RevisionId`.
@@ -120,6 +132,90 @@ impl BlobCandidate {
     pub fn into_parts(self) -> (BlobRevisionIdentity, DesiredState, ActivationReadyRevision) {
         (self.identity, self.state, self.activation)
     }
+
+    /// Consume the candidate and retain the evidence required to bind one
+    /// namespace-owned secret request. The activation witness remains owned by
+    /// the authority, so later serving code cannot separate the secret
+    /// binding from the exact head fence that authenticated the candidate.
+    pub fn into_secret_authority(self) -> Result<BlobSecretAuthority, BlobSecretAuthorityError> {
+        let namespaces = FlatNamespaces::of(&self.state)?;
+        let environment = EnvironmentId::parse(
+            self.activation
+                .active_revision()
+                .environment()
+                .as_str()
+                .to_owned(),
+        )?;
+        Ok(BlobSecretAuthority {
+            identity: self.identity,
+            state: self.state,
+            namespaces,
+            environment,
+            activation: self.activation,
+        })
+    }
+}
+
+/// Non-cloneable authority derived only from a checksum-validated,
+/// head-fenced blob candidate.
+///
+/// This type carries no secret material and has no constructor from raw
+/// environment, owner, reference, or digest values. It is the only production
+/// input accepted by the namespace binding minting path.
+pub struct BlobSecretAuthority {
+    identity: BlobRevisionIdentity,
+    state: DesiredState,
+    namespaces: FlatNamespaces,
+    environment: EnvironmentId,
+    activation: ActivationReadyRevision,
+}
+
+impl BlobSecretAuthority {
+    pub const fn identity(&self) -> BlobRevisionIdentity {
+        self.identity
+    }
+
+    pub const fn state(&self) -> &DesiredState {
+        &self.state
+    }
+
+    pub const fn namespaces(&self) -> &FlatNamespaces {
+        &self.namespaces
+    }
+
+    pub const fn activation(&self) -> &ActivationReadyRevision {
+        &self.activation
+    }
+
+    pub(crate) fn bind(
+        &self,
+        request: &NamespaceSecretRequest,
+    ) -> Result<AuthenticatedSecretBinding, BlobSecretBindingError> {
+        super::secret_binding::mint_from_blob_authority(self, request)
+    }
+
+    pub(crate) fn environment(&self) -> &EnvironmentId {
+        &self.environment
+    }
+
+    pub(crate) fn indexed_request(
+        &self,
+        request: &NamespaceSecretRequest,
+    ) -> Option<NamespaceSecretRequest> {
+        self.namespaces
+            .secret_request(request.owner(), request.reference())
+    }
+}
+
+/// Why a namespace secret request cannot be bound to a blob candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BlobSecretBindingError {
+    #[error("secret request is not declared by the authenticated deployment secret index")]
+    Undeclared,
+    #[error("secret request is not active ({lifecycle:?})")]
+    Inactive { lifecycle: SecretLifecycle },
+    #[error("secret request does not match the authenticated deployment secret index")]
+    Mismatch,
 }
 
 /// Read-only source for the current authenticated blob revision.
@@ -375,6 +471,51 @@ mod tests {
         assert_eq!(identity.digest(), outcome.revision);
         assert_eq!(hydrated, state);
         assert_eq!(activation.active_revision().revision(), outcome.revision);
+    }
+
+    #[tokio::test]
+    async fn candidate_mints_only_active_indexed_secret_bindings() {
+        let store = Arc::new(InMemoryObjectStore::new(object_store_limits()));
+        let state = fixtures::flat_namespace_state_with_active_credential();
+        let (trust, outcome) = publish_state(Arc::clone(&store), &state, "secret-authority").await;
+        let source = BlobRevisionSource::new(
+            BlobReader::new(store, environment(), trust),
+            BlobHydrationLimits::default(),
+        );
+        let authority = source
+            .candidate()
+            .await
+            .expect("authenticated hydration")
+            .expect("active candidate")
+            .into_secret_authority()
+            .expect("flat projection");
+
+        assert_eq!(authority.identity().digest(), outcome.revision);
+        assert_eq!(
+            authority.activation().active_revision().revision(),
+            outcome.revision
+        );
+        let namespace = crate::namespace::NamespaceId::parse("acme").expect("fixture namespace");
+        let request = authority
+            .namespaces()
+            .secret_request(&namespace, fixtures::secret_ref(953))
+            .expect("indexed fixture secret");
+        let binding = authority.bind(&request).expect("active binding");
+        assert_eq!(binding.environment().as_str(), environment().as_str());
+        assert_eq!(binding.owner(), &namespace);
+        assert_eq!(binding.reference(), &fixtures::secret_ref(953));
+        assert_eq!(
+            binding.ciphertext_digest(),
+            Checksum::of(b"fixture-ciphertext")
+        );
+
+        let staged = request.with_lifecycle(SecretLifecycle::Staged);
+        assert!(matches!(
+            authority.bind(&staged),
+            Err(BlobSecretBindingError::Inactive {
+                lifecycle: SecretLifecycle::Staged
+            })
+        ));
     }
 
     #[tokio::test]

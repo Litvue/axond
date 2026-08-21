@@ -106,7 +106,8 @@ pub use access::{
 #[allow(unused_imports)]
 pub use blob_revision::{
     BlobCandidate, BlobHydrationLimit, BlobHydrationLimits, BlobRevisionError,
-    BlobRevisionIdentity, BlobRevisionSource,
+    BlobRevisionIdentity, BlobRevisionSource, BlobSecretAuthority, BlobSecretAuthorityError,
+    BlobSecretBindingError,
 };
 #[allow(unused_imports)]
 pub use canonical::{
