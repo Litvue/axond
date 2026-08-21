@@ -94,7 +94,7 @@ pub use compile::{
 #[allow(unused_imports)]
 pub use credentials::{CredentialProjection, RuntimeProjection};
 #[allow(unused_imports)]
-pub use lkg::{LastKnownGood, LastKnownGoodError};
+pub use lkg::{CachedBlobCandidate, LastKnownGood, LastKnownGoodError};
 #[allow(unused_imports)]
 pub use namespaces::{FlatNamespaceProjection, StateModelProjection};
 #[allow(unused_imports)]

@@ -478,11 +478,10 @@ fn append_length_prefixed(bytes: &mut Vec<u8>, value: &[u8]) {
 ///
 /// Sequence alone is insufficient: retaining the digest makes a signed second
 /// head at the same sequence a typed equivocation rather than an accepted replay.
-/// This domain value is not wired to the production last-known-good cache in
-/// this protocol slice. Exporting it and supplying it to a new guard proves only
-/// the future runtime integration seam; it does not provide cross-restart
-/// rollback or equivocation resistance until an authenticated blob-cache slice
-/// durably persists and restores it.
+/// The blob-native last-known-good cache persists this tuple and supplies it to
+/// [`BlobReader::new_with_observed_state`] on the next boot. Keeping the tuple
+/// in the publication domain means cache recovery cannot restore a sequence
+/// floor without also restoring the revision digest that fences equivocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationHeadState {
     environment: EnvironmentId,
@@ -525,8 +524,8 @@ impl PublicationHeadState {
 /// fail closed. A successful conditional write is different evidence. Its
 /// success remains truthful if another writer has already advanced the shared
 /// guard, but it still cannot contradict the accepted digest at its own sequence.
-/// The guard has no durable backing in this slice; clones share process memory
-/// only.
+/// The guard itself remains process-local; durable restart state is restored by
+/// the blob-native last-known-good cache before the first read.
 #[derive(Debug, Clone)]
 pub struct PublicationSequenceGuard {
     environment: EnvironmentId,
@@ -549,9 +548,8 @@ impl PublicationSequenceGuard {
 
     /// Build an in-memory guard from state supplied by a trusted caller.
     ///
-    /// No production cache supplies this value yet. A future runtime must bind
-    /// it to the authenticated blob last-known-good record before using this
-    /// seam across process restart.
+    /// The blob-native last-known-good cache supplies this tuple after
+    /// authenticating its environment and record integrity.
     pub fn from_observed_state(
         environment: EnvironmentId,
         state: PublicationHeadState,
@@ -571,8 +569,8 @@ impl PublicationSequenceGuard {
 
     /// Export the highest tuple observed by this in-memory guard.
     ///
-    /// The caller receives a domain value only; this method performs no durable
-    /// write and is not connected to the legacy production LKG cache.
+    /// The caller receives a domain value only; the blob-native cache owns the
+    /// durable encoding and atomic write.
     pub fn observed_state(&self) -> Option<PublicationHeadState> {
         self.accepted
             .lock()
@@ -1648,13 +1646,32 @@ impl<S> Clone for BlobReader<S> {
 
 impl<S: ObjectStore> BlobReader<S> {
     pub fn new(store: Arc<S>, environment: EnvironmentId, trust: PublicationTrustStore) -> Self {
-        let sequence_guard = PublicationSequenceGuard::new(environment.clone());
-        Self {
+        Self::new_with_observed_state(store, environment, trust, None)
+            .expect("an absent observed publication state is always valid")
+    }
+
+    /// Construct a reader with an authenticated tuple restored from durable
+    /// blob-native state. The tuple's environment is checked before any object
+    /// store read, so a cache copied between environments cannot seed this
+    /// reader's sequence floor.
+    pub fn new_with_observed_state(
+        store: Arc<S>,
+        environment: EnvironmentId,
+        trust: PublicationTrustStore,
+        observed: Option<PublicationHeadState>,
+    ) -> Result<Self, HeadDocumentError> {
+        let sequence_guard = match observed {
+            Some(state) => {
+                PublicationSequenceGuard::from_observed_state(environment.clone(), state)?
+            }
+            None => PublicationSequenceGuard::new(environment.clone()),
+        };
+        Ok(Self {
             store,
             environment,
             trust,
             sequence_guard,
-        }
+        })
     }
 
     pub fn environment(&self) -> &EnvironmentId {
@@ -1764,9 +1781,8 @@ impl<S: ObjectStore> BlobPublication<S> {
 
     /// Export the tuple retained by this process's publication guard.
     ///
-    /// This performs no durable write and is not integrated with the production
-    /// last-known-good cache. Cross-restart protection is intentionally not
-    /// claimed by this protocol slice.
+    /// This accessor performs no durable write; callers persist an accepted
+    /// candidate through the signed blob-native last-known-good cache.
     pub fn observed_head_state(&self) -> Option<PublicationHeadState> {
         self.sequence_guard.observed_state()
     }
