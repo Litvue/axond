@@ -40,11 +40,10 @@ pub struct ConcurrencyCaps {
 
 /// The policy governing one namespace, and the generation it is enforced under.
 ///
-/// `None` caps mean *this replica cannot enforce a cap for this namespace*, which
-/// happens in exactly one situation: a stateful deployment whose control plane has
-/// published no document for a namespace whose backend enforces one. That denies
-/// rather than admits — an unenforced cap is indistinguishable from an infinite
-/// one, and the whole point of the section is that it is finite.
+/// `None` caps mean *this replica has no exact cap values for the namespace*.
+/// That is either a missing policy document, which denies rather than admits
+/// when a shared backend is configured, or an intentional flat-v2 static-only
+/// namespace, which bypasses exact enforcement altogether.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ActivePolicy {
     pub budget: Option<BudgetCaps>,
@@ -52,15 +51,33 @@ pub struct ActivePolicy {
     /// The generation these values came from, or `None` when they are the
     /// bootstrap file's.
     pub generation: Option<PolicyGeneration>,
+    /// A flat-v2 namespace may intentionally omit exact distributed caps. It
+    /// remains serveable with static policy even when another namespace uses a
+    /// shared budget or lease backend; this is distinct from a projected
+    /// namespace that is missing its required policy document.
+    pub(crate) static_only: bool,
 }
 
 impl ActivePolicy {
+    pub(crate) const fn static_only() -> Self {
+        Self {
+            budget: None,
+            concurrency: None,
+            generation: None,
+            static_only: true,
+        }
+    }
+
+    pub(crate) const fn is_static_only(&self) -> bool {
+        self.static_only
+    }
+
     /// Whether this replica has values to enforce for the namespace at all.
     ///
-    /// The two `None`s move together — a policy is a whole document or nothing
-    /// — so one of them answers it.
+    /// An intentional flat-v2 static-only namespace is not an ungoverned
+    /// namespace: it has explicitly opted out of exact enforcement.
     pub(super) const fn unenforceable(&self) -> bool {
-        self.budget.is_none()
+        self.budget.is_none() && !self.static_only
     }
 
     /// The policy the bootstrap file states, which is the whole policy of a
@@ -84,6 +101,7 @@ impl ActivePolicy {
                 lease_ttl: Duration::from_secs(config.rate_limit.lease_ttl_seconds),
             }),
             generation: None,
+            static_only: false,
         }
     }
 
@@ -99,6 +117,7 @@ impl ActivePolicy {
                 lease_ttl: Duration::from_secs(body.concurrency().lease_ttl_seconds()),
             }),
             generation: Some(generation),
+            static_only: false,
         }
     }
 }
@@ -134,14 +153,15 @@ pub struct PolicyView {
 impl PolicyView {
     /// Derive the view a configuration describes.
     ///
-    /// Stateless: every namespace is governed by the file. Stateful: a namespace
-    /// is governed by the document a revision published for it
-    /// ([`Namespace::policy`](crate::config::Namespace::policy)) and by nothing
-    /// otherwise — the file governs none of them, because a stateful bootstrap
-    /// cannot declare one.
+    /// Stateless: every namespace is governed by the file. Stateful: exact
+    /// distributed spend/concurrency enforcement comes only from the optional
+    /// document a revision published for it
+    /// ([`Namespace::policy`](crate::config::Namespace::policy)); the file
+    /// governs none of them, because a stateful bootstrap cannot declare one.
     ///
-    /// "By nothing" denies rather than admits, but a replica does not reach that
-    /// state by activating a revision:
+    /// When shared enforcement backends are configured, "by nothing" denies
+    /// rather than admits, but a replica does not reach that state by activating
+    /// a revision:
     /// [`plan`](super::activation::plan) refuses a candidate that would serve an
     /// ungoverned namespace, so the denial is what a *bootstrap* view can
     /// describe before any document exists, not something a publication
@@ -153,7 +173,14 @@ impl PolicyView {
         let projected_namespaces = config
             .namespace
             .iter()
-            .filter(|namespace| namespace.project.is_some())
+            .filter(|namespace| {
+                namespace.project.is_some()
+                    || namespace.static_policy.is_some()
+                    || matches!(
+                        namespace.policy.as_ref().map(|policy| policy.body.scope()),
+                        Some(PolicyScope::Namespace(_))
+                    )
+            })
             .map(|namespace| namespace.id.clone())
             .collect();
         let mut published = BTreeMap::new();
@@ -170,6 +197,9 @@ impl PolicyView {
                         .namespaces
                         .push(namespace.id.clone());
                     ActivePolicy::published(&policy.body, policy.generation)
+                }
+                None if stateful && namespace.static_policy.is_some() => {
+                    ActivePolicy::static_only()
                 }
                 None if stateful => ActivePolicy::default(),
                 None => bootstrap,
@@ -335,6 +365,7 @@ dsn_env = "GW_BUDGET_REDIS"
                 project: crate::desired_state::fixtures::project_id(1),
             }),
             policy,
+            static_policy: None,
         }
     }
 
@@ -378,6 +409,27 @@ dsn_env = "GW_BUDGET_REDIS"
         let view = PolicyView::of(&config);
         assert_eq!(view.policy("acme/core"), ActivePolicy::default());
         assert!(view.policy("acme/core").budget.is_none());
+    }
+
+    #[test]
+    fn a_flat_v2_static_only_namespace_is_not_an_ungoverned_gap() {
+        let mut config = stateful_config();
+        config.namespace.push(crate::config::Namespace {
+            id: "acme/core".to_owned(),
+            default: true,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+            static_policy: Some(crate::config::NamespaceStaticPolicy::default()),
+        });
+
+        let view = PolicyView::of(&config);
+        assert!(view.policy("acme/core").is_static_only());
+        assert!(
+            !view
+                .unenforceable()
+                .any(|namespace| namespace == "acme/core")
+        );
     }
 
     #[test]

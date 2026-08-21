@@ -21,6 +21,8 @@ from fake_upstream import CHAT, EMBEDDINGS, FakeUpstream, MESSAGES, RESPONSES
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GATEWAY_KEY = "test-inbound-key"
+NAMESPACE = "platform"
+UNGRANTED_NAMESPACE = "tenant"
 UPSTREAM_OPENAI_KEY = "test-upstream-openai-key"
 UPSTREAM_ANTHROPIC_KEY = "test-upstream-anthropic-key"
 
@@ -59,8 +61,14 @@ def _config(bind: str, upstream: str) -> str:
 bind = "{bind}"
 
 [[namespace]]
-id = "platform"
+id = "{NAMESPACE}"
 default = true
+
+# This namespace exists but the SDK caller's key does not grant it. Keeping it
+# in the black-box fixture lets the SDK lanes prove that an existing namespace
+# and an absent namespace have the same refusal envelope.
+[[namespace]]
+id = "{UNGRANTED_NAMESPACE}"
 
 [[provider]]
 id = "fake-openai"
@@ -73,18 +81,18 @@ kind = "anthropic"
 base_url = "{upstream}"
 
 [[credential]]
-namespace = "platform"
+namespace = "{NAMESPACE}"
 provider = "fake-openai"
 env = "GW_FAKE_OPENAI_KEY"
 
 [[credential]]
-namespace = "platform"
+namespace = "{NAMESPACE}"
 provider = "fake-anthropic"
 env = "GW_FAKE_ANTHROPIC_KEY"
 
 [[gateway_key]]
 env = "GW_INBOUND_KEY"
-namespace = "platform"
+namespace = "{NAMESPACE}"
 
 {models}"""
 

@@ -125,6 +125,7 @@ impl RevisionProjection for TenancyProjection {
                     allow_platform_fallback: false,
                     project: None,
                     policy: None,
+                    static_policy: None,
                 });
             } else {
                 return Err(ProjectionError::Incomplete {
@@ -188,6 +189,7 @@ impl RevisionProjection for TenancyProjection {
                 // Policy is the policy projection's to fill (#150): a namespace
                 // arrives here governed by nothing, and that projection decides
                 // what governs it.
+                static_policy: None,
                 policy: None,
             });
         }

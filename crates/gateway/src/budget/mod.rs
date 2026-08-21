@@ -194,6 +194,11 @@ pub struct InMemoryBudget {
     namespace_count: usize,
     floor: usize,
     unavailable: UnavailablePolicy,
+    /// The production builder supplies the live policy view so a stateful
+    /// static-only namespace can bypass exact budget accounting. Direct test
+    /// constructors leave this unset and retain their legacy per-replica
+    /// behavior.
+    shared: Option<SharedSettings>,
     ledger_state: Mutex<LedgerState>,
 }
 
@@ -302,8 +307,30 @@ impl InMemoryBudget {
             namespace_count,
             floor,
             unavailable,
+            shared: None,
             ledger_state: Mutex::new(LedgerState::default()),
         }
+    }
+
+    fn with_shared_settings(
+        limit_microdollars: u64,
+        idle_ttl: Duration,
+        reservation_ttl: Duration,
+        max_subjects: usize,
+        unavailable: UnavailablePolicy,
+        namespace_count: usize,
+        shared: SharedSettings,
+    ) -> Self {
+        let mut budget = Self::with_settings_and_policy(
+            limit_microdollars,
+            idle_ttl,
+            reservation_ttl,
+            max_subjects,
+            unavailable,
+            namespace_count,
+        );
+        budget.shared = Some(shared);
+        budget
     }
 
     #[cfg(test)]
@@ -431,6 +458,22 @@ impl BudgetStore for InMemoryBudget {
     }
 
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+        if let Some(shared) = &self.shared {
+            let Some(governing) =
+                shared.caps(crate::policy::ungoverned::BUDGET_IN_MEMORY, &key.namespace)
+            else {
+                // A missing policy is not a store outage and must not inherit
+                // the configured fail-open stance: admitting an ungoverned
+                // stateful namespace would serve traffic without a policy.
+                return Admission::Denied(Denial::StoreUnavailable);
+            };
+            if governing.caps.is_none() {
+                // Flat-v2 static-only namespaces intentionally have no exact
+                // budget. An unheld reservation keeps them out of the local
+                // ledger entirely, just like the shared stores' bypass.
+                return Admission::Allowed(Reservation::unheld());
+            }
+        }
         let mut state = self.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.ledgers.contains_key(key) {
             let free = self.max_subjects.saturating_sub(state.ledgers.len());
@@ -636,6 +679,7 @@ impl SharedSettings {
                 budget: Some(caps),
                 concurrency: None,
                 generation: None,
+                static_only: false,
             }),
             unavailable,
         }
@@ -645,8 +689,10 @@ impl SharedSettings {
         self.namespace_scope
     }
 
-    /// The caps governing `namespace` and the generation that stated them, or
-    /// `None` when this replica holds no enforceable policy for it.
+    /// The caps governing `namespace` and the generation that stated them.
+    /// `Some` with `caps = None` is an intentional flat-v2 static-only
+    /// namespace, which bypasses exact budget enforcement. `None` still means
+    /// that a projected namespace has no policy document and must be denied.
     ///
     /// A store that cannot answer "what is the cap here" must not admit: an
     /// unenforced cap and an infinite one are indistinguishable to a caller, and
@@ -663,6 +709,12 @@ impl SharedSettings {
     /// the same backend and the two denials are different operator problems.
     pub(crate) fn caps(&self, store: &'static str, namespace: &str) -> Option<Governing> {
         let policy = self.ceilings.active(namespace);
+        if policy.is_static_only() {
+            return Some(Governing {
+                caps: None,
+                generation: None,
+            });
+        }
         let Some(caps) = policy.budget else {
             // Every one of these denials is counted; the explanation is sampled,
             // because the condition belongs to the published view and repeating
@@ -691,7 +743,7 @@ impl SharedSettings {
             return None;
         }
         Some(Governing {
-            caps,
+            caps: Some(caps),
             generation: policy.generation,
         })
     }
@@ -702,7 +754,7 @@ impl SharedSettings {
 /// caps never bound it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Governing {
-    pub(crate) caps: BudgetCaps,
+    pub(crate) caps: Option<BudgetCaps>,
     pub(crate) generation: Option<PolicyGeneration>,
 }
 
@@ -733,13 +785,14 @@ pub async fn build(
         // `validate_budget` already refuses a namespace cap on these two, so
         // reaching them here means no namespace cap was asked for.
         BudgetBackend::None => Ok(Box::new(NoBudget)),
-        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_settings_and_policy(
+        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_shared_settings(
             config.limit_microdollars,
             Duration::from_secs(config.idle_ttl_seconds),
             Duration::from_secs(config.reservation_ttl_seconds),
             config.max_subjects,
             config.on_unavailable.into(),
             namespace_count,
+            settings,
         ))),
         BudgetBackend::Redis => {
             let url = dsn(config, "redis", env)?;
@@ -926,6 +979,67 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn built_in_memory_budget_bypasses_a_flat_static_only_namespace() {
+        let config = BudgetConfig {
+            backend: BudgetBackend::InMemory,
+            limit_microdollars: 1,
+            ..BudgetConfig::default()
+        };
+        let budget = build(
+            &config,
+            &HashMap::new(),
+            1,
+            Ceilings::fixed(crate::policy::ActivePolicy::static_only()),
+        )
+        .await
+        .expect("the in-memory backend has no connection to open");
+
+        assert_eq!(
+            budget
+                .reserve(
+                    &BudgetKey {
+                        namespace: "static-only".into(),
+                        subject: "caller".into(),
+                    },
+                    2,
+                )
+                .await,
+            Admission::Allowed(Reservation::unheld())
+        );
+    }
+
+    #[tokio::test]
+    async fn built_in_memory_budget_denies_an_ungoverned_namespace() {
+        let config = BudgetConfig {
+            backend: BudgetBackend::InMemory,
+            limit_microdollars: 1_000,
+            on_unavailable: StoreUnavailable::Allow,
+            ..BudgetConfig::default()
+        };
+        let budget = build(
+            &config,
+            &HashMap::new(),
+            1,
+            Ceilings::fixed(crate::policy::ActivePolicy::default()),
+        )
+        .await
+        .expect("the in-memory backend has no connection to open");
+
+        assert_eq!(
+            budget
+                .reserve(
+                    &BudgetKey {
+                        namespace: "ungoverned".into(),
+                        subject: "caller".into(),
+                    },
+                    1,
+                )
+                .await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
+    }
+
     #[test]
     fn reservation_ids_are_unique() {
         let ids: std::collections::HashSet<String> =
@@ -1059,7 +1173,7 @@ mod tests {
         let first = settings
             .caps(crate::policy::ungoverned::BUDGET_REDIS, "acme/core")
             .expect("the namespace is governed");
-        assert_eq!(first.caps.subject_microdollars, 1_000);
+        assert_eq!(first.caps.expect("governed").subject_microdollars, 1_000);
         assert_eq!(
             first.generation,
             Some(generation(&published_body(1_000, 1), 1))
@@ -1070,7 +1184,7 @@ mod tests {
             .expect("the namespace is governed");
         // The caps and the generation stamped on the hold come from one read, so
         // they always name each other.
-        assert_eq!(second.caps.subject_microdollars, 9_000);
+        assert_eq!(second.caps.expect("governed").subject_microdollars, 9_000);
         assert_eq!(
             second.generation,
             Some(generation(&published_body(9_000, 2), 2))
@@ -1109,6 +1223,27 @@ mod tests {
                 .caps(crate::policy::ungoverned::BUDGET_REDIS, "acme/core")
                 .is_none()
         );
+
+        let static_only = crate::policy::PolicyView::of(&crate::config::Config {
+            namespace: vec![crate::config::Namespace {
+                id: "static-only".to_owned(),
+                default: true,
+                allow_platform_fallback: false,
+                project: None,
+                policy: None,
+                static_policy: Some(crate::config::NamespaceStaticPolicy::default()),
+            }],
+            ..crate::policy::view::tests::stateful_config()
+        });
+        let settings = SharedSettings {
+            ceilings: Ceilings::fixed(static_only.policy("static-only")),
+            namespace_scope: false,
+            unavailable: UnavailablePolicy::Deny,
+        };
+        let governing = settings
+            .caps(crate::policy::ungoverned::BUDGET_REDIS, "static-only")
+            .expect("static-only explicitly bypasses exact budget enforcement");
+        assert!(governing.caps.is_none());
     }
 
     #[tokio::test(start_paused = true)]

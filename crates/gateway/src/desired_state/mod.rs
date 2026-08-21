@@ -67,18 +67,23 @@
 //! `ControlPlaneStore` must behave when they do.
 
 pub mod access;
+pub mod blob_revision;
 pub mod canonical;
 pub mod credentials;
+mod environment;
 pub mod ids;
 pub mod models;
 pub mod mutation;
+pub mod namespaces;
 pub mod policy;
 pub mod pricing;
 pub mod providers;
 pub mod publication;
 mod publication_auth;
 pub mod resource;
+pub mod resource_document;
 pub mod revision;
+mod secret_binding;
 pub mod secrets;
 pub mod tenancy;
 
@@ -99,6 +104,11 @@ pub use access::{
     IdentityError, IdentityKind, KeyError, Principal, Role, Surface, WorkloadKey,
 };
 #[allow(unused_imports)]
+pub use blob_revision::{
+    BlobCandidate, BlobHydrationLimit, BlobHydrationLimits, BlobRevisionError,
+    BlobRevisionIdentity, BlobRevisionSource,
+};
+#[allow(unused_imports)]
 pub use canonical::{
     Canonical, CanonicalError, CanonicalValue, Checksum, InvalidChecksum, SerializerVersion,
 };
@@ -107,6 +117,8 @@ pub use credentials::{
     CredentialError, Credentials, PROVIDER_CREDENTIAL_SCHEMA, ProviderCredential,
     ProviderCredentialBody,
 };
+#[allow(unused_imports)]
+pub use environment::{EnvironmentId, InvalidEnvironmentId};
 #[allow(unused_imports)]
 pub use ids::{
     AuditEventId, InvalidId, InvalidSlug, InvalidUuid7, MutationId, PrincipalId, ProjectId,
@@ -123,6 +135,13 @@ pub use models::{
 pub use mutation::{
     Actor, AuditEvent, ExpectedRevision, IdempotencyKey, InvalidActor, InvalidIdempotencyKey,
     Mutation, MutationKind,
+};
+#[allow(unused_imports)]
+pub use namespaces::{
+    DeploymentBody, DeploymentCatalogueEntry, DeploymentProvider, DeploymentSecretIndexEntry,
+    DeploymentTrust, FlatNamespaces, FlatProviderKind, InboundGrantBody, NamespaceAlias,
+    NamespaceBody, NamespaceCredential, NamespaceExactEnforcement, NamespacePolicySpec,
+    NamespaceProvider, NamespaceStateError, NamespaceTarget,
 };
 #[allow(unused_imports)]
 pub use policy::{
@@ -144,7 +163,7 @@ pub use providers::{PROVIDER_SCHEMA, Provider, ProviderBody, ProviderError, Prov
 #[allow(unused_imports)]
 pub use publication::{
     ActivationReadyRevision, BlobPublication, BlobPublicationError, BlobPublicationRequest,
-    EnvironmentId, ExpectedHead, HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus,
+    BlobReader, ExpectedHead, HeadDocument, IdempotencyHistoryLimit, IdempotencyHistoryStatus,
     ImmutableObject, ImmutableObjectKind, PublicationActorBinding, PublicationAuthorization,
     PublicationGrantBinding, PublicationHeadState, PublicationOutcome, PublicationSequenceGuard,
     VerifiedActiveRevision, VerifiedRevisionManifest,
@@ -161,10 +180,14 @@ pub use resource::{
     ResourceVersion, ResourceVersionNumber,
 };
 #[allow(unused_imports)]
+pub use resource_document::{BlobResourceDocument, BlobResourceDocumentError};
+#[allow(unused_imports)]
 pub use revision::{
     BodySkew, DesiredState, IntegrityError, LoadedRevision, ManifestEntry, RevisionCandidate,
     RevisionManifest, ValidationError,
 };
+#[allow(unused_imports)]
+pub use secret_binding::{AuthenticatedSecretBinding, BlobSecretPublicationBinding};
 #[allow(unused_imports)]
 pub use secrets::{
     ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,

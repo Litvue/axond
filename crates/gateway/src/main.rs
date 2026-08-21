@@ -50,6 +50,7 @@ mod desired_state;
 mod error;
 mod key_material;
 mod mint;
+mod namespace;
 // The request-path middleware primitive (#355). The production chain is empty
 // until typed policy delivery registers content middleware.
 #[allow(dead_code)]
@@ -107,8 +108,8 @@ use budget::BudgetStore;
 use clap::{Arg, ArgAction, Command};
 use config::{Config, Mode};
 use convergence::{
-    ConvergenceSettings, LastKnownGood, MaterialLedger, PolicyProjection, Reconciler,
-    RevisionCompiler, RevisionStatus, RuntimeProjection, SnapshotSink, SystemClock,
+    ConvergenceSettings, LastKnownGood, MaterialLedger, Reconciler, RevisionCompiler,
+    RevisionStatus, SnapshotSink, SystemClock,
 };
 use rate_limit::RateLimiter;
 use revocation::RevocationStore;
@@ -869,7 +870,7 @@ async fn serve() -> anyhow::Result<()> {
         let compiler = RevisionCompiler::with_secrets(
             bootstrap_config,
             env.clone(),
-            PolicyProjection::over(RuntimeProjection),
+            crate::convergence::StateModelProjection,
             Arc::new(crate::convergence::SecretMaterialization::new(
                 resolver,
                 MaterialLedger::new(),

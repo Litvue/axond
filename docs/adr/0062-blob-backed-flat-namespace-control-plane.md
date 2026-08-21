@@ -4,9 +4,16 @@ Date: 2026-08-20
 
 ## Status
 
-Accepted. The provider-neutral object-store and authenticated publication domain
-contracts are implemented; runtime convergence and operator configuration are
-still staged work and blob-backed serving remains fail-closed until they land.
+Accepted; implementation in progress. Typed namespace identity, canonical
+namespace-prefixed inference routes, complete flat namespace desired-state
+resources, deployment-scoped single/set/all workload grants, the
+provider-neutral object-store contract, and authenticated blob publication
+contracts now compile into recoverable serving snapshots. Deployment resources
+carry a signed secret index, static policy compiles without a coordination
+backend, and exact shared caps remain explicit. Runtime convergence, blob-backed
+secret resolution, administrative trust activation, migration, and topology
+qualification remain open; blob-backed serving remains fail-closed until those
+slices land.
 
 Supersedes the PostgreSQL-only stateful control plane and the durable
 tenant/project/workload-principal hierarchy selected by
@@ -164,16 +171,6 @@ Listing, deletion, notifications, leases, object versioning, and retention are
 useful operational capabilities but are not on the publication or serving
 correctness path.
 
-Ciphertext destruction uses a separate background-maintenance capability:
-`delete_if_version(key, expected_version)`. It is called only after a signed
-tombstone revision has removed the ciphertext from the reachable object set.
-The operation must use the provider's native version precondition; a stale
-eraser may not delete a replacement object. `NotFound` is idempotent success to
-the eraser, while a failed precondition is an integrity alarm. Stores without
-this optional capability can still publish and serve, but cannot claim physical
-secret erasure. Provider soft-delete or version-retention policy may delay
-physical destruction and must be disclosed by deployment documentation.
-
 There is one mutable publication object per environment:
 
 ```text
@@ -195,56 +192,6 @@ mutation summary, resource hashes, and signature. The namespace map is
 `namespace identifier -> immutable resource digest`, so changing one namespace
 reuses every unchanged resource.
 
-Both publication documents are authenticated v2 formats. The manifest is
-deterministic CBOR and the head is canonical JSON. Each carries signature schema
-`1`, algorithm `ed25519.v1`, a bounded non-secret signer key id, and an Ed25519
-signature. Their signing inputs are separately domain-separated; a signature
-over one format can never verify as the other. The manifest signature binds its
-schema, environment, sequence, parent, actor and grant bindings, mutation id and
-kind, authorization-scoped idempotency binding, desired-state checksum, sorted
-object references, and its own signing metadata. The head signature binds its
-schema, environment, sequence, revision digest, SHA-256 integrity metadata, and
-signing metadata.
-Manifest object references are strictly sorted and unique; a differently
-ordered or duplicated representation is not another valid spelling of the same
-revision.
-
-Serving replicas bootstrap with a verification-only key set. Publishers hold a
-private signer and refuse to start unless that signer is in the same trust set.
-Bootstrap trust is bounded to 64 keys total, including rotation overlap.
-Unknown key ids, algorithms, signature schemas, malformed signatures, and
-invalid signatures are distinct typed refusals. Raw actor/grant inputs and raw
-idempotency keys are domain-separated digests in durable metadata; signing key
-material, bearer values, and secret material are never serialized or included
-in errors. Key rotation adds the next public key to bootstrap trust before a
-publisher switches signer, then removes the old key only after no retained head,
-manifest, or last-known-good record depends on it.
-
-There is deliberately no public parse-only manifest API. Untrusted bytes can
-become a `VerifiedRevisionManifest` only after content-address, canonical-form,
-environment, sequence/parent shape, and signature verification, but that type is
-history evidence only: a valid signature does not prove that its candidate won
-head CAS. Hydration requires `VerifiedActiveRevision`, which is produced only by
-reading a verified head with its opaque `ObjectVersion`, loading the exact
-environment/revision/sequence manifest it selects, and strongly re-reading an
-unchanged head/version fence. Immediately before local snapshot activation the
-fence is read again and consumed as a non-cloneable `ActivationReadyRevision`.
-Neither an orphaned immutable manifest nor a signed body retained from a failed
-conditional request can manufacture either active wrapper.
-
-The per-process, per-environment guard retains `(sequence, active_revision)`,
-not sequence alone. A valid older head or an absent head below that state is
-rollback; a different digest at the same sequence is typed equivocation. This
-protocol slice can export the tuple and initialize another in-memory guard, but
-it does not connect that seam to the existing production last-known-good cache.
-It therefore makes no cross-restart rollback or equivocation-resistance claim.
-The later authenticated blob LKG runtime slice must bind, persist, and restore
-the complete tuple beside its authenticated snapshot before that claim becomes
-valid; the legacy LKG format is unchanged here. A successful native conditional
-write is authoritative commit evidence: it still returns truthful success if
-another writer has already advanced the shared guard to a newer sequence, while
-a same-sequence digest contradiction remains an error.
-
 ### Publication is immutable upload followed by one CAS
 
 A publisher:
@@ -265,37 +212,15 @@ before the final compare-and-swap leaves unreachable immutable objects, not a
 partial revision. A losing concurrent publisher receives a typed conflict,
 re-reads, and rebuilds; it never retries a stale head update as last-writer-wins.
 
-The storage trust boundary requires strong exact-key reads, opaque versions that
-change on every successful write, and native create/replace preconditions with a
-single winner. Providers, proxies, or diagnostics may retain failed conditional
-request bodies, but those bytes are untrusted input: activation accepts only the
-body currently returned for the head key with its matching version fence. A
-captured signed loser replayed at the winner's sequence is equivocation, and an
-older committed body replayed after advancement is rollback. A store that lies
-about conditional-write success or serves a version token for different bytes
-violates the adapter contract and must be treated as an integrity failure.
-
 Administrative mutations are declarative. Callers choose stable resource IDs
 and send an expected revision and idempotency key. The immutable revision binds
-an authorization-scoped digest of that key to the desired-state checksum: the
-same actor/grant, key, and checksum replay the original result, while the same
-binding with different content is refused. The same caller string under another
-authenticated grant is an independent write rather than a collision. The
+that key to the desired-state checksum: the same key and checksum replay the
+original result, while the same key with different content is refused. The
 check occurs before stale-head conflict reporting so a lost successful response
 is recoverable. The core protocol does not recreate a mutable relational
 idempotency table or imperative ID allocator; retained history is the initial
 index, and any future compaction must first add immutable idempotency
 checkpoints.
-
-The initial parent walk has an explicit configured revision bound. Until
-immutable idempotency checkpoints ship, that bound must cover the complete
-reachable chain for a genuinely new key: if a parent remains after the bound is
-consumed, the publisher reports the history as exhausted and refuses the novel
-mutation. It never treats the unsearched prefix as proof that a key is absent or
-falls back to an unbounded walk. An exact replay found inside the bounded window
-still returns its original result. Operators must monitor this status and size
-the bound above retained history; garbage collection alone cannot shorten the
-linked chain without a checkpoint.
 
 Rollback publishes a new revision whose resources reproduce an earlier desired
 state. It never rewinds the sequence or edits history. Successful-mutation
@@ -305,13 +230,6 @@ that publish no revision use individually immutable create-only audit objects;
 listing those records is administrative behavior, not serving correctness.
 Operational retention may additionally protect objects with store-native
 versioning or WORM policy.
-
-Unsigned blob publication is not a migration input. Unsigned head/manifest v2
-documents fail closed, as do the earlier unsigned blob schema-1 prototypes.
-There was no released blob authority to preserve. The legacy PostgreSQL journal,
-its canonical revision format, and its serving behavior are untouched; migration
-must authenticate newly exported blob v2 objects rather than copying an unsigned
-prototype format.
 
 Garbage collection starts from retained environment heads and walks immutable
 references. It deletes unreachable objects only after a grace period longer
@@ -328,17 +246,21 @@ swaps the compiled snapshot. Requests capture one namespace view from that
 snapshot for their whole lifetime.
 
 Warm replicas keep serving during an object-store outage. Administration and
-convergence pause. The target runtime allows a cold replica to restore an
-authenticated local last-known-good snapshot; without either object storage or
-a valid local cache it remains healthy-but-unready and serves no inference. This
-publication protocol slice does not yet wire its head tuple into that cache, so
-the cold-start path and cross-restart tuple guarantees remain work for the
-authenticated blob LKG runtime slice.
+convergence pause. A cold replica may restore an authenticated local
+last-known-good snapshot only when that snapshot contains no flat-v2 provider
+credentials. Credential-bearing flat-v2 snapshots deliberately do not cross a
+restart until the cache is checked against an authenticated monotonic
+revision/tombstone floor; otherwise a stale but authentic cache could resurrect
+material revoked by a newer revision whose cache write failed. Without object
+storage or an eligible local cache, the replica remains healthy-but-unready and
+serves no inference.
 
 The optional local cache is a recovery copy, never the desired-state authority.
 It is not an additional external service and may use a VM disk or per-replica
 persistent volume. A deployment that does not retain it makes no cold-start
-outage claim.
+outage claim. This projection slice retains cold recovery for credential-free
+flat-v2 state; credential-bearing recovery is a later integration gate, not a
+claim inferred from the cache format alone.
 
 ### Secrets remain encrypted and off the request path
 
@@ -347,6 +269,50 @@ manifest, audit entry, log, or administrative response. The minimal deployment
 receives a bootstrap key from an environment variable or mounted secret and
 uses per-version envelope encryption bound to the deployment, namespace owner,
 and exact secret reference. A KMS or external secret manager is optional.
+
+The signed deployment resource is authoritative for non-secret secret metadata.
+Each index entry binds an owner namespace, exact `SecretRef` and version,
+ciphertext digest, and lifecycle state. A namespace credential is valid only
+when that exact active entry exists and names the same namespace. Two
+credentials in one namespace may share an exact reference; an exact reference
+cannot have two index rows, and versions of one secret cannot move between
+namespace owners. Resolution receives this complete typed binding rather than
+an ownerless reference. Only the validated flat-state index can mint the opaque
+request consumed by resolution; raw request construction is unavailable.
+
+The native v2 object is a deterministic canonical-CBOR fixed array containing
+only schema `2`, scheme `aes256-kw.aes256-gcm.envelope.v2`, stable KEK id, RFC
+3394 wrapped DEK, material nonce, and ciphertext. Environment, namespace, and
+exact secret reference are authenticated caller context rather than stored
+fields. Binary length-prefixed material AAD binds its purpose, environment id,
+`NamespaceId`, secret UUID, version, and KEK id. RFC 3394 AES-256-KW wraps the
+fixed 32-byte DEK without a nonce; because AES-KW has no AAD, caller-context
+binding is asserted only for the complete object after material authentication.
+The environment value is the publication protocol's single `EnvironmentId`,
+not a codec-local spelling. Opening consumes an opaque
+`AuthenticatedSecretBinding` and checks its indexed ciphertext digest before
+selecting a KEK. This crypto slice intentionally provides no production
+constructor for that binding: the integration slice must mint it only after a
+signed active revision, its content-addressed deployment object, and the exact
+deployment secret-index entry have all been verified. Tests and fuzzing alone
+have synthetic constructors. The same is true of the distinct create-only
+publication binding; its production minting belongs beside immutable publisher
+reservation enforcement.
+Plaintext is capped at 64 KiB, and the strict decoder rejects alternate CBOR
+spellings and oversized objects before allocation. A serving
+`BlobSecretOpener` owns only a bounded `KekDecryptRing` and has no sealing API or
+publication authority. A publisher-only `BlobSecretSealer` owns one active KEK
+and one opaque create-only binding and has no opening API. Up to eight
+decrypt-only keys permit rolling rotation, while duplicate ids or aliased raw
+key bytes refuse the whole ring atomically. The legacy v1
+Postgres envelope is a separate unchanged format and is never guessed from blob
+bytes.
+
+Publication must reserve an exact `SecretRef` create-only and report a conflict
+if any value already occupies it; changing bytes always requires a new version.
+The object-store contract already refuses overwriting an immutable object key,
+but the reference index and publisher that enforce this stronger rule are a
+follow-up slice and are not claimed by the codec alone.
 
 Staging or rotation creates a new sealed version. Activation, disablement, and
 revocation publish namespace or deployment revisions that change references;
@@ -364,7 +330,14 @@ material is owned and zeroized with the compiled snapshot as required by
 Object storage does not implement distributed counters or transactional
 request journaling. The blob-only deployment supports static namespace policy,
 per-replica admission, revisioned token epochs, and usage attribution, but not
-an implied exact fleet-wide counter.
+an implied exact fleet-wide counter. A namespace therefore carries static
+policy independently of an optional exact-enforcement block. Omitting exact
+enforcement activates on the blob-only topology, even when another namespace
+in the same process uses an optional shared exact backend; the shared budget and
+lease stores bypass that namespace rather than treating its absent document as
+an ungoverned failure. Requesting exact spend and concurrency caps preserves
+the existing fail-closed backend and storage-layout checks and is refused unless
+configured shared backends enforce every value for that exact namespace.
 
 The following remain optional responsibility-specific backends:
 
@@ -378,6 +351,12 @@ The following remain optional responsibility-specific backends:
 Selecting one of those capabilities raises only that responsibility's tier and
 request-path availability coupling. It does not make PostgreSQL or Redis a
 requirement of stateful namespace management.
+
+Deployment-scoped administrative trust remains part of the target authority,
+but it is security state and cannot be accepted as inert configuration. Until
+one snapshot can activate trust for both administrative authentication and
+flat-namespace authorization and recover it through LKG atomically, this build
+rejects every nonempty durable trust list.
 
 ### State tier
 

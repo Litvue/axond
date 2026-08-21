@@ -241,6 +241,10 @@ A valid cache permits cold boot during a control-plane outage. Missing, invalid,
 or tampered projected state leaves the process alive but unready while
 convergence retries; keyless projected state remains fail-closed. The cache is
 not a fallback for a candidate that fails validation or secret resolution.
+Credential-bearing flat-v2 snapshots are a deliberate exception: this build
+does not persist or cold-restore their compiled-serving sibling until an
+authenticated monotonic revision/tombstone floor is integrated. Credential-free
+flat-v2 state remains eligible for cache recovery.
 
 The stateful projection supplies recoverable project-scoped inbound principals,
 so a revision with complete provider, retained catalogue, credential, and

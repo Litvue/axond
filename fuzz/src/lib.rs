@@ -44,6 +44,101 @@ pub use wire::{
 /// payload, not that any particular wording fits.
 const CATALOG_REFUSAL_BYTES: usize = 4096;
 
+/// Untrusted immutable blob ciphertext: strict fixed-array canonical CBOR.
+///
+/// Coverage-guided bytes and committed binary seeds reach the production
+/// parser byte-for-byte; the harness performs no seed decoding or transformation.
+pub fn blob_secret_envelope(data: &[u8]) -> &'static str {
+    match axond_fuzz_seam::blob_secret_envelope_cbor(data) {
+        Ok(canonical) => {
+            assert_eq!(
+                canonical.as_slice(),
+                data,
+                "the strict decoder accepted a second spelling"
+            );
+            assert!(
+                canonical.len() <= axond_fuzz_seam::BLOB_SECRET_MAX_SEALED_BYTES,
+                "the decoder accepted an object over its bound"
+            );
+            "accepted"
+        }
+        Err(class) => class,
+    }
+}
+
+/// Structured, bounded crypto operations complement the raw parser target.
+///
+/// The committed corpus owns a stable binary layout: scenario, primary seed,
+/// secondary seed, little-endian `u64` identity seed, little-endian `u16`
+/// version seed, then all remaining bytes as material. Implementing the layout
+/// here keeps seed meaning stable across derive-macro changes and lets smoke
+/// replay every file through [`Arbitrary::arbitrary_take_rest`] exactly as the
+/// coverage-guided target does.
+#[derive(Debug)]
+pub struct BlobSecretCryptoInput<'a> {
+    pub material: &'a [u8],
+    pub scenario: u8,
+    pub primary_seed: u8,
+    pub secondary_seed: u8,
+    pub identity_seed: u64,
+    pub version_seed: u16,
+}
+
+impl<'a> BlobSecretCryptoInput<'a> {
+    fn prefix(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<(u8, u8, u8, u64, u16)> {
+        Ok((
+            u.arbitrary()?,
+            u.arbitrary()?,
+            u.arbitrary()?,
+            u.arbitrary()?,
+            u.arbitrary()?,
+        ))
+    }
+}
+
+impl<'a> Arbitrary<'a> for BlobSecretCryptoInput<'a> {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let (scenario, primary_seed, secondary_seed, identity_seed, version_seed) =
+            Self::prefix(u)?;
+        Ok(Self {
+            material: u.arbitrary()?,
+            scenario,
+            primary_seed,
+            secondary_seed,
+            identity_seed,
+            version_seed,
+        })
+    }
+
+    fn arbitrary_take_rest(mut u: arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let (scenario, primary_seed, secondary_seed, identity_seed, version_seed) =
+            Self::prefix(&mut u)?;
+        Ok(Self {
+            material: u.take_rest(),
+            scenario,
+            primary_seed,
+            secondary_seed,
+            identity_seed,
+            version_seed,
+        })
+    }
+
+    fn size_hint(_depth: usize) -> (usize, Option<usize>) {
+        (13, None)
+    }
+}
+
+pub fn blob_secret_crypto(input: &BlobSecretCryptoInput<'_>) -> &'static str {
+    axond_fuzz_seam::blob_secret_seal_open(
+        input.material,
+        input.scenario,
+        input.primary_seed,
+        input.secondary_seed,
+        input.identity_seed,
+        input.version_seed,
+    )
+}
+
 /// A refusal must carry an operator-facing reason. An empty one would reach a
 /// log or a response body as a blank message.
 ///
@@ -462,6 +557,35 @@ pub fn config_toml(data: &[u8]) -> &'static str {
         "the same configuration text was accepted and refused"
     );
     outcome
+}
+
+/// Untrusted canonical JSON for deployment, namespace, and inbound-grant v2
+/// bodies. Durable schema skew must remain a typed incompatibility and malformed
+/// storage must remain an ordinary refusal; neither may panic.
+/// The exact target body called by both `fuzz_targets/flat_v2_body.rs` and the
+/// bounded seed replay. Keeping one public entrypoint prevents the smoke from
+/// testing a lookalike path while libFuzzer drives another.
+pub fn flat_v2_body_target(data: &[u8]) -> &'static str {
+    let first = axond_fuzz_seam::flat_v2_body(data);
+    assert!(
+        matches!(
+            first,
+            "empty"
+                | "invalid_json"
+                | "noncanonical_json"
+                | "unknown_selector"
+                | "accepted"
+                | "incompatible"
+                | "invalid"
+        ),
+        "flat-v2 seam returned an unbounded outcome class: {first}"
+    );
+    assert_eq!(
+        first,
+        axond_fuzz_seam::flat_v2_body(data),
+        "the same durable body was classified differently"
+    );
+    first
 }
 
 /// An untrusted `GET /v1/credentials/status?...` query string: malformed

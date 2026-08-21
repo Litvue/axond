@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import json
 
+import openai
 import pytest
 from openai import OpenAI
 
-from conftest import GATEWAY_KEY, UPSTREAM_OPENAI_KEY
+from conftest import GATEWAY_KEY, NAMESPACE, UNGRANTED_NAMESPACE, UPSTREAM_OPENAI_KEY
 from fake_upstream import CHAT, fixture, RESPONSES
 
 
+@pytest.fixture(params=("namespaced", "legacy"))
+def sdk_base_url(request, gateway) -> str:
+    """Exercise the canonical mount and the documented stateless alias."""
+    if request.param == "namespaced":
+        return f"{gateway}/namespaces/{NAMESPACE}/v1"
+    return f"{gateway}/v1"
+
+
 @pytest.fixture
-def client(gateway) -> OpenAI:
-    return OpenAI(base_url=f"{gateway}/v1", api_key=GATEWAY_KEY)
+def client(sdk_base_url) -> OpenAI:
+    return OpenAI(base_url=sdk_base_url, api_key=GATEWAY_KEY)
 
 
 def test_buffered_chat_completion(client, upstream):
@@ -29,12 +38,13 @@ def test_buffered_chat_completion(client, upstream):
     sent = upstream.requests[-1]
     # The alias is rewritten to the target model, and the caller's gateway key
     # never travels upstream.
+    assert sent["path"] == "/chat/completions"
     assert sent["model"] == CHAT
     assert sent["authorization"] == f"Bearer {UPSTREAM_OPENAI_KEY}"
     assert sent["body"]["messages"][0]["content"] == "What is the capital of France?"
 
 
-def test_streamed_chat_completion(client):
+def test_streamed_chat_completion(client, upstream):
     stream = client.chat.completions.create(
         model="chat-golden",
         messages=[{"role": "user", "content": "What is the capital of France?"}],
@@ -46,13 +56,24 @@ def test_streamed_chat_completion(client):
         if chunk.choices
     )
     assert text == "The capital of France is Paris."
+    sent = upstream.requests[-1]
+    assert sent["path"] == "/chat/completions"
+    assert sent["model"] == CHAT
+    assert sent["body"]["stream"] is True
+    assert sent["body"]["messages"] == [
+        {"role": "user", "content": "What is the capital of France?"}
+    ]
 
 
-def test_embeddings(client):
+def test_embeddings(client, upstream):
     response = client.embeddings.create(model="embeddings-golden", input="hello")
     expected = json.loads(fixture("openai/embeddings.json"))
     assert response.data[0].embedding == expected["data"][0]["embedding"]
     assert response.usage.prompt_tokens == expected["usage"]["prompt_tokens"]
+    sent = upstream.requests[-1]
+    assert sent["path"] == "/embeddings"
+    assert sent["body"]["input"] == "hello"
+    assert sent["authorization"] == f"Bearer {UPSTREAM_OPENAI_KEY}"
 
 
 def test_buffered_responses(client, upstream):
@@ -65,11 +86,13 @@ def test_buffered_responses(client, upstream):
     assert response.output[0].content[0].text == expected["output"][0]["content"][0]["text"]
     assert response.usage.input_tokens == expected["usage"]["input_tokens"]
     sent = upstream.requests[-1]
+    assert sent["path"] == "/responses"
     assert sent["model"] == RESPONSES
+    assert sent["body"]["input"] == "What is the capital of France?"
     assert sent["authorization"] == f"Bearer {UPSTREAM_OPENAI_KEY}"
 
 
-def test_streamed_responses(client):
+def test_streamed_responses(client, upstream):
     stream = client.responses.create(
         model="responses-golden",
         input="What is the capital of France?",
@@ -77,6 +100,11 @@ def test_streamed_responses(client):
     )
     text = "".join(event.delta for event in stream if getattr(event, "delta", None))
     assert text == "The capital of France is Paris."
+    sent = upstream.requests[-1]
+    assert sent["path"] == "/responses"
+    assert sent["model"] == RESPONSES
+    assert sent["body"]["stream"] is True
+    assert sent["body"]["input"] == "What is the capital of France?"
 
 
 def test_models_are_listed(client):
@@ -88,12 +116,59 @@ def test_models_are_listed(client):
     }
 
 
-def test_an_unknown_gateway_key_is_rejected(gateway):
-    import openai
-
-    stranger = OpenAI(base_url=f"{gateway}/v1", api_key="not-a-gateway-key", max_retries=0)
+def test_an_unknown_gateway_key_is_rejected(sdk_base_url):
+    stranger = OpenAI(base_url=sdk_base_url, api_key="not-a-gateway-key", max_retries=0)
     with pytest.raises(openai.AuthenticationError):
         stranger.chat.completions.create(
             model="chat-golden",
             messages=[{"role": "user", "content": "hi"}],
         )
+
+
+def _models_refusal(gateway: str, namespace: str) -> tuple[int, dict]:
+    candidate = OpenAI(
+        base_url=f"{gateway}/namespaces/{namespace}/v1",
+        api_key=GATEWAY_KEY,
+        max_retries=0,
+    )
+    with pytest.raises(openai.APIStatusError) as caught:
+        candidate.models.list()
+    return caught.value.status_code, caught.value.response.json()
+
+
+def test_existing_and_absent_unauthorized_namespaces_are_indistinguishable(
+    gateway, upstream
+):
+    before = len(upstream.requests)
+    existing = _models_refusal(gateway, UNGRANTED_NAMESPACE)
+    absent = _models_refusal(gateway, "ghost")
+
+    assert existing == absent == (
+        403,
+        {
+            "error": {
+                "type": "namespace_not_authorized",
+                "message": (
+                    "the authenticated grant does not authorize the selected namespace"
+                ),
+            }
+        },
+    )
+    assert len(upstream.requests) == before
+
+
+def test_noncanonical_namespace_path_is_a_generic_non_disclosing_refusal(
+    gateway, upstream
+):
+    before = len(upstream.requests)
+    status, body = _models_refusal(gateway, "%70latform")
+
+    assert status == 400
+    assert body == {
+        "error": {
+            "type": "invalid_namespace",
+            "message": "namespace identifier is invalid",
+        }
+    }
+    assert "%70latform" not in json.dumps(body)
+    assert len(upstream.requests) == before

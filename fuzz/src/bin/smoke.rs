@@ -35,9 +35,10 @@ use std::time::{Duration, Instant};
 
 use arbitrary::{Arbitrary, Unstructured};
 use axond_fuzz::{
-    CapabilityField, CatalogEdit, CatalogInput, CostField, LifecycleValue, MetaField,
-    ProviderStreamInput, SseInput, StreamShape, TokenInput,
+    BlobSecretCryptoInput, CapabilityField, CatalogEdit, CatalogInput, CostField, LifecycleValue,
+    MetaField, ProviderStreamInput, SseInput, StreamShape, TokenInput,
 };
+use sha2::{Digest, Sha256};
 
 /// Live heap the whole replay may hold at once. The parsers under test are
 /// bounded by their input, which is why this is generous in absolute terms and
@@ -51,7 +52,7 @@ const PER_INPUT_BUDGET: Duration = Duration::from_secs(2);
 const TOTAL_BUDGET: Duration = Duration::from_secs(60);
 
 /// How large the oversized derivation of each seed is.
-const OVERSIZED_BYTES: usize = 64 * 1024;
+const OVERSIZED_BYTES: usize = 66 * 1024;
 
 /// How many outcome classes the freshly-minted token scenarios must reach.
 /// [`EXPECTED_MINTED_CLASSES`] pins which ones; this is the floor for the rest.
@@ -64,9 +65,301 @@ const MINIMUM_RESIGNED_CLASSES: usize = 10;
 /// [`EXPECTED_CATALOG_CLASSES`] pins which ones.
 const MINIMUM_CATALOG_EDIT_CLASSES: usize = 6;
 
-/// Exact direct outcome of every committed publication seed. Derived mutations
-/// remain coverage inputs, while these pins ensure each named security vector
-/// still reaches the refusal or acceptance it documents.
+/// Every committed flat-v2 body seed and the semantic class it exists to pin.
+/// The guard below requires an exact filename match in both directions: adding,
+/// deleting, or renaming a seed requires an explicit decision here.
+const EXPECTED_FLAT_V2_SEED_CLASSES: &[(&str, &str, &str)] = &[
+    (
+        "deployment-missing-field.json",
+        "incompatible",
+        "d153339a7ce441e9935f70756aaa794cef722d06ca6acda09e68dedb50140199",
+    ),
+    (
+        "deployment-unknown-field.json",
+        "incompatible",
+        "ef87e355b1f975129023d6e539661f0f5a4f1f4be3aa2af76c9a634399e4ca9d",
+    ),
+    (
+        "deployment-unknown-variant.json",
+        "incompatible",
+        "797b26e41d24ca394a39f70cdd28b22a34dc4d706da8950ac7c24b4e0efb5665",
+    ),
+    (
+        "deployment-valid.json",
+        "accepted",
+        "fcec8d1304944fa2c09cb4d890acd9feb34adada66cf011f08cfa0c04d30ac64",
+    ),
+    (
+        "grant-semantic-invalid.json",
+        "invalid",
+        "4bbecd4794c7e241e9c72b71b9d5c660b7defacd2067eff8ac6227e8bf033bb5",
+    ),
+    (
+        "grant-valid.json",
+        "accepted",
+        "6776407f1ac596472b1470ffc5cd59b65686c948f680ccbc1e8a4ae3f620e2de",
+    ),
+    (
+        "namespace-valid.json",
+        "accepted",
+        "4dc578ac7d4073a8183a35123a6760678c2f12df95690a7095d918c6d517c742",
+    ),
+    (
+        "namespace-wrong-schema-shape.json",
+        "incompatible",
+        "f5fac6c616168d08b9faaa121ff9b55a3e26717bd530beaa8cf063c7b215746b",
+    ),
+];
+
+#[global_allocator]
+static ALLOCATOR: Capped = Capped;
+
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// A global allocator that refuses to exceed [`ALLOCATION_CAP`] of live memory.
+///
+/// Returning null makes Rust's allocation-failure path abort with a message,
+/// which is the finding: an input reached a parser that allocated from an
+/// attacker-controlled size.
+struct Capped;
+
+unsafe impl GlobalAlloc for Capped {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let live = LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+        if live > ALLOCATION_CAP {
+            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+            return std::ptr::null_mut();
+        }
+        PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+        // SAFETY: the layout is the caller's, forwarded unchanged.
+        let pointer = unsafe { System.alloc(layout) };
+        if pointer.is_null() {
+            // Nothing was handed out, so nothing is live: only `dealloc`
+            // subtracts, and a refusal leaves no pointer to deallocate.
+            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: the pointer and layout are the caller's, forwarded unchanged.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+struct Target {
+    /// The `cargo fuzz` target name, which is also its seed directory.
+    name: &'static str,
+    /// Replays one input, returning every outcome class it produced.
+    run: fn(&[u8]) -> Vec<&'static str>,
+    /// How many distinct outcome classes the seeds must still reach.
+    minimum_classes: usize,
+}
+
+const TARGETS: &[Target] = &[
+    Target {
+        name: "config_toml",
+        run: replay_config_toml,
+        minimum_classes: 3,
+    },
+    Target {
+        name: "credentials_query",
+        run: replay_credentials_query,
+        minimum_classes: 4,
+    },
+    Target {
+        name: "flat_v2_body",
+        run: replay_flat_v2_body,
+        minimum_classes: 3,
+    },
+    Target {
+        // Below what the corpus reaches today (8), because part of that count
+        // comes from arbitrary `Minted` decodings whose lifetime claims are
+        // compared against the wall clock: pinning the floor at the observed
+        // value would let the clock, not a regression, fail a required lane.
+        // The named scenarios below assert the time-sensitive classes exactly.
+        name: "token_verify",
+        run: replay_token_verify,
+        minimum_classes: 6,
+    },
+    Target {
+        name: "sse_decode",
+        run: replay_sse_decode,
+        minimum_classes: 7,
+    },
+    Target {
+        name: "provider_stream",
+        run: replay_provider_stream,
+        minimum_classes: 7,
+    },
+    Target {
+        name: "provider_error",
+        run: replay_provider_error,
+        minimum_classes: 5,
+    },
+    Target {
+        name: "catalog_import",
+        run: replay_catalog_import,
+        minimum_classes: 6,
+    },
+    Target {
+        name: "blob_secret_envelope",
+        run: replay_blob_secret_envelope,
+        minimum_classes: 10,
+    },
+    Target {
+        name: "blob_secret_crypto",
+        run: replay_blob_secret_crypto,
+        minimum_classes: 1,
+    },
+    Target {
+        name: "publication_parsers",
+        run: replay_publication_parsers,
+        minimum_classes: 6,
+    },
+];
+
+/// Chunk boundaries the SSE seeds are replayed on. Coprime with nothing in
+/// particular — the point is that they land inside `data:` prefixes, inside
+/// `\r\n\r\n` delimiters, and inside multi-byte characters.
+const SMOKE_CUTS: &[u16] = &[1, 3, 6, 7, 11, 13, 17, 23, 29, 31];
+
+/// A buffer limit the seeds can reach, so the refusal path is replayed rather
+/// than merely defined.
+const SMOKE_BUFFER_LIMIT: u16 = 48;
+
+/// The statuses every provider-error seed body is classified under, chosen to
+/// reach each arm of `from_upstream`: a client refusal, a missing model, a rate
+/// limit, and two server-side failures.
+const SMOKE_STATUSES: &[u16] = &[400, 404, 413, 429, 500, 503];
+
+/// SSE seeds are readable wire captures, so a seed file is replayed twice: the
+/// way libFuzzer replays it, decoded through `Arbitrary`, and as the body it
+/// literally is — split on fixed boundaries, once under a limit it cannot trip
+/// and once under one it can.
+fn replay_sse_decode(data: &[u8]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    if let Ok(input) = SseInput::arbitrary_take_rest(Unstructured::new(data)) {
+        classes.extend(axond_fuzz::sse_decode(&input));
+    }
+    let Ok(body) = str::from_utf8(data) else {
+        classes.push("not_utf8");
+        return classes;
+    };
+    // A limit the body cannot trip, then one it always can. The first is sized
+    // from the body rather than pinned to `u16::MAX`, because the oversized
+    // derivation is `OVERSIZED_BYTES` — one byte past what a `u16` can express,
+    // which would make this pass a second refusal rather than a clean decode.
+    for max_buffer_bytes in [body.len().max(1), usize::from(SMOKE_BUFFER_LIMIT)] {
+        classes.extend(axond_fuzz::sse_decode_at_limit(
+            body,
+            SMOKE_CUTS,
+            max_buffer_bytes,
+        ));
+    }
+    classes
+}
+
+/// Provider-stream seeds are wire captures too, so each is decoded into SSE
+/// events first and then fed to every decoder shape. A capture of one provider
+/// reaching another provider's decoder is the interesting case: it is what a
+/// misconfigured or swapped upstream produces.
+fn replay_provider_stream(data: &[u8]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    if let Ok(input) = ProviderStreamInput::arbitrary_take_rest(Unstructured::new(data)) {
+        classes.extend(axond_fuzz::provider_stream(&input));
+    }
+    let Ok(body) = str::from_utf8(data) else {
+        classes.push("not_utf8");
+        return classes;
+    };
+    let events = axond_fuzz::sse_events(body);
+    let borrowed: Vec<(Option<&str>, &str)> = events
+        .iter()
+        .map(|(name, data)| (name.as_deref(), data.as_str()))
+        .collect();
+    for shape in [
+        StreamShape::OpenAiChat,
+        StreamShape::OpenAiResponses,
+        StreamShape::FoundryChat,
+        StreamShape::AnthropicTranslated,
+        StreamShape::AnthropicNative,
+    ] {
+        classes.extend(axond_fuzz::provider_stream(&ProviderStreamInput {
+            shape,
+            events: borrowed.clone(),
+        }));
+    }
+    classes
+}
+
+/// Provider-error seeds are upstream failure bodies, replayed under every
+/// status in [`SMOKE_STATUSES`] so one body exercises every classification arm.
+fn replay_provider_error(data: &[u8]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    if let Ok(input) = axond_fuzz::UpstreamFailure::arbitrary_take_rest(Unstructured::new(data)) {
+        classes.extend(axond_fuzz::provider_error(&input));
+    }
+    let Ok(body) = str::from_utf8(data) else {
+        classes.push("not_utf8");
+        return classes;
+    };
+    for status in SMOKE_STATUSES {
+        classes.extend(axond_fuzz::provider_error(&axond_fuzz::UpstreamFailure {
+            provider: "smoke-provider",
+            status: *status,
+            body,
+        }));
+    }
+    classes
+}
+
+fn replay_config_toml(data: &[u8]) -> Vec<&'static str> {
+    vec![axond_fuzz::config_toml(data)]
+}
+
+fn replay_credentials_query(data: &[u8]) -> Vec<&'static str> {
+    vec![axond_fuzz::credentials_query(data)]
+}
+
+fn replay_flat_v2_body(data: &[u8]) -> Vec<&'static str> {
+    vec![axond_fuzz::flat_v2_body_target(data)]
+}
+
+fn replay_blob_secret_envelope(data: &[u8]) -> Vec<&'static str> {
+    vec![axond_fuzz::blob_secret_envelope(data)]
+}
+
+fn replay_blob_secret_crypto(data: &[u8]) -> Vec<&'static str> {
+    BlobSecretCryptoInput::arbitrary_take_rest(Unstructured::new(data))
+        .map(|input| vec![axond_fuzz::blob_secret_crypto(&input)])
+        .unwrap_or_default()
+}
+
+fn replay_publication_parsers(data: &[u8]) -> Vec<&'static str> {
+    axond_fuzz::publication_parsers(data)
+}
+
+const EXPECTED_BLOB_CRYPTO_CLASSES: &[&str] = &[
+    "roundtrip",
+    "wrong_environment",
+    "wrong_namespace",
+    "wrong_reference",
+    "wrong_version",
+    "wrong_purpose",
+    "wrapped_mutation",
+    "nonce_mutation",
+    "ciphertext_mutation",
+    "unknown_key",
+    "rotation",
+    "alias_rejected",
+    "invalid_utf8_refused",
+    "stored_id_mutation",
+];
+
+/// Exact direct outcome of every committed publication seed.
 const EXPECTED_PUBLICATION_SEED_CLASSES: &[(&str, &[&str])] = &[
     (
         "cross-environment-head.json",
@@ -205,206 +498,209 @@ const EXPECTED_PUBLICATION_SEED_CLASSES: &[(&str, &[&str])] = &[
     ),
 ];
 
-#[global_allocator]
-static ALLOCATOR: Capped = Capped;
-
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// A global allocator that refuses to exceed [`ALLOCATION_CAP`] of live memory.
-///
-/// Returning null makes Rust's allocation-failure path abort with a message,
-/// which is the finding: an input reached a parser that allocated from an
-/// attacker-controlled size.
-struct Capped;
-
-unsafe impl GlobalAlloc for Capped {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let live = LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-        if live > ALLOCATION_CAP {
-            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-            return std::ptr::null_mut();
-        }
-        PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
-        // SAFETY: the layout is the caller's, forwarded unchanged.
-        let pointer = unsafe { System.alloc(layout) };
-        if pointer.is_null() {
-            // Nothing was handed out, so nothing is live: only `dealloc`
-            // subtracts, and a refusal leaves no pointer to deallocate.
-            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        }
-        pointer
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        // SAFETY: the pointer and layout are the caller's, forwarded unchanged.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-struct Target {
-    /// The `cargo fuzz` target name, which is also its seed directory.
-    name: &'static str,
-    /// Replays one input, returning every outcome class it produced.
-    run: fn(&[u8]) -> Vec<&'static str>,
-    /// How many distinct outcome classes the seeds must still reach.
-    minimum_classes: usize,
-}
-
-const TARGETS: &[Target] = &[
-    Target {
-        name: "config_toml",
-        run: replay_config_toml,
-        minimum_classes: 3,
-    },
-    Target {
-        name: "credentials_query",
-        run: replay_credentials_query,
-        minimum_classes: 4,
-    },
-    Target {
-        // Below what the corpus reaches today (8), because part of that count
-        // comes from arbitrary `Minted` decodings whose lifetime claims are
-        // compared against the wall clock: pinning the floor at the observed
-        // value would let the clock, not a regression, fail a required lane.
-        // The named scenarios below assert the time-sensitive classes exactly.
-        name: "token_verify",
-        run: replay_token_verify,
-        minimum_classes: 6,
-    },
-    Target {
-        name: "sse_decode",
-        run: replay_sse_decode,
-        minimum_classes: 7,
-    },
-    Target {
-        name: "provider_stream",
-        run: replay_provider_stream,
-        minimum_classes: 7,
-    },
-    Target {
-        name: "provider_error",
-        run: replay_provider_error,
-        minimum_classes: 5,
-    },
-    Target {
-        name: "catalog_import",
-        run: replay_catalog_import,
-        minimum_classes: 6,
-    },
-    Target {
-        name: "publication_parsers",
-        run: replay_publication_parsers,
-        minimum_classes: 6,
-    },
+/// Exact outcome and SHA-256 byte pin for every committed envelope seed.
+const EXPECTED_BLOB_ENVELOPE_SEEDS: &[(&str, &str, &str)] = &[
+    (
+        "accepted.cbor",
+        "accepted",
+        "76235874f36073d57a677e660c6e6695903d51dccb28011d9f807078e0b3df5b",
+    ),
+    (
+        "ciphertext.cbor",
+        "ciphertext",
+        "67687b2c4afd2048c1d100ebe05e9e58acbdc8b5d04cc6acb9d8032d9c6dbba5",
+    ),
+    (
+        "compatibility.cbor",
+        "compatibility",
+        "fd96772c45de98ebf18863101d02ea5ce6e2f8ee392d928a75d35be02cf9e90a",
+    ),
+    (
+        "fixed-field.cbor",
+        "fixed_field",
+        "31eedaa2901b803eec05c5def8d759628428411274e65ff77d0e2359e5826e80",
+    ),
+    (
+        "kek-id.cbor",
+        "kek_id",
+        "832ebe7f6468a3cf0310903571903672a8fbb353c5017198ef3e9c8a7524445f",
+    ),
+    (
+        "noncanonical.cbor",
+        "noncanonical",
+        "a2ef34504a7a1917b69aeeea9bebb8d83e5e643104cc01e4ce09d3041a8bfbb4",
+    ),
+    (
+        "oversized.cbor",
+        "oversized",
+        "167eaeb258096ab4781a3f19db5ac9c1500712c75ec1f590b41a26872ebd608e",
+    ),
+    (
+        "shape.cbor",
+        "shape",
+        "a87a50293e792491ee5d908a95430885bb4407bdee2c7cf11a042a71dcdcbafb",
+    ),
+    (
+        "trailing.cbor",
+        "trailing",
+        "4901a289df008325860d220ada53b7118ad11e2ebd02bc88e15c8c26769518d7",
+    ),
+    (
+        "truncated.cbor",
+        "truncated",
+        "3cbdaf66b3dd2b174788a2f17f938b52dda93a2a97440cead19332cbfacba7c8",
+    ),
 ];
 
-/// Chunk boundaries the SSE seeds are replayed on. Coprime with nothing in
-/// particular — the point is that they land inside `data:` prefixes, inside
-/// `\r\n\r\n` delimiters, and inside multi-byte characters.
-const SMOKE_CUTS: &[u16] = &[1, 3, 6, 7, 11, 13, 17, 23, 29, 31];
+/// Exact outcome and SHA-256 byte pin for every committed crypto seed.
+const EXPECTED_BLOB_CRYPTO_SEEDS: &[(&str, &str, &str)] = &[
+    (
+        "00-roundtrip.bin",
+        "roundtrip",
+        "244cfec8f756021aa0a09c4ad27212e840cd2a0ab49ec866c5915613a832316e",
+    ),
+    (
+        "01-wrong-environment.bin",
+        "wrong_environment",
+        "bd7d21eb6c59cbf8bbd92adfe3859a9c006b5f3ea29ad706466ebaafe954f923",
+    ),
+    (
+        "02-wrong-namespace.bin",
+        "wrong_namespace",
+        "7de0bb1992430a8ef49ed6a163d5cd7df150c1f22bdb4507b668fa51adef8db7",
+    ),
+    (
+        "03-wrong-reference.bin",
+        "wrong_reference",
+        "d30ca3f719b0330d780ba48182cc4c647658f1768629fbf2ad9dcac1882de52a",
+    ),
+    (
+        "04-wrong-version.bin",
+        "wrong_version",
+        "915b20b0ffb6a87443ea70170a9abd4bf95b5e90e5588ec293612202e3030f6d",
+    ),
+    (
+        "05-wrong-purpose.bin",
+        "wrong_purpose",
+        "00487aa2f5893ad10995d16e64a1498b64376bd8ee2a5067c4fdfeb9e89d745c",
+    ),
+    (
+        "06-wrapped-mutation.bin",
+        "wrapped_mutation",
+        "9d6a04207362495b41b3b32460315599553e07d2ee3c28dd7b0400fabba60c8e",
+    ),
+    (
+        "07-nonce-mutation.bin",
+        "nonce_mutation",
+        "2df6b8211671cdd158c93a41fbbc83b48aa4bc0c6de08eaa33864828b85eb27e",
+    ),
+    (
+        "08-ciphertext-mutation.bin",
+        "ciphertext_mutation",
+        "51d5848ec3dbfb30112f41da429bcd1f983f9356c3c298f15d97330a54305ce7",
+    ),
+    (
+        "09-unknown-key.bin",
+        "unknown_key",
+        "0d8a7f7b7636a721fb29e59a0a9b9e0ff9446c16d94816b3d1a30dfb68f43a38",
+    ),
+    (
+        "10-rotation.bin",
+        "rotation",
+        "5fdbe3adb9889c7e82f1214bc9d4c92b799c1515c44c00dfd12a6d61db16f471",
+    ),
+    (
+        "11-alias-rejected.bin",
+        "alias_rejected",
+        "3f4d9694d9911d7c30f5af149044dd632b8779331da02dd21293273a3f35ff4f",
+    ),
+    (
+        "12-invalid-utf8-refused.bin",
+        "invalid_utf8_refused",
+        "fad71cd9027f58abbb2e62cd4bd758edbc165643d094c1acd98c1a6e9f9fe1c5",
+    ),
+    (
+        "13-stored-id-mutation.bin",
+        "stored_id_mutation",
+        "ae51ae828fb009738b70681af3d01c26f93847fd7c618a1c316c1e04c9967fe5",
+    ),
+    (
+        "boundary-empty.bin",
+        "empty_refused",
+        "6babf6bad712d40cc33b5c1bd10208d72269e7bc4b633b1c289ce47b5aa30f84",
+    ),
+    (
+        "boundary-input-not-utf8.bin",
+        "input_not_utf8",
+        "6d2f75b6322353c07db47cd3e1412316de99a334bd12adf6c0fc99be81dd6d8d",
+    ),
+    (
+        "boundary-multibyte-limit.bin",
+        "roundtrip",
+        "c2a404d3c5cf90c84d4fd26f53344fe730e59172cc740a7648ab5fe9053c8d6b",
+    ),
+    (
+        "boundary-multibyte-over-limit.bin",
+        "oversized_refused",
+        "498a4d4a6c3efa1359a9c10331f0f87809caac7b6f6c9504b31192def8ab735a",
+    ),
+];
 
-/// A buffer limit the seeds can reach, so the refusal path is replayed rather
-/// than merely defined.
-const SMOKE_BUFFER_LIMIT: u16 = 48;
-
-/// The statuses every provider-error seed body is classified under, chosen to
-/// reach each arm of `from_upstream`: a client refusal, a missing model, a rate
-/// limit, and two server-side failures.
-const SMOKE_STATUSES: &[u16] = &[400, 404, 413, 429, 500, 503];
-
-/// SSE seeds are readable wire captures, so a seed file is replayed twice: the
-/// way libFuzzer replays it, decoded through `Arbitrary`, and as the body it
-/// literally is — split on fixed boundaries, once under a limit it cannot trip
-/// and once under one it can.
-fn replay_sse_decode(data: &[u8]) -> Vec<&'static str> {
-    let mut classes = Vec::new();
-    if let Ok(input) = SseInput::arbitrary_take_rest(Unstructured::new(data)) {
-        classes.extend(axond_fuzz::sse_decode(&input));
-    }
-    let Ok(body) = str::from_utf8(data) else {
-        classes.push("not_utf8");
-        return classes;
-    };
-    // A limit the body cannot trip, then one it always can. The first is sized
-    // from the body rather than pinned to `u16::MAX`, because the oversized
-    // derivation is `OVERSIZED_BYTES` — one byte past what a `u16` can express,
-    // which would make this pass a second refusal rather than a clean decode.
-    for max_buffer_bytes in [body.len().max(1), usize::from(SMOKE_BUFFER_LIMIT)] {
-        classes.extend(axond_fuzz::sse_decode_at_limit(
-            body,
-            SMOKE_CUTS,
-            max_buffer_bytes,
-        ));
-    }
-    classes
-}
-
-/// Provider-stream seeds are wire captures too, so each is decoded into SSE
-/// events first and then fed to every decoder shape. A capture of one provider
-/// reaching another provider's decoder is the interesting case: it is what a
-/// misconfigured or swapped upstream produces.
-fn replay_provider_stream(data: &[u8]) -> Vec<&'static str> {
-    let mut classes = Vec::new();
-    if let Ok(input) = ProviderStreamInput::arbitrary_take_rest(Unstructured::new(data)) {
-        classes.extend(axond_fuzz::provider_stream(&input));
-    }
-    let Ok(body) = str::from_utf8(data) else {
-        classes.push("not_utf8");
-        return classes;
-    };
-    let events = axond_fuzz::sse_events(body);
-    let borrowed: Vec<(Option<&str>, &str)> = events
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
-        .map(|(name, data)| (name.as_deref(), data.as_str()))
-        .collect();
-    for shape in [
-        StreamShape::OpenAiChat,
-        StreamShape::OpenAiResponses,
-        StreamShape::FoundryChat,
-        StreamShape::AnthropicTranslated,
-        StreamShape::AnthropicNative,
-    ] {
-        classes.extend(axond_fuzz::provider_stream(&ProviderStreamInput {
-            shape,
-            events: borrowed.clone(),
-        }));
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn assert_exact_seed_outcomes(
+    target: &str,
+    expected: &[(&str, &str, &str)],
+    replay: fn(&[u8]) -> Vec<&'static str>,
+) {
+    let corpus = seeds(target);
+    assert_eq!(
+        corpus.len(),
+        expected.len(),
+        "{target}: every raw seed must have exactly one filename pin"
+    );
+    for (filename, bytes) in corpus {
+        let (_, expected_class, expected_sha256) = expected
+            .iter()
+            .find(|(name, _, _)| *name == filename)
+            .unwrap_or_else(|| panic!("{target}/{filename} has no exact outcome pin"));
+        assert_eq!(
+            sha256_hex(&bytes),
+            *expected_sha256,
+            "{target}/{filename} bytes no longer match its SHA-256 pin"
+        );
+        let classes = replay(&bytes);
+        assert_eq!(
+            classes.as_slice(),
+            &[*expected_class],
+            "{target}/{filename} no longer reaches its exact named outcome"
+        );
     }
-    classes
-}
-
-/// Provider-error seeds are upstream failure bodies, replayed under every
-/// status in [`SMOKE_STATUSES`] so one body exercises every classification arm.
-fn replay_provider_error(data: &[u8]) -> Vec<&'static str> {
-    let mut classes = Vec::new();
-    if let Ok(input) = axond_fuzz::UpstreamFailure::arbitrary_take_rest(Unstructured::new(data)) {
-        classes.extend(axond_fuzz::provider_error(&input));
+    for (filename, _, _) in expected {
+        assert!(
+            seed_directory(target).join(filename).is_file(),
+            "{target}/{filename} is pinned but absent"
+        );
     }
-    let Ok(body) = str::from_utf8(data) else {
-        classes.push("not_utf8");
-        return classes;
-    };
-    for status in SMOKE_STATUSES {
-        classes.extend(axond_fuzz::provider_error(&axond_fuzz::UpstreamFailure {
-            provider: "smoke-provider",
-            status: *status,
-            body,
-        }));
-    }
-    classes
 }
 
-fn replay_config_toml(data: &[u8]) -> Vec<&'static str> {
-    vec![axond_fuzz::config_toml(data)]
-}
-
-fn replay_credentials_query(data: &[u8]) -> Vec<&'static str> {
-    vec![axond_fuzz::credentials_query(data)]
-}
-
-fn replay_publication_parsers(data: &[u8]) -> Vec<&'static str> {
-    axond_fuzz::publication_parsers(data)
+fn assert_publication_seed_outcome(seed: &str, bytes: &[u8]) {
+    let expected = EXPECTED_PUBLICATION_SEED_CLASSES
+        .iter()
+        .find(|(name, _)| *name == seed)
+        .unwrap_or_else(|| panic!("publication seed {seed} has no explicit expected outcome"))
+        .1;
+    let actual = axond_fuzz::publication_parsers(bytes);
+    assert_eq!(
+        actual.as_slice(),
+        expected,
+        "publication seed {seed} no longer reaches its pinned verification outcome"
+    );
 }
 
 /// The token target takes a structured input, so a seed file is replayed twice:
@@ -898,20 +1194,6 @@ fn seeds(target: &str) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-fn assert_publication_seed_outcome(seed: &str, bytes: &[u8]) {
-    let expected = EXPECTED_PUBLICATION_SEED_CLASSES
-        .iter()
-        .find(|(name, _)| *name == seed)
-        .unwrap_or_else(|| panic!("publication seed {seed} has no explicit expected outcome"))
-        .1;
-    let actual = axond_fuzz::publication_parsers(bytes);
-    assert_eq!(
-        actual.as_slice(),
-        expected,
-        "publication seed {seed} no longer reaches its pinned verification outcome"
-    );
-}
-
 /// The fixed derivations of a seed: prefixes, single-byte flips, and one
 /// oversized repetition. All computed from the seed, so nothing here is random.
 fn derivations(seed: &[u8]) -> Vec<(String, Vec<u8>)> {
@@ -956,14 +1238,44 @@ fn main() {
     // input carrying it, not a decoder disclosing it.
     axond_fuzz::assert_disclosure_check_survives_escaping();
     println!("provider_error: an escaped canary is read as the input that carried it");
+    assert_exact_seed_outcomes(
+        "flat_v2_body",
+        EXPECTED_FLAT_V2_SEED_CLASSES,
+        replay_flat_v2_body,
+    );
+    assert_exact_seed_outcomes(
+        "blob_secret_envelope",
+        EXPECTED_BLOB_ENVELOPE_SEEDS,
+        replay_blob_secret_envelope,
+    );
+    assert_exact_seed_outcomes(
+        "blob_secret_crypto",
+        EXPECTED_BLOB_CRYPTO_SEEDS,
+        replay_blob_secret_crypto,
+    );
+    let publication_corpus = seeds("publication_parsers");
+    for (seed, bytes) in &publication_corpus {
+        assert_publication_seed_outcome(seed, bytes);
+    }
+    for (seed, _) in EXPECTED_PUBLICATION_SEED_CLASSES {
+        assert!(
+            publication_corpus.iter().any(|(name, _)| name == seed),
+            "publication outcome pin {seed} names no committed seed"
+        );
+    }
+    assert_eq!(
+        publication_corpus.len(),
+        EXPECTED_PUBLICATION_SEED_CLASSES.len(),
+        "publication seeds and explicit outcome pins must remain one-to-one"
+    );
+    println!(
+        "blob secret and publication corpora: every filename reaches its exact pinned outcome"
+    );
     let mut inputs = 0_usize;
     for target in TARGETS {
         let mut target_inputs = 0_usize;
         let mut classes: BTreeMap<&'static str, usize> = BTreeMap::new();
         for (seed, bytes) in seeds(target.name) {
-            if target.name == "publication_parsers" {
-                assert_publication_seed_outcome(&seed, &bytes);
-            }
             for (label, input) in
                 std::iter::once(("seed".to_owned(), bytes.clone())).chain(derivations(&bytes))
             {
@@ -999,17 +1311,6 @@ fn main() {
             classes.len()
         );
     }
-    for (seed, _) in EXPECTED_PUBLICATION_SEED_CLASSES {
-        assert!(
-            seed_directory("publication_parsers").join(seed).is_file(),
-            "publication outcome pin {seed} names no committed seed"
-        );
-    }
-    assert_eq!(
-        seeds("publication_parsers").len(),
-        EXPECTED_PUBLICATION_SEED_CLASSES.len(),
-        "publication seeds and explicit outcome pins must remain one-to-one"
-    );
     // The guard below refuses to skip a pinned seed. Prove it fires before
     // trusting it, the same way `ops/check-docs.py --self-test` does.
     assert_pinning_guard_fires();
@@ -1147,6 +1448,63 @@ fn main() {
         catalog_classes.values().sum::<usize>(),
         catalog_classes.len(),
         catalog_classes
+            .iter()
+            .map(|(class, count)| format!("{class}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    let mut crypto_classes = BTreeMap::new();
+    for (scenario, expected) in EXPECTED_BLOB_CRYPTO_CLASSES.iter().enumerate() {
+        let input = BlobSecretCryptoInput {
+            material: b"synthetic-provider-key",
+            scenario: u8::try_from(scenario).expect("bounded scenario"),
+            primary_seed: 0x11,
+            secondary_seed: 0x22,
+            identity_seed: 7,
+            version_seed: 3,
+        };
+        let class = axond_fuzz::blob_secret_crypto(&input);
+        assert_eq!(class, *expected, "blob crypto scenario {scenario}");
+        *crypto_classes.entry(class).or_default() += 1;
+        inputs += 1;
+    }
+    for (label, material, expected) in [
+        ("empty", Vec::new(), "empty_refused"),
+        (
+            "multibyte-limit",
+            "é".repeat(axond_fuzz_seam::BLOB_SECRET_MAX_PLAINTEXT_BYTES / 2)
+                .into_bytes(),
+            "roundtrip",
+        ),
+        (
+            "multibyte-over-limit",
+            format!(
+                "{}x",
+                "é".repeat(axond_fuzz_seam::BLOB_SECRET_MAX_PLAINTEXT_BYTES / 2)
+            )
+            .into_bytes(),
+            "oversized_refused",
+        ),
+    ] {
+        let input = BlobSecretCryptoInput {
+            material: &material,
+            scenario: 0,
+            primary_seed: 0x33,
+            secondary_seed: 0x44,
+            identity_seed: 9,
+            version_seed: 1,
+        };
+        let class = axond_fuzz::blob_secret_crypto(&input);
+        assert_eq!(class, expected, "blob crypto boundary {label}");
+        *crypto_classes.entry(class).or_default() += 1;
+        inputs += 1;
+    }
+    println!(
+        "blob_secret_crypto (pinned scenarios): {} scenarios, {} outcome classes: {}",
+        crypto_classes.values().sum::<usize>(),
+        crypto_classes.len(),
+        crypto_classes
             .iter()
             .map(|(class, count)| format!("{class}={count}"))
             .collect::<Vec<_>>()

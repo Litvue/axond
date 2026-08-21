@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-Axond parses input it does not control on several paths. An operator's TOML is parsed
+Axond parses input it does not control on two paths. An operator's TOML is parsed
 at boot and again on every reload ([ADR 0011](./0011-config-hot-reload.md)), and a
 caller's credential and query string are parsed on every request before anything
 authenticates them ([ADR 0013](./0013-inbound-auth-fails-closed.md),
@@ -20,8 +20,7 @@ denial of service on a request that was never entitled to anything.
 
 [ADR 0014](./0014-compatibility-and-soak-harness.md) built the harness for what
 the *process* does with well-formed traffic. This is the other axis: what a
-parser does with bytes that are not trusted, including provider, catalogue, and
-durable object-store bytes added to the program after this ADR was accepted.
+parser does with traffic that is not.
 
 Coverage-guided fuzzing does not fit the shape of the existing CI. It needs a
 nightly toolchain and sanitizer runtimes, its dependencies are not ones the
@@ -30,11 +29,12 @@ the opposite of what a required pull-request lane can be.
 
 ## Decision
 
-A fuzzing program in two halves over every registered untrusted-input parser.
-The initial targets were `Config::from_toml_str` plus its validation graph,
-`axt1.` token verification, and the credential-query parser. Provider wire,
-catalogue import, and object-store publication-document parsers use the same
-required replay and scheduled coverage-guided contract as they are added.
+A fuzzing program in two halves over the production parsers for configuration,
+`axt1.` tokens, credential queries, provider SSE and error bodies, models.dev
+catalogues, namespace-native sealed-secret objects, and signed durable
+publication documents. The target list grows with trust boundaries; the
+required bounded replay and scheduled coverage-guided run remain the two
+evidence tiers.
 
 ### An out-of-tree workspace, not a workspace member
 
@@ -63,8 +63,8 @@ pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection>
 pub fn credentials_query_namespaces(q: Option<&str>) -> Result<Option<String>, Rejection>
 pub fn verify_token(credential: &str) -> Result<Option<VerifiedToken>, Rejection>
 pub fn catalog_import_over_seed(payload: &[u8], etag: Option<&str>) -> CatalogAdmission
+pub fn blob_secret_envelope_cbor(input: &[u8]) -> Result<Vec<u8>, &'static str>
 pub fn publication_head_document(input: &[u8]) -> Result<(), StoredDocumentRejection>
-pub fn publication_revision_manifest(input: &[u8]) -> Result<(), StoredDocumentRejection>
 ```
 
 The catalogue entry point is the shape the rest follow as coverage grows: the
@@ -130,6 +130,14 @@ The seam's verifiers come from a configuration compiled into the target with
 synthetic key material and an `.invalid` audience. No target opens a socket, reads
 a file, or holds real key material, which is also what makes the corpora
 publishable.
+
+The raw sealed-secret target does not open ciphertext or hold a KEK. Every
+coverage-guided byte reaches the production bounded canonical-CBOR decoder
+unchanged; accepted bytes must re-encode identically, and refusals map to static
+classes with no rejected-byte payload. Its committed binary corpus includes the
+valid format and every parser refusal class. A separate structured target uses
+only committed synthetic KEKs to drive bounded seal/open, context substitution,
+rotation, key-alias rejection, mutation, unknown-key, and UTF-8 boundaries.
 
 ### State tier
 

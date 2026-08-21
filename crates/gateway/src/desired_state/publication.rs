@@ -15,7 +15,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::backends::object_store::{
-    ObjectKey, ObjectStore, ObjectStoreError, ObjectStoreErrorKind, ObjectVersion,
+    ObjectKey, ObjectStore, ObjectStoreError, ObjectStoreErrorKind, ObjectStoreOperation,
+    ObjectVersion,
 };
 
 use super::publication_auth::{
@@ -1063,9 +1064,9 @@ impl VerifiedRevisionManifest {
 /// strong object-store read and tied to that read's opaque version fence.
 ///
 /// Unlike [`VerifiedRevisionManifest`], this wrapper is eligible for hydration.
-/// It has no public constructor: only [`BlobPublication::read_active_revision`]
-/// can establish that the signed manifest won head CAS and remained current
-/// through the final fence read.
+/// It has no public constructor: only [`BlobReader::read_active_revision`] and
+/// [`BlobPublication::read_active_revision`] can establish that the signed
+/// manifest won head CAS and remained current through the final fence read.
 #[derive(Debug)]
 pub struct VerifiedActiveRevision {
     manifest: VerifiedRevisionManifest,
@@ -1404,6 +1405,12 @@ pub enum BlobPublicationError {
     Manifest(RevisionManifestError),
     #[error("immutable object `{key}` already exists with different bytes")]
     ImmutableCollision { key: ObjectKey },
+    #[error("immutable {kind:?} object does not match its requested content address")]
+    ImmutableDigestMismatch {
+        kind: ImmutableObjectKind,
+        expected: Checksum,
+        actual: Checksum,
+    },
     #[error("expected {expected}, but the active revision is {actual:?}")]
     Conflict {
         expected: ExpectedHead,
@@ -1517,6 +1524,181 @@ fn verify_activation_snapshot(
     Ok(ActivationReadyRevision(active))
 }
 
+async fn read_head<S: ObjectStore>(
+    store: &S,
+    environment: &EnvironmentId,
+    sequence_guard: &PublicationSequenceGuard,
+    trust: &PublicationTrustStore,
+) -> Result<Option<ReadHead>, BlobPublicationError> {
+    match store.get(&environment_head_key(environment)).await {
+        Ok(value) => authenticate_read_head(&value.bytes, value.version, sequence_guard, trust)
+            .map(Some)
+            .map_err(Into::into),
+        Err(error) if error.kind() == ObjectStoreErrorKind::NotFound => {
+            sequence_guard.verify_absent()?;
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn read_manifest<S: ObjectStore>(
+    store: &S,
+    environment: &EnvironmentId,
+    trust: &PublicationTrustStore,
+    digest: Checksum,
+    expected_sequence: u64,
+) -> Result<VerifiedRevisionManifest, BlobPublicationError> {
+    let key = revision_manifest_key(digest);
+    let value = store.get(&key).await?;
+    Ok(VerifiedRevisionManifest::verify(
+        &value.bytes,
+        environment,
+        digest,
+        expected_sequence,
+        trust,
+    )?)
+}
+
+async fn read_active_revision<S: ObjectStore>(
+    store: &S,
+    environment: &EnvironmentId,
+    sequence_guard: &PublicationSequenceGuard,
+    trust: &PublicationTrustStore,
+) -> Result<Option<VerifiedActiveRevision>, BlobPublicationError> {
+    let Some(first_head) = read_head(store, environment, sequence_guard, trust).await? else {
+        return Ok(None);
+    };
+    let manifest_revision = first_head.document.active_revision;
+    let manifest = read_manifest(
+        store,
+        environment,
+        trust,
+        manifest_revision,
+        first_head.document.sequence,
+    )
+    .await?;
+    let fenced_head = read_head(store, environment, sequence_guard, trust).await?;
+    verify_active_revision_snapshot(first_head, manifest_revision, manifest, fenced_head).map(Some)
+}
+
+async fn read_immutable_object<S: ObjectStore>(
+    store: &S,
+    kind: ImmutableObjectKind,
+    digest: Checksum,
+) -> Result<ImmutableObject, BlobPublicationError> {
+    let key = kind.key(digest);
+    let value = store.get(&key).await?;
+    let limit = store.limits().max_read_bytes();
+    if value.bytes.len() > limit {
+        return Err(ObjectStoreError::PayloadTooLarge {
+            key,
+            operation: ObjectStoreOperation::Get,
+            observed: value.bytes.len(),
+            limit,
+        }
+        .into());
+    }
+    let actual = Checksum::of(&value.bytes);
+    if actual != digest {
+        return Err(BlobPublicationError::ImmutableDigestMismatch {
+            kind,
+            expected: digest,
+            actual,
+        });
+    }
+    Ok(ImmutableObject {
+        kind,
+        bytes: value.bytes,
+    })
+}
+
+async fn fence_for_activation<S: ObjectStore>(
+    store: &S,
+    environment: &EnvironmentId,
+    sequence_guard: &PublicationSequenceGuard,
+    trust: &PublicationTrustStore,
+    active: VerifiedActiveRevision,
+) -> Result<ActivationReadyRevision, BlobPublicationError> {
+    let current = read_head(store, environment, sequence_guard, trust).await?;
+    verify_activation_snapshot(active, current)
+}
+
+/// Provider-neutral authenticated reader over an [`ObjectStore`].
+///
+/// This trust boundary contains public verification material only. It cannot
+/// sign a head or manifest and exposes no administrative mutation operation.
+pub struct BlobReader<S> {
+    store: Arc<S>,
+    environment: EnvironmentId,
+    trust: PublicationTrustStore,
+    sequence_guard: PublicationSequenceGuard,
+}
+
+impl<S> Clone for BlobReader<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            environment: self.environment.clone(),
+            trust: self.trust.clone(),
+            sequence_guard: self.sequence_guard.clone(),
+        }
+    }
+}
+
+impl<S: ObjectStore> BlobReader<S> {
+    pub fn new(store: Arc<S>, environment: EnvironmentId, trust: PublicationTrustStore) -> Self {
+        let sequence_guard = PublicationSequenceGuard::new(environment.clone());
+        Self {
+            store,
+            environment,
+            trust,
+            sequence_guard,
+        }
+    }
+
+    pub fn environment(&self) -> &EnvironmentId {
+        &self.environment
+    }
+
+    /// Read, authenticate, and fence the current head and its exact manifest.
+    pub async fn read_active_revision(
+        &self,
+    ) -> Result<Option<VerifiedActiveRevision>, BlobPublicationError> {
+        read_active_revision(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+        )
+        .await
+    }
+
+    /// Read one immutable publication object by its typed content address.
+    pub async fn read_immutable_object(
+        &self,
+        kind: ImmutableObjectKind,
+        digest: Checksum,
+    ) -> Result<ImmutableObject, BlobPublicationError> {
+        read_immutable_object(self.store.as_ref(), kind, digest).await
+    }
+
+    /// Re-read the exact selecting head immediately before local activation.
+    pub async fn fence_for_activation(
+        &self,
+        active: VerifiedActiveRevision,
+    ) -> Result<ActivationReadyRevision, BlobPublicationError> {
+        fence_for_activation(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+            active,
+        )
+        .await
+    }
+}
+
 /// Provider-neutral immutable publisher over an [`ObjectStore`].
 pub struct BlobPublication<S> {
     store: Arc<S>,
@@ -1597,16 +1779,33 @@ impl<S: ObjectStore> BlobPublication<S> {
     pub async fn read_active_revision(
         &self,
     ) -> Result<Option<VerifiedActiveRevision>, BlobPublicationError> {
-        let Some(first_head) = self.read_head().await? else {
-            return Ok(None);
-        };
-        let manifest_revision = first_head.document.active_revision;
-        let manifest = self
-            .read_manifest(manifest_revision, first_head.document.sequence)
-            .await?;
-        let fenced_head = self.read_head().await?;
-        verify_active_revision_snapshot(first_head, manifest_revision, manifest, fenced_head)
-            .map(Some)
+        read_active_revision(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+        )
+        .await
+    }
+
+    /// Read one immutable publication object by its typed content address.
+    ///
+    /// The object-store key is derived internally from the signed publication
+    /// vocabulary. Callers cannot use this boundary to supply arbitrary object
+    /// keys. The provider's advertised read limit is checked again here so an
+    /// adapter that returns an over-limit body cannot make this layer buffer or
+    /// publish it as a valid immutable object.
+    ///
+    /// This is an integrity-only primitive, not an authorization decision:
+    /// callers must authenticate and authorize the requested resource before
+    /// invoking it. In particular, a matching digest does not authorize access
+    /// to a secret object and this method never decrypts or returns plaintext.
+    pub async fn read_immutable_object(
+        &self,
+        kind: ImmutableObjectKind,
+        digest: Checksum,
+    ) -> Result<ImmutableObject, BlobPublicationError> {
+        read_immutable_object(self.store.as_ref(), kind, digest).await
     }
 
     /// Consume a hydrated active revision and re-read its exact head fence at
@@ -1616,8 +1815,14 @@ impl<S: ObjectStore> BlobPublication<S> {
         &self,
         active: VerifiedActiveRevision,
     ) -> Result<ActivationReadyRevision, BlobPublicationError> {
-        let current = self.read_head().await?;
-        verify_activation_snapshot(active, current)
+        fence_for_activation(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+            active,
+        )
+        .await
     }
 
     /// Report whether the complete retained history fits inside the configured
@@ -1775,25 +1980,13 @@ impl<S: ObjectStore> BlobPublication<S> {
     }
 
     async fn read_head(&self) -> Result<Option<ReadHead>, BlobPublicationError> {
-        match self
-            .store
-            .get(&environment_head_key(&self.environment))
-            .await
-        {
-            Ok(value) => authenticate_read_head(
-                &value.bytes,
-                value.version,
-                &self.sequence_guard,
-                &self.trust,
-            )
-            .map(Some)
-            .map_err(Into::into),
-            Err(error) if error.kind() == ObjectStoreErrorKind::NotFound => {
-                self.sequence_guard.verify_absent()?;
-                Ok(None)
-            }
-            Err(error) => Err(error.into()),
-        }
+        read_head(
+            self.store.as_ref(),
+            &self.environment,
+            &self.sequence_guard,
+            &self.trust,
+        )
+        .await
     }
 
     async fn read_manifest(
@@ -1801,15 +1994,14 @@ impl<S: ObjectStore> BlobPublication<S> {
         digest: Checksum,
         expected_sequence: u64,
     ) -> Result<VerifiedRevisionManifest, BlobPublicationError> {
-        let key = revision_manifest_key(digest);
-        let value = self.store.get(&key).await?;
-        Ok(VerifiedRevisionManifest::verify(
-            &value.bytes,
+        read_manifest(
+            self.store.as_ref(),
             &self.environment,
+            &self.trust,
             digest,
             expected_sequence,
-            &self.trust,
-        )?)
+        )
+        .await
     }
 
     fn idempotency_binding(
@@ -2344,6 +2536,144 @@ mod tests {
             None,
         )
         .expect("trusted test publisher")
+    }
+
+    #[derive(Clone)]
+    struct OverLimitReadStore {
+        inner: InMemoryObjectStore,
+        advertised_limits: ObjectStoreLimits,
+    }
+
+    #[async_trait]
+    impl ObjectStore for OverLimitReadStore {
+        fn name(&self) -> &'static str {
+            "over-limit-read-test-store"
+        }
+
+        fn limits(&self) -> ObjectStoreLimits {
+            self.advertised_limits
+        }
+
+        async fn get(&self, key: &ObjectKey) -> Result<ObjectValue, ObjectStoreError> {
+            self.inner.get(key).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &ObjectKey,
+            bytes: Bytes,
+        ) -> Result<ObjectVersion, ObjectStoreError> {
+            self.inner.put_if_absent(key, bytes).await
+        }
+
+        async fn replace_if_version(
+            &self,
+            key: &ObjectKey,
+            bytes: Bytes,
+            expected: &ObjectVersion,
+        ) -> Result<ObjectVersion, ObjectStoreError> {
+            self.inner.replace_if_version(key, bytes, expected).await
+        }
+    }
+
+    #[tokio::test]
+    async fn immutable_object_read_returns_the_content_addressed_object() {
+        let store = Arc::new(InMemoryObjectStore::new(limits()));
+        let bytes = Bytes::from_static(b"namespace-body");
+        let digest = Checksum::of(&bytes);
+        store
+            .put_if_absent(&namespace_resource_key(digest), bytes.clone())
+            .await
+            .expect("immutable object upload");
+        let publication = publisher(Arc::clone(&store));
+
+        let fetched = publication
+            .read_immutable_object(ImmutableObjectKind::NamespaceResource, digest)
+            .await
+            .expect("content-addressed read");
+
+        assert_eq!(
+            fetched,
+            ImmutableObject {
+                kind: ImmutableObjectKind::NamespaceResource,
+                bytes,
+            }
+        );
+        assert_eq!(fetched.digest(), digest);
+    }
+
+    #[tokio::test]
+    async fn immutable_object_read_rejects_a_digest_mismatch() {
+        let store = Arc::new(InMemoryObjectStore::new(limits()));
+        let expected = Checksum::of(b"expected");
+        let actual = Checksum::of(b"tampered");
+        store
+            .put_if_absent(
+                &namespace_resource_key(expected),
+                Bytes::from_static(b"tampered"),
+            )
+            .await
+            .expect("tampered test object upload");
+        let publication = publisher(Arc::clone(&store));
+
+        let error = publication
+            .read_immutable_object(ImmutableObjectKind::NamespaceResource, expected)
+            .await
+            .expect_err("a mismatched content address must fail closed");
+
+        assert_eq!(
+            error,
+            BlobPublicationError::ImmutableDigestMismatch {
+                kind: ImmutableObjectKind::NamespaceResource,
+                expected,
+                actual,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_object_read_maps_missing_and_over_limit_objects() {
+        let missing_store = Arc::new(InMemoryObjectStore::new(limits()));
+        let missing_publication = publisher(Arc::clone(&missing_store));
+        let missing_digest = Checksum::of(b"missing");
+        let missing_error = missing_publication
+            .read_immutable_object(ImmutableObjectKind::Secret, missing_digest)
+            .await
+            .expect_err("a missing immutable object must remain typed");
+        assert!(matches!(
+            missing_error,
+            BlobPublicationError::Store(ObjectStoreError::NotFound { key })
+                if key == secret_key(missing_digest)
+        ));
+
+        let inner = InMemoryObjectStore::new(limits());
+        let bytes = Bytes::from_static(b"over-limit");
+        let digest = Checksum::of(&bytes);
+        inner
+            .put_if_absent(&deployment_resource_key(digest), bytes.clone())
+            .await
+            .expect("over-limit test object upload");
+        let limit = NonZeroUsize::new(bytes.len() - 1).expect("test payload has a limit");
+        let over_limit_store = Arc::new(OverLimitReadStore {
+            inner,
+            advertised_limits: ObjectStoreLimits::for_max_object_bytes(limit),
+        });
+        let over_limit_publication = publisher(Arc::clone(&over_limit_store));
+
+        let over_limit_error = over_limit_publication
+            .read_immutable_object(ImmutableObjectKind::DeploymentResource, digest)
+            .await
+            .expect_err("the publication boundary must enforce the provider read limit");
+
+        assert!(matches!(
+            over_limit_error,
+            BlobPublicationError::Store(ObjectStoreError::PayloadTooLarge {
+                operation: ObjectStoreOperation::Get,
+                observed,
+                limit: observed_limit,
+                ..
+            }) if observed == bytes.len() && observed_limit == bytes.len() - 1
+        ));
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

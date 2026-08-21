@@ -11,6 +11,65 @@ enforced as a test.
 The claims in [the deployment security model](./deployment-model.md) are
 unchanged by it. This page is the evidence for them under stateful mode.
 
+## Namespace-native blob envelope
+
+`backends/secrets/blob_envelope.rs` defines the independent v2 ciphertext
+codec. It does not alter or auto-detect the legacy v1 Postgres envelope. A v2
+object is exactly this deterministic canonical-CBOR array:
+
+```text
+[2, "aes256-kw.aes256-gcm.envelope.v2", kek_id,
+ wrapped_dek, material_nonce, ciphertext]
+```
+
+Environment, namespace ownership, `SecretId`, and exact version are not stored
+in the object. The authenticated manifest supplies them to the opener through a
+constructor visible only inside the secrets backend, where the publisher and
+hydrator adapters live. The material is AES-256-GCM under
+a fresh 32-byte DEK used for exactly one message. Its binary length-prefixed AAD
+binds the purpose, environment, namespace, raw secret UUID, version, and stable
+KEK id. The DEK is wrapped under the selected KEK with nonce-free RFC 3394
+AES-256-KW. AES-KW has no AAD facility: context binding is therefore a property
+of opening the complete wrapped-DEK plus material-ciphertext object, not of the
+wrapped DEK in isolation. Substituting environment, namespace, id, version, KEK
+id, or material purpose refuses the complete object; so does any mutation.
+
+Plaintext is non-empty and at most 64 KiB. KEKs are exactly 32 bytes, KEK ids
+are at most 64 canonical ASCII bytes, nonces and the wrapped DEK have exact
+lengths, and the entire encoded object has a pre-parse ceiling. The decoder
+rejects indefinite forms, non-minimal lengths, unknown schema/scheme, trailing
+bytes, truncation, and any field outside the fixed array. Errors carry only a
+typed class; material, AAD, rejected bytes, keys, and ciphertext have no error
+payload. A `KekRing` uses one active key for new objects and resolves older ids
+only from explicit decrypt-only entries. The complete ring is built atomically,
+is capped at eight keys, and rejects both duplicate ids and duplicate raw KEK
+material under different ids. Raw alias detection uses a private SHA-256
+fingerprint that is neither stored in the finished ring nor renderable.
+
+Production bootstrap accepts KEKs only as owned zeroizing buffers. Staging
+arrays and RustCrypto AES-KW expanded keys use drop-time zeroization. This is a
+best-effort process-memory property, not cryptographic erasure: compiler copies,
+CPU registers, allocator remnants, kernel crash dumps or swap, and `ring`'s
+expanded per-message AES-GCM key state cannot be proven cleared by Rust types.
+Disable or encrypt swap and core dumps. Removing a KEK from configuration does
+not prove every residual copy is gone; restart every replica with the old key
+absent when rotation requires process-wide eviction.
+
+Golden vectors and mutation, context-substitution, canonicality, truncation,
+oversize, rotation, ring-bound, alias, invalid-UTF-8, byte-boundary, legacy-v1,
+and redaction tests live beside the codecs. Raw coverage-guided bytes drive the
+`blob_secret_envelope` parser; `blob_secret_crypto` separately drives bounded
+seal/open, substitution, mutation, rotation, alias, and UTF-8 scenarios.
+This slice intentionally stops at the codec: deployment resource indexing,
+blob retrieval, lifecycle publication, and snapshot-time materialization remain
+follow-up integration work and no production runtime selects this path yet.
+
+The future publisher must reserve each exact `SecretRef` with a create-only
+write and refuse a second value for that reference, even when the ciphertext
+digest differs. The current object-store create-only seam proves immutable
+object keys, but this codec slice does not yet contain the publication index and
+therefore does not claim same-reference conflict enforcement.
+
 ## What is guaranteed
 
 - **A reference is durable; material is not.** A revision, a resource body, an

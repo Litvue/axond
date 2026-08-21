@@ -34,6 +34,9 @@ use super::ids::{ProjectId, ResourceId, Slug, TenantId};
 /// attaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResourceKind {
+    Deployment,
+    Namespace,
+    InboundGrant,
     Tenant,
     Project,
     Identity,
@@ -49,6 +52,9 @@ pub enum ResourceKind {
 impl ResourceKind {
     /// Every kind, so exhaustiveness is testable rather than assumed.
     pub const ALL: &'static [Self] = &[
+        Self::Deployment,
+        Self::Namespace,
+        Self::InboundGrant,
         Self::Tenant,
         Self::Project,
         Self::Identity,
@@ -63,6 +69,9 @@ impl ResourceKind {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Deployment => "deployment",
+            Self::Namespace => "namespace",
+            Self::InboundGrant => "inbound-grant",
             Self::Tenant => "tenant",
             Self::Project => "project",
             Self::Identity => "identity",
@@ -102,7 +111,13 @@ impl ResourceKind {
     ///   no ordinary resource can be authored outside a tenant by accident.
     pub const fn permits(self, scope: &ResourceScope) -> bool {
         match self {
-            Self::Tenant | Self::CatalogModel => matches!(scope, ResourceScope::Deployment),
+            Self::Deployment
+            | Self::Namespace
+            | Self::InboundGrant
+            | Self::Tenant
+            | Self::CatalogModel => {
+                matches!(scope, ResourceScope::Deployment)
+            }
             Self::Price => matches!(
                 scope,
                 ResourceScope::Deployment
@@ -525,6 +540,10 @@ mod tests {
         };
 
         assert!(ResourceKind::Tenant.permits(&ResourceScope::Deployment));
+        assert!(ResourceKind::Namespace.permits(&ResourceScope::Deployment));
+        assert!(ResourceKind::InboundGrant.permits(&ResourceScope::Deployment));
+        assert!(!ResourceKind::Namespace.permits(&ResourceScope::Tenant(tenant)));
+        assert!(!ResourceKind::InboundGrant.permits(&project));
         assert!(!ResourceKind::Tenant.permits(&ResourceScope::Tenant(tenant)));
         assert!(ResourceKind::CatalogModel.permits(&ResourceScope::Deployment));
         assert!(ResourceKind::Project.permits(&ResourceScope::Tenant(tenant)));
@@ -554,7 +573,10 @@ mod tests {
         for kind in ResourceKind::ALL {
             if matches!(
                 kind,
-                ResourceKind::Tenant
+                ResourceKind::Deployment
+                    | ResourceKind::Namespace
+                    | ResourceKind::InboundGrant
+                    | ResourceKind::Tenant
                     | ResourceKind::Project
                     | ResourceKind::CatalogModel
                     | ResourceKind::Identity

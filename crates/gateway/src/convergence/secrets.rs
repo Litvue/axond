@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backends::secrets::{SecretError, SecretMaterial, SecretResolver};
 use crate::desired_state::credentials::Credentials;
+use crate::desired_state::namespaces::NamespaceSecretRequest;
 use crate::desired_state::secrets::{SecretOwner, SecretRef};
 use crate::desired_state::{DesiredState, ResourceRef};
 
@@ -65,6 +66,7 @@ impl MaterialLedger {
         self: &Arc<Self>,
         reference: SecretRef,
         material: SecretMaterial,
+        binding: ResolvedSecretBinding,
     ) -> RetainedMaterial {
         *self
             .held
@@ -75,6 +77,7 @@ impl MaterialLedger {
         RetainedMaterial(Arc::new(Retained {
             reference,
             material,
+            binding,
             ledger: Arc::clone(self),
         }))
     }
@@ -132,7 +135,16 @@ pub struct RetainedMaterial(Arc<Retained>);
 struct Retained {
     reference: SecretRef,
     material: SecretMaterial,
+    binding: ResolvedSecretBinding,
     ledger: Arc<MaterialLedger>,
+}
+
+/// The authority metadata retained beside plaintext and copied into encrypted
+/// compiled recovery state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedSecretBinding {
+    Legacy,
+    Namespace(NamespaceSecretRequest),
 }
 
 /// Deregistration happens here rather than at any call site, so a snapshot that
@@ -160,6 +172,10 @@ impl RetainedMaterial {
     /// test can assert.
     pub fn holders(&self) -> usize {
         Arc::strong_count(&self.0)
+    }
+
+    pub(crate) fn binding(&self) -> &ResolvedSecretBinding {
+        &self.0.binding
     }
 }
 
@@ -194,15 +210,20 @@ impl ResolvedSecrets {
     /// zeroization semantics.
     pub(crate) fn from_cached(
         ledger: Arc<MaterialLedger>,
-        materials: impl IntoIterator<Item = (SecretRef, SecretMaterial)>,
-    ) -> Self {
+        materials: impl IntoIterator<Item = (SecretRef, SecretMaterial, ResolvedSecretBinding)>,
+    ) -> Result<Self, String> {
         let mut resolved = Self::default();
-        for (reference, material) in materials {
+        for (reference, material, binding) in materials {
+            if resolved.materials.contains_key(&reference) {
+                return Err(format!(
+                    "compiled cache declares secret {reference} more than once"
+                ));
+            }
             resolved
                 .materials
-                .insert(reference, ledger.retain(reference, material));
+                .insert(reference, ledger.retain(reference, material, binding));
         }
-        resolved
+        Ok(resolved)
     }
 
     /// The material for an exact version, or `None` if this candidate did not
@@ -281,6 +302,9 @@ impl SecretMaterialization {
     /// Versions are deduplicated: two credentials pinning one version resolve it
     /// once and share the buffer.
     pub async fn resolve(&self, state: &DesiredState) -> Result<ResolvedSecrets, ProjectionError> {
+        if state.is_flat_namespace_v2() {
+            return self.resolve_flat(state).await;
+        }
         let credentials = Credentials::of(state).map_err(|error| ProjectionError::Body {
             reference: error.reference(),
             detail: error.to_string(),
@@ -300,9 +324,52 @@ impl SecretMaterialization {
             let material = self
                 .unwrap_one(credential.body.owner(), reference, credential.reference)
                 .await?;
-            resolved
-                .materials
-                .insert(reference, self.ledger.retain(reference, material));
+            resolved.materials.insert(
+                reference,
+                self.ledger
+                    .retain(reference, material, ResolvedSecretBinding::Legacy),
+            );
+        }
+        Ok(resolved)
+    }
+
+    async fn resolve_flat(&self, state: &DesiredState) -> Result<ResolvedSecrets, ProjectionError> {
+        let flat = crate::desired_state::FlatNamespaces::of(state).map_err(|error| {
+            ProjectionError::Incomplete {
+                detail: error.to_string(),
+            }
+        })?;
+        let mut resolved = ResolvedSecrets::default();
+        for (holder, namespace) in flat.namespaces() {
+            for credential in namespace.credentials() {
+                let reference = credential.secret;
+                if resolved.materials.contains_key(&reference) {
+                    continue;
+                }
+                let Some(resolver) = &self.resolver else {
+                    return Err(secret_error(
+                        *holder,
+                        reference,
+                        "this process has no deployment-scoped secret resolver configured"
+                            .to_owned(),
+                    ));
+                };
+                let request = flat
+                    .secret_request(namespace.namespace(), reference)
+                    .expect("validated flat credentials have one exact secret binding");
+                let material = resolver
+                    .resolve_namespace(&request)
+                    .await
+                    .map_err(|error| secret_error(*holder, reference, error.to_string()))?;
+                resolved.materials.insert(
+                    reference,
+                    self.ledger.retain(
+                        reference,
+                        material,
+                        ResolvedSecretBinding::Namespace(request),
+                    ),
+                );
+            }
         }
         Ok(resolved)
     }
@@ -385,6 +452,20 @@ pub(crate) mod testing {
             &self,
             _owner: SecretOwner,
             _reference: &SecretRef,
+        ) -> Result<bool, SecretError> {
+            Ok(true)
+        }
+
+        async fn resolve_namespace(
+            &self,
+            _request: &NamespaceSecretRequest,
+        ) -> Result<SecretMaterial, SecretError> {
+            Ok(SecretMaterial::new(MATERIAL.to_owned()))
+        }
+
+        async fn exists_namespace(
+            &self,
+            _request: &NamespaceSecretRequest,
         ) -> Result<bool, SecretError> {
             Ok(true)
         }

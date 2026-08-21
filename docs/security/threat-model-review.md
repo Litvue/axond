@@ -48,7 +48,7 @@ unnoticed one.
 | --- | --- |
 | `routes.rs` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
 | Namespace resolution, `credentials.rs` pool lookup, `allow_platform_fallback`, budget/rate-limit keys, operator views | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
-| `backends/secrets.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
+| `backends/secrets.rs`, `backends/secrets/blob_envelope.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
 | `backends/catalog.rs`, `aliases.rs`, `availability/`, `admin/catalogue.rs`, `desired_state/models.rs`, `desired_state/pricing.rs`, `/v1/models`, alias scope and ownership, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `usage/`, `telemetry/`, control-plane journal | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
@@ -197,6 +197,58 @@ lifecycle: `one_secret_belongs_to_one_owner`,
 `only_staged_and_active_material_unwraps`,
 `one_version_of_a_secret_is_in_service_and_it_is_not_ambiguous`, and
 `a_revision_is_refused_before_publication_and_again_on_hydration`.
+
+The namespace-native blob envelope adds
+`deterministic_crypto_and_codec_golden_vector`,
+`axond_owns_rfc3394_aes256_key_wrap_vectors`,
+`context_and_purpose_are_cryptographic_boundaries`,
+`every_stored_byte_is_authenticated_or_a_strict_codec_field`,
+`canonical_cbor_is_the_only_accepted_spelling`,
+`every_truncation_and_oversized_object_is_refused`, and
+`context_is_not_stored_and_nothing_sensitive_is_rendered`, plus the ring-bound,
+duplicate-material, invalid-UTF-8, multibyte-byte-limit, and frozen-v1 tests.
+Together they pin schema 2, RFC 3394 AES-256-KW, owner/reference omission,
+material-AAD dimensions, strict canonical decoding, allocation and ring
+ceilings, key rotation, mutation refusal, zeroizing bootstrap ownership, legacy
+compatibility, and non-rendering errors. The RFC test is Axond-owned: it asserts
+the section 4.6 AES-256 wrap and unwrap values and a corrupted-wrap integrity
+failure whose output buffer is cleared. `blob_secret_envelope` drives raw bytes
+directly through the production decoder and pins every committed filename to
+its exact parser outcome. `blob_secret_crypto` drives bounded synthetic
+seal/open and rotation scenarios; every scenario and byte-boundary case has a
+stable encoded corpus file replayed through `arbitrary_take_rest` with an exact
+outcome. A change to the fixed array, AAD bytes, wrap primitive, key-selection
+rule, bound, key lifetime, authority wrapper, publisher immutability rule, or
+error payload fires this trigger even when no runtime wiring changes.
+
+The codec reuses publication's `EnvironmentId`. Its read wrapper is not a
+free-form context constructor: `AuthenticatedSecretBinding` has private fields,
+no production constructor, no `Clone`, and is consumed by opening. This slice
+does not yet contain publication's `VerifiedActiveRevision` or projection's
+validated deployment secret-index entry, so it makes no claim that the runtime
+provenance handoff is wired. The integration slice must add the only production
+minting path from those two verified types. Tests and fuzzing alone can create a
+synthetic binding. The binding still carries the indexed ciphertext digest,
+which opening checks before KEK lookup.
+
+Write and read capabilities are separate concrete types. A serving
+`BlobSecretOpener` owns a `KekDecryptRing`; neither type contains an active key,
+random generator, publication binding, or seal method. A publisher-only
+`BlobSecretSealer` owns exactly one active encryption KEK and an opaque
+`BlobSecretPublicationBinding`; it has no open method. That publication binding
+also has no production constructor in this slice: the integration publisher
+must mint it only after a create-only exact-`SecretRef` reservation. The codec
+does not claim that it performs that object-store reservation itself. Raw KEK
+buffers remain exact-length, zeroizing, bounded, duplicate-material checked,
+and atomically admitted before an immutable decrypt ring replaces an old one.
+
+AES-KW authenticates the wrapped key but has no AAD. The isolation claim belongs
+to opening the complete object: AES-GCM material AAD binds environment,
+namespace, exact reference, purpose, and KEK id. Do not claim that the wrapped
+DEK alone authenticates caller context. Drop-time zeroization covers owned
+bootstrap buffers and the RustCrypto AES-KW schedule, but cannot prove removal
+from registers, optimizer/library copies, crash dumps, or swap; retiring a KEK
+requires restarting replicas with it absent when process-wide eviction matters.
 
 Request-content redaction is held by
 `deterministic_redaction_round_trips_buffered_and_split_openai_sse_output`,

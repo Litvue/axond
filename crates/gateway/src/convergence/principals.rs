@@ -77,6 +77,7 @@ impl RevisionProjection for PrincipalProjection {
                 namespace: namespace.id.clone(),
                 subject: principal.body.principal().to_string(),
                 digest: *digest,
+                grant: None,
             });
         }
         Ok(config)
