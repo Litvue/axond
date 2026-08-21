@@ -829,8 +829,17 @@ impl PrincipalStore for ProjectedPrincipals {
         let Ok(key) = WorkloadKey::parse(presented.credential) else {
             return Ok(None);
         };
-        let digest = key.digest();
-        Ok(self.entries.get(&digest).cloned())
+        let presented_digest = key.digest();
+        // Scan every stored digest with a constant-time compare. `HashMap::get`
+        // would leak prefix matches of the presented digest through hash/eq
+        // short-circuiting; this is an authentication path.
+        let mut found = None;
+        for (digest, inbound) in self.entries.iter() {
+            if constant_time_eq(digest.as_bytes(), presented_digest.as_bytes()) {
+                found = Some(inbound.clone());
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -2041,5 +2050,46 @@ max_ttl = "15m"
             TokenVerifier::build(&config, &env),
             Err(TokenVerifierBuildError::WeakHs256Secret { ref kid }) if kid == "hs-test"
         ));
+    }
+
+    #[tokio::test]
+    async fn projected_workload_keys_resolve_by_constant_time_digest() {
+        let key = WorkloadKey::generate().expect("system randomness");
+        let digest = key.digest();
+        let material = key.expose_once();
+        let store = ProjectedPrincipals::new(vec![ProjectedPrincipal {
+            namespace: "acme".to_owned(),
+            subject: "svc".to_owned(),
+            digest,
+            grant: None,
+        }]);
+        let found = store
+            .resolve(&Presented {
+                credential: &material,
+            })
+            .await
+            .expect("store is in-process")
+            .expect("digest must match");
+        assert_eq!(found.namespace, "acme");
+        assert_eq!(found.subject, "svc");
+        assert!(
+            store
+                .resolve(&Presented {
+                    credential: "axw1.not-a-key",
+                })
+                .await
+                .expect("malformed keys are a miss, not an error")
+                .is_none()
+        );
+        let other = WorkloadKey::generate().expect("system randomness");
+        assert!(
+            store
+                .resolve(&Presented {
+                    credential: &other.expose_once(),
+                })
+                .await
+                .expect("store is in-process")
+                .is_none()
+        );
     }
 }
