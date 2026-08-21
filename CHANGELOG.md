@@ -1,5 +1,124 @@
 # Changelog
 
+## [0.4.0](https://github.com/Litvue/axond/compare/v0.3.40...v0.4.0) (2026-08-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **routing:** remove the legacy governance and guardrail APIs in favor of typed, bounded request/response middleware.
+
+### Features
+
+* **backends:** add Azure Blob object store ([0d16157](https://github.com/Litvue/axond/commit/0d16157b83093994138519bd5539b2c8afce3e19))
+* **backends:** add Azure Blob object store ([e49a2a4](https://github.com/Litvue/axond/commit/e49a2a4ba11916f9a7c01f4d037adcafecdfc822))
+* **backends:** add conditional object erasure ([2f984d7](https://github.com/Litvue/axond/commit/2f984d7b3e686e3119ea7813750f664bbc165723))
+* **backends:** add conditional object erasure ([3431dd8](https://github.com/Litvue/axond/commit/3431dd8b0602e45c44ff9a935fa8590ddbec4011))
+* **backends:** add object-store CAS contract ([5d19a59](https://github.com/Litvue/axond/commit/5d19a59eed0a6025a75b073190ee16e259c37ed1))
+* **backends:** add object-store CAS contract ([0b42810](https://github.com/Litvue/axond/commit/0b42810e12ade77fd2cdfb425ebac0063a820eb5))
+* **blob:** add read-only revision hydration ([d60701d](https://github.com/Litvue/axond/commit/d60701d9818a39772f6a5f0079935cd5fa8d6345))
+* **blob:** add read-only revision hydration ([#398](https://github.com/Litvue/axond/issues/398)) ([c73ae3c](https://github.com/Litvue/axond/commit/c73ae3cf260eb203ad8437b3884a73a2b802b07d))
+* **blob:** decode canonical resource documents ([a180bdb](https://github.com/Litvue/axond/commit/a180bdb7b222df9f59af0514ad0d894acd16675c))
+* **blob:** decode canonical resource documents ([#397](https://github.com/Litvue/axond/issues/397)) ([d9d9294](https://github.com/Litvue/axond/commit/d9d9294308a9ace7145edbb28e835d63a1fdf2c7))
+* **blob:** implement blob-backed flat namespace control plane ([cbdf03a](https://github.com/Litvue/axond/commit/cbdf03a89412b8eed9f26c4d1cbf76865089ff5d))
+* **blob:** persist candidate sequence floors ([4f6f156](https://github.com/Litvue/axond/commit/4f6f156d053dd5330b77da7bce2266d47b997e0a))
+* **blob:** persist sequence floors and signed recovery candidates ([57b7b53](https://github.com/Litvue/axond/commit/57b7b5348bf76bb5fd90e3c36d454e6f506275ac))
+* **blob:** read authenticated immutable objects ([7e91263](https://github.com/Litvue/axond/commit/7e91263a2885726f485656a5abf592b23b8634bb))
+* **config:** add blob control-plane contract ([7f617a2](https://github.com/Litvue/axond/commit/7f617a21f983a98b42f90523ca892e302fc66c75))
+* **config:** add blob control-plane contract ([a8c4fc8](https://github.com/Litvue/axond/commit/a8c4fc87d3557b5bcad841e7232aa31ccdd2f8c9))
+* **convergence:** wire blob secrets into snapshot compilation ([5436b5c](https://github.com/Litvue/axond/commit/5436b5c02fd925c56e3a60f318efb5b0e65476d7))
+* **desired-state:** add blob publication protocol ([da10795](https://github.com/Litvue/axond/commit/da10795658c322e2559208a4ce64740a3a8dd169))
+* **desired-state:** add blob publication protocol ([2588a80](https://github.com/Litvue/axond/commit/2588a80d6a37e0721c63c9f03b11d0237f779626))
+* **desired-state:** add flat namespace projection ([b623c6a](https://github.com/Litvue/axond/commit/b623c6a5df9160be6a3413fe2d9096dd86e9ad3f))
+* **desired-state:** add flat namespace projection ([#394](https://github.com/Litvue/axond/issues/394)) ([9ab3628](https://github.com/Litvue/axond/commit/9ab36281d282e4f1058e76216793ce02ec3bf46d))
+* **desired-state:** authenticate blob publication ([8b5148f](https://github.com/Litvue/axond/commit/8b5148fde8f72e19cdcbdbb4a7653d36c95988aa))
+* **middleware:** add the request-path primitive ([#365](https://github.com/Litvue/axond/issues/365)) ([b9b6248](https://github.com/Litvue/axond/commit/b9b62486af4ba8bbf253aac5a6d48300980dd9fd))
+* **operations:** register content middleware through policy ([#367](https://github.com/Litvue/axond/issues/367)) ([0aa3ba9](https://github.com/Litvue/axond/commit/0aa3ba96e25094810f8e76b549fc2e84a971a818))
+* **publication:** add authenticated immutable object reads ([#396](https://github.com/Litvue/axond/issues/396)) ([c359efb](https://github.com/Litvue/axond/commit/c359efb750856418419af8389c8e340bf8e11154))
+* **routes:** add namespaced inference contract ([39ae8ce](https://github.com/Litvue/axond/commit/39ae8ce133f2831cb7bdd4d2c17410d78c2d1f9f))
+* **routing:** add deterministic request-path redaction ([#370](https://github.com/Litvue/axond/issues/370)) ([7e2edec](https://github.com/Litvue/axond/commit/7e2edec59caf7a18c00ea05ed234b1473424da0a))
+* **routing:** opt byte-faithful routes into buffered middleware responses ([#368](https://github.com/Litvue/axond/issues/368)) ([1abef95](https://github.com/Litvue/axond/commit/1abef9552c499487e59ec716f50655a2955fbc1e))
+* **secrets:** add namespace blob envelope codec ([f8fd49e](https://github.com/Litvue/axond/commit/f8fd49e25be31181c606deac3fe26af8be2b1010))
+* **secrets:** add namespace blob envelope codec ([3ad4bb9](https://github.com/Litvue/axond/commit/3ad4bb9f89e237f17738e564e61ed9a1b1ae3e34))
+* **secrets:** bind blob secrets to authenticated candidates ([1ee9474](https://github.com/Litvue/axond/commit/1ee94747675deb7e8a843f05b14b7cf6289b2368))
+
+
+### Bug Fixes
+
+* **auth:** compare projected workload-key digests in constant time ([bd6bedf](https://github.com/Litvue/axond/commit/bd6bedfb2b273df7596a05c1faf9a5d65da6bd1c))
+* **backends:** align Azure CAS contract ([dee7cb3](https://github.com/Litvue/axond/commit/dee7cb3f84dfeb7bd4616a0990ad0857fee6cbc0))
+* **backends:** distinguish missing CAS targets ([5fef93a](https://github.com/Litvue/axond/commit/5fef93a6a1db7531725eec295800f6467a6a0ebb))
+* **backends:** harden Azure Blob edge cases ([4f49f90](https://github.com/Litvue/axond/commit/4f49f9008cc9aa8a2dd081ad1d171871857f96c1))
+* **backends:** keep maintenance trait unambiguous ([14d05bb](https://github.com/Litvue/axond/commit/14d05bb0ab57fa80c7b93266647a5e5c9646ce5c))
+* **budget:** honor static-only namespace bypass in memory ([b3c9c0e](https://github.com/Litvue/axond/commit/b3c9c0e385ff02fe6d0f1cec72459900fd4d90a3))
+* **ci:** align endurance policy tests ([6977cf7](https://github.com/Litvue/axond/commit/6977cf7e4096dd2b48d085837e42678b6f91fa4d))
+* **ci:** bound musl package installation ([#376](https://github.com/Litvue/axond/issues/376)) ([10a4008](https://github.com/Litvue/axond/commit/10a4008149afc57466926382812610e52c9e9787))
+* **ci:** pin scheduled fuzzing to GNU target ([#351](https://github.com/Litvue/axond/issues/351)) ([4639bf5](https://github.com/Litvue/axond/commit/4639bf5ec39681047de6ffeae28d54e70b2ebf04))
+* **config:** align Azurite URL contract ([be73a5c](https://github.com/Litvue/axond/commit/be73a5c402f31bd5884731eb5a55cfb54f60804b))
+* **config:** harden blob control-plane contract ([ad5d58c](https://github.com/Litvue/axond/commit/ad5d58cf0c7fbfbe26daa7aa24b1c8c61167262d))
+* **deploy:** set fsGroup on persistent cache PVCs ([c6f4a54](https://github.com/Litvue/axond/commit/c6f4a54d0ccd7320ab8414289d409931d49c173f))
+* **desired-state:** fence blob activation ([e7c75bd](https://github.com/Litvue/axond/commit/e7c75bde5386aa9c1f16bd4cf870dc8ac0e876be))
+* **desired-state:** harden blob publication bounds ([6ff36fb](https://github.com/Litvue/axond/commit/6ff36fb5e5b916de03266577bf6bb66aae928c22))
+* **desired-state:** tighten blob activation boundary ([3843696](https://github.com/Litvue/axond/commit/3843696faaf3668257b03d8033d599030def6591))
+* **policy:** allow mixed flat static-only namespaces ([dfb604d](https://github.com/Litvue/axond/commit/dfb604d0c34721d3f08e3aaf0af89cad15fc2e1d))
+* preserve exact rollout trace evidence ([#378](https://github.com/Litvue/axond/issues/378)) ([6b35561](https://github.com/Litvue/axond/commit/6b355619aaba926bc965f9a4f8e02e4ac2eb8242))
+* **qualification:** align restore provenance validation ([cfb4ac2](https://github.com/Litvue/axond/commit/cfb4ac21b734958ac7494f6917250131918758c5))
+* **qualification:** align restore provenance validation ([c81469d](https://github.com/Litvue/axond/commit/c81469d22c56deba01030a53306c5060d02d62fd))
+* **qualification:** align rollout shared alias ([#380](https://github.com/Litvue/axond/issues/380)) ([205a7aa](https://github.com/Litvue/axond/commit/205a7aa9142c05b051bbdeefd61332d469cef7a8))
+* **qualification:** bound model cancellation fault timing ([#374](https://github.com/Litvue/axond/issues/374)) ([42b90f3](https://github.com/Litvue/axond/commit/42b90f31425a5eec19bab0d4471198167f0c5000))
+* **qualification:** close Devin review gaps on PR 385 ([413a242](https://github.com/Litvue/axond/commit/413a2425de1fbd6e36ce452c9b44d11dd7a08cdc))
+* **qualification:** repair rollout and capacity evidence ([#377](https://github.com/Litvue/axond/issues/377)) ([e9aa36c](https://github.com/Litvue/axond/commit/e9aa36ca4fe296e15b94349a8d44bb4a5f3e6d9f))
+* **qualification:** reproduce rollout float fold ([5322691](https://github.com/Litvue/axond/commit/5322691270ac91edb9ba0db28db760529092c570))
+* **qualification:** reproduce rollout float fold ([d946f23](https://github.com/Litvue/axond/commit/d946f2388dc8be456838d0884a1ab870e664bff2))
+* **qualification:** verify rollout control plane structurally ([e1c7eac](https://github.com/Litvue/axond/commit/e1c7eac2ab9210fc66d4da78bc0088cf58c58438))
+* **routes:** align stateful checks with namespaces ([a3e4845](https://github.com/Litvue/axond/commit/a3e4845bd4d9dbb9e3e6773a2f910b0a2361688f))
+* **routes:** avoid retaining refused namespace text ([555a557](https://github.com/Litvue/axond/commit/555a5578255de963af3a54d074216ecf1311d387))
+* **routes:** keep namespace error tests clippy-clean ([c37b83d](https://github.com/Litvue/axond/commit/c37b83d7da2761113dca85dee834e658a9b65113))
+* **routes:** redact invalid namespace debug output ([bcff46b](https://github.com/Litvue/axond/commit/bcff46b864347e7ab339015faae1be80db3df7e8))
+* **secrets:** bind blob opens to signed provenance ([7d058b8](https://github.com/Litvue/axond/commit/7d058b83ec719b2907469d58ce6d644281718f98))
+* **secrets:** harden blob envelope cryptography ([0d6c736](https://github.com/Litvue/axond/commit/0d6c73676c0a87d238bf3017390b7c9566d455d6))
+* **secrets:** separate blob crypto authorities ([d3ba6d8](https://github.com/Litvue/axond/commit/d3ba6d80839bf82100a9b80c076a69407c8294cd))
+* **stateful:** close flat namespace audit gaps ([0cd1349](https://github.com/Litvue/axond/commit/0cd13499096f16b78a2d37e8beee193b3f271c82))
+* **stateful:** fence flat namespace recovery ([cd177a2](https://github.com/Litvue/axond/commit/cd177a2fde8a342988fd393b94038a227f0cc4ba))
+* **stateful:** harden flat namespace projection ([031612d](https://github.com/Litvue/axond/commit/031612d5cf1b7864cdde82bbc0848cf461842fb5))
+* **stateful:** preserve legacy cache recovery ([424e484](https://github.com/Litvue/axond/commit/424e484bd0be0cba571bdb0761adb4db95b502ae))
+
+
+### Refactors
+
+* **usage:** move accounting holds into middleware ([#371](https://github.com/Litvue/axond/issues/371)) ([5b1cfff](https://github.com/Litvue/axond/commit/5b1cfff2eb2b06b16dfbc2d0d8d0ed945b448559))
+
+
+### Documentation
+
+* **architecture:** adopt blob-backed flat namespaces ([0053fca](https://github.com/Litvue/axond/commit/0053fca37f614b014d94dba5ac025190a342048b))
+* **architecture:** adopt blob-backed flat namespaces ([#385](https://github.com/Litvue/axond/issues/385)) ([596ab92](https://github.com/Litvue/axond/commit/596ab92fb50eaebb5f71fffd9c5e3b7417e813c6))
+* **auth:** keep authentication at outer boundary ([#372](https://github.com/Litvue/axond/issues/372)) ([d22392a](https://github.com/Litvue/axond/commit/d22392a78bf6247b422e217e811647450a93f766))
+* **publication:** clarify immutable read authorization boundary ([d15111a](https://github.com/Litvue/axond/commit/d15111a3ffd754f126847dc7b03748010972a10e))
+* **qualification:** align rollout evidence schema ([#379](https://github.com/Litvue/axond/issues/379)) ([558fd4a](https://github.com/Litvue/axond/commit/558fd4abc7259c5636869041e79fef58cc9b5255))
+* **qualification:** reconcile wave two closure evidence ([#352](https://github.com/Litvue/axond/issues/352)) ([4e70a6d](https://github.com/Litvue/axond/commit/4e70a6df298a77b8fedbaa0c2df788177665d116))
+* **secrets:** clarify decrypt ring key limit ([6e7d2a8](https://github.com/Litvue/axond/commit/6e7d2a893113fbad26c56e7a924529933cb07d82))
+
+
+### Tests
+
+* **compat:** qualify namespaced provider SDK routes ([d87c78a](https://github.com/Litvue/axond/commit/d87c78a54012aa5f2d874f2a42834388cf6d425a))
+* **compat:** qualify namespaced provider SDK routes ([a10f9e1](https://github.com/Litvue/axond/commit/a10f9e169c2b173e1fbee9e4ca849d983a8030f0))
+* **fuzz:** pin blob seed bytes in smoke ([9782290](https://github.com/Litvue/axond/commit/9782290807fc511bcf3d4a8b19d2e61724486f4e))
+* **fuzz:** pin flat-v2 seed SHA-256 outcomes ([65f8e33](https://github.com/Litvue/axond/commit/65f8e33e443f3110031c7a9d75e4561e4fe740e8))
+* **qualification:** allow active cohort evidence ([1db3b2c](https://github.com/Litvue/axond/commit/1db3b2cf4785b11b623eeb9bd9b59449e5e951e9))
+* **qualification:** allow active cohort evidence ([d32ad16](https://github.com/Litvue/axond/commit/d32ad16a71b206aefc589a489a0603ade845e9ce))
+* **qualification:** harden production evidence cohort ([#373](https://github.com/Litvue/axond/issues/373)) ([c56c004](https://github.com/Litvue/axond/commit/c56c00438299cec41865e4a32b4ba4e38e0a6cbb))
+* **secrets:** harden blob envelope boundaries ([60dc4f0](https://github.com/Litvue/axond/commit/60dc4f052e22a7fa499c01ef3b975cdefcf19635))
+
+
+### Continuous Integration
+
+* bump the github-actions group across 1 directory with 4 updates ([#369](https://github.com/Litvue/axond/issues/369)) ([5c02e4f](https://github.com/Litvue/axond/commit/5c02e4fdd3e77ab86f94846bc29d394f899857a2))
+* **qualification:** dispatch exact-head evidence ([#375](https://github.com/Litvue/axond/issues/375)) ([bb3625d](https://github.com/Litvue/axond/commit/bb3625d197ee1df2c06a464d64cf67fd33221b8e))
+* **qualification:** gate endurance on CI smoke, not a 12h soak ([c122abd](https://github.com/Litvue/axond/commit/c122abd3e6c56cca6b314f2fe1f743eea84f252f))
+* **qualification:** pause legacy postgres lanes ([e3f99af](https://github.com/Litvue/axond/commit/e3f99afb2eaa23a2192d55cebf40a9b20f7c4658))
+* **qualification:** pause legacy Postgres lanes ([f68c524](https://github.com/Litvue/axond/commit/f68c524e9e254df886ba2fe196709ae2a68e4718))
+
 ## [0.3.40](https://github.com/Litvue/axond/compare/v0.3.39...v0.3.40) (2026-08-15)
 
 
