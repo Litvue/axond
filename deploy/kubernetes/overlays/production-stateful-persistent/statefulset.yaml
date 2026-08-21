@@ -48,6 +48,9 @@ spec:
             matchLabels:
               app.kubernetes.io/name: axond
       securityContext:
+        # distroless/static-debian12:nonroot uses UID/GID 65532; the retained
+        # recovery PVC must be writable by that non-root process.
+        fsGroup: 65532
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault

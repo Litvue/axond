@@ -75,6 +75,8 @@ IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
 # deploying whatever bytes a tag happens to point at today.
 SENTINEL_DIGEST = "sha256:" + "0" * 64
 SELECTOR = {"app.kubernetes.io/name": "axond"}
+# gcr.io/distroless/static-debian12:nonroot's documented nonroot UID/GID.
+DISTROLESS_NONROOT_GROUP = 65532
 PRIVATE_RANGES = {"169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 # The Redis release that added `SET … PXAT`, which the revocation write uses and
 # which is therefore what the documented floor has to say.
@@ -1044,6 +1046,11 @@ def check_stateful_persistent(documents: list[Document]) -> list[str]:
             )
 
     pod = spec["template"]["spec"]
+    if pod.get("securityContext", {}).get("fsGroup") != DISTROLESS_NONROOT_GROUP:
+        failures.append(
+            f"{label}: pod securityContext.fsGroup must be the distroless nonroot group "
+            f"{DISTROLESS_NONROOT_GROUP} so the writable PVC is usable by the image"
+        )
     axond = next(
         (
             container
@@ -1460,6 +1467,15 @@ def self_test() -> int:
     expect_failure(
         "a persistent option deleting a replica cache with the workload",
         check_stateful_persistent(persistent_deleted),
+    )
+
+    persistent_missing_fs_group = copy.deepcopy(stateful_persistent)
+    one(persistent_missing_fs_group, "StatefulSet")["spec"]["template"]["spec"][
+        "securityContext"
+    ].pop("fsGroup", None)
+    expect_failure(
+        "a persistent option leaving the writable PVC without a distroless nonroot group",
+        check_stateful_persistent(persistent_missing_fs_group),
     )
 
     rolling = copy.deepcopy(stateful)
