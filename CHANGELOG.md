@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/Litvue/axond/compare/v0.4.1...v0.4.2) (2026-08-24)
+
+
+### Continuous Integration
+
+* bump the github-actions group with 2 updates ([#408](https://github.com/Litvue/axond/issues/408)) ([efdadd8](https://github.com/Litvue/axond/commit/efdadd89d7646ee862693c0a726c65fe38e05e98))
+
 ## [0.4.1](https://github.com/Litvue/axond/compare/v0.4.0...v0.4.1) (2026-08-21)
 
 
