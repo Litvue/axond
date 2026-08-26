@@ -7,10 +7,18 @@
 //! validation the API performs — the CLI cannot be a second, weaker way in
 //! (ADR 0027).
 //!
-//! Mutating commands send the same envelope the route parses, read from a file
-//! or standard input, rather than reconstructing every resource field as flags:
-//! the schema then has exactly one definition, and `--dry-run` against a real
-//! deployment is how an operator checks a document before applying it.
+//! Happy-path model changes are `axond admin model apply`: GET
+//! `/admin/v1/catalogue` for `x-axond-expected-revision` (`empty` when the
+//! control plane has never published), mint `idempotency-key`, and POST
+//! `/admin/v1/bindings`. `mutation` is `create` when the alias slug is absent
+//! and `update` when it exists. Expert `apply --resource` still sends a
+//! caller-authored envelope and still requires those headers on the command
+//! line.
+//!
+//! Mutating expert commands send the same envelope the route parses, read from
+//! a file or standard input, rather than reconstructing every resource field as
+//! flags: the schema then has exactly one definition, and `--dry-run` against a
+//! real deployment is how an operator checks a document before applying it.
 //!
 //! Budgets and limits are policy fields, so they are `policies` documents;
 //! `axond admin resources` prints the mapping rather than leaving it to be
@@ -22,9 +30,11 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::time::Duration;
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use ring::rand::{SecureRandom, SystemRandom};
+use serde::Deserialize;
 
 use super::auth::{BREAKGLASS_OPERATOR_HEADER, BREAKGLASS_REASON_HEADER};
 use super::protocol::{
@@ -161,6 +171,233 @@ fn secret_command() -> Command {
         )
 }
 
+/// `axond admin model`: make a published model id callable, without authoring
+/// the four-resource graph.
+///
+/// Apply still goes through `/admin/v1/bindings`. The CLI fills the protocol
+/// preconditions so an operator is not asked for a revision id or a key.
+fn model_command() -> Command {
+    let tenant = || {
+        Arg::new("tenant")
+            .long("tenant")
+            .required(true)
+            .help("Tenant id the binding is for")
+    };
+    let project = || {
+        Arg::new("project")
+            .long("project")
+            .help("Project id the alias is for; omitted, the tenant's only project")
+    };
+    let dry_run = || {
+        Arg::new("dry-run")
+            .long("dry-run")
+            .action(ArgAction::SetTrue)
+            .help("Validate and diff the candidate without publishing anything")
+    };
+    Command::new("model")
+        .about("Make a published model id available, priced, and named on /v1/models")
+        .long_about(
+            "Make a published model id available, priced, and named on /v1/models.\n\n\
+             `apply` GETs /admin/v1/catalogue for x-axond-expected-revision (or `empty`), \
+             mints the idempotency key, and POSTs /admin/v1/bindings. It does not open \
+             the control plane. Omit --name and the alias is the published model id \
+             (for example gpt-4o).",
+        )
+        .subcommand_required(true)
+        .subcommand(
+            Command::new("apply")
+                .about("Publish one [[model]] fragment as a binding")
+                .arg(tenant())
+                .arg(project())
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .short('f')
+                        .help(
+                            "A [[model]] TOML fragment (not a full axond.toml), or a binding JSON \
+                             object",
+                        ),
+                )
+                .arg(
+                    Arg::new("target")
+                        .long("target")
+                        .help("Connection and published id as provider:model (for example openai:gpt-4o)"),
+                )
+                .arg(
+                    Arg::new("from-catalogue")
+                        .long("from-catalogue")
+                        .requires("provider")
+                        .help(
+                            "Catalogue offering as provider/model (for example openai/gpt-4o); \
+                             requires --provider for the connection",
+                        ),
+                )
+                .arg(
+                    Arg::new("provider")
+                        .long("provider")
+                        .requires("from-catalogue")
+                        .help(
+                            "Connection slug for --from-catalogue; not inferred from the \
+                             catalogue id",
+                        ),
+                )
+                .arg(
+                    Arg::new("name")
+                        .long("name")
+                        .help("Caller-facing alias; omit to use the published model id"),
+                )
+                .arg(
+                    Arg::new("price")
+                        .long("price")
+                        .value_parser(["observed"])
+                        .conflicts_with_all(["price-input", "price-output"])
+                        .help("Adopt catalogue rates; not a default"),
+                )
+                .arg(
+                    Arg::new("price-input")
+                        .long("price-input")
+                        .requires("price-output")
+                        .help("Input rate in micro-dollars per million tokens"),
+                )
+                .arg(
+                    Arg::new("price-output")
+                        .long("price-output")
+                        .requires("price-input")
+                        .help("Output rate in micro-dollars per million tokens"),
+                )
+                .arg(
+                    Arg::new("pin")
+                        .long("pin")
+                        .value_parser(["follow", "lock"])
+                        .help("Catalogue pin; default follow"),
+                )
+                .arg(
+                    Arg::new("summary")
+                        .long("summary")
+                        .help("Why: recorded in the audit trail"),
+                )
+                .arg(dry_run())
+                .group(
+                    ArgGroup::new("document")
+                        .args(["file", "target", "from-catalogue"])
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            Command::new("disable")
+                .about("Withdraw an alias without deleting it")
+                .arg(tenant())
+                .arg(project())
+                .arg(
+                    Arg::new("name")
+                        .long("name")
+                        .required(true)
+                        .help("Caller-facing alias to disable"),
+                )
+                .arg(
+                    Arg::new("target")
+                        .long("target")
+                        .help("Connection and published id as provider:model, if catalogue metadata is pending"),
+                )
+                .arg(
+                    Arg::new("summary")
+                        .long("summary")
+                        .help("Why: recorded in the audit trail"),
+                )
+                .arg(dry_run()),
+        )
+        .subcommand(
+            Command::new("price")
+                .about("Change stated rates on an existing binding")
+                .arg(tenant())
+                .arg(project())
+                .arg(
+                    Arg::new("name")
+                        .long("name")
+                        .required(true)
+                        .help("Caller-facing alias to reprice"),
+                )
+                .arg(
+                    Arg::new("input")
+                        .long("input")
+                        .required(true)
+                        .help("Input rate in micro-dollars per million tokens"),
+                )
+                .arg(
+                    Arg::new("output")
+                        .long("output")
+                        .required(true)
+                        .help("Output rate in micro-dollars per million tokens"),
+                )
+                .arg(
+                    Arg::new("target")
+                        .long("target")
+                        .help("Connection and published id as provider:model, if catalogue metadata is pending"),
+                )
+                .arg(
+                    Arg::new("summary")
+                        .long("summary")
+                        .help("Why: recorded in the audit trail"),
+                )
+                .arg(dry_run()),
+        )
+        .subcommand(
+            Command::new("show")
+                .about("One alias and its catalogue rows")
+                .arg(tenant())
+                .arg(project())
+                .arg(
+                    Arg::new("name")
+                        .long("name")
+                        .required(true)
+                        .help("Caller-facing alias to show"),
+                ),
+        )
+}
+
+/// `axond admin catalog`: imported browse and a manual refresh.
+///
+/// Browse is GET /admin/v1/catalogue with `source=imported`. Refresh is POST
+/// /admin/v1/catalogue/refresh: it writes, it does not mutate desired state, so
+/// it carries no idempotency key and no expected revision.
+fn catalog_command() -> Command {
+    Command::new("catalog")
+        .about("Browse imported offerings and refresh the active catalogue")
+        .subcommand_required(true)
+        .subcommand(
+            Command::new("browse")
+                .about("Search the imported catalogue")
+                .arg(
+                    Arg::new("tenant")
+                        .long("tenant")
+                        .required(true)
+                        .help("Tenant id to read as"),
+                )
+                .arg(
+                    Arg::new("project")
+                        .long("project")
+                        .help("Project id to scope to; requires --tenant"),
+                )
+                .arg(
+                    Arg::new("provider")
+                        .long("provider")
+                        .help("Catalogue provider id to narrow to"),
+                )
+                .arg(
+                    Arg::new("q")
+                        .long("q")
+                        .help("Substring match over imported provider, model, and display name"),
+                )
+                .group(
+                    ArgGroup::new("imported")
+                        .args(["provider", "q"])
+                        .required(true)
+                        .multiple(true),
+                ),
+        )
+        .subcommand(Command::new("refresh").about("Import now; last-known-good stays on refusal"))
+}
+
 pub fn command() -> Command {
     let endpoint = Arg::new("endpoint")
         .long("endpoint")
@@ -232,6 +469,8 @@ pub fn command() -> Command {
         .subcommand(
             Command::new("resources").about("List the resource kinds `axond admin apply` accepts"),
         )
+        .subcommand(model_command())
+        .subcommand(catalog_command())
         .subcommand(
             Command::new("apply")
                 .about("Publish a mutation document, or validate it with --dry-run")
@@ -325,9 +564,17 @@ pub fn run(args: &ArgMatches) -> anyhow::Result<()> {
         return Ok(());
     }
     let env: HashMap<String, String> = std::env::vars().collect();
-    let call = plan(name, sub, &env)?;
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(send(call, base(args, &env)?, headers(args, sub, &env)?))
+    runtime.block_on(async {
+        match name {
+            "model" => run_model(args, sub, &env).await,
+            "catalog" => run_catalog(args, sub, &env).await,
+            name => {
+                let call = plan(name, sub, &env)?;
+                send(call, base(args, &env)?, headers(args, sub, &env)?).await
+            }
+        }
+    })
 }
 
 /// A required flag clap has already validated as present.
@@ -403,12 +650,684 @@ fn plan(name: &str, args: &ArgMatches, env: &HashMap<String, String>) -> anyhow:
         "secret" => secret_call(args)?,
         other => unreachable!("clap validates subcommands: {other}"),
     };
-    // Read only to fail early on a missing credential, before a connection is
-    // opened against a deployment that would answer 401.
+    require_token(env)?;
+    Ok(call)
+}
+
+fn require_token(env: &HashMap<String, String>) -> anyhow::Result<()> {
+    // Fail before a connection is opened against a deployment that would answer 401.
     if !env.contains_key(TOKEN_ENV) {
         anyhow::bail!("${TOKEN_ENV} is not set: `axond admin` needs an administrative credential");
     }
-    Ok(call)
+    Ok(())
+}
+
+/// One binding the CLI is about to POST. `name` omitted is the happy path: the
+/// server defaults the alias to the published model id.
+#[derive(Debug, Clone, PartialEq)]
+struct BindingSpec {
+    tenant: String,
+    project: Option<String>,
+    name: Option<String>,
+    alias: String,
+    pin: Option<String>,
+    state: Option<String>,
+    summary: String,
+    targets: Vec<serde_json::Value>,
+}
+
+impl BindingSpec {
+    fn envelope(&self, mutation: &str) -> serde_json::Value {
+        let mut resource = serde_json::Map::new();
+        resource.insert("tenant".to_owned(), serde_json::json!(self.tenant));
+        if let Some(project) = &self.project {
+            resource.insert("project".to_owned(), serde_json::json!(project));
+        }
+        if let Some(name) = &self.name {
+            resource.insert("name".to_owned(), serde_json::json!(name));
+        }
+        if let Some(state) = &self.state {
+            resource.insert("state".to_owned(), serde_json::json!(state));
+        }
+        if let Some(pin) = &self.pin {
+            resource.insert("pin".to_owned(), serde_json::json!(pin));
+        }
+        resource.insert("targets".to_owned(), serde_json::json!(self.targets));
+        serde_json::json!({
+            "summary": self.summary,
+            "mutation": mutation,
+            "resource": resource,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelFragmentFile {
+    #[serde(default, rename = "model")]
+    model: Vec<TomlModel>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlModel {
+    #[serde(default)]
+    name: Option<String>,
+    /// Accepted so a `[[model]]` copied from file config does not explode;
+    /// scope is `--tenant` / `--project`, not this string.
+    #[allow(dead_code)]
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    pin: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    targets: Vec<TomlTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlTarget {
+    provider: String,
+    model: String,
+    #[serde(default)]
+    catalog: Option<TomlCatalog>,
+    #[serde(default)]
+    price: Option<TomlPrice>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlCatalog {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TomlPrice {
+    Stated {
+        input_microdollars_per_million: u64,
+        output_microdollars_per_million: u64,
+    },
+    Observed(String),
+}
+
+async fn run_model(
+    global: &ArgMatches,
+    args: &ArgMatches,
+    env: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    require_token(env)?;
+    let (verb, verb_args) = args
+        .subcommand()
+        .expect("clap requires an `axond admin model` subcommand");
+    let endpoint = base(global, env)?;
+    match verb {
+        "show" => {
+            let tenant = required(verb_args, "tenant");
+            let project = verb_args.get_one::<String>("project").map(String::as_str);
+            let name = required(verb_args, "name");
+            let catalogue = fetch_json(
+                catalogue_call(tenant, project, Vec::new()),
+                endpoint,
+                headers(global, verb_args, env)?,
+            )
+            .await?;
+            let body = show_document(&catalogue, name)?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        "apply" | "disable" | "price" => {
+            let mut spec = match verb {
+                "apply" => apply_spec(verb_args)?,
+                "disable" => disable_spec(verb_args)?,
+                "price" => price_spec(verb_args)?,
+                _ => unreachable!("clap validates subcommands: {verb}"),
+            };
+            let catalogue = fetch_json(
+                catalogue_call(&spec.tenant, spec.project.as_deref(), Vec::new()),
+                endpoint.clone(),
+                headers(global, verb_args, env)?,
+            )
+            .await?;
+            let expected = expected_revision_of(&catalogue);
+            let exists = alias_published(&catalogue, &spec.alias);
+            let mutation = match verb {
+                "apply" => {
+                    if exists {
+                        "update"
+                    } else {
+                        "create"
+                    }
+                }
+                "disable" | "price" => {
+                    if !exists {
+                        anyhow::bail!("alias `{}` is not published in this catalogue", spec.alias);
+                    }
+                    if spec.targets.is_empty() {
+                        spec.targets = vec![target_from_catalogue(&catalogue, &spec.alias)?];
+                    }
+                    "update"
+                }
+                _ => unreachable!("clap validates subcommands: {verb}"),
+            };
+            let call = Call {
+                method: Method::POST,
+                path: "bindings".to_owned(),
+                query: Vec::new(),
+                body: Some(spec.envelope(mutation).to_string()),
+            };
+            send(
+                call,
+                endpoint,
+                mutation_headers(global, verb_args, env, &mint_idempotency_key()?, &expected)?,
+            )
+            .await
+        }
+        other => unreachable!("clap validates subcommands: {other}"),
+    }
+}
+
+async fn run_catalog(
+    global: &ArgMatches,
+    args: &ArgMatches,
+    env: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    require_token(env)?;
+    let (verb, verb_args) = args
+        .subcommand()
+        .expect("clap requires an `axond admin catalog` subcommand");
+    let call = match verb {
+        "browse" => browse_call(verb_args)?,
+        "refresh" => Call {
+            method: Method::POST,
+            path: "catalogue/refresh".to_owned(),
+            query: Vec::new(),
+            body: None,
+        },
+        other => unreachable!("clap validates subcommands: {other}"),
+    };
+    send(call, base(global, env)?, headers(global, verb_args, env)?).await
+}
+
+fn apply_spec(args: &ArgMatches) -> anyhow::Result<BindingSpec> {
+    let mut spec = if let Some(path) = args.get_one::<String>("file") {
+        spec_from_file(path, args)?
+    } else if let Some(from) = args.get_one::<String>("from-catalogue") {
+        spec_from_catalogue(from, args)?
+    } else {
+        spec_from_target(args)?
+    };
+    if let Some(name) = args.get_one::<String>("name") {
+        spec.name = Some(name.clone());
+        spec.alias = name.clone();
+    }
+    if let Some(pin) = args.get_one::<String>("pin") {
+        spec.pin = Some(pin.clone());
+    }
+    if let Some(summary) = args.get_one::<String>("summary") {
+        spec.summary = summary.clone();
+    }
+    if spec.summary.is_empty() {
+        spec.summary = format!("enable {}", spec.alias);
+    }
+    Ok(spec)
+}
+
+fn disable_spec(args: &ArgMatches) -> anyhow::Result<BindingSpec> {
+    let name = required(args, "name").to_owned();
+    let targets = match args.get_one::<String>("target") {
+        Some(target) => {
+            let (provider, model) = split_once(target, ':', "--target")?;
+            vec![target_json(provider, model, None, None)]
+        }
+        None => Vec::new(),
+    };
+    Ok(BindingSpec {
+        tenant: required(args, "tenant").to_owned(),
+        project: args.get_one::<String>("project").cloned(),
+        name: Some(name.clone()),
+        alias: name.clone(),
+        pin: None,
+        state: Some("disabled".to_owned()),
+        summary: args
+            .get_one::<String>("summary")
+            .cloned()
+            .unwrap_or_else(|| format!("disable {name}")),
+        targets,
+    })
+}
+
+fn price_spec(args: &ArgMatches) -> anyhow::Result<BindingSpec> {
+    let name = required(args, "name").to_owned();
+    let price = Some(stated_price(
+        parse_u64("--input", required(args, "input"))?,
+        parse_u64("--output", required(args, "output"))?,
+    ));
+    let targets = match args.get_one::<String>("target") {
+        Some(target) => {
+            let (provider, model) = split_once(target, ':', "--target")?;
+            vec![target_json(provider, model, None, price)]
+        }
+        None => Vec::new(),
+    };
+    Ok(BindingSpec {
+        tenant: required(args, "tenant").to_owned(),
+        project: args.get_one::<String>("project").cloned(),
+        name: Some(name.clone()),
+        alias: name.clone(),
+        pin: None,
+        state: None,
+        summary: args
+            .get_one::<String>("summary")
+            .cloned()
+            .unwrap_or_else(|| format!("price {name}")),
+        targets,
+    })
+}
+
+fn spec_from_file(path: &str, args: &ArgMatches) -> anyhow::Result<BindingSpec> {
+    let text = document(Some(path))?;
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('{') {
+        spec_from_json(&text, args)
+    } else {
+        spec_from_toml(&text, args)
+    }
+}
+
+fn spec_from_toml(text: &str, args: &ArgMatches) -> anyhow::Result<BindingSpec> {
+    let parsed: ModelFragmentFile = toml::from_str(text).map_err(|error| {
+        anyhow::anyhow!("TOML is a [[model]] fragment, not a full axond.toml: {error}")
+    })?;
+    let [model] = parsed.model.as_slice() else {
+        anyhow::bail!("TOML must contain exactly one [[model]] table");
+    };
+    if model.targets.is_empty() {
+        anyhow::bail!("[[model]] must list at least one target");
+    }
+    let published = published_id(&model.targets[0].model, model.targets[0].catalog.as_ref());
+    let name = model.name.clone().filter(|name| !name.is_empty());
+    let alias = name.clone().unwrap_or_else(|| published.to_owned());
+    if alias.is_empty() {
+        anyhow::bail!("a published model id is required");
+    }
+    let mut targets = Vec::with_capacity(model.targets.len());
+    for target in &model.targets {
+        let price = match &target.price {
+            None => None,
+            Some(TomlPrice::Observed(token)) => {
+                if token != "observed" {
+                    anyhow::bail!("price must be a rate object or the token `observed`");
+                }
+                Some(serde_json::json!("observed"))
+            }
+            Some(TomlPrice::Stated {
+                input_microdollars_per_million,
+                output_microdollars_per_million,
+            }) => Some(stated_price(
+                *input_microdollars_per_million,
+                *output_microdollars_per_million,
+            )),
+        };
+        let catalog = target.catalog.as_ref().map(|catalog| {
+            let mut object = serde_json::Map::new();
+            if let Some(provider) = &catalog.provider {
+                object.insert("provider".to_owned(), serde_json::json!(provider));
+            }
+            if let Some(model) = &catalog.model {
+                object.insert("model".to_owned(), serde_json::json!(model));
+            }
+            serde_json::Value::Object(object)
+        });
+        let mut json = serde_json::json!({
+            "provider": target.provider,
+            "model": target.model,
+        });
+        if let Some(catalog) = catalog {
+            json["catalog"] = catalog;
+        }
+        if let Some(price) = price {
+            json["price"] = price;
+        }
+        targets.push(json);
+    }
+    Ok(BindingSpec {
+        tenant: required(args, "tenant").to_owned(),
+        project: args.get_one::<String>("project").cloned(),
+        name,
+        alias,
+        pin: model.pin.clone(),
+        state: model.state.clone(),
+        summary: String::new(),
+        targets,
+    })
+}
+
+fn spec_from_json(text: &str, args: &ArgMatches) -> anyhow::Result<BindingSpec> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| anyhow::anyhow!("binding JSON is invalid: {error}"))?;
+    let resource = value.get("resource").unwrap_or(&value);
+    let tenant = args
+        .get_one::<String>("tenant")
+        .cloned()
+        .or_else(|| {
+            resource
+                .get("tenant")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| anyhow::anyhow!("--tenant is required"))?;
+    let project = args.get_one::<String>("project").cloned().or_else(|| {
+        resource
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
+    let targets = resource
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("binding JSON must contain targets"))?;
+    if targets.is_empty() {
+        anyhow::bail!("binding JSON must contain at least one target");
+    }
+    let first = &targets[0];
+    let model = first
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let catalog_model = first
+        .get("catalog")
+        .and_then(|catalog| catalog.get("model"))
+        .and_then(serde_json::Value::as_str);
+    let published = catalog_model.unwrap_or(model);
+    let name = resource
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let alias = name.clone().unwrap_or_else(|| published.to_owned());
+    if alias.is_empty() {
+        anyhow::bail!("a published model id is required");
+    }
+    Ok(BindingSpec {
+        tenant,
+        project,
+        name,
+        alias,
+        pin: resource
+            .get("pin")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        state: resource
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        summary: value
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        targets,
+    })
+}
+
+fn spec_from_catalogue(from: &str, args: &ArgMatches) -> anyhow::Result<BindingSpec> {
+    let (catalog_provider, published) = split_once(from, '/', "--from-catalogue")?;
+    let provider = required(args, "provider");
+    let price = price_from_apply_flags(args)?;
+    let catalog = Some(serde_json::json!({
+        "provider": catalog_provider,
+        "model": published,
+    }));
+    Ok(BindingSpec {
+        tenant: required(args, "tenant").to_owned(),
+        project: args.get_one::<String>("project").cloned(),
+        name: None,
+        alias: published.to_owned(),
+        pin: None,
+        state: None,
+        summary: String::new(),
+        targets: vec![target_json(provider, published, catalog, price)],
+    })
+}
+
+fn spec_from_target(args: &ArgMatches) -> anyhow::Result<BindingSpec> {
+    let target = required(args, "target");
+    let (provider, model) = split_once(target, ':', "--target")?;
+    let price = price_from_apply_flags(args)?;
+    Ok(BindingSpec {
+        tenant: required(args, "tenant").to_owned(),
+        project: args.get_one::<String>("project").cloned(),
+        name: None,
+        alias: model.to_owned(),
+        pin: None,
+        state: None,
+        summary: String::new(),
+        targets: vec![target_json(provider, model, None, price)],
+    })
+}
+
+fn price_from_apply_flags(args: &ArgMatches) -> anyhow::Result<Option<serde_json::Value>> {
+    if args.get_one::<String>("price").is_some() {
+        return Ok(Some(serde_json::json!("observed")));
+    }
+    match (
+        args.get_one::<String>("price-input"),
+        args.get_one::<String>("price-output"),
+    ) {
+        (Some(input), Some(output)) => Ok(Some(stated_price(
+            parse_u64("--price-input", input)?,
+            parse_u64("--price-output", output)?,
+        ))),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("--price-input and --price-output must be passed together"),
+    }
+}
+
+fn stated_price(input: u64, output: u64) -> serde_json::Value {
+    serde_json::json!({
+        "input_microdollars_per_million": input,
+        "output_microdollars_per_million": output,
+    })
+}
+
+fn target_json(
+    provider: &str,
+    model: &str,
+    catalog: Option<serde_json::Value>,
+    price: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut target = serde_json::json!({
+        "provider": provider,
+        "model": model,
+    });
+    if let Some(catalog) = catalog {
+        target["catalog"] = catalog;
+    }
+    if let Some(price) = price {
+        target["price"] = price;
+    }
+    target
+}
+
+fn published_id<'a>(model: &'a str, catalog: Option<&'a TomlCatalog>) -> &'a str {
+    catalog
+        .and_then(|catalog| catalog.model.as_deref())
+        .unwrap_or(model)
+}
+
+fn split_once<'a>(value: &'a str, sep: char, flag: &str) -> anyhow::Result<(&'a str, &'a str)> {
+    let (left, right) = value.split_once(sep).ok_or_else(|| {
+        anyhow::anyhow!("{flag} expects a value separated by `{sep}`, not `{value}`")
+    })?;
+    if left.is_empty() || right.is_empty() {
+        anyhow::bail!("{flag} expects a value separated by `{sep}`, not `{value}`");
+    }
+    Ok((left, right))
+}
+
+fn parse_u64(flag: &str, value: &str) -> anyhow::Result<u64> {
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{flag} is not a micro-dollar amount: `{value}`"))
+}
+
+fn catalogue_call(tenant: &str, project: Option<&str>, extra: Vec<(String, String)>) -> Call {
+    let mut query = vec![("tenant".to_owned(), tenant.to_owned())];
+    if let Some(project) = project {
+        query.push(("project".to_owned(), project.to_owned()));
+    }
+    query.extend(extra);
+    Call {
+        method: Method::GET,
+        path: "catalogue".to_owned(),
+        query,
+        body: None,
+    }
+}
+
+fn browse_call(args: &ArgMatches) -> anyhow::Result<Call> {
+    if let Some(q) = args.get_one::<String>("q") {
+        let chars = q.chars().count();
+        if chars < 3 {
+            anyhow::bail!("--q must be at least 3 characters");
+        }
+    }
+    let mut extra = vec![("source".to_owned(), "imported".to_owned())];
+    if let Some(provider) = args.get_one::<String>("provider") {
+        extra.push(("provider".to_owned(), provider.clone()));
+    }
+    if let Some(q) = args.get_one::<String>("q") {
+        extra.push(("q".to_owned(), q.clone()));
+    }
+    Ok(catalogue_call(
+        required(args, "tenant"),
+        args.get_one::<String>("project").map(String::as_str),
+        extra,
+    ))
+}
+
+/// Catalogue `revision`, or `empty` when the control plane has never published.
+fn expected_revision_of(catalogue: &serde_json::Value) -> String {
+    catalogue
+        .get("revision")
+        .and_then(serde_json::Value::as_str)
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or(EXPECTED_REVISION_EMPTY)
+        .to_owned()
+}
+
+fn alias_published(catalogue: &serde_json::Value, slug: &str) -> bool {
+    catalogue
+        .get("aliases")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|aliases| {
+            aliases
+                .iter()
+                .any(|alias| alias.get("slug").and_then(serde_json::Value::as_str) == Some(slug))
+        })
+}
+
+fn target_from_catalogue(
+    catalogue: &serde_json::Value,
+    slug: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let entries = catalogue
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let entry = entries.iter().find(|entry| {
+        entry
+            .get("aliases")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|aliases| aliases.iter().any(|name| name.as_str() == Some(slug)))
+    });
+    let Some(metadata) = entry.and_then(|entry| entry.get("metadata")) else {
+        anyhow::bail!(
+            "catalogue metadata for `{slug}` is not available; pass --target provider:model"
+        );
+    };
+    let provider = metadata
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("catalogue metadata for `{slug}` has no provider"))?;
+    let model = metadata
+        .get("published_model")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| metadata.get("model").and_then(serde_json::Value::as_str))
+        .ok_or_else(|| anyhow::anyhow!("catalogue metadata for `{slug}` has no model"))?;
+    Ok(target_json(provider, model, None, None))
+}
+
+fn show_document(catalogue: &serde_json::Value, name: &str) -> anyhow::Result<serde_json::Value> {
+    let alias = catalogue
+        .get("aliases")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|aliases| {
+            aliases
+                .iter()
+                .find(|alias| alias.get("slug").and_then(serde_json::Value::as_str) == Some(name))
+                .cloned()
+        });
+    let entries = catalogue
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| {
+            entry.get("slug").and_then(serde_json::Value::as_str) == Some(name)
+                || entry
+                    .get("aliases")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(name)))
+        })
+        .collect::<Vec<_>>();
+    if alias.is_none() && entries.is_empty() {
+        anyhow::bail!("alias `{name}` is not in the catalogue");
+    }
+    Ok(serde_json::json!({
+        "revision": catalogue.get("revision"),
+        "alias": alias,
+        "entries": entries,
+    }))
+}
+
+fn mint_idempotency_key() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("could not mint an idempotency key"))?;
+    Ok(hex_lower(&bytes))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn mutation_headers(
+    global: &ArgMatches,
+    args: &ArgMatches,
+    env: &HashMap<String, String>,
+    idempotency_key: &str,
+    expected_revision: &str,
+) -> anyhow::Result<HeaderMap> {
+    let mut headers = headers(global, args, env)?;
+    headers.insert(header(IDEMPOTENCY_KEY_HEADER), value(idempotency_key)?);
+    headers.insert(header(EXPECTED_REVISION_HEADER), value(expected_revision)?);
+    Ok(headers)
 }
 
 /// One `axond admin secret` call.
@@ -620,7 +1539,13 @@ fn value(text: &str) -> anyhow::Result<HeaderValue> {
         .map_err(|_| anyhow::anyhow!("a header value contains characters HTTP cannot carry"))
 }
 
-async fn send(call: Call, base: String, headers: HeaderMap) -> anyhow::Result<()> {
+struct Exchange {
+    ok: bool,
+    status: reqwest::StatusCode,
+    raw: String,
+}
+
+async fn exchange(call: Call, base: String, headers: HeaderMap) -> anyhow::Result<Exchange> {
     let client = reqwest::Client::builder()
         // Bounded, because an administrative command is usually run by a person
         // waiting for it, and an unreachable control plane must say so.
@@ -639,19 +1564,52 @@ async fn send(call: Call, base: String, headers: HeaderMap) -> anyhow::Result<()
         .await
         .map_err(|error| anyhow::anyhow!("{url} could not be reached: {error}"))?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let raw = response.text().await.unwrap_or_default();
+    Ok(Exchange {
+        ok: status.is_success(),
+        status,
+        raw,
+    })
+}
+
+fn render_body(raw: &str) -> String {
     // Pretty-printed when it is JSON, verbatim otherwise: an operator reads this,
     // and a body that failed to parse is evidence rather than something to hide.
-    let rendered = serde_json::from_str::<serde_json::Value>(&body)
+    serde_json::from_str::<serde_json::Value>(raw)
         .ok()
         .and_then(|json| serde_json::to_string_pretty(&json).ok())
-        .unwrap_or(body);
-    if status.is_success() {
+        .unwrap_or_else(|| raw.to_owned())
+}
+
+async fn send(call: Call, base: String, headers: HeaderMap) -> anyhow::Result<()> {
+    let response = exchange(call, base, headers).await?;
+    let rendered = render_body(&response.raw);
+    if response.ok {
         println!("{rendered}");
         return Ok(());
     }
     eprintln!("{rendered}");
-    anyhow::bail!("the gateway refused this administrative request: {status}")
+    anyhow::bail!(
+        "the gateway refused this administrative request: {}",
+        response.status
+    )
+}
+
+async fn fetch_json(
+    call: Call,
+    base: String,
+    headers: HeaderMap,
+) -> anyhow::Result<serde_json::Value> {
+    let response = exchange(call, base, headers).await?;
+    if !response.ok {
+        eprintln!("{}", render_body(&response.raw));
+        anyhow::bail!(
+            "the gateway refused this administrative request: {}",
+            response.status
+        );
+    }
+    serde_json::from_str(&response.raw)
+        .map_err(|error| anyhow::anyhow!("catalogue response was not JSON: {error}"))
 }
 
 #[cfg(test)]
@@ -855,5 +1813,397 @@ mod tests {
             base(&opted_in, &HashMap::new()).expect("the operator said so explicitly"),
             format!("http://gw.example{ADMIN_PREFIX}")
         );
+    }
+
+    fn nested<'a>(args: &'a ArgMatches) -> (&'a str, &'a ArgMatches) {
+        args.subcommand().expect("a subcommand")
+    }
+
+    fn apply_argv(extra: &[&str]) -> ArgMatches {
+        let mut argv = vec![
+            "admin",
+            "model",
+            "apply",
+            "--tenant",
+            "ten_1",
+            "--project",
+            "prj_1",
+        ];
+        argv.extend_from_slice(extra);
+        matches(&argv)
+    }
+
+    fn apply_flags(extra: &[&str]) -> BindingSpec {
+        let args = apply_argv(extra);
+        let (_, model) = nested(&args);
+        let (_, apply) = nested(model);
+        apply_spec(apply).expect("a binding")
+    }
+
+    fn help_text(path: &[&str]) -> String {
+        let mut cmd = command();
+        let mut current = &mut cmd;
+        for name in path {
+            current = current
+                .find_subcommand_mut(*name)
+                .unwrap_or_else(|| panic!("subcommand {name}"));
+        }
+        let mut buf = Vec::new();
+        current.write_long_help(&mut buf).expect("help");
+        String::from_utf8(buf).expect("utf-8")
+    }
+
+    #[test]
+    fn resources_lists_bindings_first() {
+        assert_eq!(RESOURCES[0].0, "bindings");
+    }
+
+    #[test]
+    fn from_catalogue_requires_a_connection_provider() {
+        command()
+            .try_get_matches_from([
+                "admin",
+                "model",
+                "apply",
+                "--tenant",
+                "ten_1",
+                "--from-catalogue",
+                "openai/gpt-4o",
+            ])
+            .expect_err("--from-catalogue does not guess the connection");
+    }
+
+    #[test]
+    fn happy_path_apply_omits_name_and_defaults_the_alias_to_the_published_id() {
+        let spec = apply_flags(&[
+            "--target",
+            "openai:gpt-4o",
+            "--price-input",
+            "2500000",
+            "--price-output",
+            "10000000",
+        ]);
+        assert!(
+            spec.name.is_none(),
+            "happy path omits name: {:?}",
+            spec.name
+        );
+        assert_eq!(spec.alias, "gpt-4o");
+        let body = spec.envelope("create");
+        assert!(body["resource"].get("name").is_none());
+        assert_eq!(body["resource"]["targets"][0]["provider"], "openai");
+        assert_eq!(body["resource"]["targets"][0]["model"], "gpt-4o");
+        assert_eq!(
+            body["resource"]["targets"][0]["price"]["input_microdollars_per_million"],
+            2_500_000
+        );
+        assert_eq!(body["mutation"], "create");
+        assert_eq!(body["resource"]["tenant"], "ten_1");
+        assert_eq!(body["resource"]["project"], "prj_1");
+    }
+
+    #[test]
+    fn from_catalogue_builds_catalog_identity_and_requires_the_connection_flag() {
+        let spec = apply_flags(&[
+            "--from-catalogue",
+            "openai/gpt-4o",
+            "--provider",
+            "openai",
+            "--price",
+            "observed",
+        ]);
+        assert!(spec.name.is_none());
+        assert_eq!(spec.alias, "gpt-4o");
+        let target = &spec.targets[0];
+        assert_eq!(target["provider"], "openai");
+        assert_eq!(target["model"], "gpt-4o");
+        assert_eq!(target["catalog"]["provider"], "openai");
+        assert_eq!(target["catalog"]["model"], "gpt-4o");
+        assert_eq!(target["price"], "observed");
+    }
+
+    #[test]
+    fn toml_fragment_is_a_model_table_not_a_full_config() {
+        let toml = r#"
+[[model]]
+targets = [
+  { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } },
+]
+"#;
+        let args = apply_argv(&["--target", "openai:unused"]);
+        let (_, model) = nested(&args);
+        let (_, apply) = nested(model);
+        let spec = spec_from_toml(toml, apply).expect("fragment");
+        assert!(spec.name.is_none());
+        assert_eq!(spec.alias, "gpt-4o");
+        assert_eq!(spec.targets[0]["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn extra_toml_tables_are_refused_before_any_post() {
+        let toml = r#"
+[[provider]]
+id = "openai"
+
+[[model]]
+targets = [{ provider = "openai", model = "gpt-4o" }]
+"#;
+        let args = apply_argv(&["--target", "openai:unused"]);
+        let (_, model) = nested(&args);
+        let (_, apply) = nested(model);
+        let error = spec_from_toml(toml, apply).expect_err("full config");
+        let message = error.to_string();
+        assert!(
+            message.contains("[[model]] fragment") || message.contains("unknown field"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn apply_creates_when_the_alias_slug_is_absent_and_updates_when_it_exists() {
+        let empty = serde_json::json!({ "aliases": [] });
+        assert!(!alias_published(&empty, "gpt-4o"));
+        let present = serde_json::json!({
+            "revision": "rev_1",
+            "aliases": [{ "slug": "gpt-4o" }]
+        });
+        assert!(alias_published(&present, "gpt-4o"));
+        assert!(!alias_published(&present, "gpt-5"));
+    }
+
+    #[test]
+    fn apply_uses_empty_expected_revision_when_the_catalogue_has_none() {
+        assert_eq!(
+            expected_revision_of(&serde_json::json!({ "aliases": [] })),
+            EXPECTED_REVISION_EMPTY
+        );
+    }
+
+    #[test]
+    fn apply_uses_the_catalogue_revision_as_expected_revision() {
+        assert_eq!(
+            expected_revision_of(&serde_json::json!({ "revision": "rev_9" })),
+            "rev_9"
+        );
+    }
+
+    #[test]
+    fn apply_mints_a_printable_idempotency_key() {
+        let first = mint_idempotency_key().expect("key");
+        let second = mint_idempotency_key().expect("key");
+        assert_ne!(first, second);
+        crate::desired_state::IdempotencyKey::parse(&first).expect("protocol key");
+        crate::desired_state::IdempotencyKey::parse(&second).expect("protocol key");
+    }
+
+    #[test]
+    fn apply_headers_carry_minted_preconditions_and_breakglass() {
+        let env = HashMap::from([(TOKEN_ENV.to_owned(), "secret".to_owned())]);
+        let args = apply_argv(&["--target", "openai:gpt-4o"]);
+        let (_, model) = nested(&args);
+        let (_, apply) = nested(model);
+        let sent = mutation_headers(&args, apply, &env, "minted-key", EXPECTED_REVISION_EMPTY)
+            .expect("headers");
+        assert_eq!(sent[IDEMPOTENCY_KEY_HEADER], "minted-key");
+        assert_eq!(sent[EXPECTED_REVISION_HEADER], EXPECTED_REVISION_EMPTY);
+        assert_eq!(sent[AUTHORIZATION], "Bearer secret");
+    }
+
+    #[test]
+    fn disable_is_an_update_with_state_disabled() {
+        let args = matches(&[
+            "admin",
+            "model",
+            "disable",
+            "--tenant",
+            "ten_1",
+            "--project",
+            "prj_1",
+            "--name",
+            "gpt-4o",
+            "--target",
+            "openai:gpt-4o",
+        ]);
+        let (_, model) = nested(&args);
+        let (_, disable) = nested(model);
+        let spec = disable_spec(disable).expect("disable");
+        assert_eq!(spec.alias, "gpt-4o");
+        assert_eq!(spec.state.as_deref(), Some("disabled"));
+        let body = spec.envelope("update");
+        assert_eq!(body["mutation"], "update");
+        assert_eq!(body["resource"]["state"], "disabled");
+        assert_eq!(body["resource"]["name"], "gpt-4o");
+    }
+
+    #[test]
+    fn price_is_an_update_of_the_same_binding() {
+        let args = matches(&[
+            "admin",
+            "model",
+            "price",
+            "--tenant",
+            "ten_1",
+            "--name",
+            "gpt-4o",
+            "--input",
+            "3000000",
+            "--output",
+            "12000000",
+            "--target",
+            "openai:gpt-4o",
+        ]);
+        let (_, model) = nested(&args);
+        let (_, price) = nested(model);
+        let spec = price_spec(price).expect("price");
+        let body = spec.envelope("update");
+        assert_eq!(body["mutation"], "update");
+        assert_eq!(
+            body["resource"]["targets"][0]["price"]["input_microdollars_per_million"],
+            3_000_000
+        );
+        assert_eq!(
+            body["resource"]["targets"][0]["price"]["output_microdollars_per_million"],
+            12_000_000
+        );
+    }
+
+    #[test]
+    fn catalog_browse_is_an_imported_catalogue_read() {
+        let args = matches(&[
+            "admin",
+            "catalog",
+            "browse",
+            "--tenant",
+            "ten_1",
+            "--provider",
+            "openai",
+            "--q",
+            "gpt",
+        ]);
+        let (_, catalog) = nested(&args);
+        let (_, browse) = nested(catalog);
+        let call = browse_call(browse).expect("browse");
+        assert_eq!(call.method, Method::GET);
+        assert_eq!(call.path, "catalogue");
+        assert!(
+            call.query
+                .contains(&("source".to_owned(), "imported".to_owned()))
+        );
+        assert!(
+            call.query
+                .contains(&("provider".to_owned(), "openai".to_owned()))
+        );
+        assert!(call.query.contains(&("q".to_owned(), "gpt".to_owned())));
+        assert!(
+            call.query
+                .contains(&("tenant".to_owned(), "ten_1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn catalog_browse_requires_provider_or_q() {
+        command()
+            .try_get_matches_from(["admin", "catalog", "browse", "--tenant", "ten_1"])
+            .expect_err("imported browse is a search");
+    }
+
+    #[test]
+    fn catalog_refresh_does_not_send_mutation_preconditions() {
+        let env = HashMap::from([(TOKEN_ENV.to_owned(), "secret".to_owned())]);
+        let args = matches(&["admin", "catalog", "refresh"]);
+        let (_, catalog) = nested(&args);
+        let (verb, refresh) = nested(catalog);
+        assert_eq!(verb, "refresh");
+        let sent = headers(&args, refresh, &env).expect("headers");
+        assert!(!sent.contains_key(IDEMPOTENCY_KEY_HEADER));
+        assert!(!sent.contains_key(EXPECTED_REVISION_HEADER));
+        assert!(!sent.contains_key(DRY_RUN_HEADER));
+    }
+
+    #[test]
+    fn model_apply_does_not_require_protocol_flags() {
+        command()
+            .try_get_matches_from([
+                "admin",
+                "model",
+                "apply",
+                "--tenant",
+                "ten_1",
+                "--target",
+                "openai:gpt-4o",
+                "--price-input",
+                "2500000",
+                "--price-output",
+                "10000000",
+            ])
+            .expect("the CLI fills expected-revision and the idempotency key");
+    }
+
+    #[test]
+    fn model_show_and_catalog_refresh_are_http_paths() {
+        assert_eq!(catalogue_call("ten_1", None, Vec::new()).path, "catalogue");
+        let refresh = Call {
+            method: Method::POST,
+            path: "catalogue/refresh".to_owned(),
+            query: Vec::new(),
+            body: None,
+        };
+        assert_eq!(refresh.path, "catalogue/refresh");
+        assert!(refresh.body.is_none());
+    }
+
+    #[test]
+    fn disable_and_price_fill_targets_from_catalogue_metadata() {
+        let catalogue = serde_json::json!({
+            "revision": "rev_3",
+            "aliases": [{ "slug": "gpt-4o" }],
+            "entries": [{
+                "aliases": ["gpt-4o"],
+                "metadata": {
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "published_model": "gpt-4o"
+                }
+            }]
+        });
+        let target = target_from_catalogue(&catalogue, "gpt-4o").expect("target");
+        assert_eq!(target["provider"], "openai");
+        assert_eq!(target["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn help_does_not_teach_class_aliases() {
+        let help = format!(
+            "{}{}{}",
+            help_text(&[]),
+            help_text(&["model"]),
+            help_text(&["model", "apply"])
+        );
+        assert!(!help.contains("standard"), "{help}");
+        assert!(!help.contains("simple"), "{help}");
+        assert!(help.contains("gpt-4o"), "{help}");
+    }
+
+    #[test]
+    fn toml_namespace_is_accepted_and_ignored_for_scope() {
+        let toml = r#"
+[[model]]
+namespace = "acme"
+targets = [{ provider = "openai", model = "gpt-4o", price = "observed" }]
+"#;
+        let args = apply_argv(&["--target", "openai:unused"]);
+        let (_, model) = nested(&args);
+        let (_, apply) = nested(model);
+        let spec = spec_from_toml(toml, apply).expect("namespace is not a table");
+        assert_eq!(spec.tenant, "ten_1");
+        assert_eq!(spec.project.as_deref(), Some("prj_1"));
+        assert_eq!(spec.targets[0]["price"], "observed");
+    }
+
+    #[test]
+    fn a_missing_credential_fails_before_model_apply_opens_a_connection() {
+        let _args = apply_argv(&["--target", "openai:gpt-4o"]);
+        let error = require_token(&HashMap::new()).expect_err("no credential");
+        assert!(error.to_string().contains(TOKEN_ENV), "{error}");
     }
 }
