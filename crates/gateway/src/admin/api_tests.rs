@@ -9,10 +9,12 @@
 //! test here can publish without an idempotency key, an expected revision, and a
 //! complete candidate that validates, because the surface offers no other way.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use gateway_core::CircuitState;
+use gateway_core::catalog::Usage;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -35,17 +37,30 @@ use crate::availability::{
     DiscoveryCompleteness, DiscoveryObservation, DiscoveryResult, DiscoverySource, Enablement,
     Entitlement, PolicyDecision, RuntimeObservations, ScopeRef, TargetRef,
 };
-use crate::backends::catalog::{RawPayload, SourceValidators};
+use crate::backends::catalog::{CatalogSnapshot, RawPayload, SourceValidators};
 use crate::backends::catalog_store::{CatalogStore, InMemoryCatalogStore, RetainedCatalog};
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::fakes::InMemorySecrets;
 use crate::backends::local_catalog::LocalCatalogBuilder;
 use crate::backends::models_dev::{ModelsDevAdapter, SEED_PAYLOAD, seed_snapshot};
+use crate::budget::NoBudget;
+use crate::convergence::compile::testing::stateful_bootstrap;
+use crate::convergence::compile::{CandidateCompiler, RevisionCompiler};
+use crate::convergence::credentials::RuntimeProjection;
+use crate::convergence::lkg::LastKnownGood;
+use crate::convergence::lkg::testing::{KEY, cache_path};
+use crate::convergence::secrets::testing::permissive;
+use crate::convergence::{ConvergenceSettings, Outcome, Reconciler, SnapshotSource, SystemClock};
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
-    Actor, DenialPage, ModelEnablementBody, OfferingId, PriceBookBody, ResourceKind, ResourceScope,
-    Role, Surface, fixtures,
+    Actor, Checksum, DenialPage, LoadedRevision, ModelEnablementBody, OfferingId, PriceBookBody,
+    ResourceKind, ResourceScope, Role, Surface, fixtures,
 };
+use crate::pricing::AliasPrices;
+use crate::routes::router as inference_router;
+use crate::state::AppState;
+use crate::telemetry;
+use crate::usage::{UsageFanout, UsageSink};
 
 const TOKEN: &str = "human-admin-token";
 const ISSUER: &str = "https://idp.example";
@@ -3492,12 +3507,13 @@ async fn pin_and_price(
         .await
 }
 
-#[tokio::test]
-async fn four_step_then_binding_adopts_the_book_and_alias_id() {
-    let (deployment, snapshot) = imported_deployment().await;
-    let mut expected = foundation(&deployment).await;
+async fn publish_four_step(
+    deployment: &Deployment,
+    expected: String,
+    snapshot: &CatalogSnapshot,
+) -> String {
     let digest = snapshot.source.raw.digest;
-    expected = deployment
+    let expected = deployment
         .publish(
             "/catalogs",
             "four-0",
@@ -3514,7 +3530,7 @@ async fn four_step_then_binding_adopts_the_book_and_alias_id() {
             }),
         )
         .await;
-    expected = deployment
+    let expected = deployment
         .publish(
             "/models",
             "four-1",
@@ -3535,7 +3551,7 @@ async fn four_step_then_binding_adopts_the_book_and_alias_id() {
             }),
         )
         .await;
-    expected = deployment
+    let expected = deployment
         .publish(
             "/prices",
             "four-2",
@@ -3563,7 +3579,7 @@ async fn four_step_then_binding_adopts_the_book_and_alias_id() {
             }),
         )
         .await;
-    expected = deployment
+    deployment
         .publish(
             "/aliases",
             "four-3",
@@ -3581,7 +3597,43 @@ async fn four_step_then_binding_adopts_the_book_and_alias_id() {
                 }
             }),
         )
-        .await;
+        .await
+}
+
+async fn hydrate_head(deployment: &Deployment) -> LoadedRevision {
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("the control plane answers")
+        .expect("a published revision");
+    LoadedRevision::assemble(loaded.manifest().clone(), loaded.state().clone())
+        .expect("the published revision hydrates on this binary")
+}
+
+fn assert_one_four_step_alias_and_book(loaded: &LoadedRevision) {
+    let books: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::Price)
+        .collect();
+    assert_eq!(books.len(), 1, "one deployment book");
+    assert_eq!(books[0].reference.id, fixtures::resource_id(31));
+    let aliases: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::Alias)
+        .collect();
+    assert_eq!(aliases.len(), 1, "one alias");
+    assert_eq!(aliases[0].reference.id, fixtures::resource_id(15));
+    assert_eq!(aliases[0].slug.as_str(), "gpt-4o");
+}
+
+#[tokio::test]
+async fn four_step_then_binding_adopts_the_book_and_alias_id() {
+    let (deployment, snapshot) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let expected = publish_four_step(&deployment, expected, &snapshot).await;
 
     let (status, body) = deployment
         .post("/bindings", "bind-adopt", &expected, &binding_update())
@@ -5106,4 +5158,538 @@ async fn mixed_imported_and_local_alias_publishes_both_pins() {
         .expect("alias");
     let body = crate::desired_state::ModelAliasBody::read(alias).expect("readable");
     assert_eq!(body.targets().len(), 2);
+}
+
+const STATED_INPUT_MICROS: u64 = 2_500_000;
+const STATED_OUTPUT_MICROS: u64 = 10_000_000;
+
+fn activate_credential_document() -> Value {
+    let mut document = credential_document();
+    document["mutation"] = json!("update");
+    document["resource"]["lifecycle"] = json!("active");
+    document
+}
+
+fn principal_document(key: &str) -> Value {
+    json!({
+        "summary": "issue an inference workload",
+        "mutation": "create",
+        "resource": {
+            "principal": fixtures::principal_id(33).to_string(),
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "slug": "caller",
+            "display_name": "Caller",
+            "key_digest": Checksum::of(key.as_bytes()).to_string(),
+            "roles": ["developer"],
+        }
+    })
+}
+
+async fn make_four_step_servable(deployment: &Deployment, expected: &str) -> (String, String) {
+    let expected = deployment
+        .publish(
+            "/credentials",
+            "hydrate-activate",
+            expected,
+            &activate_credential_document(),
+        )
+        .await;
+    let key = fixtures::workload_key(0xd0);
+    let head = deployment
+        .publish(
+            "/principals",
+            "hydrate-principal",
+            &expected,
+            &principal_document(&key),
+        )
+        .await;
+    (head, key)
+}
+
+async fn compile_revision(
+    catalogue: Arc<dyn CatalogStore>,
+    loaded: &LoadedRevision,
+) -> crate::state::ConfigSnapshot {
+    RevisionCompiler::with_secrets(
+        stateful_bootstrap(),
+        HashMap::new(),
+        RuntimeProjection,
+        permissive(),
+    )
+    .with_catalogue(catalogue)
+    .compile(loaded, 1)
+    .await
+    .expect("the hydrated revision compiles on this binary")
+}
+
+async fn compile_head(deployment: &Deployment) -> (LoadedRevision, crate::state::ConfigSnapshot) {
+    let loaded = hydrate_head(deployment).await;
+    let catalogue = deployment
+        .api
+        .catalogue
+        .as_ref()
+        .expect("the binding path hydrates a catalogue")
+        .clone();
+    let snapshot = compile_revision(catalogue, &loaded).await;
+    (loaded, snapshot)
+}
+
+fn binding_replica(
+    store: &Arc<InMemoryControlPlane>,
+    catalogue: Arc<dyn CatalogStore>,
+    cache: LastKnownGood,
+) -> (AppState, Reconciler) {
+    let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+    let state = AppState::new(
+        stateful_bootstrap(),
+        &HashMap::new(),
+        UsageFanout::new(sinks),
+        Box::new(NoBudget),
+    )
+    .expect("the stateful bootstrap is a keyless snapshot");
+    let compiler = Arc::new(
+        RevisionCompiler::with_secrets(
+            stateful_bootstrap(),
+            HashMap::new(),
+            RuntimeProjection,
+            permissive(),
+        )
+        .with_catalogue(catalogue),
+    );
+    let reconciler = Reconciler::new(
+        Arc::clone(store) as Arc<dyn ControlPlaneStore>,
+        compiler,
+        Arc::new(state.clone()),
+        ConvergenceSettings::default(),
+        Some(cache),
+        Arc::new(SystemClock),
+    );
+    (state, reconciler)
+}
+
+fn served_alias_names(state: &AppState) -> Vec<String> {
+    state
+        .config()
+        .config
+        .model
+        .iter()
+        .map(|model| model.name.clone())
+        .collect()
+}
+
+fn serve_snapshot(mut snapshot: crate::state::ConfigSnapshot) -> AppState {
+    // Qualified `tenant/project` ids are not one `/namespaces/{id}` segment.
+    snapshot.config.mode = crate::config::Mode::Stateless;
+    let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+    let state = AppState::new(
+        crate::convergence::compile::testing::bootstrap(),
+        &crate::convergence::compile::testing::env(),
+        UsageFanout::new(sinks),
+        Box::new(NoBudget),
+    )
+    .expect("the file bootstrap is a serving snapshot");
+    state.publish(snapshot);
+    state
+}
+
+async fn listed_models(state: AppState, key: &str) -> Value {
+    let response = inference_router(state)
+        .oneshot(
+            Request::get("/v1/models")
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .expect("a request"),
+        )
+        .await
+        .expect("a response");
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).expect("a catalogue document")
+}
+
+fn assert_charges_stated_rates(snapshot: &crate::state::ConfigSnapshot) {
+    let model = snapshot
+        .config
+        .model
+        .iter()
+        .find(|model| model.name == "gpt-4o")
+        .expect("the binding alias is compiled");
+    assert_eq!(
+        model.targets[0].price.input_microdollars_per_million,
+        STATED_INPUT_MICROS
+    );
+    assert_eq!(
+        model.targets[0].price.output_microdollars_per_million,
+        STATED_OUTPUT_MICROS
+    );
+    let prices = AliasPrices::resolve(snapshot, model);
+    let charged = prices.get(0).expect("the bound target is chargeable");
+    assert_eq!(
+        charged.rates().input_microdollars_per_million,
+        STATED_INPUT_MICROS
+    );
+    assert_eq!(
+        charged.rates().output_microdollars_per_million,
+        STATED_OUTPUT_MICROS
+    );
+    assert!(
+        charged.identity().is_some(),
+        "imported traffic is book-priced"
+    );
+    assert_eq!(
+        charged.cost_microdollars(Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        }),
+        STATED_INPUT_MICROS
+    );
+}
+
+fn export_lkg(name: &str, revision: &LoadedRevision) -> LastKnownGood {
+    let cache = LastKnownGood::new(cache_path(name), KEY).expect("a signing key");
+    cache
+        .export(revision)
+        .expect("a hydrated revision is last-known-good");
+    cache
+}
+
+fn restore_lkg(cache: &LastKnownGood) -> LoadedRevision {
+    cache
+        .load()
+        .expect("the cache hydrates")
+        .expect("the cache holds a revision")
+}
+
+#[tokio::test]
+async fn hydrate_four_step_revision_before_binding_on_the_new_binary() {
+    let (deployment, snapshot) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let _ = publish_four_step(&deployment, expected, &snapshot).await;
+    let loaded = hydrate_head(&deployment).await;
+    assert_one_four_step_alias_and_book(&loaded);
+    let cache = export_lkg("four-step-hydrate-binding", &loaded);
+    let restored = restore_lkg(&cache);
+    assert_eq!(restored.id(), loaded.id());
+    assert_one_four_step_alias_and_book(&restored);
+    let _ = std::fs::remove_file(cache.path());
+}
+
+#[tokio::test]
+async fn hydrate_binding_adopted_four_step_revision_same_alias_one_book() {
+    let (deployment, snapshot) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let expected = publish_four_step(&deployment, expected, &snapshot).await;
+    let four_step = hydrate_head(&deployment).await;
+    let (status, body) = deployment
+        .post(
+            "/bindings",
+            "bind-hydrate-adopt",
+            &expected,
+            &binding_update(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "unchanged", "{body}");
+    let adopted = hydrate_head(&deployment).await;
+    assert_eq!(adopted.id(), four_step.id());
+    assert_one_four_step_alias_and_book(&adopted);
+    let cache = export_lkg("binding-adopted-hydrate", &adopted);
+    let restored = restore_lkg(&cache);
+    assert_eq!(restored.id(), four_step.id());
+    assert_one_four_step_alias_and_book(&restored);
+    let _ = std::fs::remove_file(cache.path());
+}
+
+#[tokio::test]
+async fn hydrate_binding_produced_snapshot_answers_models_and_charges_stated_rates() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let expected = deployment
+        .publish(
+            "/bindings",
+            "bind-hydrate-serve",
+            &expected,
+            &binding_document(),
+        )
+        .await;
+    let (_, key) = make_four_step_servable(&deployment, &expected).await;
+    let (_, snapshot) = compile_head(&deployment).await;
+    assert_charges_stated_rates(&snapshot);
+    let listed = listed_models(serve_snapshot(snapshot), &key).await;
+    assert_eq!(listed["data"][0]["id"], "gpt-4o", "{listed}");
+}
+
+#[tokio::test]
+async fn hydrate_binding_still_boots_axond_example_toml_unchanged() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../axond.example.toml");
+    let toml = std::fs::read_to_string(&path).expect("axond.example.toml is shipped");
+    let config = crate::config::Config::from_toml_str(&toml)
+        .expect("axond.example.toml must still boot unchanged");
+    assert_eq!(config.mode, crate::config::Mode::Stateless);
+    let gpt4o: Vec<_> = config
+        .model
+        .iter()
+        .filter(|model| model.name == "gpt-4o")
+        .collect();
+    assert!(!gpt4o.is_empty(), "axond.example.toml still ships gpt-4o");
+    for model in gpt4o {
+        assert!(
+            !model.targets.is_empty(),
+            "gpt-4o must keep at least one target"
+        );
+        for target in &model.targets {
+            assert_eq!(
+                target.price.input_microdollars_per_million,
+                STATED_INPUT_MICROS
+            );
+            assert_eq!(
+                target.price.output_microdollars_per_million,
+                STATED_OUTPUT_MICROS
+            );
+        }
+    }
+    let env = HashMap::from([
+        (
+            "GW_PLATFORM_OPENAI_API_KEY".to_owned(),
+            "sk-platform-openai".to_owned(),
+        ),
+        (
+            "GW_PLATFORM_OPENAI_API_KEY_OVERFLOW".to_owned(),
+            "sk-platform-openai-overflow".to_owned(),
+        ),
+        (
+            "GW_PLATFORM_ANTHROPIC_API_KEY".to_owned(),
+            "sk-platform-anthropic".to_owned(),
+        ),
+        (
+            "GW_PLATFORM_AZURE_OPENAI_API_KEY".to_owned(),
+            "sk-platform-azure".to_owned(),
+        ),
+        (
+            "GW_ACME_OPENAI_API_KEY".to_owned(),
+            "sk-acme-openai".to_owned(),
+        ),
+        (
+            "GW_INBOUND_PLATFORM_KEY".to_owned(),
+            "inbound-platform".to_owned(),
+        ),
+        ("GW_INBOUND_ACME_KEY".to_owned(), "inbound-acme".to_owned()),
+    ]);
+    let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+    AppState::new(config, &env, UsageFanout::new(sinks), Box::new(NoBudget))
+        .expect("axond.example.toml resolves into a serving snapshot");
+}
+
+/// TOML expert path: a catalogue-bound target the book does not price stays
+/// listed and 503s. Stateful unpriced still fail-closes at `project()`.
+#[tokio::test]
+async fn hydrate_binding_expert_path_unpriced_imported_target_is_model_not_priced() {
+    let cfg = crate::config::Config::from_toml_str(
+        r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }, catalog = { provider = "openai", model = "o3" } }]
+"#,
+    )
+    .expect("a catalogue-bound expert target parses");
+    let env = HashMap::from([
+        (
+            "AXOND_PLATFORM_OPENAI".to_owned(),
+            "sk-platform-test".to_owned(),
+        ),
+        ("AXOND_INBOUND_KEY".to_owned(), "inbound-secret".to_owned()),
+    ]);
+    let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+    let state = AppState::new(
+        cfg.clone(),
+        &env,
+        UsageFanout::new(sinks),
+        Box::new(NoBudget),
+    )
+    .expect("credentials resolve");
+    state.publish(
+        crate::state::ConfigSnapshot::build(cfg, &env, 1)
+            .expect("the expert snapshot compiles")
+            .with_pricing(fixtures::approved_pricing_snapshot()),
+    );
+
+    let listed = inference_router(state.clone())
+        .oneshot(
+            Request::get("/v1/models")
+                .header(axum::http::header::AUTHORIZATION, "Bearer inbound-secret")
+                .body(Body::empty())
+                .expect("a request"),
+        )
+        .await
+        .expect("a response");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: Value = serde_json::from_slice(
+        &listed
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes(),
+    )
+    .expect("a catalogue document");
+    assert_eq!(listed["data"][0]["id"], "gpt-4o");
+
+    let refused = inference_router(state)
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header(axum::http::header::AUTHORIZATION, "Bearer inbound-secret")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "gpt-4o",
+                        "messages": [{ "role": "user", "content": "hi" }]
+                    }))
+                    .expect("body"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("a response");
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = serde_json::from_slice(
+        &refused
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes(),
+    )
+    .expect("an error document");
+    assert_eq!(body["error"]["type"], "model_not_priced");
+    let pricing = fixtures::approved_pricing_snapshot();
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("an error message")
+        .to_owned();
+    assert!(message.contains("gpt-4o"), "{message}");
+    for internal in [
+        pricing.book().to_string(),
+        pricing.book().id.to_string(),
+        pricing.checksum().to_string(),
+        pricing.catalog().to_string(),
+        pricing.approval().state().to_owned(),
+    ] {
+        assert!(
+            !message.contains(&internal),
+            "the refusal `{message}` discloses `{internal}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hydrate_binding_refusal_keeps_last_known_good() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let expected = deployment
+        .publish(
+            "/bindings",
+            "bind-hydrate-lkg",
+            &expected,
+            &binding_document(),
+        )
+        .await;
+    let (expected, key) = make_four_step_servable(&deployment, &expected).await;
+    let loaded = hydrate_head(&deployment).await;
+    let catalogue = deployment
+        .api
+        .catalogue
+        .as_ref()
+        .expect("the binding path hydrates a catalogue")
+        .clone();
+    let path = cache_path("refused-binding-lkg");
+    let (warm_state, warm) = binding_replica(
+        &deployment.store,
+        catalogue.clone(),
+        LastKnownGood::new(&path, KEY).expect("a signing key"),
+    );
+    let outcome = warm.converge_once(telemetry::CONVERGENCE_POLLED).await;
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Published { revision, .. } if revision == loaded.id()
+        ),
+        "{outcome:?}"
+    );
+    assert!(path.exists(), "converging exported the cache");
+    assert!(
+        served_alias_names(&warm_state).contains(&"gpt-4o".to_owned()),
+        "{:?}",
+        served_alias_names(&warm_state)
+    );
+
+    let mut refused = binding_update();
+    refused["resource"]["targets"][0]["provider"] = json!("no-such-provider");
+    let (status, body) = deployment
+        .post("/bindings", "bind-hydrate-refuse", &expected, &refused)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "binding_refused", "{body}");
+    assert_eq!(body["error"]["rule"], "unknown_provider", "{body}");
+
+    let still = hydrate_head(&deployment).await;
+    assert_eq!(
+        still.id(),
+        loaded.id(),
+        "a refused binding publishes nothing"
+    );
+    let cache = LastKnownGood::new(&path, KEY).expect("a signing key");
+    let restored = restore_lkg(&cache);
+    assert_eq!(restored.id(), loaded.id());
+
+    deployment.store.set_unavailable(true);
+    let (cold_state, cold) = binding_replica(
+        &deployment.store,
+        catalogue.clone(),
+        LastKnownGood::new(&path, KEY).expect("a signing key"),
+    );
+    let booted = cold.bootstrap().await.expect("the cache serves");
+    assert_eq!(booted, loaded.id());
+    let report = cold.report();
+    assert_eq!(report.active, Some(loaded.id()));
+    assert_eq!(report.source, Some(SnapshotSource::LastKnownGood));
+    assert!(
+        served_alias_names(&cold_state).contains(&"gpt-4o".to_owned()),
+        "{:?}",
+        served_alias_names(&cold_state)
+    );
+
+    let snapshot = compile_revision(catalogue, &restored).await;
+    assert_charges_stated_rates(&snapshot);
+    let listed = listed_models(serve_snapshot(snapshot), &key).await;
+    assert_eq!(listed["data"][0]["id"], "gpt-4o", "{listed}");
+    let _ = std::fs::remove_file(cache.compiled_path());
+    let _ = std::fs::remove_file(cache.path());
 }
