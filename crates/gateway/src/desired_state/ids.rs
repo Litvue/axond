@@ -432,15 +432,18 @@ impl Slug {
         PrincipalId::PREFIX,
     ];
 
-    /// Ordinary resource names (tenants, projects, providers, enablements, …).
+    /// Ordinary resource names (tenants, projects, providers, …).
     /// `.` is not allowed: a tenant slug `acme.corp` would compile to a namespace
-    /// that [`crate::namespace::NamespaceId`] cannot parse.
+    /// that [`crate::namespace::NamespaceId`] cannot parse. Enablements that
+    /// clone a published id use [`Self::parse_alias`].
     pub fn parse(input: &str) -> Result<Self, InvalidSlug> {
         Self::parse_chars(input, false)
     }
 
     /// Alias slugs are published model ids (`gpt-4o`, `gpt-5.5`). `.` is allowed
     /// here only; tenants, projects, and providers still use [`Self::parse`].
+    /// Model enablements that copy that published id hydrate through this parser
+    /// too.
     pub fn parse_alias(input: &str) -> Result<Self, InvalidSlug> {
         Self::parse_chars(input, true)
     }

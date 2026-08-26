@@ -694,15 +694,16 @@ fn reference(row: &Row, at: usize) -> Result<ResourceRef, IntegrityError> {
 }
 
 fn manifest_entry(row: &Row) -> Result<ManifestEntry, IntegrityError> {
+    let reference = reference(row, 0)?;
     let scope_kind: String = row.get(3);
     let tenant: Option<String> = row.get(4);
     let project: Option<String> = row.get(5);
     let slug: String = row.get(6);
     let content: String = row.get(7);
     Ok(ManifestEntry {
-        reference: reference(row, 0)?,
+        reference,
         scope: rows::scope(&scope_kind, tenant.as_deref(), project.as_deref())?,
-        slug: rows::slug(&slug)?,
+        slug: rows::slug(reference.kind, &slug)?,
         content: rows::checksum(&content)?,
     })
 }
@@ -740,7 +741,7 @@ fn resource_version(
     let version = ResourceVersion::new(
         reference,
         rows::scope(&scope_kind, tenant.as_deref(), project.as_deref())?,
-        rows::slug(&slug)?,
+        rows::slug(reference.kind, &slug)?,
         body,
     );
     Ok(match dependencies.get(&reference) {
