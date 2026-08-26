@@ -1321,6 +1321,12 @@ fn ensure_book(
         return Ok(());
     };
 
+    if matches!(existing.body.approval(), Approval::Draft) {
+        return Err(refused(
+            RULE_DRAFT_BOOK_NOT_APPROVED_BY_BINDING,
+            "a binding does not approve a draft deployment price book; approve it on /admin/v1/prices first",
+        ));
+    }
     let current = existing.body.rules();
     let in_force = current.iter().find(|rule| {
         rule.target() == &target
@@ -1329,12 +1335,6 @@ fn ensure_book(
     });
     if in_force.is_some_and(|rule| rule.rates() == rates) {
         return Ok(());
-    }
-    if matches!(existing.body.approval(), Approval::Draft) {
-        return Err(refused(
-            RULE_DRAFT_BOOK_NOT_APPROVED_BY_BINDING,
-            "a binding does not approve a draft deployment price book; approve it on /admin/v1/prices first",
-        ));
     }
     let has_history = current
         .iter()
