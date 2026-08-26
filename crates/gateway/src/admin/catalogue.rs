@@ -49,7 +49,7 @@
 //! the scope rule, the reason vocabulary, and the response shape are independent
 //! of where offering metadata comes from.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use serde::Serialize;
@@ -61,13 +61,14 @@ use crate::backends::catalog::{
     CatalogSnapshot, Modality, ModelCapability, ModelLifecycle as CatalogLifecycle, ProviderId,
 };
 use crate::backends::catalog_pins::{PinnedCatalog, Resolution};
+use crate::backends::catalog_projection::CallableOffering;
 use crate::backends::catalog_store::{self, CatalogStore};
 use crate::desired_state::pricing::{EffectiveInstant, PriceBooks, PricingSnapshot};
 use crate::desired_state::{
     LoadedRevision, ModelAlias, ModelEnablement, ModelError, ModelLifecycle, ModelOwner, Models,
     OfferingId, ProjectId, ResourceId, ResourceScope, TenantId, WireFamily,
 };
-use crate::status::StatusScope;
+use crate::status::{CatalogueSummary, StatusScope};
 
 /// What a catalogue read asks for: one scope, and filters over it.
 ///
@@ -80,8 +81,36 @@ pub struct CatalogueRequest {
     /// The project whose effective catalogue is wanted, or `None` for the tenant's
     /// own defaults.
     pub project: Option<ProjectId>,
+    /// Enablements this tenant published, or offerings the active import lists.
+    pub source: CatalogueSource,
     pub filters: CatalogueFilters,
 }
+
+/// Which catalogue a read is of.
+///
+/// Default [`Self::Enabled`]: the tenant's enablements. [`Self::Imported`] is
+/// the active retained snapshot, and the handler requires a `provider` and/or
+/// `q` so a caller cannot dump every upstream offering into one response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogueSource {
+    #[default]
+    Enabled,
+    Imported,
+}
+
+impl CatalogueSource {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "enabled" => Some(Self::Enabled),
+            "imported" => Some(Self::Imported),
+            _ => None,
+        }
+    }
+}
+
+/// Imported browse is a search, not a dump of models.dev.
+pub const IMPORTED_BROWSE_LIMIT: usize = 100;
+pub const IMPORTED_QUERY_MIN_CHARS: usize = 3;
 
 /// The filters a catalogue read may apply, all of them predicates over state this
 /// revision holds.
@@ -103,6 +132,8 @@ pub struct CatalogueFilters {
     pub catalog_lifecycle: Option<CatalogLifecycle>,
     /// The derived availability state for this replica and scope.
     pub availability: Option<crate::availability::AvailabilityState>,
+    /// Substring match over imported provider/model/display-name text.
+    pub q: Option<String>,
 }
 
 impl CatalogueRequest {
@@ -182,6 +213,10 @@ impl CatalogueRequest {
             && filters.availability.is_none_or(|state| {
                 availability.is_some_and(|availability| availability.state == state.as_str())
             })
+            && filters
+                .q
+                .as_deref()
+                .is_none_or(|q| metadata.is_some_and(|metadata| matches_query(q, metadata)))
     }
 }
 
@@ -208,6 +243,8 @@ pub enum UnavailableReason {
     /// Nothing routes to it: no alias in this scope names this enablement, so no
     /// caller has a name to send.
     Unaliased,
+    /// Present in the imported catalogue and not enabled for this tenant.
+    NotEnabled,
 }
 
 impl UnavailableReason {
@@ -216,6 +253,7 @@ impl UnavailableReason {
         Self::Shadowed,
         Self::Unpriced,
         Self::Unaliased,
+        Self::NotEnabled,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -224,6 +262,7 @@ impl UnavailableReason {
             Self::Shadowed => "shadowed",
             Self::Unpriced => "unpriced",
             Self::Unaliased => "unaliased",
+            Self::NotEnabled => "not-enabled",
         }
     }
 }
@@ -315,12 +354,17 @@ pub struct CatalogueEntry {
     pub offering: String,
     /// The digest of the catalogue snapshot the identity was read from.
     pub catalog_snapshot: String,
-    pub enablement: String,
-    pub version: u64,
-    pub slug: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enablement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
     pub scope: ScopeView,
-    pub wire_family: &'static str,
-    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire_family: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<&'static str>,
     /// Whether this row is the one in effect for the scope that was read. False
     /// for a tenant default a project override replaces.
     pub effective: bool,
@@ -439,12 +483,44 @@ impl Serialize for AliasUnavailableReason {
 
 /// Closed vocabulary of operator warnings that do not make the offering unroutable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CatalogueNotice {}
+pub enum CatalogueNotice {
+    /// The enablement still pins a snapshot that is no longer the active import.
+    StalePin,
+    /// The active import no longer publishes this offering.
+    WithdrawnUpstream,
+}
+
+impl CatalogueNotice {
+    pub const ALL: &'static [Self] = &[Self::StalePin, Self::WithdrawnUpstream];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StalePin => "stale-pin",
+            Self::WithdrawnUpstream => "withdrawn-upstream",
+        }
+    }
+}
 
 impl Serialize for CatalogueNotice {
-    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
-        match *self {}
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
+}
+
+/// What a manual catalogue refresh left active, and what that would mean for
+/// published enablements. No revision: a refresh does not publish desired state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogueRefreshView {
+    pub catalogue: CatalogueSummary,
+    pub impact: CatalogueRefreshImpact,
+}
+
+/// [`crate::backends::catalog_refresh::RefreshImpact`] as the admin surface
+/// returns it: offering ids as the text form an operator already knows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogueRefreshImpact {
+    pub pins_unmoved: usize,
+    pub withdrawn: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +552,14 @@ impl CatalogueView {
         revision: Option<&LoadedRevision>,
         request: &CatalogueRequest,
     ) -> Result<Self, AdminError> {
+        // Imported browse needs the retained snapshot; without a store this
+        // names the missing fact rather than inventing an empty catalogue.
+        if request.source == CatalogueSource::Imported {
+            return Ok(Self::empty(
+                revision.map(|revision| revision.id().to_string()),
+                request,
+            ));
+        }
         Self::build(revision, request, &BTreeMap::new(), true, true)
     }
 
@@ -491,6 +575,17 @@ impl CatalogueView {
         disclosure: StatusScope,
         now: SystemTime,
     ) -> Result<Self, AdminError> {
+        let active = load_active(catalogue).await;
+        if request.source == CatalogueSource::Imported {
+            return Self::imported(
+                revision,
+                request,
+                active.as_ref(),
+                availability,
+                disclosure,
+                now,
+            );
+        }
         let Some(revision) = revision else {
             return Ok(Self::empty(None, request));
         };
@@ -505,6 +600,9 @@ impl CatalogueView {
             .ok()
             .and_then(|books| books.book().cloned());
         let availability = availability_context(availability);
+        let pinned_active = active
+            .as_ref()
+            .and_then(|snapshot| PinnedCatalog::of_snapshot(snapshot).ok());
         let mut contexts = BTreeMap::new();
         for enablement in models.enablements() {
             let metadata = snapshots
@@ -517,6 +615,7 @@ impl CatalogueView {
                 price_metadata(book.as_ref(), pricing.as_ref(), metadata, now)
             });
             let billable = price.is_some();
+            let notices = notices_for(enablement, pinned_active.as_ref());
             contexts.insert(
                 enablement.reference.id,
                 EntryContext {
@@ -524,6 +623,7 @@ impl CatalogueView {
                     price,
                     availability,
                     billable,
+                    notices,
                 },
             );
         }
@@ -542,6 +642,170 @@ impl CatalogueView {
         )
     }
 
+    fn imported(
+        revision: Option<&LoadedRevision>,
+        request: &CatalogueRequest,
+        active: Option<&CatalogSnapshot>,
+        availability: Option<&dyn AvailabilityReader>,
+        disclosure: StatusScope,
+        now: SystemTime,
+    ) -> Result<Self, AdminError> {
+        let models = match revision {
+            Some(revision) => {
+                Some(Models::of(revision.state()).map_err(|error| unreadable(revision, &error))?)
+            }
+            None => None,
+        };
+        let Some(snapshot) = active else {
+            return Ok(Self {
+                revision: revision.map(|revision| revision.id().to_string()),
+                scope: ScopeView::of(&request.scope()),
+                entries: Vec::new(),
+                aliases: models
+                    .as_ref()
+                    .map(|models| project_aliases(models, request, &BTreeMap::new()))
+                    .unwrap_or_default(),
+                pending: pending_facts(true, availability.is_none()),
+            });
+        };
+        let Ok(pinned) = PinnedCatalog::of_snapshot(snapshot) else {
+            return Ok(Self {
+                revision: revision.map(|revision| revision.id().to_string()),
+                scope: ScopeView::of(&request.scope()),
+                entries: Vec::new(),
+                aliases: models
+                    .as_ref()
+                    .map(|models| project_aliases(models, request, &BTreeMap::new()))
+                    .unwrap_or_default(),
+                pending: pending_facts(true, availability.is_none()),
+            });
+        };
+        let pricing = revision.and_then(|revision| {
+            PriceBooks::of(revision.state()).ok().and_then(|books| {
+                EffectiveInstant::of(now)
+                    .ok()
+                    .and_then(|at| books.snapshot_at(at))
+            })
+        });
+        let book = revision.and_then(|revision| {
+            PriceBooks::of(revision.state())
+                .ok()
+                .and_then(|books| books.book().cloned())
+        });
+        let availability_ctx = availability_context(availability);
+        let mut contexts = BTreeMap::new();
+        if let Some(models) = models.as_ref() {
+            for enablement in models.enablements() {
+                let metadata = offering_metadata(snapshot, enablement).or_else(|| {
+                    pinned
+                        .projection()
+                        .callables()
+                        .iter()
+                        .find(|callable| {
+                            OfferingId::of(callable.provider().as_str(), callable.model().as_str())
+                                .is_ok_and(|offering| {
+                                    offering == enablement.body.offering().offering
+                                })
+                        })
+                        .map(metadata_from_callable)
+                });
+                let availability = metadata.as_ref().and_then(|metadata| {
+                    entry_availability(
+                        availability_ctx.as_ref(),
+                        request,
+                        metadata,
+                        disclosure,
+                        now,
+                    )
+                });
+                let price = metadata.as_ref().and_then(|metadata| {
+                    price_metadata(book.as_ref(), pricing.as_ref(), metadata, now)
+                });
+                let billable = metadata
+                    .as_ref()
+                    .is_some_and(|metadata| offering_is_billable(pricing.as_ref(), metadata));
+                contexts.insert(
+                    enablement.reference.id,
+                    EntryContext {
+                        metadata,
+                        price,
+                        availability,
+                        billable,
+                        notices: notices_for(enablement, Some(&pinned)),
+                    },
+                );
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut entries = Vec::new();
+        for callable in pinned.projection().callables() {
+            let Ok(offering) =
+                OfferingId::of(callable.provider().as_str(), callable.model().as_str())
+            else {
+                continue;
+            };
+            if !seen.insert(offering) {
+                continue;
+            }
+            let metadata = metadata_from_callable(callable);
+            if !imported_admits(request, offering, &metadata) {
+                continue;
+            }
+            if let Some(enablement) = models
+                .as_ref()
+                .and_then(|models| enablement_for_offering(models, request, offering))
+            {
+                let context = contexts.get(&enablement.reference.id);
+                let billable = context.is_some_and(|context| context.billable);
+                if !request.admits(
+                    enablement,
+                    context.and_then(|context| context.metadata.as_ref()),
+                    context.and_then(|context| context.availability.as_ref()),
+                    billable,
+                ) {
+                    continue;
+                }
+                entries.push(enablement_entry(
+                    models.as_ref().expect("enablement implies models"),
+                    request,
+                    enablement,
+                    context,
+                ));
+            } else {
+                let availability = entry_availability(
+                    availability_ctx.as_ref(),
+                    request,
+                    &metadata,
+                    disclosure,
+                    now,
+                );
+                if !imported_row_admits(request, availability.as_ref()) {
+                    continue;
+                }
+                entries.push(imported_entry(
+                    request,
+                    offering,
+                    snapshot.source.raw.digest.to_string(),
+                    metadata,
+                    availability,
+                ));
+            }
+            if entries.len() == IMPORTED_BROWSE_LIMIT {
+                break;
+            }
+        }
+        Ok(Self {
+            revision: revision.map(|revision| revision.id().to_string()),
+            scope: ScopeView::of(&request.scope()),
+            entries,
+            aliases: models
+                .as_ref()
+                .map(|models| project_aliases(models, request, &contexts))
+                .unwrap_or_default(),
+            pending: pending_facts(false, availability_ctx.is_none()),
+        })
+    }
+
     fn build(
         revision: Option<&LoadedRevision>,
         request: &CatalogueRequest,
@@ -556,10 +820,6 @@ impl CatalogueView {
         // read these bodies its own way could report a catalogue the runtime would
         // never serve.
         let models = Models::of(revision.state()).map_err(|error| unreadable(revision, &error))?;
-        let alias_statuses: BTreeMap<ResourceId, AliasStatus> = models
-            .aliases()
-            .map(|alias| (alias.reference.id, alias_status(&models, alias, contexts)))
-            .collect();
         let mut entries = Vec::new();
         for enablement in models.enablements() {
             let owner = enablement.body.owner();
@@ -576,78 +836,9 @@ impl CatalogueView {
             {
                 continue;
             }
-            let aliases = aliases_naming(&models, request, enablement);
-            let shadowed = request.project.is_some_and(|project| {
-                owner.project.is_none()
-                    && models
-                        .override_for(request.tenant, project, enablement.body.offering().offering)
-                        .is_some()
-            });
-            let mut unavailable = Vec::new();
-            if !enablement.body.is_enabled() {
-                unavailable.push(UnavailableReason::Disabled);
-            }
-            if shadowed {
-                unavailable.push(UnavailableReason::Shadowed);
-            }
-            if enablement.body.is_enabled() && !shadowed && !billable && metadata.is_some() {
-                unavailable.push(UnavailableReason::Unpriced);
-            }
-            if aliases.is_empty() {
-                unavailable.push(UnavailableReason::Unaliased);
-            }
-            entries.push(CatalogueEntry {
-                offering: enablement.body.offering().offering.to_string(),
-                catalog_snapshot: enablement.body.offering().snapshot.to_string(),
-                enablement: enablement.reference.id.to_string(),
-                version: enablement.reference.version.get(),
-                slug: enablement.slug.as_str().to_owned(),
-                scope: ScopeView::of(&enablement.body.scope()),
-                wire_family: enablement.body.wire_family().as_str(),
-                state: enablement.body.state().as_str(),
-                effective: !shadowed,
-                routable: unavailable.is_empty() && billable,
-                billable,
-                aliases,
-                unavailable,
-                notices: Vec::new(),
-                metadata: context.and_then(|context| context.metadata.clone()),
-                price: context.and_then(|context| context.price.clone()),
-                availability: context.and_then(|context| context.availability.clone()),
-            });
+            entries.push(enablement_entry(&models, request, enablement, context));
         }
-        let aliases = models
-            .aliases()
-            .filter(|alias| in_scope(request, alias))
-            .map(|alias| {
-                // `in_scope` has already established that this alias belongs
-                // to the requested tenant/project. Status uses the alias's
-                // exact target references; scope does not rewrite those
-                // references through project override precedence.
-                let status = alias_statuses
-                    .get(&alias.reference.id)
-                    .expect("every alias has a derived status");
-                CatalogueAlias {
-                    alias: alias.reference.id.to_string(),
-                    version: alias.reference.version.get(),
-                    slug: alias.slug.as_str().to_owned(),
-                    scope: ScopeView::of(&alias.body.scope()),
-                    wire_family: alias.body.wire_family().as_str(),
-                    state: alias.body.state().as_str(),
-                    routable: status.routable,
-                    unavailable: status.unavailable.clone(),
-                    targets: alias
-                        .body
-                        .targets()
-                        .iter()
-                        .map(|target| CatalogueAliasTarget {
-                            enablement: target.enablement.to_string(),
-                            version: target.version.get(),
-                        })
-                        .collect(),
-                }
-            })
-            .collect();
+        let aliases = project_aliases(&models, request, contexts);
         Ok(Self {
             revision: Some(revision.id().to_string()),
             scope: ScopeView::of(&request.scope()),
@@ -674,6 +865,32 @@ struct EntryContext {
     price: Option<CataloguePrice>,
     availability: Option<super::reads::AvailabilityTarget>,
     billable: bool,
+    notices: Vec<CatalogueNotice>,
+}
+
+impl CatalogueRefreshView {
+    pub fn of(
+        report: Option<&crate::backends::catalog::CatalogReport>,
+        impact: crate::backends::catalog_refresh::RefreshImpact,
+    ) -> Self {
+        Self {
+            catalogue: report.map_or(
+                CatalogueSummary {
+                    content_id: None,
+                    active_age_ms: None,
+                    consecutive_refusals: 0,
+                    last_refusal: None,
+                    last_diff: None,
+                    persistent_refusal: false,
+                },
+                CatalogueSummary::from_report,
+            ),
+            impact: CatalogueRefreshImpact {
+                pins_unmoved: impact.pins_unmoved,
+                withdrawn: impact.withdrawn.iter().map(ToString::to_string).collect(),
+            },
+        }
+    }
 }
 
 fn pending_facts(metadata: bool, availability: bool) -> Vec<PendingFact> {
@@ -711,6 +928,12 @@ async fn retained_catalogues(
     snapshots
 }
 
+async fn load_active(catalogue: Option<&dyn CatalogStore>) -> Option<CatalogSnapshot> {
+    let catalogue = catalogue?;
+    let retained = catalogue.load().await.ok()?.active?;
+    catalog_store::hydrate(&retained).ok()
+}
+
 fn offering_metadata(
     snapshot: &CatalogSnapshot,
     enablement: &ModelEnablement,
@@ -719,8 +942,12 @@ fn offering_metadata(
     let Resolution::Callable(callable) = pinned.resolve(enablement.body.offering()) else {
         return None;
     };
+    Some(metadata_from_callable(callable))
+}
+
+fn metadata_from_callable(callable: &CallableOffering<'_>) -> CatalogueMetadata {
     let facts = callable.facts();
-    Some(CatalogueMetadata {
+    CatalogueMetadata {
         provider: callable.provider().as_str().to_owned(),
         model: callable.model().as_str().to_owned(),
         published_model: callable.published_model_id().to_owned(),
@@ -745,7 +972,225 @@ fn offering_metadata(
         context_tokens: facts.limits.context_tokens,
         input_tokens: facts.limits.input_tokens,
         output_tokens: facts.limits.output_tokens,
-    })
+    }
+}
+
+fn matches_query(q: &str, metadata: &CatalogueMetadata) -> bool {
+    let q = q.to_ascii_lowercase();
+    [
+        metadata.provider.as_str(),
+        metadata.model.as_str(),
+        metadata.published_model.as_str(),
+    ]
+    .into_iter()
+    .chain(metadata.display_name.as_deref())
+    .any(|field| field.to_ascii_lowercase().contains(&q))
+}
+
+fn imported_admits(
+    request: &CatalogueRequest,
+    offering: OfferingId,
+    metadata: &CatalogueMetadata,
+) -> bool {
+    let filters = &request.filters;
+    filters.offering.is_none_or(|wanted| wanted == offering)
+        && filters
+            .provider
+            .as_deref()
+            .is_none_or(|provider| metadata.provider == provider)
+        && filters.capability.is_none_or(|capability| {
+            metadata
+                .capabilities
+                .iter()
+                .any(|candidate| candidate == capability.as_str())
+        })
+        && filters.modality.is_none_or(|modality| {
+            metadata
+                .input_modalities
+                .iter()
+                .any(|candidate| candidate == modality.as_str())
+                || metadata
+                    .output_modalities
+                    .iter()
+                    .any(|candidate| candidate == modality.as_str())
+        })
+        && filters
+            .catalog_lifecycle
+            .is_none_or(|lifecycle| metadata.catalog_lifecycle == lifecycle.as_str())
+        && filters
+            .q
+            .as_deref()
+            .is_none_or(|q| matches_query(q, metadata))
+}
+
+fn imported_row_admits(
+    request: &CatalogueRequest,
+    availability: Option<&super::reads::AvailabilityTarget>,
+) -> bool {
+    let filters = &request.filters;
+    filters.state.is_none()
+        && filters.wire_family.is_none()
+        && filters.billable.is_none_or(|wanted| !wanted)
+        && filters.availability.is_none_or(|state| {
+            availability.is_some_and(|availability| availability.state == state.as_str())
+        })
+}
+
+fn enablement_for_offering<'a>(
+    models: &'a Models,
+    request: &CatalogueRequest,
+    offering: OfferingId,
+) -> Option<&'a ModelEnablement> {
+    let mut tenant_default = None;
+    for enablement in models.enablements() {
+        if !request.covers(enablement.body.owner())
+            || enablement.body.offering().offering != offering
+        {
+            continue;
+        }
+        if enablement.body.owner().project.is_some() {
+            return Some(enablement);
+        }
+        tenant_default = Some(enablement);
+    }
+    tenant_default
+}
+
+fn notices_for(
+    enablement: &ModelEnablement,
+    active: Option<&PinnedCatalog<'_>>,
+) -> Vec<CatalogueNotice> {
+    let Some(active) = active else {
+        return Vec::new();
+    };
+    let pin = enablement.body.offering();
+    let mut notices = Vec::new();
+    if pin.snapshot != active.snapshot() {
+        notices.push(CatalogueNotice::StalePin);
+    }
+    if !active.published().any(|offering| offering == pin.offering) {
+        notices.push(CatalogueNotice::WithdrawnUpstream);
+    }
+    notices
+}
+
+fn enablement_entry(
+    models: &Models,
+    request: &CatalogueRequest,
+    enablement: &ModelEnablement,
+    context: Option<&EntryContext>,
+) -> CatalogueEntry {
+    let owner = enablement.body.owner();
+    let metadata = context.and_then(|context| context.metadata.as_ref());
+    let billable = context.is_some_and(|context| context.billable);
+    let aliases = aliases_naming(models, request, enablement);
+    let shadowed = request.project.is_some_and(|project| {
+        owner.project.is_none()
+            && models
+                .override_for(request.tenant, project, enablement.body.offering().offering)
+                .is_some()
+    });
+    let mut unavailable = Vec::new();
+    if !enablement.body.is_enabled() {
+        unavailable.push(UnavailableReason::Disabled);
+    }
+    if shadowed {
+        unavailable.push(UnavailableReason::Shadowed);
+    }
+    if enablement.body.is_enabled() && !shadowed && !billable && metadata.is_some() {
+        unavailable.push(UnavailableReason::Unpriced);
+    }
+    if aliases.is_empty() {
+        unavailable.push(UnavailableReason::Unaliased);
+    }
+    CatalogueEntry {
+        offering: enablement.body.offering().offering.to_string(),
+        catalog_snapshot: enablement.body.offering().snapshot.to_string(),
+        enablement: Some(enablement.reference.id.to_string()),
+        version: Some(enablement.reference.version.get()),
+        slug: Some(enablement.slug.as_str().to_owned()),
+        scope: ScopeView::of(&enablement.body.scope()),
+        wire_family: Some(enablement.body.wire_family().as_str()),
+        state: Some(enablement.body.state().as_str()),
+        effective: !shadowed,
+        routable: unavailable.is_empty() && billable,
+        billable,
+        aliases,
+        unavailable,
+        notices: context
+            .map(|context| context.notices.clone())
+            .unwrap_or_default(),
+        metadata: context.and_then(|context| context.metadata.clone()),
+        price: context.and_then(|context| context.price.clone()),
+        availability: context.and_then(|context| context.availability.clone()),
+    }
+}
+
+fn imported_entry(
+    request: &CatalogueRequest,
+    offering: OfferingId,
+    catalog_snapshot: String,
+    metadata: CatalogueMetadata,
+    availability: Option<super::reads::AvailabilityTarget>,
+) -> CatalogueEntry {
+    CatalogueEntry {
+        offering: offering.to_string(),
+        catalog_snapshot,
+        enablement: None,
+        version: None,
+        slug: None,
+        scope: ScopeView::of(&request.scope()),
+        wire_family: None,
+        state: None,
+        effective: false,
+        routable: false,
+        billable: false,
+        aliases: Vec::new(),
+        unavailable: vec![UnavailableReason::NotEnabled],
+        notices: Vec::new(),
+        metadata: Some(metadata),
+        price: None,
+        availability,
+    }
+}
+
+fn project_aliases(
+    models: &Models,
+    request: &CatalogueRequest,
+    contexts: &BTreeMap<ResourceId, EntryContext>,
+) -> Vec<CatalogueAlias> {
+    let alias_statuses: BTreeMap<ResourceId, AliasStatus> = models
+        .aliases()
+        .map(|alias| (alias.reference.id, alias_status(models, alias, contexts)))
+        .collect();
+    models
+        .aliases()
+        .filter(|alias| in_scope(request, alias))
+        .map(|alias| {
+            let status = alias_statuses
+                .get(&alias.reference.id)
+                .expect("every alias has a derived status");
+            CatalogueAlias {
+                alias: alias.reference.id.to_string(),
+                version: alias.reference.version.get(),
+                slug: alias.slug.as_str().to_owned(),
+                scope: ScopeView::of(&alias.body.scope()),
+                wire_family: alias.body.wire_family().as_str(),
+                state: alias.body.state().as_str(),
+                routable: status.routable,
+                unavailable: status.unavailable.clone(),
+                targets: alias
+                    .body
+                    .targets()
+                    .iter()
+                    .map(|target| CatalogueAliasTarget {
+                        enablement: target.enablement.to_string(),
+                        version: target.version.get(),
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 fn price_metadata(
@@ -1003,6 +1448,7 @@ mod tests {
             &CatalogueRequest {
                 tenant,
                 project,
+                source: CatalogueSource::Enabled,
                 filters,
             },
         )
@@ -1012,7 +1458,7 @@ mod tests {
     fn entry<'a>(view: &'a CatalogueView, slug: &str) -> &'a CatalogueEntry {
         view.entries
             .iter()
-            .find(|entry| entry.slug == slug)
+            .find(|entry| entry.slug.as_deref() == Some(slug))
             .unwrap_or_else(|| panic!("an entry named {slug}, in {:?}", view.entries))
     }
 
@@ -1048,7 +1494,7 @@ mod tests {
         // enabled and in effect.
         let withdrawn = entry(&view, "gpt-4o-mini");
         assert!(!withdrawn.routable);
-        assert_eq!(withdrawn.state, "disabled");
+        assert_eq!(withdrawn.state, Some("disabled"));
         assert_eq!(
             withdrawn.unavailable,
             vec![UnavailableReason::Disabled, UnavailableReason::Unaliased,]
@@ -1079,7 +1525,7 @@ mod tests {
         let shadowed = view
             .entries
             .iter()
-            .find(|entry| entry.scope.kind == "tenant" && entry.slug == "gpt-4o")
+            .find(|entry| entry.scope.kind == "tenant" && entry.slug.as_deref() == Some("gpt-4o"))
             .expect("the tenant default");
         assert!(!shadowed.effective);
         assert!(!shadowed.routable);
@@ -1126,7 +1572,7 @@ mod tests {
             enabled
                 .entries
                 .iter()
-                .map(|entry| entry.slug.as_str())
+                .map(|entry| entry.slug.as_deref().unwrap_or_default())
                 .collect::<Vec<_>>(),
             vec!["gpt-4o"]
         );
@@ -1143,7 +1589,7 @@ mod tests {
             unbillable
                 .entries
                 .iter()
-                .map(|entry| entry.slug.as_str())
+                .map(|entry| entry.slug.as_deref().unwrap_or_default())
                 .collect::<Vec<_>>(),
             vec!["gpt-4o", "gpt-4o-mini"]
         );
@@ -1157,10 +1603,10 @@ mod tests {
             },
         );
         assert_eq!(one.entries.len(), 1);
-        assert_eq!(one.entries[0].slug, "gpt-4o");
+        assert_eq!(one.entries[0].slug.as_deref(), Some("gpt-4o"));
         assert_eq!(
             one.entries[0].wire_family,
-            WireFamily::OpenaiChat.as_str(),
+            Some(WireFamily::OpenaiChat.as_str()),
             "an entry carries the wire family its targets are held to"
         );
     }
@@ -1324,6 +1770,7 @@ mod tests {
         let request = CatalogueRequest {
             tenant: tenant_id(1),
             project: None,
+            source: CatalogueSource::Enabled,
             filters: CatalogueFilters::default(),
         };
         let view = CatalogueView::of(None, &request).expect("an empty control plane is readable");
@@ -1377,6 +1824,7 @@ mod tests {
             &CatalogueRequest {
                 tenant: tenant_id(1),
                 project: None,
+                source: CatalogueSource::Enabled,
                 filters: CatalogueFilters::default(),
             },
             Some(&store),
@@ -1545,11 +1993,129 @@ mod tests {
         (loaded(state), store)
     }
 
+    #[tokio::test]
+    async fn imported_browse_skips_identity_fields_and_reports_not_enabled() {
+        let (revision, store) = covering_book().await;
+        let view = CatalogueView::of_with_context(
+            Some(&revision),
+            &CatalogueRequest {
+                tenant: tenant_id(1),
+                project: None,
+                source: CatalogueSource::Imported,
+                filters: CatalogueFilters {
+                    provider: Some("hpc-ai".to_owned()),
+                    ..CatalogueFilters::default()
+                },
+            },
+            Some(&store),
+            None,
+            StatusScope::Deployment,
+            SystemTime::now(),
+        )
+        .await
+        .expect("imported browse is readable");
+        assert_eq!(view.entries.len(), 1, "{:?}", view.entries);
+        let entry = &view.entries[0];
+        assert!(entry.enablement.is_none(), "{entry:?}");
+        assert!(entry.version.is_none(), "{entry:?}");
+        assert!(entry.slug.is_none(), "{entry:?}");
+        assert!(entry.state.is_none(), "{entry:?}");
+        assert!(!entry.routable);
+        assert!(!entry.billable);
+        assert_eq!(entry.unavailable, vec![UnavailableReason::NotEnabled]);
+        let encoded = serde_json::to_value(entry).expect("serializable");
+        assert!(encoded.get("enablement").is_none());
+        assert!(encoded.get("version").is_none());
+        assert!(encoded.get("slug").is_none());
+        assert!(encoded.get("state").is_none());
+        assert_eq!(encoded["unavailable"], serde_json::json!(["not-enabled"]));
+        assert!(!view.pending.contains(&PendingFact::OfferingMetadata));
+    }
+
+    #[tokio::test]
+    async fn imported_browse_without_a_store_names_offering_metadata_pending() {
+        let view = CatalogueView::of_with_context(
+            Some(&published()),
+            &CatalogueRequest {
+                tenant: tenant_id(1),
+                project: None,
+                source: CatalogueSource::Imported,
+                filters: CatalogueFilters {
+                    q: Some("gpt".to_owned()),
+                    ..CatalogueFilters::default()
+                },
+            },
+            None,
+            None,
+            StatusScope::Deployment,
+            SystemTime::now(),
+        )
+        .await
+        .expect("a missing store is still readable");
+        assert!(view.entries.is_empty(), "{:?}", view.entries);
+        assert!(view.pending.contains(&PendingFact::OfferingMetadata));
+    }
+
+    #[tokio::test]
+    async fn an_enablement_reports_stale_pin_and_withdrawn_upstream_as_notices() {
+        let snapshot = ModelsDevAdapter::default()
+            .parse(CATALOG.as_bytes(), SourceValidators::default(), UNIX_EPOCH)
+            .expect("the catalogue fixture parses");
+        let store = InMemoryCatalogStore::new();
+        store
+            .activate(
+                &RetainedCatalog {
+                    source: snapshot.source,
+                    payload: RawPayload::new(CATALOG.as_bytes()),
+                },
+                SystemTime::now(),
+            )
+            .await
+            .expect("the exact payload is retained");
+        let view = CatalogueView::of_with_context(
+            Some(&published()),
+            &CatalogueRequest {
+                tenant: tenant_id(1),
+                project: None,
+                source: CatalogueSource::Enabled,
+                filters: CatalogueFilters::default(),
+            },
+            Some(&store),
+            None,
+            StatusScope::Deployment,
+            SystemTime::now(),
+        )
+        .await
+        .expect("the published revision is readable");
+        let enabled = entry(&view, "gpt-4o");
+        assert!(
+            enabled.notices.contains(&CatalogueNotice::StalePin),
+            "{enabled:?}"
+        );
+        assert!(
+            enabled
+                .notices
+                .contains(&CatalogueNotice::WithdrawnUpstream),
+            "{enabled:?}"
+        );
+        assert!(!enabled.unavailable.contains(&UnavailableReason::NotEnabled));
+    }
+
     #[test]
     fn a_reason_and_a_pending_fact_serialize_as_their_wire_spelling() {
         assert_eq!(
             serde_json::to_value(UnavailableReason::ALL).expect("serializable"),
-            serde_json::json!(["disabled", "shadowed", "unpriced", "unaliased"])
+            serde_json::json!([
+                "disabled",
+                "shadowed",
+                "unpriced",
+                "unaliased",
+                "not-enabled"
+            ])
+        );
+        assert_eq!(
+            serde_json::to_value(CatalogueNotice::ALL).expect("serializable"),
+            serde_json::json!(["stale-pin", "withdrawn-upstream"])
         );
         assert_eq!(
             serde_json::to_value(PendingFact::ALL).expect("serializable"),

@@ -57,7 +57,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use super::auth::{AdminAction, AdminAuthError, AdminGrant, AdminIdentity};
-use super::catalogue::{CatalogueRequest, CatalogueView};
+use super::catalogue::{CatalogueRefreshView, CatalogueRequest, CatalogueView};
 use super::diff::SemanticDiff;
 use super::error::AdminError;
 use super::protocol::{MutationRequest, WriteMode};
@@ -66,7 +66,9 @@ use super::reads::{
     StateView,
 };
 use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
-use crate::backends::catalog_store::CatalogStore;
+use crate::backends::catalog_refresh::RefreshImpact;
+use crate::backends::catalog_runtime::CatalogHandle;
+use crate::backends::catalog_store::{self, CatalogStore};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::secrets::SecretStore;
 use crate::config::Mode;
@@ -74,7 +76,7 @@ use crate::convergence::{ChangeSignal, RevisionReport};
 use crate::desired_state::models::legacy_alias_allowlist;
 use crate::desired_state::{
     AccessDenial, Actor, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
-    LoadedRevision, Mutation, MutationId, PolicyBody, ResourceKind, ResourceScope,
+    LoadedRevision, Models, Mutation, MutationId, PolicyBody, ResourceKind, ResourceScope,
     RevisionCandidate, RevisionId, Surface, Uuid7Generator, ValidationError,
 };
 use crate::middleware::validate_content_middleware;
@@ -482,6 +484,47 @@ impl AdminService {
             now,
         )
         .await
+    }
+
+    /// Run the catalogue import now. Does not publish a revision: last-known-good
+    /// stays active on refusal, and enablements keep their pins.
+    pub async fn catalogue_refresh(
+        &self,
+        grant: &AdminGrant,
+        handle: &CatalogHandle,
+    ) -> Result<CatalogueRefreshView, AdminError> {
+        Self::permits_deployment_read(grant, AdminAction::RefreshCatalog)?;
+        let _outcome = handle.refresh_now().await;
+        let report = handle.status().report();
+        let impact = match handle.store().load().await {
+            Ok(state) => match state.active {
+                Some(retained) => match catalog_store::hydrate(&retained) {
+                    Ok(snapshot) => {
+                        let enablements = match self.store()?.load_desired_revision().await {
+                            Ok(Some(revision)) => Models::of(revision.state())
+                                .ok()
+                                .map(|models| {
+                                    models
+                                        .enablements()
+                                        .map(|enablement| enablement.body.clone())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default(),
+                            Ok(None) | Err(_) => Vec::new(),
+                        };
+                        RefreshImpact::of(
+                            enablements.iter(),
+                            &snapshot.content,
+                            snapshot.source.raw.digest,
+                        )
+                    }
+                    Err(_) => RefreshImpact::default(),
+                },
+                None => RefreshImpact::default(),
+            },
+            Err(_) => RefreshImpact::default(),
+        };
+        Ok(CatalogueRefreshView::of(report.as_ref(), impact))
     }
 
     /// A bounded page of revision history, newest first.

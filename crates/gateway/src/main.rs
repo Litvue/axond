@@ -777,7 +777,7 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
     let admin = match catalogue.as_ref() {
-        Some(handle) => admin.with_catalogue(handle.store()),
+        Some(handle) => admin.with_catalog_handle(handle.clone()),
         None => admin,
     };
 

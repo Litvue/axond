@@ -31,6 +31,7 @@ use super::oidc::{OidcBootError, OidcVerifier};
 use super::router::{self, AdminApi};
 use super::service::AdminService;
 use crate::availability::AvailabilityReader;
+use crate::backends::catalog_runtime::CatalogHandle;
 use crate::backends::catalog_store::CatalogStore;
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
@@ -258,6 +259,15 @@ impl Surface {
         self
     }
 
+    /// Attach the running catalogue import: the store the management read uses,
+    /// and the handle a manual refresh waits on.
+    pub fn with_catalog_handle(mut self, handle: CatalogHandle) -> Self {
+        if let Some(api) = self.api.take() {
+            self.api = Some(api.with_catalog_handle(handle));
+        }
+        self
+    }
+
     /// The router to merge into the served application, reading this replica's
     /// derived availability from `availability` where it has any.
     ///
@@ -373,7 +383,9 @@ impl AdminAuthorizer for ActiveSnapshotAuthorizer {
             | AdminAction::ReadConvergence
             | AdminAction::ReadAvailability
             | AdminAction::ReadSecrets => Action::Read,
-            AdminAction::Publish | AdminAction::Rollback => Action::Update,
+            AdminAction::Publish | AdminAction::Rollback | AdminAction::RefreshCatalog => {
+                Action::Update
+            }
             AdminAction::WriteSecrets => Action::Rotate,
         };
         snapshot

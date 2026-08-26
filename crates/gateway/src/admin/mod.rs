@@ -114,7 +114,8 @@ pub use auth::{
 #[allow(unused_imports)]
 pub use catalogue::{
     AliasUnavailableReason, CatalogueAlias, CatalogueAliasTarget, CatalogueEntry, CatalogueFilters,
-    CatalogueRequest, CatalogueView, PendingFact, UnavailableReason,
+    CatalogueNotice, CatalogueRefreshImpact, CatalogueRefreshView, CatalogueRequest,
+    CatalogueSource, CatalogueView, PendingFact, UnavailableReason,
 };
 #[allow(unused_imports)]
 pub use diff::{BlobDelta, ChangeKind, DiffSummary, ResourceDelta, SemanticDiff};

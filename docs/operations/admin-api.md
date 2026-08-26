@@ -330,8 +330,8 @@ snapshot; `availability` uses the replica's scoped availability view. If those
 readers are not attached, the response remains explicit in `pending` and a
 filter that depends on missing metadata matches no entries.
 
-The query is bounded to 2 KiB and eleven parameters (the required `tenant` plus
-ten supported filters). Repeated parameters are rejected by the query parser;
+The query is bounded to 2 KiB and thirteen parameters (the required `tenant` plus
+twelve supported filters). Repeated parameters are rejected by the query parser;
 there is no “last value wins” interpretation for a catalogue filter.
 
 ```json

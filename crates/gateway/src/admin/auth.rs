@@ -280,6 +280,10 @@ pub enum AdminAction {
     /// already-staged version is not thereby trusted to destroy the material it
     /// names, and a single verb would make those one grant.
     WriteSecrets,
+    /// Ask the catalogue import to run now. A write, not a revision: the active
+    /// pointer moves in the catalogue store, enablements stay put, and there is
+    /// no expected revision for a caller to have held.
+    RefreshCatalog,
 }
 
 impl AdminAction {
@@ -293,6 +297,7 @@ impl AdminAction {
         Self::Rollback,
         Self::ReadSecrets,
         Self::WriteSecrets,
+        Self::RefreshCatalog,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -306,20 +311,22 @@ impl AdminAction {
             Self::Rollback => "rollback",
             Self::ReadSecrets => "read_secrets",
             Self::WriteSecrets => "write_secrets",
+            Self::RefreshCatalog => "refresh_catalog",
         }
     }
 
     /// Whether this action publishes a revision, and therefore requires an
     /// idempotency key and an expected revision.
     ///
-    /// [`Self::WriteSecrets`] is a write and is still not one of them: it
-    /// changes the secret store, not desired state, so there is no revision for
-    /// a caller to have expected and none for its change to conflict with. What
-    /// stands in for the preconditions is the shape of the operations
-    /// themselves — staging mints a fresh version rather than overwriting one,
-    /// and a lifecycle move to the state a version already holds is
-    /// [`LifecycleTransition::Unchanged`], so a retried call is not a second
-    /// change.
+    /// [`Self::WriteSecrets`] and [`Self::RefreshCatalog`] are writes and still
+    /// not this: they change the secret store or the catalogue store, not
+    /// desired state, so there is no revision for a caller to have expected and
+    /// none for their change to conflict with. What stands in for the
+    /// preconditions is the shape of the operations themselves — staging mints
+    /// a fresh version rather than overwriting one, a lifecycle move to the
+    /// state a version already holds is [`LifecycleTransition::Unchanged`], and
+    /// a catalogue refresh is last-known-good on refusal — so a retried call is
+    /// not a second change.
     ///
     /// [`LifecycleTransition::Unchanged`]: crate::desired_state::secrets::LifecycleTransition::Unchanged
     pub const fn mutates(self) -> bool {
@@ -329,10 +336,11 @@ impl AdminAction {
     /// Whether the route this action guards changes something, and is therefore
     /// reached with `POST` rather than `GET`.
     ///
-    /// Wider than [`Self::mutates`] by exactly [`Self::WriteSecrets`]: what
-    /// separates the two is the revision preconditions, not the verb.
+    /// Wider than [`Self::mutates`] by [`Self::WriteSecrets`] and
+    /// [`Self::RefreshCatalog`]: what separates them is the revision
+    /// preconditions, not the verb.
     pub const fn writes(self) -> bool {
-        self.mutates() || matches!(self, Self::WriteSecrets)
+        self.mutates() || matches!(self, Self::WriteSecrets | Self::RefreshCatalog)
     }
 
     /// The action that publishing `kind` requires authority for.
@@ -368,7 +376,7 @@ impl AdminAction {
             | Self::ReadConvergence
             | Self::ReadAvailability => Action::Read,
             Self::ReadSecrets => Action::Read,
-            Self::Publish | Self::Rollback => Action::Update,
+            Self::Publish | Self::Rollback | Self::RefreshCatalog => Action::Update,
             Self::WriteSecrets => Action::Rotate,
         }
     }
@@ -562,4 +570,37 @@ pub trait AdminAuthorizer: Send + Sync {
         surface: crate::desired_state::Surface,
         scope: &ResourceScope,
     ) -> Result<AdminGrant, AdminAuthError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_admin_action_names_itself_and_classifies_revision_preconditions() {
+        let mut names = std::collections::BTreeSet::new();
+        for action in AdminAction::ALL {
+            assert!(names.insert(action.as_str()), "duplicate action name");
+            if action.mutates() {
+                assert!(
+                    action.writes(),
+                    "{} mutates desired state but is not a write",
+                    action.as_str()
+                );
+            }
+            let _ = action.recorded_action();
+        }
+        assert!(names.contains(&AdminAction::RefreshCatalog.as_str()));
+        assert!(AdminAction::RefreshCatalog.writes());
+        assert!(!AdminAction::RefreshCatalog.mutates());
+        assert_eq!(
+            AdminAction::RefreshCatalog.recorded_action(),
+            Action::Update
+        );
+        assert_eq!(
+            AdminAction::ALL.len(),
+            names.len(),
+            "ALL and as_str have diverged"
+        );
+    }
 }
