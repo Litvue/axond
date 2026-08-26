@@ -52,6 +52,10 @@ pub(super) fn publish_route<R: AdminResourceRequest>() -> MethodRouter<Arc<Admin
     post(publish::<R>)
 }
 
+pub(super) fn bindings_route() -> MethodRouter<Arc<AdminApi>> {
+    super::binding::bindings_route()
+}
+
 pub(super) fn rollback_route() -> MethodRouter<Arc<AdminApi>> {
     post(rollback)
 }
@@ -107,7 +111,7 @@ pub(super) fn secret_versions_route() -> MethodRouter<Arc<AdminApi>> {
 /// declared limit answers in this surface's envelope: a client branching on
 /// [`AdminError::CODES`] would otherwise meet axum's bare `413` on the one
 /// response it cannot afford to misread as success.
-fn document(
+pub(super) fn document(
     schema: &'static str,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Bytes, AdminError> {

@@ -104,8 +104,8 @@ impl<F> DesiredStateEdit for ActorAwareEdit<F>
 where
     F: Fn(&mut DesiredState, &Actor) -> Result<(), ValidationError> + Send + Sync,
 {
-    fn edit(&self, state: &mut DesiredState, actor: &Actor) -> Result<(), ValidationError> {
-        (self.0)(state, actor)
+    fn edit(&self, state: &mut DesiredState, actor: &Actor) -> Result<(), AdminError> {
+        (self.0)(state, actor).map_err(AdminError::from)
     }
 }
 
@@ -1187,7 +1187,10 @@ fn refuse_withdrawing_a_pinned_snapshot(
 /// changed again: superseding it would dangle the alias, and pointing the alias
 /// at a version that does not exist yet dangles too. The edit holds the complete
 /// desired state, so the candidate carries the dependents forward itself.
-fn publish(state: &mut DesiredState, resource: ResourceVersion) -> Result<(), ValidationError> {
+pub(super) fn publish(
+    state: &mut DesiredState,
+    resource: ResourceVersion,
+) -> Result<(), ValidationError> {
     let current = resource.reference;
     let superseded = state.version_of(current.kind, current.id).map(|held| {
         let was_enabled = if current.kind == ResourceKind::ModelEnablement {
@@ -1283,7 +1286,11 @@ fn restack(
 }
 
 /// The version a supersede publishes: the first, or one past what is there.
-fn next_version(state: &DesiredState, kind: ResourceKind, id: ResourceId) -> ResourceVersionNumber {
+pub(super) fn next_version(
+    state: &DesiredState,
+    kind: ResourceKind,
+    id: ResourceId,
+) -> ResourceVersionNumber {
     state
         .version_of(kind, id)
         .map_or(ResourceVersionNumber::FIRST, |resource| {

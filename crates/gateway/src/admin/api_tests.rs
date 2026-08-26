@@ -38,9 +38,12 @@ use crate::backends::catalog::{RawPayload, SourceValidators};
 use crate::backends::catalog_store::{CatalogStore, InMemoryCatalogStore, RetainedCatalog};
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::fakes::InMemorySecrets;
-use crate::backends::models_dev::ModelsDevAdapter;
+use crate::backends::models_dev::{ModelsDevAdapter, SEED_PAYLOAD, seed_snapshot};
 use crate::desired_state::oracle::InMemoryControlPlane;
-use crate::desired_state::{DenialPage, OfferingId, ResourceScope, fixtures};
+use crate::desired_state::{
+    Actor, DenialPage, ModelEnablementBody, OfferingId, PriceBookBody, ResourceKind, ResourceScope,
+    fixtures,
+};
 
 const TOKEN: &str = "human-admin-token";
 const ISSUER: &str = "https://idp.example";
@@ -3320,4 +3323,526 @@ async fn material_calls_need_the_material_authority_and_not_the_publishing_one()
     assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
     assert_eq!(refusal["error"]["type"], "admin_forbidden");
     carries_no_material(&refusal);
+}
+
+// ---------------------------------------------------------------------------
+// POST /admin/v1/bindings
+// ---------------------------------------------------------------------------
+
+async fn imported_deployment() -> (Deployment, crate::backends::catalog::CatalogSnapshot) {
+    let snapshot = seed_snapshot();
+    let store = Arc::new(InMemoryCatalogStore::new());
+    store
+        .activate(
+            &RetainedCatalog {
+                source: snapshot.source.clone(),
+                payload: RawPayload::new(SEED_PAYLOAD.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("the seed is retained");
+    (Deployment::with_catalogue(store), snapshot)
+}
+
+async fn foundation(deployment: &Deployment) -> String {
+    let mut expected = EXPECTED_REVISION_EMPTY.to_owned();
+    expected = deployment
+        .publish("/tenants", "found-0", &expected, &tenant_document())
+        .await;
+    expected = deployment
+        .publish("/projects", "found-1", &expected, &project_document())
+        .await;
+    expected = deployment
+        .publish("/providers", "found-2", &expected, &provider_document())
+        .await;
+    deployment
+        .publish("/credentials", "found-3", &expected, &credential_document())
+        .await
+}
+
+fn binding_document() -> Value {
+    json!({
+        "summary": "enable gpt-4o",
+        "mutation": "create",
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "targets": [{
+                "provider": "openai",
+                "model": "gpt-4o",
+                "price": {
+                    "input_microdollars_per_million": 2_500_000u64,
+                    "output_microdollars_per_million": 10_000_000u64
+                }
+            }]
+        }
+    })
+}
+
+fn binding_update() -> Value {
+    let mut document = binding_document();
+    document["mutation"] = json!("update");
+    document
+}
+
+#[tokio::test]
+async fn four_step_then_binding_adopts_the_book_and_alias_id() {
+    let (deployment, snapshot) = imported_deployment().await;
+    let mut expected = foundation(&deployment).await;
+    let digest = snapshot.source.raw.digest;
+    expected = deployment
+        .publish(
+            "/catalogs",
+            "four-0",
+            &expected,
+            &json!({
+                "summary": "pin the imported catalogue",
+                "mutation": "create",
+                "resource": {
+                    "catalog": fixtures::resource_id(13).to_string(),
+                    "slug": "openai-models",
+                    "digest": digest.to_string(),
+                    "size_bytes": snapshot.source.raw.size_bytes,
+                }
+            }),
+        )
+        .await;
+    expected = deployment
+        .publish(
+            "/models",
+            "four-1",
+            &expected,
+            &json!({
+                "summary": "enable gpt-4o",
+                "mutation": "create",
+                "resource": {
+                    "enablement": fixtures::resource_id(14).to_string(),
+                    "tenant": fixtures::tenant_id(1).to_string(),
+                    "slug": "gpt-4o",
+                    "offering": fixtures::offering_id("gpt-4o").to_string(),
+                    "catalog": fixtures::resource_id(13).to_string(),
+                    "snapshot": digest.to_string(),
+                    "wire_family": "openai-chat",
+                }
+            }),
+        )
+        .await;
+    expected = deployment
+        .publish(
+            "/prices",
+            "four-2",
+            &expected,
+            &json!({
+                "summary": "approve openai gpt-4o",
+                "mutation": "create",
+                "resource": {
+                    "price_book": fixtures::resource_id(31).to_string(),
+                    "slug": "deployment-prices",
+                    "catalog": snapshot.content.content_id().checksum().to_string(),
+                    "catalog_version": 1,
+                    "state": "approved",
+                    "approved_at_millis": 0,
+                    "rules": [{
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "precedence": "baseline",
+                        "from_millis": 0,
+                        "input_nano_dollars_per_million": 2_500_000_000u64,
+                        "output_nano_dollars_per_million": 10_000_000_000u64,
+                        "origin": "operator"
+                    }]
+                }
+            }),
+        )
+        .await;
+    expected = deployment
+        .publish(
+            "/aliases",
+            "four-3",
+            &expected,
+            &json!({
+                "summary": "alias gpt-4o",
+                "mutation": "create",
+                "resource": {
+                    "alias": fixtures::resource_id(15).to_string(),
+                    "tenant": fixtures::tenant_id(1).to_string(),
+                    "project": fixtures::project_id(2).to_string(),
+                    "slug": "gpt-4o",
+                    "wire_family": "openai-chat",
+                    "targets": [{ "enablement": fixtures::resource_id(14).to_string() }],
+                }
+            }),
+        )
+        .await;
+
+    let (status, body) = deployment
+        .post("/bindings", "bind-adopt", &expected, &binding_update())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "published", "{body}");
+
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let books: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::Price)
+        .collect();
+    assert_eq!(books.len(), 1, "one deployment book");
+    assert_eq!(books[0].reference.id, fixtures::resource_id(31));
+    let aliases: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::Alias)
+        .collect();
+    assert_eq!(aliases.len(), 1, "one alias");
+    assert_eq!(aliases[0].reference.id, fixtures::resource_id(15));
+}
+
+#[tokio::test]
+async fn identical_reapply_is_unchanged_only_when_expected_matches_head() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let head = deployment
+        .publish("/bindings", "bind-1", &expected, &binding_document())
+        .await;
+    let (status, body) = deployment
+        .post("/bindings", "bind-2", &head, &binding_update())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "unchanged", "{body}");
+    assert_eq!(body["revision"], head);
+    assert_eq!(body["diff"]["resources"].as_array().unwrap().len(), 0);
+    assert_eq!(deployment.store.published_revisions(), 5);
+}
+
+#[tokio::test]
+async fn lost_response_retry_of_first_pin_classifies_deployment_and_replays() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let first = deployment
+        .publish("/bindings", "bind-retry", &expected, &binding_document())
+        .await;
+    let (status, body) = deployment
+        .post("/bindings", "bind-retry", &expected, &binding_document())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "replayed", "{body}");
+    assert_eq!(body["revision"], first);
+    assert_eq!(deployment.store.published_revisions(), 5);
+}
+
+#[tokio::test]
+async fn dry_run_with_stale_expected_is_409_from_apply() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let _head = deployment
+        .publish("/bindings", "bind-dry", &expected, &binding_document())
+        .await;
+    let (status, body) = deployment
+        .dry_run("/bindings", "bind-dry-stale", &expected, &binding_update())
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["type"], "revision_conflict");
+}
+
+#[tokio::test]
+async fn pin_follow_disables_the_old_enablement_and_retargets_the_alias() {
+    let snapshot = seed_snapshot();
+    let mutated = SEED_PAYLOAD.replace("\"input\": 2.5", "\"input\": 2.51");
+    let next = ModelsDevAdapter::default()
+        .parse(
+            mutated.as_bytes(),
+            SourceValidators::default(),
+            SystemTime::now(),
+        )
+        .expect("a one-field edit still parses");
+    assert_ne!(next.source.raw.digest, snapshot.source.raw.digest);
+
+    let store = Arc::new(InMemoryCatalogStore::new());
+    store
+        .activate(
+            &RetainedCatalog {
+                source: snapshot.source.clone(),
+                payload: RawPayload::new(SEED_PAYLOAD.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("seed");
+    let deployment = Deployment::with_catalogue(store.clone());
+    let expected = foundation(&deployment).await;
+    let head = deployment
+        .publish("/bindings", "bind-pin-1", &expected, &binding_document())
+        .await;
+
+    store
+        .activate(
+            &RetainedCatalog {
+                source: next.source.clone(),
+                payload: RawPayload::new(mutated.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("refresh");
+
+    let (status, body) = deployment
+        .post("/bindings", "bind-pin-2", &head, &binding_update())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "published", "{body}");
+
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let enablements: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+        .filter_map(|resource| {
+            ModelEnablementBody::read(resource)
+                .ok()
+                .map(|body| (resource, body))
+        })
+        .collect();
+    let enabled: Vec<_> = enablements
+        .iter()
+        .filter(|(_, body)| body.is_enabled())
+        .collect();
+    assert_eq!(enabled.len(), 1, "one enabled pin");
+    assert_eq!(enabled[0].1.offering().snapshot, next.source.raw.digest);
+    assert!(
+        enablements.iter().any(|(_, body)| !body.is_enabled()
+            && body.offering().snapshot == snapshot.source.raw.digest),
+        "old pin is disabled"
+    );
+
+    let followed = body["revision"].as_str().expect("revision").to_owned();
+    let locked_payload = mutated.replace("\"input\": 2.51", "\"input\": 2.52");
+    let locked_snap = ModelsDevAdapter::default()
+        .parse(
+            locked_payload.as_bytes(),
+            SourceValidators::default(),
+            SystemTime::now(),
+        )
+        .expect("another edit still parses");
+    store
+        .activate(
+            &RetainedCatalog {
+                source: locked_snap.source.clone(),
+                payload: RawPayload::new(locked_payload.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("second refresh");
+    let (status, locked) = deployment
+        .post(
+            "/bindings",
+            "bind-pin-lock",
+            &followed,
+            &json!({
+                "summary": "lock gpt-4o",
+                "mutation": "update",
+                "resource": {
+                    "tenant": fixtures::tenant_id(1).to_string(),
+                    "project": fixtures::project_id(2).to_string(),
+                    "pin": "lock",
+                    "targets": [{
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "price": {
+                            "input_microdollars_per_million": 2_500_000u64,
+                            "output_microdollars_per_million": 10_000_000u64
+                        }
+                    }]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{locked}");
+    assert_eq!(locked["error"]["type"], "binding_refused");
+    assert_eq!(locked["error"]["rule"], "pin_locked");
+}
+
+#[tokio::test]
+async fn published_not_neutral_uses_catalog_model_when_provider_equals_slug() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let document = json!({
+        "summary": "enable gpt-5.5",
+        "mutation": "create",
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "name": "gpt-5-5",
+            "targets": [{
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "catalog": { "provider": "openai", "model": "gpt-5.5" },
+                "price": {
+                    "input_microdollars_per_million": 5_000_000u64,
+                    "output_microdollars_per_million": 30_000_000u64
+                }
+            }]
+        }
+    });
+    let _head = deployment
+        .publish("/bindings", "bind-neutral", &expected, &document)
+        .await;
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let offering = OfferingId::of("openai", "openai/gpt-5.5").expect("id");
+    let wrong = OfferingId::of("openai", "gpt-5.5").expect("id");
+    let enablement = loaded
+        .state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+        .expect("an enablement");
+    let body = ModelEnablementBody::read(enablement).expect("readable");
+    assert_eq!(body.offering().offering, offering);
+    assert_ne!(body.offering().offering, wrong);
+}
+
+#[tokio::test]
+async fn catalogue_identity_is_required_when_provider_is_not_the_callable() {
+    let (deployment, _) = imported_deployment().await;
+    let mut expected = foundation(&deployment).await;
+    expected = deployment
+        .publish(
+            "/providers",
+            "found-prod",
+            &expected,
+            &json!({
+                "summary": "openai-prod",
+                "mutation": "create",
+                "resource": {
+                    "provider": fixtures::resource_id(40).to_string(),
+                    "tenant": fixtures::tenant_id(1).to_string(),
+                    "slug": "openai-prod",
+                    "display_name": "OpenAI prod",
+                    "wire_family": "openai-chat",
+                    "endpoint": "https://api.openai.com",
+                }
+            }),
+        )
+        .await;
+
+    let mismatched = json!({
+        "summary": "openai-prod is not openai",
+        "mutation": "create",
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "targets": [{
+                "provider": "openai-prod",
+                "model": "gpt-4o",
+                "catalog": { "provider": "openai", "model": "gpt-4o" },
+                "price": {
+                    "input_microdollars_per_million": 2_500_000u64,
+                    "output_microdollars_per_million": 10_000_000u64
+                }
+            }]
+        }
+    });
+    let (status, body) = deployment
+        .post("/bindings", "bind-id-1", &expected, &mismatched)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "binding_refused");
+    assert_eq!(body["error"]["rule"], "catalogue_identity_required");
+
+    let azure = json!({
+        "summary": "azure-openai is not a callable",
+        "mutation": "create",
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "targets": [{
+                "provider": "azure-openai",
+                "model": "gpt-4o",
+                "price": {
+                    "input_microdollars_per_million": 2_500_000u64,
+                    "output_microdollars_per_million": 10_000_000u64
+                }
+            }]
+        }
+    });
+    expected = deployment
+        .publish(
+            "/providers",
+            "found-azure",
+            &expected,
+            &json!({
+                "summary": "azure-openai",
+                "mutation": "create",
+                "resource": {
+                    "provider": fixtures::resource_id(41).to_string(),
+                    "tenant": fixtures::tenant_id(1).to_string(),
+                    "slug": "azure-openai",
+                    "display_name": "Azure OpenAI",
+                    "wire_family": "openai-chat",
+                    "endpoint": "https://example.openai.azure.com",
+                }
+            }),
+        )
+        .await;
+    let (status, body) = deployment
+        .post("/bindings", "bind-id-2", &expected, &azure)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "binding_refused");
+    assert_eq!(body["error"]["rule"], "catalogue_identity_required");
+}
+
+#[tokio::test]
+async fn binding_book_is_actor_aware_and_enablements_have_no_approved_price() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let _head = deployment
+        .publish("/bindings", "bind-actor", &expected, &binding_document())
+        .await;
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let book = loaded
+        .state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::Price)
+        .expect("a book");
+    let body = PriceBookBody::read(book).expect("readable");
+    assert_eq!(
+        body.approval().approver(),
+        Some(&Actor::Human {
+            issuer: ISSUER.to_owned(),
+            subject: SUBJECT.to_owned(),
+        })
+    );
+    for resource in loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+    {
+        let body = ModelEnablementBody::read(resource).expect("readable");
+        assert!(
+            body.billable_price().is_none(),
+            "expander leaves approved_price unset"
+        );
+    }
 }

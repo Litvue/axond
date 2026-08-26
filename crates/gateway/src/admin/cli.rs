@@ -45,6 +45,10 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080";
 /// The mutating routes, as the CLI names them. One list, so `apply` accepts
 /// exactly the paths the router mounts.
 const RESOURCES: &[(&str, &str)] = &[
+    (
+        "bindings",
+        "one imported model expanded into a catalogue pin, enablement, price, and alias",
+    ),
     ("tenants", "a tenant and its lifecycle state"),
     ("projects", "a project (namespace) inside a tenant"),
     (
