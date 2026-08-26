@@ -399,6 +399,73 @@ impl CatalogStore for PostgresCatalogStore {
         .await
     }
 
+    async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
+        let content_id = import.content_id().checksum().to_string();
+        let raw_digest = import.source.raw.digest.to_string();
+        let raw_bytes = i64::try_from(import.source.raw.size_bytes).map_err(|_| {
+            CatalogStoreError::denied(
+                BACKEND,
+                format!(
+                    "a {}-byte payload is not storable",
+                    import.source.raw.size_bytes
+                ),
+            )
+        })?;
+        let etag = import
+            .source
+            .validators
+            .etag
+            .as_ref()
+            .map(|tag| tag.0.clone());
+        let last_modified = import
+            .source
+            .validators
+            .last_modified
+            .as_ref()
+            .map(|date| date.0.clone());
+        self.run(move |client| {
+            let content_id = content_id.clone();
+            let raw_digest = raw_digest.clone();
+            let etag = etag.clone();
+            let last_modified = last_modified.clone();
+            let source_url = import.source.source_url.clone();
+            let schema_version = import.source.schema_version.as_str();
+            let payload = import.payload.as_bytes().to_vec();
+            let fetched_at = import.source.fetched_at;
+            Box::pin(async move {
+                // Same idempotent insert as activate, without touching the
+                // active pointer: local snapshots must not clobber import.
+                let inserted = client
+                    .execute(
+                        &format!(
+                            "INSERT INTO axond_catalog_snapshot ({SNAPSHOT_COLUMNS}) \
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                             ON CONFLICT (content_id) DO NOTHING"
+                        ),
+                        &[
+                            &content_id,
+                            &source_url,
+                            &schema_version,
+                            &raw_digest,
+                            &raw_bytes,
+                            &payload,
+                            &fetched_at,
+                            &etag,
+                            &last_modified,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| statement_failure("retain a catalogue snapshot", &error))?;
+                Ok(if inserted == 1 {
+                    Retention::Retained
+                } else {
+                    Retention::AlreadyRetained
+                })
+            })
+        })
+        .await
+    }
+
     async fn activate(
         &self,
         import: &RetainedCatalog,

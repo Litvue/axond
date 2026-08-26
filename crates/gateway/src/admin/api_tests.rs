@@ -39,6 +39,7 @@ use crate::backends::catalog::{RawPayload, SourceValidators};
 use crate::backends::catalog_store::{CatalogStore, InMemoryCatalogStore, RetainedCatalog};
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::fakes::InMemorySecrets;
+use crate::backends::local_catalog::LocalCatalogBuilder;
 use crate::backends::models_dev::{ModelsDevAdapter, SEED_PAYLOAD, seed_snapshot};
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
@@ -4546,4 +4547,360 @@ async fn tenant_admin_pin_follow_after_new_digest_is_scope_not_permitted() {
         probed(&calls, Surface::Model, &ResourceScope::Deployment),
         "pin-follow after a new digest writes CatalogModel, got {calls:?}"
     );
+}
+
+fn vllm_provider_document() -> Value {
+    json!({
+        "summary": "connect acme to vllm",
+        "mutation": "create",
+        "resource": {
+            "provider": fixtures::resource_id(60).to_string(),
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "slug": "vllm",
+            "display_name": "vLLM",
+            "wire_family": "openai-chat",
+            "endpoint": "http://vllm.internal/v1",
+        }
+    })
+}
+
+fn vllm_credential_document() -> Value {
+    json!({
+        "summary": "stage acme's vllm key",
+        "mutation": "create",
+        "resource": {
+            "credential": fixtures::resource_id(61).to_string(),
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "provider": fixtures::resource_id(60).to_string(),
+            "slug": "vllm-primary",
+            "display_name": "vLLM primary",
+            "secret": fixtures::secret_id(62).to_string(),
+        }
+    })
+}
+
+async fn foundation_with_vllm(deployment: &Deployment) -> String {
+    let mut expected = foundation(deployment).await;
+    expected = deployment
+        .publish(
+            "/providers",
+            "found-vllm",
+            &expected,
+            &vllm_provider_document(),
+        )
+        .await;
+    deployment
+        .publish(
+            "/credentials",
+            "found-vllm-cred",
+            &expected,
+            &vllm_credential_document(),
+        )
+        .await
+}
+
+fn local_binding(input: u64, output: u64, mutation: &str) -> Value {
+    json!({
+        "summary": format!("{mutation} local-llama"),
+        "mutation": mutation,
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "name": "local-llama",
+            "targets": [{
+                "provider": "vllm",
+                "model": "meta-llama-3-70b-instruct",
+                "source": "local",
+                "price": {
+                    "input_microdollars_per_million": input,
+                    "output_microdollars_per_million": output
+                }
+            }]
+        }
+    })
+}
+
+#[tokio::test]
+async fn local_apply_does_not_move_the_imported_active_catalogue() {
+    let (deployment, snapshot) = imported_deployment().await;
+    let expected = foundation_with_vllm(&deployment).await;
+    let imported_id = snapshot.content.content_id();
+    let _head = deployment
+        .publish(
+            "/bindings",
+            "bind-local-1",
+            &expected,
+            &local_binding(0, 0, "create"),
+        )
+        .await;
+    let active = deployment
+        .api
+        .catalogue
+        .as_ref()
+        .expect("catalogue")
+        .load()
+        .await
+        .expect("load")
+        .active
+        .expect("active");
+    assert_eq!(
+        active.content_id(),
+        imported_id,
+        "local retain must not become load().active"
+    );
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let catalogs: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::CatalogModel)
+        .collect();
+    assert!(
+        catalogs
+            .iter()
+            .any(|resource| matches!(resource.scope, ResourceScope::Tenant(_))),
+        "local CatalogModel is tenant-scoped, got {catalogs:?}"
+    );
+    assert!(
+        catalogs
+            .iter()
+            .all(|resource| matches!(resource.scope, ResourceScope::Tenant(_))),
+        "local-only apply must not write a deployment catalogue pin"
+    );
+}
+
+#[tokio::test]
+async fn local_zero_price_is_approved_free() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation_with_vllm(&deployment).await;
+    let _head = deployment
+        .publish(
+            "/bindings",
+            "bind-local-zero",
+            &expected,
+            &local_binding(0, 0, "create"),
+        )
+        .await;
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let enablement = loaded
+        .state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+        .expect("enablement");
+    let body = ModelEnablementBody::read(enablement).expect("readable");
+    assert!(body.is_enabled());
+    assert!(body.billable_price().is_none());
+    assert_eq!(
+        body.observed_price().map(|price| (
+            price.input_micros_per_million,
+            price.output_micros_per_million
+        )),
+        Some((0, 0))
+    );
+}
+
+#[tokio::test]
+async fn local_price_change_reauthors_digest_and_retargets() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation_with_vllm(&deployment).await;
+    let head = deployment
+        .publish(
+            "/bindings",
+            "bind-local-price-1",
+            &expected,
+            &local_binding(0, 0, "create"),
+        )
+        .await;
+    let first = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let first_digest = first
+        .state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+        .and_then(|resource| ModelEnablementBody::read(resource).ok())
+        .expect("body")
+        .offering()
+        .snapshot;
+    let (status, body) = deployment
+        .post(
+            "/bindings",
+            "bind-local-price-2",
+            &head,
+            &local_binding(1_000_000, 2_000_000, "update"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "published", "{body}");
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let enablements: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+        .filter_map(|resource| ModelEnablementBody::read(resource).ok())
+        .collect();
+    assert_eq!(enablements.len(), 2);
+    assert!(
+        enablements
+            .iter()
+            .any(|body| !body.is_enabled() && body.offering().snapshot == first_digest)
+    );
+    let enabled: Vec<_> = enablements
+        .iter()
+        .filter(|body| body.is_enabled())
+        .collect();
+    assert_eq!(enabled.len(), 1);
+    assert_ne!(enabled[0].offering().snapshot, first_digest);
+}
+
+#[tokio::test]
+async fn source_local_on_an_imported_callable_is_not_local() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let document = json!({
+        "summary": "hide gpt-4o in a local snapshot",
+        "mutation": "create",
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "targets": [{
+                "provider": "openai",
+                "model": "gpt-4o",
+                "source": "local",
+                "price": {
+                    "input_microdollars_per_million": 0u64,
+                    "output_microdollars_per_million": 0u64
+                }
+            }]
+        }
+    });
+    let (status, body) = deployment
+        .post("/bindings", "bind-not-local", &expected, &document)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "binding_refused");
+    assert_eq!(body["error"]["rule"], "not_local");
+}
+
+#[tokio::test]
+async fn dry_run_local_does_not_retain() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation_with_vllm(&deployment).await;
+    let would = LocalCatalogBuilder::new("vllm", "meta-llama-3-70b-instruct")
+        .price(0, 0)
+        .retained(fixtures::tenant_id(1), SystemTime::UNIX_EPOCH)
+        .expect("payload");
+    let (status, body) = deployment
+        .dry_run(
+            "/bindings",
+            "bind-local-dry",
+            &expected,
+            &local_binding(0, 0, "create"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "dry_run", "{body}");
+    let held = deployment
+        .api
+        .catalogue
+        .as_ref()
+        .expect("catalogue")
+        .retained_by_raw_digest(would.source.raw.digest)
+        .await
+        .expect("lookup");
+    assert!(held.is_none(), "dry-run must not retain local bytes");
+}
+
+#[tokio::test]
+async fn mixed_imported_and_local_alias_publishes_both_pins() {
+    let (deployment, snapshot) = imported_deployment().await;
+    let expected = foundation_with_vllm(&deployment).await;
+    let imported_id = snapshot.content.content_id();
+    let document = json!({
+        "summary": "gpt-4o with vllm failover",
+        "mutation": "create",
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "name": "gpt-4o",
+            "targets": [
+                {
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "price": {
+                        "input_microdollars_per_million": 2_500_000u64,
+                        "output_microdollars_per_million": 10_000_000u64
+                    }
+                },
+                {
+                    "provider": "vllm",
+                    "model": "meta-llama-3-70b-instruct",
+                    "source": "local",
+                    "price": {
+                        "input_microdollars_per_million": 0u64,
+                        "output_microdollars_per_million": 0u64
+                    }
+                }
+            ]
+        }
+    });
+    let _head = deployment
+        .publish("/bindings", "bind-mixed", &expected, &document)
+        .await;
+    let active = deployment
+        .api
+        .catalogue
+        .as_ref()
+        .expect("catalogue")
+        .load()
+        .await
+        .expect("load")
+        .active
+        .expect("active");
+    assert_eq!(active.content_id(), imported_id);
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let catalogs: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::CatalogModel)
+        .collect();
+    assert!(
+        catalogs
+            .iter()
+            .any(|resource| resource.scope == ResourceScope::Deployment)
+    );
+    assert!(
+        catalogs
+            .iter()
+            .any(|resource| matches!(resource.scope, ResourceScope::Tenant(_)))
+    );
+    let alias = loaded
+        .state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::Alias)
+        .expect("alias");
+    let body = crate::desired_state::ModelAliasBody::read(alias).expect("readable");
+    assert_eq!(body.targets().len(), 2);
 }

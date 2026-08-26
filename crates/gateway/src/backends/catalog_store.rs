@@ -221,6 +221,13 @@ pub trait CatalogStore: Send + Sync {
         digest: crate::desired_state::Checksum,
     ) -> Result<Option<RetainedCatalog>, CatalogStoreError>;
 
+    /// Checksum-addressed put that does **not** move the active pointer.
+    ///
+    /// Local (operator-authored) snapshots use only this method. [`Self::activate`]
+    /// remains the scheduled import path: a vLLM one-offering payload must never
+    /// become `load().active`.
+    async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError>;
+
     /// Retain `import` if it is new, and make it the active catalogue as of
     /// `activated_at`.
     ///
@@ -287,6 +294,10 @@ impl<T: CatalogStore + ?Sized> CatalogStore for &T {
         (**self).retained_by_raw_digest(digest).await
     }
 
+    async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
+        (**self).retain(import).await
+    }
+
     async fn activate(
         &self,
         import: &RetainedCatalog,
@@ -339,6 +350,10 @@ impl<T: CatalogStore + ?Sized> CatalogStore for std::sync::Arc<T> {
         digest: crate::desired_state::Checksum,
     ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
         (**self).retained_by_raw_digest(digest).await
+    }
+
+    async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
+        (**self).retain(import).await
     }
 
     async fn activate(
@@ -557,6 +572,17 @@ impl CatalogStore for InMemoryCatalogStore {
             .cloned())
     }
 
+    async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
+        let mut state = self.locked();
+        match state.retained.entry(import.content_id()) {
+            std::collections::btree_map::Entry::Occupied(_) => Ok(Retention::AlreadyRetained),
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(import.clone());
+                Ok(Retention::Retained)
+            }
+        }
+    }
+
     async fn activate(
         &self,
         import: &RetainedCatalog,
@@ -682,6 +708,48 @@ mod tests {
         import.source.source_url = "https://models.dev/api.json".to_owned();
         let error = hydrate(&import).expect_err("the URL is not a catalogue document");
         assert!(matches!(error, HydrationError::Parse { .. }));
+    }
+
+    #[tokio::test]
+    async fn retain_does_not_move_the_active_pointer() {
+        let store = InMemoryCatalogStore::new();
+        let import = seed_import();
+        store.activate(&import, at(10)).await.expect("activate");
+        let before = store
+            .load()
+            .await
+            .expect("load")
+            .active
+            .expect("active")
+            .content_id();
+
+        let mut local = import.clone();
+        local.source.content_id =
+            CatalogContentId::from_checksum(crate::desired_state::Checksum::of(b"local-only"));
+        local.source.source_url = "axond://local/ten_test/sha256:local/catalog.json".to_owned();
+        assert_eq!(
+            store.retain(&local).await.expect("retain"),
+            Retention::Retained
+        );
+        assert_eq!(
+            store.retain(&local).await.expect("re-retain"),
+            Retention::AlreadyRetained
+        );
+
+        let state = store.load().await.expect("load");
+        assert_eq!(
+            state.active.expect("still active").content_id(),
+            before,
+            "retain must not clobber the imported active catalogue"
+        );
+        assert_eq!(store.retained_count(), 2);
+        assert!(
+            store
+                .retained(local.content_id())
+                .await
+                .expect("lookup")
+                .is_some()
+        );
     }
 
     #[tokio::test]

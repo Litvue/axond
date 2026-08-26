@@ -780,6 +780,13 @@ mod tests {
             Ok(None)
         }
 
+        async fn retain(&self, _import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
+            Err(CatalogStoreError::unavailable(
+                "refusing",
+                "the database is down",
+            ))
+        }
+
         async fn activate(
             &self,
             _import: &RetainedCatalog,
@@ -844,6 +851,10 @@ mod tests {
             _digest: crate::desired_state::Checksum,
         ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
             Ok(None)
+        }
+
+        async fn retain(&self, _import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
+            std::future::pending().await
         }
 
         async fn activate(
