@@ -4900,5 +4900,6 @@ async fn mixed_imported_and_local_alias_publishes_both_pins() {
         .find(|resource| resource.reference.kind == ResourceKind::Alias)
         .expect("alias");
     let body = crate::desired_state::ModelAliasBody::read(alias).expect("readable");
-    assert_eq!(body.targets().len(), 2);>>>>>>> 94c6c5ef (feat(models): tenant-scoped local catalogue snapshots for custom deployment ids)
+    assert_eq!(body.targets().len(), 2);
+}
 }
