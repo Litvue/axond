@@ -10,9 +10,12 @@
 //! distinguishes local vs imported by tenant-scoped `CatalogModel`, not by
 //! sniffing the URL.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use gateway_core::ModelPrice;
+use serde::Serialize;
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use super::catalog::{
@@ -105,25 +108,33 @@ impl LocalCatalogBuilder {
     /// Exact models.dev bytes this builder will retain.
     pub fn payload(&self) -> Result<Vec<u8>, LocalCatalogError> {
         let env = format!("{}_API_KEY", env_prefix(&self.provider));
-        let model = model_record(&self.model, &self.display_name, self.context_tokens, None);
-        let offered = model_record(
-            &self.model,
-            &self.display_name,
-            self.context_tokens,
-            Some((self.input_micros, self.output_micros)),
+        let model = model_record(&self.model, &self.display_name, self.context_tokens);
+        let offered = LocalOffering {
+            cost: LocalCost {
+                input: dollars_token(self.input_micros)?,
+                output: dollars_token(self.output_micros)?,
+            },
+            id: self.model.as_str(),
+            limit: model["limit"].clone(),
+            modalities: model["modalities"].clone(),
+            name: self.display_name.as_str(),
+        };
+        let mut models = BTreeMap::new();
+        models.insert(self.model.as_str(), model);
+        let mut offerings = BTreeMap::new();
+        offerings.insert(self.model.as_str(), offered);
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            self.provider.as_str(),
+            LocalProvider {
+                env: vec![env],
+                id: self.provider.as_str(),
+                models: offerings,
+                name: self.provider_name.as_str(),
+            },
         );
-        let document = json!({
-            "models": { self.model.clone(): model },
-            "providers": {
-                self.provider.clone(): {
-                    "id": self.provider,
-                    "name": self.provider_name,
-                    "env": [env],
-                    "models": { self.model.clone(): offered },
-                }
-            }
-        });
-        serde_json::to_vec_pretty(&document).map_err(|_| LocalCatalogError::Encode)
+        serde_json::to_vec_pretty(&LocalDocument { models, providers })
+            .map_err(|_| LocalCatalogError::Encode)
     }
 
     /// Provenance URL hydrate can hand to [`ModelsDevAdapter::new`].
@@ -222,37 +233,67 @@ fn env_prefix(provider: &str) -> String {
         .collect()
 }
 
-fn model_record(id: &str, name: &str, context: u64, cost: Option<(u64, u64)>) -> Value {
-    let mut record = json!({
+/// Models.dev document whose `cost` rates stay raw number tokens.
+///
+/// Field order matches `serde_json::Value` map order (alphabetical) so
+/// [`LocalCatalogBuilder::golden`] bytes stay identical to the committed fixture.
+#[derive(Serialize)]
+struct LocalDocument<'a> {
+    models: BTreeMap<&'a str, Value>,
+    providers: BTreeMap<&'a str, LocalProvider<'a>>,
+}
+
+#[derive(Serialize)]
+struct LocalProvider<'a> {
+    env: Vec<String>,
+    id: &'a str,
+    models: BTreeMap<&'a str, LocalOffering<'a>>,
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+struct LocalOffering<'a> {
+    cost: LocalCost,
+    id: &'a str,
+    limit: Value,
+    modalities: Value,
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+struct LocalCost {
+    input: Box<RawValue>,
+    output: Box<RawValue>,
+}
+
+fn model_record(id: &str, name: &str, context: u64) -> Value {
+    json!({
         "id": id,
         "name": name,
         "modalities": { "input": ["text"], "output": ["text"] },
         "limit": { "context": context },
-    });
-    if let Some((input, output)) = cost {
-        record["cost"] = json!({
-            "input": dollars_value(input),
-            "output": dollars_value(output),
-        });
-    }
-    record
+    })
 }
 
-/// Exact dollars-per-million JSON number: micros / 1_000_000, never through f64.
-fn dollars_value(micros: u64) -> Value {
+/// Dollars-per-million as a JSON number token: micros / 1_000_000.
+///
+/// Integer micros emit an integer token (`10`); otherwise the exact decimal
+/// (`0.000001`, `2.5`). The token is never parsed into `Value::Number`.
+fn dollars_token(micros: u64) -> Result<Box<RawValue>, LocalCatalogError> {
     const MILLION: u64 = 1_000_000;
-    if micros.is_multiple_of(MILLION) {
-        return Value::Number((micros / MILLION).into());
-    }
-    let whole = micros / MILLION;
-    let mut frac = micros % MILLION;
-    let mut digits = 6usize;
-    while frac.is_multiple_of(10) && digits > 1 {
-        frac /= 10;
-        digits -= 1;
-    }
-    let text = format!("{whole}.{frac:0digits$}");
-    serde_json::from_str(&text).expect("a micro-dollar decimal is JSON")
+    let text = if micros.is_multiple_of(MILLION) {
+        (micros / MILLION).to_string()
+    } else {
+        let whole = micros / MILLION;
+        let mut frac = micros % MILLION;
+        let mut digits = 6usize;
+        while frac.is_multiple_of(10) && digits > 1 {
+            frac /= 10;
+            digits -= 1;
+        }
+        format!("{whole}.{frac:0digits$}")
+    };
+    RawValue::from_string(text).map_err(|_| LocalCatalogError::Encode)
 }
 
 #[cfg(test)]
@@ -311,8 +352,22 @@ mod tests {
 
     #[test]
     fn stated_micros_become_exact_nano_dollar_cost() {
-        let snapshot = LocalCatalogBuilder::new("vllm", "local-model")
-            .price(2_500_000, 10_000_000)
+        let builder = LocalCatalogBuilder::new("vllm", "local-model").price(2_500_000, 10_000_000);
+        let payload = builder.payload().expect("priced local encodes");
+        let text = String::from_utf8_lossy(&payload);
+        assert!(
+            text.contains("\"input\": 2.5"),
+            "2.5 must pretty-print as a decimal token, got {text}"
+        );
+        assert!(
+            text.contains("\"output\": 10"),
+            "integer micros must pretty-print as a JSON integer, got {text}"
+        );
+        assert!(
+            !text.contains("10.0"),
+            "integer micros must not emit a trailing fraction, got {text}"
+        );
+        let snapshot = builder
             .snapshot(tenant(), UNIX_EPOCH)
             .expect("priced local parses");
         let offering = snapshot.content.models()[0].offerings[0]
@@ -324,6 +379,55 @@ mod tests {
         let price = model_price_from_cost(offering).expect("exact micros");
         assert_eq!(price.input_microdollars_per_million, 2_500_000);
         assert_eq!(price.output_microdollars_per_million, 10_000_000);
+    }
+
+    #[test]
+    fn non_f64_safe_micros_round_trip_as_exact_decimal_tokens() {
+        assert_exact_cost_tokens(1, 3, "0.000001", "0.000003");
+        assert_exact_cost_tokens(1_000_001, 10_000_000, "1.000001", "10");
+    }
+
+    fn assert_exact_cost_tokens(input: u64, output: u64, input_token: &str, output_token: &str) {
+        let builder = LocalCatalogBuilder::new("vllm", "local-model").price(input, output);
+        let payload = builder.payload().expect("encodes");
+        let text = String::from_utf8_lossy(&payload);
+        assert!(
+            text.contains(&format!("\"input\": {input_token}")),
+            "payload must contain {input_token}, got {text}"
+        );
+        assert!(
+            text.contains(&format!("\"output\": {output_token}")),
+            "payload must contain {output_token}, got {text}"
+        );
+        assert!(
+            !text.contains("e-") && !text.contains("E-"),
+            "cost must not use exponent form, got {text}"
+        );
+
+        let snapshot = builder
+            .snapshot(tenant(), UNIX_EPOCH)
+            .expect("snapshot parses the tokens");
+        let offering = CatalogOffering::new(
+            crate::desired_state::OfferingId::of("vllm", "local-model").expect("id"),
+            snapshot.source.raw.digest,
+        );
+        let price = compiled_local_price(&snapshot, offering).expect("compiles");
+        assert_eq!(price.input_microdollars_per_million, input);
+        assert_eq!(price.output_microdollars_per_million, output);
+
+        let retained = builder.retained(tenant(), UNIX_EPOCH).expect("retainable");
+        let hydrated = hydrate(&retained).expect("hydrate re-parses the same tokens");
+        let offering = CatalogOffering::new(
+            crate::desired_state::OfferingId::of("vllm", "local-model").expect("id"),
+            hydrated.source.raw.digest,
+        );
+        let hydrated_price = compiled_local_price(&hydrated, offering).expect("hydrated compiles");
+        assert_eq!(hydrated_price, price);
+        let stated = hydrated.content.models()[0].offerings[0]
+            .price
+            .as_ref()
+            .expect("cost is stated");
+        assert_eq!(model_price_from_cost(stated).expect("exact micros"), price);
     }
 
     #[test]
