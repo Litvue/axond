@@ -3729,6 +3729,164 @@ async fn pin_follow_disables_the_old_enablement_and_retargets_the_alias() {
     assert_eq!(locked["error"]["rule"], "pin_locked");
 }
 
+fn seed_with_second_dotted_openai_model() -> String {
+    let mut catalog: Value = serde_json::from_str(SEED_PAYLOAD).expect("seed json");
+    let mut dotted = catalog["providers"]["openai"]["models"]["gpt-4o"].clone();
+    dotted["id"] = json!("gpt-4.1");
+    dotted["name"] = json!("GPT-4.1");
+    catalog["providers"]["openai"]["models"]["gpt-4.1"] = dotted;
+    catalog.to_string()
+}
+
+fn dotted_binding(model: &str, input: u64, output: u64, mutation: &str) -> Value {
+    json!({
+        "summary": format!("{mutation} {model}"),
+        "mutation": mutation,
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "targets": [{
+                "provider": "openai",
+                "model": model,
+                "catalog": { "provider": "openai", "model": model },
+                "price": {
+                    "input_microdollars_per_million": input,
+                    "output_microdollars_per_million": output
+                }
+            }]
+        }
+    })
+}
+
+#[tokio::test]
+async fn two_dotted_aliases_pin_follow_in_one_project() {
+    let v1 = seed_with_second_dotted_openai_model();
+    let snapshot = ModelsDevAdapter::default()
+        .parse(
+            v1.as_bytes(),
+            SourceValidators::default(),
+            SystemTime::now(),
+        )
+        .expect("seed with gpt-4.1 parses");
+    let v2 = v1.replace("2024-08-06", "2024-08-07");
+    let next = ModelsDevAdapter::default()
+        .parse(
+            v2.as_bytes(),
+            SourceValidators::default(),
+            SystemTime::now(),
+        )
+        .expect("refreshed seed parses");
+    assert_ne!(next.source.raw.digest, snapshot.source.raw.digest);
+
+    let store = Arc::new(InMemoryCatalogStore::new());
+    store
+        .activate(
+            &RetainedCatalog {
+                source: snapshot.source.clone(),
+                payload: RawPayload::new(v1.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("seed");
+    let deployment = Deployment::with_catalogue(store.clone());
+    let mut expected = foundation(&deployment).await;
+    expected = deployment
+        .publish(
+            "/bindings",
+            "bind-dot-1",
+            &expected,
+            &dotted_binding("gpt-5.5", 5_000_000, 30_000_000, "create"),
+        )
+        .await;
+    expected = deployment
+        .publish(
+            "/bindings",
+            "bind-dot-2",
+            &expected,
+            &dotted_binding("gpt-4.1", 2_500_000, 10_000_000, "create"),
+        )
+        .await;
+
+    store
+        .activate(
+            &RetainedCatalog {
+                source: next.source.clone(),
+                payload: RawPayload::new(v2.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("refresh");
+
+    expected = deployment
+        .publish(
+            "/bindings",
+            "bind-dot-3",
+            &expected,
+            &dotted_binding("gpt-5.5", 5_000_000, 30_000_000, "update"),
+        )
+        .await;
+    let (status, body) = deployment
+        .post(
+            "/bindings",
+            "bind-dot-4",
+            &expected,
+            &dotted_binding("gpt-4.1", 2_500_000, 10_000_000, "update"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "published", "{body}");
+
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let mut aliases: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::Alias)
+        .map(|resource| resource.slug.as_str())
+        .collect();
+    aliases.sort_unstable();
+    assert_eq!(aliases, ["gpt-4.1", "gpt-5.5"]);
+
+    let enablements: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+        .filter_map(|resource| {
+            ModelEnablementBody::read(resource)
+                .ok()
+                .map(|body| (resource.slug.as_str(), body))
+        })
+        .collect();
+    assert_eq!(enablements.len(), 4, "two pins each, old disabled");
+    let mut enabled: Vec<_> = enablements
+        .iter()
+        .filter(|(_, body)| body.is_enabled())
+        .map(|(slug, _)| *slug)
+        .collect();
+    enabled.sort_unstable();
+    enabled.dedup();
+    assert_eq!(enabled.len(), 2, "two distinct enabled slugs: {enabled:?}");
+    assert!(
+        !enabled.contains(&"gpt-5.5") && !enabled.contains(&"gpt-4.1"),
+        "disabled rows keep the published ids, got {enabled:?}"
+    );
+    assert!(
+        enablements
+            .iter()
+            .any(|(slug, body)| *slug == "gpt-5.5" && !body.is_enabled())
+            && enablements
+                .iter()
+                .any(|(slug, body)| *slug == "gpt-4.1" && !body.is_enabled()),
+        "old pins keep the preferred slugs"
+    );
+}
+
 #[tokio::test]
 async fn published_not_neutral_uses_catalog_model_when_provider_equals_slug() {
     let (deployment, _) = imported_deployment().await;

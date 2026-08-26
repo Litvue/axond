@@ -875,25 +875,64 @@ fn unique_enablement_slug(
     state: &DesiredState,
     owner: ModelOwner,
     preferred: &Slug,
+    id: ResourceId,
+    offering: OfferingId,
     digest: Checksum,
 ) -> Slug {
     let scope = owner.scope();
-    let taken = state.resources().any(|resource| {
-        resource.reference.kind == ResourceKind::ModelEnablement
-            && resource.scope == scope
-            && resource.slug == *preferred
-    });
-    if !taken {
+    let taken = |candidate: &Slug| {
+        state.resources().any(|resource| {
+            resource.reference.kind == ResourceKind::ModelEnablement
+                && resource.scope == scope
+                && resource.slug == *candidate
+        })
+    };
+    if !taken(preferred) {
         return preferred.clone();
     }
-    let hex: String = digest
+    let digest_hex: String = digest
         .as_bytes()
         .iter()
         .take(8)
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    let candidate = format!("{preferred}-{hex}");
-    Slug::parse(&candidate).unwrap_or_else(|_| Slug::parse(&hex).expect("hex is a slug"))
+    let candidate = format!("{preferred}-{digest_hex}");
+    if let Ok(slug) = Slug::parse_alias(&candidate)
+        && !taken(&slug)
+    {
+        return slug;
+    }
+    let offering_hex = offering
+        .to_string()
+        .strip_prefix(OfferingId::PREFIX)
+        .unwrap_or("")
+        .to_owned();
+    let id_hex: String = id
+        .uuid()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    for width in [8usize, 16, 32] {
+        let mix = format!(
+            "{}{}",
+            &offering_hex[..width.min(offering_hex.len())],
+            &id_hex[..width.min(id_hex.len())]
+        );
+        if let Ok(slug) = Slug::parse_alias(&mix)
+            && !taken(&slug)
+        {
+            return slug;
+        }
+    }
+    (0u32..)
+        .find_map(|salt| {
+            let candidate = format!("{id_hex}-{salt:x}");
+            Slug::parse_alias(&candidate)
+                .ok()
+                .filter(|slug| !taken(slug))
+        })
+        .expect("uuid hex with a salt is a slug")
 }
 
 fn catalog_insert_slug(state: &DesiredState, digest: Checksum) -> Slug {
@@ -1069,7 +1108,7 @@ fn ensure_enablement(
         body = body.observing(observed);
     }
     let version = resources::next_version(state, ResourceKind::ModelEnablement, id);
-    let insert_slug = unique_enablement_slug(state, owner, slug, digest);
+    let insert_slug = unique_enablement_slug(state, owner, slug, id, offering, digest);
     resources::publish(state, body.version_at(insert_slug, version, catalog))?;
     Ok(state
         .version_of(ResourceKind::ModelEnablement, id)
@@ -1309,5 +1348,94 @@ mod tests {
             .expect("two rows");
         let picked = ensure_catalog_model(&mut without, digest, 4, None).expect("lowest");
         assert_eq!(picked.reference.id, low);
+    }
+
+    fn occupy_enablement(state: &mut DesiredState, owner: ModelOwner, seed: u64, slug: Slug) {
+        state
+            .insert(ResourceVersion::new(
+                ResourceRef::new(
+                    ResourceKind::ModelEnablement,
+                    fixtures::resource_id(seed),
+                    ResourceVersionNumber::FIRST,
+                ),
+                owner.scope(),
+                slug,
+                ResourceBody::Inline(crate::desired_state::CanonicalValue::Bool(true)),
+            ))
+            .expect("distinct enablement");
+    }
+
+    #[test]
+    fn unique_dotted_enablement_slugs_do_not_collapse_to_the_catalogue_digest() {
+        let owner = ModelOwner::project(fixtures::tenant_id(1), fixtures::project_id(2));
+        let digest = Checksum::of(b"shared-catalogue");
+        let gpt = Slug::parse_alias("gpt-5.5").unwrap();
+        let claude = Slug::parse_alias("claude-3.5-sonnet").unwrap();
+        let mut state = DesiredState::new();
+        occupy_enablement(&mut state, owner, 1, gpt.clone());
+        occupy_enablement(&mut state, owner, 2, claude.clone());
+        let first = unique_enablement_slug(
+            &state,
+            owner,
+            &gpt,
+            fixtures::resource_id(101),
+            fixtures::offering_id("openai/gpt-5.5"),
+            digest,
+        );
+        occupy_enablement(&mut state, owner, 101, first.clone());
+        let second = unique_enablement_slug(
+            &state,
+            owner,
+            &claude,
+            fixtures::resource_id(102),
+            fixtures::offering_id("openai/claude-3.5-sonnet"),
+            digest,
+        );
+        let digest_only: String = digest
+            .as_bytes()
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_ne!(first, second);
+        assert_ne!(first.as_str(), digest_only);
+        assert_ne!(second.as_str(), digest_only);
+        assert!(first.as_str().starts_with("gpt-5.5-"));
+        assert!(second.as_str().starts_with("claude-3.5-sonnet-"));
+    }
+
+    #[test]
+    fn a_too_long_dotted_suffix_falls_back_to_offering_and_id() {
+        let owner = ModelOwner::project(fixtures::tenant_id(1), fixtures::project_id(2));
+        let digest = Checksum::of(b"shared-catalogue");
+        let long = Slug::parse_alias(&format!("a.{}", "b".repeat(Slug::MAX_LEN - 2))).unwrap();
+        let mut state = DesiredState::new();
+        occupy_enablement(&mut state, owner, 1, long.clone());
+        let slug = unique_enablement_slug(
+            &state,
+            owner,
+            &long,
+            fixtures::resource_id(101),
+            fixtures::offering_id("openai/gpt-5.5"),
+            digest,
+        );
+        assert_ne!(slug, long);
+        assert!(
+            slug.as_str()
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()),
+            "length overflow must not reuse the catalogue digest hex, got {}",
+            slug.as_str()
+        );
+        occupy_enablement(&mut state, owner, 101, slug.clone());
+        let other = unique_enablement_slug(
+            &state,
+            owner,
+            &long,
+            fixtures::resource_id(102),
+            fixtures::offering_id("openai/claude-3.5-sonnet"),
+            digest,
+        );
+        assert_ne!(slug, other);
     }
 }
