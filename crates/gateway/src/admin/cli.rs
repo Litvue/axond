@@ -209,13 +209,20 @@ fn model_command() -> Command {
                 .about("Publish one [[model]] fragment as a binding")
                 .arg(tenant())
                 .arg(project())
-                .arg(Arg::new("file").long("file").short('f').help(
-                    "A [[model]] TOML fragment (not a full axond.toml), or a binding JSON \
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .short('f')
+                        .help(
+                            "A [[model]] TOML fragment (not a full axond.toml), or a binding JSON \
                              object",
-                ))
-                .arg(Arg::new("target").long("target").help(
-                    "Connection and published id as provider:model (for example openai:gpt-4o)",
-                ))
+                        ),
+                )
+                .arg(
+                    Arg::new("target")
+                        .long("target")
+                        .help("Connection and published id as provider:model (for example openai:gpt-4o)"),
+                )
                 .arg(
                     Arg::new("from-catalogue")
                         .long("from-catalogue")
@@ -287,10 +294,11 @@ fn model_command() -> Command {
                         .required(true)
                         .help("Caller-facing alias to disable"),
                 )
-                .arg(Arg::new("target").long("target").help(
-                    "Connection and published id as provider:model when the catalogue \
-                             does not name a unique matching connection",
-                ))
+                .arg(
+                    Arg::new("target")
+                        .long("target")
+                        .help("Connection and published id as provider:model, if catalogue metadata is pending"),
+                )
                 .arg(
                     Arg::new("summary")
                         .long("summary")
@@ -321,10 +329,11 @@ fn model_command() -> Command {
                         .required(true)
                         .help("Output rate in micro-dollars per million tokens"),
                 )
-                .arg(Arg::new("target").long("target").help(
-                    "Connection and published id as provider:model when the catalogue \
-                             does not name a unique matching connection",
-                ))
+                .arg(
+                    Arg::new("target")
+                        .long("target")
+                        .help("Connection and published id as provider:model, if catalogue metadata is pending"),
+                )
                 .arg(
                     Arg::new("summary")
                         .long("summary")
@@ -1419,30 +1428,16 @@ fn target_from_catalogue(
             "catalogue metadata for `{slug}` is not available; pass --target provider:model"
         );
     };
-    let catalog_provider = metadata.get("provider").and_then(serde_json::Value::as_str);
+    let provider = metadata
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("catalogue metadata for `{slug}` has no provider"))?;
     let model = metadata
         .get("published_model")
         .and_then(serde_json::Value::as_str)
         .or_else(|| metadata.get("model").and_then(serde_json::Value::as_str))
         .ok_or_else(|| anyhow::anyhow!("catalogue metadata for `{slug}` has no model"))?;
-    // Connection slug comes from the published Provider resource projection,
-    // never from metadata.provider (catalogue identity).
-    let connection = entry
-        .and_then(|entry| entry.get("connection"))
-        .and_then(serde_json::Value::as_str);
-    let Some(connection) = connection else {
-        anyhow::bail!(
-            "catalogue does not name a connection slug for `{slug}`; pass --target provider:model"
-        );
-    };
-    if let Some(provider) = catalog_provider
-        && provider != connection
-    {
-        anyhow::bail!(
-            "connection slug `{connection}` differs from catalogue provider `{provider}`; pass --target provider:model"
-        );
-    }
-    Ok(target_json(connection, model, None, None))
+    Ok(target_json(provider, model, None, None))
 }
 
 fn show_document(catalogue: &serde_json::Value, name: &str) -> anyhow::Result<serde_json::Value> {
@@ -2289,7 +2284,6 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
             "entries": [{
                 "enablement": "enb_1",
                 "aliases": named,
-                "connection": "openai",
                 "metadata": {
                     "provider": "openai",
                     "model": "gpt-4o",
@@ -2492,27 +2486,13 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
     }
 
     #[test]
-    fn disable_and_price_fill_targets_from_catalogue_connection() {
+    fn disable_and_price_fill_targets_from_catalogue_metadata() {
         let target = target_from_catalogue(&scoped_catalogue("enabled"), "gpt-4o").expect("target");
         assert_eq!(target["provider"], "openai");
         assert_eq!(target["model"], "gpt-4o");
         let disabled = target_from_catalogue(&scoped_catalogue("disabled"), "gpt-4o")
             .expect("disabled alias still names an enablement");
         assert_eq!(disabled["provider"], "openai");
-    }
-
-    #[test]
-    fn target_from_catalogue_does_not_use_metadata_provider_as_connection() {
-        let mut catalogue = scoped_catalogue("enabled");
-        catalogue["entries"][0]
-            .as_object_mut()
-            .expect("entry")
-            .remove("connection");
-        let error = target_from_catalogue(&catalogue, "gpt-4o").expect_err("no connection");
-        assert!(error.to_string().contains("--target"), "{error}");
-        catalogue["entries"][0]["connection"] = serde_json::json!("openai-prod");
-        let error = target_from_catalogue(&catalogue, "gpt-4o").expect_err("they differ");
-        assert!(error.to_string().contains("--target"), "{error}");
     }
 
     #[test]

@@ -370,7 +370,6 @@ there is no “last value wins” interpretation for a catalogue filter.
       "routable": false,
       "billable": false,
       "aliases": ["default"],
-      "connection": "openai",
       "unavailable": ["unpriced"],
       "metadata": {
         "provider": "openai",
@@ -397,8 +396,6 @@ there is no “last value wins” interpretation for a catalogue filter.
   "pending": []
 }
 ```
-
-`connection` is the published Provider slug in reach for this enablement, when that slug is unique or matches the pinned catalogue identity. `metadata.provider` is that imported identity, not a connection id. `axond admin model disable` and `price` fill `targets[].provider` from `connection`; if it is omitted, pass `--target`.
 
 `unavailable` is why a caller of this tenant cannot route to the offering:
 `disabled` (its lifecycle), `shadowed` (a project override replaces the tenant
