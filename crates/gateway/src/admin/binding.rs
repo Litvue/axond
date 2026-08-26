@@ -528,7 +528,7 @@ impl BindingPlan {
         if name.is_empty() {
             return Err(malformed("name", "must not be empty"));
         }
-        let _ = Slug::parse(name).map_err(|error| malformed("name", &error.to_string()))?;
+        let _ = Slug::parse_alias(name).map_err(|error| malformed("name", &error.to_string()))?;
         let price = match &target.price {
             None => None,
             Some(BindingPrice::Stated {
@@ -588,7 +588,7 @@ fn expand(
     let project = resolve_project(state, plan.tenant, plan.project)?;
     let owner = ModelOwner::project(plan.tenant, project);
     let alias_slug =
-        Slug::parse(&plan.name).map_err(|error| malformed("name", &error.to_string()))?;
+        Slug::parse_alias(&plan.name).map_err(|error| malformed("name", &error.to_string()))?;
     if plan.mutation == MutationKind::Create
         && alias_by_name(state, plan.tenant, project, &alias_slug).is_some()
     {

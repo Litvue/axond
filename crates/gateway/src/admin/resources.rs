@@ -934,7 +934,7 @@ impl AdminResourceRequest for AliasRequest {
         let alias = resource_id::<Self>("alias", &self.alias)?;
         let tenant = tenant_id::<Self>(&self.tenant)?;
         let project = project_id::<Self>(&self.project)?;
-        let slug = slug::<Self>(&self.slug)?;
+        let slug = alias_slug::<Self>(&self.slug)?;
         let wire_family = wire_family::<Self>(&self.wire_family)?;
         let lifecycle = match self.state.as_deref() {
             None => ModelLifecycle::Enabled,
@@ -1314,12 +1314,26 @@ fn project_id<R: AdminResourceRequest>(text: &str) -> Result<ProjectId, AdminErr
 }
 
 fn slug<R: AdminResourceRequest>(text: &str) -> Result<Slug, AdminError> {
-    Slug::parse(text).map_err(|error| {
+    map_slug::<R>(Slug::parse(text), false)
+}
+
+fn alias_slug<R: AdminResourceRequest>(text: &str) -> Result<Slug, AdminError> {
+    map_slug::<R>(Slug::parse_alias(text), true)
+}
+
+fn map_slug<R: AdminResourceRequest>(
+    parsed: Result<Slug, InvalidSlug>,
+    alias: bool,
+) -> Result<Slug, AdminError> {
+    parsed.map_err(|error| {
         let detail = match error {
             InvalidSlug::Empty => "must not be empty".to_owned(),
             InvalidSlug::TooLong { max, .. } => format!("is over the {max}-character limit"),
-            InvalidSlug::Character { .. } => {
+            InvalidSlug::Character { .. } if alias => {
                 "contains a character outside ASCII letters, digits, `.`, `-`, and `_`".to_owned()
+            }
+            InvalidSlug::Character { .. } => {
+                "contains a character outside ASCII letters, digits, `-`, and `_`".to_owned()
             }
             InvalidSlug::Boundary { .. } => "must start and end with a letter or digit".to_owned(),
             InvalidSlug::IdLike { .. } => "looks like an id; ids are not names".to_owned(),

@@ -408,7 +408,7 @@ pub enum InvalidSlug {
         max: usize,
     },
     #[error(
-        "a slug may not contain `{character}`; only ASCII letters, digits, `.`, `-`, and `_` are allowed"
+        "a slug may not contain `{character}`; only ASCII letters, digits, `-`, and `_` are allowed"
     )]
     Character { slug: String, character: char },
     #[error("a slug must start and end with a letter or digit")]
@@ -432,7 +432,20 @@ impl Slug {
         PrincipalId::PREFIX,
     ];
 
+    /// Ordinary resource names (tenants, projects, providers, enablements, …).
+    /// `.` is not allowed: a tenant slug `acme.corp` would compile to a namespace
+    /// that [`crate::namespace::NamespaceId`] cannot parse.
     pub fn parse(input: &str) -> Result<Self, InvalidSlug> {
+        Self::parse_chars(input, false)
+    }
+
+    /// Alias slugs are published model ids (`gpt-4o`, `gpt-5.5`). `.` is allowed
+    /// here only; tenants, projects, and providers still use [`Self::parse`].
+    pub fn parse_alias(input: &str) -> Result<Self, InvalidSlug> {
+        Self::parse_chars(input, true)
+    }
+
+    fn parse_chars(input: &str, allow_dot: bool) -> Result<Self, InvalidSlug> {
         if input.is_empty() {
             return Err(InvalidSlug::Empty);
         }
@@ -444,10 +457,9 @@ impl Slug {
             });
         }
         let lowered = input.to_ascii_lowercase();
-        if let Some(character) = lowered
-            .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.'))
-        {
+        if let Some(character) = lowered.chars().find(|c| {
+            !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || (allow_dot && *c == '.'))
+        }) {
             return Err(InvalidSlug::Character {
                 slug: input.to_owned(),
                 character,
@@ -685,7 +697,10 @@ mod tests {
         );
         assert_eq!(Slug::parse("a").unwrap().to_string(), "a");
         assert_eq!(Slug::parse("team_1-x").unwrap().as_str(), "team_1-x");
-        assert_eq!(Slug::parse("gpt-5.5").unwrap().as_str(), "gpt-5.5");
+        assert_eq!(Slug::parse_alias("gpt-5.5").unwrap().as_str(), "gpt-5.5");
+        assert!(Slug::parse("gpt-5.5").is_err());
+        assert!(Slug::parse("acme.corp").is_err());
+        assert!(Slug::parse_alias("acme.corp").is_ok());
     }
 
     #[test]
@@ -695,7 +710,7 @@ mod tests {
             Slug::parse(&"a".repeat(Slug::MAX_LEN + 1)),
             Err(InvalidSlug::TooLong { .. })
         ));
-        for input in ["prod eu", "prodé", "prod/eu"] {
+        for input in ["prod eu", "prod.eu", "prodé", "prod/eu"] {
             assert!(
                 matches!(Slug::parse(input), Err(InvalidSlug::Character { .. })),
                 "`{input}` must be refused"
