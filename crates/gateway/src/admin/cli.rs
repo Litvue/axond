@@ -673,6 +673,9 @@ struct BindingSpec {
     pin: Option<String>,
     state: Option<String>,
     summary: String,
+    /// Stated rates kept here so `price` without `--target` still lands on the
+    /// catalogue-filled target.
+    price: Option<serde_json::Value>,
     targets: Vec<serde_json::Value>,
 }
 
@@ -770,8 +773,10 @@ async fn run_model(
             let tenant = required(verb_args, "tenant");
             let project = verb_args.get_one::<String>("project").map(String::as_str);
             let name = required(verb_args, "name");
-            let catalogue = fetch_json(
-                catalogue_call(tenant, project, Vec::new()),
+            let (catalogue, _) = catalogue_for_alias(
+                tenant,
+                project,
+                name,
                 endpoint,
                 headers(global, verb_args, env)?,
             )
@@ -780,55 +785,84 @@ async fn run_model(
             println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
         }
-        "apply" | "disable" | "price" => {
-            let mut spec = match verb {
-                "apply" => apply_spec(verb_args)?,
-                "disable" => disable_spec(verb_args)?,
-                "price" => price_spec(verb_args)?,
-                _ => unreachable!("clap validates subcommands: {verb}"),
-            };
+        "apply" => {
+            let spec = apply_spec(verb_args)?;
             let catalogue = fetch_json(
                 catalogue_call(&spec.tenant, spec.project.as_deref(), Vec::new()),
                 endpoint.clone(),
                 headers(global, verb_args, env)?,
             )
             .await?;
-            let expected = expected_revision_of(&catalogue);
-            let exists = alias_published(&catalogue, &spec.alias);
-            let mutation = match verb {
-                "apply" => {
-                    if exists {
-                        "update"
-                    } else {
-                        "create"
-                    }
-                }
-                "disable" | "price" => {
-                    if !exists {
-                        anyhow::bail!("alias `{}` is not published in this catalogue", spec.alias);
-                    }
-                    if spec.targets.is_empty() {
-                        spec.targets = vec![target_from_catalogue(&catalogue, &spec.alias)?];
-                    }
-                    "update"
-                }
+            let mutation = if alias_published(&catalogue, &spec.alias) {
+                "update"
+            } else {
+                "create"
+            };
+            post_binding(
+                spec,
+                mutation,
+                expected_revision_of(&catalogue),
+                global,
+                verb_args,
+                env,
+                endpoint,
+            )
+            .await
+        }
+        "disable" | "price" => {
+            let mut spec = match verb {
+                "disable" => disable_spec(verb_args)?,
+                "price" => price_spec(verb_args)?,
                 _ => unreachable!("clap validates subcommands: {verb}"),
             };
-            let call = Call {
-                method: Method::POST,
-                path: "bindings".to_owned(),
-                query: Vec::new(),
-                body: Some(spec.envelope(mutation).to_string()),
-            };
-            send(
-                call,
+            let (catalogue, project) = catalogue_for_alias(
+                &spec.tenant,
+                spec.project.as_deref(),
+                &spec.alias,
+                endpoint.clone(),
+                headers(global, verb_args, env)?,
+            )
+            .await?;
+            if spec.project.is_none() {
+                spec.project = project;
+            }
+            hydrate_from_catalogue(&mut spec, &catalogue)?;
+            post_binding(
+                spec,
+                "update",
+                expected_revision_of(&catalogue),
+                global,
+                verb_args,
+                env,
                 endpoint,
-                mutation_headers(global, verb_args, env, &mint_idempotency_key()?, &expected)?,
             )
             .await
         }
         other => unreachable!("clap validates subcommands: {other}"),
     }
+}
+
+async fn post_binding(
+    spec: BindingSpec,
+    mutation: &str,
+    expected: String,
+    global: &ArgMatches,
+    args: &ArgMatches,
+    env: &HashMap<String, String>,
+    endpoint: String,
+) -> anyhow::Result<()> {
+    let call = Call {
+        method: Method::POST,
+        path: "bindings".to_owned(),
+        query: Vec::new(),
+        body: Some(spec.envelope(mutation).to_string()),
+    };
+    send(
+        call,
+        endpoint,
+        mutation_headers(global, args, env, &mint_idempotency_key()?, &expected)?,
+    )
+    .await
 }
 
 async fn run_catalog(
@@ -897,20 +931,21 @@ fn disable_spec(args: &ArgMatches) -> anyhow::Result<BindingSpec> {
             .get_one::<String>("summary")
             .cloned()
             .unwrap_or_else(|| format!("disable {name}")),
+        price: None,
         targets,
     })
 }
 
 fn price_spec(args: &ArgMatches) -> anyhow::Result<BindingSpec> {
     let name = required(args, "name").to_owned();
-    let price = Some(stated_price(
+    let price = stated_price(
         parse_u64("--input", required(args, "input"))?,
         parse_u64("--output", required(args, "output"))?,
-    ));
+    );
     let targets = match args.get_one::<String>("target") {
         Some(target) => {
             let (provider, model) = split_once(target, ':', "--target")?;
-            vec![target_json(provider, model, None, price)]
+            vec![target_json(provider, model, None, Some(price.clone()))]
         }
         None => Vec::new(),
     };
@@ -925,6 +960,7 @@ fn price_spec(args: &ArgMatches) -> anyhow::Result<BindingSpec> {
             .get_one::<String>("summary")
             .cloned()
             .unwrap_or_else(|| format!("price {name}")),
+        price: Some(price),
         targets,
     })
 }
@@ -1003,6 +1039,7 @@ fn spec_from_toml(text: &str, args: &ArgMatches) -> anyhow::Result<BindingSpec> 
         pin: model.pin.clone(),
         state: model.state.clone(),
         summary: String::new(),
+        price: None,
         targets,
     })
 }
@@ -1027,14 +1064,8 @@ fn spec_from_json(text: &str, args: &ArgMatches) -> anyhow::Result<BindingSpec> 
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     });
-    let targets = resource
-        .get("targets")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("binding JSON must contain targets"))?;
-    if targets.is_empty() {
-        anyhow::bail!("binding JSON must contain at least one target");
-    }
+    let model_one = json_one_model(resource)?;
+    let targets = json_targets(resource, model_one)?;
     let first = &targets[0];
     let model = first
         .get("model")
@@ -1045,11 +1076,20 @@ fn spec_from_json(text: &str, args: &ArgMatches) -> anyhow::Result<BindingSpec> 
         .and_then(|catalog| catalog.get("model"))
         .and_then(serde_json::Value::as_str);
     let published = catalog_model.unwrap_or(model);
-    let name = resource
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned);
+    let pick = |key: &str| {
+        resource
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                model_one
+                    .and_then(|model| model.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
+            .map(str::to_owned)
+    };
+    let name = pick("name");
     let alias = name.clone().unwrap_or_else(|| published.to_owned());
     if alias.is_empty() {
         anyhow::bail!("a published model id is required");
@@ -1059,21 +1099,56 @@ fn spec_from_json(text: &str, args: &ArgMatches) -> anyhow::Result<BindingSpec> 
         project,
         name,
         alias,
-        pin: resource
-            .get("pin")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        state: resource
-            .get("state")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
+        pin: pick("pin"),
+        state: pick("state"),
         summary: value
             .get("summary")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        price: None,
         targets,
     })
+}
+
+fn json_one_model(resource: &serde_json::Value) -> anyhow::Result<Option<&serde_json::Value>> {
+    let Some(models) = resource.get("models") else {
+        return Ok(None);
+    };
+    let Some(models) = models.as_array() else {
+        anyhow::bail!("binding JSON `models` must be an array");
+    };
+    match models.as_slice() {
+        [one] => Ok(Some(one)),
+        _ => anyhow::bail!("binding JSON models must contain exactly one model"),
+    }
+}
+
+fn json_targets(
+    resource: &serde_json::Value,
+    model: Option<&serde_json::Value>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    if let Some(targets) = resource.get("targets") {
+        let Some(targets) = targets.as_array() else {
+            anyhow::bail!("binding JSON `targets` must be an array");
+        };
+        if targets.is_empty() {
+            anyhow::bail!("binding JSON must contain at least one target");
+        }
+        return Ok(targets.clone());
+    }
+    let Some(model) = model else {
+        anyhow::bail!("binding JSON must contain targets or models");
+    };
+    let targets = model
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("binding JSON must contain at least one target"))?;
+    if targets.is_empty() {
+        anyhow::bail!("binding JSON must contain at least one target");
+    }
+    Ok(targets)
 }
 
 fn spec_from_catalogue(from: &str, args: &ArgMatches) -> anyhow::Result<BindingSpec> {
@@ -1092,6 +1167,7 @@ fn spec_from_catalogue(from: &str, args: &ArgMatches) -> anyhow::Result<BindingS
         pin: None,
         state: None,
         summary: String::new(),
+        price: None,
         targets: vec![target_json(provider, published, catalog, price)],
     })
 }
@@ -1108,6 +1184,7 @@ fn spec_from_target(args: &ArgMatches) -> anyhow::Result<BindingSpec> {
         pin: None,
         state: None,
         summary: String::new(),
+        price: None,
         targets: vec![target_json(provider, model, None, price)],
     })
 }
@@ -1223,14 +1300,97 @@ fn expected_revision_of(catalogue: &serde_json::Value) -> String {
 }
 
 fn alias_published(catalogue: &serde_json::Value, slug: &str) -> bool {
+    !matching_aliases(catalogue, slug).is_empty()
+}
+
+fn matching_aliases<'a>(
+    catalogue: &'a serde_json::Value,
+    slug: &str,
+) -> Vec<&'a serde_json::Value> {
     catalogue
         .get("aliases")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|aliases| {
+        .map(|aliases| {
             aliases
                 .iter()
-                .any(|alias| alias.get("slug").and_then(serde_json::Value::as_str) == Some(slug))
+                .filter(|alias| alias.get("slug").and_then(serde_json::Value::as_str) == Some(slug))
+                .collect()
         })
+        .unwrap_or_default()
+}
+
+/// Project on the unique alias with this slug. `None` is a tenant-default alias.
+///
+/// Tenant-wide catalogue lists every project's aliases but only tenant-default
+/// enablement entries. Bindings publish project-owned enablements, so disable
+/// and price re-GET with this project before reading `entries`.
+fn unique_alias_project(
+    catalogue: &serde_json::Value,
+    slug: &str,
+) -> anyhow::Result<Option<String>> {
+    match matching_aliases(catalogue, slug).as_slice() {
+        [] => anyhow::bail!("alias `{slug}` is not published in this catalogue"),
+        [alias] => Ok(alias
+            .get("scope")
+            .and_then(|scope| scope.get("project"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)),
+        _ => anyhow::bail!("alias `{slug}` is published in more than one project; pass --project"),
+    }
+}
+
+async fn catalogue_for_alias(
+    tenant: &str,
+    project: Option<&str>,
+    slug: &str,
+    endpoint: String,
+    headers: HeaderMap,
+) -> anyhow::Result<(serde_json::Value, Option<String>)> {
+    let catalogue = fetch_json(
+        catalogue_call(tenant, project, Vec::new()),
+        endpoint.clone(),
+        headers.clone(),
+    )
+    .await?;
+    if let Some(project) = project {
+        if !alias_published(&catalogue, slug) {
+            anyhow::bail!("alias `{slug}` is not published in this catalogue");
+        }
+        return Ok((catalogue, Some(project.to_owned())));
+    }
+    let Some(resolved) = unique_alias_project(&catalogue, slug)? else {
+        return Ok((catalogue, None));
+    };
+    let scoped = fetch_json(
+        catalogue_call(tenant, Some(&resolved), Vec::new()),
+        endpoint,
+        headers,
+    )
+    .await?;
+    Ok((scoped, Some(resolved)))
+}
+
+fn hydrate_from_catalogue(
+    spec: &mut BindingSpec,
+    catalogue: &serde_json::Value,
+) -> anyhow::Result<()> {
+    // Price must not re-enable: omitted state is enabled on the expander.
+    if spec.state.is_none() {
+        spec.state = matching_aliases(catalogue, &spec.alias)
+            .first()
+            .and_then(|alias| alias.get("state"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+    }
+    if spec.targets.is_empty() {
+        spec.targets = vec![target_from_catalogue(catalogue, &spec.alias)?];
+    }
+    if let Some(price) = spec.price.clone() {
+        spec.targets
+            .first_mut()
+            .ok_or_else(|| anyhow::anyhow!("binding has no target to price"))?["price"] = price;
+    }
+    Ok(())
 }
 
 fn target_from_catalogue(
@@ -1242,12 +1402,27 @@ fn target_from_catalogue(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let entry = entries.iter().find(|entry| {
-        entry
-            .get("aliases")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|aliases| aliases.iter().any(|name| name.as_str() == Some(slug)))
-    });
+    let enablement = matching_aliases(catalogue, slug)
+        .first()
+        .and_then(|alias| alias.get("targets"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|targets| targets.first())
+        .and_then(|target| target.get("enablement"))
+        .and_then(serde_json::Value::as_str);
+    let entry = enablement
+        .and_then(|id| {
+            entries.iter().find(|entry| {
+                entry.get("enablement").and_then(serde_json::Value::as_str) == Some(id)
+            })
+        })
+        .or_else(|| {
+            entries.iter().find(|entry| {
+                entry
+                    .get("aliases")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|aliases| aliases.iter().any(|name| name.as_str() == Some(slug)))
+            })
+        });
     let Some(metadata) = entry.and_then(|entry| entry.get("metadata")) else {
         anyhow::bail!(
             "catalogue metadata for `{slug}` is not available; pass --target provider:model"
@@ -1545,11 +1720,24 @@ struct Exchange {
     raw: String,
 }
 
+const ADMIN_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Import bound is 60s (`default_catalog_refresh_timeout_seconds`); hydrate
+/// and the response must still fit after that.
+const CATALOG_REFRESH_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn call_timeout(path: &str) -> Duration {
+    if path == "catalogue/refresh" {
+        CATALOG_REFRESH_TIMEOUT
+    } else {
+        ADMIN_CALL_TIMEOUT
+    }
+}
+
 async fn exchange(call: Call, base: String, headers: HeaderMap) -> anyhow::Result<Exchange> {
     let client = reqwest::Client::builder()
         // Bounded, because an administrative command is usually run by a person
         // waiting for it, and an unreachable control plane must say so.
-        .timeout(Duration::from_secs(30))
+        .timeout(call_timeout(&call.path))
         .build()?;
     let url = format!("{base}/{}", call.path);
     let mut request = client
@@ -2067,6 +2255,151 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
         );
     }
 
+    fn price_flags(extra: &[&str]) -> BindingSpec {
+        let mut argv = vec![
+            "admin", "model", "price", "--tenant", "ten_1", "--name", "gpt-4o", "--input",
+            "3000000", "--output", "12000000",
+        ];
+        argv.extend_from_slice(extra);
+        let args = matches(&argv);
+        let (_, model) = nested(&args);
+        let (_, price) = nested(model);
+        price_spec(price).expect("price")
+    }
+
+    fn scoped_catalogue(state: &str) -> serde_json::Value {
+        let named = if state == "enabled" {
+            serde_json::json!(["gpt-4o"])
+        } else {
+            serde_json::json!([])
+        };
+        serde_json::json!({
+            "revision": "rev_3",
+            "aliases": [{
+                "slug": "gpt-4o",
+                "state": state,
+                "scope": { "kind": "project", "project": "prj_1" },
+                "targets": [{ "enablement": "enb_1" }]
+            }],
+            "entries": [{
+                "enablement": "enb_1",
+                "aliases": named,
+                "metadata": {
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "published_model": "gpt-4o"
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn price_without_target_still_carries_stated_rates_after_catalogue_fill() {
+        let mut spec = price_flags(&[]);
+        assert!(spec.targets.is_empty());
+        assert_eq!(
+            spec.price.as_ref().unwrap()["input_microdollars_per_million"],
+            3_000_000
+        );
+        hydrate_from_catalogue(&mut spec, &scoped_catalogue("enabled")).expect("hydrate");
+        let body = spec.envelope("update");
+        assert_eq!(
+            body["resource"]["targets"][0]["price"]["input_microdollars_per_million"],
+            3_000_000
+        );
+        assert_eq!(
+            body["resource"]["targets"][0]["price"]["output_microdollars_per_million"],
+            12_000_000
+        );
+        assert_eq!(body["resource"]["targets"][0]["provider"], "openai");
+    }
+
+    #[test]
+    fn price_preserves_the_alias_lifecycle() {
+        let mut spec = price_flags(&[]);
+        hydrate_from_catalogue(&mut spec, &scoped_catalogue("disabled")).expect("hydrate");
+        assert_eq!(spec.state.as_deref(), Some("disabled"));
+        assert_eq!(spec.envelope("update")["resource"]["state"], "disabled");
+    }
+
+    #[test]
+    fn unique_alias_project_refuses_zero_or_several_projects() {
+        let tenant_wide = serde_json::json!({
+            "aliases": [{
+                "slug": "gpt-4o",
+                "scope": { "kind": "project", "project": "prj_1" }
+            }],
+            "entries": []
+        });
+        assert_eq!(
+            unique_alias_project(&tenant_wide, "gpt-4o").expect("one project"),
+            Some("prj_1".to_owned())
+        );
+        unique_alias_project(&serde_json::json!({ "aliases": [] }), "gpt-4o")
+            .expect_err("not published");
+        let two = serde_json::json!({
+            "aliases": [
+                { "slug": "gpt-4o", "scope": { "project": "prj_1" } },
+                { "slug": "gpt-4o", "scope": { "project": "prj_2" } }
+            ]
+        });
+        let error = unique_alias_project(&two, "gpt-4o").expect_err("ambiguous");
+        assert!(error.to_string().contains("--project"), "{error}");
+        assert!(
+            target_from_catalogue(&tenant_wide, "gpt-4o").is_err(),
+            "tenant-wide entries are not the binding target source"
+        );
+    }
+
+    #[test]
+    fn json_file_flattens_a_single_models_array() {
+        let args = apply_argv(&["--target", "openai:unused"]);
+        let (_, model) = nested(&args);
+        let (_, apply) = nested(model);
+        let spec = spec_from_json(
+            r#"{
+                "summary": "enable gpt-4o",
+                "resource": {
+                    "tenant": "ten_1",
+                    "project": "prj_1",
+                    "models": [{
+                        "targets": [{
+                            "provider": "openai",
+                            "model": "gpt-4o",
+                            "price": "observed"
+                        }]
+                    }]
+                }
+            }"#,
+            apply,
+        )
+        .expect("models array");
+        assert!(spec.name.is_none());
+        assert_eq!(spec.alias, "gpt-4o");
+        assert_eq!(spec.targets[0]["price"], "observed");
+        spec_from_json(
+            r#"{ "resource": { "tenant": "ten_1", "models": [] } }"#,
+            apply,
+        )
+        .expect_err("zero models");
+        spec_from_json(
+            r#"{ "resource": { "tenant": "ten_1", "models": [
+                { "targets": [{ "provider": "openai", "model": "gpt-4o" }] },
+                { "targets": [{ "provider": "openai", "model": "gpt-4o-mini" }] }
+            ] } }"#,
+            apply,
+        )
+        .expect_err("more than one model");
+    }
+
+    #[test]
+    fn catalog_refresh_outlives_the_import_timeout() {
+        assert_eq!(call_timeout("catalogue/refresh"), CATALOG_REFRESH_TIMEOUT);
+        assert_eq!(call_timeout("bindings"), ADMIN_CALL_TIMEOUT);
+        assert!(CATALOG_REFRESH_TIMEOUT >= Duration::from_secs(60));
+        assert!(CATALOG_REFRESH_TIMEOUT > ADMIN_CALL_TIMEOUT);
+    }
+
     #[test]
     fn catalog_browse_is_an_imported_catalogue_read() {
         let args = matches(&[
@@ -2154,21 +2487,12 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
 
     #[test]
     fn disable_and_price_fill_targets_from_catalogue_metadata() {
-        let catalogue = serde_json::json!({
-            "revision": "rev_3",
-            "aliases": [{ "slug": "gpt-4o" }],
-            "entries": [{
-                "aliases": ["gpt-4o"],
-                "metadata": {
-                    "provider": "openai",
-                    "model": "gpt-4o",
-                    "published_model": "gpt-4o"
-                }
-            }]
-        });
-        let target = target_from_catalogue(&catalogue, "gpt-4o").expect("target");
+        let target = target_from_catalogue(&scoped_catalogue("enabled"), "gpt-4o").expect("target");
         assert_eq!(target["provider"], "openai");
         assert_eq!(target["model"], "gpt-4o");
+        let disabled = target_from_catalogue(&scoped_catalogue("disabled"), "gpt-4o")
+            .expect("disabled alias still names an enablement");
+        assert_eq!(disabled["provider"], "openai");
     }
 
     #[test]
