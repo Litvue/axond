@@ -1009,19 +1009,13 @@ fn ensure_book(
             "changing rates that would overlap existing coverage requires an interval close",
         ));
     }
+    // Keep the original approval. Stamping the current actor (and EPOCH) here
+    // would rewrite attribution for every earlier rate on this book.
     let body = current
         .iter()
         .cloned()
         .fold(
-            PriceBookBody::new(
-                catalog,
-                catalog_version,
-                Approval::Approved {
-                    by: actor.clone(),
-                    at: EffectiveInstant::EPOCH,
-                    citation: None,
-                },
-            ),
+            PriceBookBody::new(catalog, catalog_version, existing.body.approval().clone()),
             PriceBookBody::with_rule,
         )
         .with_rule(rule);

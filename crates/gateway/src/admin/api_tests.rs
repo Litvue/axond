@@ -4066,6 +4066,122 @@ async fn binding_book_is_actor_aware_and_enablements_have_no_approved_price() {
 }
 
 #[tokio::test]
+async fn appending_a_rule_keeps_the_first_books_approver() {
+    const OTHER_TOKEN: &str = "other-admin-token";
+    const OTHER_SUBJECT: &str = "other@example";
+    let snapshot = seed_snapshot();
+    let catalogue = Arc::new(InMemoryCatalogStore::new());
+    catalogue
+        .activate(
+            &RetainedCatalog {
+                source: snapshot.source.clone(),
+                payload: RawPayload::new(SEED_PAYLOAD.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("the seed is retained");
+    let store = Arc::new(InMemoryControlPlane::new());
+    let secrets = Arc::new(InMemorySecrets::new());
+    let api = Arc::new(
+        AdminApi::new(
+            Arc::new(AdminService::stateful(store.clone()).with_secrets(secrets.clone())),
+            Arc::new(
+                FakeAdminAuthenticator::new()
+                    .with_human(TOKEN, ISSUER, SUBJECT)
+                    .with_human(OTHER_TOKEN, ISSUER, OTHER_SUBJECT),
+            ),
+            Arc::new(FakeAdminAuthorizer::permissive()),
+        )
+        .with_catalogue(catalogue),
+    );
+    let deployment = Deployment {
+        api,
+        store,
+        secrets,
+    };
+    let expected = foundation(&deployment).await;
+    let head = deployment
+        .publish("/bindings", "bind-keep-1", &expected, &binding_document())
+        .await;
+    let first = PriceBookBody::read(
+        deployment
+            .store
+            .load_desired_revision()
+            .await
+            .expect("head")
+            .expect("published")
+            .state()
+            .resources()
+            .find(|resource| resource.reference.kind == ResourceKind::Price)
+            .expect("a book"),
+    )
+    .expect("readable")
+    .approval()
+    .clone();
+    let second = json!({
+        "summary": "enable gpt-5.5",
+        "mutation": "create",
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "targets": [{
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "catalog": { "provider": "openai", "model": "gpt-5.5" },
+                "price": {
+                    "input_microdollars_per_million": 5_000_000u64,
+                    "output_microdollars_per_million": 30_000_000u64
+                }
+            }]
+        }
+    });
+    let (status, body) = deployment
+        .send(
+            Request::post(format!("{ADMIN_PREFIX}/bindings"))
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {OTHER_TOKEN}"),
+                )
+                .header(IDEMPOTENCY_KEY_HEADER, "bind-keep-2")
+                .header(EXPECTED_REVISION_HEADER, &head)
+                .body(Body::from(second.to_string()))
+                .expect("a request"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "published", "{body}");
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let book = loaded
+        .state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::Price)
+        .expect("a book");
+    let body = PriceBookBody::read(book).expect("readable");
+    assert_eq!(body.rules().len(), 2, "second callable appended a rule");
+    assert_eq!(body.approval(), &first);
+    assert_eq!(
+        body.approval().approver(),
+        Some(&Actor::Human {
+            issuer: ISSUER.to_owned(),
+            subject: SUBJECT.to_owned(),
+        })
+    );
+    assert_ne!(
+        body.approval().approver(),
+        Some(&Actor::Human {
+            issuer: ISSUER.to_owned(),
+            subject: OTHER_SUBJECT.to_owned(),
+        })
+    );
+}
+
+#[tokio::test]
 async fn a_rate_change_on_existing_coverage_is_refused() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
