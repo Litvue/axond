@@ -659,6 +659,7 @@ impl CatalogueView {
             }
             None => None,
         };
+        let availability_ctx = availability_context(availability);
         let Some(snapshot) = active else {
             return Ok(Self {
                 revision: revision.map(|revision| revision.id().to_string()),
@@ -668,7 +669,7 @@ impl CatalogueView {
                     .as_ref()
                     .map(|models| project_aliases(models, request, &BTreeMap::new()))
                     .unwrap_or_default(),
-                pending: pending_facts(true, availability.is_none()),
+                pending: pending_facts(true, availability_ctx.is_none()),
                 truncated: false,
             });
         };
@@ -681,7 +682,7 @@ impl CatalogueView {
                     .as_ref()
                     .map(|models| project_aliases(models, request, &BTreeMap::new()))
                     .unwrap_or_default(),
-                pending: pending_facts(true, availability.is_none()),
+                pending: pending_facts(true, availability_ctx.is_none()),
                 truncated: false,
             });
         };
@@ -697,7 +698,6 @@ impl CatalogueView {
                 .ok()
                 .and_then(|books| books.book().cloned())
         });
-        let availability_ctx = availability_context(availability);
         let mut contexts = BTreeMap::new();
         if let Some(models) = models.as_ref() {
             for enablement in models.enablements() {
@@ -726,9 +726,7 @@ impl CatalogueView {
                 let price = metadata.as_ref().and_then(|metadata| {
                     price_metadata(book.as_ref(), pricing.as_ref(), metadata, now)
                 });
-                let billable = metadata
-                    .as_ref()
-                    .is_some_and(|metadata| offering_is_billable(pricing.as_ref(), metadata));
+                let billable = price.is_some();
                 contexts.insert(
                     enablement.reference.id,
                     EntryContext {
@@ -1924,6 +1922,7 @@ mod tests {
             &CatalogueRequest {
                 tenant: tenant_id(1),
                 project: None,
+                source: CatalogueSource::Enabled,
                 filters: CatalogueFilters::default(),
             },
             None,
@@ -1956,6 +1955,7 @@ mod tests {
             &CatalogueRequest {
                 tenant: tenant_id(1),
                 project: None,
+                source: CatalogueSource::Enabled,
                 filters: CatalogueFilters::default(),
             },
             Some(&store),
@@ -2175,6 +2175,48 @@ mod tests {
         .expect("a missing store is still readable");
         assert!(view.entries.is_empty(), "{:?}", view.entries);
         assert!(view.pending.contains(&PendingFact::OfferingMetadata));
+        assert!(view.pending.contains(&PendingFact::Availability));
+    }
+
+    struct SilentAvailability;
+
+    impl AvailabilityReader for SilentAvailability {
+        fn read(
+            &self,
+        ) -> Option<(
+            std::sync::Arc<crate::availability::AvailabilityIndex>,
+            crate::availability::RuntimeObservations,
+        )> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn imported_browse_names_availability_pending_when_the_reader_derives_nothing() {
+        let view = CatalogueView::of_with_context(
+            Some(&published()),
+            &CatalogueRequest {
+                tenant: tenant_id(1),
+                project: None,
+                source: CatalogueSource::Imported,
+                filters: CatalogueFilters {
+                    q: Some("gpt".to_owned()),
+                    ..CatalogueFilters::default()
+                },
+            },
+            None,
+            Some(&SilentAvailability),
+            StatusScope::Deployment,
+            SystemTime::now(),
+        )
+        .await
+        .expect("a silent availability reader is still readable");
+        assert!(view.pending.contains(&PendingFact::OfferingMetadata));
+        assert!(
+            view.pending.contains(&PendingFact::Availability),
+            "{:?}",
+            view.pending
+        );
     }
 
     #[tokio::test]
