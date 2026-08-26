@@ -233,7 +233,16 @@ async fn publish_binding_inner(
             .clone(),
         None => DesiredState::new(),
     };
-    let document_scope = plan.document_scope(&head_state)?;
+    let expected = preconditions.expected;
+    let expected_base = load_expected_base(store.as_ref(), expected, head_id).await?;
+    // Scope and probes are the expected-delta's, not head's: a lost-response
+    // retry of first-apply still has a pre-pin expected and must present a
+    // Deployment grant to `apply`.
+    let expected_state = match &expected_base {
+        ExpectedBase::Missing => &head_state,
+        ExpectedBase::State(state) => state,
+    };
+    let document_scope = plan.document_scope(expected_state)?;
     api.authorize(
         &identity,
         AdminAction::Publish,
@@ -250,7 +259,6 @@ async fn publish_binding_inner(
     .await?;
 
     let snapshot = load_active_snapshot(api.catalogue.as_deref()).await?;
-    let expected = preconditions.expected;
     let actor = identity.actor();
     let now = EffectiveInstant::of(SystemTime::now()).unwrap_or(EffectiveInstant::EPOCH);
     let edit = BindingEdit {
@@ -259,7 +267,7 @@ async fn publish_binding_inner(
         now,
     };
 
-    let expected_state = match load_expected_base(store.as_ref(), expected, head_id).await? {
+    let expected_state = match expected_base {
         ExpectedBase::Missing => {
             let grant = api
                 .authorize(
@@ -395,14 +403,14 @@ fn classify(
     document_scope: ResourceScope,
 ) -> Classification {
     let mut probes = BTreeSet::new();
-    let mut needs_deployment = false;
+    let mut needs_deployment_write = false;
     for resource in touched(before, after) {
         probes.insert((Surface::of(resource.reference.kind), resource.scope.clone()));
         if resource.scope == ResourceScope::Deployment {
-            needs_deployment = true;
+            needs_deployment_write = true;
         }
     }
-    let request_scope = if needs_deployment {
+    let request_scope = if needs_deployment_write {
         ResourceScope::Deployment
     } else {
         document_scope
