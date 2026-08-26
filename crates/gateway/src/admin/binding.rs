@@ -350,24 +350,14 @@ async fn load_active_snapshot(
             "no catalogue store is attached",
         ));
     };
-    let loaded = store
-        .load()
-        .await
-        .map_err(|error| AdminError::ControlPlaneUnavailable {
-            detail: error.to_string(),
-        })?;
+    let loaded = store.load().await.map_err(AdminError::from_catalog_store)?;
     let Some(active) = loaded.active else {
         return Err(refused(
             RULE_CATALOGUE_NOT_IMPORTED,
             "no imported catalogue is active",
         ));
     };
-    hydrate(&active).map_err(|error| {
-        refused(
-            RULE_CATALOGUE_NOT_IMPORTED,
-            &format!("the active catalogue could not be hydrated: {error}"),
-        )
-    })
+    hydrate(&active).map_err(AdminError::from_catalog_hydration)
 }
 
 enum ExpectedBase {
