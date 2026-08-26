@@ -2003,7 +2003,7 @@ mod tests {
         );
     }
 
-    fn nested<'a>(args: &'a ArgMatches) -> (&'a str, &'a ArgMatches) {
+    fn nested(args: &ArgMatches) -> (&str, &ArgMatches) {
         args.subcommand().expect("a subcommand")
     }
 
