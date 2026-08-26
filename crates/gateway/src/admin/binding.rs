@@ -31,7 +31,7 @@ use crate::desired_state::{
     ModelEnablementBody, ModelLifecycle, ModelOwner, MutationKind, ObservedPrice, OfferingId,
     PriceBookBody, PriceBooks, PriceOrigin, PriceProvenance, PriceRule, PricedTarget, ProjectBody,
     ProjectId, ProviderBody, ResourceId, ResourceKind, ResourceRef, ResourceScope, ResourceVersion,
-    ResourceVersionNumber, Slug, Surface, TenantId, Uuid7, ValidationError,
+    ResourceVersionNumber, RulePrecedence, Slug, Surface, TenantId, Uuid7, ValidationError,
 };
 use crate::telemetry::metrics::{record_binding, record_binding_refusal};
 
@@ -1423,7 +1423,6 @@ fn replace_baseline_from(
     Ok(next)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn ensure_enablement(
     state: &mut DesiredState,
