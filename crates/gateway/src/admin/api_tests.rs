@@ -1685,14 +1685,15 @@ async fn the_management_catalogue_reports_what_a_tenant_published() {
     assert_eq!(aliases.len(), 1, "{view}");
     assert_eq!(aliases[0]["slug"], "default");
     assert_eq!(aliases[0]["scope"]["kind"], "project");
-    assert_eq!(aliases[0]["routable"], json!(true));
+    assert_eq!(aliases[0]["routable"], json!(false));
     assert_eq!(aliases[0]["unavailable"], json!([]));
     assert_eq!(aliases[0]["targets"].as_array().unwrap().len(), 1);
     // Offering metadata was not consultable, so Unpriced is pending rather than
-    // a definitive verdict. billable stays false and agrees with price.
+    // a definitive verdict. billable stays false and agrees with price; routable
+    // requires a covering compiled price.
     assert_eq!(entry["billable"], json!(false));
     assert!(entry.get("price").is_none(), "{entry}");
-    assert_eq!(entry["routable"], json!(true));
+    assert_eq!(entry["routable"], json!(false));
     assert_eq!(entry["unavailable"], json!([]));
     assert_eq!(
         view["pending"],

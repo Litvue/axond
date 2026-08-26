@@ -324,15 +324,18 @@ pub struct CatalogueEntry {
     /// Whether this row is the one in effect for the scope that was read. False
     /// for a tenant default a project override replaces.
     pub effective: bool,
-    /// Whether a caller could invoke it right now: in effect, enabled, priced,
-    /// and named by at least one alias.
+    /// Whether a caller could invoke it right now: in effect, enabled, **priced**
+    /// (`billable`), and named by at least one alias. Empty `unavailable` is
+    /// necessary but not sufficient when offering metadata is pending.
     pub routable: bool,
     /// Whether a compiled price covers this offering. True only when
     /// [`Self::price`] is present.
     pub billable: bool,
     /// The alias names, in this scope, that resolve to this enablement.
     pub aliases: Vec<String>,
-    /// Why it is not routable, in a stable order. Empty when it is.
+    /// Why it is not routable, in a stable order. Empty when it is routable;
+    /// may also be empty when `routable` is false because a pending fact is the
+    /// reason rather than a definitive [`UnavailableReason::Unpriced`] verdict.
     pub unavailable: Vec<UnavailableReason>,
     /// Operator warnings that do not make the offering unroutable.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -372,7 +375,9 @@ pub struct CatalogueAlias {
     /// Whether at least one exact ordered target is enabled and covered by a
     /// compiled price.
     pub routable: bool,
-    /// Why this alias cannot currently route. Empty when `routable` is true.
+    /// Why this alias cannot currently route. Empty when `routable` is true;
+    /// may also be empty when targets are pending offering metadata rather than
+    /// definitively [`AliasUnavailableReason::UnpricedTarget`].
     pub unavailable: Vec<AliasUnavailableReason>,
     /// Ordered enablement references. The order is the failover priority and is
     /// therefore part of the response contract rather than a set.
@@ -601,7 +606,7 @@ impl CatalogueView {
                 wire_family: enablement.body.wire_family().as_str(),
                 state: enablement.body.state().as_str(),
                 effective: !shadowed,
-                routable: unavailable.is_empty(),
+                routable: unavailable.is_empty() && billable,
                 billable,
                 aliases,
                 unavailable,
@@ -867,6 +872,9 @@ fn alias_status(
             unavailable.push(AliasUnavailableReason::UnpricedTarget);
             continue;
         }
+        if !context.is_some_and(|context| context.billable) {
+            continue;
+        }
         routable = true;
         break;
     }
@@ -1009,7 +1017,8 @@ mod tests {
     }
 
     /// The acceptance gate (IG-10) in one test: a tenant reads its own catalogue
-    /// and nobody else's, and every row that is not routable says why.
+    /// and nobody else's. Definitive unroutable reasons live in `unavailable`;
+    /// pending facts (`offering-metadata`) explain unroutable-with-empty-unavailable.
     ///
     /// Isolation is asserted against a *sibling with the same offering*: the other
     /// tenant enables `gpt-4o` too, so a projection that leaked would leak a row
@@ -1029,7 +1038,7 @@ mod tests {
         );
 
         let enabled = entry(&view, "gpt-4o");
-        assert!(enabled.routable);
+        assert!(!enabled.routable);
         assert!(!enabled.billable);
         assert!(enabled.price.is_none());
         assert_eq!(enabled.aliases, vec!["fast".to_owned()]);
@@ -1179,7 +1188,7 @@ mod tests {
         );
         assert_eq!(alias.wire_family, WireFamily::OpenaiChat.as_str());
         assert_eq!(alias.state, ModelLifecycle::Enabled.as_str());
-        assert!(alias.routable);
+        assert!(!alias.routable);
         assert!(alias.unavailable.is_empty());
         assert_eq!(
             alias.targets,
@@ -1415,10 +1424,12 @@ mod tests {
         assert!(!enabled.billable);
         assert!(enabled.price.is_none());
         assert_eq!(enabled.billable, enabled.price.is_some());
+        assert!(!enabled.routable);
         assert!(
             !enabled.unavailable.contains(&UnavailableReason::Unpriced),
             "{enabled:?}"
         );
+        assert!(!view.aliases[0].routable);
         assert!(view.aliases[0].unavailable.is_empty());
     }
 
