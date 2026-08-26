@@ -127,6 +127,25 @@ pub enum BindingPrice {
     Observed(String),
 }
 
+impl BindingResource {
+    /// Parse-time path label; [`BindingPlan::path`] is unavailable until parse succeeds.
+    fn path(&self) -> &'static str {
+        let local = match self {
+            Self::One(one) => one
+                .targets
+                .iter()
+                .any(|target| target.source.as_deref() == Some("local")),
+            Self::Many(many) => many.models.iter().any(|model| {
+                model
+                    .targets
+                    .iter()
+                    .any(|target| target.source.as_deref() == Some("local"))
+            }),
+        };
+        if local { "local" } else { "imported" }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PinMode {
     Follow,
@@ -265,11 +284,12 @@ async fn publish_binding_inner(
         });
     }
     let summary = super::protocol::AuditSummary::parse(&envelope.summary)?;
+    let parse_path = envelope.resource.path();
     let plan = match BindingPlan::from_resource(envelope.resource, envelope.mutation.kind()) {
         Ok(plan) => plan,
         Err(error) => {
             if let AdminError::BindingRefused { rule, .. } = &error {
-                record_binding("refused", "imported");
+                record_binding("refused", parse_path);
                 record_binding_refusal(rule);
             }
             return Err(error);
@@ -1751,5 +1771,57 @@ mod tests {
             digest,
         );
         assert_ne!(slug, other);
+    }
+
+    fn observed_target(source: Option<&str>) -> BindingTarget {
+        BindingTarget {
+            provider: "vllm".into(),
+            model: "llama".into(),
+            catalog: None,
+            price: Some(BindingPrice::Observed("observed".into())),
+            source: source.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn parse_time_path_is_local_when_source_local_even_if_from_resource_refuses() {
+        let one = BindingResource::One(BindingOne {
+            tenant: "ten".into(),
+            project: None,
+            pin: None,
+            name: None,
+            state: None,
+            targets: vec![observed_target(Some("local"))],
+        });
+        assert_eq!(one.path(), "local");
+        match BindingPlan::from_resource(one, MutationKind::Create) {
+            Err(AdminError::BindingRefused { rule, .. }) => {
+                assert_eq!(rule, RULE_OBSERVED_UNBILLABLE);
+            }
+            other => panic!("expected observed_unbillable, got {other:?}"),
+        }
+
+        let many = BindingResource::Many(BindingMany {
+            tenant: "ten".into(),
+            project: None,
+            pin: None,
+            models: vec![BindingModel {
+                name: None,
+                state: None,
+                pin: None,
+                targets: vec![observed_target(Some("local"))],
+            }],
+        });
+        assert_eq!(many.path(), "local");
+
+        let imported = BindingResource::One(BindingOne {
+            tenant: "ten".into(),
+            project: None,
+            pin: None,
+            name: None,
+            state: None,
+            targets: vec![observed_target(None)],
+        });
+        assert_eq!(imported.path(), "imported");
     }
 }
