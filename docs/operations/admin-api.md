@@ -3,7 +3,9 @@
 In `mode = "stateful"` ([ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md))
 a deployment's tenants, projects, providers, credentials, catalogues, model
 enablements, aliases, and policy are owned by the Postgres control plane and
-changed through `/admin/v1` — the same surface `axond admin` calls. TOML still
+changed through `/admin/v1` — the same surface `axond admin` calls. Making a
+model callable is `axond admin model apply` (`POST /admin/v1/bindings`), not
+four separately authored resources. TOML still
 owns bootstrap: the listener, transport and admission bounds, telemetry, the
 control-plane and secret-store connections, and the breakglass credential. None
 of those are publishable through this API, and no administrative read happens on
@@ -51,6 +53,91 @@ unreachable or reject the credential it expects — so route `/admin/v1/status`
 with the inference listener and the rest of the prefix with the administrative
 one. The method contract is uniform either way: a wrong method on it answers
 `405 admin_method_not_allowed`, like every other path under the prefix.
+
+## Make a model available
+
+A model is a provider connection plus the published id that connection serves,
+and a price. Apply it. Callers send that same id. `GET /v1/models` lists it.
+
+The provider connection and credential must already exist. Import does not
+enable, alias, or price anything. Browse, then one apply:
+
+```console
+$ export AXOND_ADMIN_TOKEN=...
+$ export AXOND_ADMIN_ENDPOINT=https://axond.internal:8080
+$ axond admin catalog browse --tenant ten_01J... --provider openai --q gpt-4o
+$ axond admin model apply --tenant ten_01J... --project prj_01J... \
+    --target openai:gpt-4o \
+    --price-input 2500000 --price-output 10000000
+```
+
+Omit `--name`. The alias is `gpt-4o`. `--from-catalogue openai/gpt-4o` is the
+same document with an explicit catalogue identity; it still requires
+`--provider` for the connection (not guessed). `--price observed` adopts
+imported rates instead of stating them. `--file` is a `[[model]]` TOML fragment
+(not a full `axond.toml`) or a binding JSON object.
+
+The CLI GETs `/admin/v1/catalogue?tenant=…` for `x-axond-expected-revision`
+(`empty` when nothing has been published) and mints `idempotency-key`. A
+workload caller then lists and invokes the published id:
+
+```console
+$ curl --fail -H 'Authorization: Bearer <workload-key>' \
+    "$AXOND_ADMIN_ENDPOINT/v1/models"
+$ curl "$AXOND_ADMIN_ENDPOINT/v1/chat/completions" \
+    -H 'Authorization: Bearer <workload-key>' \
+    -H 'content-type: application/json' \
+    -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
+```
+
+Expected `/v1/models` listing: `{"data":[{"id":"gpt-4o",...}],"object":"list"}`.
+
+That POST is `/admin/v1/bindings`. The flattened document is:
+
+```json
+{
+  "summary": "enable gpt-4o",
+  "mutation": "create",
+  "resource": {
+    "tenant": "ten_01J...",
+    "project": "prj_01J...",
+    "targets": [
+      {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "price": {
+          "input_microdollars_per_million": 2500000,
+          "output_microdollars_per_million": 10000000
+        }
+      }
+    ]
+  }
+}
+```
+
+`price` may be that object or `"observed"`. `pin` defaults to `follow`.
+`mutation: "delete"` is refused (`admin_request_invalid`); withdraw with
+`axond admin model disable --tenant ten_01J... --project prj_01J... --name gpt-4o`
+(`update` + `state: disabled`). Identical re-apply is `result: "unchanged"`
+when the expected revision still matches head. After a background import
+advances the snapshot, the same apply disables the old pin and retargets the
+alias. Changing stated rates once a book rule already covers the offering is
+`binding_refused` / `price_change_requires_interval`.
+
+The public example is **one imported target** whose connection slug is the
+catalogue provider. An alias may list another imported target only when that
+target's slug is *that* catalogue provider (a different published id). Two
+connections for one offering are not this path. Operator-authored vLLM or Azure
+deployment ids need a local catalogue snapshot, which this imported apply does
+not create.
+
+First pin and any book write are a deployment act (PlatformAdmin / breakglass).
+TenantAdmin and Operator may attach a name only to an already-pinned,
+already-priced offering.
+
+`axond admin apply --resource {catalogs,models,aliases,prices}` remains the
+expert graph. It is not the happy path; see the
+[appendix](#appendix-expert-four-resource-publications).
 
 ## Authentication
 
@@ -104,7 +191,8 @@ Two preconditions are required on every write:
 | `x-axond-expected-revision` | The revision the change was written against, or `empty` for a control plane that has never published. A stale value is `409 revision_conflict`, which names the current head. |
 | `x-axond-dry-run` | Optional. `true` validates and diffs without publishing or recording anything. |
 
-The response is the same shape whether it published, replayed, or dry-ran:
+The response is the same shape whether it published, replayed, was unchanged,
+or dry-ran:
 
 ```json
 {
@@ -131,17 +219,18 @@ record, or a state read.
 | `/admin/v1/audit/{revision}` | `GET` | One revision's actor, summary, and recorded changes. |
 | `/admin/v1/convergence` | `GET` | What this replica has loaded and activated, from its own cached status — never a control-plane read. |
 | `/admin/v1/availability` | `GET` | What this replica derives about one scope's models. `?tenant=` is required, `?project=` optional; answered from the snapshot it is serving and its own circuits — never a control-plane read. |
-| `/admin/v1/catalogue` | `GET` | One tenant's management catalogue: what it has enabled, imported offerings (`?source=imported`), and why a model is not routable. `?tenant=` is required. |
+| `/admin/v1/catalogue` | `GET` | One tenant's management catalogue: what it has enabled, imported offerings (`?source=imported`), and why a model is not routable, including `not-enabled`. `?tenant=` is required. |
 | `/admin/v1/catalogue/refresh` | `POST` | Import now. A write without a revision: no idempotency key, no expected-revision. Last-known-good stays active on refusal. |
+| `/admin/v1/bindings` | `POST` | One imported model: pin, enablement, price, and alias as one revision. The happy path. |
 | `/admin/v1/tenants` | `POST` | A tenant and its lifecycle. |
 | `/admin/v1/projects` | `POST` | A project (namespace) inside a tenant. |
 | `/admin/v1/principals` | `POST` | A durable workload or human identity. Workloads carry only a key digest; humans carry an explicit issuer-scoped subject. Key material is never returned. |
 | `/admin/v1/providers` | `POST` | A provider connection: wire family and endpoint. |
 | `/admin/v1/credentials` | `POST` | A provider credential: a secret reference and its lifecycle. |
-| `/admin/v1/catalogs` | `POST` | A provider's model catalogue snapshot. |
-| `/admin/v1/models` | `POST` | A model enablement and its observed price. |
-| `/admin/v1/aliases` | `POST` | A routing alias and its ordered targets. |
-| `/admin/v1/prices` | `POST` | A deployment PriceBook. Approval records the authenticated actor and effective rates are compiled into the serving snapshot. |
+| `/admin/v1/catalogs` | `POST` | Expert: a provider's model catalogue snapshot. |
+| `/admin/v1/models` | `POST` | Expert: a model enablement and its observed price. |
+| `/admin/v1/aliases` | `POST` | Expert: a routing alias and its ordered targets. |
+| `/admin/v1/prices` | `POST` | Expert: a deployment PriceBook. Approval records the authenticated actor and effective rates are compiled into the serving snapshot. |
 | `/admin/v1/policies` | `POST` | Budgets, concurrency limits, token epoch, and ordered content-middleware registrations for a scope. |
 | `/admin/v1/rollback` | `POST` | Republish an earlier revision's complete state as a *new* revision. |
 | `/admin/v1/secrets` | `POST` | Store credential material as a new secret's first version, staged. |
@@ -345,7 +434,7 @@ there is no “last value wins” interpretation for a catalogue filter.
     {
       "alias": "res_...",
       "version": 1,
-      "slug": "default",
+      "slug": "gpt-4o",
       "scope": { "kind": "project", "tenant": "...", "project": "..." },
       "wire_family": "openai-chat",
       "state": "enabled",
@@ -367,10 +456,10 @@ there is no “last value wins” interpretation for a catalogue filter.
       "wire_family": "openai-chat",
       "state": "enabled",
       "effective": true,
-      "routable": false,
-      "billable": false,
-      "aliases": ["default"],
-      "unavailable": ["unpriced"],
+      "routable": true,
+      "billable": true,
+      "aliases": ["gpt-4o"],
+      "unavailable": [],
       "metadata": {
         "provider": "openai",
         "model": "gpt-4o",
@@ -490,10 +579,13 @@ code rather than on prose:
 
 `stateful_mode_required`, `admin_unauthenticated`, `admin_forbidden`,
 `revision_conflict`, `idempotency_key_reused`, `validation_failed`,
-`admin_request_invalid`, `history_limit_invalid`, `control_plane_unavailable`,
+`admin_request_invalid`, `binding_refused`, `history_limit_invalid`,
+`control_plane_unavailable`,
 and the rest of the vocabulary are listed in `AdminError::CODES`, which a test
-holds in step with the enum. Operator detail — a backend's message, a store's
-DSN — is logged, never serialized.
+holds in step with the enum. `binding_refused` carries a stable `rule` (for
+example `not_in_catalogue`, `price_required`, `catalogue_identity_required`).
+Operator detail — a backend's message, a store's DSN — is logged, never
+serialized.
 
 `name_taken` is the one refusal an operator most often meets by accident: a
 `409` saying that the slug a tenant or project asked for is already projected to
@@ -576,44 +668,28 @@ Withdrawal has two strengths:
   credential that no longer resolves it, then destroy. The plaintext a running
   replica already resolved is zeroized once no active snapshot holds it.
 
-### Refreshing a model catalogue
-
-A catalogue resource *is* its snapshot: an enablement records the digest it read
-an offering from, and that pin is immutable, because re-pointing it is how a
-published alias's meaning would change underneath its callers. Re-importing
-different content under a catalogue an enablement reads from is therefore
-refused with `validation_failed` and the rule `pinned_snapshot_withdrawn`,
-naming the enablement that holds the pin.
-
-The refresh is published alongside the old snapshot instead:
-
-```console
-$ axond admin apply --resource catalogs --file catalogue-2026-08.json ...   # a new catalogue id
-$ axond admin apply --resource models   --file retire-gpt-4o.json ...       # "state": "disabled"
-$ axond admin apply --resource models   --file enable-gpt-4o-2026-08.json ...
-$ axond admin apply --resource aliases  --file retarget-default.json ...
-```
-
-Disabling the old enablement is what frees the offering for its replacement: a
-disabled enablement resolves to nothing, so it holds no offering, while every
-revision that served it stays readable and auditable. Aliases keep pointing at
-the enablement they name until they are retargeted, so the switchover is one
-alias publication and its rollback is another.
-
 ## `axond admin`
 
 The CLI is an HTTP client for the routes above and deliberately nothing more: it
 never opens the control plane, so there is no command that can publish without
-the same key, precondition, identity, and validation the API enforces.
+the same identity and validation the API enforces. Model changes go through
+`axond admin model apply`, which fills the mutation preconditions.
 
 ```console
 $ export AXOND_ADMIN_TOKEN=...            # never a flag: flags reach `ps` and shell history
 $ export AXOND_ADMIN_ENDPOINT=https://axond.internal:8080
+$ axond admin catalog browse --tenant ten_01J... --provider openai --q gpt
+$ axond admin catalog refresh
+$ axond admin model apply --tenant ten_01J... --project prj_01J... \
+    --target openai:gpt-4o \
+    --price-input 2500000 --price-output 10000000
+$ axond admin model show --tenant ten_01J... --name gpt-4o
+$ axond admin model disable --tenant ten_01J... --project prj_01J... --name gpt-4o
 $ axond admin state
 $ axond admin history --limit 20
 $ axond admin audit --revision rev_01J...
 $ axond admin convergence
-$ axond admin resources                   # which documents `apply` accepts
+$ axond admin resources                   # bindings first, then the expert kinds
 ```
 
 `--endpoint` overrides `$AXOND_ADMIN_ENDPOINT`, which overrides
@@ -627,7 +703,10 @@ clear. Loopback is exempt, because there is no wire; a deployment that
 terminates TLS in a sidecar on the same trusted path opts in explicitly with
 `--insecure-plaintext`.
 
-A mutation is a document, from a file or standard input:
+`axond admin apply --resource` is the expert envelope: tenants, providers,
+credentials, and the four-resource model graph. It still requires
+`--idempotency-key` and `--expected-revision` on the command line. A document,
+from a file or standard input:
 
 ```console
 $ cat > tenant.json <<'JSON'
@@ -676,6 +755,37 @@ $ axond admin secret versions  --secret sct_01J... --tenant ten_01J...
 
 One trailing newline is stripped and nothing else is, so `printf %s` and a file
 written by an editor both store the key the operator holds.
+
+## Appendix: expert four-resource publications
+
+Catalogue pin, enablement, price book, and alias remain as
+`POST /admin/v1/catalogs`, `/models`, `/prices`, and `/aliases`. A binding
+re-apply of the same published id adopts those rows by natural key. Do not
+start here.
+
+A catalogue resource *is* its snapshot: an enablement records the digest it read
+an offering from, and that pin is immutable, because re-pointing it is how a
+published alias's meaning would change underneath its callers. Re-importing
+different content under a catalogue an enablement reads from is therefore
+refused with `validation_failed` and the rule `pinned_snapshot_withdrawn`,
+naming the enablement that holds the pin.
+
+The happy-path refresh is `axond admin catalog refresh` then the same
+`axond admin model apply` (`pin` defaults to `follow`). Publishing the four
+resources by hand is:
+
+```console
+$ axond admin apply --resource catalogs --file catalogue-2026-08.json ...   # a new catalogue id
+$ axond admin apply --resource models   --file retire-gpt-4o.json ...       # "state": "disabled"
+$ axond admin apply --resource models   --file enable-gpt-4o-2026-08.json ...
+$ axond admin apply --resource aliases  --file retarget-gpt-4o.json ...
+```
+
+Disabling the old enablement is what frees the offering for its replacement: a
+disabled enablement resolves to nothing, so it holds no offering, while every
+revision that served it stays readable and auditable. Aliases keep pointing at
+the enablement they name until they are retargeted, so the switchover is one
+alias publication and its rollback is another.
 
 ## Related
 

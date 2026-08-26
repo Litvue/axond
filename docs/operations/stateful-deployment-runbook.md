@@ -182,6 +182,25 @@ curl -fsS -H "Authorization: Bearer $GW_ADMIN_BREAKGLASS" \
   http://127.0.0.1:18080/admin/v1/state >/dev/null
 ~~~
 
+## Publish a model
+
+Once a tenant, project, provider connection, and credential are in the control
+plane, one apply makes a published id callable. Do not author a catalogue pin,
+enablement, price book, and alias as four documents.
+
+~~~bash
+export AXOND_ADMIN_ENDPOINT=http://127.0.0.1:18080
+export AXOND_ADMIN_TOKEN="$GW_ADMIN_BREAKGLASS"
+axond admin catalog browse --tenant ten_01J... --provider openai --q gpt-4o
+axond admin model apply --tenant ten_01J... --project prj_01J... \
+  --target openai:gpt-4o \
+  --price-input 2500000 --price-output 10000000
+~~~
+
+The alias is `gpt-4o`. Projected workload callers then see it on `GET /v1/models`
+and send that same id on a completion. Browse, disable, and the binding document
+are in [administering a stateful deployment](./admin-api.md).
+
 ## Upgrade
 
 An upgrade is a maintenance window for this overlay: Recreate replaces the

@@ -7,7 +7,8 @@ and operate it.
 ## Evaluate Axond
 
 - [Getting started](./getting-started.md) — boot the public image, prove
-  authentication and routing, and make a first provider request.
+  authentication and routing, make a first provider request, and in
+  `mode = "stateful"` apply one imported model (`gpt-4o`).
 - [Compatibility contract](./compatibility.md) — supported routes, provider
   wires, client behavior, and the `0.x` stability policy.
 - [State tiers](./configuration.md#state-tiers) — decide whether a deployment
@@ -33,7 +34,8 @@ and operate it.
 ## Configure
 
 - [Configuration reference](./configuration.md) — every key, default, and
-  validation rule.
+  validation rule. File `[[model]]` is the stateless form; stateful apply uses
+  the same published id (`gpt-4o`).
 - [`axond.example.toml`](../axond.example.toml) — the complete annotated
   configuration surface.
 - [Minted-token guide](./minted-token-guide.md) — key generation, issuance,
@@ -93,13 +95,13 @@ and operate it.
   windows, rollback limits, and the evidence a run leaves behind.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
-- [Administering a stateful deployment](./operations/admin-api.md) — the
-  `/admin/v1` routes and `axond admin`, their preconditions, revision
-  convergence, and the fail-closed bootstrap state before a serving revision is
-  admitted.
+- [Administering a stateful deployment](./operations/admin-api.md) — make a
+  model callable with `axond admin model apply` (`POST /admin/v1/bindings`);
+  `/admin/v1` preconditions, catalogue browse, and the expert four-resource
+  graph in the appendix.
 - [Stateful Kubernetes deployment runbook](./operations/stateful-deployment-runbook.md)
-  — apply, migrate, verify readiness, upgrade, and roll back the shipped
-  stateful overlay.
+  — apply, migrate, verify readiness, publish a model, upgrade, and roll back
+  the shipped stateful overlay.
 - [Billing-grade usage outbox](./operations/usage-outbox.md) — the opt-in durable
   outbox: setup, guarantees, refusals, recovery, poison, upgrades, and alerts.
 - [Control-plane revision journal](./operations/control-plane-journal.md) — the

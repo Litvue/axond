@@ -347,9 +347,12 @@ namespace = "acme"
 # store. See docs/minted-token-guide.md for the complete runbook.
 
 # ── Models (aliases) ──────────────────────────────────────────────────────────
-# Callers send the alias (`gpt-4o`), never `provider/model`. Targets are tried
-# in configured order, failing over to the next on a retryable upstream failure
-# (see `[failover]`). List a fallback provider/model as a second target here.
+# Callers send the published model id (`gpt-4o`), never `provider/model`. That
+# is `name` and what `/v1/models` lists. Targets are tried in configured order,
+# failing over to the next on a retryable upstream failure (see `[failover]`).
+# A second openai-compatible target here is file-config failover. Stateful
+# imported models are one connection whose slug is the catalogue provider:
+# `axond admin model apply` (docs/getting-started.md).
 #
 # Each target MUST carry a `price` (micro-dollars per million tokens). Pricing is
 # what lets budgets be denominated in currency rather than raw tokens — cost is

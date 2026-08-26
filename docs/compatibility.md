@@ -17,7 +17,8 @@ breaking them is a deliberate, documented act — not that they are frozen.
 | `GET /v1/models` | **supported** | the alias catalogue, gated + namespace-scoped | n/a |
 | `GET /v1/credentials` | **supported** | replica-local credential labels and circuit state, scoped | n/a |
 | `GET /admin/v1/status` | **supported** | this replica's cached dependency status, scoped and redacted | n/a |
-| `GET /admin/v1/catalogue` | **supported** (stateful only) | one tenant's management catalogue, read from the published revision | n/a |
+| `GET /admin/v1/catalogue` | **supported** (stateful only) | one tenant's management catalogue, including imported offerings that are not enabled (`unavailable` may contain `not-enabled`) | n/a |
+| `POST /admin/v1/bindings` | **supported** (stateful only) | one imported model expanded into one revision | n/a |
 | `GET /healthz`, `GET /readyz` | **supported** | liveness / readiness text | n/a |
 | `POST /v1/responses` | **supported** | OpenAI Responses, native passthrough | yes |
 
@@ -409,7 +410,11 @@ version 2 transition.
   bootstrap surface is under the `0.x` config or HTTP promise; a stateless deployment
   answers every `/admin/v1` resource path with `501 stateful_mode_required`, with
   `GET /admin/v1/status` the one exception — it is a replica diagnostic rather
-  than a control-plane resource, so it answers in either mode. See
+  than a control-plane resource, so it answers in either mode. `POST
+  /admin/v1/bindings` is an additive route on that surface (older binaries
+  answer `404 admin_route_not_found`). Catalogue `unavailable` gained
+  `not-enabled` for imported-but-not-enabled offerings; existing reasons are
+  unchanged. See
   [administering a stateful deployment](./operations/admin-api.md).
 
 ### Stateful-v2 namespace route transition (first runtime slice implemented)
