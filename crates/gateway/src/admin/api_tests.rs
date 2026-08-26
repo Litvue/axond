@@ -4327,6 +4327,81 @@ async fn a_rate_change_on_existing_coverage_closes_the_predecessor() {
 }
 
 #[tokio::test]
+async fn a_binding_does_not_approve_a_draft_price_book() {
+    let (deployment, snapshot) = imported_deployment().await;
+    let mut expected = foundation(&deployment).await;
+    let digest = snapshot.source.raw.digest;
+    expected = deployment
+        .publish(
+            "/catalogs",
+            "draft-pin",
+            &expected,
+            &json!({
+                "summary": "pin the imported catalogue",
+                "mutation": "create",
+                "resource": {
+                    "catalog": fixtures::resource_id(13).to_string(),
+                    "slug": "openai-models",
+                    "digest": digest.to_string(),
+                    "size_bytes": snapshot.source.raw.size_bytes,
+                }
+            }),
+        )
+        .await;
+    expected = deployment
+        .publish(
+            "/prices",
+            "draft-book",
+            &expected,
+            &json!({
+                "summary": "draft openai gpt-4o",
+                "mutation": "create",
+                "resource": {
+                    "price_book": fixtures::resource_id(31).to_string(),
+                    "slug": "deployment-prices",
+                    "catalog": snapshot.content.content_id().checksum().to_string(),
+                    "catalog_version": 1,
+                    "state": "draft",
+                    "rules": [{
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "precedence": "baseline",
+                        "from_millis": 0,
+                        "input_nano_dollars_per_million": 1_000_000_000u64,
+                        "output_nano_dollars_per_million": 2_000_000_000u64,
+                        "origin": "operator"
+                    }]
+                }
+            }),
+        )
+        .await;
+    let (status, body) = deployment
+        .post("/bindings", "bind-draft", &expected, &binding_document())
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "binding_refused");
+    assert_eq!(body["error"]["rule"], "draft_book_not_approved_by_binding");
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let book = loaded
+        .state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::Price)
+        .expect("a book");
+    let body = PriceBookBody::read(book).expect("readable");
+    assert_eq!(body.approval().state(), "draft");
+    assert_eq!(body.rules().len(), 1);
+    assert_eq!(
+        body.rules()[0].price().input_microdollars_per_million,
+        1_000_000
+    );
+}
+
+#[tokio::test]
 async fn pin_lock_on_first_apply_pins_the_active_digest() {
     let (deployment, snapshot) = imported_deployment().await;
     let expected = foundation(&deployment).await;

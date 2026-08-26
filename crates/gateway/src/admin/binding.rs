@@ -47,6 +47,7 @@ const RULE_CATALOGUE_NOT_IMPORTED: &str = "catalogue_not_imported";
 const RULE_PROJECT_REQUIRED: &str = "project_required";
 const RULE_PIN_LOCKED: &str = "pin_locked";
 const RULE_NOT_LOCAL: &str = "not_local";
+const RULE_DRAFT_BOOK_NOT_APPROVED_BY_BINDING: &str = "draft_book_not_approved_by_binding";
 
 /// One-model flattened form, or `models: [...]`.
 #[derive(Debug, Deserialize)]
@@ -1328,6 +1329,12 @@ fn ensure_book(
     });
     if in_force.is_some_and(|rule| rule.rates() == rates) {
         return Ok(());
+    }
+    if matches!(existing.body.approval(), Approval::Draft) {
+        return Err(refused(
+            RULE_DRAFT_BOOK_NOT_APPROVED_BY_BINDING,
+            "a binding does not approve a draft deployment price book; approve it on /admin/v1/prices first",
+        ));
     }
     let has_history = current
         .iter()
