@@ -265,7 +265,16 @@ async fn publish_binding_inner(
         });
     }
     let summary = super::protocol::AuditSummary::parse(&envelope.summary)?;
-    let plan = BindingPlan::from_resource(envelope.resource, envelope.mutation.kind())?;
+    let plan = match BindingPlan::from_resource(envelope.resource, envelope.mutation.kind()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let AdminError::BindingRefused { rule, .. } = &error {
+                record_binding("refused", "imported");
+                record_binding_refusal(rule);
+            }
+            return Err(error);
+        }
+    };
     let path = plan.path();
     let outcome = publish_parsed_binding(api, identity, preconditions, summary, plan).await;
     record_binding_outcome(&outcome, path);
@@ -542,9 +551,7 @@ async fn retain_local_payloads(
         store
             .retain(retained)
             .await
-            .map_err(|error| AdminError::ControlPlaneUnavailable {
-                detail: error.to_string(),
-            })?;
+            .map_err(AdminError::from_catalog_store)?;
     }
     Ok(())
 }
