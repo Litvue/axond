@@ -93,8 +93,8 @@ pub struct CatalogueFilters {
     /// One offering, by identity. Exact rather than a substring search: the id is
     /// an opaque digest, so a prefix of one means nothing.
     pub offering: Option<OfferingId>,
-    /// `Some(true)` for entries with an approved price, `Some(false)` for those
-    /// without.
+    /// `Some(true)` for entries a compiled price covers, `Some(false)` for those
+    /// it does not.
     pub billable: Option<bool>,
     /// Provider and model facts from the pinned imported catalogue.
     pub provider: Option<String>,
@@ -139,6 +139,7 @@ impl CatalogueRequest {
         entry: &ModelEnablement,
         metadata: Option<&CatalogueMetadata>,
         availability: Option<&super::reads::AvailabilityTarget>,
+        billable: bool,
     ) -> bool {
         let filters = &self.filters;
         let durable = filters
@@ -150,9 +151,7 @@ impl CatalogueRequest {
             && filters
                 .offering
                 .is_none_or(|offering| offering == entry.body.offering().offering)
-            && filters
-                .billable
-                .is_none_or(|billable| billable == entry.body.billable_price().is_some());
+            && filters.billable.is_none_or(|wanted| wanted == billable);
         durable
             && filters.provider.as_deref().is_none_or(|provider| {
                 metadata.is_some_and(|metadata| metadata.provider == provider)
@@ -201,8 +200,9 @@ pub enum UnavailableReason {
     /// effect here" is the question, and the answer is another row in the same
     /// response.
     Shadowed,
-    /// No approved price, so the model could be routed but not billed. An observed
-    /// price is not an approval (ADR 0042).
+    /// Enabled and in effect, but no compiled price covers the offering, so it
+    /// could be routed but not billed. An observed catalogue rate is not an
+    /// approval (ADR 0042).
     Unpriced,
     /// Nothing routes to it: no alias in this scope names this enablement, so no
     /// caller has a name to send.
@@ -306,8 +306,8 @@ pub struct CataloguePrice {
 ///
 /// Identities, scope, lifecycle, and the pinned catalogue coordinates — never a
 /// price amount, and never anything derived from secret material. An amount is
-/// billing state that the price resource owns; what belongs here is whether one
-/// was *approved*, which is what decides routability.
+/// billing state that the price resource owns; what belongs here is whether a
+/// compiled price covers the offering, which is what decides routability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CatalogueEntry {
     /// The opaque offering identity, as an enablement names it.
@@ -326,12 +326,15 @@ pub struct CatalogueEntry {
     /// Whether a caller could invoke it right now: in effect, enabled, priced,
     /// and named by at least one alias.
     pub routable: bool,
-    /// Whether an approved price makes it billable.
+    /// Whether a compiled price covers this offering.
     pub billable: bool,
     /// The alias names, in this scope, that resolve to this enablement.
     pub aliases: Vec<String>,
     /// Why it is not routable, in a stable order. Empty when it is.
     pub unavailable: Vec<UnavailableReason>,
+    /// Operator warnings that do not make the offering unroutable.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<CatalogueNotice>,
     /// The exact provider offering resolved from the pinned imported snapshot.
     /// `None` means the catalogue store was unavailable, the pin was withdrawn,
     /// or the snapshot published more than one callable id for this opaque id.
@@ -364,8 +367,8 @@ pub struct CatalogueAlias {
     pub scope: ScopeView,
     pub wire_family: &'static str,
     pub state: &'static str,
-    /// Whether at least one exact ordered target is enabled and backed by an
-    /// approved price.
+    /// Whether at least one exact ordered target is enabled and covered by a
+    /// compiled price.
     pub routable: bool,
     /// Why this alias cannot currently route. Empty when `routable` is true.
     pub unavailable: Vec<AliasUnavailableReason>,
@@ -397,7 +400,7 @@ pub enum AliasUnavailableReason {
     NoTargets,
     /// A target exists but its enablement is withdrawn.
     DisabledTarget,
-    /// A target is enabled but has no approved price, so it cannot be billed.
+    /// A target is enabled but no compiled price covers it, so it cannot be billed.
     UnpricedTarget,
 }
 
@@ -422,6 +425,18 @@ impl AliasUnavailableReason {
 impl Serialize for AliasUnavailableReason {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
+    }
+}
+
+/// An operator warning that does not make the offering unroutable.
+///
+/// Closed vocabulary; this read never emits a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CatalogueNotice {}
+
+impl Serialize for CatalogueNotice {
+    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {}
     }
 }
 
@@ -494,12 +509,16 @@ impl CatalogueView {
             let price = metadata.as_ref().and_then(|metadata| {
                 price_metadata(book.as_ref(), pricing.as_ref(), metadata, now)
             });
+            let billable = metadata
+                .as_ref()
+                .is_some_and(|metadata| offering_is_billable(pricing.as_ref(), metadata));
             contexts.insert(
                 enablement.reference.id,
                 EntryContext {
                     metadata,
                     price,
                     availability,
+                    billable,
                 },
             );
         }
@@ -534,17 +553,19 @@ impl CatalogueView {
         let models = Models::of(revision.state()).map_err(|error| unreadable(revision, &error))?;
         let alias_statuses: BTreeMap<ResourceId, AliasStatus> = models
             .aliases()
-            .map(|alias| (alias.reference.id, alias_status(&models, alias)))
+            .map(|alias| (alias.reference.id, alias_status(&models, alias, contexts)))
             .collect();
         let mut entries = Vec::new();
         for enablement in models.enablements() {
             let owner = enablement.body.owner();
             let context = contexts.get(&enablement.reference.id);
+            let billable = context.is_some_and(|context| context.billable);
             if !request.covers(owner)
                 || !request.admits(
                     enablement,
                     context.and_then(|context| context.metadata.as_ref()),
                     context.and_then(|context| context.availability.as_ref()),
+                    billable,
                 )
             {
                 continue;
@@ -563,7 +584,7 @@ impl CatalogueView {
             if shadowed {
                 unavailable.push(UnavailableReason::Shadowed);
             }
-            if enablement.body.billable_price().is_none() {
+            if enablement.body.is_enabled() && !shadowed && !billable {
                 unavailable.push(UnavailableReason::Unpriced);
             }
             if aliases.is_empty() {
@@ -580,9 +601,10 @@ impl CatalogueView {
                 state: enablement.body.state().as_str(),
                 effective: !shadowed,
                 routable: unavailable.is_empty(),
-                billable: enablement.body.billable_price().is_some(),
+                billable,
                 aliases,
                 unavailable,
+                notices: Vec::new(),
                 metadata: context.and_then(|context| context.metadata.clone()),
                 price: context.and_then(|context| context.price.clone()),
                 availability: context.and_then(|context| context.availability.clone()),
@@ -645,6 +667,7 @@ struct EntryContext {
     metadata: Option<CatalogueMetadata>,
     price: Option<CataloguePrice>,
     availability: Option<super::reads::AvailabilityTarget>,
+    billable: bool,
 }
 
 fn pending_facts(metadata: bool, availability: bool) -> Vec<PendingFact> {
@@ -717,6 +740,13 @@ fn offering_metadata(
         input_tokens: facts.limits.input_tokens,
         output_tokens: facts.limits.output_tokens,
     })
+}
+
+fn offering_is_billable(pricing: Option<&PricingSnapshot>, metadata: &CatalogueMetadata) -> bool {
+    ProviderId::parse(&metadata.provider)
+        .ok()
+        .and_then(|provider| pricing?.price(&provider, &metadata.published_model))
+        .is_some()
 }
 
 fn price_metadata(
@@ -811,7 +841,11 @@ fn aliases_naming(
 /// permits either target and keeps the ordered references intact. Effective
 /// enablement precedence belongs to unaliased model resolution, not to alias
 /// target interpretation.
-fn alias_status(models: &Models, alias: &ModelAlias) -> AliasStatus {
+fn alias_status(
+    models: &Models,
+    alias: &ModelAlias,
+    contexts: &BTreeMap<ResourceId, EntryContext>,
+) -> AliasStatus {
     if !alias.body.is_enabled() {
         return AliasStatus {
             routable: false,
@@ -834,7 +868,10 @@ fn alias_status(models: &Models, alias: &ModelAlias) -> AliasStatus {
             unavailable.push(AliasUnavailableReason::DisabledTarget);
             continue;
         }
-        if enablement.body.billable_price().is_none() {
+        if !contexts
+            .get(&enablement.reference.id)
+            .is_some_and(|context| context.billable)
+        {
             unavailable.push(AliasUnavailableReason::UnpricedTarget);
             continue;
         }
@@ -876,16 +913,26 @@ fn unreadable(revision: &LoadedRevision, error: &ModelError) -> AdminError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::catalog::{RawPayload, SourceValidators};
+    use crate::backends::catalog_store::{InMemoryCatalogStore, RetainedCatalog};
+    use crate::backends::models_dev::ModelsDevAdapter;
     use crate::desired_state::fixtures::{
-        alias_body, approved_price, blob_backed_catalog, candidate, catalog_reference,
-        enablement_body, offering_id, price, project, project_enablement, project_id, reference,
-        revision_id, tenant, tenant_id, typed_alias,
+        actor, alias_body, approved_price, blob_backed_catalog, candidate, catalog_reference,
+        enablement_body, offering_id, price, price_rule, priced_target, project,
+        project_enablement, project_id, reference, resource_id, revision_id, tenant, tenant_id,
+        typed_alias,
     };
     use crate::desired_state::{
-        DesiredState, ExpectedRevision, ProjectId, RevisionManifest, Slug, TenantId,
+        Approval, BlobKind, BlobRef, CatalogOffering, DesiredState, EffectiveInstant,
+        EffectiveInterval, ExpectedRevision, ModelEnablementBody, OfferingId, PriceBookBody,
+        ProjectId, ResourceBody, ResourceKind, ResourceScope, ResourceVersion,
+        ResourceVersionNumber, RevisionManifest, RulePrecedence, Slug, TenantId,
     };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// A revision two tenants publish into: one has priced, aliased, shadowed, and
+    const CATALOG: &str = include_str!("../backends/fixtures/models_dev/catalog.identity.json");
+
+    /// A revision two tenants publish into: one has aliased, shadowed, and
     /// withdrawn enablements; the other has an enablement of the *same* offering,
     /// so an isolation assertion cannot pass by the offering id being distinct.
     fn published() -> LoadedRevision {
@@ -989,25 +1036,20 @@ mod tests {
             view.entries
         );
 
-        let priced = entry(&view, "gpt-4o");
-        assert!(priced.routable);
-        assert!(priced.billable);
-        assert_eq!(priced.aliases, vec!["fast".to_owned()]);
-        assert!(priced.unavailable.is_empty());
+        let enabled = entry(&view, "gpt-4o");
+        assert!(!enabled.routable);
+        assert!(!enabled.billable);
+        assert_eq!(enabled.aliases, vec!["fast".to_owned()]);
+        assert_eq!(enabled.unavailable, vec![UnavailableReason::Unpriced]);
 
-        // Withdrawn, unpriced, and unnamed: three independent reasons, each one a
-        // separate administrative act to clear, so the read states all three
-        // rather than the first.
+        // Withdrawn and unnamed: unpriced is only reported when the row is
+        // enabled and in effect.
         let withdrawn = entry(&view, "gpt-4o-mini");
         assert!(!withdrawn.routable);
         assert_eq!(withdrawn.state, "disabled");
         assert_eq!(
             withdrawn.unavailable,
-            vec![
-                UnavailableReason::Disabled,
-                UnavailableReason::Unpriced,
-                UnavailableReason::Unaliased,
-            ]
+            vec![UnavailableReason::Disabled, UnavailableReason::Unaliased,]
         );
     }
 
@@ -1103,7 +1145,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.slug.as_str())
                 .collect::<Vec<_>>(),
-            vec!["gpt-4o-mini"]
+            vec!["gpt-4o", "gpt-4o-mini"]
         );
 
         let one = filtered(
@@ -1146,8 +1188,11 @@ mod tests {
         );
         assert_eq!(alias.wire_family, WireFamily::OpenaiChat.as_str());
         assert_eq!(alias.state, ModelLifecycle::Enabled.as_str());
-        assert!(alias.routable);
-        assert!(alias.unavailable.is_empty());
+        assert!(!alias.routable);
+        assert_eq!(
+            alias.unavailable,
+            vec![AliasUnavailableReason::UnpricedTarget]
+        );
         assert_eq!(
             alias.targets,
             vec![CatalogueAliasTarget {
@@ -1164,9 +1209,16 @@ mod tests {
         let acme = tenant_id(1);
         let core = project_id(2);
 
+        let compiled = BTreeMap::from([(
+            crate::desired_state::fixtures::resource_id(30),
+            EntryContext {
+                billable: true,
+                ..EntryContext::default()
+            },
+        )]);
         let exact_default = models.aliases().next().expect("the fixture alias");
         assert_eq!(
-            alias_status(&models, exact_default),
+            alias_status(&models, exact_default, &compiled),
             AliasStatus {
                 routable: true,
                 unavailable: Vec::new(),
@@ -1188,7 +1240,7 @@ mod tests {
             ),
         };
         assert_eq!(
-            alias_status(&models, &unpriced).unavailable,
+            alias_status(&models, &unpriced, &compiled).unavailable,
             vec![AliasUnavailableReason::UnpricedTarget]
         );
 
@@ -1206,7 +1258,7 @@ mod tests {
             ),
         };
         assert_eq!(
-            alias_status(&models, &withdrawn).unavailable,
+            alias_status(&models, &withdrawn, &compiled).unavailable,
             vec![AliasUnavailableReason::DisabledTarget]
         );
 
@@ -1224,7 +1276,7 @@ mod tests {
             ),
         };
         assert_eq!(
-            alias_status(&models, &fallback),
+            alias_status(&models, &fallback, &compiled),
             AliasStatus {
                 routable: true,
                 unavailable: Vec::new(),
@@ -1284,6 +1336,118 @@ mod tests {
         let stranger = read(tenant_id(7), None);
         assert!(stranger.revision.is_some());
         assert!(stranger.entries.is_empty());
+    }
+
+    /// Compiled `PricingSnapshot::price` decides `billable`, not the enablement
+    /// pointer. Before this, a covering book produced the admin-api.md lie:
+    /// `price` present, `billable` false, `unavailable` contains `unpriced`.
+    #[tokio::test]
+    async fn a_covering_book_is_billable_without_an_enablement_price_pointer() {
+        let (revision, store) = covering_book().await;
+        let models = Models::of(revision.state()).expect("the fixture models are valid");
+        let enablement = models
+            .enablement(resource_id(30))
+            .expect("the enablement is present");
+        assert!(
+            enablement.body.billable_price().is_none(),
+            "the lie is a covering book with no approved_price pointer"
+        );
+
+        let view = CatalogueView::of_with_context(
+            Some(&revision),
+            &CatalogueRequest {
+                tenant: tenant_id(1),
+                project: None,
+                filters: CatalogueFilters::default(),
+            },
+            Some(&store),
+            None,
+            StatusScope::Deployment,
+            SystemTime::now(),
+        )
+        .await
+        .expect("the covering-book revision is readable");
+        let entry = entry(&view, "gpt-4o");
+        assert!(entry.price.is_some(), "{entry:?}");
+        assert!(entry.billable, "{entry:?}");
+        assert!(
+            !entry.unavailable.contains(&UnavailableReason::Unpriced),
+            "{entry:?}"
+        );
+        assert!(entry.notices.is_empty());
+        let encoded = serde_json::to_value(entry).expect("serializable");
+        assert!(encoded.get("notices").is_none());
+        assert_eq!(view.aliases.len(), 1);
+        assert!(view.aliases[0].routable);
+        assert!(view.aliases[0].unavailable.is_empty());
+    }
+
+    async fn covering_book() -> (LoadedRevision, InMemoryCatalogStore) {
+        let snapshot = ModelsDevAdapter::default()
+            .parse(CATALOG.as_bytes(), SourceValidators::default(), UNIX_EPOCH)
+            .expect("the catalogue fixture parses");
+        let acme = tenant_id(1);
+        let core = project_id(2);
+        let catalog_reference = reference(ResourceKind::CatalogModel, 5);
+        let catalog = ResourceVersion::new(
+            catalog_reference,
+            ResourceScope::Deployment,
+            slug("models-dev"),
+            ResourceBody::Blob(BlobRef::of(BlobKind::CatalogSnapshot, CATALOG.as_bytes())),
+        );
+        let offering = CatalogOffering::new(
+            OfferingId::of("openai", "openai/gpt-5.5").expect("an offering id"),
+            snapshot.source.raw.digest,
+        );
+        let default = ModelEnablementBody::new(
+            resource_id(30),
+            ModelOwner::tenant(acme),
+            offering,
+            WireFamily::OpenaiChat,
+        )
+        .version(slug("gpt-4o"), catalog_reference);
+        let book = PriceBookBody::new(
+            snapshot.content.content_id(),
+            ResourceVersionNumber::FIRST,
+            Approval::Approved {
+                by: actor(),
+                at: EffectiveInstant::EPOCH,
+                citation: None,
+            },
+        )
+        .with_rule(price_rule(
+            priced_target("openai", "openai/gpt-5.5"),
+            RulePrecedence::Baseline,
+            EffectiveInterval::from(EffectiveInstant::EPOCH),
+            2_500_000,
+            10_000_000,
+        ))
+        .version(resource_id(70), slug("baseline"));
+        let alias = typed_alias(&acme, &core, 33, "default", &[default.reference]);
+
+        let mut state = DesiredState::new();
+        state.declare_blob(*catalog.body.blob().expect("a blob body"));
+        state
+            .insert(tenant(1, "acme"))
+            .and_then(|state| state.insert(project(&acme, 2, "core")))
+            .and_then(|state| state.insert(catalog))
+            .and_then(|state| state.insert(default))
+            .and_then(|state| state.insert(book))
+            .and_then(|state| state.insert(alias))
+            .expect("the covering-book state is publishable");
+
+        let store = InMemoryCatalogStore::new();
+        store
+            .activate(
+                &RetainedCatalog {
+                    source: snapshot.source,
+                    payload: RawPayload::new(CATALOG.as_bytes()),
+                },
+                SystemTime::now(),
+            )
+            .await
+            .expect("the exact payload is retained");
+        (loaded(state), store)
     }
 
     #[test]
