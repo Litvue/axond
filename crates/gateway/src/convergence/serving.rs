@@ -477,12 +477,13 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     /// Binding-shaped imported graph: pin, enablement with no `approved_price`,
-    /// operator book covering the callable, alias named for the published id,
-    /// and an active credential.
+    /// alias named for the published id, and (unless noted) an operator book
+    /// plus an active credential.
     enum ImportedServing {
         Binding,
         ExpertWithoutBook,
         BindingPlusUnpricedAlias,
+        BindingWithoutCredential,
     }
 
     fn imported_serving(
@@ -509,16 +510,21 @@ env = "GW_ADMIN_BREAKGLASS"
             "https://api.openai.com/v1",
         )
         .version(Slug::parse("openai").expect("a slug"));
-        let credential = ProviderCredentialBody::staged(
+        let staged = ProviderCredentialBody::staged(
             fixtures::resource_id(41),
             SecretOwner::project(tenant, project),
             fixtures::resource_id(40),
             DisplayName::parse("OpenAI key").expect("a name"),
             fixtures::secret_ref(41),
-        )
-        .transitioned(SecretLifecycle::Active)
-        .expect("staged material activates")
-        .version(Slug::parse("openai-key").expect("a slug"));
+        );
+        let credential = if matches!(graph, ImportedServing::BindingWithoutCredential) {
+            staged.version(Slug::parse("openai-key").expect("a slug"))
+        } else {
+            staged
+                .transitioned(SecretLifecycle::Active)
+                .expect("staged material activates")
+                .version(Slug::parse("openai-key").expect("a slug"))
+        };
         let offering = CatalogOffering::new(
             OfferingId::of("openai", "gpt-4o").expect("an offering id"),
             snapshot.source.raw.digest,
@@ -757,27 +763,23 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[tokio::test]
-    async fn refused_binding_leaves_the_previous_projected_alias_serving() {
-        let (previous, snapshot) = imported_serving(ImportedServing::Binding);
-        let pricing = epoch_pricing(&previous);
-        let served = project_imported(&previous, &snapshot, Some(&pricing))
-            .await
-            .expect("the binding revision serves");
-        assert_eq!(served.model[0].name, "gpt-4o");
-
-        // A non-chargeable next candidate must not replace the binding alias already serving.
+    async fn binding_unpriced_second_alias_fail_closes_serving_projection() {
         let (candidate, snapshot) = imported_serving(ImportedServing::BindingPlusUnpricedAlias);
         let models = Models::of(&candidate).expect("the typed model state reads");
         let extra = models
             .enablement(fixtures::resource_id(50))
             .expect("the unpriced enablement is present");
-        assert!(
-            callable_target(&snapshot, extra)
-                .expect("the second offering resolves")
-                .is_some(),
-            "fail-close is missing book coverage, not a withdrawn pin"
-        );
+        let (provider, published) = callable_target(&snapshot, extra)
+            .expect("the second offering resolves")
+            .expect("fail-close is missing book coverage, not a withdrawn pin");
+        assert_eq!(provider, "openai");
+        assert_eq!(published, "gpt-5.5");
+        let openai = ProviderId::parse("openai").expect("a catalogue provider");
         let candidate_pricing = epoch_pricing(&candidate);
+        assert!(
+            candidate_pricing.price(&openai, &published).is_none(),
+            "the book must not cover the extra callable"
+        );
         let refused = project_imported(&candidate, &snapshot, Some(&candidate_pricing))
             .await
             .expect_err("an enabled alias without book coverage refuses the revision");
@@ -785,24 +787,41 @@ env = "GW_ADMIN_BREAKGLASS"
             matches!(refused, ProjectionError::Incomplete { .. }),
             "{refused}"
         );
+        assert!(refused.to_string().contains("`gpt-5.5`"), "{refused}");
         assert!(
             refused
                 .to_string()
                 .contains("without a routable, approved target"),
             "{refused}"
         );
+    }
 
-        assert_eq!(served.model.len(), 1);
-        assert_eq!(served.model[0].name, "gpt-4o");
-        let still = project_imported(&previous, &snapshot, Some(&pricing))
+    #[tokio::test]
+    async fn binding_without_an_active_credential_fail_closes_serving_projection() {
+        let (state, snapshot) = imported_serving(ImportedServing::BindingWithoutCredential);
+        let pricing = epoch_pricing(&state);
+        assert!(
+            pricing
+                .price(
+                    &ProviderId::parse("openai").expect("a catalogue provider"),
+                    "gpt-4o",
+                )
+                .is_some(),
+            "the book covers the bound callable"
+        );
+        let error = project_imported(&state, &snapshot, Some(&pricing))
             .await
-            .expect("the previous binding revision still compiles");
-        assert_eq!(still.model[0].name, "gpt-4o");
-        assert_eq!(
-            still.model[0].targets[0]
-                .price
-                .input_microdollars_per_million,
-            2_500_000
+            .expect_err("an alias with no active secret must not converge");
+        assert!(
+            matches!(error, ProjectionError::Incomplete { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("`gpt-4o`"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("without a routable, approved target"),
+            "{error}"
         );
     }
 }
