@@ -31,7 +31,7 @@ use crate::desired_state::{
     ModelEnablementBody, ModelLifecycle, ModelOwner, MutationKind, ObservedPrice, OfferingId,
     PriceBookBody, PriceBooks, PriceOrigin, PriceProvenance, PriceRule, PricedTarget, ProjectBody,
     ProjectId, ProviderBody, ResourceId, ResourceKind, ResourceRef, ResourceScope, ResourceVersion,
-    ResourceVersionNumber, Slug, Surface, TenantId, Uuid7, ValidationError,
+    ResourceVersionNumber, RulePrecedence, Slug, Surface, TenantId, Uuid7, ValidationError,
 };
 use crate::telemetry::metrics::{record_binding, record_binding_refusal};
 
@@ -47,7 +47,7 @@ const RULE_CATALOGUE_NOT_IMPORTED: &str = "catalogue_not_imported";
 const RULE_PROJECT_REQUIRED: &str = "project_required";
 const RULE_PIN_LOCKED: &str = "pin_locked";
 const RULE_NOT_LOCAL: &str = "not_local";
-const RULE_PRICE_CHANGE: &str = "price_change_requires_interval";
+const RULE_DRAFT_BOOK_NOT_APPROVED_BY_BINDING: &str = "draft_book_not_approved_by_binding";
 
 /// One-model flattened form, or `models: [...]`.
 #[derive(Debug, Deserialize)]
@@ -980,6 +980,7 @@ fn expand_target(
                 priced,
                 rates,
                 origin,
+                now,
             )?;
         }
     }
@@ -1283,6 +1284,7 @@ fn catalog_insert_slug(state: &DesiredState, digest: Checksum, scope: &ResourceS
     Slug::parse(&hex).expect("hex is a slug")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_book(
     state: &mut DesiredState,
     actor: &Actor,
@@ -1291,18 +1293,16 @@ fn ensure_book(
     target: PricedTarget,
     rates: ApprovedRates,
     origin: PriceOrigin,
+    at: EffectiveInstant,
 ) -> Result<(), AdminError> {
     let books = PriceBooks::of(state).map_err(|error| ValidationError::Pricing(Box::new(error)))?;
-    let rule = PriceRule::new(
-        target.clone(),
-        crate::desired_state::RulePrecedence::Baseline,
-        EffectiveInterval::from(EffectiveInstant::EPOCH),
-        rates,
-        PriceProvenance::stated(origin),
-    )
-    .map_err(|error| refused(RULE_OBSERVED_UNBILLABLE, &error.to_string()))?;
-
     let Some(existing) = books.book() else {
+        let rule = baseline_rule(
+            target,
+            EffectiveInterval::from(EffectiveInstant::EPOCH),
+            rates,
+            origin,
+        )?;
         let id = derived_resource_id(&[ResourceKind::Price.as_str(), "deployment", "approved"]);
         let slug = Slug::parse("approved").expect("approved is a slug");
         // Open interval from epoch so a lost-response retry rebuilds the same book.
@@ -1321,39 +1321,113 @@ fn ensure_book(
         return Ok(());
     };
 
-    let current = existing.body.rules();
-    let covering: Vec<&PriceRule> = current
-        .iter()
-        .filter(|rule| rule.target() == &target)
-        .collect();
-    if covering
-        .iter()
-        .any(|existing_rule| existing_rule.rates() == rates)
-    {
-        return Ok(());
-    }
-    if !covering.is_empty() {
+    if matches!(existing.body.approval(), Approval::Draft) {
         return Err(refused(
-            RULE_PRICE_CHANGE,
-            "changing rates that would overlap existing coverage requires an interval close",
+            RULE_DRAFT_BOOK_NOT_APPROVED_BY_BINDING,
+            "a binding does not approve a draft deployment price book; approve it on /admin/v1/prices first",
         ));
     }
-    // Keep the original approval. Stamping the current actor (and EPOCH) here
-    // would rewrite attribution for every earlier rate on this book.
-    let body = current
+    let current = existing.body.rules();
+    let in_force = current.iter().find(|rule| {
+        rule.target() == &target
+            && rule.precedence() == RulePrecedence::Baseline
+            && rule.effective().contains(at)
+    });
+    if in_force.is_some_and(|rule| rule.rates() == rates) {
+        return Ok(());
+    }
+    let has_history = current
         .iter()
-        .cloned()
-        .fold(
-            PriceBookBody::new(catalog, catalog_version, existing.body.approval().clone()),
-            PriceBookBody::with_rule,
-        )
-        .with_rule(rule);
+        .any(|rule| rule.target() == &target && rule.precedence() == RulePrecedence::Baseline);
+    // Greenfield coverage stays from epoch (retry identity). A rate change
+    // closes the predecessor at `at` so consecutive baselines meet and the
+    // existing pricing-boundary timer can arm from `PricingSnapshot::effective`.
+    // A later binding that only appends a rule keeps the original approval.
+    let (from, dated) = if in_force.is_some() || has_history {
+        (at, true)
+    } else {
+        (EffectiveInstant::EPOCH, false)
+    };
+    let rules = replace_baseline_from(current, &target, rates, origin, from)?;
+    let approval = if dated {
+        Approval::Approved {
+            by: actor.clone(),
+            at: from,
+            citation: None,
+        }
+    } else {
+        existing.body.approval().clone()
+    };
+    let body = rules.into_iter().fold(
+        PriceBookBody::new(catalog, catalog_version, approval),
+        PriceBookBody::with_rule,
+    );
     let version = resources::next_version(state, ResourceKind::Price, existing.reference.id);
     resources::publish(
         state,
         body.version_at(existing.reference.id, existing.slug.clone(), version),
     )?;
     Ok(())
+}
+
+fn baseline_rule(
+    target: PricedTarget,
+    effective: EffectiveInterval,
+    rates: ApprovedRates,
+    origin: PriceOrigin,
+) -> Result<PriceRule, AdminError> {
+    PriceRule::new(
+        target,
+        RulePrecedence::Baseline,
+        effective,
+        rates,
+        PriceProvenance::stated(origin),
+    )
+    .map_err(|error| refused(RULE_OBSERVED_UNBILLABLE, &error.to_string()))
+}
+
+fn replace_baseline_from(
+    current: &[PriceRule],
+    target: &PricedTarget,
+    rates: ApprovedRates,
+    origin: PriceOrigin,
+    from: EffectiveInstant,
+) -> Result<Vec<PriceRule>, AdminError> {
+    let mut next = Vec::with_capacity(current.len() + 1);
+    for rule in current {
+        if rule.target() != target || rule.precedence() != RulePrecedence::Baseline {
+            next.push(rule.clone());
+            continue;
+        }
+        if rule.effective().contains(from) {
+            if rule.effective().starts() < from {
+                let closed = EffectiveInterval::bounded(rule.effective().starts(), from)
+                    .map_err(|error| malformed("effective_from", &error.to_string()))?;
+                next.push(
+                    PriceRule::new(
+                        rule.target().clone(),
+                        rule.precedence(),
+                        closed,
+                        rule.rates(),
+                        rule.provenance().clone(),
+                    )
+                    .map_err(|error| refused(RULE_OBSERVED_UNBILLABLE, &error.to_string()))?,
+                );
+            }
+            continue;
+        }
+        if rule.effective().starts() >= from {
+            continue;
+        }
+        next.push(rule.clone());
+    }
+    next.push(baseline_rule(
+        target.clone(),
+        EffectiveInterval::from(from),
+        rates,
+        origin,
+    )?);
+    Ok(next)
 }
 
 #[allow(clippy::too_many_arguments)]

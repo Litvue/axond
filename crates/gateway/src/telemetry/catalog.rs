@@ -880,7 +880,7 @@ pub const CATALOG: &[MetricSpec] = &[
                 "project_required",
                 "pin_locked",
                 "not_local",
-                "price_change_requires_interval",
+                "draft_book_not_approved_by_binding",
             ],
         )],
     },
