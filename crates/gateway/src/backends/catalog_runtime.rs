@@ -177,6 +177,13 @@ impl CatalogStore for RuntimeStore {
         }
     }
 
+    async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
+        match self {
+            Self::Postgres(store) => store.retain(import).await,
+            Self::InMemory(store) => store.retain(import).await,
+        }
+    }
+
     async fn activate(
         &self,
         import: &RetainedCatalog,

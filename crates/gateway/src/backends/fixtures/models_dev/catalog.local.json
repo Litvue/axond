@@ -1,0 +1,49 @@
+{
+  "models": {
+    "meta-llama-3-70b-instruct": {
+      "id": "meta-llama-3-70b-instruct",
+      "limit": {
+        "context": 8192
+      },
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "name": "Llama 3 70B Instruct"
+    }
+  },
+  "providers": {
+    "vllm": {
+      "env": [
+        "VLLM_API_KEY"
+      ],
+      "id": "vllm",
+      "models": {
+        "meta-llama-3-70b-instruct": {
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "id": "meta-llama-3-70b-instruct",
+          "limit": {
+            "context": 8192
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Llama 3 70B Instruct"
+        }
+      },
+      "name": "vLLM"
+    }
+  }
+}

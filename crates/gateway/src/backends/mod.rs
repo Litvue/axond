@@ -54,6 +54,7 @@ pub mod catalog_runtime;
 pub mod catalog_store;
 pub mod control_plane;
 pub mod health;
+pub mod local_catalog;
 pub mod models_dev;
 pub mod object_store;
 pub mod secrets;

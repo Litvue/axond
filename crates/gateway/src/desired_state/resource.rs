@@ -103,8 +103,11 @@ impl ResourceKind {
     /// Four rules, and they are the reason scope is on the envelope rather than
     /// inside a body:
     ///
-    /// - a tenant and the model catalogue are deployment-wide: the tenant *is*
-    ///   the boundary, and catalogue metadata is upstream fact, not tenant state;
+    /// - a tenant is deployment-wide: the tenant *is* the boundary;
+    /// - a catalogue pin is deployment-wide when it is an imported snapshot, or
+    ///   tenant-scoped when it is an operator-authored local snapshot (custom
+    ///   deployment ids). Imported pins stay deployment-scoped; local pins must
+    ///   not be authored at project scope;
     /// - a project belongs to exactly one tenant;
     /// - an identity may live at *any* scope, because a platform administrator is
     ///   an identity that belongs to no tenant: its grants are over the
@@ -124,12 +127,11 @@ impl ResourceKind {
     ///   no ordinary resource can be authored outside a tenant by accident.
     pub const fn permits(self, scope: &ResourceScope) -> bool {
         match self {
-            Self::Deployment
-            | Self::Namespace
-            | Self::InboundGrant
-            | Self::Tenant
-            | Self::CatalogModel => {
+            Self::Deployment | Self::Namespace | Self::InboundGrant | Self::Tenant => {
                 matches!(scope, ResourceScope::Deployment)
+            }
+            Self::CatalogModel => {
+                matches!(scope, ResourceScope::Deployment | ResourceScope::Tenant(_))
             }
             Self::Price => matches!(
                 scope,
@@ -591,6 +593,8 @@ mod tests {
         assert!(!ResourceKind::InboundGrant.permits(&project));
         assert!(!ResourceKind::Tenant.permits(&ResourceScope::Tenant(tenant)));
         assert!(ResourceKind::CatalogModel.permits(&ResourceScope::Deployment));
+        assert!(ResourceKind::CatalogModel.permits(&ResourceScope::Tenant(tenant)));
+        assert!(!ResourceKind::CatalogModel.permits(&project));
         assert!(ResourceKind::Project.permits(&ResourceScope::Tenant(tenant)));
         assert!(!ResourceKind::Project.permits(&project));
         // An identity is the one kind that lives at every scope: a platform

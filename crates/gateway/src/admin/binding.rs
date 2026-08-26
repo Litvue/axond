@@ -1,10 +1,10 @@
-//! `POST /admin/v1/bindings`: expand one imported model into one revision.
+//! `POST /admin/v1/bindings`: expand one imported or local model into one revision.
 //!
 //! Dedicated handler, not `publish::<R>`. Hydration of [`CatalogStore`] happens
 //! here, before a synchronous [`DesiredStateEdit`]. Classification, probes, and
 //! `request.scope` are computed from the expander delta against **expected**.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -23,7 +23,8 @@ use super::service::{DesiredStateEdit, MutationOutcome, MutationResult, log_stor
 use crate::backends::catalog::{CatalogSnapshot, ProviderId};
 use crate::backends::catalog_pins::{PinnedCatalog, Resolution};
 use crate::backends::catalog_projection::CallableId;
-use crate::backends::catalog_store::{CatalogStore, hydrate};
+use crate::backends::catalog_store::{CatalogStore, RetainedCatalog, hydrate};
+use crate::backends::local_catalog::LocalCatalogBuilder;
 use crate::desired_state::{
     Actor, AliasTarget, Approval, ApprovedRate, ApprovedRates, BlobKind, BlobRef, CatalogOffering,
     Checksum, DesiredState, EffectiveInstant, EffectiveInterval, ExpectedRevision, ModelAliasBody,
@@ -35,7 +36,6 @@ use crate::desired_state::{
 use crate::telemetry::metrics::{record_binding, record_binding_refusal};
 
 const SCHEMA: &str = "binding";
-const BINDING_PATH: &str = "imported";
 
 const RULE_UNKNOWN_PROVIDER: &str = "unknown_provider";
 const RULE_CATALOGUE_IDENTITY: &str = "catalogue_identity_required";
@@ -46,6 +46,7 @@ const RULE_PRICE_REQUIRED: &str = "price_required";
 const RULE_CATALOGUE_NOT_IMPORTED: &str = "catalogue_not_imported";
 const RULE_PROJECT_REQUIRED: &str = "project_required";
 const RULE_PIN_LOCKED: &str = "pin_locked";
+const RULE_NOT_LOCAL: &str = "not_local";
 const RULE_PRICE_CHANGE: &str = "price_change_requires_interval";
 
 /// One-model flattened form, or `models: [...]`.
@@ -103,6 +104,8 @@ pub struct BindingTarget {
     pub catalog: Option<BindingCatalog>,
     #[serde(default)]
     pub price: Option<BindingPrice>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,13 +133,29 @@ enum PinMode {
     Lock,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetSource {
+    Imported,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum PriceSpec {
     Stated {
         input_micros: u64,
         output_micros: u64,
     },
     Observed,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedTarget {
+    provider_slug: String,
+    model: String,
+    catalog_provider: Option<String>,
+    catalog_model: Option<String>,
+    price: Option<PriceSpec>,
+    source: TargetSource,
 }
 
 #[derive(Debug, Clone)]
@@ -147,22 +166,46 @@ struct BindingPlan {
     pin: PinMode,
     lifecycle: ModelLifecycle,
     mutation: MutationKind,
-    provider_slug: String,
-    model: String,
-    catalog_provider: Option<String>,
-    catalog_model: Option<String>,
-    price: Option<PriceSpec>,
+    targets: Vec<PlannedTarget>,
+}
+
+impl BindingPlan {
+    fn path(&self) -> &'static str {
+        if self
+            .targets
+            .iter()
+            .any(|target| target.source == TargetSource::Local)
+        {
+            "local"
+        } else {
+            "imported"
+        }
+    }
+
+    fn has_imported(&self) -> bool {
+        self.targets
+            .iter()
+            .any(|target| target.source == TargetSource::Imported)
+    }
 }
 
 struct BindingEdit {
     plan: BindingPlan,
-    snapshot: CatalogSnapshot,
+    imported: Option<CatalogSnapshot>,
+    locals: BTreeMap<(String, String), CatalogSnapshot>,
     now: EffectiveInstant,
 }
 
 impl DesiredStateEdit for BindingEdit {
     fn edit(&self, state: &mut DesiredState, actor: &Actor) -> Result<(), AdminError> {
-        expand(state, actor, &self.plan, &self.snapshot, self.now)
+        expand(
+            state,
+            actor,
+            &self.plan,
+            self.imported.as_ref(),
+            &self.locals,
+            self.now,
+        )
     }
 }
 
@@ -176,28 +219,29 @@ async fn publish_binding(
     preconditions: MutationPreconditions,
     body: Result<axum::body::Bytes, BytesRejection>,
 ) -> Result<Json<MutationOutcome>, AdminError> {
-    let outcome = publish_binding_inner(api, identity, preconditions, body).await;
-    match &outcome {
+    publish_binding_inner(api, identity, preconditions, body).await
+}
+
+fn record_binding_outcome(outcome: &Result<Json<MutationOutcome>, AdminError>, path: &'static str) {
+    match outcome {
         Ok(json) => {
-            let result = &json.0.result;
-            let label = match result {
+            let label = match &json.0.result {
                 MutationResult::Published { .. } => "published",
                 MutationResult::Replayed { .. } => "replayed",
                 MutationResult::Unchanged { .. } => "unchanged",
                 MutationResult::DryRun => "dry_run",
             };
-            record_binding(label, BINDING_PATH);
+            record_binding(label, path);
         }
         Err(error) => {
             if let AdminError::BindingRefused { rule, .. } = error {
-                record_binding("refused", BINDING_PATH);
+                record_binding("refused", path);
                 record_binding_refusal(rule);
             } else if matches!(error, AdminError::NameTaken { .. }) {
-                record_binding("refused", BINDING_PATH);
+                record_binding("refused", path);
             }
         }
     }
-    outcome
 }
 
 async fn publish_binding_inner(
@@ -222,6 +266,19 @@ async fn publish_binding_inner(
     }
     let summary = super::protocol::AuditSummary::parse(&envelope.summary)?;
     let plan = BindingPlan::from_resource(envelope.resource, envelope.mutation.kind())?;
+    let path = plan.path();
+    let outcome = publish_parsed_binding(api, identity, preconditions, summary, plan).await;
+    record_binding_outcome(&outcome, path);
+    outcome
+}
+
+async fn publish_parsed_binding(
+    api: Arc<AdminApi>,
+    identity: AdminIdentity,
+    preconditions: MutationPreconditions,
+    summary: super::protocol::AuditSummary,
+    plan: BindingPlan,
+) -> Result<Json<MutationOutcome>, AdminError> {
     let store = api.service.store()?;
     let head_id = store.desired_revision().await.map_err(log_store)?;
     let head_state = match head_id {
@@ -258,17 +315,35 @@ async fn publish_binding_inner(
     )
     .await?;
 
-    let snapshot = load_active_snapshot(api.catalogue.as_deref()).await?;
+    let imported = load_active_snapshot(api.catalogue.as_deref()).await?;
+    if plan.has_imported() && imported.is_none() {
+        return Err(refused(
+            RULE_CATALOGUE_NOT_IMPORTED,
+            "no imported catalogue is active",
+        ));
+    }
+    let locals = prepare_local_catalogs(&plan, imported.as_ref())?;
     let actor = identity.actor();
     let now = EffectiveInstant::of(SystemTime::now()).unwrap_or(EffectiveInstant::EPOCH);
+    let local_snapshots: BTreeMap<(String, String), CatalogSnapshot> = locals
+        .iter()
+        .map(|(key, _, snapshot)| (key.clone(), snapshot.clone()))
+        .collect();
     let edit = BindingEdit {
         plan: plan.clone(),
-        snapshot: snapshot.clone(),
+        imported: imported.clone(),
+        locals: local_snapshots.clone(),
         now,
     };
 
     let expected_state = match expected_base {
         ExpectedBase::Missing => {
+            retain_local_payloads(
+                api.catalogue.as_deref(),
+                &locals,
+                preconditions.mode.is_dry_run(),
+            )
+            .await?;
             let grant = api
                 .authorize(
                     &identity,
@@ -291,7 +366,14 @@ async fn publish_binding_inner(
     };
 
     let mut expanded = expected_state.clone();
-    expand(&mut expanded, &actor, &plan, &snapshot, now)?;
+    expand(
+        &mut expanded,
+        &actor,
+        &plan,
+        imported.as_ref(),
+        &local_snapshots,
+        now,
+    )?;
     let expected_diff = SemanticDiff::between(Some(&expected_state), &expanded)?;
     let classification = classify(&expected_state, &expanded, document_scope.clone());
 
@@ -322,6 +404,13 @@ async fn publish_binding_inner(
         }));
     }
 
+    retain_local_payloads(
+        api.catalogue.as_deref(),
+        &locals,
+        preconditions.mode.is_dry_run(),
+    )
+    .await?;
+
     let apply_scope = classification.request_scope.clone();
     let grant = api
         .authorize(
@@ -351,21 +440,113 @@ fn document_bytes(
 
 async fn load_active_snapshot(
     catalogue: Option<&dyn CatalogStore>,
-) -> Result<CatalogSnapshot, AdminError> {
+) -> Result<Option<CatalogSnapshot>, AdminError> {
+    let Some(store) = catalogue else {
+        return Ok(None);
+    };
+    let loaded = store.load().await.map_err(AdminError::from_catalog_store)?;
+    let Some(active) = loaded.active else {
+        return Ok(None);
+    };
+    hydrate(&active)
+        .map(Some)
+        .map_err(AdminError::from_catalog_hydration)
+}
+
+type PreparedLocal = ((String, String), RetainedCatalog, CatalogSnapshot);
+
+fn prepare_local_catalogs(
+    plan: &BindingPlan,
+    imported: Option<&CatalogSnapshot>,
+) -> Result<Vec<PreparedLocal>, AdminError> {
+    let imported_projection = imported
+        .map(PinnedCatalog::of_snapshot)
+        .transpose()
+        .map_err(|error| {
+            refused(
+                RULE_CATALOGUE_NOT_IMPORTED,
+                &format!("the active catalogue cannot be keyed: {error}"),
+            )
+        })?;
+    let mut locals = Vec::new();
+    for target in &plan.targets {
+        if target.source != TargetSource::Local {
+            continue;
+        }
+        if let Some(projection) = imported_projection.as_ref()
+            && let Ok(provider) = ProviderId::parse(&target.provider_slug)
+        {
+            let published = target
+                .catalog_model
+                .as_deref()
+                .unwrap_or(target.model.as_str());
+            if projection
+                .projection()
+                .callable(&CallableId::new(provider, published))
+                .is_some()
+            {
+                return Err(refused(
+                    RULE_NOT_LOCAL,
+                    &format!(
+                        "`{}` / `{published}` exists in the imported catalogue",
+                        target.provider_slug
+                    ),
+                ));
+            }
+        }
+        let Some(PriceSpec::Stated {
+            input_micros,
+            output_micros,
+        }) = target.price
+        else {
+            return Err(refused(
+                RULE_PRICE_REQUIRED,
+                "source: local requires stated micro-dollar rates",
+            ));
+        };
+        let builder = LocalCatalogBuilder::new(&target.provider_slug, &target.model)
+            .price(input_micros, output_micros);
+        let retained = builder
+            .retained(plan.tenant, SystemTime::now())
+            .map_err(|error| malformed("source", &error.to_string()))?;
+        let snapshot = hydrate(&retained).map_err(|error| {
+            malformed(
+                "source",
+                &format!("the local catalogue could not be hydrated: {error}"),
+            )
+        })?;
+        locals.push((
+            (target.provider_slug.clone(), target.model.clone()),
+            retained,
+            snapshot,
+        ));
+    }
+    Ok(locals)
+}
+
+async fn retain_local_payloads(
+    catalogue: Option<&dyn CatalogStore>,
+    locals: &[PreparedLocal],
+    dry_run: bool,
+) -> Result<(), AdminError> {
+    if dry_run || locals.is_empty() {
+        return Ok(());
+    }
     let Some(store) = catalogue else {
         return Err(refused(
             RULE_CATALOGUE_NOT_IMPORTED,
             "no catalogue store is attached",
         ));
     };
-    let loaded = store.load().await.map_err(AdminError::from_catalog_store)?;
-    let Some(active) = loaded.active else {
-        return Err(refused(
-            RULE_CATALOGUE_NOT_IMPORTED,
-            "no imported catalogue is active",
-        ));
-    };
-    hydrate(&active).map_err(AdminError::from_catalog_hydration)
+    for (_, retained, _) in locals {
+        store
+            .retain(retained)
+            .await
+            .map_err(|error| AdminError::ControlPlaneUnavailable {
+                detail: error.to_string(),
+            })?;
+    }
+    Ok(())
 }
 
 enum ExpectedBase {
@@ -403,22 +584,29 @@ fn classify(
     document_scope: ResourceScope,
 ) -> Classification {
     let mut probes = BTreeSet::new();
-    let mut needs_deployment_write = false;
+    let mut request_scope = document_scope;
     for resource in touched(before, after) {
         probes.insert((Surface::of(resource.reference.kind), resource.scope.clone()));
-        if resource.scope == ResourceScope::Deployment {
-            needs_deployment_write = true;
-        }
+        request_scope = widen_scope(request_scope, &resource.scope);
     }
-    let request_scope = if needs_deployment_write {
-        ResourceScope::Deployment
-    } else {
-        document_scope
-    };
     Classification {
         request_scope,
         probes,
     }
+}
+
+fn widen_scope(current: ResourceScope, touched: &ResourceScope) -> ResourceScope {
+    if matches!(current, ResourceScope::Deployment) || matches!(touched, ResourceScope::Deployment)
+    {
+        return ResourceScope::Deployment;
+    }
+    if let ResourceScope::Tenant(tenant) = current {
+        return ResourceScope::Tenant(tenant);
+    }
+    if let ResourceScope::Tenant(tenant) = touched {
+        return ResourceScope::Tenant(*tenant);
+    }
+    current
 }
 
 fn touched<'a>(
@@ -479,18 +667,13 @@ impl BindingPlan {
         targets: &[BindingTarget],
         mutation: MutationKind,
     ) -> Result<Self, AdminError> {
-        let [target] = targets else {
-            return Err(malformed(
-                "targets",
-                "this release expands exactly one imported target",
-            ));
-        };
-        if target.provider.is_empty() {
-            return Err(malformed("provider", "must not be empty"));
+        if targets.is_empty() {
+            return Err(malformed("targets", "must not be empty"));
         }
-        if target.model.is_empty() {
-            return Err(malformed("model", "must not be empty"));
-        }
+        let planned = targets
+            .iter()
+            .map(parse_planned_target)
+            .collect::<Result<Vec<_>, _>>()?;
         let tenant =
             TenantId::parse(tenant).map_err(|error| malformed("tenant", &error.to_string()))?;
         let project = project
@@ -517,35 +700,16 @@ impl BindingPlan {
                 ));
             }
         };
-        let published = target
-            .catalog
-            .as_ref()
-            .and_then(|catalog| catalog.model.as_deref())
-            .unwrap_or(target.model.as_str());
+        let first = &planned[0];
+        let published = first
+            .catalog_model
+            .as_deref()
+            .unwrap_or(first.model.as_str());
         let name = name.unwrap_or(published);
         if name.is_empty() {
             return Err(malformed("name", "must not be empty"));
         }
         let _ = Slug::parse_alias(name).map_err(|error| malformed("name", &error.to_string()))?;
-        let price = match &target.price {
-            None => None,
-            Some(BindingPrice::Stated {
-                input_microdollars_per_million,
-                output_microdollars_per_million,
-            }) => Some(PriceSpec::Stated {
-                input_micros: *input_microdollars_per_million,
-                output_micros: *output_microdollars_per_million,
-            }),
-            Some(BindingPrice::Observed(token)) => {
-                if token != "observed" {
-                    return Err(malformed(
-                        "price",
-                        "must be a rate object or the token `observed`",
-                    ));
-                }
-                Some(PriceSpec::Observed)
-            }
-        };
         Ok(Self {
             tenant,
             project,
@@ -553,17 +717,7 @@ impl BindingPlan {
             pin,
             lifecycle,
             mutation,
-            provider_slug: target.provider.clone(),
-            model: target.model.clone(),
-            catalog_provider: target
-                .catalog
-                .as_ref()
-                .and_then(|catalog| catalog.provider.clone()),
-            catalog_model: target
-                .catalog
-                .as_ref()
-                .and_then(|catalog| catalog.model.clone()),
-            price,
+            targets: planned,
         })
     }
 
@@ -576,11 +730,73 @@ impl BindingPlan {
     }
 }
 
+fn parse_planned_target(target: &BindingTarget) -> Result<PlannedTarget, AdminError> {
+    if target.provider.is_empty() {
+        return Err(malformed("provider", "must not be empty"));
+    }
+    if target.model.is_empty() {
+        return Err(malformed("model", "must not be empty"));
+    }
+    let source = match target.source.as_deref() {
+        None => TargetSource::Imported,
+        Some("local") => TargetSource::Local,
+        Some(_) => {
+            return Err(malformed(
+                "source",
+                "is not a value this build knows; it accepts `local`",
+            ));
+        }
+    };
+    if source == TargetSource::Local && target.catalog.is_some() {
+        return Err(malformed("catalog", "must be omitted when source is local"));
+    }
+    if source == TargetSource::Local && matches!(target.price, Some(BindingPrice::Observed(_))) {
+        return Err(refused(
+            RULE_OBSERVED_UNBILLABLE,
+            "source: local requires stated rates, not `observed`",
+        ));
+    }
+    let price = match &target.price {
+        None => None,
+        Some(BindingPrice::Stated {
+            input_microdollars_per_million,
+            output_microdollars_per_million,
+        }) => Some(PriceSpec::Stated {
+            input_micros: *input_microdollars_per_million,
+            output_micros: *output_microdollars_per_million,
+        }),
+        Some(BindingPrice::Observed(token)) => {
+            if token != "observed" {
+                return Err(malformed(
+                    "price",
+                    "must be a rate object or the token `observed`",
+                ));
+            }
+            Some(PriceSpec::Observed)
+        }
+    };
+    Ok(PlannedTarget {
+        provider_slug: target.provider.clone(),
+        model: target.model.clone(),
+        catalog_provider: target
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.provider.clone()),
+        catalog_model: target
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.model.clone()),
+        price,
+        source,
+    })
+}
+
 fn expand(
     state: &mut DesiredState,
     actor: &Actor,
     plan: &BindingPlan,
-    snapshot: &CatalogSnapshot,
+    imported: Option<&CatalogSnapshot>,
+    locals: &BTreeMap<(String, String), CatalogSnapshot>,
     now: EffectiveInstant,
 ) -> Result<(), AdminError> {
     let project = resolve_project(state, plan.tenant, plan.project)?;
@@ -597,20 +813,92 @@ fn expand(
         });
     }
 
-    let wire_family = {
-        let provider = provider_in_reach(state, owner, &plan.provider_slug)?;
-        ProviderBody::read(provider)
-            .map_err(ValidationError::from)?
-            .wire_family()
-    };
+    let mut wire_family = None;
+    let mut enablements = Vec::new();
+    for target in &plan.targets {
+        let family = {
+            let provider = provider_in_reach(state, owner, &target.provider_slug)?;
+            ProviderBody::read(provider)
+                .map_err(ValidationError::from)?
+                .wire_family()
+        };
+        match wire_family {
+            None => wire_family = Some(family),
+            Some(held) if held != family => {
+                return Err(malformed(
+                    "targets",
+                    "must share one wire family across an alias",
+                ));
+            }
+            Some(_) => {}
+        }
+        let snapshot = match target.source {
+            TargetSource::Imported => imported.ok_or_else(|| {
+                refused(
+                    RULE_CATALOGUE_NOT_IMPORTED,
+                    "no imported catalogue is active",
+                )
+            })?,
+            TargetSource::Local => locals
+                .get(&(target.provider_slug.clone(), target.model.clone()))
+                .ok_or_else(|| malformed("source", "local catalogue was not prepared"))?,
+        };
+        let catalog_scope = match target.source {
+            TargetSource::Imported => ResourceScope::Deployment,
+            TargetSource::Local => ResourceScope::Tenant(plan.tenant),
+        };
+        let write_book = target.source == TargetSource::Imported;
+        let enablement = expand_target(
+            state,
+            actor,
+            target,
+            snapshot,
+            owner,
+            catalog_scope,
+            write_book,
+            family,
+            plan.pin,
+            plan.lifecycle,
+            &alias_slug,
+            now,
+        )?;
+        enablements.push(enablement);
+    }
+    let wire_family = wire_family.expect("targets is non-empty");
+    ensure_alias(
+        state,
+        plan.tenant,
+        project,
+        alias_slug,
+        wire_family,
+        plan.lifecycle,
+        &enablements,
+    )?;
+    Ok(())
+}
 
+#[allow(clippy::too_many_arguments)]
+fn expand_target(
+    state: &mut DesiredState,
+    actor: &Actor,
+    target: &PlannedTarget,
+    snapshot: &CatalogSnapshot,
+    owner: ModelOwner,
+    catalog_scope: ResourceScope,
+    write_book: bool,
+    wire_family: crate::desired_state::WireFamily,
+    pin: PinMode,
+    lifecycle: ModelLifecycle,
+    alias_slug: &Slug,
+    now: EffectiveInstant,
+) -> Result<ResourceRef, AdminError> {
     let pinned = PinnedCatalog::of_snapshot(snapshot).map_err(|error| {
         refused(
             RULE_CATALOGUE_NOT_IMPORTED,
-            &format!("the active catalogue cannot be keyed: {error}"),
+            &format!("the catalogue cannot be keyed: {error}"),
         )
     })?;
-    let callable = resolve_callable(plan, pinned.projection())?;
+    let callable = resolve_callable(target, pinned.projection())?;
     let offering_id = OfferingId::of(callable.provider().as_str(), callable.model().as_str())
         .map_err(|error| malformed("model", &error.to_string()))?;
     match pinned.resolve(CatalogOffering::new(
@@ -633,7 +921,7 @@ fn expand(
             return Err(refused(
                 RULE_NOT_IN_CATALOGUE,
                 &format!(
-                    "`{}` / `{}` is not in the active catalogue",
+                    "`{}` / `{}` is not in the catalogue",
                     callable.provider(),
                     callable.published_model_id()
                 ),
@@ -645,75 +933,80 @@ fn expand(
     let size_bytes = snapshot.source.raw.size_bytes;
     let content_id = snapshot.content.content_id();
     let adopted_enablement = enabled_for(state, owner, offering_id).cloned();
-    let catalog = ensure_catalog_model(state, digest, size_bytes, adopted_enablement.as_ref())?;
+    let catalog = ensure_catalog_model(
+        state,
+        digest,
+        size_bytes,
+        adopted_enablement.as_ref(),
+        catalog_scope,
+    )?;
     let catalog_version = catalog.reference.version;
     let priced = PricedTarget::new(callable.provider().clone(), callable.published_model_id());
-    let rates = resolve_rates(plan, callable.price(), state, &priced, now)?;
-    if let Some((rates, origin)) = rates {
-        ensure_book(
-            state,
-            actor,
-            content_id,
-            catalog_version,
-            priced,
-            rates,
-            origin,
-        )?;
+    if write_book {
+        let rates = resolve_rates(target, callable.price(), state, &priced, now)?;
+        if let Some((rates, origin)) = rates {
+            ensure_book(
+                state,
+                actor,
+                content_id,
+                catalog_version,
+                priced,
+                rates,
+                origin,
+            )?;
+        }
     }
-
-    let enablement = ensure_enablement(
+    ensure_enablement(
         state,
         owner,
         offering_id,
         digest,
         catalog.reference,
         wire_family,
-        plan.pin,
-        plan.lifecycle,
+        pin,
+        lifecycle,
         callable.price(),
-        &alias_slug,
-    )?;
-
-    ensure_alias(
-        state,
-        plan.tenant,
-        project,
         alias_slug,
-        wire_family,
-        plan.lifecycle,
-        enablement,
-    )?;
-    Ok(())
+    )
 }
 
 fn resolve_callable<'a>(
-    plan: &BindingPlan,
+    target: &PlannedTarget,
     projection: &'a crate::backends::catalog_projection::ModelProjection<'a>,
 ) -> Result<&'a crate::backends::catalog_projection::CallableOffering<'a>, AdminError> {
-    if let Some(catalog_provider) = plan.catalog_provider.as_deref()
-        && catalog_provider != plan.provider_slug
+    if let Some(catalog_provider) = target.catalog_provider.as_deref()
+        && catalog_provider != target.provider_slug
     {
         return Err(refused(
             RULE_CATALOGUE_IDENTITY,
             &format!(
                 "catalog.provider `{catalog_provider}` must equal connection slug `{}`",
-                plan.provider_slug
+                target.provider_slug
             ),
         ));
     }
-    let published = plan.catalog_model.as_deref().unwrap_or(plan.model.as_str());
-    let Ok(provider) = ProviderId::parse(&plan.provider_slug) else {
+    let published = target
+        .catalog_model
+        .as_deref()
+        .unwrap_or(target.model.as_str());
+    let Ok(provider) = ProviderId::parse(&target.provider_slug) else {
         return Err(refused(
             RULE_CATALOGUE_IDENTITY,
             &format!(
                 "connection slug `{}` is not a catalogue provider id",
-                plan.provider_slug
+                target.provider_slug
             ),
         ));
     };
     let id = CallableId::new(provider.clone(), published);
     if let Some(callable) = projection.callable(&id) {
         return Ok(callable);
+    }
+    if target.source == TargetSource::Local {
+        return Err(refused(
+            RULE_NOT_IN_CATALOGUE,
+            &format!("`{provider}` / `{published}` is not in the local catalogue"),
+        ));
     }
     let provider_known = projection
         .callables()
@@ -729,20 +1022,20 @@ fn resolve_callable<'a>(
             RULE_CATALOGUE_IDENTITY,
             &format!(
                 "connection slug `{}` is not a unique CallableId provider",
-                plan.provider_slug
+                target.provider_slug
             ),
         ))
     }
 }
 
 fn resolve_rates(
-    plan: &BindingPlan,
+    planned: &PlannedTarget,
     observed: Option<&crate::backends::catalog::ObservedPrice>,
     state: &DesiredState,
     target: &PricedTarget,
     now: EffectiveInstant,
 ) -> Result<Option<(ApprovedRates, PriceOrigin)>, AdminError> {
-    match &plan.price {
+    match &planned.price {
         Some(PriceSpec::Stated {
             input_micros,
             output_micros,
@@ -814,11 +1107,13 @@ fn ensure_catalog_model(
     digest: Checksum,
     size_bytes: u64,
     adopted_enablement: Option<&ResourceVersion>,
+    scope: ResourceScope,
 ) -> Result<ResourceVersion, AdminError> {
     let mut matches: Vec<ResourceVersion> = state
         .resources()
         .filter(|resource| {
             resource.reference.kind == ResourceKind::CatalogModel
+                && resource.scope == scope
                 && resource
                     .body
                     .blob()
@@ -840,12 +1135,17 @@ fn ensure_catalog_model(
         matches.sort_by_key(|row| row.reference.id);
         return Ok(matches.into_iter().next().expect("matches is non-empty"));
     }
+    let scope_key = match &scope {
+        ResourceScope::Deployment => "deployment".to_owned(),
+        ResourceScope::Tenant(tenant) => tenant.to_string(),
+        ResourceScope::Project { tenant, project } => format!("{tenant}/{project}"),
+    };
     let id = derived_resource_id(&[
         ResourceKind::CatalogModel.as_str(),
-        "deployment",
+        &scope_key,
         &digest.to_string(),
     ]);
-    let slug = catalog_insert_slug(state, digest);
+    let slug = catalog_insert_slug(state, digest, &scope);
     let blob = BlobRef {
         kind: BlobKind::CatalogSnapshot,
         digest,
@@ -857,7 +1157,7 @@ fn ensure_catalog_model(
         state,
         ResourceVersion::new(
             ResourceRef::new(ResourceKind::CatalogModel, id, version),
-            ResourceScope::Deployment,
+            scope,
             slug,
             crate::desired_state::ResourceBody::Blob(blob),
         ),
@@ -933,15 +1233,19 @@ fn unique_enablement_slug(
         .expect("uuid hex with a salt is a slug")
 }
 
-fn catalog_insert_slug(state: &DesiredState, digest: Checksum) -> Slug {
-    let imported = Slug::parse("imported").expect("imported is a slug");
+fn catalog_insert_slug(state: &DesiredState, digest: Checksum, scope: &ResourceScope) -> Slug {
+    let preferred = if matches!(scope, ResourceScope::Deployment) {
+        Slug::parse("imported").expect("imported is a slug")
+    } else {
+        Slug::parse("local").expect("local is a slug")
+    };
     let taken = state.resources().any(|resource| {
         resource.reference.kind == ResourceKind::CatalogModel
-            && resource.scope == ResourceScope::Deployment
-            && resource.slug == imported
+            && resource.scope == *scope
+            && resource.slug == preferred
     });
     if !taken {
-        return imported;
+        return preferred;
     }
     let hex: String = digest
         .as_bytes()
@@ -1115,18 +1419,21 @@ fn ensure_alias(
     slug: Slug,
     wire_family: crate::desired_state::WireFamily,
     lifecycle: ModelLifecycle,
-    enablement: ResourceRef,
+    enablements: &[ResourceRef],
 ) -> Result<(), AdminError> {
-    let target = AliasTarget::new(enablement.id, enablement.version);
+    let targets: Vec<AliasTarget> = enablements
+        .iter()
+        .map(|enablement| AliasTarget::new(enablement.id, enablement.version))
+        .collect();
     if let Some(held) = alias_by_name(state, tenant, project, &slug).cloned() {
         let body = ModelAliasBody::read(&held).map_err(ValidationError::from)?;
-        if body.targets() == [target].as_slice()
+        if body.targets() == targets.as_slice()
             && body.state() == lifecycle
             && body.wire_family() == wire_family
         {
             return Ok(());
         }
-        let next = ModelAliasBody::new(body.alias(), tenant, project, wire_family, [target])
+        let next = ModelAliasBody::new(body.alias(), tenant, project, wire_family, targets)
             .transitioned(lifecycle);
         let version = resources::next_version(state, ResourceKind::Alias, held.reference.id);
         resources::publish(state, next.version_at(held.slug.clone(), version))?;
@@ -1139,7 +1446,7 @@ fn ensure_alias(
         slug.as_str(),
     ]);
     let body =
-        ModelAliasBody::new(id, tenant, project, wire_family, [target]).transitioned(lifecycle);
+        ModelAliasBody::new(id, tenant, project, wire_family, targets).transitioned(lifecycle);
     let version = resources::next_version(state, ResourceKind::Alias, id);
     resources::publish(state, body.version_at(slug, version))?;
     Ok(())
@@ -1329,7 +1636,14 @@ mod tests {
             .expect("two catalog rows of one digest are valid");
 
         let adopted = enabled_for(&state, owner, offering).cloned();
-        let picked = ensure_catalog_model(&mut state, digest, 4, adopted.as_ref()).expect("adopts");
+        let picked = ensure_catalog_model(
+            &mut state,
+            digest,
+            4,
+            adopted.as_ref(),
+            ResourceScope::Deployment,
+        )
+        .expect("adopts");
         assert_eq!(picked.reference.id, high, "enablement pin wins");
 
         let mut without = DesiredState::new();
@@ -1338,7 +1652,8 @@ mod tests {
             .insert(high_row)
             .and_then(|state| state.insert(low_row))
             .expect("two rows");
-        let picked = ensure_catalog_model(&mut without, digest, 4, None).expect("lowest");
+        let picked = ensure_catalog_model(&mut without, digest, 4, None, ResourceScope::Deployment)
+            .expect("lowest");
         assert_eq!(picked.reference.id, low);
     }
 

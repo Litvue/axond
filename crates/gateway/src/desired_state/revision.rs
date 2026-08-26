@@ -1227,6 +1227,33 @@ mod tests {
     }
 
     #[test]
+    fn a_tenant_scoped_catalog_model_validates_and_a_pre_local_replica_would_refuse_it() {
+        let tenant = tenant_id(1);
+        let catalog = ResourceVersion::new(
+            reference(ResourceKind::CatalogModel, 5),
+            ResourceScope::Tenant(tenant),
+            Slug::parse("local").unwrap(),
+            ResourceBody::Blob(BlobRef::of(BlobKind::CatalogSnapshot, b"local-bytes")),
+        );
+        let mut state = DesiredState::new();
+        state.declare_blob(*catalog.body.blob().expect("blob"));
+        state.insert(self::tenant(1, "acme")).unwrap();
+        state.insert(catalog.clone()).unwrap();
+        state
+            .validate()
+            .expect("this binary admits tenant-scoped catalogue pins");
+
+        fn catalog_model_permits_before_local(scope: &ResourceScope) -> bool {
+            matches!(scope, ResourceScope::Deployment)
+        }
+        assert!(
+            !catalog_model_permits_before_local(&catalog.scope),
+            "old replicas refuse tenant-scoped catalog rows at permits"
+        );
+        assert!(ResourceKind::CatalogModel.permits(&catalog.scope));
+    }
+
+    #[test]
     fn a_dangling_resource_reference_is_refused() {
         let tenant = tenant_id(1);
         let missing = reference(ResourceKind::ProviderCredential, 99);

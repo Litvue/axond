@@ -63,10 +63,12 @@ use crate::backends::catalog::{
 use crate::backends::catalog_pins::{PinnedCatalog, Resolution};
 use crate::backends::catalog_projection::CallableOffering;
 use crate::backends::catalog_store::{self, CatalogStore};
+use crate::backends::local_catalog::compiled_local_price;
 use crate::desired_state::pricing::{EffectiveInstant, PriceBooks, PricingSnapshot};
 use crate::desired_state::{
-    LoadedRevision, ModelAlias, ModelEnablement, ModelError, ModelLifecycle, ModelOwner, Models,
-    OfferingId, ProjectId, ResourceId, ResourceScope, TenantId, WireFamily,
+    DesiredState, LoadedRevision, ModelAlias, ModelEnablement, ModelError, ModelLifecycle,
+    ModelOwner, Models, OfferingId, ProjectId, ResourceId, ResourceKind, ResourceScope, TenantId,
+    WireFamily,
 };
 use crate::status::{CatalogueSummary, StatusScope};
 
@@ -617,7 +619,14 @@ impl CatalogueView {
             let price = metadata.as_ref().and_then(|metadata| {
                 price_metadata(book.as_ref(), pricing.as_ref(), metadata, now)
             });
-            let billable = price.is_some();
+            let billable = if catalog_pin_is_local(revision.state(), enablement) {
+                snapshots
+                    .get(&enablement.body.offering().snapshot)
+                    .and_then(|snapshot| compiled_local_price(snapshot, enablement.body.offering()))
+                    .is_some()
+            } else {
+                price.is_some()
+            };
             let notices = notices_for(enablement, pinned_active.as_ref());
             contexts.insert(
                 enablement.reference.id,
@@ -1256,6 +1265,18 @@ fn project_aliases(
             }
         })
         .collect()
+}
+
+fn catalog_pin_is_local(state: &DesiredState, enablement: &ModelEnablement) -> bool {
+    let Some(resource) = state.get(&enablement.reference) else {
+        return false;
+    };
+    resource
+        .depends_on
+        .iter()
+        .find(|dependency| dependency.kind == ResourceKind::CatalogModel)
+        .and_then(|dependency| state.get(dependency))
+        .is_some_and(|catalog| matches!(catalog.scope, ResourceScope::Tenant(_)))
 }
 
 fn price_metadata(

@@ -14,13 +14,14 @@ use std::sync::Arc;
 use crate::backends::catalog::{CatalogSnapshot, ProviderId};
 use crate::backends::catalog_pins::{PinnedCatalog, Resolution};
 use crate::backends::catalog_store::{self, CatalogStore, CatalogStoreError};
+use crate::backends::local_catalog::compiled_local_price;
 use crate::config::{CatalogBinding, Config, Model, Target};
 use crate::convergence::compile::ProjectionError;
 use crate::convergence::credentials::runtime_provider_id;
 use crate::desired_state::models::{ModelEnablement, Models};
 use crate::desired_state::pricing::PricingSnapshot;
 use crate::desired_state::providers::Providers;
-use crate::desired_state::{Checksum, DesiredState};
+use crate::desired_state::{Checksum, DesiredState, ResourceKind, ResourceScope};
 
 /// Project all typed model contracts in `state` onto `config`.
 ///
@@ -49,13 +50,15 @@ pub async fn project(
                 .to_owned(),
         });
     };
-    let Some(pricing) = pricing else {
+    // Deployment-scoped pins still require a book covering their callable.
+    // Tenant-scoped (local) pins compile Target.price from snapshot cost.
+    if needs_deployment_price_book(&models, state) && pricing.is_none() {
         return Err(ProjectionError::Incomplete {
             detail: "typed model contracts require an effective approved price book; no pricing \
                      snapshot is available for stateful serving"
                 .to_owned(),
         });
-    };
+    }
 
     let providers = Providers::of(state).map_err(|error| ProjectionError::Body {
         reference: error.reference(),
@@ -110,12 +113,16 @@ pub async fn project(
                     ),
                 }
             })?;
-            let Some(price) = pricing.price(&catalog_provider_id, &published_model) else {
-                // An approved pointer is not enough: the effective book must
-                // cover the exact callable id at this compile instant. The
-                // request path must never reinterpret an absent stateful book
-                // as file pricing, nor turn an uncovered target into free
-                // traffic.
+            let local = catalog_pin_is_local(state, enablement);
+            let Some(price) = (if local {
+                compiled_local_price(snapshot, enablement.body.offering())
+            } else {
+                pricing.and_then(|pricing| pricing.price(&catalog_provider_id, &published_model))
+            }) else {
+                // Imported: an approved pointer is not enough; the effective
+                // book must cover the exact callable id. Local: snapshot cost
+                // that cannot convert exactly is not a file price. Neither
+                // path may turn an uncovered target into free traffic.
                 continue;
             };
             let Some(provider) = providers
@@ -160,24 +167,28 @@ pub async fn project(
                 // request can discover an uncredentialed route.
                 continue;
             }
-            let catalog =
-                CatalogBinding::new(&catalog_provider, &published_model).map_err(|error| {
-                    ProjectionError::Incomplete {
-                        detail: format!(
-                            "{} resolves to an invalid catalogue callable target: {error}",
-                            alias.reference
-                        ),
-                    }
-                })?;
+            let catalog = if local {
+                None
+            } else {
+                Some(
+                    CatalogBinding::new(&catalog_provider, &published_model).map_err(|error| {
+                        ProjectionError::Incomplete {
+                            detail: format!(
+                                "{} resolves to an invalid catalogue callable target: {error}",
+                                alias.reference
+                            ),
+                        }
+                    })?,
+                )
+            };
             targets.push(Target {
                 provider: runtime_provider,
                 model: published_model,
-                // Keep the resolved rate on the target as well as on the
-                // immutable PricingSnapshot. The request path uses the latter
-                // because the catalogue binding is explicit; this value keeps
-                // the config structurally complete and auditable.
+                // Imported: keep the book rate on the target as well as on the
+                // immutable PricingSnapshot. Local: file price from snapshot
+                // cost; catalog_version stays 0 on usage rows.
                 price,
-                catalog: Some(catalog),
+                catalog,
             });
         }
         if targets.is_empty() {
@@ -272,6 +283,29 @@ fn store_refusal(error: CatalogStoreError) -> ProjectionError {
     ProjectionError::Incomplete {
         detail: format!("the retained catalogue store could not answer convergence: {error}"),
     }
+}
+
+fn catalog_pin<'a>(
+    state: &'a DesiredState,
+    enablement: &ModelEnablement,
+) -> Option<&'a crate::desired_state::ResourceVersion> {
+    let resource = state.get(&enablement.reference)?;
+    resource
+        .depends_on
+        .iter()
+        .find(|dependency| dependency.kind == ResourceKind::CatalogModel)
+        .and_then(|dependency| state.get(dependency))
+}
+
+fn catalog_pin_is_local(state: &DesiredState, enablement: &ModelEnablement) -> bool {
+    catalog_pin(state, enablement)
+        .is_some_and(|catalog| matches!(catalog.scope, ResourceScope::Tenant(_)))
+}
+
+fn needs_deployment_price_book(models: &Models, state: &DesiredState) -> bool {
+    models
+        .enablements()
+        .any(|enablement| enablement.body.is_enabled() && !catalog_pin_is_local(state, enablement))
 }
 
 #[cfg(test)]
@@ -824,4 +858,257 @@ env = "GW_ADMIN_BREAKGLASS"
             "{error}"
         );
     }
+
+    fn local_snapshot() -> (crate::backends::catalog::CatalogSnapshot, Vec<u8>) {
+        let builder = crate::backends::local_catalog::LocalCatalogBuilder::golden();
+        let bytes = builder.payload().expect("golden payload");
+        let snapshot = builder
+            .snapshot(fixtures::tenant_id(1), UNIX_EPOCH)
+            .expect("the golden local catalogue parses");
+        (snapshot, bytes)
+    }
+
+    fn vllm_connection(
+        tenant: crate::desired_state::TenantId,
+        project: crate::desired_state::ProjectId,
+    ) -> (ResourceVersion, ResourceVersion) {
+        let provider = ProviderBody::for_tenant(
+            fixtures::resource_id(50),
+            tenant,
+            DisplayName::parse("vLLM").expect("a name"),
+            WireFamily::OpenaiChat,
+            "http://vllm.internal/v1",
+        )
+        .version(Slug::parse("vllm").expect("a slug"));
+        let credential = ProviderCredentialBody::staged(
+            fixtures::resource_id(51),
+            SecretOwner::project(tenant, project),
+            fixtures::resource_id(50),
+            DisplayName::parse("vLLM key").expect("a name"),
+            fixtures::secret_ref(51),
+        )
+        .transitioned(SecretLifecycle::Active)
+        .expect("staged material activates")
+        .version(Slug::parse("vllm-key").expect("a slug"));
+        (provider, credential)
+    }
+
+    #[tokio::test]
+    async fn a_tenant_scoped_local_pin_compiles_file_price_without_a_book() {
+        let (local, local_bytes) = local_snapshot();
+        let tenant = fixtures::tenant_id(1);
+        let project_id = fixtures::project_id(2);
+        let local_bytes = local_bytes.as_slice();
+        let catalog_reference = fixtures::reference(ResourceKind::CatalogModel, 80);
+        let catalog = ResourceVersion::new(
+            catalog_reference,
+            ResourceScope::Tenant(tenant),
+            Slug::parse("local").expect("a slug"),
+            ResourceBody::Blob(BlobRef::of(BlobKind::CatalogSnapshot, local_bytes)),
+        );
+        let (provider, credential) = vllm_connection(tenant, project_id);
+        let offering = CatalogOffering::new(
+            OfferingId::of("vllm", "meta-llama-3-70b-instruct").expect("an offering id"),
+            local.source.raw.digest,
+        );
+        let enablement = ModelEnablementBody::new(
+            fixtures::resource_id(81),
+            ModelOwner::project(tenant, project_id),
+            offering,
+            WireFamily::OpenaiChat,
+        )
+        .version(
+            Slug::parse("local-llama").expect("a slug"),
+            catalog_reference,
+        );
+        let alias = ModelAliasBody::new(
+            fixtures::resource_id(82),
+            tenant,
+            project_id,
+            WireFamily::OpenaiChat,
+            [crate::desired_state::AliasTarget::first(
+                fixtures::resource_id(81),
+            )],
+        )
+        .version(Slug::parse("local-llama").expect("a slug"));
+        let mut state = crate::desired_state::DesiredState::new();
+        state.declare_blob(*catalog.body.blob().expect("the catalog blob"));
+        state
+            .insert(fixtures::tenant(1, "acme"))
+            .and_then(|state| state.insert(fixtures::project(&tenant, 2, "core")))
+            .and_then(|state| state.insert(catalog))
+            .and_then(|state| state.insert(provider))
+            .and_then(|state| state.insert(credential))
+            .and_then(|state| state.insert(enablement))
+            .and_then(|state| state.insert(alias))
+            .and_then(|state| {
+                let key = fixtures::workload_key(0xd1);
+                state.insert(fixtures::workload(
+                    83,
+                    "caller",
+                    ResourceScope::Project {
+                        tenant,
+                        project: project_id,
+                    },
+                    &[crate::desired_state::Role::Developer],
+                    Some(&key),
+                ))
+            })
+            .expect("the local serving state is distinct");
+
+        let imported = ModelsDevAdapter::default()
+            .parse(CATALOG.as_bytes(), SourceValidators::default(), UNIX_EPOCH)
+            .expect("imported fixture");
+        let store: Arc<dyn CatalogStore> = Arc::new(InMemoryCatalogStore::new());
+        store
+            .activate(
+                &RetainedCatalog {
+                    source: imported.source.clone(),
+                    payload: crate::backends::catalog::RawPayload::new(CATALOG.as_bytes()),
+                },
+                SystemTime::now(),
+            )
+            .await
+            .expect("imported is active");
+        let imported_active = store
+            .load()
+            .await
+            .expect("load")
+            .active
+            .expect("active")
+            .content_id();
+        store
+            .retain(&RetainedCatalog {
+                source: local.source.clone(),
+                payload: crate::backends::catalog::RawPayload::new(local_bytes),
+            })
+            .await
+            .expect("local is retained");
+        assert_eq!(
+            store
+                .load()
+                .await
+                .expect("load")
+                .active
+                .expect("active")
+                .content_id(),
+            imported_active,
+            "local retain must not move load().active"
+        );
+
+        let config = RuntimeProjection
+            .project(&bootstrap(), &state, fixtures::revision_id(3))
+            .expect("tenancy, providers, and principals project");
+        let config = project(config, &state, Some(&store), None)
+            .await
+            .expect("a local-only fleet compiles without a price book");
+        config
+            .validate_compiled()
+            .expect("the projected serving graph passes the boot gate");
+        assert_eq!(config.model.len(), 1);
+        let target = &config.model[0].targets[0];
+        assert_eq!(target.provider, "vllm");
+        assert_eq!(target.model, "meta-llama-3-70b-instruct");
+        assert_eq!(target.price.input_microdollars_per_million, 0);
+        assert_eq!(target.price.output_microdollars_per_million, 0);
+        assert!(target.catalog.is_none(), "local compiles unbound");
+    }
+
+    #[tokio::test]
+    async fn mixed_imported_and_local_alias_uses_book_and_file_price() {
+        let (mut state, imported_snapshot) = state_and_snapshot();
+        let (local, local_bytes) = local_snapshot();
+        let tenant = fixtures::tenant_id(1);
+        let project_id = fixtures::project_id(2);
+        let local_bytes = local_bytes.as_slice();
+        let catalog_reference = fixtures::reference(ResourceKind::CatalogModel, 80);
+        let catalog = ResourceVersion::new(
+            catalog_reference,
+            ResourceScope::Tenant(tenant),
+            Slug::parse("local").expect("a slug"),
+            ResourceBody::Blob(BlobRef::of(BlobKind::CatalogSnapshot, local_bytes)),
+        );
+        let (provider, credential) = vllm_connection(tenant, project_id);
+        let offering = CatalogOffering::new(
+            OfferingId::of("vllm", "meta-llama-3-70b-instruct").expect("an offering id"),
+            local.source.raw.digest,
+        );
+        let enablement = ModelEnablementBody::new(
+            fixtures::resource_id(81),
+            ModelOwner::project(tenant, project_id),
+            offering,
+            WireFamily::OpenaiChat,
+        )
+        .version(
+            Slug::parse("local-llama").expect("a slug"),
+            catalog_reference,
+        );
+        state.declare_blob(*catalog.body.blob().expect("blob"));
+        state
+            .insert(catalog)
+            .and_then(|state| state.insert(provider))
+            .and_then(|state| state.insert(credential))
+            .and_then(|state| state.insert(enablement))
+            .expect("local rows");
+
+        let alias = state
+            .resources()
+            .find(|resource| resource.reference.kind == ResourceKind::Alias)
+            .expect("the imported alias")
+            .clone();
+        let mixed = ModelAliasBody::new(
+            alias.reference.id,
+            tenant,
+            project_id,
+            WireFamily::OpenaiChat,
+            [
+                crate::desired_state::AliasTarget::first(fixtures::resource_id(30)),
+                crate::desired_state::AliasTarget::first(fixtures::resource_id(81)),
+            ],
+        )
+        .version_at(alias.slug.clone(), alias.reference.version.next());
+        state.supersede(mixed).expect("mixed alias");
+
+        let store: Arc<dyn CatalogStore> = Arc::new(InMemoryCatalogStore::new());
+        store
+            .activate(
+                &RetainedCatalog {
+                    source: imported_snapshot.source.clone(),
+                    payload: crate::backends::catalog::RawPayload::new(CATALOG.as_bytes()),
+                },
+                SystemTime::now(),
+            )
+            .await
+            .expect("imported");
+        store
+            .retain(&RetainedCatalog {
+                source: local.source.clone(),
+                payload: crate::backends::catalog::RawPayload::new(local_bytes),
+            })
+            .await
+            .expect("local");
+
+        let config = RuntimeProjection
+            .project(&bootstrap(), &state, fixtures::revision_id(3))
+            .expect("tenancy projects");
+        let pricing = crate::desired_state::pricing::PriceBooks::of(&state)
+            .expect("book")
+            .snapshot_at(EffectiveInstant::EPOCH)
+            .expect("snapshot");
+        let config = project(config, &state, Some(&store), Some(&pricing))
+            .await
+            .expect("mixed alias projects");
+        let model = config
+            .model
+            .iter()
+            .find(|model| model.name == "fast")
+            .expect("the mixed alias");
+        assert_eq!(model.targets.len(), 2);
+        assert!(model.targets[0].catalog.is_some());
+        assert_eq!(model.targets[0].price.input_microdollars_per_million, 2_500);
+        assert!(model.targets[1].catalog.is_none());
+        assert_eq!(model.targets[1].price.input_microdollars_per_million, 0);
+        assert_eq!(model.targets[1].provider, "vllm");
+    }
+
 }
