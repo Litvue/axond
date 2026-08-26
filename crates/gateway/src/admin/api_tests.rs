@@ -20,9 +20,10 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use super::auth::AdminAction;
-use super::auth::INFERENCE_KEY_HEADER;
-use super::fakes::{CountingStore, FakeAdminAuthenticator, FakeAdminAuthorizer};
+use super::auth::{AdminAction, AdminAuthorizer, INFERENCE_KEY_HEADER};
+use super::fakes::{
+    CountingStore, FakeAdminAuthenticator, FakeAdminAuthorizer, RecordingAuthorizer,
+};
 use super::protocol::{
     ADMIN_PREFIX, DRY_RUN_HEADER, EXPECTED_REVISION_EMPTY, EXPECTED_REVISION_HEADER,
     IDEMPOTENCY_KEY_HEADER,
@@ -42,7 +43,7 @@ use crate::backends::models_dev::{ModelsDevAdapter, SEED_PAYLOAD, seed_snapshot}
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
     Actor, DenialPage, ModelEnablementBody, OfferingId, PriceBookBody, ResourceKind, ResourceScope,
-    fixtures,
+    Surface, fixtures,
 };
 
 const TOKEN: &str = "human-admin-token";
@@ -63,13 +64,20 @@ impl Deployment {
     }
 
     fn with_catalogue(catalogue: Arc<dyn CatalogStore>) -> Self {
+        Self::with_catalogue_authorizer(catalogue, Arc::new(FakeAdminAuthorizer::permissive()))
+    }
+
+    fn with_catalogue_authorizer(
+        catalogue: Arc<dyn CatalogStore>,
+        authorizer: Arc<dyn AdminAuthorizer>,
+    ) -> Self {
         let store = Arc::new(InMemoryControlPlane::new());
         let secrets = Arc::new(InMemorySecrets::new());
         let api = Arc::new(
             AdminApi::new(
                 Arc::new(AdminService::stateful(store.clone()).with_secrets(secrets.clone())),
                 Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
-                Arc::new(FakeAdminAuthorizer::permissive()),
+                authorizer,
             )
             .with_catalogue(catalogue),
         );
@@ -194,12 +202,20 @@ impl Deployment {
     /// administrator sees of a deployment somebody with deployment authority
     /// built.
     fn narrowed(&self, scopes: &[ResourceScope]) -> Self {
+        self.reauthorize(Arc::new(FakeAdminAuthorizer::permissive().within(scopes)))
+    }
+
+    fn reauthorize(&self, authorizer: Arc<dyn AdminAuthorizer>) -> Self {
+        let mut api = AdminApi::new(
+            Arc::new(AdminService::stateful(self.store.clone()).with_secrets(self.secrets.clone())),
+            Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+            authorizer,
+        );
+        if let Some(catalogue) = &self.api.catalogue {
+            api = api.with_catalogue(catalogue.clone());
+        }
         Self {
-            api: Arc::new(AdminApi::new(
-                Arc::new(AdminService::stateful(self.store.clone())),
-                Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
-                Arc::new(FakeAdminAuthorizer::permissive().within(scopes)),
-            )),
+            api: Arc::new(api),
             store: self.store.clone(),
             secrets: self.secrets.clone(),
         }
@@ -3419,6 +3435,7 @@ async fn four_step_then_binding_adopts_the_book_and_alias_id() {
                 "resource": {
                     "enablement": fixtures::resource_id(14).to_string(),
                     "tenant": fixtures::tenant_id(1).to_string(),
+                    "project": fixtures::project_id(2).to_string(),
                     "slug": "gpt-4o",
                     "offering": fixtures::offering_id("gpt-4o").to_string(),
                     "catalog": fixtures::resource_id(13).to_string(),
@@ -3480,7 +3497,7 @@ async fn four_step_then_binding_adopts_the_book_and_alias_id() {
         .post("/bindings", "bind-adopt", &expected, &binding_update())
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["result"], "published", "{body}");
+    assert_eq!(body["result"], "unchanged", "{body}");
 
     let loaded = deployment
         .store
@@ -3502,6 +3519,13 @@ async fn four_step_then_binding_adopts_the_book_and_alias_id() {
         .collect();
     assert_eq!(aliases.len(), 1, "one alias");
     assert_eq!(aliases[0].reference.id, fixtures::resource_id(15));
+    let enablements: Vec<_> = loaded
+        .state()
+        .resources()
+        .filter(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+        .collect();
+    assert_eq!(enablements.len(), 1, "one enablement");
+    assert_eq!(enablements[0].reference.id, fixtures::resource_id(14));
 }
 
 #[tokio::test]
@@ -3523,11 +3547,25 @@ async fn identical_reapply_is_unchanged_only_when_expected_matches_head() {
 
 #[tokio::test]
 async fn lost_response_retry_of_first_pin_classifies_deployment_and_replays() {
-    let (deployment, _) = imported_deployment().await;
+    let snapshot = seed_snapshot();
+    let catalogue = Arc::new(InMemoryCatalogStore::new());
+    catalogue
+        .activate(
+            &RetainedCatalog {
+                source: snapshot.source.clone(),
+                payload: RawPayload::new(SEED_PAYLOAD.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("the seed is retained");
+    let recorder = RecordingAuthorizer::permissive();
+    let deployment = Deployment::with_catalogue_authorizer(catalogue, recorder.clone());
     let expected = foundation(&deployment).await;
     let first = deployment
         .publish("/bindings", "bind-retry", &expected, &binding_document())
         .await;
+    recorder.calls.lock().expect("not poisoned").clear();
     let (status, body) = deployment
         .post("/bindings", "bind-retry", &expected, &binding_document())
         .await;
@@ -3535,6 +3573,23 @@ async fn lost_response_retry_of_first_pin_classifies_deployment_and_replays() {
     assert_eq!(body["result"], "replayed", "{body}");
     assert_eq!(body["revision"], first);
     assert_eq!(deployment.store.published_revisions(), 5);
+    let calls = recorder.calls.lock().expect("not poisoned").clone();
+    assert!(
+        calls.iter().any(|(action, surface, scope)| {
+            *action == AdminAction::Publish
+                && *surface == Surface::Model
+                && *scope == ResourceScope::Deployment
+        }),
+        "retry must probe Model at Deployment, got {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|(action, surface, scope)| {
+            *action == AdminAction::Publish
+                && *surface == Surface::Price
+                && *scope == ResourceScope::Deployment
+        }),
+        "retry must probe Price at Deployment, got {calls:?}"
+    );
 }
 
 #[tokio::test]
@@ -3684,7 +3739,6 @@ async fn published_not_neutral_uses_catalog_model_when_provider_equals_slug() {
         "resource": {
             "tenant": fixtures::tenant_id(1).to_string(),
             "project": fixtures::project_id(2).to_string(),
-            "name": "gpt-5-5",
             "targets": [{
                 "provider": "openai",
                 "model": "gpt-5.5",
@@ -3715,6 +3769,12 @@ async fn published_not_neutral_uses_catalog_model_when_provider_equals_slug() {
     let body = ModelEnablementBody::read(enablement).expect("readable");
     assert_eq!(body.offering().offering, offering);
     assert_ne!(body.offering().offering, wrong);
+    let alias = loaded
+        .state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::Alias)
+        .expect("an alias");
+    assert_eq!(alias.slug.as_str(), "gpt-5.5");
 }
 
 #[tokio::test]
@@ -3845,4 +3905,83 @@ async fn binding_book_is_actor_aware_and_enablements_have_no_approved_price() {
             "expander leaves approved_price unset"
         );
     }
+}
+
+#[tokio::test]
+async fn a_rate_change_on_existing_coverage_is_refused() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let head = deployment
+        .publish("/bindings", "bind-rate-1", &expected, &binding_document())
+        .await;
+    let mut changed = binding_update();
+    changed["resource"]["targets"][0]["price"]["input_microdollars_per_million"] =
+        json!(3_000_000u64);
+    let (status, body) = deployment
+        .post("/bindings", "bind-rate-2", &head, &changed)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "binding_refused");
+    assert_eq!(body["error"]["rule"], "price_change_requires_interval");
+}
+
+#[tokio::test]
+async fn pin_lock_on_first_apply_pins_the_active_digest() {
+    let (deployment, snapshot) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let mut document = binding_document();
+    document["resource"]["pin"] = json!("lock");
+    let _head = deployment
+        .publish("/bindings", "bind-lock-first", &expected, &document)
+        .await;
+    let loaded = deployment
+        .store
+        .load_desired_revision()
+        .await
+        .expect("head")
+        .expect("published");
+    let enablement = loaded
+        .state()
+        .resources()
+        .find(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+        .expect("an enablement");
+    let body = ModelEnablementBody::read(enablement).expect("readable");
+    assert_eq!(body.offering().snapshot, snapshot.source.raw.digest);
+    assert!(body.is_enabled());
+}
+
+#[tokio::test]
+async fn a_missing_stale_expected_is_a_conflict_from_apply() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let _head = deployment
+        .publish("/bindings", "bind-missing", &expected, &binding_document())
+        .await;
+    let (status, body) = deployment
+        .post(
+            "/bindings",
+            "bind-missing-stale",
+            &fixtures::revision_id(99).to_string(),
+            &binding_update(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["type"], "revision_conflict");
+}
+
+#[tokio::test]
+async fn unchanged_still_requires_a_publish_grant() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let head = deployment
+        .publish("/bindings", "bind-auth-1", &expected, &binding_document())
+        .await;
+    let reader = deployment.reauthorize(Arc::new(FakeAdminAuthorizer::permitting(&[
+        AdminAction::ReadState,
+    ])));
+    let (status, body) = reader
+        .post("/bindings", "bind-auth-2", &head, &binding_update())
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["type"], "admin_forbidden");
 }

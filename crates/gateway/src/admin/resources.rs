@@ -1319,7 +1319,7 @@ fn slug<R: AdminResourceRequest>(text: &str) -> Result<Slug, AdminError> {
             InvalidSlug::Empty => "must not be empty".to_owned(),
             InvalidSlug::TooLong { max, .. } => format!("is over the {max}-character limit"),
             InvalidSlug::Character { .. } => {
-                "contains a character outside ASCII letters, digits, `-`, and `_`".to_owned()
+                "contains a character outside ASCII letters, digits, `.`, `-`, and `_`".to_owned()
             }
             InvalidSlug::Boundary { .. } => "must start and end with a letter or digit".to_owned(),
             InvalidSlug::IdLike { .. } => "looks like an id; ids are not names".to_owned(),

@@ -222,42 +222,92 @@ async fn publish_binding_inner(
     }
     let summary = super::protocol::AuditSummary::parse(&envelope.summary)?;
     let plan = BindingPlan::from_resource(envelope.resource, envelope.mutation.kind())?;
-    let snapshot = load_active_snapshot(api.catalogue.as_deref()).await?;
     let store = api.service.store()?;
     let head_id = store.desired_revision().await.map_err(log_store)?;
+    let head_state = match head_id {
+        Some(id) => store
+            .load_revision(id)
+            .await
+            .map_err(log_store)?
+            .state()
+            .clone(),
+        None => DesiredState::new(),
+    };
+    let document_scope = plan.document_scope(&head_state)?;
+    api.authorize(
+        &identity,
+        AdminAction::Publish,
+        Surface::Model,
+        &document_scope,
+    )
+    .await?;
+    api.authorize(
+        &identity,
+        AdminAction::Publish,
+        Surface::Alias,
+        &document_scope,
+    )
+    .await?;
+
+    let snapshot = load_active_snapshot(api.catalogue.as_deref()).await?;
     let expected = preconditions.expected;
-    let expected_state = load_expected_state(store.as_ref(), expected, head_id).await?;
     let actor = identity.actor();
     let now = EffectiveInstant::of(SystemTime::now()).unwrap_or(EffectiveInstant::EPOCH);
+    let edit = BindingEdit {
+        plan: plan.clone(),
+        snapshot: snapshot.clone(),
+        now,
+    };
+
+    let expected_state = match load_expected_base(store.as_ref(), expected, head_id).await? {
+        ExpectedBase::Missing => {
+            let grant = api
+                .authorize(
+                    &identity,
+                    AdminAction::Publish,
+                    Surface::Model,
+                    &document_scope,
+                )
+                .await?;
+            let request = MutationRequest {
+                preconditions,
+                kind: plan.mutation,
+                surface: Surface::Model,
+                scope: document_scope,
+                summary,
+            };
+            let outcome = api.service.apply(&grant, &request, &edit).await?;
+            return Ok(Json(outcome));
+        }
+        ExpectedBase::State(state) => state,
+    };
 
     let mut expanded = expected_state.clone();
     expand(&mut expanded, &actor, &plan, &snapshot, now)?;
     let expected_diff = SemanticDiff::between(Some(&expected_state), &expanded)?;
-    let document_scope = plan.document_scope(&expected_state)?;
     let classification = classify(&expected_state, &expanded, document_scope.clone());
 
     for (surface, scope) in &classification.probes {
-        let _grant = api
-            .authorize(&identity, AdminAction::Publish, *surface, scope)
+        if *scope == document_scope && matches!(*surface, Surface::Model | Surface::Alias) {
+            continue;
+        }
+        api.authorize(&identity, AdminAction::Publish, *surface, scope)
             .await?;
     }
 
     if expected.matches(head_id) && expected_diff.is_empty() {
         let checksum = expected_state.checksum()?;
+        let Some(revision) = head_id else {
+            return Err(AdminError::RequestInvalid {
+                schema: SCHEMA,
+                detail: "an empty control plane has no revision to leave unchanged".to_owned(),
+            });
+        };
         return Ok(Json(MutationOutcome {
             result: MutationResult::Unchanged {
-                revision: match head_id {
-                    Some(id) => id.to_string(),
-                    None => {
-                        return Err(AdminError::RequestInvalid {
-                            schema: SCHEMA,
-                            detail: "an empty control plane has no revision to leave unchanged"
-                                .to_owned(),
-                        });
-                    }
-                },
+                revision: revision.to_string(),
             },
-            base: head_id.map(|id| id.to_string()),
+            base: Some(revision.to_string()),
             checksum: checksum.to_string(),
             mode: preconditions.mode.as_str(),
             diff: expected_diff,
@@ -280,11 +330,6 @@ async fn publish_binding_inner(
         surface: Surface::Model,
         scope: apply_scope,
         summary,
-    };
-    let edit = BindingEdit {
-        plan,
-        snapshot,
-        now,
     };
     let outcome = api.service.apply(&grant, &request, &edit).await?;
     Ok(Json(outcome))
@@ -325,19 +370,24 @@ async fn load_active_snapshot(
     })
 }
 
-async fn load_expected_state(
+enum ExpectedBase {
+    State(DesiredState),
+    Missing,
+}
+
+async fn load_expected_base(
     store: &dyn crate::backends::control_plane::ControlPlaneStore,
     expected: ExpectedRevision,
     head: Option<crate::desired_state::RevisionId>,
-) -> Result<DesiredState, AdminError> {
+) -> Result<ExpectedBase, AdminError> {
     match expected {
-        ExpectedRevision::Empty => Ok(DesiredState::new()),
+        ExpectedRevision::Empty => Ok(ExpectedBase::State(DesiredState::new())),
         ExpectedRevision::Exactly(id) => match store.load_revision(id).await {
-            Ok(revision) => Ok(revision.state().clone()),
+            Ok(revision) => Ok(ExpectedBase::State(revision.state().clone())),
             Err(crate::backends::control_plane::ControlPlaneError::RevisionNotFound(_))
                 if !expected.matches(head) =>
             {
-                Ok(DesiredState::new())
+                Ok(ExpectedBase::Missing)
             }
             Err(error) => Err(log_store(error)),
         },
@@ -610,7 +660,6 @@ fn expand(
             priced,
             rates,
             origin,
-            now,
         )?;
     }
 
@@ -866,7 +915,6 @@ fn catalog_insert_slug(state: &DesiredState, digest: Checksum) -> Slug {
     Slug::parse(&hex).expect("hex is a slug")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn ensure_book(
     state: &mut DesiredState,
     actor: &Actor,
@@ -875,23 +923,21 @@ fn ensure_book(
     target: PricedTarget,
     rates: ApprovedRates,
     origin: PriceOrigin,
-    now: EffectiveInstant,
 ) -> Result<(), AdminError> {
     let books = PriceBooks::of(state).map_err(|error| ValidationError::Pricing(Box::new(error)))?;
+    let rule = PriceRule::new(
+        target.clone(),
+        crate::desired_state::RulePrecedence::Baseline,
+        EffectiveInterval::from(EffectiveInstant::EPOCH),
+        rates,
+        PriceProvenance::stated(origin),
+    )
+    .map_err(|error| refused(RULE_OBSERVED_UNBILLABLE, &error.to_string()))?;
 
     let Some(existing) = books.book() else {
         let id = derived_resource_id(&[ResourceKind::Price.as_str(), "deployment", "approved"]);
         let slug = Slug::parse("approved").expect("approved is a slug");
-        // Greenfield open interval starts at epoch so a lost-response retry
-        // rebuilds the same book; PR 6 uses the mutation instant for close/open.
-        let rule = PriceRule::new(
-            target,
-            crate::desired_state::RulePrecedence::Baseline,
-            EffectiveInterval::from(EffectiveInstant::EPOCH),
-            rates,
-            PriceProvenance::stated(origin),
-        )
-        .map_err(|error| refused(RULE_OBSERVED_UNBILLABLE, &error.to_string()))?;
+        // Open interval from epoch so a lost-response retry rebuilds the same book.
         let body = PriceBookBody::new(
             catalog,
             catalog_version,
@@ -912,42 +958,28 @@ fn ensure_book(
         .iter()
         .filter(|rule| rule.target() == &target)
         .collect();
-    if covering.iter().any(|rule| rule.rates() == rates) {
+    if covering
+        .iter()
+        .any(|existing_rule| existing_rule.rates() == rates)
+    {
         return Ok(());
     }
-    if covering.len() > 1 {
+    if !covering.is_empty() {
         return Err(refused(
             RULE_PRICE_CHANGE,
-            "changing rates that would overlap existing coverage requires an interval close (PR 6)",
+            "changing rates that would overlap existing coverage requires an interval close",
         ));
     }
-    let kept: Vec<PriceRule> = current
+    let body = current
         .iter()
-        .filter(|rule| rule.target() != &target)
         .cloned()
-        .collect();
-    let from = if covering.is_empty() {
-        EffectiveInstant::EPOCH
-    } else {
-        now
-    };
-    let rule = PriceRule::new(
-        target,
-        crate::desired_state::RulePrecedence::Baseline,
-        EffectiveInterval::from(from),
-        rates,
-        PriceProvenance::stated(origin),
-    )
-    .map_err(|error| refused(RULE_OBSERVED_UNBILLABLE, &error.to_string()))?;
-    let body = kept
-        .into_iter()
         .fold(
             PriceBookBody::new(
                 catalog,
                 catalog_version,
                 Approval::Approved {
                     by: actor.clone(),
-                    at: from,
+                    at: EffectiveInstant::EPOCH,
                     citation: None,
                 },
             ),
@@ -1017,11 +1049,6 @@ fn ensure_enablement(
             state,
             disabled.version_at(held.slug.clone(), version, old_catalog),
         )?;
-    } else if pin == PinMode::Lock {
-        return Err(refused(
-            RULE_PIN_LOCKED,
-            "pin=lock requires an existing pin",
-        ));
     }
 
     let id = derived_resource_id(&[

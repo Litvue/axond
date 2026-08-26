@@ -408,7 +408,7 @@ pub enum InvalidSlug {
         max: usize,
     },
     #[error(
-        "a slug may not contain `{character}`; only ASCII letters, digits, `-`, and `_` are allowed"
+        "a slug may not contain `{character}`; only ASCII letters, digits, `.`, `-`, and `_` are allowed"
     )]
     Character { slug: String, character: char },
     #[error("a slug must start and end with a letter or digit")]
@@ -446,7 +446,7 @@ impl Slug {
         let lowered = input.to_ascii_lowercase();
         if let Some(character) = lowered
             .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.'))
         {
             return Err(InvalidSlug::Character {
                 slug: input.to_owned(),
@@ -685,6 +685,7 @@ mod tests {
         );
         assert_eq!(Slug::parse("a").unwrap().to_string(), "a");
         assert_eq!(Slug::parse("team_1-x").unwrap().as_str(), "team_1-x");
+        assert_eq!(Slug::parse("gpt-5.5").unwrap().as_str(), "gpt-5.5");
     }
 
     #[test]
@@ -694,7 +695,7 @@ mod tests {
             Slug::parse(&"a".repeat(Slug::MAX_LEN + 1)),
             Err(InvalidSlug::TooLong { .. })
         ));
-        for input in ["prod eu", "prod.eu", "prodé", "prod/eu"] {
+        for input in ["prod eu", "prodé", "prod/eu"] {
             assert!(
                 matches!(Slug::parse(input), Err(InvalidSlug::Character { .. })),
                 "`{input}` must be refused"

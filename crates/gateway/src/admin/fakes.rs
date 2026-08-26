@@ -11,8 +11,8 @@
 //! control-plane backend" is asserted against a number rather than inferred.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use secrecy::SecretString;
@@ -154,6 +154,41 @@ impl AdminAuthorizer for FakeAdminAuthorizer {
             return Err(AdminAuthError::ScopeNotPermitted);
         }
         Ok(AdminGrant::granted(identity.clone(), action, scope.clone()))
+    }
+}
+
+/// Records every authorize call so a test can assert which grant `apply` saw.
+pub(crate) struct RecordingAuthorizer {
+    inner: FakeAdminAuthorizer,
+    pub calls: Mutex<Vec<(AdminAction, crate::desired_state::Surface, ResourceScope)>>,
+}
+
+impl RecordingAuthorizer {
+    pub(crate) fn permissive() -> Arc<Self> {
+        Arc::new(Self {
+            inner: FakeAdminAuthorizer::permissive(),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl AdminAuthorizer for RecordingAuthorizer {
+    fn name(&self) -> &'static str {
+        "recording-admin-authorizer"
+    }
+
+    fn authorize(
+        &self,
+        identity: &AdminIdentity,
+        action: AdminAction,
+        surface: crate::desired_state::Surface,
+        scope: &ResourceScope,
+    ) -> Result<AdminGrant, AdminAuthError> {
+        self.calls
+            .lock()
+            .expect("not poisoned")
+            .push((action, surface, scope.clone()));
+        self.inner.authorize(identity, action, surface, scope)
     }
 }
 
