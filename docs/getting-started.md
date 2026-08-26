@@ -92,8 +92,9 @@ before every Compose command.
 
 ## Try the stateful stack
 
-The stateful example adds Redis-backed budgets/rate limits and a Postgres usage
-sink:
+The stateful Compose example adds Redis-backed budgets/rate limits and a
+Postgres usage sink. It is still file-owned models (`gpt-4o` in the TOML),
+not the control-plane mode below.
 
 ```bash
 export AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml
@@ -105,6 +106,45 @@ docker compose \
 Use those same `-f` and `--profile` flags on every follow-up command. See the
 [Compose guide](./deployment/docker-compose.md) for the durable-row probe and
 failure tests.
+
+## Make a model available (`mode = "stateful"`)
+
+A control-plane replica does not take `[[model]]` in the file. After a tenant,
+project, provider connection, and credential exist, one apply makes a published
+id callable:
+
+```bash
+export AXOND_ADMIN_TOKEN=...
+axond admin catalog browse --tenant ten_01J... --provider openai --q gpt-4o
+axond admin model apply --tenant ten_01J... --project prj_01J... \
+  --target openai:gpt-4o \
+  --price-input 2500000 --price-output 10000000
+```
+
+Omit `--name`. The alias is `gpt-4o` — the id callers send and what
+`GET /v1/models` lists. The CLI fills `idempotency-key` and
+`x-axond-expected-revision`.
+
+```bash
+curl --fail \
+  -H 'Authorization: Bearer <workload-key>' \
+  http://127.0.0.1:8080/v1/models
+```
+
+Expected: `{"data":[{"id":"gpt-4o",...}],"object":"list"}`. Then one completion:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Authorization: Bearer <workload-key>' \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
+```
+
+The workload key is an inference credential, not `AXOND_ADMIN_TOKEN`. Browse,
+apply, disable, and the binding document are in
+[administering a stateful deployment](./operations/admin-api.md). The
+[stateful Kubernetes runbook](./operations/stateful-deployment-runbook.md)
+covers first install.
 
 ## Run current source instead
 

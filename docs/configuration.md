@@ -77,12 +77,12 @@ policy between a file and a database. It is a bootstrap property, so a reload
 cannot switch a serving process between modes — that needs a restart.
 
 **A stateful replica administers and serves only projected state.** It opens the
-control plane and serves `/admin/v1` — see [administering a stateful deployment]
+control plane and serves `/admin/v1`. Making a model callable is
+`axond admin model apply` — see [administering a stateful deployment]
 (./operations/admin-api.md) — while inference remains fail-closed until a
 projected snapshot or valid signed last-known-good cache is active. Once active,
 the immutable snapshot keeps serving through a control-plane outage. See
-[revision convergence](./operations/revision-convergence.md) for recovery and
-read the ADR's ownership and failure matrices before planning a deployment.
+[revision convergence](./operations/revision-convergence.md) for recovery.
 
 ### Stateful bootstrap
 
@@ -345,7 +345,7 @@ The tenancy boundary: which credential pool a caller's requests draw from.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `name` | string | — | The name callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. Credential labels are separately exposed by the scoped, replica-local `/v1/credentials` status view. |
+| `name` | string | — | The published model id callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. Required in this file; a stateful apply omits it and defaults to the first target's published id. Credential labels are separately exposed by the scoped, replica-local `/v1/credentials` status view. |
 | `namespace` | string | — | The namespace that owns the alias. Omitted, the alias is deployment-wide: every namespace may name it. Named, only that namespace lists or invokes it, and it shadows a deployment-wide alias of the same name for that namespace alone. An undefined namespace is rejected, and one namespace may not define the same `name` twice ([ADR 0058](./adr/0058-tenant-owned-alias-names-and-the-management-catalogue.md)). |
 | `targets` | array of target | — | Concrete destinations, tried **in order** on a retryable failure. All targets must use one provider wire family: OpenAI (`openai` or `openai-compatible`) or Anthropic. An empty list is rejected. |
 
@@ -363,6 +363,12 @@ Each target:
 Pricing is mandatory because budgets are denominated in currency: an unpriced
 target could not be charged, so it fails to parse.
 
+Stateful mode rejects `[[model]]` in this file. The same fields are a binding
+applied with `axond admin model apply`: connection slug, published id, and
+price. The public example is one imported target whose slug is the catalogue
+provider (`openai` / `gpt-4o`). Operator-authored vLLM or Azure deployment ids
+are not that imported path.
+
 `catalog` is optional and opts the target into **approved price books**: where the
 serving snapshot carries an approved book covering the bound offering, that book's
 rates are charged and the usage row names the book, its checksum, and the
@@ -375,6 +381,8 @@ another's traffic), and a bound target the approved book does *not* price is
 **ineligible** rather than free — the alias stays listed by `/v1/models`, but a
 request that can only route to unpriced targets is refused
 `503 model_not_priced` ([ADR 0056](./adr/0056-request-path-pricing.md)).
+On a stateful *imported* apply, `catalog.provider` if set must equal the
+connection slug.
 
 `/v1/responses` does not use the target order at all: every Responses request,
 initial or continuation, is served only by the **first** target so a
@@ -1139,9 +1147,10 @@ An HTTPS mirror is a supported `source_url`; a plaintext, hostless, or credentia
 carrying one is refused at boot. Hosts are deliberately not allowlisted: an
 operator-controlled HTTPS mirror may be deployment-local or air-gapped. The URL
 must still name the exact supported `/catalog.json` document.
-Imported metadata is what an operator later reads to approve a price or enable a
-model, so a document anyone on the path could substitute is not a source this
-gateway will trust. Redirects are not followed either: the configured URL is the
+Imported metadata is what an operator browses (`axond admin catalog browse`)
+before `axond admin model apply`. An import still never enables, aliases, or
+prices anything, so a document anyone on the path could substitute is not a
+source this gateway will trust. Redirects are not followed either: the configured URL is the
 provenance every snapshot records, so a `3xx` is a bounded refusal naming its
 status rather than an import of whatever the answer pointed at.
 
