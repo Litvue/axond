@@ -65,8 +65,9 @@ use crate::backends::catalog_projection::CallableOffering;
 use crate::backends::catalog_store::{self, CatalogStore};
 use crate::desired_state::pricing::{EffectiveInstant, PriceBooks, PricingSnapshot};
 use crate::desired_state::{
-    LoadedRevision, ModelAlias, ModelEnablement, ModelError, ModelLifecycle, ModelOwner, Models,
-    OfferingId, ProjectId, ResourceId, ResourceScope, TenantId, WireFamily,
+    DesiredState, LoadedRevision, ModelAlias, ModelEnablement, ModelError, ModelLifecycle,
+    ModelOwner, Models, OfferingId, ProjectId, ResourceId, ResourceKind, ResourceScope,
+    ResourceVersion, TenantId, WireFamily,
 };
 use crate::status::{CatalogueSummary, StatusScope};
 
@@ -377,6 +378,13 @@ pub struct CatalogueEntry {
     pub billable: bool,
     /// The alias names, in this scope, that resolve to this enablement.
     pub aliases: Vec<String>,
+    /// Published Provider connection slug in reach for this enablement.
+    ///
+    /// Reconstructed from the Provider resource, not [`CatalogueMetadata::provider`].
+    /// Omitted when no unique in-reach connection exists, or when that slug
+    /// differs from the pinned catalogue identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
     /// Why it is not routable, in a stable order. Empty when it is routable;
     /// may also be empty when `routable` is false because a pending fact is the
     /// reason rather than a definitive [`UnavailableReason::Unpriced`] verdict.
@@ -763,6 +771,9 @@ impl CatalogueView {
                     let mut overlay = context.cloned().unwrap_or_default();
                     overlay.metadata = Some(metadata);
                     Some(enablement_entry(
+                        revision
+                            .expect("an enablement exists only on a published revision")
+                            .state(),
                         models.as_ref().expect("enablement implies models"),
                         request,
                         enablement,
@@ -839,7 +850,13 @@ impl CatalogueView {
             {
                 continue;
             }
-            entries.push(enablement_entry(&models, request, enablement, context));
+            entries.push(enablement_entry(
+                revision.state(),
+                &models,
+                request,
+                enablement,
+                context,
+            ));
         }
         let aliases = project_aliases(&models, request, contexts);
         Ok(Self {
@@ -1140,6 +1157,7 @@ fn notices_for(
 }
 
 fn enablement_entry(
+    state: &DesiredState,
     models: &Models,
     request: &CatalogueRequest,
     enablement: &ModelEnablement,
@@ -1181,6 +1199,11 @@ fn enablement_entry(
         routable: unavailable.is_empty() && billable,
         billable,
         aliases,
+        connection: connection_slug(
+            state,
+            owner,
+            metadata.map(|metadata| metadata.provider.as_str()),
+        ),
         unavailable,
         notices: context
             .map(|context| context.notices.clone())
@@ -1211,6 +1234,7 @@ fn imported_entry(
         routable: false,
         billable: false,
         aliases: Vec::new(),
+        connection: None,
         unavailable: vec![UnavailableReason::NotEnabled],
         notices: Vec::new(),
         metadata: Some(metadata),
@@ -1256,6 +1280,45 @@ fn project_aliases(
             }
         })
         .collect()
+}
+
+/// Published Provider slug in reach for this owner.
+///
+/// `catalog_provider` is imported identity. A unique in-reach slug is omitted
+/// when it differs. Several in-reach connections resolve to the published
+/// Provider whose slug matches that identity.
+fn connection_slug(
+    state: &DesiredState,
+    owner: ModelOwner,
+    catalog_provider: Option<&str>,
+) -> Option<String> {
+    let mut found: Vec<&ResourceVersion> = state
+        .resources()
+        .filter(|resource| {
+            resource.reference.kind == ResourceKind::Provider
+                && ModelOwner::from_scope(&resource.scope).is_some_and(|other| owner.reaches(other))
+        })
+        .collect();
+    found.sort_by_key(|resource| match resource.scope {
+        ResourceScope::Project { .. } => 0u8,
+        ResourceScope::Tenant(_) => 1,
+        ResourceScope::Deployment => 2,
+    });
+    match found.as_slice() {
+        [] => None,
+        [one] => {
+            let slug = one.slug.as_str();
+            match catalog_provider {
+                Some(catalog) if catalog != slug => None,
+                _ => Some(slug.to_owned()),
+            }
+        }
+        many => catalog_provider.and_then(|catalog| {
+            many.iter()
+                .find(|resource| resource.slug.as_str() == catalog)
+                .map(|resource| resource.slug.as_str().to_owned())
+        }),
+    }
 }
 
 fn price_metadata(
@@ -1429,8 +1492,8 @@ mod tests {
     use crate::desired_state::fixtures::{
         actor, alias_body, approved_price, blob_backed_catalog, candidate, catalog_reference,
         enablement_body, offering_id, price, price_rule, priced_target, project,
-        project_enablement, project_id, reference, resource_id, revision_id, tenant, tenant_id,
-        typed_alias,
+        project_enablement, project_id, provider as fixture_provider, reference, resource_id,
+        revision_id, tenant, tenant_id, typed_alias,
     };
     use crate::desired_state::{
         Approval, BlobKind, BlobRef, CatalogOffering, DesiredState, EffectiveInstant,
@@ -1848,6 +1911,52 @@ mod tests {
         let stranger = read(tenant_id(7), None);
         assert!(stranger.revision.is_some());
         assert!(stranger.entries.is_empty());
+    }
+
+    #[test]
+    fn connection_slug_is_the_published_provider_resource() {
+        let tenant = tenant_id(1);
+        let owner = ModelOwner::tenant(tenant);
+        let mut state = DesiredState::new();
+        state
+            .insert(fixture_provider(
+                40,
+                ResourceScope::Tenant(tenant),
+                "openai",
+            ))
+            .expect("fixture provider");
+        assert_eq!(
+            connection_slug(&state, owner, Some("openai")).as_deref(),
+            Some("openai")
+        );
+        assert_eq!(connection_slug(&state, owner, Some("anthropic")), None);
+        state
+            .insert(fixture_provider(
+                41,
+                ResourceScope::Tenant(tenant),
+                "anthropic",
+            ))
+            .expect("second provider");
+        assert_eq!(
+            connection_slug(&state, owner, Some("openai")).as_deref(),
+            Some("openai"),
+            "several in-reach connections look up the matching published slug"
+        );
+    }
+
+    #[test]
+    fn connection_slug_is_omitted_when_the_unique_connection_differs() {
+        let tenant = tenant_id(1);
+        let owner = ModelOwner::tenant(tenant);
+        let mut state = DesiredState::new();
+        state
+            .insert(fixture_provider(
+                40,
+                ResourceScope::Tenant(tenant),
+                "openai-prod",
+            ))
+            .expect("fixture provider");
+        assert_eq!(connection_slug(&state, owner, Some("openai")), None);
     }
 
     fn priced_context(billable: bool) -> EntryContext {
