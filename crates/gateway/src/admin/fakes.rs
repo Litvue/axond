@@ -26,7 +26,7 @@ use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
     AccessDenial, AuditEvent, DenialPage, LoadedRevision, ResourceScope, RevisionCandidate,
-    RevisionId, RevisionManifest,
+    RevisionId, RevisionManifest, Role, Surface,
 };
 
 /// An authenticator over two hard-coded credential populations: OIDC-issued
@@ -142,7 +142,7 @@ impl AdminAuthorizer for FakeAdminAuthorizer {
         &self,
         identity: &AdminIdentity,
         action: AdminAction,
-        _surface: crate::desired_state::Surface,
+        _surface: Surface,
         scope: &ResourceScope,
     ) -> Result<AdminGrant, AdminAuthError> {
         if !self.actions.contains(&action) {
@@ -157,18 +157,82 @@ impl AdminAuthorizer for FakeAdminAuthorizer {
     }
 }
 
+/// Authorizes with a role matrix and grant-scope containment, not exact match.
+///
+/// [`FakeAdminAuthorizer::within`] compares scopes by equality, so a tenant
+/// grant cannot probe a project. Bindings do: TenantAdmin's tenant contains the
+/// document project, and PlatformAdmin's deployment contains both.
+pub(crate) struct RoleAuthorizer {
+    role: Role,
+    scope: ResourceScope,
+}
+
+impl RoleAuthorizer {
+    pub(crate) fn new(role: Role, scope: ResourceScope) -> Self {
+        Self { role, scope }
+    }
+}
+
+impl AdminAuthorizer for RoleAuthorizer {
+    fn name(&self) -> &'static str {
+        "role-admin-authorizer"
+    }
+
+    fn authorize(
+        &self,
+        identity: &AdminIdentity,
+        action: AdminAction,
+        surface: Surface,
+        scope: &ResourceScope,
+    ) -> Result<AdminGrant, AdminAuthError> {
+        if !self.scope.contains(scope) {
+            return Err(AdminAuthError::ScopeNotPermitted);
+        }
+        if !self.role.permits(surface, action.recorded_action()) {
+            return Err(AdminAuthError::ActionNotPermitted { action });
+        }
+        Ok(AdminGrant::granted(identity.clone(), action, scope.clone()))
+    }
+}
+
 /// Records every authorize call so a test can assert which grant `apply` saw.
 pub(crate) struct RecordingAuthorizer {
-    inner: FakeAdminAuthorizer,
-    pub calls: Mutex<Vec<(AdminAction, crate::desired_state::Surface, ResourceScope)>>,
+    inner: Arc<dyn AdminAuthorizer>,
+    pub calls: Mutex<Vec<(AdminAction, Surface, ResourceScope)>>,
+    grants: Mutex<Vec<AdminGrant>>,
+    last_error: Mutex<Option<AdminAuthError>>,
 }
 
 impl RecordingAuthorizer {
-    pub(crate) fn permissive() -> Arc<Self> {
+    pub(crate) fn wrapping(inner: Arc<dyn AdminAuthorizer>) -> Arc<Self> {
         Arc::new(Self {
-            inner: FakeAdminAuthorizer::permissive(),
+            inner,
             calls: Mutex::new(Vec::new()),
+            grants: Mutex::new(Vec::new()),
+            last_error: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn permissive() -> Arc<Self> {
+        Self::wrapping(Arc::new(FakeAdminAuthorizer::permissive()))
+    }
+
+    pub(crate) fn role(role: Role, scope: ResourceScope) -> Arc<Self> {
+        Self::wrapping(Arc::new(RoleAuthorizer::new(role, scope)))
+    }
+
+    pub(crate) fn last_grant(&self) -> Option<AdminGrant> {
+        self.grants.lock().expect("not poisoned").last().cloned()
+    }
+
+    pub(crate) fn last_error(&self) -> Option<AdminAuthError> {
+        self.last_error.lock().expect("not poisoned").clone()
+    }
+
+    pub(crate) fn reset(&self) {
+        self.calls.lock().expect("not poisoned").clear();
+        self.grants.lock().expect("not poisoned").clear();
+        *self.last_error.lock().expect("not poisoned") = None;
     }
 }
 
@@ -181,14 +245,26 @@ impl AdminAuthorizer for RecordingAuthorizer {
         &self,
         identity: &AdminIdentity,
         action: AdminAction,
-        surface: crate::desired_state::Surface,
+        surface: Surface,
         scope: &ResourceScope,
     ) -> Result<AdminGrant, AdminAuthError> {
         self.calls
             .lock()
             .expect("not poisoned")
             .push((action, surface, scope.clone()));
-        self.inner.authorize(identity, action, surface, scope)
+        match self.inner.authorize(identity, action, surface, scope) {
+            Ok(grant) => {
+                self.grants
+                    .lock()
+                    .expect("not poisoned")
+                    .push(grant.clone());
+                Ok(grant)
+            }
+            Err(error) => {
+                *self.last_error.lock().expect("not poisoned") = Some(error.clone());
+                Err(error)
+            }
+        }
     }
 }
 

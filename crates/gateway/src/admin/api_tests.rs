@@ -20,7 +20,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use super::auth::{AdminAction, AdminAuthorizer, INFERENCE_KEY_HEADER};
+use super::auth::{AdminAction, AdminAuthError, AdminAuthorizer, INFERENCE_KEY_HEADER};
 use super::fakes::{
     CountingStore, FakeAdminAuthenticator, FakeAdminAuthorizer, RecordingAuthorizer,
 };
@@ -43,7 +43,7 @@ use crate::backends::models_dev::{ModelsDevAdapter, SEED_PAYLOAD, seed_snapshot}
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
     Actor, DenialPage, ModelEnablementBody, OfferingId, PriceBookBody, ResourceKind, ResourceScope,
-    Surface, fixtures,
+    Role, Surface, fixtures,
 };
 
 const TOKEN: &str = "human-admin-token";
@@ -3402,6 +3402,95 @@ fn binding_update() -> Value {
     document
 }
 
+fn binding_attach() -> Value {
+    json!({
+        "summary": "attach gpt-4o",
+        "mutation": "create",
+        "resource": {
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "project": fixtures::project_id(2).to_string(),
+            "targets": [{
+                "provider": "openai",
+                "model": "gpt-4o"
+            }]
+        }
+    })
+}
+
+fn binding_project() -> ResourceScope {
+    ResourceScope::Project {
+        tenant: fixtures::tenant_id(1),
+        project: fixtures::project_id(2),
+    }
+}
+
+fn binding_tenant() -> ResourceScope {
+    ResourceScope::Tenant(fixtures::tenant_id(1))
+}
+
+fn probed(
+    calls: &[(AdminAction, Surface, ResourceScope)],
+    surface: Surface,
+    scope: &ResourceScope,
+) -> bool {
+    calls.iter().any(|(action, probed_surface, probed_scope)| {
+        *action == AdminAction::Publish && *probed_surface == surface && probed_scope == scope
+    })
+}
+
+async fn pin_and_price(
+    deployment: &Deployment,
+    snapshot: &crate::backends::catalog::CatalogSnapshot,
+    expected: &str,
+) -> String {
+    let digest = snapshot.source.raw.digest;
+    let expected = deployment
+        .publish(
+            "/catalogs",
+            "grant-pin",
+            expected,
+            &json!({
+                "summary": "pin the imported catalogue",
+                "mutation": "create",
+                "resource": {
+                    "catalog": fixtures::resource_id(13).to_string(),
+                    "slug": "openai-models",
+                    "digest": digest.to_string(),
+                    "size_bytes": snapshot.source.raw.size_bytes,
+                }
+            }),
+        )
+        .await;
+    deployment
+        .publish(
+            "/prices",
+            "grant-book",
+            &expected,
+            &json!({
+                "summary": "approve openai gpt-4o",
+                "mutation": "create",
+                "resource": {
+                    "price_book": fixtures::resource_id(31).to_string(),
+                    "slug": "deployment-prices",
+                    "catalog": snapshot.content.content_id().checksum().to_string(),
+                    "catalog_version": 1,
+                    "state": "approved",
+                    "approved_at_millis": 0,
+                    "rules": [{
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "precedence": "baseline",
+                        "from_millis": 0,
+                        "input_nano_dollars_per_million": 2_500_000_000u64,
+                        "output_nano_dollars_per_million": 10_000_000_000u64,
+                        "origin": "operator"
+                    }]
+                }
+            }),
+        )
+        .await
+}
+
 #[tokio::test]
 async fn four_step_then_binding_adopts_the_book_and_alias_id() {
     let (deployment, snapshot) = imported_deployment().await;
@@ -3565,7 +3654,11 @@ async fn lost_response_retry_of_first_pin_classifies_deployment_and_replays() {
     let first = deployment
         .publish("/bindings", "bind-retry", &expected, &binding_document())
         .await;
-    recorder.calls.lock().expect("not poisoned").clear();
+    assert_eq!(
+        recorder.last_grant().expect("first apply grant").scope(),
+        &ResourceScope::Deployment
+    );
+    recorder.reset();
     let (status, body) = deployment
         .post("/bindings", "bind-retry", &expected, &binding_document())
         .await;
@@ -3575,20 +3668,17 @@ async fn lost_response_retry_of_first_pin_classifies_deployment_and_replays() {
     assert_eq!(deployment.store.published_revisions(), 5);
     let calls = recorder.calls.lock().expect("not poisoned").clone();
     assert!(
-        calls.iter().any(|(action, surface, scope)| {
-            *action == AdminAction::Publish
-                && *surface == Surface::Model
-                && *scope == ResourceScope::Deployment
-        }),
+        probed(&calls, Surface::Model, &ResourceScope::Deployment),
         "retry must probe Model at Deployment, got {calls:?}"
     );
     assert!(
-        calls.iter().any(|(action, surface, scope)| {
-            *action == AdminAction::Publish
-                && *surface == Surface::Price
-                && *scope == ResourceScope::Deployment
-        }),
+        probed(&calls, Surface::Price, &ResourceScope::Deployment),
         "retry must probe Price at Deployment, got {calls:?}"
+    );
+    assert_eq!(
+        recorder.last_grant().expect("retry apply grant").scope(),
+        &ResourceScope::Deployment,
+        "lost-response retry of first-apply still presents Deployment to apply"
     );
 }
 
@@ -4258,4 +4348,202 @@ async fn unchanged_still_requires_a_publish_grant() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"]["type"], "admin_forbidden");
+}
+
+#[tokio::test]
+async fn platform_admin_first_apply_with_price_uses_deployment_grant() {
+    let snapshot = seed_snapshot();
+    let catalogue = Arc::new(InMemoryCatalogStore::new());
+    catalogue
+        .activate(
+            &RetainedCatalog {
+                source: snapshot.source.clone(),
+                payload: RawPayload::new(SEED_PAYLOAD.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("the seed is retained");
+    let recorder = RecordingAuthorizer::role(Role::PlatformAdmin, ResourceScope::Deployment);
+    let deployment = Deployment::with_catalogue_authorizer(catalogue, recorder.clone());
+    let expected = foundation(&deployment).await;
+    recorder.reset();
+    let (status, body) = deployment
+        .post("/bindings", "bind-grant-pa", &expected, &binding_document())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "published", "{body}");
+    let calls = recorder.calls.lock().expect("not poisoned").clone();
+    let project = binding_project();
+    assert!(
+        probed(&calls, Surface::Alias, &project),
+        "first-apply probes include Alias at project, got {calls:?}"
+    );
+    assert!(
+        probed(&calls, Surface::Model, &project),
+        "first-apply probes Model at project, got {calls:?}"
+    );
+    assert!(
+        probed(&calls, Surface::Model, &ResourceScope::Deployment),
+        "first-apply probes Model at Deployment, got {calls:?}"
+    );
+    assert!(
+        probed(&calls, Surface::Price, &ResourceScope::Deployment),
+        "first-apply probes Price at Deployment, got {calls:?}"
+    );
+    assert_eq!(
+        recorder.last_grant().expect("apply grant").scope(),
+        &ResourceScope::Deployment
+    );
+}
+
+#[tokio::test]
+async fn tenant_admin_with_price_is_scope_not_permitted_on_deployment_probes() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let recorder = RecordingAuthorizer::role(Role::TenantAdmin, binding_tenant());
+    let tenant_admin = deployment.reauthorize(recorder.clone());
+    let (status, body) = tenant_admin
+        .post(
+            "/bindings",
+            "bind-grant-ta-price",
+            &expected,
+            &binding_document(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["type"], "admin_forbidden");
+    assert_eq!(
+        recorder.last_error(),
+        Some(AdminAuthError::ScopeNotPermitted)
+    );
+    let calls = recorder.calls.lock().expect("not poisoned").clone();
+    assert!(
+        probed(&calls, Surface::Model, &ResourceScope::Deployment)
+            || probed(&calls, Surface::Price, &ResourceScope::Deployment),
+        "TenantAdmin with price must probe Deployment Price/Model, got {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn tenant_admin_attach_only_succeeds_with_project_grant() {
+    let (deployment, snapshot) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    let expected = pin_and_price(&deployment, &snapshot, &expected).await;
+    let recorder = RecordingAuthorizer::role(Role::TenantAdmin, binding_tenant());
+    let tenant_admin = deployment.reauthorize(recorder.clone());
+    let (status, body) = tenant_admin
+        .post(
+            "/bindings",
+            "bind-grant-ta-attach",
+            &expected,
+            &binding_attach(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"], "published", "{body}");
+    let calls = recorder.calls.lock().expect("not poisoned").clone();
+    assert!(
+        !probed(&calls, Surface::Model, &ResourceScope::Deployment)
+            && !probed(&calls, Surface::Price, &ResourceScope::Deployment),
+        "attach-only must not probe Deployment, got {calls:?}"
+    );
+    assert_eq!(
+        recorder.last_grant().expect("apply grant").scope(),
+        &binding_project()
+    );
+}
+
+#[tokio::test]
+async fn operator_with_price_is_action_not_permitted_on_price() {
+    let (deployment, _) = imported_deployment().await;
+    let expected = foundation(&deployment).await;
+    // Deployment-scoped so the refusal is Price, not OutOfScope on CatalogModel.
+    let recorder = RecordingAuthorizer::role(Role::Operator, ResourceScope::Deployment);
+    let operator = deployment.reauthorize(recorder.clone());
+    let (status, body) = operator
+        .post(
+            "/bindings",
+            "bind-grant-op-price",
+            &expected,
+            &binding_document(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["type"], "admin_forbidden");
+    assert_eq!(
+        recorder.last_error(),
+        Some(AdminAuthError::ActionNotPermitted {
+            action: AdminAction::Publish
+        })
+    );
+    let calls = recorder.calls.lock().expect("not poisoned").clone();
+    assert!(
+        probed(&calls, Surface::Price, &ResourceScope::Deployment),
+        "Operator with price must probe Price at Deployment, got {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn tenant_admin_pin_follow_after_new_digest_is_scope_not_permitted() {
+    let snapshot = seed_snapshot();
+    let mutated = SEED_PAYLOAD.replace("\"input\": 2.5", "\"input\": 2.51");
+    let next = ModelsDevAdapter::default()
+        .parse(
+            mutated.as_bytes(),
+            SourceValidators::default(),
+            SystemTime::now(),
+        )
+        .expect("a one-field edit still parses");
+    assert_ne!(next.source.raw.digest, snapshot.source.raw.digest);
+
+    let store = Arc::new(InMemoryCatalogStore::new());
+    store
+        .activate(
+            &RetainedCatalog {
+                source: snapshot.source.clone(),
+                payload: RawPayload::new(SEED_PAYLOAD.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("seed");
+    let deployment = Deployment::with_catalogue(store.clone());
+    let expected = foundation(&deployment).await;
+    let head = deployment
+        .publish(
+            "/bindings",
+            "bind-grant-pin-1",
+            &expected,
+            &binding_document(),
+        )
+        .await;
+
+    store
+        .activate(
+            &RetainedCatalog {
+                source: next.source.clone(),
+                payload: RawPayload::new(mutated.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("refresh");
+
+    let recorder = RecordingAuthorizer::role(Role::TenantAdmin, binding_tenant());
+    let tenant_admin = deployment.reauthorize(recorder.clone());
+    let (status, body) = tenant_admin
+        .post("/bindings", "bind-grant-pin-2", &head, &binding_update())
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["type"], "admin_forbidden");
+    assert_eq!(
+        recorder.last_error(),
+        Some(AdminAuthError::ScopeNotPermitted)
+    );
+    let calls = recorder.calls.lock().expect("not poisoned").clone();
+    assert!(
+        probed(&calls, Surface::Model, &ResourceScope::Deployment),
+        "pin-follow after a new digest writes CatalogModel, got {calls:?}"
+    );
 }
