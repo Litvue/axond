@@ -202,7 +202,8 @@ pub enum UnavailableReason {
     Shadowed,
     /// Enabled and in effect, but no compiled price covers the offering, so it
     /// could be routed but not billed. An observed catalogue rate is not an
-    /// approval (ADR 0042).
+    /// approval (ADR 0042). Asserted only after offering metadata was resolved
+    /// so coverage could be evaluated; otherwise [`PendingFact::OfferingMetadata`].
     Unpriced,
     /// Nothing routes to it: no alias in this scope names this enablement, so no
     /// caller has a name to send.
@@ -326,7 +327,8 @@ pub struct CatalogueEntry {
     /// Whether a caller could invoke it right now: in effect, enabled, priced,
     /// and named by at least one alias.
     pub routable: bool,
-    /// Whether a compiled price covers this offering.
+    /// Whether a compiled price covers this offering. True only when
+    /// [`Self::price`] is present.
     pub billable: bool,
     /// The alias names, in this scope, that resolve to this enablement.
     pub aliases: Vec<String>,
@@ -401,6 +403,8 @@ pub enum AliasUnavailableReason {
     /// A target exists but its enablement is withdrawn.
     DisabledTarget,
     /// A target is enabled but no compiled price covers it, so it cannot be billed.
+    /// Asserted only after offering metadata was resolved so coverage could be
+    /// evaluated; otherwise [`PendingFact::OfferingMetadata`].
     UnpricedTarget,
 }
 
@@ -507,9 +511,7 @@ impl CatalogueView {
             let price = metadata.as_ref().and_then(|metadata| {
                 price_metadata(book.as_ref(), pricing.as_ref(), metadata, now)
             });
-            let billable = metadata
-                .as_ref()
-                .is_some_and(|metadata| offering_is_billable(pricing.as_ref(), metadata));
+            let billable = price.is_some();
             contexts.insert(
                 enablement.reference.id,
                 EntryContext {
@@ -557,11 +559,12 @@ impl CatalogueView {
         for enablement in models.enablements() {
             let owner = enablement.body.owner();
             let context = contexts.get(&enablement.reference.id);
+            let metadata = context.and_then(|context| context.metadata.as_ref());
             let billable = context.is_some_and(|context| context.billable);
             if !request.covers(owner)
                 || !request.admits(
                     enablement,
-                    context.and_then(|context| context.metadata.as_ref()),
+                    metadata,
                     context.and_then(|context| context.availability.as_ref()),
                     billable,
                 )
@@ -582,7 +585,7 @@ impl CatalogueView {
             if shadowed {
                 unavailable.push(UnavailableReason::Shadowed);
             }
-            if enablement.body.is_enabled() && !shadowed && !billable {
+            if enablement.body.is_enabled() && !shadowed && !billable && metadata.is_some() {
                 unavailable.push(UnavailableReason::Unpriced);
             }
             if aliases.is_empty() {
@@ -740,13 +743,6 @@ fn offering_metadata(
     })
 }
 
-fn offering_is_billable(pricing: Option<&PricingSnapshot>, metadata: &CatalogueMetadata) -> bool {
-    ProviderId::parse(&metadata.provider)
-        .ok()
-        .and_then(|provider| pricing?.price(&provider, &metadata.published_model))
-        .is_some()
-}
-
 fn price_metadata(
     book: Option<&crate::desired_state::pricing::PriceBook>,
     pricing: Option<&PricingSnapshot>,
@@ -770,8 +766,8 @@ fn price_metadata(
         .max_by_key(|rule| rule.precedence())
         .map(|rule| rule.provenance().origin.as_str())?;
     Some(CataloguePrice {
-        book: book.reference.to_string(),
-        book_version: book.reference.version.get(),
+        book: pricing.book().to_string(),
+        book_version: pricing.book().version.get(),
         catalog: pricing.catalog().to_string(),
         catalog_version: pricing.catalog_version().map(|version| version.get()),
         source,
@@ -866,10 +862,8 @@ fn alias_status(
             unavailable.push(AliasUnavailableReason::DisabledTarget);
             continue;
         }
-        if !contexts
-            .get(&enablement.reference.id)
-            .is_some_and(|context| context.billable)
-        {
+        let context = contexts.get(&enablement.reference.id);
+        if context.is_some_and(|context| context.metadata.is_some() && !context.billable) {
             unavailable.push(AliasUnavailableReason::UnpricedTarget);
             continue;
         }
@@ -1035,10 +1029,11 @@ mod tests {
         );
 
         let enabled = entry(&view, "gpt-4o");
-        assert!(!enabled.routable);
+        assert!(enabled.routable);
         assert!(!enabled.billable);
+        assert!(enabled.price.is_none());
         assert_eq!(enabled.aliases, vec!["fast".to_owned()]);
-        assert_eq!(enabled.unavailable, vec![UnavailableReason::Unpriced]);
+        assert!(enabled.unavailable.is_empty());
 
         // Withdrawn and unnamed: unpriced is only reported when the row is
         // enabled and in effect.
@@ -1088,12 +1083,10 @@ mod tests {
             .expect("the project override");
         assert!(over.effective);
         assert!(!over.billable);
+        assert!(over.price.is_none());
         // An override is a fresh administrative decision: it inherits neither the
         // default's approved price nor the alias that named the default.
-        assert_eq!(
-            over.unavailable,
-            vec![UnavailableReason::Unpriced, UnavailableReason::Unaliased]
-        );
+        assert_eq!(over.unavailable, vec![UnavailableReason::Unaliased]);
     }
 
     /// Another tenant's project cannot be read through a tenant it does own: the
@@ -1186,11 +1179,8 @@ mod tests {
         );
         assert_eq!(alias.wire_family, WireFamily::OpenaiChat.as_str());
         assert_eq!(alias.state, ModelLifecycle::Enabled.as_str());
-        assert!(!alias.routable);
-        assert_eq!(
-            alias.unavailable,
-            vec![AliasUnavailableReason::UnpricedTarget]
-        );
+        assert!(alias.routable);
+        assert!(alias.unavailable.is_empty());
         assert_eq!(
             alias.targets,
             vec![CatalogueAliasTarget {
@@ -1207,13 +1197,16 @@ mod tests {
         let acme = tenant_id(1);
         let core = project_id(2);
 
-        let compiled = BTreeMap::from([(
-            crate::desired_state::fixtures::resource_id(30),
-            EntryContext {
-                billable: true,
-                ..EntryContext::default()
-            },
-        )]);
+        let compiled = BTreeMap::from([
+            (
+                crate::desired_state::fixtures::resource_id(30),
+                priced_context(true),
+            ),
+            (
+                crate::desired_state::fixtures::resource_id(31),
+                priced_context(false),
+            ),
+        ]);
         let exact_default = models.aliases().next().expect("the fixture alias");
         assert_eq!(
             alias_status(&models, exact_default, &compiled),
@@ -1336,6 +1329,27 @@ mod tests {
         assert!(stranger.entries.is_empty());
     }
 
+    fn priced_context(billable: bool) -> EntryContext {
+        EntryContext {
+            metadata: Some(CatalogueMetadata {
+                provider: "openai".to_owned(),
+                model: "gpt-4o".to_owned(),
+                published_model: "gpt-4o".to_owned(),
+                display_name: None,
+                family: None,
+                capabilities: Vec::new(),
+                input_modalities: Vec::new(),
+                output_modalities: Vec::new(),
+                catalog_lifecycle: "available",
+                context_tokens: None,
+                input_tokens: None,
+                output_tokens: None,
+            }),
+            billable,
+            ..EntryContext::default()
+        }
+    }
+
     /// Compiled `PricingSnapshot::price` decides `billable`, not `approved_price`.
     #[tokio::test]
     async fn a_covering_book_is_billable_without_an_enablement_price_pointer() {
@@ -1366,6 +1380,7 @@ mod tests {
         let entry = entry(&view, "gpt-4o");
         assert!(entry.price.is_some(), "{entry:?}");
         assert!(entry.billable, "{entry:?}");
+        assert_eq!(entry.billable, entry.price.is_some());
         assert!(
             !entry.unavailable.contains(&UnavailableReason::Unpriced),
             "{entry:?}"
@@ -1378,7 +1393,74 @@ mod tests {
         assert!(view.aliases[0].unavailable.is_empty());
     }
 
+    #[tokio::test]
+    async fn missing_offering_metadata_is_pending_not_unpriced() {
+        let view = CatalogueView::of_with_context(
+            Some(&published()),
+            &CatalogueRequest {
+                tenant: tenant_id(1),
+                project: None,
+                filters: CatalogueFilters::default(),
+            },
+            None,
+            None,
+            StatusScope::Deployment,
+            SystemTime::now(),
+        )
+        .await
+        .expect("a revision without a catalogue store is readable");
+        assert_eq!(view.pending, PendingFact::ALL.to_vec());
+        let enabled = entry(&view, "gpt-4o");
+        assert!(enabled.metadata.is_none());
+        assert!(!enabled.billable);
+        assert!(enabled.price.is_none());
+        assert_eq!(enabled.billable, enabled.price.is_some());
+        assert!(
+            !enabled.unavailable.contains(&UnavailableReason::Unpriced),
+            "{enabled:?}"
+        );
+        assert!(view.aliases[0].unavailable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_metadata_without_a_covering_price_is_unpriced() {
+        let (revision, store) = catalogued_enablement(false).await;
+        let view = CatalogueView::of_with_context(
+            Some(&revision),
+            &CatalogueRequest {
+                tenant: tenant_id(1),
+                project: None,
+                filters: CatalogueFilters::default(),
+            },
+            Some(&store),
+            None,
+            StatusScope::Deployment,
+            SystemTime::now(),
+        )
+        .await
+        .expect("the catalogued revision is readable");
+        let row = entry(&view, "gpt-4o");
+        assert!(row.metadata.is_some(), "{row:?}");
+        assert!(!row.billable);
+        assert!(row.price.is_none());
+        assert_eq!(row.billable, row.price.is_some());
+        assert_eq!(
+            row.unavailable,
+            vec![UnavailableReason::Unpriced],
+            "{row:?}"
+        );
+        assert!(!view.pending.contains(&PendingFact::OfferingMetadata));
+        assert_eq!(
+            view.aliases[0].unavailable,
+            vec![AliasUnavailableReason::UnpricedTarget]
+        );
+    }
+
     async fn covering_book() -> (LoadedRevision, InMemoryCatalogStore) {
+        catalogued_enablement(true).await
+    }
+
+    async fn catalogued_enablement(with_book: bool) -> (LoadedRevision, InMemoryCatalogStore) {
         let snapshot = ModelsDevAdapter::default()
             .parse(CATALOG.as_bytes(), SourceValidators::default(), UNIX_EPOCH)
             .expect("the catalogue fixture parses");
@@ -1428,9 +1510,15 @@ mod tests {
             .and_then(|state| state.insert(project(&acme, 2, "core")))
             .and_then(|state| state.insert(catalog))
             .and_then(|state| state.insert(default))
-            .and_then(|state| state.insert(book))
+            .and_then(|state| {
+                if with_book {
+                    state.insert(book)
+                } else {
+                    Ok(state)
+                }
+            })
             .and_then(|state| state.insert(alias))
-            .expect("the covering-book state is publishable");
+            .expect("the catalogued state is publishable");
 
         let store = InMemoryCatalogStore::new();
         store

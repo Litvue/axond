@@ -1654,8 +1654,7 @@ async fn a_tenant_scoped_administrator_cannot_publish_outside_its_tenant() {
 // ---------------------------------------------------------------------------
 
 /// The read a tenant administrator makes after publishing: the enablement it
-/// created, the alias that names it, and the one thing still standing between
-/// them and a routable model.
+/// created, the alias that names it, and the facts this build could not consult.
 #[tokio::test]
 async fn the_management_catalogue_reports_what_a_tenant_published() {
     let deployment = Deployment::new();
@@ -1686,17 +1685,15 @@ async fn the_management_catalogue_reports_what_a_tenant_published() {
     assert_eq!(aliases.len(), 1, "{view}");
     assert_eq!(aliases[0]["slug"], "default");
     assert_eq!(aliases[0]["scope"]["kind"], "project");
-    assert_eq!(aliases[0]["routable"], json!(false));
-    assert_eq!(aliases[0]["unavailable"], json!(["unpriced-target"]));
+    assert_eq!(aliases[0]["routable"], json!(true));
+    assert_eq!(aliases[0]["unavailable"], json!([]));
     assert_eq!(aliases[0]["targets"].as_array().unwrap().len(), 1);
-    // Enabled and named, and still not routable: nobody approved a price. The
-    // read says which of the two acts is missing rather than reporting a bare
-    // "unavailable".
+    // Offering metadata was not consultable, so Unpriced is pending rather than
+    // a definitive verdict. billable stays false and agrees with price.
     assert_eq!(entry["billable"], json!(false));
-    assert_eq!(entry["routable"], json!(false));
-    assert_eq!(entry["unavailable"], json!(["unpriced"]));
-    // And it says what this build could not consult, so an operator does not read
-    // silence as an all-clear.
+    assert!(entry.get("price").is_none(), "{entry}");
+    assert_eq!(entry["routable"], json!(true));
+    assert_eq!(entry["unavailable"], json!([]));
     assert_eq!(
         view["pending"],
         json!(["offering-metadata", "availability"])
@@ -1824,6 +1821,11 @@ async fn the_management_catalogue_treats_a_covering_book_as_billable() {
     assert_eq!(entry["slug"], "gpt-4o");
     assert!(entry.get("price").is_some(), "{entry}");
     assert_eq!(entry["billable"], json!(true), "{entry}");
+    assert_eq!(
+        entry["billable"].as_bool(),
+        Some(entry.get("price").is_some()),
+        "{entry}"
+    );
     assert_eq!(entry["unavailable"], json!([]), "{entry}");
     assert!(entry.get("notices").is_none(), "{entry}");
     assert_eq!(view["aliases"][0]["routable"], json!(true), "{view}");
