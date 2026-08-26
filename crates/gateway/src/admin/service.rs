@@ -57,7 +57,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use super::auth::{AdminAction, AdminAuthError, AdminGrant, AdminIdentity};
-use super::catalogue::{CatalogueRequest, CatalogueView};
+use super::catalogue::{CatalogueRefreshView, CatalogueRequest, CatalogueView};
 use super::diff::SemanticDiff;
 use super::error::AdminError;
 use super::protocol::{MutationRequest, WriteMode};
@@ -66,7 +66,9 @@ use super::reads::{
     StateView,
 };
 use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
-use crate::backends::catalog_store::CatalogStore;
+use crate::backends::catalog_refresh::{RefreshImpact, RefreshOutcome};
+use crate::backends::catalog_runtime::CatalogHandle;
+use crate::backends::catalog_store::{self, CatalogStore, CatalogStoreError, HydrationError};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::secrets::SecretStore;
 use crate::config::Mode;
@@ -74,7 +76,7 @@ use crate::convergence::{ChangeSignal, RevisionReport};
 use crate::desired_state::models::legacy_alias_allowlist;
 use crate::desired_state::{
     AccessDenial, Actor, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
-    LoadedRevision, Mutation, MutationId, PolicyBody, ResourceKind, ResourceScope,
+    LoadedRevision, Models, Mutation, MutationId, PolicyBody, ResourceKind, ResourceScope,
     RevisionCandidate, RevisionId, Surface, Uuid7Generator, ValidationError,
 };
 use crate::middleware::validate_content_middleware;
@@ -484,6 +486,59 @@ impl AdminService {
         .await
     }
 
+    /// Run the catalogue import now. Does not publish a revision: last-known-good
+    /// stays active on refusal, and enablements keep their pins.
+    pub async fn catalogue_refresh(
+        &self,
+        grant: &AdminGrant,
+        handle: &CatalogHandle,
+    ) -> Result<CatalogueRefreshView, AdminError> {
+        Self::permits_deployment_read(grant, AdminAction::RefreshCatalog)?;
+        match handle.refresh_now().await {
+            None => {
+                return Err(AdminError::CatalogStoreUnavailable {
+                    detail: "catalogue refresh is not running".to_owned(),
+                });
+            }
+            Some(RefreshOutcome::NotDue { .. }) => {
+                return Err(AdminError::CatalogStoreUnavailable {
+                    detail: "catalogue refresh did not run".to_owned(),
+                });
+            }
+            Some(RefreshOutcome::Admitted { .. } | RefreshOutcome::Refused { .. }) => {}
+        }
+        let report = handle.status().report();
+        let state = handle.store().load().await.map_err(log_catalog_store)?;
+        let impact = match state.active {
+            None => RefreshImpact::default(),
+            Some(retained) => {
+                let snapshot = catalog_store::hydrate(&retained).map_err(log_catalog_hydration)?;
+                let revision = self
+                    .store()?
+                    .load_desired_revision()
+                    .await
+                    .map_err(log_store)?;
+                let enablements = match revision {
+                    None => Vec::new(),
+                    Some(revision) => Models::of(revision.state())
+                        .map_err(|error| AdminError::RevisionUnreadable {
+                            revision: Some(revision.id()),
+                            detail: error.to_string(),
+                        })?
+                        .enablements()
+                        .map(|enablement| enablement.body.clone())
+                        .collect(),
+                };
+                RefreshImpact::of(
+                    enablements.iter(),
+                    &snapshot.content,
+                    snapshot.source.raw.digest,
+                )
+            }
+        };
+        Ok(CatalogueRefreshView::of(report.as_ref(), impact))
+    }
+
     /// A bounded page of revision history, newest first.
     ///
     /// A parent walk rather than a query: see [`crate::admin::reads`]. A parent the
@@ -887,6 +942,28 @@ pub(super) fn log_store(error: ControlPlaneError) -> AdminError {
         warn!(
             code = error.code(),
             detail, "control-plane operation failed"
+        );
+    }
+    error
+}
+
+fn log_catalog_store(error: CatalogStoreError) -> AdminError {
+    let error = AdminError::from_catalog_store(error);
+    if let Some(detail) = error.operator_detail() {
+        warn!(
+            code = error.code(),
+            detail, "catalogue-store operation failed"
+        );
+    }
+    error
+}
+
+fn log_catalog_hydration(error: HydrationError) -> AdminError {
+    let error = AdminError::from_catalog_hydration(error);
+    if let Some(detail) = error.operator_detail() {
+        warn!(
+            code = error.code(),
+            detail, "retained catalogue could not be rehydrated"
         );
     }
     error

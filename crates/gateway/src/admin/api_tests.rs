@@ -77,6 +77,24 @@ impl Deployment {
         }
     }
 
+    fn with_catalog_handle(handle: crate::backends::catalog_runtime::CatalogHandle) -> Self {
+        let store = Arc::new(InMemoryControlPlane::new());
+        let secrets = Arc::new(InMemorySecrets::new());
+        let api = Arc::new(
+            AdminApi::new(
+                Arc::new(AdminService::stateful(store.clone()).with_secrets(secrets.clone())),
+                Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+                Arc::new(FakeAdminAuthorizer::permissive()),
+            )
+            .with_catalog_handle(handle),
+        );
+        Self {
+            api,
+            store,
+            secrets,
+        }
+    }
+
     fn with_authorizer(authorizer: FakeAdminAuthorizer) -> Self {
         let store = Arc::new(InMemoryControlPlane::new());
         let secrets = Arc::new(InMemorySecrets::new());
@@ -1886,6 +1904,19 @@ async fn a_catalogue_filter_that_cannot_be_parsed_is_refused() {
         format!("tenant={}&lifecycle=telepathy", fixtures::tenant_id(1)),
         format!("tenant={}&availability=telepathy", fixtures::tenant_id(1)),
         format!("tenant={}&unknown=1", fixtures::tenant_id(1)),
+        format!("tenant={}&source=invented", fixtures::tenant_id(1)),
+        format!("tenant={}&source=imported", fixtures::tenant_id(1)),
+        format!(
+            "tenant={}&source=imported&provider=",
+            fixtures::tenant_id(1)
+        ),
+        format!("tenant={}&source=imported&q=", fixtures::tenant_id(1)),
+        format!(
+            "tenant={}&source=imported&provider=%20",
+            fixtures::tenant_id(1)
+        ),
+        format!("tenant={}&q=ab", fixtures::tenant_id(1)),
+        format!("tenant={}&source=imported&q=ab", fixtures::tenant_id(1)),
         format!(
             "tenant={}&state=enabled&state=disabled",
             fixtures::tenant_id(1)
@@ -1906,6 +1937,193 @@ async fn a_catalogue_filter_that_cannot_be_parsed_is_refused() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["type"], "admin_request_invalid");
     assert!(!body.to_string().contains(&"x".repeat(64)));
+}
+
+#[tokio::test]
+async fn imported_browse_lists_not_enabled_offerings() {
+    const CATALOG: &str = include_str!("../backends/fixtures/models_dev/catalog.identity.json");
+    let snapshot = ModelsDevAdapter::default()
+        .parse(
+            CATALOG.as_bytes(),
+            SourceValidators::default(),
+            std::time::UNIX_EPOCH,
+        )
+        .expect("the catalogue fixture parses");
+    let store = Arc::new(InMemoryCatalogStore::new());
+    store
+        .activate(
+            &RetainedCatalog {
+                source: snapshot.source.clone(),
+                payload: RawPayload::new(CATALOG.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("the exact payload is retained");
+    let deployment = Deployment::with_catalogue(store);
+    deployment
+        .publish(
+            "/tenants",
+            "key-0",
+            EXPECTED_REVISION_EMPTY,
+            &tenant_document(),
+        )
+        .await;
+
+    let (status, view) = deployment
+        .get(&format!(
+            "/catalogue?tenant={}&source=imported&provider=hpc-ai",
+            fixtures::tenant_id(1)
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let entries = view["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "{view}");
+    assert!(entries[0].get("enablement").is_none(), "{view}");
+    assert!(entries[0].get("slug").is_none(), "{view}");
+    assert!(entries[0].get("state").is_none(), "{view}");
+    assert_eq!(entries[0]["unavailable"], json!(["not-enabled"]));
+    assert_eq!(entries[0]["routable"], json!(false));
+    assert_eq!(entries[0]["billable"], json!(false));
+    assert_eq!(entries[0]["metadata"]["provider"], "hpc-ai");
+}
+
+/// Refresh is a write without a revision: no idempotency key, no expected
+/// revision, and the control plane does not move.
+#[tokio::test]
+async fn catalogue_refresh_does_not_require_idempotency_and_does_not_publish() {
+    let (status, body) = Deployment::new()
+        .post_material("/catalogue/refresh", &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "admin_request_invalid");
+    assert_ne!(body["error"]["type"], "idempotency_key_required");
+    assert_ne!(body["error"]["type"], "expected_revision_required");
+}
+
+#[tokio::test]
+async fn catalogue_refresh_returns_impact_without_a_revision_bump() {
+    let handle = crate::backends::catalog_runtime::start(
+        &crate::config::CatalogConfig {
+            source: crate::config::CatalogSourceBackend::Seed,
+            store: crate::config::CatalogStoreBackend::InMemory,
+            bootstrap: crate::config::CatalogBootstrap::Seed,
+            refresh_interval_seconds: 86_400,
+            ..crate::config::CatalogConfig::default()
+        },
+        None,
+        &std::collections::HashMap::new(),
+        std::future::pending(),
+    )
+    .await
+    .expect("an offline catalogue starts")
+    .expect("an enabled catalogue yields a handle");
+    let deployment = Deployment::with_catalog_handle(handle);
+    let head = deployment
+        .publish(
+            "/tenants",
+            "key-0",
+            EXPECTED_REVISION_EMPTY,
+            &tenant_document(),
+        )
+        .await;
+    let published = deployment.store.published_revisions();
+
+    let (status, body) = deployment
+        .post_material("/catalogue/refresh", &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("revision").is_none(), "{body}");
+    assert!(body["catalogue"]["content_id"].is_string(), "{body}");
+    assert_eq!(body["catalogue"]["consecutive_refusals"], json!(0));
+    assert_eq!(body["impact"]["pins_unmoved"], json!(0));
+    assert_eq!(body["impact"]["withdrawn"], json!([]));
+    assert_eq!(deployment.store.published_revisions(), published);
+
+    let (status, view) = deployment
+        .get(&format!("/catalogue?tenant={}", fixtures::tenant_id(1)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["revision"], head);
+}
+
+#[tokio::test]
+async fn catalogue_refresh_keeps_last_known_good_on_refusal() {
+    let handle = crate::backends::catalog_runtime::start(
+        &crate::config::CatalogConfig {
+            source: crate::config::CatalogSourceBackend::ModelsDev,
+            store: crate::config::CatalogStoreBackend::InMemory,
+            bootstrap: crate::config::CatalogBootstrap::Seed,
+            source_url: Some("http://127.0.0.1:1/catalog.json".to_owned()),
+            refresh_timeout_seconds: 1,
+            refresh_interval_seconds: 86_400,
+            retry_initial_seconds: 1,
+            retry_max_seconds: 1,
+            ..crate::config::CatalogConfig::default()
+        },
+        None,
+        &std::collections::HashMap::new(),
+        std::future::pending(),
+    )
+    .await
+    .expect("a seed-bootstrapped catalogue starts")
+    .expect("an enabled catalogue yields a handle");
+    let before = handle.status().report().expect("boot published a report");
+    let content_id = before
+        .active
+        .expect("seed bootstrap is active")
+        .content_id
+        .short();
+    let deployment = Deployment::with_catalog_handle(handle);
+    let published = deployment.store.published_revisions();
+
+    let (status, body) = deployment
+        .post_material("/catalogue/refresh", &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["catalogue"]["content_id"], json!(content_id));
+    assert!(
+        body["catalogue"]["consecutive_refusals"]
+            .as_u64()
+            .expect("a refusal count")
+            >= 1,
+        "{body}"
+    );
+    assert!(body["catalogue"]["last_refusal"].is_string(), "{body}");
+    assert_eq!(deployment.store.published_revisions(), published);
+}
+
+#[tokio::test]
+async fn catalogue_refresh_is_unavailable_when_the_import_task_has_stopped() {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let handle = crate::backends::catalog_runtime::start(
+        &crate::config::CatalogConfig {
+            source: crate::config::CatalogSourceBackend::Seed,
+            store: crate::config::CatalogStoreBackend::InMemory,
+            bootstrap: crate::config::CatalogBootstrap::Seed,
+            refresh_interval_seconds: 86_400,
+            ..crate::config::CatalogConfig::default()
+        },
+        None,
+        &std::collections::HashMap::new(),
+        async move {
+            let _ = stopped.await;
+        },
+    )
+    .await
+    .expect("an offline catalogue starts")
+    .expect("an enabled catalogue yields a handle");
+    let deployment = Deployment::with_catalog_handle(handle.clone());
+    stop.send(()).expect("the task is listening");
+    while handle.refresh_now().await.is_some() {
+        tokio::task::yield_now().await;
+    }
+    let (status, body) = deployment
+        .post_material("/catalogue/refresh", &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["type"], "catalog_store_unavailable");
+    assert_eq!(body["error"]["retryable"], json!(true));
 }
 
 // ---------------------------------------------------------------------------

@@ -78,6 +78,7 @@ use super::resources::{
 };
 use super::service::AdminService;
 use crate::availability::AvailabilityReader;
+use crate::backends::catalog_runtime::CatalogHandle;
 use crate::backends::catalog_store::CatalogStore;
 use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::desired_state::{ResourceScope, Surface};
@@ -102,6 +103,10 @@ pub struct AdminApi {
     /// The retained catalogue reader used only by the authenticated management
     /// catalogue. Inference never receives this handle.
     pub catalogue: Option<Arc<dyn CatalogStore>>,
+    /// The running import a manual refresh waits on. Beside the store: a
+    /// management read hydrates retained bytes, a refresh asks the same task
+    /// the schedule drives.
+    pub catalog_handle: Option<CatalogHandle>,
 }
 
 impl AdminApi {
@@ -117,6 +122,7 @@ impl AdminApi {
             convergence: None,
             availability: None,
             catalogue: None,
+            catalog_handle: None,
         }
     }
 
@@ -131,6 +137,15 @@ impl AdminApi {
     #[must_use]
     pub fn with_catalogue(mut self, catalogue: Arc<dyn CatalogStore>) -> Self {
         self.catalogue = Some(catalogue);
+        self
+    }
+
+    /// Attach the running catalogue import: its store for management reads and
+    /// its handle for a manual refresh.
+    #[must_use]
+    pub fn with_catalog_handle(mut self, handle: CatalogHandle) -> Self {
+        self.catalogue = Some(handle.store());
+        self.catalog_handle = Some(handle);
         self
     }
 
@@ -255,6 +270,11 @@ pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
             path: "/catalogue",
             action: AdminAction::ReadState,
             router: handlers::catalogue_route,
+        },
+        AdminRouteSpec {
+            path: "/catalogue/refresh",
+            action: AdminAction::RefreshCatalog,
+            router: handlers::catalogue_refresh_route,
         },
         AdminRouteSpec {
             path: "/history",

@@ -33,6 +33,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use super::auth::AdminAuthError;
+use crate::backends::catalog_store::{CatalogStoreError, HydrationError};
 use crate::backends::control_plane::ControlPlaneError;
 use crate::backends::secrets::SecretError;
 use crate::desired_state::secrets::SecretRef;
@@ -215,6 +216,15 @@ pub enum AdminError {
     /// help.
     #[error("the secret store could not complete the operation")]
     SecretStoreUnusable { detail: String },
+    /// The catalogue store is unreachable, or the import task has stopped.
+    /// Administration of the catalogue is degraded; inference is not — last
+    /// known good remains active.
+    #[error("the catalogue import is unavailable")]
+    CatalogStoreUnavailable { detail: String },
+    /// Stored catalogue bytes this replica cannot rehydrate, or a store that
+    /// refused the operation. An operator acts; a retry does not help.
+    #[error("the catalogue import could not complete the operation")]
+    CatalogStoreUnusable { detail: String },
 }
 
 impl AdminError {
@@ -255,6 +265,8 @@ impl AdminError {
         "secret_version_exists",
         "secret_material_refused",
         "secret_store_unusable",
+        "catalog_store_unavailable",
+        "catalog_store_unusable",
     ];
 
     pub const fn code(&self) -> &'static str {
@@ -292,6 +304,8 @@ impl AdminError {
             Self::SecretVersionExists { .. } => "secret_version_exists",
             Self::SecretMaterialRefused { .. } => "secret_material_refused",
             Self::SecretStoreUnusable { .. } => "secret_store_unusable",
+            Self::CatalogStoreUnavailable { .. } => "catalog_store_unavailable",
+            Self::CatalogStoreUnusable { .. } => "catalog_store_unusable",
         }
     }
 
@@ -330,7 +344,8 @@ impl AdminError {
             Self::StatefulModeRequired => StatusCode::NOT_IMPLEMENTED,
             Self::ControlPlaneUnavailable { .. }
             | Self::IdentityProviderUnavailable
-            | Self::SecretStoreUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::SecretStoreUnavailable { .. }
+            | Self::CatalogStoreUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             // Unreadable, incompatible, oversized, and refused storage are all
             // "this replica cannot serve the request, and retrying will not
             // change that": an operator acts, the caller does not.
@@ -338,7 +353,8 @@ impl AdminError {
             | Self::RevisionIncompatible { .. }
             | Self::RevisionTooLarge { .. }
             | Self::ControlPlaneDenied { .. }
-            | Self::SecretStoreUnusable { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::SecretStoreUnusable { .. }
+            | Self::CatalogStoreUnusable { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -354,6 +370,7 @@ impl AdminError {
             Self::ControlPlaneUnavailable { .. }
                 | Self::IdentityProviderUnavailable
                 | Self::SecretStoreUnavailable { .. }
+                | Self::CatalogStoreUnavailable { .. }
         )
     }
 
@@ -373,7 +390,9 @@ impl AdminError {
             | Self::SecretStoreUnavailable { detail }
             | Self::SecretLifecycleRefused { detail, .. }
             | Self::SecretMaterialRefused { detail }
-            | Self::SecretStoreUnusable { detail } => Some(detail),
+            | Self::SecretStoreUnusable { detail }
+            | Self::CatalogStoreUnavailable { detail }
+            | Self::CatalogStoreUnusable { detail } => Some(detail),
             _ => None,
         }
     }
@@ -428,6 +447,27 @@ impl AdminError {
             SecretError::Denied { backend, message } => Self::SecretStoreUnusable {
                 detail: format!("{backend}: {message}"),
             },
+        }
+    }
+
+    /// Translate a catalogue-store failure into the administrative vocabulary.
+    pub fn from_catalog_store(error: CatalogStoreError) -> Self {
+        match error {
+            CatalogStoreError::Unavailable { backend, message } => Self::CatalogStoreUnavailable {
+                detail: format!("{backend}: {message}"),
+            },
+            CatalogStoreError::Corrupt { backend, message }
+            | CatalogStoreError::Denied { backend, message } => Self::CatalogStoreUnusable {
+                detail: format!("{backend}: {message}"),
+            },
+        }
+    }
+
+    /// A retained snapshot this build cannot rehydrate. Last-known-good stays
+    /// active; the operator acts.
+    pub fn from_catalog_hydration(error: HydrationError) -> Self {
+        Self::CatalogStoreUnusable {
+            detail: error.to_string(),
         }
     }
 

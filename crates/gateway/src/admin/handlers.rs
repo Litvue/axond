@@ -24,7 +24,10 @@ use axum::routing::{MethodRouter, get, post};
 use serde::Deserialize;
 
 use super::auth::{AdminAction, AdminIdentity};
-use super::catalogue::{CatalogueFilters, CatalogueRequest, CatalogueView};
+use super::catalogue::{
+    CatalogueFilters, CatalogueRefreshView, CatalogueRequest, CatalogueSource, CatalogueView,
+    IMPORTED_QUERY_MIN_CHARS,
+};
 use super::conditional::Conditional;
 use super::error::AdminError;
 use super::protocol::{AuditSummary, MutationPreconditions, MutationRequest};
@@ -59,6 +62,10 @@ pub(super) fn state_route() -> MethodRouter<Arc<AdminApi>> {
 
 pub(super) fn catalogue_route() -> MethodRouter<Arc<AdminApi>> {
     get(catalogue)
+}
+
+pub(super) fn catalogue_refresh_route() -> MethodRouter<Arc<AdminApi>> {
+    post(refresh_catalogue)
 }
 
 pub(super) fn history_route() -> MethodRouter<Arc<AdminApi>> {
@@ -267,15 +274,19 @@ struct CatalogueQuery {
     lifecycle: Option<String>,
     #[serde(default)]
     availability: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    q: Option<String>,
 }
 
 /// Catalogue queries are deliberately small and finite: the route has one
-/// required scope key and ten optional filters. Bounding the raw query before
+/// required scope key and twelve optional filters. Bounding the raw query before
 /// deserialization keeps malformed input from turning into an unbounded error
 /// detail and prevents a client from spending parser work on an unbounded
 /// number of repeated keys.
 pub(super) const CATALOGUE_MAX_QUERY_BYTES: usize = 2 * 1024;
-pub(super) const CATALOGUE_MAX_QUERY_PARAMS: usize = 11;
+pub(super) const CATALOGUE_MAX_QUERY_PARAMS: usize = 13;
 
 fn validate_catalogue_query(uri: &Uri) -> Result<(), AdminError> {
     let query = uri.query().unwrap_or_default();
@@ -354,7 +365,12 @@ async fn catalogue(
             Some(OfferingId::parse(text).map_err(|error| invalid("offering", error.to_string()))?)
         }
     };
-    let provider = query.provider.clone();
+    let provider = query
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_owned);
     let capability = match query.capability.as_deref() {
         None => None,
         Some(text) => Some(
@@ -395,9 +411,33 @@ async fn catalogue(
             })?,
         ),
     };
+    let source = match query.source.as_deref() {
+        None => CatalogueSource::Enabled,
+        Some(text) => CatalogueSource::parse(text)
+            .ok_or_else(|| invalid("source", format!("`{text}` is not a catalogue source")))?,
+    };
+    let q = match query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        None => None,
+        Some(text) => {
+            if text.chars().count() < IMPORTED_QUERY_MIN_CHARS {
+                return Err(invalid(
+                    "q",
+                    format!("must be at least {IMPORTED_QUERY_MIN_CHARS} characters"),
+                ));
+            }
+            Some(text.to_owned())
+        }
+    };
+    if source == CatalogueSource::Imported && provider.is_none() && q.is_none() {
+        return Err(AdminError::RequestInvalid {
+            schema: SCHEMA,
+            detail: "`source=imported` requires `provider` and/or `q`".to_owned(),
+        });
+    }
     let request = CatalogueRequest {
         tenant,
         project,
+        source,
         filters: CatalogueFilters {
             state,
             wire_family,
@@ -408,6 +448,7 @@ async fn catalogue(
             modality,
             catalog_lifecycle,
             availability,
+            q,
         },
     };
     let grant = api
@@ -433,6 +474,29 @@ async fn catalogue(
             )
             .await?,
     ))
+}
+
+/// Import now. Same timeout and backoff as the scheduled loop; a refusal leaves
+/// last-known-good active and does not publish a revision.
+async fn refresh_catalogue(
+    State(api): State<Arc<AdminApi>>,
+    identity: AdminIdentity,
+) -> Result<Json<CatalogueRefreshView>, AdminError> {
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::RefreshCatalog,
+            Surface::Model,
+            &ResourceScope::Deployment,
+        )
+        .await?;
+    let Some(handle) = api.catalog_handle.as_ref() else {
+        return Err(AdminError::RequestInvalid {
+            schema: "catalogue_refresh",
+            detail: "catalogue imports are not enabled".to_owned(),
+        });
+    };
+    Ok(Json(api.service.catalogue_refresh(&grant, handle).await?))
 }
 
 /// What a history read may ask for.
