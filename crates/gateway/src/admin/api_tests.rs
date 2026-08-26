@@ -34,10 +34,13 @@ use crate::availability::{
     DiscoveryCompleteness, DiscoveryObservation, DiscoveryResult, DiscoverySource, Enablement,
     Entitlement, PolicyDecision, RuntimeObservations, ScopeRef, TargetRef,
 };
+use crate::backends::catalog::{RawPayload, SourceValidators};
+use crate::backends::catalog_store::{CatalogStore, InMemoryCatalogStore, RetainedCatalog};
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::fakes::InMemorySecrets;
+use crate::backends::models_dev::ModelsDevAdapter;
 use crate::desired_state::oracle::InMemoryControlPlane;
-use crate::desired_state::{DenialPage, ResourceScope, fixtures};
+use crate::desired_state::{DenialPage, OfferingId, ResourceScope, fixtures};
 
 const TOKEN: &str = "human-admin-token";
 const ISSUER: &str = "https://idp.example";
@@ -54,6 +57,24 @@ struct Deployment {
 impl Deployment {
     fn new() -> Self {
         Self::with_authorizer(FakeAdminAuthorizer::permissive())
+    }
+
+    fn with_catalogue(catalogue: Arc<dyn CatalogStore>) -> Self {
+        let store = Arc::new(InMemoryControlPlane::new());
+        let secrets = Arc::new(InMemorySecrets::new());
+        let api = Arc::new(
+            AdminApi::new(
+                Arc::new(AdminService::stateful(store.clone()).with_secrets(secrets.clone())),
+                Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+                Arc::new(FakeAdminAuthorizer::permissive()),
+            )
+            .with_catalogue(catalogue),
+        );
+        Self {
+            api,
+            store,
+            secrets,
+        }
     }
 
     fn with_authorizer(authorizer: FakeAdminAuthorizer) -> Self {
@@ -1633,8 +1654,7 @@ async fn a_tenant_scoped_administrator_cannot_publish_outside_its_tenant() {
 // ---------------------------------------------------------------------------
 
 /// The read a tenant administrator makes after publishing: the enablement it
-/// created, the alias that names it, and the one thing still standing between
-/// them and a routable model.
+/// created, the alias that names it, and the facts this build could not consult.
 #[tokio::test]
 async fn the_management_catalogue_reports_what_a_tenant_published() {
     let deployment = Deployment::new();
@@ -1666,16 +1686,15 @@ async fn the_management_catalogue_reports_what_a_tenant_published() {
     assert_eq!(aliases[0]["slug"], "default");
     assert_eq!(aliases[0]["scope"]["kind"], "project");
     assert_eq!(aliases[0]["routable"], json!(false));
-    assert_eq!(aliases[0]["unavailable"], json!(["unpriced-target"]));
+    assert_eq!(aliases[0]["unavailable"], json!([]));
     assert_eq!(aliases[0]["targets"].as_array().unwrap().len(), 1);
-    // Enabled and named, and still not routable: nobody approved a price. The
-    // read says which of the two acts is missing rather than reporting a bare
-    // "unavailable".
+    // Offering metadata was not consultable, so Unpriced is pending rather than
+    // a definitive verdict. billable stays false and agrees with price; routable
+    // requires a covering compiled price.
     assert_eq!(entry["billable"], json!(false));
+    assert!(entry.get("price").is_none(), "{entry}");
     assert_eq!(entry["routable"], json!(false));
-    assert_eq!(entry["unavailable"], json!(["unpriced"]));
-    // And it says what this build could not consult, so an operator does not read
-    // silence as an all-clear.
+    assert_eq!(entry["unavailable"], json!([]));
     assert_eq!(
         view["pending"],
         json!(["offering-metadata", "availability"])
@@ -1691,6 +1710,127 @@ async fn the_management_catalogue_reports_what_a_tenant_published() {
     assert_eq!(status, StatusCode::OK, "{filtered}");
     assert_eq!(filtered["entries"].as_array().expect("entries").len(), 1);
     assert_eq!(filtered["entries"][0]["slug"], "gpt-4o");
+}
+
+/// Compiled `PricingSnapshot::price` decides `billable`, not `approved_price`.
+#[tokio::test]
+async fn the_management_catalogue_treats_a_covering_book_as_billable() {
+    const CATALOG: &str = include_str!("../backends/fixtures/models_dev/catalog.identity.json");
+    let snapshot = ModelsDevAdapter::default()
+        .parse(
+            CATALOG.as_bytes(),
+            SourceValidators::default(),
+            std::time::UNIX_EPOCH,
+        )
+        .expect("the catalogue fixture parses");
+    let store = Arc::new(InMemoryCatalogStore::new());
+    store
+        .activate(
+            &RetainedCatalog {
+                source: snapshot.source.clone(),
+                payload: RawPayload::new(CATALOG.as_bytes()),
+            },
+            SystemTime::now(),
+        )
+        .await
+        .expect("the exact payload is retained");
+    let deployment = Deployment::with_catalogue(store);
+    let digest = snapshot.source.raw.digest;
+    let offering = OfferingId::of("openai", "openai/gpt-5.5").expect("an offering id");
+
+    let mut expected = EXPECTED_REVISION_EMPTY.to_owned();
+    expected = deployment
+        .publish("/tenants", "key-0", &expected, &tenant_document())
+        .await;
+    expected = deployment
+        .publish("/projects", "key-1", &expected, &project_document())
+        .await;
+    expected = deployment
+        .publish(
+            "/catalogs",
+            "key-2",
+            &expected,
+            &json!({
+                "summary": "import the openai catalogue",
+                "mutation": "create",
+                "resource": {
+                    "catalog": fixtures::resource_id(13).to_string(),
+                    "slug": "openai-models",
+                    "digest": digest.to_string(),
+                    "size_bytes": snapshot.source.raw.size_bytes,
+                }
+            }),
+        )
+        .await;
+    expected = deployment
+        .publish(
+            "/models",
+            "key-3",
+            &expected,
+            &json!({
+                "summary": "enable gpt-4o for acme",
+                "mutation": "create",
+                "resource": {
+                    "enablement": fixtures::resource_id(14).to_string(),
+                    "tenant": fixtures::tenant_id(1).to_string(),
+                    "slug": "gpt-4o",
+                    "offering": offering.to_string(),
+                    "catalog": fixtures::resource_id(13).to_string(),
+                    "snapshot": digest.to_string(),
+                    "wire_family": "openai-chat",
+                }
+            }),
+        )
+        .await;
+    expected = deployment
+        .publish("/aliases", "key-4", &expected, &alias_document())
+        .await;
+    let _head = deployment
+        .publish(
+            "/prices",
+            "key-5",
+            &expected,
+            &json!({
+                "summary": "approve openai rates",
+                "mutation": "create",
+                "resource": {
+                    "price_book": fixtures::resource_id(31).to_string(),
+                    "slug": "deployment-prices",
+                    "catalog": snapshot.content.content_id().checksum().to_string(),
+                    "catalog_version": 1,
+                    "state": "approved",
+                    "approved_at_millis": 0,
+                    "rules": [{
+                        "provider": "openai",
+                        "model": "openai/gpt-5.5",
+                        "precedence": "baseline",
+                        "from_millis": 0,
+                        "input_nano_dollars_per_million": 2_500_000u64,
+                        "output_nano_dollars_per_million": 10_000_000u64,
+                        "origin": "operator"
+                    }]
+                }
+            }),
+        )
+        .await;
+
+    let (status, view) = deployment
+        .get(&format!("/catalogue?tenant={}", fixtures::tenant_id(1)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let entry = &view["entries"].as_array().expect("entries")[0];
+    assert_eq!(entry["slug"], "gpt-4o");
+    assert!(entry.get("price").is_some(), "{entry}");
+    assert_eq!(entry["billable"], json!(true), "{entry}");
+    assert_eq!(
+        entry["billable"].as_bool(),
+        Some(entry.get("price").is_some()),
+        "{entry}"
+    );
+    assert_eq!(entry["unavailable"], json!([]), "{entry}");
+    assert!(entry.get("notices").is_none(), "{entry}");
+    assert_eq!(view["aliases"][0]["routable"], json!(true), "{view}");
+    assert_eq!(view["aliases"][0]["unavailable"], json!([]), "{view}");
 }
 
 /// The scope is a request parameter, so it is checked against the grant like any
