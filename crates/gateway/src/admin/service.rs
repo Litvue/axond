@@ -66,9 +66,9 @@ use super::reads::{
     StateView,
 };
 use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
-use crate::backends::catalog_refresh::RefreshImpact;
+use crate::backends::catalog_refresh::{RefreshImpact, RefreshOutcome};
 use crate::backends::catalog_runtime::CatalogHandle;
-use crate::backends::catalog_store::{self, CatalogStore};
+use crate::backends::catalog_store::{self, CatalogStore, CatalogStoreError, HydrationError};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::secrets::SecretStore;
 use crate::config::Mode;
@@ -494,35 +494,47 @@ impl AdminService {
         handle: &CatalogHandle,
     ) -> Result<CatalogueRefreshView, AdminError> {
         Self::permits_deployment_read(grant, AdminAction::RefreshCatalog)?;
-        let _outcome = handle.refresh_now().await;
+        match handle.refresh_now().await {
+            None => {
+                return Err(AdminError::CatalogStoreUnavailable {
+                    detail: "catalogue refresh is not running".to_owned(),
+                });
+            }
+            Some(RefreshOutcome::NotDue { .. }) => {
+                return Err(AdminError::CatalogStoreUnavailable {
+                    detail: "catalogue refresh did not run".to_owned(),
+                });
+            }
+            Some(RefreshOutcome::Admitted { .. } | RefreshOutcome::Refused { .. }) => {}
+        }
         let report = handle.status().report();
-        let impact = match handle.store().load().await {
-            Ok(state) => match state.active {
-                Some(retained) => match catalog_store::hydrate(&retained) {
-                    Ok(snapshot) => {
-                        let enablements = match self.store()?.load_desired_revision().await {
-                            Ok(Some(revision)) => Models::of(revision.state())
-                                .ok()
-                                .map(|models| {
-                                    models
-                                        .enablements()
-                                        .map(|enablement| enablement.body.clone())
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default(),
-                            Ok(None) | Err(_) => Vec::new(),
-                        };
-                        RefreshImpact::of(
-                            enablements.iter(),
-                            &snapshot.content,
-                            snapshot.source.raw.digest,
-                        )
-                    }
-                    Err(_) => RefreshImpact::default(),
-                },
-                None => RefreshImpact::default(),
-            },
-            Err(_) => RefreshImpact::default(),
+        let state = handle.store().load().await.map_err(log_catalog_store)?;
+        let impact = match state.active {
+            None => RefreshImpact::default(),
+            Some(retained) => {
+                let snapshot = catalog_store::hydrate(&retained).map_err(log_catalog_hydration)?;
+                let revision = self
+                    .store()?
+                    .load_desired_revision()
+                    .await
+                    .map_err(log_store)?;
+                let enablements = match revision {
+                    None => Vec::new(),
+                    Some(revision) => Models::of(revision.state())
+                        .map_err(|error| AdminError::RevisionUnreadable {
+                            revision: Some(revision.id()),
+                            detail: error.to_string(),
+                        })?
+                        .enablements()
+                        .map(|enablement| enablement.body.clone())
+                        .collect(),
+                };
+                RefreshImpact::of(
+                    enablements.iter(),
+                    &snapshot.content,
+                    snapshot.source.raw.digest,
+                )
+            }
         };
         Ok(CatalogueRefreshView::of(report.as_ref(), impact))
     }
@@ -930,6 +942,28 @@ pub(super) fn log_store(error: ControlPlaneError) -> AdminError {
         warn!(
             code = error.code(),
             detail, "control-plane operation failed"
+        );
+    }
+    error
+}
+
+fn log_catalog_store(error: CatalogStoreError) -> AdminError {
+    let error = AdminError::from_catalog_store(error);
+    if let Some(detail) = error.operator_detail() {
+        warn!(
+            code = error.code(),
+            detail, "catalogue-store operation failed"
+        );
+    }
+    error
+}
+
+fn log_catalog_hydration(error: HydrationError) -> AdminError {
+    let error = AdminError::from_catalog_hydration(error);
+    if let Some(detail) = error.operator_detail() {
+        warn!(
+            code = error.code(),
+            detail, "retained catalogue could not be rehydrated"
         );
     }
     error

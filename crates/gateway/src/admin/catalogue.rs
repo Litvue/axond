@@ -49,7 +49,7 @@
 //! the scope rule, the reason vocabulary, and the response shape are independent
 //! of where offering metadata comes from.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use serde::Serialize;
@@ -545,6 +545,9 @@ pub struct CatalogueView {
     /// Facts this build could not consult. Always projected, including when
     /// empty, so a client can tell an old build from a complete answer.
     pub pending: Vec<PendingFact>,
+    /// Imported browse hit [`IMPORTED_BROWSE_LIMIT`]. Narrow `provider` or `q`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 impl CatalogueView {
@@ -666,6 +669,7 @@ impl CatalogueView {
                     .map(|models| project_aliases(models, request, &BTreeMap::new()))
                     .unwrap_or_default(),
                 pending: pending_facts(true, availability.is_none()),
+                truncated: false,
             });
         };
         let Ok(pinned) = PinnedCatalog::of_snapshot(snapshot) else {
@@ -678,6 +682,7 @@ impl CatalogueView {
                     .map(|models| project_aliases(models, request, &BTreeMap::new()))
                     .unwrap_or_default(),
                 pending: pending_facts(true, availability.is_none()),
+                truncated: false,
             });
         };
         let pricing = revision.and_then(|revision| {
@@ -736,22 +741,14 @@ impl CatalogueView {
                 );
             }
         }
-        let mut seen = BTreeSet::new();
         let mut entries = Vec::new();
-        for callable in pinned.projection().callables() {
-            let Ok(offering) =
-                OfferingId::of(callable.provider().as_str(), callable.model().as_str())
-            else {
+        let mut truncated = false;
+        for (offering, callables) in imported_callable_groups(&pinned) {
+            let Some(callable) = best_imported_callable(request, offering, &callables) else {
                 continue;
             };
-            if !seen.insert(offering) {
-                continue;
-            }
             let metadata = metadata_from_callable(callable);
-            if !imported_admits(request, offering, &metadata) {
-                continue;
-            }
-            if let Some(enablement) = models
+            let entry = if let Some(enablement) = models
                 .as_ref()
                 .and_then(|models| enablement_for_offering(models, request, offering))
             {
@@ -759,18 +756,21 @@ impl CatalogueView {
                 let billable = context.is_some_and(|context| context.billable);
                 if !request.admits(
                     enablement,
-                    context.and_then(|context| context.metadata.as_ref()),
+                    Some(&metadata),
                     context.and_then(|context| context.availability.as_ref()),
                     billable,
                 ) {
-                    continue;
+                    None
+                } else {
+                    let mut overlay = context.cloned().unwrap_or_default();
+                    overlay.metadata = Some(metadata);
+                    Some(enablement_entry(
+                        models.as_ref().expect("enablement implies models"),
+                        request,
+                        enablement,
+                        Some(&overlay),
+                    ))
                 }
-                entries.push(enablement_entry(
-                    models.as_ref().expect("enablement implies models"),
-                    request,
-                    enablement,
-                    context,
-                ));
             } else {
                 let availability = entry_availability(
                     availability_ctx.as_ref(),
@@ -779,20 +779,24 @@ impl CatalogueView {
                     disclosure,
                     now,
                 );
-                if !imported_row_admits(request, availability.as_ref()) {
-                    continue;
-                }
-                entries.push(imported_entry(
-                    request,
-                    offering,
-                    snapshot.source.raw.digest.to_string(),
-                    metadata,
-                    availability,
-                ));
-            }
+                imported_row_admits(request, availability.as_ref()).then(|| {
+                    imported_entry(
+                        request,
+                        offering,
+                        snapshot.source.raw.digest.to_string(),
+                        metadata,
+                        availability,
+                    )
+                })
+            };
+            let Some(entry) = entry else {
+                continue;
+            };
             if entries.len() == IMPORTED_BROWSE_LIMIT {
+                truncated = true;
                 break;
             }
+            entries.push(entry);
         }
         Ok(Self {
             revision: revision.map(|revision| revision.id().to_string()),
@@ -803,6 +807,7 @@ impl CatalogueView {
                 .map(|models| project_aliases(models, request, &contexts))
                 .unwrap_or_default(),
             pending: pending_facts(false, availability_ctx.is_none()),
+            truncated,
         })
     }
 
@@ -845,6 +850,7 @@ impl CatalogueView {
             entries,
             aliases,
             pending: pending_facts(metadata_pending, availability_pending),
+            truncated: false,
         })
     }
 
@@ -855,6 +861,7 @@ impl CatalogueView {
             entries: Vec::new(),
             aliases: Vec::new(),
             pending: PendingFact::ALL.to_vec(),
+            truncated: false,
         }
     }
 }
@@ -972,6 +979,66 @@ fn metadata_from_callable(callable: &CallableOffering<'_>) -> CatalogueMetadata 
         context_tokens: facts.limits.context_tokens,
         input_tokens: facts.limits.input_tokens,
         output_tokens: facts.limits.output_tokens,
+    }
+}
+
+fn imported_callable_groups<'p, 'a>(
+    pinned: &'p PinnedCatalog<'a>,
+) -> Vec<(OfferingId, Vec<&'p CallableOffering<'a>>)> {
+    let mut groups: Vec<(OfferingId, Vec<&'p CallableOffering<'a>>)> = Vec::new();
+    let mut index: BTreeMap<OfferingId, usize> = BTreeMap::new();
+    for callable in pinned.projection().callables() {
+        let Ok(offering) = OfferingId::of(callable.provider().as_str(), callable.model().as_str())
+        else {
+            continue;
+        };
+        match index.get(&offering).copied() {
+            Some(slot) => groups[slot].1.push(callable),
+            None => {
+                index.insert(offering, groups.len());
+                groups.push((offering, vec![callable]));
+            }
+        }
+    }
+    groups
+}
+
+fn best_imported_callable<'a>(
+    request: &CatalogueRequest,
+    offering: OfferingId,
+    callables: &[&'a CallableOffering<'_>],
+) -> Option<&'a CallableOffering<'a>> {
+    let mut best: Option<(&'a CallableOffering<'a>, u8)> = None;
+    for callable in callables.iter().copied() {
+        let metadata = metadata_from_callable(callable);
+        if !imported_admits(request, offering, &metadata) {
+            continue;
+        }
+        let score = query_match_score(request.filters.q.as_deref(), &metadata);
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((callable, score));
+        }
+    }
+    best.map(|(callable, _)| callable)
+}
+
+fn query_match_score(q: Option<&str>, metadata: &CatalogueMetadata) -> u8 {
+    let Some(q) = q else {
+        return 0;
+    };
+    let q = q.to_ascii_lowercase();
+    if metadata.published_model.to_ascii_lowercase().contains(&q) {
+        3
+    } else if metadata
+        .display_name
+        .as_deref()
+        .is_some_and(|name| name.to_ascii_lowercase().contains(&q))
+    {
+        2
+    } else if metadata.model.to_ascii_lowercase().contains(&q) {
+        1
+    } else {
+        0
     }
 }
 
@@ -2030,6 +2097,60 @@ mod tests {
         assert!(encoded.get("state").is_none());
         assert_eq!(encoded["unavailable"], serde_json::json!(["not-enabled"]));
         assert!(!view.pending.contains(&PendingFact::OfferingMetadata));
+        assert!(!view.truncated);
+        let encoded = serde_json::to_value(&view).expect("serializable");
+        assert!(encoded.get("truncated").is_none());
+    }
+
+    #[tokio::test]
+    async fn imported_browse_matches_a_later_published_alias() {
+        const ALIASES: &str = include_str!("../backends/fixtures/models_dev/catalog.aliases.json");
+        let snapshot = ModelsDevAdapter::default()
+            .parse(ALIASES.as_bytes(), SourceValidators::default(), UNIX_EPOCH)
+            .expect("the aliases fixture parses");
+        let store = InMemoryCatalogStore::new();
+        store
+            .activate(
+                &RetainedCatalog {
+                    source: snapshot.source,
+                    payload: RawPayload::new(ALIASES.as_bytes()),
+                },
+                SystemTime::now(),
+            )
+            .await
+            .expect("the exact payload is retained");
+        let view = CatalogueView::of_with_context(
+            None,
+            &CatalogueRequest {
+                tenant: tenant_id(1),
+                project: None,
+                source: CatalogueSource::Imported,
+                filters: CatalogueFilters {
+                    q: Some("xiaomi".to_owned()),
+                    ..CatalogueFilters::default()
+                },
+            },
+            Some(&store),
+            None,
+            StatusScope::Deployment,
+            SystemTime::now(),
+        )
+        .await
+        .expect("imported browse is readable");
+        assert_eq!(view.entries.len(), 1, "{:?}", view.entries);
+        assert_eq!(
+            view.entries[0]
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.published_model.as_str()),
+            Some("xiaomi/mimo-v2-flash"),
+            "{:?}",
+            view.entries[0]
+        );
+        assert_eq!(
+            view.entries[0].unavailable,
+            vec![UnavailableReason::NotEnabled]
+        );
     }
 
     #[tokio::test]
@@ -2099,6 +2220,26 @@ mod tests {
             "{enabled:?}"
         );
         assert!(!enabled.unavailable.contains(&UnavailableReason::NotEnabled));
+    }
+
+    #[test]
+    fn truncated_imported_browse_is_named_on_the_view() {
+        let mut view = CatalogueView::of(
+            None,
+            &CatalogueRequest {
+                tenant: tenant_id(1),
+                project: None,
+                source: CatalogueSource::Imported,
+                filters: CatalogueFilters::default(),
+            },
+        )
+        .expect("an empty imported view is readable");
+        assert!(!view.truncated);
+        view.truncated = true;
+        assert_eq!(
+            serde_json::to_value(&view).expect("serializable")["truncated"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]

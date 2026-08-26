@@ -321,12 +321,11 @@ impl AdminAction {
     /// [`Self::WriteSecrets`] and [`Self::RefreshCatalog`] are writes and still
     /// not this: they change the secret store or the catalogue store, not
     /// desired state, so there is no revision for a caller to have expected and
-    /// none for their change to conflict with. What stands in for the
-    /// preconditions is the shape of the operations themselves — staging mints
-    /// a fresh version rather than overwriting one, a lifecycle move to the
-    /// state a version already holds is [`LifecycleTransition::Unchanged`], and
-    /// a catalogue refresh is last-known-good on refusal — so a retried call is
-    /// not a second change.
+    /// none for their change to conflict with. Secret staging mints a fresh
+    /// version rather than overwriting one, and a lifecycle move to the state a
+    /// version already holds is [`LifecycleTransition::Unchanged`]. A catalogue
+    /// refresh is last-known-good on *refusal*; a successful retry is a second
+    /// fetch.
     ///
     /// [`LifecycleTransition::Unchanged`]: crate::desired_state::secrets::LifecycleTransition::Unchanged
     pub const fn mutates(self) -> bool {

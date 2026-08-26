@@ -365,7 +365,12 @@ async fn catalogue(
             Some(OfferingId::parse(text).map_err(|error| invalid("offering", error.to_string()))?)
         }
     };
-    let provider = query.provider.clone();
+    let provider = query
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_owned);
     let capability = match query.capability.as_deref() {
         None => None,
         Some(text) => Some(
@@ -411,7 +416,7 @@ async fn catalogue(
         Some(text) => CatalogueSource::parse(text)
             .ok_or_else(|| invalid("source", format!("`{text}` is not a catalogue source")))?,
     };
-    let q = match query.q.as_deref() {
+    let q = match query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         None => None,
         Some(text) => {
             if text.chars().count() < IMPORTED_QUERY_MIN_CHARS {

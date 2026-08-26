@@ -1688,6 +1688,12 @@ fn every_declared_code_is_reachable_distinct_and_prose_free() {
         AdminError::SecretStoreUnusable {
             detail: SECRET_LOOKING.to_owned(),
         },
+        AdminError::CatalogStoreUnavailable {
+            detail: SECRET_LOOKING.to_owned(),
+        },
+        AdminError::CatalogStoreUnusable {
+            detail: SECRET_LOOKING.to_owned(),
+        },
     ];
 
     let codes: Vec<&'static str> = errors.iter().map(AdminError::code).collect();

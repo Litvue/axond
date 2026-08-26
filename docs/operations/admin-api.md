@@ -131,7 +131,8 @@ record, or a state read.
 | `/admin/v1/audit/{revision}` | `GET` | One revision's actor, summary, and recorded changes. |
 | `/admin/v1/convergence` | `GET` | What this replica has loaded and activated, from its own cached status — never a control-plane read. |
 | `/admin/v1/availability` | `GET` | What this replica derives about one scope's models. `?tenant=` is required, `?project=` optional; answered from the snapshot it is serving and its own circuits — never a control-plane read. |
-| `/admin/v1/catalogue` | `GET` | One tenant's management catalogue: what it has enabled, its first-class aliases and ordered targets, and why a model is not routable. `?tenant=` is required. |
+| `/admin/v1/catalogue` | `GET` | One tenant's management catalogue: what it has enabled, imported offerings (`?source=imported`), and why a model is not routable. `?tenant=` is required. |
+| `/admin/v1/catalogue/refresh` | `POST` | Import now. A write without a revision: no idempotency key, no expected-revision. Last-known-good stays active on refusal. |
 | `/admin/v1/tenants` | `POST` | A tenant and its lifecycle. |
 | `/admin/v1/projects` | `POST` | A project (namespace) inside a tenant. |
 | `/admin/v1/principals` | `POST` | A durable workload or human identity. Workloads carry only a key digest; humans carry an explicit issuer-scoped subject. Key material is never returned. |
@@ -321,6 +322,8 @@ no evidence in either answer that another tenant's enablements exist.
 | `modality` | Imported input or output modality, such as `text` or `image`. |
 | `lifecycle` | Imported catalogue lifecycle, such as `stable`, `preview`, or `deprecated`. |
 | `availability` | The scoped effective availability state reported by the replica. |
+| `source` | `enabled` (default) or `imported`. Imported reads the active retained snapshot, not this tenant's enablements. |
+| `q` | Case-insensitive substring over imported provider, model, published id, and display name. Minimum 3 characters. `source=imported` requires `provider` and/or `q`. |
 
 An unknown parameter, malformed enum value, or repeated parameter is refused with
 `400 admin_request_invalid` rather than ignored. A caller that asked to narrow
@@ -397,9 +400,22 @@ there is no “last value wins” interpretation for a catalogue filter.
 `unavailable` is why a caller of this tenant cannot route to the offering:
 `disabled` (its lifecycle), `shadowed` (a project override replaces the tenant
 default this entry reports), `unpriced` (no approved price, so no request can be
-billed) or `unaliased` (no enabled alias names it). `routable` is the absence of
-all of them; a read of a project reports the tenant default beside the override
-that shadows it, so an operator can see both without a second request.
+billed), `unaliased` (no enabled alias names it), or `not-enabled` (imported,
+not enabled for this tenant). `routable` is the absence of all of them; a read
+of a project reports the tenant default beside the override that shadows it, so
+an operator can see both without a second request.
+
+`notices` are warnings that do not make the offering unroutable: `stale-pin`
+(the enablement still pins a snapshot that is no longer active) and
+`withdrawn-upstream` (the active import no longer publishes the offering).
+Imported browse is capped at 100 offerings; `truncated: true` means the search
+was cut off.
+
+`POST /admin/v1/catalogue/refresh` runs the same import as the scheduled loop.
+It does not publish a revision. The body is a bounded catalogue report plus
+`impact.pins_unmoved` and `impact.withdrawn` offering ids. A refused import
+leaves last-known-good active. The route is a write without mutation
+preconditions: no `Idempotency-Key`, no expected-revision.
 
 An active alias must have a non-empty, reachable target list in its own project
 or tenant and all targets must share its wire family; disabled fallback entries

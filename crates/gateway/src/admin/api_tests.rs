@@ -1906,6 +1906,15 @@ async fn a_catalogue_filter_that_cannot_be_parsed_is_refused() {
         format!("tenant={}&unknown=1", fixtures::tenant_id(1)),
         format!("tenant={}&source=invented", fixtures::tenant_id(1)),
         format!("tenant={}&source=imported", fixtures::tenant_id(1)),
+        format!(
+            "tenant={}&source=imported&provider=",
+            fixtures::tenant_id(1)
+        ),
+        format!("tenant={}&source=imported&q=", fixtures::tenant_id(1)),
+        format!(
+            "tenant={}&source=imported&provider=%20",
+            fixtures::tenant_id(1)
+        ),
         format!("tenant={}&q=ab", fixtures::tenant_id(1)),
         format!("tenant={}&source=imported&q=ab", fixtures::tenant_id(1)),
         format!(
@@ -2082,6 +2091,39 @@ async fn catalogue_refresh_keeps_last_known_good_on_refusal() {
     );
     assert!(body["catalogue"]["last_refusal"].is_string(), "{body}");
     assert_eq!(deployment.store.published_revisions(), published);
+}
+
+#[tokio::test]
+async fn catalogue_refresh_is_unavailable_when_the_import_task_has_stopped() {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let handle = crate::backends::catalog_runtime::start(
+        &crate::config::CatalogConfig {
+            source: crate::config::CatalogSourceBackend::Seed,
+            store: crate::config::CatalogStoreBackend::InMemory,
+            bootstrap: crate::config::CatalogBootstrap::Seed,
+            refresh_interval_seconds: 86_400,
+            ..crate::config::CatalogConfig::default()
+        },
+        None,
+        &std::collections::HashMap::new(),
+        async move {
+            let _ = stopped.await;
+        },
+    )
+    .await
+    .expect("an offline catalogue starts")
+    .expect("an enabled catalogue yields a handle");
+    let deployment = Deployment::with_catalog_handle(handle.clone());
+    stop.send(()).expect("the task is listening");
+    while handle.refresh_now().await.is_some() {
+        tokio::task::yield_now().await;
+    }
+    let (status, body) = deployment
+        .post_material("/catalogue/refresh", &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["type"], "catalog_store_unavailable");
+    assert_eq!(body["error"]["retryable"], json!(true));
 }
 
 // ---------------------------------------------------------------------------
