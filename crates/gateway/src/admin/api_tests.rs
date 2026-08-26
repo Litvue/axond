@@ -4547,6 +4547,8 @@ async fn tenant_admin_pin_follow_after_new_digest_is_scope_not_permitted() {
         probed(&calls, Surface::Model, &ResourceScope::Deployment),
         "pin-follow after a new digest writes CatalogModel, got {calls:?}"
     );
+}
+
 fn vllm_provider_document() -> Value {
     json!({
         "summary": "connect acme to vllm",
@@ -4901,5 +4903,4 @@ async fn mixed_imported_and_local_alias_publishes_both_pins() {
         .expect("alias");
     let body = crate::desired_state::ModelAliasBody::read(alias).expect("readable");
     assert_eq!(body.targets().len(), 2);
-}
 }

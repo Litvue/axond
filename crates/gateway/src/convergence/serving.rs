@@ -1110,5 +1110,4 @@ env = "GW_ADMIN_BREAKGLASS"
         assert_eq!(model.targets[1].price.input_microdollars_per_million, 0);
         assert_eq!(model.targets[1].provider, "vllm");
     }
-
 }
