@@ -346,6 +346,11 @@ pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
             action: AdminAction::Publish,
             router: handlers::publish_route::<PriceBookRequest>,
         },
+        AdminRouteSpec {
+            path: "/bindings",
+            action: AdminAction::Publish,
+            router: handlers::bindings_route,
+        },
         // Material, not documents: the four rows that make a credential
         // rotatable without a redeploy. None of them publishes a revision, so
         // none of them carries the mutation preconditions — see

@@ -28,6 +28,7 @@
 //! | [`reads`] | bounded read projections: state, history, audit, convergence |
 //! | [`catalogue`] | the tenant-scoped management catalogue: what a tenant has enabled, and why a model is not routable |
 //! | [`resources`] | the typed request documents, and the edits they become |
+//! | [`binding`] | `POST /bindings`: expand one imported model into one revision |
 //! | [`mod@secrets`] | the credential lifecycle: material in, references out, never the reverse |
 //! | [`service`] | the one path a mutation takes: mode, authority, read, validate, diff, publish |
 //! | [`handlers`] | the routes themselves: parse, plan, delegate |
@@ -81,6 +82,7 @@
 //! [`Debug`]: std::fmt::Debug
 
 pub mod auth;
+pub mod binding;
 pub mod catalogue;
 pub mod cli;
 pub mod conditional;

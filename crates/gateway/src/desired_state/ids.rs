@@ -432,7 +432,23 @@ impl Slug {
         PrincipalId::PREFIX,
     ];
 
+    /// Ordinary resource names (tenants, projects, providers, …).
+    /// `.` is not allowed: a tenant slug `acme.corp` would compile to a namespace
+    /// that [`crate::namespace::NamespaceId`] cannot parse. Enablements that
+    /// clone a published id use [`Self::parse_alias`].
     pub fn parse(input: &str) -> Result<Self, InvalidSlug> {
+        Self::parse_chars(input, false)
+    }
+
+    /// Alias slugs are published model ids (`gpt-4o`, `gpt-5.5`). `.` is allowed
+    /// here only; tenants, projects, and providers still use [`Self::parse`].
+    /// Model enablements that copy that published id hydrate through this parser
+    /// too.
+    pub fn parse_alias(input: &str) -> Result<Self, InvalidSlug> {
+        Self::parse_chars(input, true)
+    }
+
+    fn parse_chars(input: &str, allow_dot: bool) -> Result<Self, InvalidSlug> {
         if input.is_empty() {
             return Err(InvalidSlug::Empty);
         }
@@ -444,10 +460,9 @@ impl Slug {
             });
         }
         let lowered = input.to_ascii_lowercase();
-        if let Some(character) = lowered
-            .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
-        {
+        if let Some(character) = lowered.chars().find(|c| {
+            !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || (allow_dot && *c == '.'))
+        }) {
             return Err(InvalidSlug::Character {
                 slug: input.to_owned(),
                 character,
@@ -685,6 +700,10 @@ mod tests {
         );
         assert_eq!(Slug::parse("a").unwrap().to_string(), "a");
         assert_eq!(Slug::parse("team_1-x").unwrap().as_str(), "team_1-x");
+        assert_eq!(Slug::parse_alias("gpt-5.5").unwrap().as_str(), "gpt-5.5");
+        assert!(Slug::parse("gpt-5.5").is_err());
+        assert!(Slug::parse("acme.corp").is_err());
+        assert!(Slug::parse_alias("acme.corp").is_ok());
     }
 
     #[test]

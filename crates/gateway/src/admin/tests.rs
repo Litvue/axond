@@ -1694,6 +1694,10 @@ fn every_declared_code_is_reachable_distinct_and_prose_free() {
         AdminError::CatalogStoreUnusable {
             detail: SECRET_LOOKING.to_owned(),
         },
+        AdminError::BindingRefused {
+            rule: "catalogue_identity_required",
+            detail: SECRET_LOOKING.to_owned(),
+        },
     ];
 
     let codes: Vec<&'static str> = errors.iter().map(AdminError::code).collect();

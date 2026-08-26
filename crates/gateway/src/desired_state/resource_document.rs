@@ -82,7 +82,7 @@ fn parse_resource_version(
     let fields = exact_map(value, RESOURCE_FIELDS)?;
     let reference = parse_resource_ref(required(fields, "reference")?)?;
     let scope = parse_scope(required(fields, "scope")?)?;
-    let slug = parse_slug(required(fields, "slug")?)?;
+    let slug = parse_slug(reference.kind, required(fields, "slug")?)?;
     let body = parse_body(required(fields, "body")?)?;
     let depends_on = parse_dependencies(required(fields, "depends_on")?)?;
 
@@ -208,8 +208,11 @@ fn parse_scope(value: &CanonicalValue) -> Result<ResourceScope, BlobResourceDocu
     }
 }
 
-fn parse_slug(value: &CanonicalValue) -> Result<Slug, BlobResourceDocumentError> {
-    Slug::parse(text(value, "slug")?)
+fn parse_slug(
+    kind: ResourceKind,
+    value: &CanonicalValue,
+) -> Result<Slug, BlobResourceDocumentError> {
+    kind.parse_slug(text(value, "slug")?)
         .map_err(|_| BlobResourceDocumentError::InvalidField { field: "slug" })
 }
 
@@ -270,7 +273,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::super::canonical::{Canonical, Checksum};
-    use super::super::ids::{ResourceId, Uuid7};
+    use super::super::ids::{ResourceId, Slug, TenantId, Uuid7};
     use super::super::publication::{ImmutableObject, ImmutableObjectKind};
     use super::super::resource::{
         BlobKind, BlobRef, ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion,
@@ -290,10 +293,10 @@ mod tests {
         );
         ResourceVersion::new(
             reference,
-            ResourceScope::Tenant(super::super::ids::TenantId::new(
+            ResourceScope::Tenant(TenantId::new(
                 Uuid7::from_parts(8, 0, 8).expect("fixture tenant UUID"),
             )),
-            super::super::ids::Slug::parse("gateway").expect("fixture slug"),
+            Slug::parse("gateway").expect("fixture slug"),
             body,
         )
         .depending_on([ResourceRef::new(
@@ -312,6 +315,45 @@ mod tests {
             kind,
             bytes: Bytes::from(bytes),
         }
+    }
+
+    fn published(kind: ResourceKind, seed: u64) -> ResourceVersion {
+        ResourceVersion::new(
+            ResourceRef::new(kind, resource_id(seed), ResourceVersionNumber::FIRST),
+            ResourceScope::Tenant(TenantId::new(
+                Uuid7::from_parts(8, 0, 8).expect("fixture tenant UUID"),
+            )),
+            Slug::parse_alias("gpt-5.5").expect("published id"),
+            ResourceBody::Inline(super::super::canonical::CanonicalValue::Bool(true)),
+        )
+    }
+
+    #[test]
+    fn a_gpt_5_5_alias_and_enablement_slug_hydrates_from_stored_rows() {
+        for resource in [
+            published(ResourceKind::Alias, 7),
+            published(ResourceKind::ModelEnablement, 11),
+        ] {
+            let object = object(ImmutableObjectKind::NamespaceResource, &resource);
+            let decoded = BlobResourceDocument::decode(&object).expect("stored slug hydrates");
+            assert_eq!(decoded.slug.as_str(), "gpt-5.5");
+            assert_eq!(decoded, resource);
+        }
+
+        let tenant = ResourceVersion::new(
+            ResourceRef::new(
+                ResourceKind::Tenant,
+                resource_id(1),
+                ResourceVersionNumber::FIRST,
+            ),
+            ResourceScope::Deployment,
+            Slug::parse_alias("gpt-5.5").expect("in-memory slug"),
+            ResourceBody::Inline(super::super::canonical::CanonicalValue::Bool(true)),
+        );
+        assert!(matches!(
+            BlobResourceDocument::decode(&object(ImmutableObjectKind::DeploymentResource, &tenant)),
+            Err(BlobResourceDocumentError::InvalidField { field: "slug" })
+        ));
     }
 
     #[test]

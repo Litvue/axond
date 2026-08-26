@@ -5,7 +5,7 @@
 //!
 //! - **Reading is parsing, not casting.** Every value comes back through the
 //!   domain's own constructor — `ResourceId::parse`, `Checksum::parse`,
-//!   `Slug::parse`, `SerializerVersion::decode` — so a row that holds something
+//!   `ResourceKind::parse_slug`, `SerializerVersion::decode` — so a row that holds something
 //!   the domain would never have written is an [`IntegrityError`] at the
 //!   boundary rather than a value that hydrates into a snapshot. The DDL's
 //!   `CHECK` constraints make those failures unreachable through this code; they
@@ -44,8 +44,9 @@ pub(super) fn checksum(text: &str) -> Result<Checksum, IntegrityError> {
     Checksum::parse(text).map_err(|error| unreadable(format!("a stored checksum {error}")))
 }
 
-pub(super) fn slug(text: &str) -> Result<Slug, IntegrityError> {
-    Slug::parse(text).map_err(|error| unreadable(format!("a stored slug is refused: {error}")))
+pub(super) fn slug(kind: ResourceKind, text: &str) -> Result<Slug, IntegrityError> {
+    kind.parse_slug(text)
+        .map_err(|error| unreadable(format!("a stored slug is refused: {error}")))
 }
 
 pub(super) fn version_number(value: i64) -> Result<ResourceVersionNumber, IntegrityError> {
@@ -358,6 +359,40 @@ mod tests {
             "{nonsense:?}"
         );
         assert!(!nonsense.is_incompatible());
+    }
+
+    #[test]
+    fn a_stored_gpt_5_5_alias_and_enablement_slug_hydrates() {
+        let dotted = "gpt-5.5";
+        assert_eq!(
+            slug(ResourceKind::Alias, dotted)
+                .expect("alias slug")
+                .as_str(),
+            dotted
+        );
+        assert_eq!(
+            slug(ResourceKind::ModelEnablement, dotted)
+                .expect("enablement slug")
+                .as_str(),
+            dotted
+        );
+        for kind in [
+            ResourceKind::Tenant,
+            ResourceKind::Project,
+            ResourceKind::Provider,
+        ] {
+            assert!(
+                matches!(slug(kind, dotted), Err(IntegrityError::Unreadable { .. })),
+                "{kind:?} must refuse a published id"
+            );
+            assert!(
+                matches!(
+                    slug(kind, "acme.corp"),
+                    Err(IntegrityError::Unreadable { .. })
+                ),
+                "{kind:?} must refuse a dotted tenant"
+            );
+        }
     }
 
     /// Every discriminant this module writes has to be a value the shipped DDL

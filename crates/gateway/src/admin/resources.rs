@@ -104,8 +104,8 @@ impl<F> DesiredStateEdit for ActorAwareEdit<F>
 where
     F: Fn(&mut DesiredState, &Actor) -> Result<(), ValidationError> + Send + Sync,
 {
-    fn edit(&self, state: &mut DesiredState, actor: &Actor) -> Result<(), ValidationError> {
-        (self.0)(state, actor)
+    fn edit(&self, state: &mut DesiredState, actor: &Actor) -> Result<(), AdminError> {
+        (self.0)(state, actor).map_err(AdminError::from)
     }
 }
 
@@ -934,7 +934,7 @@ impl AdminResourceRequest for AliasRequest {
         let alias = resource_id::<Self>("alias", &self.alias)?;
         let tenant = tenant_id::<Self>(&self.tenant)?;
         let project = project_id::<Self>(&self.project)?;
-        let slug = slug::<Self>(&self.slug)?;
+        let slug = alias_slug::<Self>(&self.slug)?;
         let wire_family = wire_family::<Self>(&self.wire_family)?;
         let lifecycle = match self.state.as_deref() {
             None => ModelLifecycle::Enabled,
@@ -1187,7 +1187,10 @@ fn refuse_withdrawing_a_pinned_snapshot(
 /// changed again: superseding it would dangle the alias, and pointing the alias
 /// at a version that does not exist yet dangles too. The edit holds the complete
 /// desired state, so the candidate carries the dependents forward itself.
-fn publish(state: &mut DesiredState, resource: ResourceVersion) -> Result<(), ValidationError> {
+pub(super) fn publish(
+    state: &mut DesiredState,
+    resource: ResourceVersion,
+) -> Result<(), ValidationError> {
     let current = resource.reference;
     let superseded = state.version_of(current.kind, current.id).map(|held| {
         let was_enabled = if current.kind == ResourceKind::ModelEnablement {
@@ -1283,7 +1286,11 @@ fn restack(
 }
 
 /// The version a supersede publishes: the first, or one past what is there.
-fn next_version(state: &DesiredState, kind: ResourceKind, id: ResourceId) -> ResourceVersionNumber {
+pub(super) fn next_version(
+    state: &DesiredState,
+    kind: ResourceKind,
+    id: ResourceId,
+) -> ResourceVersionNumber {
     state
         .version_of(kind, id)
         .map_or(ResourceVersionNumber::FIRST, |resource| {
@@ -1307,10 +1314,24 @@ fn project_id<R: AdminResourceRequest>(text: &str) -> Result<ProjectId, AdminErr
 }
 
 fn slug<R: AdminResourceRequest>(text: &str) -> Result<Slug, AdminError> {
-    Slug::parse(text).map_err(|error| {
+    map_slug::<R>(Slug::parse(text), false)
+}
+
+fn alias_slug<R: AdminResourceRequest>(text: &str) -> Result<Slug, AdminError> {
+    map_slug::<R>(Slug::parse_alias(text), true)
+}
+
+fn map_slug<R: AdminResourceRequest>(
+    parsed: Result<Slug, InvalidSlug>,
+    alias: bool,
+) -> Result<Slug, AdminError> {
+    parsed.map_err(|error| {
         let detail = match error {
             InvalidSlug::Empty => "must not be empty".to_owned(),
             InvalidSlug::TooLong { max, .. } => format!("is over the {max}-character limit"),
+            InvalidSlug::Character { .. } if alias => {
+                "contains a character outside ASCII letters, digits, `.`, `-`, and `_`".to_owned()
+            }
             InvalidSlug::Character { .. } => {
                 "contains a character outside ASCII letters, digits, `-`, and `_`".to_owned()
             }

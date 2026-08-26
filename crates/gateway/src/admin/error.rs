@@ -225,6 +225,11 @@ pub enum AdminError {
     /// refused the operation. An operator acts; a retry does not help.
     #[error("the catalogue import could not complete the operation")]
     CatalogStoreUnusable { detail: String },
+    /// The binding expander refused the document. `rule` is the stable token
+    /// (`pin_locked`, `catalogue_identity_required`, …); `detail` is operator
+    /// prose and does not travel on the wire.
+    #[error("the binding was refused ({rule})")]
+    BindingRefused { rule: &'static str, detail: String },
 }
 
 impl AdminError {
@@ -267,6 +272,7 @@ impl AdminError {
         "secret_store_unusable",
         "catalog_store_unavailable",
         "catalog_store_unusable",
+        "binding_refused",
     ];
 
     pub const fn code(&self) -> &'static str {
@@ -306,10 +312,11 @@ impl AdminError {
             Self::SecretStoreUnusable { .. } => "secret_store_unusable",
             Self::CatalogStoreUnavailable { .. } => "catalog_store_unavailable",
             Self::CatalogStoreUnusable { .. } => "catalog_store_unusable",
+            Self::BindingRefused { .. } => "binding_refused",
         }
     }
 
-    pub const fn status(&self) -> StatusCode {
+    pub fn status(&self) -> StatusCode {
         match self {
             Self::Unauthenticated(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -326,6 +333,13 @@ impl AdminError {
             | Self::HistoryLimitInvalid { .. }
             | Self::RequestInvalid { .. }
             | Self::SecretMaterialRefused { .. } => StatusCode::BAD_REQUEST,
+            Self::BindingRefused { rule, .. } => {
+                if *rule == "pin_locked" {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            }
             Self::RevisionConflict { .. }
             | Self::IdempotencyKeyReused { .. }
             | Self::NameTaken { .. }
@@ -392,7 +406,8 @@ impl AdminError {
             | Self::SecretMaterialRefused { detail }
             | Self::SecretStoreUnusable { detail }
             | Self::CatalogStoreUnavailable { detail }
-            | Self::CatalogStoreUnusable { detail } => Some(detail),
+            | Self::CatalogStoreUnusable { detail }
+            | Self::BindingRefused { detail, .. } => Some(detail),
             _ => None,
         }
     }
@@ -475,7 +490,7 @@ impl AdminError {
     /// validation refusal.
     pub const fn rule(&self) -> Option<&'static str> {
         match self {
-            Self::ValidationFailed { rule, .. } => Some(rule),
+            Self::ValidationFailed { rule, .. } | Self::BindingRefused { rule, .. } => Some(rule),
             _ => None,
         }
     }

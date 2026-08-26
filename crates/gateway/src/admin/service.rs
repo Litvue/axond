@@ -114,15 +114,15 @@ pub trait DesiredStateEdit: Send + Sync {
     /// Rewrite the complete candidate state. The actor is available for resource
     /// bodies whose semantics include an authenticated approval (for example an
     /// approved deployment PriceBook); ordinary resources deliberately ignore it.
-    fn edit(&self, state: &mut DesiredState, actor: &Actor) -> Result<(), ValidationError>;
+    fn edit(&self, state: &mut DesiredState, actor: &Actor) -> Result<(), AdminError>;
 }
 
 impl<F> DesiredStateEdit for F
 where
     F: Fn(&mut DesiredState) -> Result<(), ValidationError> + Send + Sync,
 {
-    fn edit(&self, state: &mut DesiredState, _actor: &Actor) -> Result<(), ValidationError> {
-        self(state)
+    fn edit(&self, state: &mut DesiredState, _actor: &Actor) -> Result<(), AdminError> {
+        self(state).map_err(AdminError::from)
     }
 }
 
@@ -135,6 +135,9 @@ pub enum MutationResult {
     /// The idempotency key had already published this exact desired state, so the
     /// original revision is returned rather than a second one being created.
     Replayed { revision: String },
+    /// The expected revision still matches head and the expander delta versus
+    /// that revision is empty, so nothing was published or recorded.
+    Unchanged { revision: String },
     /// Nothing was published, and nothing was recorded.
     DryRun,
 }
@@ -159,9 +162,9 @@ impl MutationOutcome {
     /// The revision this outcome names, if it published or replayed one.
     pub fn revision(&self) -> Option<&str> {
         match &self.result {
-            MutationResult::Published { revision } | MutationResult::Replayed { revision } => {
-                Some(revision)
-            }
+            MutationResult::Published { revision }
+            | MutationResult::Replayed { revision }
+            | MutationResult::Unchanged { revision } => Some(revision),
             MutationResult::DryRun => None,
         }
     }

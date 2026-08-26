@@ -25,7 +25,7 @@
 use std::collections::BTreeSet;
 
 use super::canonical::{Canonical, CanonicalValue, Checksum};
-use super::ids::{ProjectId, ResourceId, Slug, TenantId};
+use super::ids::{InvalidSlug, ProjectId, ResourceId, Slug, TenantId};
 
 /// The classes of durable resource a revision may contain.
 ///
@@ -82,6 +82,19 @@ impl ResourceKind {
             Self::Price => "price",
             Self::Alias => "alias",
             Self::Policy => "policy",
+        }
+    }
+
+    /// Re-parse a stored slug with the charset this kind may write.
+    ///
+    /// Alias names and enablements that clone a published id (`gpt-5.5`) go
+    /// through [`Slug::parse_alias`]. Tenants, projects, and providers keep
+    /// [`Slug::parse`], so a dotted tenant cannot compile then fail
+    /// [`crate::namespace::NamespaceId`].
+    pub fn parse_slug(self, input: &str) -> Result<Slug, InvalidSlug> {
+        match self {
+            Self::Alias | Self::ModelEnablement => Slug::parse_alias(input),
+            _ => Slug::parse(input),
         }
     }
 
@@ -529,6 +542,38 @@ mod tests {
 
     fn reference(kind: ResourceKind, seed: u64) -> ResourceRef {
         ResourceRef::new(kind, resource_id(seed), ResourceVersionNumber::FIRST)
+    }
+
+    #[test]
+    fn alias_and_enablement_slugs_hydrate_published_ids() {
+        let dotted = "gpt-5.5";
+        assert_eq!(
+            ResourceKind::Alias.parse_slug(dotted).unwrap().as_str(),
+            dotted
+        );
+        assert_eq!(
+            ResourceKind::ModelEnablement
+                .parse_slug(dotted)
+                .unwrap()
+                .as_str(),
+            dotted
+        );
+        for kind in [
+            ResourceKind::Tenant,
+            ResourceKind::Project,
+            ResourceKind::Provider,
+        ] {
+            assert!(
+                kind.parse_slug(dotted).is_err(),
+                "{} must refuse a published id",
+                kind.as_str()
+            );
+            assert!(
+                kind.parse_slug("acme.corp").is_err(),
+                "{} must refuse a dotted tenant",
+                kind.as_str()
+            );
+        }
     }
 
     #[test]

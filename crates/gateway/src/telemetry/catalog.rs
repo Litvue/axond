@@ -851,6 +851,39 @@ pub const CATALOG: &[MetricSpec] = &[
         unit: None,
         labels: &[],
     },
+    MetricSpec {
+        name: "axond.admin.bindings",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[
+            Label::closed(
+                "outcome",
+                &["published", "replayed", "unchanged", "dry_run", "refused"],
+            ),
+            Label::closed("path", &["imported", "local"]),
+        ],
+    },
+    MetricSpec {
+        name: "axond.admin.binding_refusals",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[Label::closed(
+            "code",
+            &[
+                "unknown_provider",
+                "catalogue_identity_required",
+                "not_in_catalogue",
+                "ambiguous_callable",
+                "observed_unbillable",
+                "price_required",
+                "catalogue_not_imported",
+                "project_required",
+                "pin_locked",
+                "not_local",
+                "price_change_requires_interval",
+            ],
+        )],
+    },
 ];
 
 /// The catalogued spec for `name`.

@@ -92,6 +92,10 @@ struct Instruments {
     catalog_active_age: Gauge<u64>,
     #[allow(dead_code)]
     catalog_consecutive_refusals: Gauge<u64>,
+    #[allow(dead_code)]
+    admin_bindings: Counter<u64>,
+    #[allow(dead_code)]
+    admin_binding_refusals: Counter<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -451,6 +455,17 @@ impl Instruments {
                     "Catalogue imports refused in a row, reset by any admitted or \
                      confirmed-unchanged import.",
                 )
+                .build(),
+            admin_bindings: meter
+                .u64_counter("axond.admin.bindings")
+                .with_description(
+                    "Binding applies, by outcome and whether the expander took the imported \
+                     or local path.",
+                )
+                .build(),
+            admin_binding_refusals: meter
+                .u64_counter("axond.admin.binding_refusals")
+                .with_description("Binding expander refusals, by closed rule token.")
                 .build(),
         }
     }
@@ -868,6 +883,28 @@ pub fn record_last_known_good(outcome: &'static str) {
     instruments
         .last_known_good
         .add(1, &[KeyValue::new("axond.revision.outcome", outcome)]);
+}
+
+pub(crate) fn record_binding(outcome: &'static str, path: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.admin_bindings.add(
+        1,
+        &[
+            KeyValue::new("outcome", outcome),
+            KeyValue::new("path", path),
+        ],
+    );
+}
+
+pub(crate) fn record_binding_refusal(code: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .admin_binding_refusals
+        .add(1, &[KeyValue::new("code", code)]);
 }
 
 /// Record an in-memory budget admission denied by the subject bound.

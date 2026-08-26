@@ -1113,10 +1113,11 @@ fn decode_manifest(value: &CanonicalValue) -> Result<RevisionManifest, String> {
 
 fn decode_entry(value: &CanonicalValue) -> Result<ManifestEntry, String> {
     let fields = map(value, "manifest entry")?;
+    let reference = decode_reference(field(fields, "reference")?)?;
     Ok(ManifestEntry {
-        reference: decode_reference(field(fields, "reference")?)?,
+        reference,
         scope: decode_scope(field(fields, "scope")?)?,
-        slug: decode_slug(field(fields, "slug")?)?,
+        slug: decode_slug(reference.kind, field(fields, "slug")?)?,
         content: digest(field(fields, "content")?, "entry.content")?,
     })
 }
@@ -1129,10 +1130,11 @@ fn decode_resource(value: &CanonicalValue) -> Result<ResourceVersion, String> {
         "blob" => ResourceBody::Blob(decode_blob(field(body, "blob")?)?),
         form => return Err(format!("resource.body.form `{form}` is not a body shape")),
     };
+    let reference = decode_reference(field(fields, "reference")?)?;
     let mut resource = ResourceVersion::new(
-        decode_reference(field(fields, "reference")?)?,
+        reference,
         decode_scope(field(fields, "scope")?)?,
-        decode_slug(field(fields, "slug")?)?,
+        decode_slug(reference.kind, field(fields, "slug")?)?,
         body,
     );
     for reference in list(field(fields, "depends_on")?, "resource.depends_on")? {
@@ -1191,8 +1193,9 @@ fn decode_blob(value: &CanonicalValue) -> Result<BlobRef, String> {
     })
 }
 
-fn decode_slug(value: &CanonicalValue) -> Result<Slug, String> {
-    Slug::parse(&string(value, "slug")?).map_err(|error| format!("slug is not valid: {error}"))
+fn decode_slug(kind: ResourceKind, value: &CanonicalValue) -> Result<Slug, String> {
+    kind.parse_slug(&string(value, "slug")?)
+        .map_err(|error| format!("slug is not valid: {error}"))
 }
 
 /// Describe an ID in the authenticated cache without copying the stored text
@@ -1287,6 +1290,7 @@ mod tests {
     use super::testing::{KEY, cache_path};
     use super::*;
     use crate::desired_state::ExpectedRevision;
+    use crate::desired_state::ModelOwner;
     use crate::desired_state::fixtures;
     use crate::state::ConfigSnapshot;
     use std::collections::HashMap;
@@ -1417,6 +1421,53 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
             restored.expect("restored").manifest().checksum,
             revision.manifest().checksum
         );
+        let _ = fs::remove_file(cache.path());
+    }
+
+    #[test]
+    fn a_gpt_5_5_alias_and_enablement_slug_hydrates_from_the_signed_cache() {
+        let cache = cache("gpt-5-5-slug-hydrate");
+        let tenant_id = fixtures::tenant_id(1);
+        let dotted = Slug::parse_alias("gpt-5.5").expect("published id");
+        let catalog = fixtures::blob_backed_catalog(5);
+        let credential = fixtures::credential(&tenant_id, 3, "primary");
+        let enablement = fixtures::enablement_body(30, ModelOwner::tenant(tenant_id), "gpt-4o")
+            .version(dotted.clone(), catalog.reference);
+        let mut alias = fixtures::alias(
+            &tenant_id,
+            4,
+            "fast",
+            &[credential.reference, catalog.reference],
+        );
+        alias.slug = dotted;
+        let mut state = DesiredState::new();
+        state.declare_blob(*catalog.body.blob().expect("a blob body"));
+        state
+            .insert(fixtures::tenant(1, "acme"))
+            .and_then(|state| state.insert(fixtures::project(&tenant_id, 2, "core")))
+            .and_then(|state| state.insert(credential))
+            .and_then(|state| state.insert(catalog))
+            .and_then(|state| state.insert(enablement))
+            .and_then(|state| state.insert(alias))
+            .expect("fixture state is valid");
+        let revision = revision(9, state);
+        cache.export(&revision).expect("export succeeds");
+        let restored = cache
+            .load()
+            .expect("the cache hydrates")
+            .expect("the cache holds a revision");
+        let slugs: Vec<_> = restored
+            .state()
+            .resources()
+            .filter(|resource| {
+                matches!(
+                    resource.reference.kind,
+                    ResourceKind::Alias | ResourceKind::ModelEnablement
+                )
+            })
+            .map(|resource| resource.slug.as_str())
+            .collect();
+        assert_eq!(slugs, ["gpt-5.5", "gpt-5.5"]);
         let _ = fs::remove_file(cache.path());
     }
 
