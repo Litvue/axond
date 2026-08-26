@@ -1714,10 +1714,7 @@ async fn the_management_catalogue_reports_what_a_tenant_published() {
     assert_eq!(filtered["entries"][0]["slug"], "gpt-4o");
 }
 
-/// Compiled `PricingSnapshot::price` decides `billable`, not the enablement
-/// pointer. ModelRequest never sets `approved_price`; a covering book used to
-/// report the admin-api.md lie (`price` present, `billable` false, `unavailable`
-/// contains `unpriced`).
+/// Compiled `PricingSnapshot::price` decides `billable`, not `approved_price`.
 #[tokio::test]
 async fn the_management_catalogue_treats_a_covering_book_as_billable() {
     const CATALOG: &str = include_str!("../backends/fixtures/models_dev/catalog.identity.json");

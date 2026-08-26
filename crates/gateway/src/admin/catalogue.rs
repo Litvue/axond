@@ -5,7 +5,7 @@
 //! The read a tenant administrator needs before publishing anything. `/v1/models`
 //! answers "what can this key invoke right now" from an immutable snapshot, and
 //! deliberately answers nothing else: it does not say that an offering exists but
-//! is disabled, that an enablement has no approved price, or that no alias points
+//! is disabled, that no compiled price covers it, or that no alias points
 //! at it. Those are administrative questions about *desired state*, so they are
 //! answered here, on the administrative surface, by an administrative credential.
 //!
@@ -428,9 +428,7 @@ impl Serialize for AliasUnavailableReason {
     }
 }
 
-/// An operator warning that does not make the offering unroutable.
-///
-/// Closed vocabulary; this read never emits a value.
+/// Closed vocabulary of operator warnings that do not make the offering unroutable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CatalogueNotice {}
 
@@ -1338,9 +1336,7 @@ mod tests {
         assert!(stranger.entries.is_empty());
     }
 
-    /// Compiled `PricingSnapshot::price` decides `billable`, not the enablement
-    /// pointer. Before this, a covering book produced the admin-api.md lie:
-    /// `price` present, `billable` false, `unavailable` contains `unpriced`.
+    /// Compiled `PricingSnapshot::price` decides `billable`, not `approved_price`.
     #[tokio::test]
     async fn a_covering_book_is_billable_without_an_enablement_price_pointer() {
         let (revision, store) = covering_book().await;
