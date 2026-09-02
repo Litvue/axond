@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use crate::config::{
     AdmissionConfig, BudgetConfig, CatalogConfig, Config, ConfigError, Mode, RateLimitConfig,
-    Reload, RevocationConfig, Transport, UsageJournalConfig, UsageSinkConfig,
+    Reload, RevocationConfig, StorageConfig, Transport, UsageJournalConfig, UsageSinkConfig,
 };
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
@@ -62,6 +62,25 @@ struct Boot {
     transport: Transport,
     admission: AdmissionConfig,
     catalog: CatalogConfig,
+    storage: Option<StorageConfig>,
+}
+
+impl From<&ConfigSnapshot> for Boot {
+    fn from(booted: &ConfigSnapshot) -> Self {
+        Self {
+            mode: booted.config.mode,
+            bind: booted.config.server.bind,
+            usage_sink: booted.config.usage_sink.clone(),
+            usage_journal: booted.config.usage_journal.clone(),
+            budget: booted.config.budget.clone(),
+            rate_limit: booted.config.rate_limit.clone(),
+            revocation: booted.config.revocation.clone(),
+            transport: booted.config.transport.clone(),
+            admission: booted.config.admission.clone(),
+            catalog: booted.config.catalog.clone(),
+            storage: booted.config.storage.clone(),
+        }
+    }
 }
 
 /// A validated reload candidate plus the boot-owned settings the file tried to
@@ -72,6 +91,7 @@ struct Boot {
 struct ReloadCandidate {
     snapshot: ConfigSnapshot,
     catalog_changed: bool,
+    storage_changed: bool,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -91,18 +111,7 @@ impl Reloader {
         let booted = state.config();
         Self {
             seen: Mutex::new(std::fs::read(&path).ok()),
-            boot: Boot {
-                mode: booted.config.mode,
-                bind: booted.config.server.bind,
-                usage_sink: booted.config.usage_sink.clone(),
-                usage_journal: booted.config.usage_journal.clone(),
-                budget: booted.config.budget.clone(),
-                rate_limit: booted.config.rate_limit.clone(),
-                revocation: booted.config.revocation.clone(),
-                transport: booted.config.transport.clone(),
-                admission: booted.config.admission.clone(),
-                catalog: booted.config.catalog.clone(),
-            },
+            boot: Boot::from(&*booted),
             path,
             state,
         }
@@ -191,6 +200,7 @@ impl Reloader {
         match self.candidate(env, &current, current.generation + 1) {
             Ok(candidate) => {
                 let catalog_changed = candidate.catalog_changed;
+                let storage_changed = candidate.storage_changed;
                 // A file reload replaces what the file describes and nothing
                 // else. Approved pricing is not in the file — it came from a
                 // desired revision this replica converged on — so it is carried
@@ -220,6 +230,7 @@ impl Reloader {
                 };
                 let mut summary = ReloadSummary::between(&self.boot, &current, &candidate_snapshot);
                 summary.catalog_changed = catalog_changed;
+                summary.storage_changed = storage_changed;
                 let generation = candidate_snapshot.generation;
                 self.state.publish(candidate_snapshot);
                 telemetry::finish_config_reload(
@@ -276,12 +287,15 @@ impl Reloader {
             ))));
         }
         let catalog_changed = self.boot.catalog != config.catalog;
+        let storage_changed = self.boot.storage != config.storage;
         // `[catalog]` selects the importer built before the listener binds. A
         // reload validates the edited values and reports the difference, but it
         // cannot safely replace that task, its client, or its retained store.
         // Keep the serving snapshot aligned with the importer that is actually
         // running until the operator restarts the process.
         config.catalog = self.boot.catalog.clone();
+        // `[storage]` is the live Store in AppState. A reload cannot reopen it.
+        config.storage = self.boot.storage.clone();
         carry_policy_forward(&mut config, &current.config);
         // Stateful convergence owns the projected inbound identities. A file
         // reload cannot recreate them, so carry the immutable set forward just
@@ -296,6 +310,7 @@ impl Reloader {
                 current.secrets().clone(),
             )?,
             catalog_changed,
+            storage_changed,
         })
     }
 
@@ -396,6 +411,8 @@ pub struct ReloadSummary {
     pub admission_changed: bool,
     /// `[catalog]` differs from the catalogue importer built at boot.
     pub catalog_changed: bool,
+    /// `[storage]` differs from the store opened at boot.
+    pub storage_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -593,6 +610,7 @@ impl ReloadSummary {
             transport_changed: boot.transport != after_config.transport,
             admission_changed: boot.admission != after_config.admission,
             catalog_changed: boot.catalog != after_config.catalog,
+            storage_changed: boot.storage != after_config.storage,
         }
     }
 
@@ -623,6 +641,7 @@ impl ReloadSummary {
             || self.transport_changed
             || self.admission_changed
             || self.catalog_changed
+            || self.storage_changed
             || self.gateway_minting_route_added()
     }
 
@@ -715,6 +734,11 @@ impl ReloadSummary {
         if self.catalog_changed {
             tracing::warn!(
                 "`[catalog]` changed, but the catalogue importer is built at boot; restart to apply it"
+            );
+        }
+        if self.storage_changed {
+            tracing::warn!(
+                "`[storage]` changed, but the namespace store is opened at boot; restart to apply it"
             );
         }
     }
@@ -934,6 +958,18 @@ mod tests {
     struct ConfigFile(PathBuf);
 
     impl ConfigFile {
+        fn with_storage(contents: &str, toml_path: &std::path::Path) -> String {
+            if contents.contains("[storage]") {
+                contents.to_string()
+            } else {
+                let sqlite = toml_path.with_extension("sqlite");
+                format!(
+                    "[storage]\nbackend = \"sqlite\"\npath = \"{}\"\n\n{contents}",
+                    sqlite.display()
+                )
+            }
+        }
+
         fn new(contents: &str) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
@@ -941,12 +977,12 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            std::fs::write(&path, contents).expect("write config");
+            std::fs::write(&path, Self::with_storage(contents, &path)).expect("write config");
             Self(path)
         }
 
         fn rewrite(&self, contents: &str) {
-            std::fs::write(&self.0, contents).expect("rewrite config");
+            std::fs::write(&self.0, Self::with_storage(contents, &self.0)).expect("rewrite config");
         }
 
         fn path(&self) -> &str {
@@ -1329,18 +1365,7 @@ env = "GW_ADMIN_BREAKGLASS"
         .unwrap();
         let before = ConfigSnapshot::build(before_config, &minting_env(), 0).unwrap();
         let after = ConfigSnapshot::build(after_config, &minting_env(), 1).unwrap();
-        let boot = Boot {
-            mode: before.config.mode,
-            bind: before.config.server.bind,
-            usage_sink: before.config.usage_sink.clone(),
-            usage_journal: before.config.usage_journal.clone(),
-            budget: before.config.budget.clone(),
-            rate_limit: before.config.rate_limit.clone(),
-            revocation: before.config.revocation.clone(),
-            transport: before.config.transport.clone(),
-            admission: before.config.admission.clone(),
-            catalog: before.config.catalog.clone(),
-        };
+        let boot = Boot::from(&before);
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
             summary.gateway_keys.changed,
@@ -1363,18 +1388,7 @@ env = "GW_ADMIN_BREAKGLASS"
             "rotated-signing-secret-012345678901234567".to_string(),
         );
         let after = ConfigSnapshot::build(config, &rotated_env, 1).unwrap();
-        let boot = Boot {
-            mode: before.config.mode,
-            bind: before.config.server.bind,
-            usage_sink: before.config.usage_sink.clone(),
-            usage_journal: before.config.usage_journal.clone(),
-            budget: before.config.budget.clone(),
-            rate_limit: before.config.rate_limit.clone(),
-            revocation: before.config.revocation.clone(),
-            transport: before.config.transport.clone(),
-            admission: before.config.admission.clone(),
-            catalog: before.config.catalog.clone(),
-        };
+        let boot = Boot::from(&before);
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
             summary.gateway_minting.changed,
@@ -1404,18 +1418,7 @@ env = "GW_ADMIN_BREAKGLASS"
             1,
         )
         .unwrap();
-        let boot = Boot {
-            mode: disabled.config.mode,
-            bind: disabled.config.server.bind,
-            usage_sink: disabled.config.usage_sink.clone(),
-            usage_journal: disabled.config.usage_journal.clone(),
-            budget: disabled.config.budget.clone(),
-            rate_limit: disabled.config.rate_limit.clone(),
-            revocation: disabled.config.revocation.clone(),
-            transport: disabled.config.transport.clone(),
-            admission: disabled.config.admission.clone(),
-            catalog: disabled.config.catalog.clone(),
-        };
+        let boot = Boot::from(&disabled);
 
         let added = ReloadSummary::between(&boot, &disabled, &enabled);
         assert_eq!(added.gateway_minting.added, vec!["enabled".to_owned()]);
@@ -1475,18 +1478,7 @@ env = "GW_ADMIN_BREAKGLASS"
             1,
         )
         .unwrap();
-        let boot = Boot {
-            mode: before.config.mode,
-            bind: before.config.server.bind,
-            usage_sink: before.config.usage_sink.clone(),
-            usage_journal: before.config.usage_journal.clone(),
-            budget: before.config.budget.clone(),
-            rate_limit: before.config.rate_limit.clone(),
-            revocation: before.config.revocation.clone(),
-            transport: before.config.transport.clone(),
-            admission: before.config.admission.clone(),
-            catalog: before.config.catalog.clone(),
-        };
+        let boot = Boot::from(&before);
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(summary.gateway_minting.changed, vec!["enabled".to_owned()]);
     }
@@ -2279,6 +2271,23 @@ targets = [
             .expect("candidate is valid");
         assert!(summary.bind_changed);
         assert_eq!(state.config().generation, 2);
+    }
+
+    #[tokio::test]
+    async fn storage_changes_are_reported_as_restart_required_and_not_applied() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let original = state.config().config.storage.clone();
+        let reloader = Reloader::new(file.path(), state.clone());
+        file.rewrite(&format!(
+            "[storage]\nbackend = \"sqlite\"\npath = \"other.sqlite\"\n{PLATFORM_ONLY}"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("storage change is valid and boot-owned");
+        assert!(summary.storage_changed);
+        assert!(summary.restart_required());
+        assert_eq!(state.config().config.storage, original);
     }
 
     #[tokio::test]

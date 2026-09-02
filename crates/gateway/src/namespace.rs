@@ -194,7 +194,15 @@ mod tests {
     #[test]
     fn parser_accepts_only_one_canonical_opaque_url_segment() {
         let longest = "z".repeat(NamespaceId::MAX_LEN);
-        for input in ["a", "platform", "Acme_01-prod", longest.as_str()] {
+        for input in [
+            "a",
+            "platform",
+            "Acme_01-prod",
+            "acme.core",
+            "a.b",
+            "a..b",
+            longest.as_str(),
+        ] {
             let id = NamespaceId::parse(input).expect("canonical namespace id");
             assert_eq!(id.as_str(), input);
             assert_eq!(id.to_string(), input);
@@ -209,11 +217,8 @@ mod tests {
         ));
         for input in [
             "acme/core",
-            "acme.core",
             "acme%2fcore",
             "acme%2Fcore",
-            ".",
-            "..",
             "café",
             "acme core",
             "acme\\core",
@@ -226,7 +231,7 @@ mod tests {
                 "`{input}` must not have an alternate URL interpretation"
             );
         }
-        for input in ["-acme", "acme-", "_acme", "acme_"] {
+        for input in ["-acme", "acme-", "_acme", "acme_", ".", ".."] {
             assert!(matches!(
                 NamespaceId::parse(input),
                 Err(InvalidNamespaceId::Boundary)

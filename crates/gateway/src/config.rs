@@ -747,7 +747,7 @@ pub enum StorageBackend {
     Postgres,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct StorageConfig {
     #[serde(default)]
@@ -759,6 +759,14 @@ pub struct StorageConfig {
     #[allow(dead_code)]
     #[serde(default)]
     pub on_unavailable: StoreUnavailable,
+    /// Apply namespace DDL at connect. SQLite always needs this; Postgres
+    /// deployments that migrate out of band set `false`.
+    #[serde(default = "default_storage_create_table")]
+    pub create_table: bool,
+}
+
+fn default_storage_create_table() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2819,6 +2827,16 @@ impl Config {
                         "`[storage]` sqlite `:memory:` is not durable; use a file path".into(),
                     ));
                 }
+                if storage
+                    .dsn_env
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty())
+                {
+                    return Err(ConfigError::Invalid(
+                        "`[storage]` sqlite ignores `dsn_env`; omit it or use backend = \"postgres\""
+                            .into(),
+                    ));
+                }
             }
             StorageBackend::Postgres => {
                 if storage
@@ -2828,6 +2846,16 @@ impl Config {
                 {
                     return Err(ConfigError::Invalid(
                         "`[storage]` postgres requires a non-empty `dsn_env`".into(),
+                    ));
+                }
+                if storage
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty())
+                {
+                    return Err(ConfigError::Invalid(
+                        "`[storage]` postgres ignores `path`; omit it or use backend = \"sqlite\""
+                            .into(),
                     ));
                 }
             }

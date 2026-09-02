@@ -151,7 +151,12 @@ async fn list_namespaces(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<ListBody>, GatewayError> {
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return Err(GatewayError::BadRequest(
+            "`limit` must be between 1 and 1000".into(),
+        ));
+    }
     match store(&state)?.list_namespaces(query.cursor, limit).await {
         Ok((data, next_cursor)) => Ok(Json(ListBody { data, next_cursor })),
         Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),

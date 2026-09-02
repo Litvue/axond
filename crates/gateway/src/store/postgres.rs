@@ -5,30 +5,30 @@ use tokio_postgres::Client;
 use super::{NamespaceRecord, Store, StoreError};
 
 pub struct PostgresStore {
-    client: tokio::sync::Mutex<Client>,
+    client: Client,
 }
 
 impl PostgresStore {
-    pub async fn connect(dsn: &str) -> Result<Self, StoreError> {
+    pub async fn connect(dsn: &str, create_table: bool) -> Result<Self, StoreError> {
         let (client, connection) = tokio_postgres::connect(dsn, crate::usage::tls_connector())
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        client
-            .batch_execute(
-                "CREATE TABLE IF NOT EXISTS axond_namespace (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    blocklist JSONB
-                );",
-            )
-            .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        Ok(Self {
-            client: tokio::sync::Mutex::new(client),
-        })
+        if create_table {
+            client
+                .batch_execute(
+                    "CREATE TABLE IF NOT EXISTS axond_namespace (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        blocklist JSONB
+                    );",
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        }
+        Ok(Self { client })
     }
 }
 
@@ -53,7 +53,7 @@ fn record_from(
 #[async_trait]
 impl Store for PostgresStore {
     async fn put_namespace(&self, ns: NamespaceRecord) -> Result<(), StoreError> {
-        let client = self.client.lock().await;
+        let client = &self.client;
         let blocklist = ns
             .blocklist
             .as_ref()
@@ -74,7 +74,7 @@ impl Store for PostgresStore {
     }
 
     async fn get_namespace(&self, id: &str) -> Result<Option<NamespaceRecord>, StoreError> {
-        let client = self.client.lock().await;
+        let client = &self.client;
         let row = client
             .query_opt(
                 "SELECT id, attrs, blocklist FROM axond_namespace WHERE id = $1",
@@ -92,7 +92,7 @@ impl Store for PostgresStore {
         limit: u32,
     ) -> Result<(Vec<NamespaceRecord>, Option<String>), StoreError> {
         let limit = i64::from(limit.clamp(1, 1000));
-        let client = self.client.lock().await;
+        let client = &self.client;
         let rows = client
             .query(
                 "SELECT id, attrs, blocklist FROM axond_namespace
@@ -122,7 +122,7 @@ impl Store for PostgresStore {
         blocklist: Option<Vec<String>>,
     ) -> Result<Option<NamespaceRecord>, StoreError> {
         let blocklist = blocklist.map(|list| serde_json::to_value(list).unwrap_or(Value::Null));
-        let client = self.client.lock().await;
+        let client = &self.client;
         let row = client
             .query_opt(
                 "UPDATE axond_namespace SET attrs = $1, blocklist = $2 WHERE id = $3
@@ -136,7 +136,7 @@ impl Store for PostgresStore {
     }
 
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError> {
-        let client = self.client.lock().await;
+        let client = &self.client;
         let n = client
             .execute("DELETE FROM axond_namespace WHERE id = $1", &[&id])
             .await

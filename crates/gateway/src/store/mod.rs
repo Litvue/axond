@@ -84,7 +84,9 @@ pub async fn open(
                     "env `{dsn_env}` is unset or empty"
                 )));
             }
-            Ok(Arc::new(PostgresStore::connect(dsn).await?))
+            Ok(Arc::new(
+                PostgresStore::connect(dsn, config.create_table).await?,
+            ))
         }
     }
 }
