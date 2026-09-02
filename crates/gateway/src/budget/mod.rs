@@ -29,8 +29,11 @@
 //! policy, which is why it shares no trait with the control-plane contracts even
 //! when both happen to be pointed at Postgres.
 
+#![allow(dead_code)]
+
 mod postgres;
 mod redis;
+mod store_budget;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,6 +50,7 @@ use crate::telemetry::metrics;
 
 pub use postgres::PostgresBudget;
 pub use redis::{MigrationReport, RedisBudget};
+pub use store_budget::StoreBudget;
 
 /// The dimension a budget is scoped to. Neutral vocabulary, like usage records.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -72,6 +76,9 @@ pub struct Reservation {
     /// the previous document settles against the generation that granted it, and
     /// a drain is finished when no hold names the superseded generation any more.
     pub generation: Option<PolicyGeneration>,
+    /// Active period this hold was taken against. Set by the Store ledger;
+    /// absent on unheld / legacy backends.
+    pub period: Option<String>,
 }
 
 impl Reservation {
@@ -81,13 +88,14 @@ impl Reservation {
             id: String::new(),
             estimate_microdollars: 0,
             generation: None,
+            period: None,
         }
     }
 
     /// A process-unique id. A stale hold is reclaimed by its own expiry rather
     /// than by id collision, so a monotonic counter with the process's start
     /// time is enough — and, unlike a UUID, needs no dependency.
-    fn next_id() -> String {
+    pub(crate) fn next_id() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         static EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let epoch = *EPOCH.get_or_init(|| {
@@ -526,6 +534,7 @@ impl BudgetStore for InMemoryBudget {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
             generation: None,
+            period: None,
         };
         ledger.held.insert(
             reservation.id.clone(),
@@ -593,7 +602,7 @@ impl UnavailablePolicy {
     /// TTL rather than dropped, on both stances — a fail-closed denial does not
     /// un-write what the store may have committed. It is `None` only where the
     /// failure provably precedes any side effect.
-    fn admission(
+    pub(crate) fn admission(
         self,
         backend: &'static str,
         error: &dyn std::fmt::Display,

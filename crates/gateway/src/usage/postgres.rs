@@ -35,10 +35,11 @@ const SCHEMA_DDL: &str = include_str!("../../sql/usage_v2.sql");
 /// installations apply them before deploying a writer that emits the new
 /// columns. Nullable columns only, so a writer deployed ahead of one of them
 /// still writes rows the earlier shape can read.
-const ADDITIVE_DDL: [&str; 3] = [
+const ADDITIVE_DDL: [&str; 4] = [
     include_str!("../../sql/usage_v1_001_add_signer_kid.sql"),
     include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
     include_str!("../../sql/usage_v2_002_nullable_cost.sql"),
+    include_str!("../../sql/usage_v2_003_add_period.sql"),
 ];
 
 /// Which migration adds each column the base DDL of the current schema version
@@ -48,11 +49,12 @@ const ADDITIVE_DDL: [&str; 3] = [
 /// Ordering is the enforcement: a writer binds all of [`COLUMNS`], so it refuses
 /// to boot against a table an operator has not migrated yet, rather than
 /// discovering it one dropped batch at a time.
-const ADDITIVE_COLUMNS: [(&str, &str); 4] = [
+const ADDITIVE_COLUMNS: [(&str, &str); 5] = [
     ("signer_kid", "usage_v1_001_add_signer_kid.sql"),
     ("price_book", "usage_v2_001_add_price_identity.sql"),
     ("price_book_checksum", "usage_v2_001_add_price_identity.sql"),
     ("price_catalog", "usage_v2_001_add_price_identity.sql"),
+    ("period", "usage_v2_003_add_period.sql"),
 ];
 
 /// The table name the shipped DDL uses; substituted when the sink is configured
@@ -65,11 +67,12 @@ const INDEX_PREFIX_PLACEHOLDER: &str = "\u{1}index_prefix\u{1}";
 
 /// Columns written per row, in parameter order. `reasoning_tokens` remains
 /// reserved for a future schema version; the cache counters are canonical.
-const COLUMNS: [&str; 25] = [
+const COLUMNS: [&str; 26] = [
     "schema_version",
     "request_id",
     "trace_id",
     "namespace",
+    "period",
     "subject",
     "signer_kid",
     "model",
@@ -433,6 +436,7 @@ fn row(observed: &ObservedRecord) -> Vec<Box<dyn ToSql + Sync + Send>> {
         Box::new(record.request_id.clone()),
         Box::new(record.trace_id.clone()),
         Box::new(record.namespace.clone()),
+        Box::new(record.period.clone()),
         Box::new(record.subject.clone()),
         Box::new(record.signer_kid.clone()),
         Box::new(record.model.clone()),
@@ -527,6 +531,10 @@ mod tests {
             (
                 "usage_v2_002_nullable_cost.sql",
                 include_str!("../../sql/usage_v2_002_nullable_cost.sql"),
+            ),
+            (
+                "usage_v2_003_add_period.sql",
+                include_str!("../../sql/usage_v2_003_add_period.sql"),
             ),
         ];
         for (column, file) in ADDITIVE_COLUMNS {

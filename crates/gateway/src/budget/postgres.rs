@@ -22,6 +22,8 @@
 //! reservation row is still the whole hold: it is inserted and deleted once, and
 //! the settlement charges both scopes in the same transaction.
 
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -643,6 +645,7 @@ impl BudgetStore for PostgresBudget {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
             generation: governing.generation,
+            period: None,
         };
         // Counted before the transaction, so a publication landing mid-admission
         // cannot see an empty drain list while this request is being admitted

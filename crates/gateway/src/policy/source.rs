@@ -134,6 +134,7 @@ impl PolicyHold {
 
     /// Hand the count off to an explicit settlement path: the generation stays
     /// counted after this guard goes away.
+    #[allow(dead_code)]
     pub fn kept(mut self) {
         self.kept = true;
     }

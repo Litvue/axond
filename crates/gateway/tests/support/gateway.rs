@@ -79,6 +79,59 @@ overall_timeout_ms = 30000
 pub const INPUT_PRICE: u64 = 2_500_000;
 pub const OUTPUT_PRICE: u64 = 10_000_000;
 
+/// Period/limit the harness PUTs for every TOML-seeded namespace so existing
+/// black-box inference tests stay admitted. Suites that POST a new namespace
+/// still start fail-closed until they PUT their own budget.
+pub const HARNESS_BUDGET_PERIOD: &str = "harness";
+pub const HARNESS_BUDGET_LIMIT: u64 = 1_000_000_000_000;
+
+async fn seed_harness_budgets(base_url: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let listed = client
+        .get(format!("{base_url}/api/v1/namespaces"))
+        .bearer_auth(GATEWAY_KEY)
+        .send()
+        .await
+        .map_err(|error| format!("list namespaces for harness budgets: {error}"))?;
+    if !listed.status().is_success() {
+        return Err(format!(
+            "list namespaces for harness budgets: {}",
+            listed.status()
+        ));
+    }
+    let body: Value = listed
+        .json()
+        .await
+        .map_err(|error| format!("namespace list: {error}"))?;
+    let Some(data) = body.get("data").and_then(Value::as_array) else {
+        return Err("namespace list missing data".into());
+    };
+    for namespace in data {
+        let Some(id) = namespace.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let put = client
+            .put(format!(
+                "{base_url}/api/v1/namespaces/{id}/budgets/{HARNESS_BUDGET_PERIOD}"
+            ))
+            .bearer_auth(GATEWAY_KEY)
+            .json(&json!({ "limit_microdollars": HARNESS_BUDGET_LIMIT }))
+            .send()
+            .await
+            .map_err(|error| format!("PUT harness budget for {id}: {error}"))?;
+        if put.status() == reqwest::StatusCode::NOT_FOUND {
+            // Older binaries on this harness have no budget surface.
+            return Ok(());
+        }
+        if !put.status().is_success() {
+            let status = put.status();
+            let text = put.text().await.unwrap_or_default();
+            return Err(format!("PUT harness budget for {id}: {status} {text}"));
+        }
+    }
+    Ok(())
+}
+
 /// Distinguishes the config directories of gateways booted by the same test
 /// process, so differently tuned boots cannot share a file.
 static CONFIGS: AtomicU64 = AtomicU64::new(0);
@@ -468,6 +521,10 @@ impl Axond {
             readers,
         };
         if gateway.await_ready().await {
+            if let Err(error) = seed_harness_budgets(&gateway.base_url).await {
+                let output = gateway.final_output();
+                return Err(format!("{error}\n{output}"));
+            }
             Ok(gateway)
         } else {
             Err(gateway.final_output())

@@ -2,9 +2,11 @@
 //!
 //! SQLite WAL is the single-replica implementation; Postgres is HA. Boot
 //! requires a reachable backend. Namespace rows are loaded on demand — never
-//! preloaded at process start.
+//! preloaded at process start. The budget ledger (`spent + reserved` per
+//! `(namespace, period)`) lives here, not in Redis.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,9 @@ pub use sqlite::SqliteStore;
 /// ADR 0063: opaque namespace `attrs` are capped at 4 KiB (serialized JSON).
 pub const MAX_ATTRS_BYTES: usize = 4 * 1024;
 
+/// Opaque billing-period keys share the namespace id charset and bound.
+pub const MAX_PERIOD_LEN: usize = 128;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceRecord {
     pub id: String,
@@ -31,10 +36,60 @@ pub struct NamespaceRecord {
     pub blocklist: Option<Vec<String>>,
 }
 
+/// One `(namespace, period)` ledger, as GET returns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetRecord {
+    pub namespace: String,
+    pub period: String,
+    pub limit_microdollars: u64,
+    pub spent_microdollars: u64,
+    pub reserved_microdollars: u64,
+    pub remaining_microdollars: u64,
+    pub active: bool,
+}
+
+impl BudgetRecord {
+    fn new(
+        namespace: impl Into<String>,
+        period: impl Into<String>,
+        limit_microdollars: u64,
+        spent_microdollars: u64,
+        reserved_microdollars: u64,
+        active: bool,
+    ) -> Self {
+        Self {
+            namespace: namespace.into(),
+            period: period.into(),
+            limit_microdollars,
+            spent_microdollars,
+            reserved_microdollars,
+            remaining_microdollars: remaining(
+                limit_microdollars,
+                spent_microdollars,
+                reserved_microdollars,
+            ),
+            active,
+        }
+    }
+}
+
+pub fn remaining(limit: u64, spent: u64, reserved: u64) -> u64 {
+    limit.saturating_sub(spent).saturating_sub(reserved)
+}
+
+/// Outcome of a pre-dispatch hold against the namespace's active period.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetReserve {
+    Allowed { period: String },
+    Exceeded,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("namespace `{0}` already exists")]
     Duplicate(String),
+    #[error("namespace `{0}` not found")]
+    NotFound(String),
     #[error("store unavailable: {0}")]
     Unavailable(String),
     #[error("{0}")]
@@ -63,6 +118,97 @@ pub trait Store: Send + Sync {
         &self,
         namespaces: &[crate::config::Namespace],
     ) -> Result<(), StoreError>;
+
+    /// Set the period's limit and mark it as the namespace's active period.
+    /// Never resets spend. A missing namespace is [`StoreError::NotFound`].
+    async fn put_budget(
+        &self,
+        namespace: &str,
+        period: &str,
+        limit_microdollars: u64,
+    ) -> Result<BudgetRecord, StoreError>;
+
+    async fn get_budget(
+        &self,
+        namespace: &str,
+        period: &str,
+    ) -> Result<Option<BudgetRecord>, StoreError>;
+
+    /// Hold `estimate` against the namespace's active period. No budget row
+    /// is [`BudgetReserve::Exceeded`] (fail closed).
+    async fn reserve_budget(
+        &self,
+        namespace: &str,
+        estimate_microdollars: u64,
+        reservation_ttl: Duration,
+        reservation_id: &str,
+    ) -> Result<BudgetReserve, StoreError>;
+
+    /// Charge `actual` and release the hold in one operation. A missing hold
+    /// (expired) still records spend against `period`.
+    async fn settle_budget(
+        &self,
+        namespace: &str,
+        period: &str,
+        reservation_id: &str,
+        actual_microdollars: u64,
+    ) -> Result<(), StoreError>;
+}
+
+#[cfg(test)]
+pub struct UnavailableStore;
+
+#[cfg(test)]
+#[async_trait]
+impl Store for UnavailableStore {
+    async fn put_namespace(&self, _: NamespaceRecord) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn get_namespace(&self, _: &str) -> Result<Option<NamespaceRecord>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn list_namespaces(
+        &self,
+        _: Option<String>,
+        _: u32,
+    ) -> Result<(Vec<NamespaceRecord>, Option<String>), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn update_namespace(
+        &self,
+        _: &str,
+        _: Value,
+        _: Option<Vec<String>>,
+    ) -> Result<Option<NamespaceRecord>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn delete_namespace(&self, _: &str) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    fn seed_namespaces_blocking(
+        &self,
+        _: &[crate::config::Namespace],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn put_budget(&self, _: &str, _: &str, _: u64) -> Result<BudgetRecord, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn get_budget(&self, _: &str, _: &str) -> Result<Option<BudgetRecord>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn reserve_budget(
+        &self,
+        _: &str,
+        _: u64,
+        _: Duration,
+        _: &str,
+    ) -> Result<BudgetReserve, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn settle_budget(&self, _: &str, _: &str, _: &str, _: u64) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
 }
 
 pub async fn open(
@@ -105,9 +251,9 @@ pub async fn seed_config_namespaces(
     namespaces: &[crate::config::Namespace],
 ) -> Result<(), StoreError> {
     for namespace in namespaces {
-        if validate_namespace_id(&namespace.id).is_err() {
-            continue;
-        }
+        validate_namespace_id(&namespace.id)?;
+    }
+    for namespace in namespaces {
         let record = NamespaceRecord {
             id: namespace.id.clone(),
             attrs: serde_json::json!({}),
@@ -138,6 +284,34 @@ pub fn validate_attrs(attrs: &Value) -> Result<(), StoreError> {
         )));
     }
     Ok(())
+}
+
+/// Opaque period: 1–128 characters of `[A-Za-z0-9._-]+`.
+pub fn validate_period(period: &str) -> Result<(), StoreError> {
+    if period.is_empty() || period.len() > MAX_PERIOD_LEN {
+        return Err(StoreError::Invalid(format!(
+            "period must be 1–{MAX_PERIOD_LEN} characters of [A-Za-z0-9._-]"
+        )));
+    }
+    if !period
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(StoreError::Invalid(
+            "period must be 1–128 characters of [A-Za-z0-9._-]".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn sql_amount(value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value).map_err(|_| {
+        StoreError::Invalid("microdollar amount exceeds the store integer range".into())
+    })
+}
+
+pub(crate) fn from_sql_amount(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -223,5 +397,233 @@ mod tests {
             ["c"]
         );
         assert_eq!(next, None);
+    }
+
+    async fn seeded(store: &dyn Store) {
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("namespace");
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_get_budget_and_active_period() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        let rec = store
+            .put_budget("wsp_x", "2026-09", 1_000)
+            .await
+            .expect("put");
+        assert_eq!(rec.limit_microdollars, 1_000);
+        assert_eq!(rec.spent_microdollars, 0);
+        assert_eq!(rec.reserved_microdollars, 0);
+        assert_eq!(rec.remaining_microdollars, 1_000);
+        assert!(rec.active);
+        let got = store
+            .get_budget("wsp_x", "2026-09")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, rec);
+        let missing_ns = store
+            .put_budget("ghost", "2026-09", 1)
+            .await
+            .expect_err("unknown ns");
+        assert!(matches!(missing_ns, StoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_does_not_reset_spend_and_accepts_a_lower_limit() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p1", 10_000).await.expect("put");
+        match store
+            .reserve_budget("wsp_x", 100, Duration::from_secs(30), "r1")
+            .await
+            .expect("reserve")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p1"),
+            other => panic!("expected hold, got {other:?}"),
+        }
+        store
+            .settle_budget("wsp_x", "p1", "r1", 40)
+            .await
+            .expect("settle");
+        let lowered = store.put_budget("wsp_x", "p1", 10).await.expect("lower");
+        assert_eq!(lowered.spent_microdollars, 40);
+        assert_eq!(lowered.limit_microdollars, 10);
+        assert_eq!(lowered.remaining_microdollars, 0);
+        assert!(matches!(
+            store
+                .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
+                .await
+                .expect("over"),
+            BudgetReserve::Exceeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_new_period_switches_admission_and_keeps_old_spend() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "old", 10_000).await.expect("old");
+        store
+            .reserve_budget("wsp_x", 50, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        store
+            .settle_budget("wsp_x", "old", "r1", 50)
+            .await
+            .expect("settle");
+        let neu = store.put_budget("wsp_x", "new", 10_000).await.expect("new");
+        assert!(neu.active);
+        assert_eq!(neu.spent_microdollars, 0);
+        let old = store
+            .get_budget("wsp_x", "old")
+            .await
+            .expect("get old")
+            .expect("row");
+        assert!(!old.active);
+        assert_eq!(old.spent_microdollars, 50);
+        match store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
+            .await
+            .expect("new period")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "new"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_no_budget_row_is_exceeded() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        assert!(matches!(
+            store
+                .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r")
+                .await
+                .expect("closed"),
+            BudgetReserve::Exceeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_in_flight_hold_counts_and_settle_is_one_operation() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 100).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 60, Duration::from_secs(30), "r1")
+            .await
+            .expect("first");
+        let held = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(held.reserved_microdollars, 60);
+        assert_eq!(held.remaining_microdollars, 40);
+        assert!(matches!(
+            store
+                .reserve_budget("wsp_x", 50, Duration::from_secs(30), "r2")
+                .await
+                .expect("second"),
+            BudgetReserve::Exceeded
+        ));
+        store
+            .settle_budget("wsp_x", "p", "r1", 25)
+            .await
+            .expect("settle");
+        let after = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(after.spent_microdollars, 25);
+        assert_eq!(after.reserved_microdollars, 0);
+        assert_eq!(after.remaining_microdollars, 75);
+    }
+
+    #[tokio::test]
+    async fn sqlite_expired_hold_does_not_block_and_later_settle_still_charges() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 100).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 80, Duration::from_millis(1), "r1")
+            .await
+            .expect("hold");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        match store
+            .reserve_budget("wsp_x", 80, Duration::from_secs(30), "r2")
+            .await
+            .expect("after expiry")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget("wsp_x", "p", "r1", 11)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 11);
+        assert_eq!(got.reserved_microdollars, 80);
+    }
+
+    #[tokio::test]
+    async fn postgres_two_connections_cannot_both_reserve_the_last_dollar() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let ns = format!(
+            "wsp_race_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let a = PostgresStore::connect(&dsn, true).await.expect("connect a");
+        let b = PostgresStore::connect(&dsn, true).await.expect("connect b");
+        a.put_namespace(NamespaceRecord {
+            id: ns.clone(),
+            attrs: serde_json::json!({}),
+            blocklist: None,
+        })
+        .await
+        .expect("ns");
+        a.put_budget(&ns, "p", 1).await.expect("budget");
+        let first = tokio::spawn({
+            let ns = ns.clone();
+            async move { a.reserve_budget(&ns, 1, Duration::from_secs(30), "a").await }
+        });
+        let second = tokio::spawn({
+            let ns = ns.clone();
+            async move { b.reserve_budget(&ns, 1, Duration::from_secs(30), "b").await }
+        });
+        let results = [first.await.expect("join a"), second.await.expect("join b")];
+        let allowed = results
+            .iter()
+            .filter(|r| matches!(r, Ok(BudgetReserve::Allowed { .. })))
+            .count();
+        let exceeded = results
+            .iter()
+            .filter(|r| matches!(r, Ok(BudgetReserve::Exceeded)))
+            .count();
+        assert_eq!(
+            (allowed, exceeded),
+            (1, 1),
+            "exactly one replica may take the last dollar: {results:?}"
+        );
     }
 }
