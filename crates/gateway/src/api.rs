@@ -348,6 +348,7 @@ async fn put_namespace(
     responses(
         (status = 204, description = "Deleted, or already absent"),
         (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 409, description = "`namespace_conflict` when `{ns}` is still in the deployment file", body = ErrorEnvelope),
         (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
     )
 )]
@@ -355,6 +356,15 @@ async fn delete_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
 ) -> Result<StatusCode, GatewayError> {
+    if state
+        .config()
+        .config
+        .namespace
+        .iter()
+        .any(|namespace| namespace.id == ns)
+    {
+        return Err(GatewayError::NamespaceConflict);
+    }
     match store(&state)?.delete_namespace(&ns).await {
         Ok(_) => Ok(StatusCode::NO_CONTENT),
         Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),

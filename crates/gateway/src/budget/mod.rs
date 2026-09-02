@@ -92,9 +92,10 @@ impl Reservation {
         }
     }
 
-    /// A process-unique id. A stale hold is reclaimed by its own expiry rather
-    /// than by id collision, so a monotonic counter with the process's start
-    /// time is enough — and, unlike a UUID, needs no dependency.
+    /// Process-unique among holds on this replica: pid + boot micros + counter.
+    /// A stale hold is reclaimed by expiry rather than by id collision. Cross-
+    /// replica collision is still possible in the same microsecond; settlement
+    /// is keyed only by this id, so replicas should not share a clock+pid pair.
     pub(crate) fn next_id() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         static EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -104,7 +105,11 @@ impl Reservation {
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or_default()
         });
-        format!("{epoch:x}-{:x}", COUNTER.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "{:x}-{epoch:x}-{:x}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
     }
 }
 
