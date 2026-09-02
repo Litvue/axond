@@ -22,7 +22,7 @@ from pathlib import Path
 REQUIRED_METHODS = {
     "/api/v1/openapi.json": {"get"},
     "/api/v1/namespaces": {"get", "post"},
-    "/api/v1/namespaces/{ns}": {"get", "put"},
+    "/api/v1/namespaces/{ns}": {"get", "put", "delete"},
     "/api/v1/namespaces/{ns}/budgets/{period}": {"get", "put"},
     "/api/v1/namespaces/{ns}/usage": {"get"},
 }
@@ -61,10 +61,6 @@ def check(spec: dict) -> list[str]:
         for forbidden in FORBIDDEN_SUBSTRINGS:
             if forbidden in path:
                 failures.append(f"unmounted discovery path claimed: {path}")
-
-    ns = paths.get("/api/v1/namespaces/{ns}")
-    if isinstance(ns, dict) and "delete" in ns:
-        failures.append("DELETE /api/v1/namespaces/{ns} is not mounted in this slice")
 
     usage = paths.get("/api/v1/namespaces/{ns}/usage", {}).get("get", {})
     params = usage.get("parameters") if isinstance(usage, dict) else None
@@ -113,14 +109,19 @@ def self_test() -> int:
 
     bad = json.loads(json.dumps(good))
     bad["openapi"] = "3.0.3"
-    bad["paths"]["/api/v1/namespaces/{ns}"]["delete"] = {}
     bad["paths"]["/api/v1/providers/models"] = {"get": {}}
     del bad["components"]["securitySchemes"]["gateway_key"]
     found = check(bad)
     assert any("3.1" in f for f in found), found
-    assert any("DELETE" in f for f in found), found
     assert any("discovery" in f for f in found), found
     assert any("gateway_key" in f for f in found), found
+
+    missing_delete = json.loads(json.dumps(good))
+    del missing_delete["paths"]["/api/v1/namespaces/{ns}"]["delete"]
+    found = check(missing_delete)
+    assert any(
+        "missing DELETE" in f and "/api/v1/namespaces/{ns}" in f for f in found
+    ), found
 
     extra_path = json.loads(json.dumps(good))
     extra_path["paths"]["/api/v1/extra"] = {"get": {}}
