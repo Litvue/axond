@@ -560,7 +560,7 @@ impl UsageDelivery {
                 }
             }
         } else if tokio::runtime::Handle::try_current().is_ok() {
-            let _ = tokio::spawn(async_usage_index_worker(store, rx, stop));
+            drop(tokio::spawn(async_usage_index_worker(store, rx, stop)));
         } else {
             tracing::error!("store usage-index worker needs a tokio runtime");
             return;

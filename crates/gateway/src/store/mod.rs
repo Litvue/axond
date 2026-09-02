@@ -1094,6 +1094,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_put_namespace_inserts_incarnation_one() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        let store = PostgresStore::connect(&scoped, true)
+            .await
+            .expect("connect");
+        let ns = unique_ns("wsp_inc");
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("put");
+        let n: i64 = setup
+            .query_one(
+                "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
+                &[&ns],
+            )
+            .await
+            .expect("row")
+            .get(0);
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_delete_missing_incarnation_row_isolates_late_settle() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        let store = PostgresStore::connect(&scoped, true)
+            .await
+            .expect("connect");
+        let ns = unique_ns("wsp_legacy_inc");
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("put");
+        store.put_budget(&ns, "p", 10_000).await.expect("budget");
+        setup
+            .execute(
+                "DELETE FROM axond_namespace_incarnation WHERE id = $1",
+                &[&ns],
+            )
+            .await
+            .expect("drop companion");
+        store
+            .reserve_budget(&ns, 77, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace(&ns).await.expect("delete"));
+        let n: i64 = setup
+            .query_one(
+                "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
+                &[&ns],
+            )
+            .await
+            .expect("bumped")
+            .get(0);
+        assert_eq!(
+            n, 2,
+            "delete must create n=2 when the companion was missing"
+        );
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        let n: i64 = setup
+            .query_one(
+                "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
+                &[&ns],
+            )
+            .await
+            .expect("kept")
+            .get(0);
+        assert_eq!(n, 2, "recreate must not reset incarnation");
+        let rec = store
+            .put_budget(&ns, "p", 10_000)
+            .await
+            .expect("new ledger");
+        assert_eq!(rec.spent_microdollars, 0);
+        store
+            .settle_budget(&ns, "p", "r1", 77)
+            .await
+            .expect("late settle");
+        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 0);
+    }
+
+    #[tokio::test]
     async fn postgres_delete_recreate_expires_any_incarnation_hold() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
@@ -1170,7 +1273,9 @@ mod tests {
             return;
         };
         let (a, ns) = postgres_seeded(&dsn).await;
-        let b = PostgresStore::connect(&dsn, true).await.expect("second client");
+        let b = PostgresStore::connect(&dsn, true)
+            .await
+            .expect("second client");
         a.put_budget(&ns, "p", 10_000).await.expect("put");
         let rid = format!("once_{ns}");
         match a
@@ -1206,13 +1311,10 @@ mod tests {
                 attrs: serde_json::json!({}),
                 blocklist: None,
             };
-            let (deleted, created) = tokio::join!(
-                a.delete_namespace(&ns),
-                async {
-                    b.put_namespace(rec.clone()).await?;
-                    b.put_budget(&ns, "p", 10_000).await
-                }
-            );
+            let (deleted, created) = tokio::join!(a.delete_namespace(&ns), async {
+                b.put_namespace(rec.clone()).await?;
+                b.put_budget(&ns, "p", 10_000).await
+            });
             deleted.expect("delete");
             match created {
                 Ok(_) | Err(StoreError::NotFound(_)) => {}
@@ -2010,8 +2112,8 @@ mod tests {
     }
 
     /// `create_table = false` probes incarnation objects; it must not CREATE
-    /// them. Additive `incarnation` on an existing reservation table is
-    /// recovered so a draft rename cannot drop the column.
+    /// them or ALTER the reservation table. Additive `incarnation` is only
+    /// recovered after a draft rename (or `create_table = true`).
     #[tokio::test]
     async fn postgres_create_table_false_does_not_apply_incarnation_ddl() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
@@ -2076,8 +2178,8 @@ mod tests {
             .expect("col")
             .get(0);
         assert!(
-            column,
-            "create_table=false still ADD COLUMN incarnation on an existing reservation table"
+            !column,
+            "create_table=false must not ADD COLUMN incarnation without a draft rename"
         );
         let tombstone: bool = setup
             .query_one(
