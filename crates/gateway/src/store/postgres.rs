@@ -226,16 +226,26 @@ const DRAFT_STORE_BUDGET_RESERVATION_IDX: &str = "axond_budget_reservation_scope
 /// Then `ADD COLUMN IF NOT EXISTS incarnation` on the reservation table so a
 /// draft rename cannot drop it (`create_table = false` included).
 async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result<(), StoreError> {
-    if draft_store_budget_present(client).await? && should_rename_draft(client).await? {
+    let renamed = if draft_store_budget_present(client).await?
+        && should_rename_draft(client).await?
+    {
         rename_draft_store_budget(client).await?;
-    }
+        true
+    } else {
+        false
+    };
     if create_table {
         client
             .batch_execute(BUDGET_DDL)
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     }
-    ensure_reservation_incarnation(client).await?;
+    // Additive ALTER only when we created tables or just renamed draft
+    // relations that predate incarnation. create_table=false otherwise
+    // only probes.
+    if create_table || renamed {
+        ensure_reservation_incarnation(client).await?;
+    }
     Ok(())
 }
 
@@ -558,6 +568,7 @@ impl Store for PostgresStore {
                 .transaction()
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            lock_namespace_id(&tx, &ns.id).await?;
             match tx
                 .execute(
                     "INSERT INTO axond_namespace (id, attrs, blocklist) VALUES ($1, $2, $3)",
@@ -566,13 +577,6 @@ impl Store for PostgresStore {
                 .await
             {
                 Ok(_) => {
-                    tx.execute(
-                        "INSERT INTO axond_namespace_incarnation (id, n) VALUES ($1, 1)
-                         ON CONFLICT (id) DO NOTHING",
-                        &[&ns.id],
-                    )
-                    .await
-                    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
                     tx.commit()
                         .await
                         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -854,16 +858,28 @@ impl Store for PostgresStore {
     }
 }
 
-/// Namespace row, then active, then spend: PUT and reserve/settle take the
-/// same locks in this order, so a concurrent delete cannot deadlock them.
+/// Incarnation row first (exists even when the namespace does not), then
+/// budget, then the namespace row. CREATE/DELETE/PUT budget share this lock
+/// so a missing-id DELETE cannot race a concurrent create.
+async fn lock_namespace_id(tx: &Transaction<'_>, id: &str) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO axond_namespace_incarnation (id, n) VALUES ($1, 1)
+         ON CONFLICT (id) DO NOTHING",
+        &[&id],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    tx.query_one(
+        "SELECT n FROM axond_namespace_incarnation WHERE id = $1 FOR UPDATE",
+        &[&id],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    Ok(())
+}
+
 async fn delete_namespace_tx(tx: &Transaction<'_>, id: &str) -> Result<bool, StoreError> {
-    let ns_row = tx
-        .query_opt(
-            "SELECT id FROM axond_namespace WHERE id = $1 FOR UPDATE",
-            &[&id],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    lock_namespace_id(tx, id).await?;
     let _ = tx
         .query_opt(
             "SELECT period FROM axond_store_budget_active WHERE namespace = $1 FOR UPDATE",
@@ -879,16 +895,6 @@ async fn delete_namespace_tx(tx: &Transaction<'_>, id: &str) -> Result<bool, Sto
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    let existed = ns_row.is_some();
-    if existed {
-        tx.execute(
-            "INSERT INTO axond_namespace_incarnation (id, n) VALUES ($1, 2)
-             ON CONFLICT (id) DO UPDATE SET n = axond_namespace_incarnation.n + 1",
-            &[&id],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    }
     tx.execute(
         "DELETE FROM axond_store_budget WHERE namespace = $1",
         &[&id],
@@ -905,6 +911,14 @@ async fn delete_namespace_tx(tx: &Transaction<'_>, id: &str) -> Result<bool, Sto
         .execute("DELETE FROM axond_namespace WHERE id = $1", &[&id])
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    if n > 0 {
+        tx.execute(
+            "UPDATE axond_namespace_incarnation SET n = n + 1 WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    }
     Ok(n > 0)
 }
 
@@ -915,6 +929,7 @@ async fn put_budget_tx(
     period: &str,
     limit: i64,
 ) -> Result<BudgetRecord, StoreError> {
+    lock_namespace_id(tx, namespace).await?;
     let exists = tx
         .query_opt(
             "SELECT 1 FROM axond_namespace WHERE id = $1 FOR UPDATE",

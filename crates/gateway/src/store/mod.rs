@@ -1174,6 +1174,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_delete_and_create_cannot_orphan_a_budget() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let a = PostgresStore::connect(&dsn, true).await.expect("a");
+        let b = PostgresStore::connect(&dsn, true).await.expect("b");
+        for _ in 0..8 {
+            let ns = unique_ns("race");
+            let rec = NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            };
+            let (deleted, created) = tokio::join!(
+                a.delete_namespace(&ns),
+                async {
+                    b.put_namespace(rec.clone()).await?;
+                    b.put_budget(&ns, "p", 10_000).await
+                }
+            );
+            deleted.expect("delete");
+            match created {
+                Ok(_) | Err(StoreError::NotFound(_)) => {}
+                Err(error) => panic!("{error}"),
+            }
+            let ns_row = a.get_namespace(&ns).await.expect("get ns");
+            let budget = a.get_budget(&ns, "p").await.expect("get budget");
+            if ns_row.is_none() {
+                assert!(budget.is_none(), "orphaned budget for {ns}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn postgres_reconnects_after_a_dropped_connection() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
