@@ -26,6 +26,7 @@ mod postgres;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -473,10 +474,18 @@ pub struct UsageDelivery {
     /// Management-API index. Attached after the Store opens so `GET .../usage`
     /// can summarize rows the request path already recorded.
     store: std::sync::OnceLock<Arc<dyn crate::store::Store>>,
+    /// Bounded queue into the usage-index worker. `append_store` only
+    /// `try_send`s; a full queue drops the event rather than spawning work.
+    index_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<crate::store::UsageAppend>>,
+    /// Set on drop so the worker abandons queued items after the in-flight write.
+    index_stop: Arc<AtomicBool>,
     /// Test-only witness for [`UsageDelivery::count_unheard_refusal`]: the loss
     /// counter it moves is a global instrument no test can read back.
     #[cfg(test)]
     unheard: std::sync::atomic::AtomicU64,
+    /// Test-only: events `try_send` rejected because the index worker was full.
+    #[cfg(test)]
+    index_timeouts: std::sync::atomic::AtomicU64,
 }
 
 /// A usage event that could not be made durable, and the request that must now
@@ -491,9 +500,10 @@ pub struct NotDurable {
 }
 
 impl UsageDelivery {
-    /// Bound on the detached Store index write. The inference verdict must not
-    /// wait on this secondary index, and shutdown must not join it.
+    /// Bound on one Postgres (cancellable) index write inside the worker.
     const STORE_INDEX_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Queued index events before `append_store` drops rather than blocking.
+    const STORE_INDEX_QUEUE: usize = 256;
 
     /// Telemetry-grade: best effort, non-blocking, lossy under overload.
     pub fn telemetry(fanout: UsageFanout) -> Self {
@@ -502,8 +512,12 @@ impl UsageDelivery {
             journal: None,
             on_undurable: UndurablePolicy::Serve,
             store: std::sync::OnceLock::new(),
+            index_tx: std::sync::OnceLock::new(),
+            index_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            index_timeouts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -515,23 +529,53 @@ impl UsageDelivery {
             journal: Some(journal),
             on_undurable,
             store: std::sync::OnceLock::new(),
+            index_tx: std::sync::OnceLock::new(),
+            index_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            index_timeouts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Index usage for `GET /api/v1/namespaces/{ns}/usage`. Idempotent.
     pub fn attach_store(&self, store: Arc<dyn crate::store::Store>) {
-        let _ = self.store.set(store);
+        if self.store.set(Arc::clone(&store)).is_err() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(Self::STORE_INDEX_QUEUE);
+        let stop = Arc::clone(&self.index_stop);
+        if store.blocking_usage_index() {
+            match std::thread::Builder::new()
+                .name("axond-usage-index".into())
+                .spawn(move || sqlite_usage_index_worker(store, rx, stop))
+            {
+                Ok(handle) => drop(handle),
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "store usage-index worker failed to start"
+                    );
+                    return;
+                }
+            }
+        } else if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = tokio::spawn(async_usage_index_worker(store, rx, stop));
+        } else {
+            tracing::error!("store usage-index worker needs a tokio runtime");
+            return;
+        }
+        let _ = self.index_tx.set(tx);
     }
 
-    /// Best-effort management-index append. Fire-and-forget: a slow Store must
-    /// not stall inference, and a successful journal append must not wait here.
-    /// Idempotency is the Store's `request_id` primary key.
+    /// Best-effort management-index append. Fire-and-forget: `try_send` onto
+    /// one worker, never `spawn_blocking` per record. A successful journal
+    /// append must not wait here. Idempotency is the Store's `request_id`
+    /// primary key.
     fn append_store(&self, record: &UsageRecord) {
-        let Some(store) = self.store.get().cloned() else {
+        if self.store.get().is_none() {
             return;
-        };
+        }
         let request_id = record.request_id.clone();
         let event = crate::store::UsageAppend {
             request_id: request_id.clone(),
@@ -541,30 +585,34 @@ impl UsageDelivery {
             status: record.status.as_str().to_owned(),
             cost_microdollars: record.cost_microdollars,
         };
-        let _ = tokio::spawn(async move {
-            let outcome =
-                match tokio::time::timeout(Self::STORE_INDEX_TIMEOUT, store.append_usage(event))
-                    .await
-                {
-                    Ok(Ok(())) => "accepted",
-                    Ok(Err(error)) => {
-                        tracing::error!(
-                            request_id = %request_id,
-                            error = %error,
-                            "store usage append failed"
-                        );
-                        "failed"
-                    }
-                    Err(_) => {
-                        tracing::error!(
-                            request_id = %request_id,
-                            "store usage append timed out"
-                        );
-                        "timeout"
-                    }
-                };
-            crate::telemetry::metrics::record_usage_index_append(outcome);
-        });
+        let Some(tx) = self.index_tx.get() else {
+            tracing::error!(
+                request_id = %request_id,
+                "store usage append failed"
+            );
+            crate::telemetry::metrics::record_usage_index_append("failed");
+            return;
+        };
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::error!(
+                    request_id = %request_id,
+                    "store usage append timed out"
+                );
+                crate::telemetry::metrics::record_usage_index_append("timeout");
+                #[cfg(test)]
+                self.index_timeouts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!(
+                    request_id = %request_id,
+                    "store usage append failed"
+                );
+                crate::telemetry::metrics::record_usage_index_append("failed");
+            }
+        }
     }
 
     pub fn mode(&self) -> DeliveryMode {
@@ -694,6 +742,13 @@ impl UsageDelivery {
         self.unheard.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many index events were dropped because the worker queue was full.
+    #[cfg(test)]
+    pub fn index_timeouts(&self) -> u64 {
+        self.index_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Record where the caller has no way to refuse: a stream that has already
     /// been relayed, or a cancellation. The event is still appended durably
     /// first; what changes is that a failure can only be reported, so it is
@@ -716,10 +771,78 @@ impl UsageDelivery {
 
     /// Flush what is buffered. Telemetry-grade only: a journal's backlog is
     /// durable, so it is drained by the worker's own bounded shutdown rather
-    /// than flushed here. In-flight Store index writes are best-effort and are
-    /// not joined; they time out on their own or drop with the runtime.
+    /// than flushed here. The usage-index worker is best-effort: drop the
+    /// sender and do not join it.
     pub async fn flush(&self, budget: Duration) -> FlushReport {
         self.fanout.flush(budget).await
+    }
+}
+
+impl Drop for UsageDelivery {
+    fn drop(&mut self) {
+        self.index_stop.store(true, Ordering::Release);
+    }
+}
+
+fn sqlite_usage_index_worker(
+    store: Arc<dyn crate::store::Store>,
+    mut rx: tokio::sync::mpsc::Receiver<crate::store::UsageAppend>,
+    stop: Arc<AtomicBool>,
+) {
+    while let Some(event) = rx.blocking_recv() {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let request_id = event.request_id.clone();
+        let outcome = match store.append_usage_sync(event) {
+            Ok(()) => "accepted",
+            Err(error) => {
+                tracing::error!(
+                    request_id = %request_id,
+                    error = %error,
+                    "store usage append failed"
+                );
+                "failed"
+            }
+        };
+        crate::telemetry::metrics::record_usage_index_append(outcome);
+    }
+}
+
+async fn async_usage_index_worker(
+    store: Arc<dyn crate::store::Store>,
+    mut rx: tokio::sync::mpsc::Receiver<crate::store::UsageAppend>,
+    stop: Arc<AtomicBool>,
+) {
+    while let Some(event) = rx.recv().await {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let request_id = event.request_id.clone();
+        let outcome = match tokio::time::timeout(
+            UsageDelivery::STORE_INDEX_TIMEOUT,
+            store.append_usage(event),
+        )
+        .await
+        {
+            Ok(Ok(())) => "accepted",
+            Ok(Err(error)) => {
+                tracing::error!(
+                    request_id = %request_id,
+                    error = %error,
+                    "store usage append failed"
+                );
+                "failed"
+            }
+            Err(_) => {
+                tracing::error!(
+                    request_id = %request_id,
+                    "store usage append timed out"
+                );
+                "timeout"
+            }
+        };
+        crate::telemetry::metrics::record_usage_index_append(outcome);
     }
 }
 
@@ -910,6 +1033,7 @@ pub async fn build_sinks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
 
     /// A record with every field filled, for sink tests.
     pub(super) fn sample_record() -> UsageRecord {
@@ -1065,6 +1189,107 @@ mod tests {
         }
     }
 
+    /// Blocking usage-index store whose first sync write waits until `release`
+    /// is dropped, so the queue can be filled without the worker draining it.
+    struct ParkingIndexStore {
+        entered: Arc<std::sync::Barrier>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl crate::store::Store for ParkingIndexStore {
+        async fn put_namespace(
+            &self,
+            _: crate::store::NamespaceRecord,
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
+        async fn get_namespace(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::store::NamespaceRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn list_namespaces(
+            &self,
+            _: Option<String>,
+            _: u32,
+        ) -> Result<(Vec<crate::store::NamespaceRecord>, Option<String>), crate::store::StoreError>
+        {
+            Ok((Vec::new(), None))
+        }
+        async fn update_namespace(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: Option<Vec<String>>,
+        ) -> Result<Option<crate::store::NamespaceRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn delete_namespace(&self, _: &str) -> Result<bool, crate::store::StoreError> {
+            Ok(false)
+        }
+        async fn put_budget(
+            &self,
+            _: &str,
+            _: &str,
+            _: u64,
+        ) -> Result<crate::store::BudgetRecord, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable("unused".into()))
+        }
+        async fn get_budget(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<crate::store::BudgetRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn reserve_budget(
+            &self,
+            _: &str,
+            _: u64,
+            _: Duration,
+            _: &str,
+        ) -> Result<crate::store::BudgetReserve, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable("unused".into()))
+        }
+        async fn settle_budget(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u64,
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
+        async fn append_usage(
+            &self,
+            _: crate::store::UsageAppend,
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
+        fn blocking_usage_index(&self) -> bool {
+            true
+        }
+        fn append_usage_sync(
+            &self,
+            _: crate::store::UsageAppend,
+        ) -> Result<(), crate::store::StoreError> {
+            if let Some(rx) = self.release.lock().expect("release mutex").take() {
+                self.entered.wait();
+                let _ = rx.recv();
+            }
+            Ok(())
+        }
+        async fn summarize_usage(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<crate::store::UsageSummaryRow>, crate::store::StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
     #[tokio::test]
     async fn telemetry_grade_delivery_cannot_refuse_a_request() {
         let delivery = UsageDelivery::telemetry(UsageFanout::new(vec![Box::new(StdoutSink)]));
@@ -1102,6 +1327,80 @@ mod tests {
             started.elapsed() < Duration::from_millis(200),
             "a successful journal append must not wait on the secondary index"
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_index_worker_lands_a_row_without_blocking_record() {
+        let store = Arc::new(crate::store::SqliteStore::open(":memory:").expect("sqlite"));
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::clone(&store) as Arc<dyn crate::store::Store>);
+        let record = sample_record();
+        let started = Instant::now();
+        delivery
+            .record(&record)
+            .await
+            .expect("telemetry-grade delivery is infallible");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "index writes must not stall the inference verdict"
+        );
+        let period = record.period.as_deref().expect("period");
+        let mut rows = Vec::new();
+        for _ in 0..50 {
+            rows = store
+                .summarize_usage(&record.namespace, period)
+                .await
+                .expect("summarize");
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            rows,
+            vec![crate::store::UsageSummaryRow {
+                model: record.model,
+                status: record.status.as_str().to_owned(),
+                count: 1,
+                cost_microdollars: record.cost_microdollars.unwrap_or(0),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_sqlite_index_queue_drops_without_blocking_record() {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::new(ParkingIndexStore {
+            entered: Arc::clone(&entered),
+            release: std::sync::Mutex::new(Some(release_rx)),
+        }));
+        delivery
+            .record(&sample_record())
+            .await
+            .expect("first event is dequeued");
+        entered.wait();
+        let started = Instant::now();
+        for _ in 0..UsageDelivery::STORE_INDEX_QUEUE {
+            delivery
+                .record(&sample_record())
+                .await
+                .expect("queued or dropped");
+        }
+        delivery
+            .record(&sample_record())
+            .await
+            .expect("overflow is dropped, not awaited");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "a full index queue must not stall the inference verdict"
+        );
+        assert!(
+            delivery.index_timeouts() >= 1,
+            "a full index queue counts timeout"
+        );
+        drop(release_tx);
     }
 
     #[tokio::test]
