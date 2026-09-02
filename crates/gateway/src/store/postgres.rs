@@ -858,23 +858,13 @@ impl Store for PostgresStore {
     }
 }
 
-/// Incarnation row first (exists even when the namespace does not), then
-/// budget, then the namespace row. CREATE/DELETE/PUT budget share this lock
-/// so a missing-id DELETE cannot race a concurrent create.
+/// Transaction-scoped advisory lock on the namespace id. Shared by CREATE,
+/// DELETE, PUT budget, and settle so those paths cannot deadlock or orphan
+/// ledgers. Does not insert an incarnation row for a missing id.
 async fn lock_namespace_id(tx: &Transaction<'_>, id: &str) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO axond_namespace_incarnation (id, n) VALUES ($1, 1)
-         ON CONFLICT (id) DO NOTHING",
-        &[&id],
-    )
-    .await
-    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    tx.query_one(
-        "SELECT n FROM axond_namespace_incarnation WHERE id = $1 FOR UPDATE",
-        &[&id],
-    )
-    .await
-    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", &[&id])
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     Ok(())
 }
 
@@ -969,6 +959,7 @@ async fn settle_tx(
     reservation_id: &str,
     actual: i64,
 ) -> Result<(), StoreError> {
+    lock_namespace_id(tx, namespace).await?;
     let ns_exists = tx
         .query_opt(
             "SELECT id FROM axond_namespace WHERE id = $1 FOR UPDATE",
