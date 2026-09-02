@@ -233,25 +233,15 @@ async fn stale_if_source_changed(state: &AppState, provider: &str, base_url: &st
     let Some(store) = state.store() else {
         return;
     };
-    match store.get_provider_models(provider).await {
-        Ok(Some(mut row)) if row.source.as_deref() != Some(base_url) => {
-            row.stale = true;
-            if let Err(error) = store.put_provider_models(row).await {
-                tracing::warn!(
-                    provider,
-                    error = %error,
-                    "could not persist stale provider model cache"
-                );
-            }
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(
-                provider,
-                error = %error,
-                "could not read provider model cache"
-            );
-        }
+    if let Err(error) = store
+        .mark_provider_models_stale_unless_source(provider, base_url)
+        .await
+    {
+        tracing::warn!(
+            provider,
+            error = %error,
+            "could not persist stale provider model cache"
+        );
     }
 }
 

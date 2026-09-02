@@ -754,7 +754,10 @@ id = "openai-b"
             .load(Ordering::SeqCst);
         let leases = creds.discovery_leases(&cfg, "openai");
         assert_eq!(
-            leases.iter().map(|lease| lease.id.as_str()).collect::<Vec<_>>(),
+            leases
+                .iter()
+                .map(|lease| lease.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["openai-a", "openai-b"]
         );
         let after = creds
