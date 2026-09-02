@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::backends::health::BackendHealth;
 use crate::config::{StorageBackend, StorageConfig};
 use crate::namespace::NamespaceId;
 
@@ -153,6 +154,11 @@ pub trait Store: Send + Sync {
         reservation_id: &str,
         actual_microdollars: u64,
     ) -> Result<(), StoreError>;
+
+    /// Reachability for the status refresher. SQLite has none; Postgres does.
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -790,5 +796,40 @@ mod tests {
             matches!(err, StoreError::Unavailable(ref message) if message.contains("schema missing")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_reserve_expires_holds_from_old_periods() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "old", 10_000).await.expect("old");
+        store
+            .reserve_budget(&ns, 10, Duration::from_millis(1), "stale")
+            .await
+            .expect("stale");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store.put_budget(&ns, "new", 10_000).await.expect("new");
+        store
+            .reserve_budget(&ns, 1, Duration::from_secs(30), "live")
+            .await
+            .expect("live");
+        assert_eq!(
+            store.reservation_count(&ns).await.expect("count"),
+            1,
+            "expired holds from the old period must be reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_store_exposes_health_sqlite_does_not() {
+        let sqlite = SqliteStore::open(":memory:").expect("sqlite");
+        assert!(sqlite.health().is_none());
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let store = PostgresStore::connect(&dsn, true).await.expect("connect");
+        assert!(store.health().is_some());
     }
 }

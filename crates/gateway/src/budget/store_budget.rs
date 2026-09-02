@@ -10,6 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::{Admission, BudgetKey, BudgetStore, Denial, Reservation, UnavailablePolicy};
+use crate::backends::health::BackendHealth;
 use crate::config::StoreUnavailable;
 use crate::store::{BudgetReserve, Store, StoreError};
 
@@ -28,7 +29,7 @@ impl StoreBudget {
         Self {
             store,
             unavailable: unavailable.into(),
-            reservation_ttl: reservation_ttl.max(Duration::from_secs(1)),
+            reservation_ttl,
         }
     }
 
@@ -41,6 +42,10 @@ impl StoreBudget {
 impl BudgetStore for StoreBudget {
     fn name(&self) -> &'static str {
         "store"
+    }
+
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        self.store.health()
     }
 
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {
@@ -62,6 +67,7 @@ impl BudgetStore for StoreBudget {
                 period: Some(period),
             }),
             Ok(BudgetReserve::Exceeded) => Admission::Denied(Denial::Exceeded),
+            Err(StoreError::Invalid(_)) => Admission::Denied(Denial::Exceeded),
             Err(error) => self.on_unavailable(&error),
         }
     }
@@ -112,6 +118,31 @@ mod tests {
             budget.reserve(&key(), 1).await,
             Admission::Denied(Denial::StoreUnavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn oversized_estimate_is_exceeded_even_when_unavailable_is_allow() {
+        let sqlite = crate::store::SqliteStore::open(":memory:").expect("sqlite");
+        sqlite
+            .put_namespace(crate::store::NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        sqlite.put_budget("wsp_x", "p", 100).await.expect("budget");
+        let store: Arc<dyn Store> = Arc::new(sqlite);
+        for stance in [StoreUnavailable::Allow, StoreUnavailable::Deny] {
+            let budget = StoreBudget::new(Arc::clone(&store), stance, Duration::from_secs(30));
+            assert!(
+                matches!(
+                    budget.reserve(&key(), u64::MAX).await,
+                    Admission::Denied(Denial::Exceeded)
+                ),
+                "{stance:?}"
+            );
+        }
     }
 
     #[tokio::test]
