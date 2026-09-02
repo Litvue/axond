@@ -117,6 +117,7 @@ impl Default for TransportLimits {
 pub fn build_client(limits: &TransportLimits) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(limits.connect_timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 

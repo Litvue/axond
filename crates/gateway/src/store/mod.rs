@@ -306,6 +306,17 @@ pub trait Store: Send + Sync {
         let _ = (provider, source);
         Ok(())
     }
+
+    /// Set `stale = true` only when the cached `source` still equals `source`.
+    /// A concurrent listing with a different URL is left untouched.
+    async fn mark_provider_models_stale_if_source(
+        &self,
+        provider: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let _ = (provider, source);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +389,13 @@ impl Store for UnavailableStore {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn mark_provider_models_stale_unless_source(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn mark_provider_models_stale_if_source(
         &self,
         _: &str,
         _: &str,
