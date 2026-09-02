@@ -8,9 +8,12 @@
 --
 -- Delete bumps `n` and keeps reservation rows so a late settle cannot
 -- charge a later generation of the same id. Expired holds become a
--- compact (id, incarnation) tombstone for the same reason.
--- `create_table = false` only probes these objects and the reservation
--- `incarnation` column; it does not CREATE or ALTER.
+-- compact (id, incarnation, expires_at) tombstone for the same reason.
+-- Reserve vacuums tombstones with expires_at < now(); a later settle of
+-- an unknown id is a no-op.
+-- `create_table = false` probes these objects. Connect still
+-- `ADD COLUMN IF NOT EXISTS incarnation` on the reservation table after
+-- a draft rename (no-op if present); it does not CREATE tables.
 
 CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (
     id text PRIMARY KEY NOT NULL,
@@ -22,5 +25,6 @@ ALTER TABLE axond_store_budget_reservation
 
 CREATE TABLE IF NOT EXISTS axond_store_budget_reservation_tombstone (
     id          text PRIMARY KEY NOT NULL,
-    incarnation bigint NOT NULL
+    incarnation bigint NOT NULL,
+    expires_at  timestamptz NOT NULL
 );
