@@ -2040,6 +2040,19 @@ impl AppState {
     /// Publish a new snapshot. In-flight requests keep the snapshot they already
     /// hold; every request that starts after this call sees the new one.
     pub fn publish(&self, snapshot: ConfigSnapshot) {
+        let store = Arc::clone(&self.0.store);
+        let namespaces = snapshot.config.namespace.clone();
+        let seed = crate::store::seed_config_namespaces(store.as_ref(), &namespaces);
+        let seeded = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(seed))
+            }
+            _ => futures::executor::block_on(seed),
+        };
+        if let Err(error) = seeded {
+            tracing::error!(error = %error, "namespace seed on snapshot publish failed");
+            return;
+        }
         self.0.config.store(Arc::new(snapshot));
     }
 

@@ -1039,25 +1039,13 @@ async fn authenticate_middleware(
             .namespace_grant()
             .map_err(|_| GatewayError::NamespaceNotAuthorized)?;
         let authorized = grant.permits(&namespace);
-        let mut record = match state.store() {
+        let record = match state.store() {
             Some(store) => store
                 .get_namespace(namespace.as_str())
                 .await
                 .map_err(GatewayError::from)?,
             None => None,
         };
-        if record.is_none() {
-            // A published snapshot is already serving these ids; seed-on-boot
-            // only inserts bootstrap rows. Projected tenant/project namespaces
-            // are admitted from the snapshot until the store catches up.
-            record = snapshot.config.namespace.iter().find_map(|declared| {
-                (declared.id == namespace.as_str()).then(|| crate::store::NamespaceRecord {
-                    id: declared.id.clone(),
-                    attrs: serde_json::json!({}),
-                    blocklist: None,
-                })
-            });
-        }
         if !authorized {
             debug!(
                 namespace = %namespace,
