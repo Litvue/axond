@@ -34,6 +34,7 @@ mod budget;
 mod config;
 mod convergence;
 mod credentials;
+mod discovery;
 mod desired_state;
 mod error;
 mod key_material;
