@@ -74,26 +74,24 @@ enum RefreshError {
 }
 
 async fn refresh_all(state: &AppState, stop: &mut oneshot::Receiver<()>) -> Round {
-    let providers: Vec<(String, ProviderKind, String)> = {
-        let snapshot = state.config();
-        snapshot
-            .config
-            .provider
-            .iter()
-            .map(|provider| {
-                (
-                    provider.id.clone(),
-                    provider.kind,
-                    provider.base_url.clone(),
-                )
-            })
-            .collect()
-    };
+    let snapshot = state.config();
+    let providers: Vec<(String, ProviderKind, String)> = snapshot
+        .config
+        .provider
+        .iter()
+        .map(|provider| {
+            (
+                provider.id.clone(),
+                provider.kind,
+                provider.base_url.clone(),
+            )
+        })
+        .collect();
     for (id, kind, base_url) in &providers {
         if stopped(stop) {
             return Round::Stopped;
         }
-        if let Err(error) = refresh_one(state, id, *kind, base_url, stop).await {
+        if let Err(error) = refresh_one(state, &snapshot, id, *kind, base_url, stop).await {
             match error {
                 RefreshError::Stopped => return Round::Stopped,
                 RefreshError::Failed(error) => {
@@ -112,6 +110,7 @@ async fn refresh_all(state: &AppState, stop: &mut oneshot::Receiver<()>) -> Roun
 
 async fn refresh_one(
     state: &AppState,
+    snapshot: &std::sync::Arc<crate::state::ConfigSnapshot>,
     provider_id: &str,
     kind: ProviderKind,
     base_url: &str,
@@ -122,7 +121,6 @@ async fn refresh_one(
     }
     stale_if_source_changed(state, provider_id, base_url).await;
 
-    let snapshot = state.config();
     let leases = snapshot
         .credentials
         .discovery_leases(&snapshot.config, provider_id);
@@ -133,7 +131,6 @@ async fn refresh_one(
     if kind == ProviderKind::Anthropic {
         headers.push(("anthropic-version", AnthropicAdapter::VERSION.to_owned()));
     }
-    drop(snapshot);
 
     let mut last_error = None;
     for lease in leases {
@@ -150,6 +147,12 @@ async fn refresh_one(
         };
         match fetch_listing(state, provider_id, &upstream, &headers, stop).await {
             Ok(data) => {
+                let current = state.config();
+                if current.generation != snapshot.generation {
+                    return Err(RefreshError::Failed(
+                        "serving snapshot changed during discovery".into(),
+                    ));
+                }
                 let row = ProviderModels {
                     provider: provider_id.to_owned(),
                     fetched_at: Some(rfc3339_utc(SystemTime::now())),
