@@ -34,8 +34,8 @@ use crate::backends::health::BackendHealth;
 use crate::backends::secrets::SecretMaterial;
 use crate::budget::BudgetStore;
 use crate::config::{
-    CatalogBinding, Config, GatewayVerifierAlgorithm, Namespace, NamespacePolicy,
-    NamespaceStaticPolicy, ProjectIdentity, ProjectedPrincipal, ProviderKind, StorageBackend,
+    Config, GatewayVerifierAlgorithm, Namespace, NamespacePolicy, NamespaceStaticPolicy,
+    ProjectIdentity, ProjectedPrincipal, ProviderKind, StorageBackend,
 };
 use crate::convergence::SystemClock;
 use crate::convergence::secrets::{MaterialLedger, ResolvedSecretBinding, ResolvedSecrets};
@@ -449,6 +449,8 @@ pub(crate) struct CachedProvider {
     pub(crate) id: String,
     pub(crate) kind: String,
     pub(crate) base_url: String,
+    #[serde(default)]
+    pub(crate) unpriced_models: crate::config::UnpricedModels,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -707,29 +709,10 @@ impl ConfigSnapshot {
                     }
                     .to_owned(),
                     base_url: provider.base_url.clone(),
+                    unpriced_models: provider.unpriced_models,
                 })
                 .collect(),
-            models: config
-                .model
-                .iter()
-                .map(|model| CachedModel {
-                    name: model.name.clone(),
-                    namespace: model.namespace.clone(),
-                    targets: model
-                        .targets
-                        .iter()
-                        .map(|target| CachedTarget {
-                            provider: target.provider.clone(),
-                            model: target.model.clone(),
-                            price: target.price,
-                            catalog: target.catalog.as_ref().map(|binding| CachedCatalogBinding {
-                                provider: binding.provider.to_string(),
-                                model: binding.model.clone(),
-                            }),
-                        })
-                        .collect(),
-                })
-                .collect(),
+            models: Vec::new(),
             credentials: config
                 .credential
                 .iter()
@@ -823,6 +806,11 @@ impl ConfigSnapshot {
                 })
             })
             .collect();
+        let file_unpriced: HashMap<String, crate::config::UnpricedModels> = bootstrap
+            .provider
+            .iter()
+            .map(|provider| (provider.id.clone(), provider.unpriced_models))
+            .collect();
         bootstrap.provider = cached
             .providers
             .into_iter()
@@ -834,41 +822,20 @@ impl ConfigSnapshot {
                     other => return Err(format!("cached provider kind `{other}` is unsupported")),
                 };
                 Ok(crate::config::Provider {
+                    unpriced_models: file_unpriced
+                        .get(&provider.id)
+                        .copied()
+                        .unwrap_or(provider.unpriced_models),
                     id: provider.id,
                     kind,
                     base_url: provider.base_url,
-                    unpriced_models: crate::config::UnpricedModels::Deny,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        bootstrap.model = cached
-            .models
-            .into_iter()
-            .map(|model| {
-                Ok(crate::config::Model {
-                    name: model.name,
-                    namespace: model.namespace,
-                    targets: model
-                        .targets
-                        .into_iter()
-                        .map(|target| {
-                            Ok(crate::config::Target {
-                                provider: target.provider,
-                                model: target.model,
-                                price: target.price,
-                                catalog: target
-                                    .catalog
-                                    .map(|binding| {
-                                        CatalogBinding::new(&binding.provider, &binding.model)
-                                            .map_err(|error| error.to_string())
-                                    })
-                                    .transpose()?,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, String>>()?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        // Cached alias tables are not a serving graph (ADR 0063). The current
+        // file's [[price]] / [blocklist] stay on `bootstrap`; do not resurrect
+        // leftover [[model]] rows from a previous revision.
+        let _ = cached.models;
         bootstrap.credential = cached
             .credentials
             .into_iter()
@@ -2506,6 +2473,46 @@ namespace = "platform"
         assert!(
             error.contains("not compiled into this axond build"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn from_cached_serving_drops_cached_models_and_keeps_file_billing_controls() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let snapshot =
+            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 7).expect("snapshot compiles");
+        let mut cached = snapshot.cached_serving(revision_id(7));
+        cached.models.push(CachedModel {
+            name: "legacy-alias".to_owned(),
+            namespace: None,
+            targets: vec![CachedTarget {
+                provider: "openai".to_owned(),
+                model: "gpt-4o".to_owned(),
+                price: gateway_core::ModelPrice {
+                    input_microdollars_per_million: 1,
+                    output_microdollars_per_million: 1,
+                    reasoning_microdollars_per_million: None,
+                    cache_read_microdollars_per_million: None,
+                    cache_write_microdollars_per_million: None,
+                },
+                catalog: None,
+            }],
+        });
+        let mut bootstrap = config_with(PLATFORM_KEY);
+        bootstrap.provider[0].unpriced_models = crate::config::UnpricedModels::Allow;
+        bootstrap.blocklist.models = vec!["*-preview".to_owned()];
+        bootstrap.price[0].price.input_microdollars_per_million = 99;
+        let (_, restored) = ConfigSnapshot::from_cached_serving(bootstrap.clone(), &env, cached)
+            .expect("restores without resurrecting aliases");
+        assert!(
+            restored.config.model.is_empty(),
+            "cached [[model]] rows are not a serving graph"
+        );
+        assert_eq!(restored.config.price, bootstrap.price);
+        assert_eq!(restored.config.blocklist, bootstrap.blocklist);
+        assert_eq!(
+            restored.config.provider[0].unpriced_models,
+            crate::config::UnpricedModels::Allow
         );
     }
 

@@ -27,8 +27,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::config::{
-    AdmissionConfig, BudgetConfig, CatalogConfig, Config, ConfigError, Mode, RateLimitConfig,
-    Reload, RevocationConfig, StorageConfig, Transport, UsageJournalConfig, UsageSinkConfig,
+    AdmissionConfig, BlocklistConfig, BudgetConfig, CatalogConfig, Config, ConfigError, Mode,
+    PriceRule, RateLimitConfig, Reload, RevocationConfig, StorageConfig, Transport, UnpricedModels,
+    UsageJournalConfig, UsageSinkConfig,
 };
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
@@ -65,6 +66,13 @@ struct Boot {
     admission: AdmissionConfig,
     catalog: CatalogConfig,
     storage: Option<StorageConfig>,
+    /// Deployment price-book, blocklist, and per-provider unpriced policy are
+    /// boot-owned (ADR 0063): a SIGHUP validates the edit and reports
+    /// `restart_required`, but the serving snapshot keeps what the process
+    /// booted with.
+    price: Vec<PriceRule>,
+    blocklist: BlocklistConfig,
+    unpriced_models: HashMap<String, UnpricedModels>,
 }
 
 impl From<&ConfigSnapshot> for Boot {
@@ -81,6 +89,14 @@ impl From<&ConfigSnapshot> for Boot {
             admission: booted.config.admission.clone(),
             catalog: booted.config.catalog.clone(),
             storage: booted.config.storage.clone(),
+            price: booted.config.price.clone(),
+            blocklist: booted.config.blocklist.clone(),
+            unpriced_models: booted
+                .config
+                .provider
+                .iter()
+                .map(|provider| (provider.id.clone(), provider.unpriced_models))
+                .collect(),
         }
     }
 }
@@ -94,6 +110,9 @@ struct ReloadCandidate {
     snapshot: ConfigSnapshot,
     catalog_changed: bool,
     storage_changed: bool,
+    price_changed: bool,
+    blocklist_changed: bool,
+    unpriced_models_changed: bool,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -199,6 +218,9 @@ impl Reloader {
             Ok(candidate) => {
                 let catalog_changed = candidate.catalog_changed;
                 let storage_changed = candidate.storage_changed;
+                let price_changed = candidate.price_changed;
+                let blocklist_changed = candidate.blocklist_changed;
+                let unpriced_models_changed = candidate.unpriced_models_changed;
                 // A file reload replaces what the file describes and nothing
                 // else. Approved pricing is not in the file — it came from a
                 // desired revision this replica converged on — so it is carried
@@ -229,6 +251,9 @@ impl Reloader {
                 let mut summary = ReloadSummary::between(&self.boot, &current, &candidate_snapshot);
                 summary.catalog_changed = catalog_changed;
                 summary.storage_changed = storage_changed;
+                summary.price_changed = price_changed;
+                summary.blocklist_changed = blocklist_changed;
+                summary.unpriced_models_changed = unpriced_models_changed;
                 let generation = candidate_snapshot.generation;
                 self.state.publish(candidate_snapshot)?;
                 telemetry::finish_config_reload(
@@ -286,6 +311,14 @@ impl Reloader {
         }
         let catalog_changed = self.boot.catalog != config.catalog;
         let storage_changed = self.boot.storage != config.storage;
+        let price_changed = self.boot.price != config.price;
+        let blocklist_changed = self.boot.blocklist != config.blocklist;
+        let unpriced_models_changed = config.provider.iter().any(|provider| {
+            self.boot
+                .unpriced_models
+                .get(&provider.id)
+                .is_some_and(|booted| *booted != provider.unpriced_models)
+        });
         // `[catalog]` selects the importer built before the listener binds. A
         // reload validates the edited values and reports the difference, but it
         // cannot safely replace that task, its client, or its retained store.
@@ -294,6 +327,15 @@ impl Reloader {
         config.catalog = self.boot.catalog.clone();
         // `[storage]` is the live Store in AppState. A reload cannot reopen it.
         config.storage = self.boot.storage.clone();
+        // Price-book, blocklist, and unpriced_models are deployment controls
+        // (ADR 0063): changing them is a restart.
+        config.price = self.boot.price.clone();
+        config.blocklist = self.boot.blocklist.clone();
+        for provider in &mut config.provider {
+            if let Some(policy) = self.boot.unpriced_models.get(&provider.id) {
+                provider.unpriced_models = *policy;
+            }
+        }
         carry_policy_forward(&mut config, &current.config);
         // Stateful convergence owns the projected inbound identities. A file
         // reload cannot recreate them, so carry the immutable set forward just
@@ -309,6 +351,9 @@ impl Reloader {
             )?,
             catalog_changed,
             storage_changed,
+            price_changed,
+            blocklist_changed,
+            unpriced_models_changed,
         })
     }
 
@@ -411,6 +456,12 @@ pub struct ReloadSummary {
     pub catalog_changed: bool,
     /// `[storage]` differs from the store opened at boot.
     pub storage_changed: bool,
+    /// `[[price]]` differs from the booted price-book.
+    pub price_changed: bool,
+    /// `[blocklist]` differs from the booted deployment denials.
+    pub blocklist_changed: bool,
+    /// A provider's `unpriced_models` differs from what the process booted with.
+    pub unpriced_models_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -609,6 +660,13 @@ impl ReloadSummary {
             admission_changed: boot.admission != after_config.admission,
             catalog_changed: boot.catalog != after_config.catalog,
             storage_changed: boot.storage != after_config.storage,
+            price_changed: boot.price != after_config.price,
+            blocklist_changed: boot.blocklist != after_config.blocklist,
+            unpriced_models_changed: after_config.provider.iter().any(|provider| {
+                boot.unpriced_models
+                    .get(&provider.id)
+                    .is_some_and(|booted| *booted != provider.unpriced_models)
+            }),
         }
     }
 
@@ -640,6 +698,9 @@ impl ReloadSummary {
             || self.admission_changed
             || self.catalog_changed
             || self.storage_changed
+            || self.price_changed
+            || self.blocklist_changed
+            || self.unpriced_models_changed
             || self.gateway_minting_route_added()
     }
 
@@ -737,6 +798,21 @@ impl ReloadSummary {
         if self.storage_changed {
             tracing::warn!(
                 "`[storage]` changed, but the namespace store is opened at boot; restart to apply it"
+            );
+        }
+        if self.price_changed {
+            tracing::warn!(
+                "`[[price]]` changed, but the deployment price-book is boot-owned; restart to apply it"
+            );
+        }
+        if self.blocklist_changed {
+            tracing::warn!(
+                "`[blocklist]` changed, but deployment denials are boot-owned; restart to apply them"
+            );
+        }
+        if self.unpriced_models_changed {
+            tracing::warn!(
+                "`unpriced_models` changed, but per-provider unpriced policy is boot-owned; restart to apply it"
             );
         }
     }
@@ -2337,6 +2413,134 @@ output_microdollars_per_million = 1
         assert!(summary.storage_changed);
         assert!(summary.restart_required());
         assert_eq!(state.config().config.storage, original);
+    }
+
+    #[tokio::test]
+    async fn price_changes_are_reported_as_restart_required_and_not_applied() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let original = state.config().config.price.clone();
+        let reloader = Reloader::new(file.path(), state.clone());
+        file.rewrite(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "PLATFORM_OPENAI_KEY"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 2
+
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 9
+output_microdollars_per_million = 9
+"#,
+        );
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("price change is valid and boot-owned");
+        assert!(summary.price_changed);
+        assert!(summary.restart_required());
+        assert!(summary.is_empty(), "price-book is not live-reloaded");
+        assert_eq!(state.config().config.price, original);
+        assert_eq!(
+            state
+                .config()
+                .config
+                .price_for("openai", "gpt-4o")
+                .expect("still the booted exact rule")
+                .input_microdollars_per_million,
+            2_500_000
+        );
+    }
+
+    #[tokio::test]
+    async fn blocklist_changes_are_reported_as_restart_required_and_not_applied() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let original = state.config().config.blocklist.clone();
+        let reloader = Reloader::new(file.path(), state.clone());
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[blocklist]\nmodels = [\"*-preview\", \"secret-*\"]\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("blocklist change is valid and boot-owned");
+        assert!(summary.blocklist_changed);
+        assert!(summary.restart_required());
+        assert!(summary.is_empty(), "blocklist is not live-reloaded");
+        assert_eq!(state.config().config.blocklist, original);
+        assert!(
+            !state
+                .config()
+                .config
+                .is_blocked("openai/gpt-4o-preview", "gpt-4o-preview", &[])
+        );
+    }
+
+    #[tokio::test]
+    async fn unpriced_models_changes_are_reported_as_restart_required_and_not_applied() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let original = state.config().config.provider[0].unpriced_models;
+        let reloader = Reloader::new(file.path(), state.clone());
+        file.rewrite(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+unpriced_models = "allow"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "PLATFORM_OPENAI_KEY"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+"#,
+        );
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("unpriced_models change is valid and boot-owned");
+        assert!(summary.unpriced_models_changed);
+        assert!(summary.restart_required());
+        assert!(summary.is_empty(), "unpriced_models is not live-reloaded");
+        assert_eq!(state.config().config.provider[0].unpriced_models, original);
+        assert_eq!(
+            state.config().config.provider[0].unpriced_models,
+            crate::config::UnpricedModels::Deny
+        );
     }
 
     #[tokio::test]

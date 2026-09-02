@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use gateway_core::ModelPrice;
 use gateway_transport::TransportLimits;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
@@ -913,7 +913,7 @@ pub struct Provider {
     pub unpriced_models: UnpricedModels,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UnpricedModels {
     #[default]
@@ -1010,7 +1010,7 @@ pub struct BlocklistConfig {
 }
 
 /// One price-book row: exact provider id, glob against the bare upstream id.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PriceRule {
     pub provider: String,
     pub model: String,
