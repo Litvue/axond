@@ -27,6 +27,7 @@
 mod admin;
 mod admission;
 mod aliases;
+mod api;
 mod availability;
 mod backends;
 mod budget;
@@ -52,6 +53,7 @@ mod routes;
 mod shutdown;
 mod state;
 mod status;
+mod store;
 mod streaming;
 // The layer re-export this module makes for `main.rs` has no consumer here.
 #[allow(unused_imports)]
