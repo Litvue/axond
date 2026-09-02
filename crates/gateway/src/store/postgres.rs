@@ -204,7 +204,7 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
         })?;
     client
         .batch_execute(
-            "SELECT provider, fetched_at, stale, models
+            "SELECT provider, fetched_at, stale, models, source
              FROM axond_store_provider_models LIMIT 0",
         )
         .await
@@ -905,14 +905,16 @@ impl Store for PostgresStore {
         self.with_client(async move |client| {
             let row = client
                 .query_opt(
-                    "SELECT provider, fetched_at, stale, models
+                    "SELECT provider, fetched_at, stale, models, source
                      FROM axond_store_provider_models WHERE provider = $1",
                     &[&provider],
                 )
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            row.map(|row| postgres_provider_models(row.get(0), row.get(1), row.get(2), row.get(3)))
-                .transpose()
+            row.map(|row| {
+                postgres_provider_models(row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
+            })
+            .transpose()
         })
         .await
     }
@@ -921,14 +923,22 @@ impl Store for PostgresStore {
         self.with_client(async move |client| {
             let rows = client
                 .query(
-                    "SELECT provider, fetched_at, stale, models
+                    "SELECT provider, fetched_at, stale, models, source
                      FROM axond_store_provider_models ORDER BY provider",
                     &[],
                 )
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
             rows.into_iter()
-                .map(|row| postgres_provider_models(row.get(0), row.get(1), row.get(2), row.get(3)))
+                .map(|row| {
+                    postgres_provider_models(
+                        row.get(0),
+                        row.get(1),
+                        row.get(2),
+                        row.get(3),
+                        row.get(4),
+                    )
+                })
                 .collect()
         })
         .await
@@ -939,13 +949,20 @@ impl Store for PostgresStore {
             let models = Value::Array(row.data);
             client
                 .execute(
-                    "INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models)
-                     VALUES ($1, $2, $3, $4)
+                    "INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source)
+                     VALUES ($1, $2, $3, $4, $5)
                      ON CONFLICT (provider) DO UPDATE SET
                         fetched_at = excluded.fetched_at,
                         stale = excluded.stale,
-                        models = excluded.models",
-                    &[&row.provider, &row.fetched_at, &row.stale, &models],
+                        models = excluded.models,
+                        source = excluded.source",
+                    &[
+                        &row.provider,
+                        &row.fetched_at,
+                        &row.stale,
+                        &models,
+                        &row.source,
+                    ],
                 )
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -960,6 +977,7 @@ fn postgres_provider_models(
     fetched_at: Option<String>,
     stale: bool,
     models: Value,
+    source: Option<String>,
 ) -> Result<ProviderModels, StoreError> {
     let data = match models {
         Value::Array(items) => items,
@@ -974,6 +992,7 @@ fn postgres_provider_models(
         fetched_at,
         stale,
         data,
+        source,
     })
 }
 
@@ -1378,5 +1397,6 @@ mod tests {
     #[test]
     fn store_provider_models_ddl_is_embedded() {
         assert!(MODELS_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_provider_models ("));
+        assert!(MODELS_DDL.contains("source      text"));
     }
 }

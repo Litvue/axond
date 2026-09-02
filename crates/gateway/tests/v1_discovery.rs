@@ -52,6 +52,7 @@ async fn per_provider_and_fan_out_return_fetched_at() {
     );
     assert_eq!(openai["stale"], false);
     assert_eq!(openai["provider"], "fake-openai");
+    assert!(openai.get("source").is_none(), "{openai}");
     let ids = model_ids(&openai);
     assert!(ids.contains(&"gpt-4o"), "{ids:?}");
     assert!(ids.contains(&"fixture-chat"), "{ids:?}");
@@ -209,4 +210,55 @@ async fn a_completion_does_not_hit_discovery() {
         hits,
         "inference must not call GET /models"
     );
+}
+
+#[tokio::test]
+async fn anthropic_style_pages_are_merged() {
+    let upstream = support::upstream::FakeUpstream::start().await;
+    upstream.state.set_models(&["m1", "m2", "m3"]);
+    upstream.state.set_models_page_size(1);
+    let gateway = Axond::start(&upstream.base_url).await;
+    let http = client();
+
+    let listing = wait_for_listing(&http, &gateway, "fake-openai").await;
+    assert_eq!(model_ids(&listing), vec!["m1", "m2", "m3"], "{listing}");
+    assert!(
+        upstream.state.models_hits() >= 3,
+        "each page is a GET /models"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_page_keeps_previous_cache() {
+    let upstream = support::upstream::FakeUpstream::start().await;
+    let gateway = Axond::start_with_options(
+        &upstream.base_url,
+        Options::new(DEFAULT_TUNING).with_config("[discovery]\nrefresh_interval_seconds = 1\n"),
+    )
+    .await;
+    let http = client();
+    let fresh = wait_for_listing(&http, &gateway, "fake-openai").await;
+    let previous = model_ids(&fresh);
+    let fetched_at = fresh["fetched_at"].clone();
+
+    upstream.state.set_models_page_size(1);
+    upstream.state.set_models_fail_when_paged(true);
+    let mut stale = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let response = http
+            .get(gateway.url("/api/v1/providers/fake-openai/models"))
+            .bearer_auth(GATEWAY_KEY)
+            .send()
+            .await
+            .expect("stale");
+        assert_eq!(response.status(), 200);
+        stale = response.json().await.expect("json");
+        if stale["stale"] == true {
+            break;
+        }
+    }
+    assert_eq!(stale["stale"], true, "{stale}");
+    assert_eq!(stale["fetched_at"], fetched_at, "{stale}");
+    assert_eq!(model_ids(&stale), previous, "{stale}");
 }
