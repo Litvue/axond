@@ -1219,7 +1219,16 @@ mod tests {
                      (namespace, period, limit_microdollars, spent_microdollars)
                      VALUES ('wsp_x', '2026-09', 1000, 40);
                  INSERT INTO axond_budget_active (namespace, period)
-                     VALUES ('wsp_x', '2026-09');",
+                     VALUES ('wsp_x', '2026-09');
+                 CREATE TABLE axond_store_usage (
+                     request_id          text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text,
+                     model               text        NOT NULL,
+                     status              text        NOT NULL,
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
+                 );",
             )
             .await
             .expect("draft store tables");
@@ -1279,7 +1288,16 @@ mod tests {
                      (namespace, period, limit_microdollars, spent_microdollars)
                      VALUES ('wsp_x', '2026-09', 1000, 40);
                  INSERT INTO axond_budget_active (namespace, period)
-                     VALUES ('wsp_x', '2026-09');",
+                     VALUES ('wsp_x', '2026-09');
+                 CREATE TABLE axond_store_usage (
+                     request_id          text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text,
+                     model               text        NOT NULL,
+                     status              text        NOT NULL,
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
+                 );",
             )
             .await
             .expect("draft");
@@ -1548,6 +1566,39 @@ mod tests {
                 .await
                 .expect("empty")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_summary_saturates_cost_at_i64_max() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        let half_plus_one = (i64::MAX / 2) as u64 + 1;
+        for id in ["req_a", "req_b"] {
+            store
+                .append_usage(UsageAppend {
+                    request_id: id.into(),
+                    namespace: "wsp_x".into(),
+                    period: Some("p".into()),
+                    model: "openai/gpt-4o".into(),
+                    status: "ok".into(),
+                    cost_microdollars: Some(half_plus_one),
+                })
+                .await
+                .expect("append");
+        }
+        let rows = store
+            .summarize_usage("wsp_x", "p")
+            .await
+            .expect("summarize");
+        assert_eq!(
+            rows,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 2,
+                cost_microdollars: i64::MAX as u64,
+            }]
         );
     }
 }
