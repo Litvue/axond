@@ -30,3 +30,6 @@ CREATE TABLE IF NOT EXISTS axond_store_budget_reservation_tombstone (
     incarnation bigint NOT NULL,
     expires_at  timestamptz NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_tombstone_expires_idx
+    ON axond_store_budget_reservation_tombstone (expires_at);
