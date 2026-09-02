@@ -46,9 +46,13 @@ pub async fn run(state: AppState, mut stop: oneshot::Receiver<()>) {
             continue;
         }
         waiting_for_providers = false;
-        if refresh_all(&state, &mut stop).await == Round::Stopped {
-            tracing::debug!("provider model discovery stopped");
-            return;
+        match refresh_all(&state, &mut stop).await {
+            Round::Stopped => {
+                tracing::debug!("provider model discovery stopped");
+                return;
+            }
+            Round::Restart => continue,
+            Round::Done => {}
         }
         let interval = state.config().config.discovery.interval();
         tokio::select! {
@@ -66,11 +70,13 @@ pub async fn run(state: AppState, mut stop: oneshot::Receiver<()>) {
 enum Round {
     Done,
     Stopped,
+    Restart,
 }
 
 enum RefreshError {
     Failed(String),
     Stopped,
+    SnapshotChanged,
 }
 
 async fn refresh_all(state: &AppState, stop: &mut oneshot::Receiver<()>) -> Round {
@@ -94,6 +100,7 @@ async fn refresh_all(state: &AppState, stop: &mut oneshot::Receiver<()>) -> Roun
         if let Err(error) = refresh_one(state, &snapshot, id, *kind, base_url, stop).await {
             match error {
                 RefreshError::Stopped => return Round::Stopped,
+                RefreshError::SnapshotChanged => return Round::Restart,
                 RefreshError::Failed(error) => {
                     tracing::warn!(
                         provider = %id,
@@ -149,9 +156,7 @@ async fn refresh_one(
             Ok(data) => {
                 let current = state.config();
                 if current.generation != snapshot.generation {
-                    return Err(RefreshError::Failed(
-                        "serving snapshot changed during discovery".into(),
-                    ));
+                    return Err(RefreshError::SnapshotChanged);
                 }
                 let row = ProviderModels {
                     provider: provider_id.to_owned(),
@@ -169,6 +174,7 @@ async fn refresh_one(
                 return Ok(());
             }
             Err(RefreshError::Stopped) => return Err(RefreshError::Stopped),
+            Err(RefreshError::SnapshotChanged) => return Err(RefreshError::SnapshotChanged),
             Err(RefreshError::Failed(error)) => {
                 tracing::debug!(
                     provider = provider_id,
