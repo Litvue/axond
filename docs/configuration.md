@@ -307,10 +307,19 @@ until restart — the live `Store` is opened once.
 | `backend` | `sqlite` \| `postgres` | `sqlite` | SQLite WAL for a single replica; Postgres for HA. |
 | `path` | string | — | SQLite file path. Required for `sqlite`. `:memory:` is refused by `Config::load`. |
 | `dsn_env` | env-var name | — | Postgres DSN environment variable. Required for `postgres`. The DSN's `sslmode` selects TLS. |
-| `create_table` | bool | `true` | Apply namespace DDL at connect. Postgres deployments that migrate out of band set `false`. |
+| `create_table` | bool | `true` | Apply namespace and `axond_store_budget*` DDL at connect. Postgres deployments that migrate out of band set `false`. |
 | `on_unavailable` | `deny` \| `allow` | `deny` | When the Store cannot reserve: `deny` answers `503 budget_unavailable`; `allow` serves without a hold. |
 
 SQLite rejects a set `dsn_env`; Postgres rejects a set `path`.
+
+Postgres Store budget tables are `axond_store_budget`,
+`axond_store_budget_active`, and `axond_store_budget_reservation`
+(`ops/postgres/store_budget_v1.sql`). They do not reuse the withdrawn
+`[budget] backend = "postgres"` names (`axond_budget*`). A database that
+already has those leftover tables keeps them; spend is not migrated (subject
+vs period). Connect still creates the Store tables and boots. An earlier
+draft of the Store DDL that used `axond_budget` with a `period` column is
+renamed at connect.
 
 ## `[shutdown]` — Tier 0
 
