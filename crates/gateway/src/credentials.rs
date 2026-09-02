@@ -405,21 +405,26 @@ impl Credentials {
         self.plan_at(config, namespace, provider, Instant::now())
     }
 
-    /// First configured credential for a provider, without advancing pool
-    /// rotation or consuming a parked-key probe. Discovery is off the request
-    /// path and must not perturb dispatch.
-    pub fn discovery_lease(&self, config: &Config, provider: &str) -> Option<CredentialLease> {
-        if let Some((pool, _)) = self.resolve_pool(config, &self.platform_ns, provider) {
-            return pool.entries.first().map(lease);
-        }
-        // Tenant-only BYOK: no platform pool, but some namespace can still
-        // dispatch this provider. Discovery lists that catalog without rotating
-        // request-path health.
-        self.pools
-            .iter()
-            .filter(|((_, name), _)| name.as_str() == provider)
-            .min_by_key(|((namespace, _), _)| namespace.as_str())
-            .and_then(|(_, pool)| pool.entries.first().map(lease))
+    /// Configured credentials for a provider, without advancing pool rotation
+    /// or consuming a parked-key probe. Discovery is off the request path and
+    /// must not perturb dispatch. Platform pool first; otherwise the
+    /// lexicographically first tenant-only pool. Every entry is returned so a
+    /// later key can succeed if the first fails.
+    pub fn discovery_leases(&self, config: &Config, provider: &str) -> Vec<CredentialLease> {
+        let pool = if let Some((pool, _)) = self.resolve_pool(config, &self.platform_ns, provider) {
+            pool
+        } else {
+            match self
+                .pools
+                .iter()
+                .filter(|((_, name), _)| name.as_str() == provider)
+                .min_by_key(|((namespace, _), _)| namespace.as_str())
+            {
+                Some((_, pool)) => pool,
+                None => return Vec::new(),
+            }
+        };
+        pool.entries.iter().map(lease).collect()
     }
 
     /// Plan only the first configured credential for an affinity-pinned route.
@@ -735,6 +740,30 @@ id = "openai-b"
             &ResolvedSecrets::default(),
         )
         .expect("credentials")
+    }
+
+    #[test]
+    fn discovery_leases_every_pool_entry_without_rotating() {
+        let cfg = config(TWO_PLATFORM_KEYS);
+        let creds = two_key_credentials(&cfg);
+        let before = creds
+            .pools
+            .get(&("platform".to_owned(), "openai".to_owned()))
+            .expect("pool")
+            .cursor
+            .load(Ordering::SeqCst);
+        let leases = creds.discovery_leases(&cfg, "openai");
+        assert_eq!(
+            leases.iter().map(|lease| lease.id.as_str()).collect::<Vec<_>>(),
+            vec!["openai-a", "openai-b"]
+        );
+        let after = creds
+            .pools
+            .get(&("platform".to_owned(), "openai".to_owned()))
+            .expect("pool")
+            .cursor
+            .load(Ordering::SeqCst);
+        assert_eq!(before, after);
     }
 
     #[test]
