@@ -173,6 +173,7 @@ destination receives by exactly what the refusals in
 | `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. `shutdown` means the termination flush could not write them. Billing-grade mode has no buffer to drop from: a failed write stays journaled, so watch `axond.usage.journal.lost` there instead. |
 | `axond.usage.flushes` | counter | `axond.usage_sink`, `axond.flush_outcome` | Termination flushes of a buffered sink: `flushed`, `failed`, or `timeout`. |
 | `axond.usage.journal.appends` | counter | `axond.usage_journal`, `axond.journal.outcome` | Billing-grade appends. Anything but `accepted` / `already_present` is a request refused or an event lost. |
+| `axond.usage.index.appends` | counter | `axond.index.outcome` | Management usage-index writes. `accepted` landed; `failed` and `timeout` are best-effort losses of the summary index, not of billing. |
 | `axond.usage.journal.deliveries` | counter | `axond.usage_journal`, `axond.usage_journal.consumer`, `axond.journal.delivery` | Journaled events handed to their destinations. |
 | `axond.usage.journal.depth` | gauge | `axond.usage_journal`, `axond.usage_journal.consumer` | Events awaiting delivery. Read against `axond.usage.journal.capacity`. |
 | `axond.usage.journal.in_flight` | gauge | same | Events under an unexpired lease. |

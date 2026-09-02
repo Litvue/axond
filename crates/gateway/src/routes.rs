@@ -5644,6 +5644,40 @@ max_ttl = "15m"
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn malformed_management_queries_are_typed_bad_request() {
+        let state = test_state();
+        for path in [
+            "/api/v1/namespaces?limit=abc",
+            "/api/v1/namespaces/platform/usage?period=bad/period",
+            "/api/v1/namespaces/platform/usage?period=a&period=b",
+            "/api/v1/namespaces/platform/usage",
+        ] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::get(path)
+                        .header(
+                            axum::http::header::AUTHORIZATION,
+                            format!("Bearer {CALLER_SECRET}"),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or_else(|_| json!({"raw": "not json"}));
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}");
+            assert_eq!(body["error"]["type"], "bad_request", "{path} {body}");
+        }
     }
 
     #[test]
