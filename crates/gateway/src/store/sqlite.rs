@@ -294,9 +294,28 @@ impl Store for SqliteStore {
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError> {
         let id = id.to_string();
         self.with_conn(move |conn| {
-            let n = conn
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(unavailable)?;
+            tx.execute(
+                "DELETE FROM axond_store_budget_reservation WHERE namespace = ?1",
+                params![id],
+            )
+            .map_err(unavailable)?;
+            tx.execute(
+                "DELETE FROM axond_store_budget WHERE namespace = ?1",
+                params![id],
+            )
+            .map_err(unavailable)?;
+            tx.execute(
+                "DELETE FROM axond_store_budget_active WHERE namespace = ?1",
+                params![id],
+            )
+            .map_err(unavailable)?;
+            let n = tx
                 .execute("DELETE FROM axond_namespace WHERE id = ?1", params![id])
                 .map_err(unavailable)?;
+            tx.commit().map_err(unavailable)?;
             Ok(n > 0)
         })
         .await
@@ -753,6 +772,53 @@ mod tests {
             .expect("count")
         };
         assert_eq!(n, 0, "denied admission must keep the expiry delete");
+    }
+
+    #[tokio::test]
+    async fn delete_drops_budget_tables_and_keeps_usage_rows() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        store
+            .append_usage(UsageAppend {
+                request_id: "req_1".into(),
+                namespace: "wsp_x".into(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(5),
+            })
+            .await
+            .expect("usage");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        let (budget, active, reservations, usage): (i64, i64, i64, i64) = {
+            let conn = store.conn.lock().expect("lock");
+            let count = |sql: &str| conn.query_row(sql, [], |row| row.get(0)).expect("count");
+            (
+                count("SELECT count(*) FROM axond_store_budget WHERE namespace = 'wsp_x'"),
+                count("SELECT count(*) FROM axond_store_budget_active WHERE namespace = 'wsp_x'"),
+                count(
+                    "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
+                ),
+                count("SELECT count(*) FROM axond_store_usage WHERE namespace = 'wsp_x'"),
+            )
+        };
+        assert_eq!((budget, active, reservations, usage), (0, 0, 0, 1));
+        assert!(store.get_namespace("wsp_x").await.expect("get").is_none());
     }
 
     #[test]

@@ -619,11 +619,15 @@ impl Store for PostgresStore {
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError> {
         let id = id.to_owned();
         self.with_client(async move |client| {
-            let n = client
-                .execute("DELETE FROM axond_namespace WHERE id = $1", &[&id])
+            let tx = client
+                .transaction()
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            Ok(n > 0)
+            let deleted = delete_namespace_tx(&tx, &id).await?;
+            tx.commit()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(deleted)
         })
         .await
     }
@@ -802,6 +806,56 @@ impl Store for PostgresStore {
     }
 }
 
+/// Namespace row, then active, then spend: PUT and reserve/settle take the
+/// same locks in this order, so a concurrent delete cannot deadlock them.
+async fn delete_namespace_tx(tx: &Transaction<'_>, id: &str) -> Result<bool, StoreError> {
+    let _ = tx
+        .query_opt(
+            "SELECT id FROM axond_namespace WHERE id = $1 FOR UPDATE",
+            &[&id],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let _ = tx
+        .query_opt(
+            "SELECT period FROM axond_store_budget_active WHERE namespace = $1 FOR UPDATE",
+            &[&id],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let _ = tx
+        .query(
+            "SELECT limit_microdollars FROM axond_store_budget
+             WHERE namespace = $1 FOR UPDATE",
+            &[&id],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    tx.execute(
+        "DELETE FROM axond_store_budget_reservation WHERE namespace = $1",
+        &[&id],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    tx.execute(
+        "DELETE FROM axond_store_budget WHERE namespace = $1",
+        &[&id],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    tx.execute(
+        "DELETE FROM axond_store_budget_active WHERE namespace = $1",
+        &[&id],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let n = tx
+        .execute("DELETE FROM axond_namespace WHERE id = $1", &[&id])
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    Ok(n > 0)
+}
+
 /// Active row first, then the spend row: the same order as reserve and settle.
 async fn put_budget_tx(
     tx: &Transaction<'_>,
@@ -810,7 +864,10 @@ async fn put_budget_tx(
     limit: i64,
 ) -> Result<BudgetRecord, StoreError> {
     let exists = tx
-        .query_opt("SELECT 1 FROM axond_namespace WHERE id = $1", &[&namespace])
+        .query_opt(
+            "SELECT 1 FROM axond_namespace WHERE id = $1 FOR UPDATE",
+            &[&namespace],
+        )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .is_some();

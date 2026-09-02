@@ -143,7 +143,8 @@ pub trait Store: Send + Sync {
         attrs: Value,
         blocklist: Option<Vec<String>>,
     ) -> Result<Option<NamespaceRecord>, StoreError>;
-    #[allow(dead_code)]
+    /// Remove the namespace and its live budget ledger in one transaction.
+    /// Usage rows are retained. Missing id is `Ok(false)`.
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError>;
     /// Seed addressable namespace ids without `spawn_blocking`.
     fn seed_namespaces_blocking(
@@ -623,6 +624,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_delete_namespace_drops_budget_and_keeps_usage() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        store
+            .append_usage(UsageAppend {
+                request_id: "req_1".into(),
+                namespace: "wsp_x".into(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(5),
+            })
+            .await
+            .expect("usage");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        assert!(!store.delete_namespace("wsp_x").await.expect("repeat"));
+        assert!(store.get_namespace("wsp_x").await.expect("get").is_none());
+        assert!(
+            store
+                .get_budget("wsp_x", "p")
+                .await
+                .expect("budget")
+                .is_none()
+        );
+        let usage = store
+            .summarize_usage("wsp_x", "p")
+            .await
+            .expect("summarize");
+        assert_eq!(
+            usage,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 1,
+                cost_microdollars: 5,
+            }]
+        );
+        seeded(&store).await;
+        assert!(
+            store
+                .get_budget("wsp_x", "p")
+                .await
+                .expect("recreate budget")
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
+                .await
+                .expect("closed"),
+            BudgetReserve::Exceeded
+        ));
+    }
+
+    #[tokio::test]
     async fn sqlite_in_flight_hold_counts_and_settle_is_one_operation() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
@@ -822,6 +883,67 @@ mod tests {
             .await
             .expect("ns");
         (store, ns)
+    }
+
+    #[tokio::test]
+    async fn postgres_delete_namespace_drops_budget_and_keeps_usage() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("put");
+        store
+            .reserve_budget(&ns, 10, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        store
+            .append_usage(UsageAppend {
+                request_id: format!("req_{ns}"),
+                namespace: ns.clone(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(5),
+            })
+            .await
+            .expect("usage");
+        assert!(store.delete_namespace(&ns).await.expect("delete"));
+        assert!(!store.delete_namespace(&ns).await.expect("repeat"));
+        assert!(store.get_namespace(&ns).await.expect("get").is_none());
+        assert!(store.get_budget(&ns, "p").await.expect("budget").is_none());
+        assert_eq!(store.reservation_count(&ns).await.expect("holds"), 0);
+        let usage = store.summarize_usage(&ns, "p").await.expect("summarize");
+        assert_eq!(
+            usage,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 1,
+                cost_microdollars: 5,
+            }]
+        );
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        assert!(
+            store
+                .get_budget(&ns, "p")
+                .await
+                .expect("recreate budget")
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .reserve_budget(&ns, 1, Duration::from_secs(30), "r2")
+                .await
+                .expect("closed"),
+            BudgetReserve::Exceeded
+        ));
     }
 
     #[tokio::test]
