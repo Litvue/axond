@@ -819,6 +819,19 @@ impl Store for SqliteStore {
         })
         .await
     }
+
+    async fn mark_provider_models_stale(&self, provider: &str) -> Result<(), StoreError> {
+        let provider = provider.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE axond_store_provider_models SET stale = 1 WHERE provider = ?1",
+                params![provider],
+            )
+            .map_err(unavailable)?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 fn sqlite_provider_models(
@@ -1528,10 +1541,7 @@ mod tests {
             .expect("row");
         assert_eq!(got, good);
         store
-            .put_provider_models(ProviderModels {
-                stale: true,
-                ..good.clone()
-            })
+            .mark_provider_models_stale("openai")
             .await
             .expect("stale");
         let stale = store
@@ -1543,6 +1553,10 @@ mod tests {
         assert_eq!(stale.data, good.data);
         assert_eq!(stale.fetched_at, good.fetched_at);
         assert_eq!(stale.source, good.source);
+        store
+            .mark_provider_models_stale("missing")
+            .await
+            .expect("missing mark");
         assert!(
             store
                 .get_provider_models("missing")
