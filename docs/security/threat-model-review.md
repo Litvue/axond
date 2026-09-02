@@ -69,7 +69,8 @@ authenticated route; anything that widens what a minted token can reach; and
 
 **Regression tests.** The fail-closed floor is
 `every_authenticated_route_rejects_a_request_without_a_gateway_key` — a new route
-belongs in it, not beside it. Scope narrowing is held by
+belongs in it, not beside it. `/api/v1` is authenticated the same way:
+`openapi_json_requires_the_gateway_key` holds the spec document. Scope narrowing is held by
 `scoped_models_token_allows_models_and_denies_chat`,
 `scoped_chat_token_allows_chat_and_denies_embeddings`,
 `scoped_token_cannot_grant_a_route_the_namespace_lacks`, and
@@ -141,6 +142,10 @@ scoping: `one_namespace_cannot_consume_another_namespaces_floor`,
 derivation is an isolation boundary, so a prefix or separator change is a
 security change. A new cross-namespace read needs a test proving it is
 one-directional and off by default.
+`usage_summary_matches_rows_for_namespace_and_period` holds that
+`GET /api/v1/namespaces/{ns}/usage` totals only that namespace's rows for the
+requested period; `usage_summary_requires_period_query` refuses a missing
+period rather than summing across periods.
 
 **Threat model and ADRs.** [ADR 0003](../adr/0003-namespaced-credentials-and-byok.md),
 [ADR 0006](../adr/0006-credential-pools-per-namespace-provider.md), and
@@ -542,7 +547,10 @@ policy on a store.
 **Regression tests.** The two copies of the shipped DDL are gated by
 `every_shipped_ddl_file_exists_in_both_locations` and
 `the_two_copies_of_each_shipped_ddl_file_are_byte_identical` — an operator
-applying `ops/postgres/*.sql` by hand and a gateway applying its embedded copy
+applying `ops/postgres/*.sql` by hand and a gateway applying its embedded copy.
+`sqlite_usage_summary_groups_by_model_and_status` holds the Store usage index
+that `GET .../usage` reads: per-model per-status counts, null cost as zero, and
+duplicate `request_id` ignored.
 must produce the same table, and a row-shape change is a new `*_v<N>.sql` rather
 than an edit. Row and statement safety: `the_row_shape_matches_the_shipped_ddl`,
 `every_column_is_bound_once_per_row`, `a_batch_never_exceeds_the_parameter_limit`,
@@ -688,6 +696,8 @@ input is an ADR-level decision, not a workflow tweak.
 at the tag: `publish-dry-run` packages each crate from its own tarball in
 dependency order, `docker-smoke` and `quickstart-smoke` boot what is shipped,
 `static-binary` proves the musl build and runs `ops/tier0-gate.sh`, the
+`openapi-smoke` dumps the generated OpenAPI 3.1 spec and typechecks a client from
+it, the
 `binary-smoke` lanes boot and serve every released target on a runner of its own
 platform and the release lanes repeat that against the archived binary, the `docs`
 lane drives both installers in dry-run with `AXOND_REQUIRE_ATTESTATION` — including

@@ -54,6 +54,7 @@ ops-venv:
 docs-check: ops-venv
     python3 ops/check-docs.py --self-test
     python3 ops/check-docs.py
+    python3 ops/check-openapi.py --self-test
     python3 ops/check-release-config.py --self-test
     python3 ops/check-release-config.py
     python3 ops/qualification-evidence.py --self-test
@@ -73,6 +74,16 @@ docs-check: ops-venv
     docker compose --env-file ops/compose/env.example config --quiet
     docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.build.yml config --quiet
     AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.stateful.yml --profile stateful config --quiet
+
+# Dump the generated OpenAPI 3.1 spec, check mounted routes, spectral-lint it,
+# and typecheck a generated TypeScript client. The client is not shipped.
+openapi-smoke:
+    mkdir -p target tests/openapi-smoke/generated
+    AXOND_OPENAPI_OUT="$PWD/target/openapi.json" cargo test -p axond --locked --bin axond -- \
+        api::tests::openapi_spec_is_31_and_covers_mounted_routes --exact
+    python3 ops/check-openapi.py --self-test
+    python3 ops/check-openapi.py target/openapi.json
+    cd tests/openapi-smoke && npm ci --ignore-scripts && npm test
 
 # The shipped Kubernetes manifests against the properties they promise, rendered
 # through Kustomize (or kubectl's copy of it). Needs PyYAML, installed into a
