@@ -4,6 +4,9 @@ metadata:
   name: axond
   namespace: axond
 spec:
+  # SQLite is the single-replica store (ADR 0063). Multi-replica fleets use the
+  # production overlay with Postgres; two replicas here would each keep a
+  # private emptyDir database and fail-close peer traffic as unknown_namespace.
   replicas: 1
   strategy:
     type: RollingUpdate

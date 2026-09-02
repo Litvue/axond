@@ -21,8 +21,10 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::Mutex;
 
 use crate::config::{
     AdmissionConfig, BudgetConfig, CatalogConfig, Config, ConfigError, Mode, RateLimitConfig,
@@ -120,55 +122,51 @@ impl Reloader {
     /// Reload from the config file and the *current* process environment, so a
     /// credential env-var exported after boot (a new BYOK tenant's key) resolves
     /// without a restart.
-    pub fn reload(&self, trigger: &'static str) -> Result<ReloadSummary, ReloadError> {
+    pub async fn reload(&self, trigger: &'static str) -> Result<ReloadSummary, ReloadError> {
         self.reload_with_env(trigger, &std::env::vars().collect())
+            .await
     }
 
     /// An unconditional reload, against an explicit environment snapshot.
-    pub fn reload_with_env(
+    pub async fn reload_with_env(
         &self,
         trigger: &'static str,
         env: &HashMap<String, String>,
     ) -> Result<ReloadSummary, ReloadError> {
-        let mut seen = self.lock_seen();
+        // Serialize reloads (including the async store seed) so two triggers
+        // cannot race the generation counter or the seen-bytes bookmark.
+        let mut seen = self.seen.lock().await;
         *seen = std::fs::read(&self.path).ok();
-        self.apply(trigger, env)
+        self.apply(trigger, env).await
     }
 
     /// Reload only if the file's bytes differ from what the last reload acted on.
     /// The watcher's entry point: an edit its operator then `SIGHUP`s is applied
     /// once, not once per trigger.
-    pub fn reload_if_changed_with_env(
+    pub async fn reload_if_changed_with_env(
         &self,
         trigger: &'static str,
         env: &HashMap<String, String>,
     ) -> Option<Result<ReloadSummary, ReloadError>> {
-        let mut seen = self.lock_seen();
+        let mut seen = self.seen.lock().await;
         // A momentarily unreadable path (mid rename) is not a change.
         let current = std::fs::read(&self.path).ok()?;
         if seen.as_deref() == Some(current.as_slice()) {
             return None;
         }
         *seen = Some(current);
-        Some(self.apply(trigger, env))
+        Some(self.apply(trigger, env).await)
     }
 
-    fn reload_if_changed(
+    async fn reload_if_changed(
         &self,
         trigger: &'static str,
     ) -> Option<Result<ReloadSummary, ReloadError>> {
         self.reload_if_changed_with_env(trigger, &std::env::vars().collect())
+            .await
     }
 
-    /// Only ever held across synchronous work, so a poisoned guard carries no
-    /// torn state: a reload reads, then publishes, and holds nothing else.
-    fn lock_seen(&self) -> MutexGuard<'_, Option<Vec<u8>>> {
-        self.seen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn apply(
+    async fn apply(
         &self,
         trigger: &'static str,
         env: &HashMap<String, String>,
@@ -231,25 +229,16 @@ impl Reloader {
                 let mut summary = ReloadSummary::between(&self.boot, &current, &candidate_snapshot);
                 summary.catalog_changed = catalog_changed;
                 summary.storage_changed = storage_changed;
-                if let Some(store) = self.state.store() {
-                    let seed = crate::store::seed_config_namespaces(
+                if let Some(store) = self.state.store()
+                    && let Err(error) = crate::store::seed_config_namespaces(
                         store.as_ref(),
                         &candidate_snapshot.config.namespace,
-                    );
-                    let result = match tokio::runtime::Handle::try_current() {
-                        Ok(handle)
-                            if handle.runtime_flavor()
-                                == tokio::runtime::RuntimeFlavor::MultiThread =>
-                        {
-                            tokio::task::block_in_place(|| handle.block_on(seed))
-                        }
-                        _ => futures::executor::block_on(seed),
-                    };
-                    if let Err(error) = result {
-                        return Err(ReloadError::Snapshot(SnapshotError::Store(
-                            error.to_string(),
-                        )));
-                    }
+                    )
+                    .await
+                {
+                    return Err(ReloadError::Snapshot(SnapshotError::Store(
+                        error.to_string(),
+                    )));
                 }
                 let generation = candidate_snapshot.generation;
                 self.state.publish(candidate_snapshot);
@@ -937,7 +926,7 @@ async fn signal_loop(reloader: Arc<Reloader>) {
         }
     };
     while hangup.recv().await.is_some() {
-        let _ = reloader.reload(TRIGGER_SIGNAL);
+        let _ = reloader.reload(TRIGGER_SIGNAL).await;
     }
 }
 
@@ -952,7 +941,7 @@ async fn watch_loop(reloader: Arc<Reloader>) {
         if !settings.watch {
             continue;
         }
-        let _ = reloader.reload_if_changed(TRIGGER_WATCH);
+        let _ = reloader.reload_if_changed(TRIGGER_WATCH).await;
     }
 }
 
@@ -1232,6 +1221,7 @@ scope = ["chat", "models"]
         file.rewrite(WITH_BYOK_TENANT);
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &tenant_env())
+            .await
             .expect("candidate is valid");
 
         assert_eq!(summary.namespaces.added, vec!["acme".to_string()]);
@@ -1286,6 +1276,7 @@ scope = ["chat", "models"]
         file.rewrite(&format!("{PLATFORM_ONLY}\n[reload]\nwatch = false\n"));
         reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("candidate is valid");
 
         assert_eq!(state.config().generation, 1, "the edit was applied");
@@ -1326,6 +1317,7 @@ env = "GW_ADMIN_BREAKGLASS"
         );
         let error = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect_err("a mode switch needs a restart");
 
         let message = error.to_string();
@@ -1349,6 +1341,7 @@ env = "GW_ADMIN_BREAKGLASS"
         file.rewrite(&epoch_config);
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("epoch candidate is valid");
         assert_eq!(
             summary.gateway_token_epochs.added,
@@ -1361,6 +1354,7 @@ env = "GW_ADMIN_BREAKGLASS"
         file.rewrite(&epoch_config.replace("min_iat = 1", "min_iat = 2"));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("changed epoch candidate is valid");
         assert_eq!(
             summary.gateway_token_epochs.changed,
@@ -1369,6 +1363,7 @@ env = "GW_ADMIN_BREAKGLASS"
 
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("no-op candidate is valid");
         assert!(summary.gateway_token_epochs.is_empty());
         assert!(summary.is_empty());
@@ -1554,6 +1549,7 @@ env = "GW_ADMIN_BREAKGLASS"
         ));
         reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("epoch candidate is valid");
 
         assert!(matches!(
@@ -1600,6 +1596,7 @@ env = "GW_ADMIN_BREAKGLASS"
 
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("verifier candidate is valid");
         assert_eq!(summary.gateway_verifiers.added, vec!["reload-kid"]);
         assert!(summary.gateway_verifiers.removed.is_empty());
@@ -1607,6 +1604,7 @@ env = "GW_ADMIN_BREAKGLASS"
         file.rewrite(PLATFORM_ONLY);
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("verifier removal is valid");
         assert!(summary.gateway_verifiers.added.is_empty());
         assert_eq!(summary.gateway_verifiers.removed, vec!["reload-kid"]);
@@ -1626,11 +1624,13 @@ env = "GW_ADMIN_BREAKGLASS"
         file.rewrite(&verifier("reload-test", "15m"));
         reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("verifier candidate is valid");
 
         file.rewrite(&verifier("reload-test", "30m"));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("changed verifier candidate is valid");
         assert!(summary.gateway_verifiers.added.is_empty());
         assert!(summary.gateway_verifiers.removed.is_empty());
@@ -1656,6 +1656,7 @@ env = "GW_ADMIN_BREAKGLASS"
         ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("changed definition and file material are valid");
         assert_eq!(summary.gateway_verifiers.changed, vec!["reload-kid"]);
         assert_ne!(
@@ -1749,6 +1750,7 @@ env = "GW_ADMIN_BREAKGLASS"
         material.rewrite("");
         let error = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect_err("empty verifier material must reject candidate");
         assert!(error.to_string().contains(material.path()));
         assert_eq!(state.config().generation, generation);
@@ -1776,11 +1778,13 @@ env = "GW_ADMIN_BREAKGLASS"
         file.rewrite(&config("reload-test"));
         reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("verifier candidate is valid");
 
         file.rewrite(&config("new-audience"));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("audience change is valid");
         assert_eq!(summary.gateway_token_audience.added, vec!["new-audience"]);
         assert_eq!(summary.gateway_token_audience.removed, vec!["reload-test"]);
@@ -1800,6 +1804,7 @@ env = "GW_ADMIN_BREAKGLASS"
         file.rewrite(WITH_BYOK_TENANT);
         let err = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect_err("the tenant's key is not exported yet");
         assert!(matches!(
             err,
@@ -1809,6 +1814,7 @@ env = "GW_ADMIN_BREAKGLASS"
 
         reloader
             .reload_with_env(TRIGGER_SIGNAL, &tenant_env())
+            .await
             .expect("resolves once the key is exported");
         assert_eq!(state.config().generation, 1);
     }
@@ -1841,6 +1847,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         ));
         Reloader::new(file.path(), state.clone())
             .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .await
             .expect("the candidate is valid");
 
         let after = state.config();
@@ -1912,6 +1919,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         ));
         Reloader::new(file.path(), state.clone())
             .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .await
             .expect("the candidate is valid");
 
         let after = state.config();
@@ -1983,6 +1991,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         ));
         Reloader::new(file.path(), state.clone())
             .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .await
             .expect("the candidate is valid");
 
         let after = state.config();
@@ -2041,6 +2050,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         ));
         Reloader::new(file.path(), state.clone())
             .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .await
             .expect("the candidate is valid");
 
         let after = state.config();
@@ -2098,6 +2108,7 @@ cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"
         );
         let error = reloader
             .reload_with_env(TRIGGER_SIGNAL, &HashMap::new())
+            .await
             .expect_err("stateful file reload is not reconciler-aware");
         assert!(matches!(error, ReloadError::StatefulUnsupported));
         assert!(
@@ -2127,6 +2138,7 @@ default = true
         );
         let err = reloader
             .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .await
             .expect_err("candidate is invalid");
 
         assert!(matches!(err, ReloadError::Config(ConfigError::Invalid(_))));
@@ -2160,6 +2172,7 @@ targets = [
         );
         let err = reloader
             .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .await
             .expect_err("cross-wire candidate must be rejected");
         let message = err.to_string();
         assert!(message.contains("mixed"), "{message}");
@@ -2181,6 +2194,7 @@ targets = [
         file.rewrite(&PLATFORM_ONLY.replace(INBOUND_KEY_ENV, "AXOND_ROTATED_KEY"));
         let err = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect_err("the rotated key is not exported");
 
         assert!(
@@ -2213,6 +2227,7 @@ targets = [
         );
         reloader
             .reload_with_env(TRIGGER_SIGNAL, &rotated)
+            .await
             .expect("resolves once the key is exported");
         let after = state.config();
         assert_eq!(after.generation, 1);
@@ -2256,6 +2271,7 @@ targets = [
         file.rewrite(PLATFORM_ONLY);
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("candidate is valid");
 
         assert_eq!(summary.models.removed, vec!["acme-fast".to_string()]);
@@ -2282,12 +2298,14 @@ targets = [
         ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("candidate is valid");
         assert!(summary.bind_changed);
         assert!(summary.is_empty());
 
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("candidate is valid");
         assert!(summary.bind_changed);
         assert_eq!(state.config().generation, 2);
@@ -2304,6 +2322,7 @@ targets = [
         ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("storage change is valid and boot-owned");
         assert!(summary.storage_changed);
         assert!(summary.restart_required());
@@ -2321,6 +2340,7 @@ targets = [
         ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("budget candidate is valid");
         assert!(summary.budget_changed);
         assert!(summary.is_empty());
@@ -2328,6 +2348,7 @@ targets = [
         file.rewrite(PLATFORM_ONLY);
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("budget removal is valid");
         assert!(!summary.budget_changed);
     }
@@ -2343,6 +2364,7 @@ targets = [
         ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("catalogue candidate is valid");
         assert!(summary.catalog_changed);
         assert!(summary.restart_required());
@@ -2356,6 +2378,7 @@ targets = [
         file.rewrite(PLATFORM_ONLY);
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("catalogue removal is valid");
         assert!(!summary.catalog_changed);
         assert!(!summary.restart_required());
@@ -2376,6 +2399,7 @@ targets = [
         ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("journal candidate is valid");
         assert!(summary.usage_journal_changed);
         assert!(summary.usage_sinks_changed);
@@ -2384,6 +2408,7 @@ targets = [
         file.rewrite(PLATFORM_ONLY);
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("journal removal is valid");
         assert!(!summary.usage_journal_changed);
     }
@@ -2399,6 +2424,7 @@ targets = [
         ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("rate limit candidate is valid");
         assert!(summary.rate_limit_changed);
         assert!(summary.is_empty());
@@ -2406,6 +2432,7 @@ targets = [
         file.rewrite(PLATFORM_ONLY);
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("rate limit removal is valid");
         assert!(!summary.rate_limit_changed);
     }
@@ -2425,6 +2452,7 @@ targets = [
                 env.insert("REDIS_URL".to_owned(), "redis://127.0.0.1:6399".to_owned());
                 env
             })
+            .await
             .expect("revocation candidate is valid");
         assert!(summary.revocation_changed);
         assert!(summary.is_empty());
@@ -2432,6 +2460,7 @@ targets = [
         file.rewrite(PLATFORM_ONLY);
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("revocation removal is valid");
         assert!(!summary.revocation_changed);
     }
@@ -2447,12 +2476,14 @@ targets = [
         file.rewrite(WITH_BYOK_TENANT);
         reloader
             .reload_with_env(TRIGGER_SIGNAL, &tenant_env())
+            .await
             .expect("candidate is valid");
         assert_eq!(state.config().generation, 1);
 
         assert!(
             reloader
                 .reload_if_changed_with_env(TRIGGER_WATCH, &tenant_env())
+                .await
                 .is_none()
         );
         assert_eq!(state.config().generation, 1);
@@ -2460,6 +2491,7 @@ targets = [
         file.rewrite(PLATFORM_ONLY);
         reloader
             .reload_if_changed_with_env(TRIGGER_WATCH, &inbound_env())
+            .await
             .expect("the file changed")
             .expect("candidate is valid");
         assert_eq!(state.config().generation, 2);
@@ -2473,6 +2505,7 @@ targets = [
 
         let err = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect_err("no file, no candidate");
         assert!(matches!(err, ReloadError::Config(_)));
         assert_eq!(state.config().generation, 0);

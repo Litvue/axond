@@ -5,9 +5,12 @@
 [server]
 bind = "0.0.0.0:8080"
 
+# SQLite is single-replica (ADR 0063). This production-floor layout scales past
+# one replica, so the namespace store is Postgres. Supply the DSN via the env
+# var named below (Key Vault → Container Apps secret).
 [storage]
-backend = "sqlite"
-path = "/tmp/axond.sqlite"
+backend = "postgres"
+dsn_env = "AXOND_STORAGE_DSN"
 
 [shutdown]
 drain_grace_ms = 5_000

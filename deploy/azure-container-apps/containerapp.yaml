@@ -25,6 +25,9 @@ properties:
       - name: gw-inbound-platform
         keyVaultUrl: https://<vault>.vault.azure.net/secrets/gw-inbound-platform
         identity: /subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<identity>
+      - name: axond-storage-dsn
+        keyVaultUrl: https://<vault>.vault.azure.net/secrets/axond-storage-dsn
+        identity: /subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<identity>
       - name: axond-toml
         keyVaultUrl: https://<vault>.vault.azure.net/secrets/axond-toml
         identity: /subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<identity>
@@ -37,7 +40,7 @@ properties:
     terminationGracePeriodSeconds: 30
     scale:
       minReplicas: 1
-      maxReplicas: 1
+      maxReplicas: 3
       rules:
         - name: http-concurrency
           http:
@@ -64,6 +67,8 @@ properties:
             secretRef: gw-platform-anthropic
           - name: GW_INBOUND_PLATFORM_KEY
             secretRef: gw-inbound-platform
+          - name: AXOND_STORAGE_DSN
+            secretRef: axond-storage-dsn
           # Optional. Unset = JSON logs and usage on stdout only.
           # - name: OTEL_EXPORTER_OTLP_ENDPOINT
           #   value: https://<collector>:4318
