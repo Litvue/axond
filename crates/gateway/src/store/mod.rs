@@ -333,9 +333,6 @@ pub async fn seed_config_namespaces(
         if validate_namespace_id(&namespace.id).is_err() {
             continue;
         }
-        if store.namespace_incarnation(&namespace.id).await?.is_some() {
-            continue;
-        }
         let record = NamespaceRecord {
             id: namespace.id.clone(),
             attrs: serde_json::json!({}),
