@@ -54,7 +54,9 @@ owned the response body (`ok`, `client_cancelled`, `partial`, or an error).
 The stdout and OTLP sinks carry the same fields, minus `id` and
 `reasoning_tokens`: stdout emits the record as JSON (`snake_case`, `trace_id`
 omitted when absent), and the OTLP sink emits it as an OTel log record with
-`event_name = axond.usage` and `axond.*` / `gen_ai.*` attributes.
+`event_name = axond.usage` and `axond.*` / `gen_ai.*` attributes. OTLP omits
+`axond.cost_microdollars` when cost is NULL so unpriced traffic is not
+exported as zero; `Some(0)` is still emitted.
 
 ## Versioning policy
 

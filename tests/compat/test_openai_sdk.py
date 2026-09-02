@@ -109,6 +109,19 @@ def test_models_are_listed(client):
     assert [model.id for model in client.models.list()] == []
 
 
+def test_unprefixed_model_is_refused_as_model_unprefixed(sdk_base_url, upstream):
+    client = OpenAI(base_url=sdk_base_url, api_key=GATEWAY_KEY, max_retries=0)
+    before = len(upstream.requests)
+    with pytest.raises(openai.APIStatusError) as caught:
+        client.chat.completions.create(
+            model=CHAT,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    assert caught.value.status_code == 400
+    assert caught.value.response.json()["error"]["type"] == "model_unprefixed"
+    assert len(upstream.requests) == before
+
+
 def test_an_unknown_gateway_key_is_rejected(sdk_base_url):
     stranger = OpenAI(base_url=sdk_base_url, api_key="not-a-gateway-key", max_retries=0)
     with pytest.raises(openai.AuthenticationError):

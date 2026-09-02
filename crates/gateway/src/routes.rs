@@ -1547,7 +1547,7 @@ async fn serve(
         .to_string();
 
     if let Some(scope) = &caller.alias_scope
-        && !scope.permits(&alias)
+        && !alias_scope_permits(scope, &alias)
     {
         return Err(GatewayError::TokenForbidden(
             TokenVerificationError::AliasNotPermitted { alias },
@@ -3009,6 +3009,18 @@ const UNPRICED_TARGET: ModelPrice = ModelPrice {
 };
 
 /// Split `provider-id/model-id` on the first `/`.
+/// Gateway-key `alias_scope` matches the prefixed request id or the bare
+/// upstream id, the same union blocklists use. A scope written as `gpt-4o` or
+/// `gpt-*` still permits `openai/gpt-4o`.
+fn alias_scope_permits(scope: &AliasScope, model: &str) -> bool {
+    if scope.permits(model) {
+        return true;
+    }
+    model
+        .split_once('/')
+        .is_some_and(|(_, bare)| !bare.is_empty() && scope.permits(bare))
+}
+
 fn split_model_id(model: &str) -> Result<(&str, &str), GatewayError> {
     let Some((provider, id)) = model.split_once('/') else {
         return Err(GatewayError::ModelUnprefixed(model.to_owned()));
@@ -6806,6 +6818,63 @@ env = "AXOND_PLATFORM_OPENAI"
             let json: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["error"]["type"], "token_alias_not_permitted");
         }
+    }
+
+    #[tokio::test]
+    async fn alias_scope_matches_prefixed_and_bare_model_ids() {
+        let (base_url, hits) = controllable_upstream(
+            Arc::new(AtomicBool::new(false)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let state = test_state_with_base_url(&base_url);
+        let scoped = |model: &str, scope: &str| {
+            let state = state.clone();
+            let model = model.to_owned();
+            let scope = scope.to_owned();
+            async move {
+                serve(
+                    state.clone(),
+                    HeaderMap::new(),
+                    json!({"model": model, "messages": []}),
+                    Route::ChatCompletions,
+                    state.config(),
+                    InboundKey {
+                        namespace: "platform".to_owned(),
+                        subject: "restricted".to_owned(),
+                        authority: PrincipalAuthority::MintedToken,
+                        signer_kid: Some("test-kid".to_owned()),
+                        scope: None,
+                        alias_scope: Some(AliasScope::parse([scope]).unwrap()),
+                        max_request_microdollars: None,
+                        can_mint: false,
+                        jti: None,
+                        namespace_grant: None,
+                        attrs: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap_or_else(|error| error.into_response())
+            }
+        };
+
+        for scope in ["gpt-4o", "gpt-*"] {
+            let response = scoped("openai/gpt-4o", scope).await;
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_ne!(
+                json["error"]["type"], "token_alias_not_permitted",
+                "scope `{scope}` should permit openai/gpt-4o: {json}"
+            );
+        }
+        assert!(hits.load(Ordering::SeqCst) > 0);
+
+        let denied = scoped("openai/other", "gpt-4o").await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let bytes = denied.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "token_alias_not_permitted");
     }
 
     #[tokio::test]
