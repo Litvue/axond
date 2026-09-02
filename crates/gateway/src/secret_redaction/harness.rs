@@ -23,8 +23,9 @@
 //! - **an alias's targets**, because projecting a catalogue is its own slice;
 //! - **which namespace an inbound key binds to**, because binding a caller to a
 //!   projected namespace is the principal slice's (#252). A projected project is
-//!   reached by a qualified id no `axond.toml` can declare, so the harness
-//!   rebinds the bootstrap key to it rather than inventing an identity model.
+//!   named `tenant/project`, which is not a request-path NamespaceId, so the
+//!   harness rewrites that label to one URL segment and rebinds the bootstrap
+//!   key to it rather than copying credentials onto `platform`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -123,9 +124,16 @@ pub(crate) fn bootstrap_env() -> HashMap<String, String> {
     )])
 }
 
-/// The namespace the fixture tenant's project is projected as: what a request
-/// names to reach the credential this suite resolves.
+/// The namespace the fixture tenant's project is projected as.
 pub(crate) const SERVING_NAMESPACE: &str = "acme/core";
+
+/// One-segment request-path id for [`SERVING_NAMESPACE`] (ADR 0063).
+/// `/` is rewritten to `-`: compiled slugs allow `-`, not `.` or `/`.
+pub(crate) const SERVING_PATH_NS: &str = "acme-core";
+
+fn addressable_namespace_id(id: &str) -> String {
+    id.replace('/', "-")
+}
 
 /// A compiler that resolves each revision's credential references through a
 /// secret store, then builds a whole snapshot from the result.
@@ -208,21 +216,26 @@ impl CandidateCompiler for SecretResolvingCompiler {
                 .any(|namespace| namespace.id == SERVING_NAMESPACE),
             "the fixture project must project as {SERVING_NAMESPACE}"
         );
-        // Inbound keys stay on the one-segment bootstrap namespace (`platform`).
-        // ADR 0063 ids are `[A-Za-z0-9._-]+`; `acme/core` is not a request-path
-        // or management-API segment. Copy projected credentials onto platform
-        // so `/ns/platform/v1` can present the resolved material.
-        let platform_creds: Vec<crate::config::Credential> = config
-            .credential
-            .iter()
-            .filter(|credential| credential.namespace == SERVING_NAMESPACE)
-            .cloned()
-            .map(|mut credential| {
-                credential.namespace = "platform".to_owned();
-                credential
-            })
-            .collect();
-        config.credential.extend(platform_creds);
+        // Projected `tenant/project` labels are not NamespaceIds. Rewrite them
+        // to one segment so credential ownership stays on the projected
+        // namespace and `/ns/{ns}/v1` can name it.
+        for namespace in &mut config.namespace {
+            namespace.id = addressable_namespace_id(&namespace.id);
+        }
+        for credential in &mut config.credential {
+            credential.namespace = addressable_namespace_id(&credential.namespace);
+        }
+        for key in &mut config.gateway_key {
+            key.namespace = addressable_namespace_id(SERVING_NAMESPACE);
+        }
+        for principal in &mut config.projected_principals {
+            principal.namespace = addressable_namespace_id(&principal.namespace);
+        }
+        for model in &mut config.model {
+            if let Some(namespace) = &model.namespace {
+                model.namespace = Some(addressable_namespace_id(namespace));
+            }
+        }
         for resource in revision.state().resources() {
             if resource.reference.kind != ResourceKind::Alias {
                 continue;
@@ -646,7 +659,7 @@ fn settings() -> ConvergenceSettings {
 
 /// A caller's request, authenticated with the inbound sentinel.
 pub(crate) fn chat_request() -> Request<Body> {
-    Request::post("/ns/platform/v1/chat/completions")
+    Request::post(format!("/ns/{SERVING_PATH_NS}/v1/chat/completions"))
         .header("content-type", "application/json")
         .header(
             axum::http::header::AUTHORIZATION,
