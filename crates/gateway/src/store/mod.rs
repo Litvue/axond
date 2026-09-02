@@ -144,7 +144,9 @@ pub trait Store: Send + Sync {
         blocklist: Option<Vec<String>>,
     ) -> Result<Option<NamespaceRecord>, StoreError>;
     /// Remove the namespace and its live budget ledger in one transaction.
-    /// Usage rows are retained. Missing id is `Ok(false)`.
+    /// Usage rows are retained. Reservation rows are kept so an in-flight
+    /// settle can see the incarnation it reserved under. Missing id is
+    /// `Ok(false)`.
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError>;
     /// Seed addressable namespace ids without `spawn_blocking`.
     fn seed_namespaces_blocking(
@@ -178,7 +180,8 @@ pub trait Store: Send + Sync {
     ) -> Result<BudgetReserve, StoreError>;
 
     /// Charge `actual` and release the hold in one operation. A missing hold
-    /// (expired) still records spend against `period`.
+    /// (expired) still records spend against `period` when the namespace row
+    /// exists. A hold from a prior incarnation is dropped without charging.
     async fn settle_budget(
         &self,
         namespace: &str,
@@ -665,6 +668,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_settle_after_recreate_does_not_charge_new_budget() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 77, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        seeded(&store).await;
+        let rec = store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("recreate");
+        assert_eq!(rec.spent_microdollars, 0);
+        assert_eq!(rec.reserved_microdollars, 0);
+        store
+            .settle_budget("wsp_x", "p", "r1", 77)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 0);
+    }
+
+    #[tokio::test]
     async fn sqlite_in_flight_hold_counts_and_settle_is_one_operation() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
@@ -892,7 +925,7 @@ mod tests {
         assert!(!store.delete_namespace(&ns).await.expect("repeat"));
         assert!(store.get_namespace(&ns).await.expect("get").is_none());
         assert!(store.get_budget(&ns, "p").await.expect("budget").is_none());
-        assert_eq!(store.reservation_count(&ns).await.expect("holds"), 0);
+        assert_eq!(store.reservation_count(&ns).await.expect("holds"), 1);
         let usage = store.summarize_usage(&ns, "p").await.expect("summarize");
         assert_eq!(
             usage,
@@ -925,6 +958,42 @@ mod tests {
                 .expect("closed"),
             BudgetReserve::Exceeded
         ));
+    }
+
+    #[tokio::test]
+    async fn postgres_settle_after_recreate_does_not_charge_new_budget() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("put");
+        store
+            .reserve_budget(&ns, 77, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace(&ns).await.expect("delete"));
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        let rec = store
+            .put_budget(&ns, "p", 10_000)
+            .await
+            .expect("new ledger");
+        assert_eq!(rec.spent_microdollars, 0);
+        assert_eq!(rec.reserved_microdollars, 0);
+        store
+            .settle_budget(&ns, "p", "r1", 77)
+            .await
+            .expect("late settle");
+        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 0);
+        assert_eq!(store.reservation_count(&ns).await.expect("holds"), 0);
     }
 
     #[tokio::test]
