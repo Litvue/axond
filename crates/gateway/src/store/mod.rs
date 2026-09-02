@@ -179,13 +179,10 @@ pub trait Store: Send + Sync {
         reservation_id: &str,
     ) -> Result<BudgetReserve, StoreError>;
 
-    /// Charge `actual` and release the hold in one operation. A missing hold
-    /// (expired) still records spend against `period` when the namespace row
-    /// exists. A hold from a prior incarnation is dropped without charging.
-    ///
-    /// TTL expiry of an old incarnation is not protected: once the hold row
-    /// is gone, settle sees missing-hold + live namespace and charges, same
-    /// as live-ns expiry. The reincarnation guard is for unexpired holds.
+    /// Charge `actual` and release the hold in one operation. Charge only when
+    /// a reservation or expire-tombstone records an incarnation that matches
+    /// the live namespace. A prior-incarnation hold (row or tombstone) is
+    /// dropped without charging. An unknown reservation id is a no-op.
     async fn settle_budget(
         &self,
         namespace: &str,
@@ -734,9 +731,8 @@ mod tests {
             .await
             .expect("get")
             .expect("row");
-        // Hold row is gone, so this is missing-hold + live ns and charges —
-        // TTL expiry of an old incarnation is not protected.
-        assert_eq!(got.spent_microdollars, 10);
+        // Expire-delete wrote a tombstone for incarnation 1; current is 2.
+        assert_eq!(got.spent_microdollars, 0);
         assert_eq!(got.reserved_microdollars, 1);
     }
 
@@ -1037,6 +1033,48 @@ mod tests {
         assert_eq!(got.spent_microdollars, 0);
         assert_eq!(got.reserved_microdollars, 0);
         assert_eq!(store.reservation_count(&ns).await.expect("holds"), 0);
+    }
+
+    #[tokio::test]
+    async fn postgres_delete_recreate_expires_any_incarnation_hold() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("put");
+        store
+            .reserve_budget(&ns, 10, Duration::from_millis(1), "old")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace(&ns).await.expect("delete"));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        store
+            .put_budget(&ns, "p", 10_000)
+            .await
+            .expect("new ledger");
+        match store
+            .reserve_budget(&ns, 1, Duration::from_secs(30), "new")
+            .await
+            .expect("expire path")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget(&ns, "p", "old", 10)
+            .await
+            .expect("late settle after TTL");
+        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
     }
 
     #[tokio::test]
@@ -1375,6 +1413,10 @@ mod tests {
                      id text PRIMARY KEY NOT NULL,
                      n  bigint NOT NULL
                  );
+                 CREATE TABLE axond_store_budget_reservation_tombstone (
+                     id          text PRIMARY KEY NOT NULL,
+                     incarnation bigint NOT NULL
+                 );
                  INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
                  INSERT INTO axond_budget
                      (namespace, period, limit_microdollars, spent_microdollars)
@@ -1457,6 +1499,10 @@ mod tests {
                  CREATE TABLE axond_namespace_incarnation (
                      id text PRIMARY KEY NOT NULL,
                      n  bigint NOT NULL
+                 );
+                 CREATE TABLE axond_store_budget_reservation_tombstone (
+                     id          text PRIMARY KEY NOT NULL,
+                     incarnation bigint NOT NULL
                  );
                  INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
                  INSERT INTO axond_budget
@@ -1788,6 +1834,18 @@ mod tests {
         assert!(
             !column,
             "create_table=false must not ALTER reservation incarnation"
+        );
+        let tombstone: bool = setup
+            .query_one(
+                "SELECT to_regclass('axond_store_budget_reservation_tombstone') IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("tombstone")
+            .get(0);
+        assert!(
+            !tombstone,
+            "create_table=false must not CREATE reservation tombstone"
         );
     }
 

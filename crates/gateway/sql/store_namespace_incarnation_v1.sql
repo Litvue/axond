@@ -7,9 +7,10 @@
 --     psql "$AXOND_STORAGE_DSN" -f ops/postgres/store_namespace_incarnation_v1.sql
 --
 -- Delete bumps `n` and keeps reservation rows so a late settle cannot
--- charge a later generation of the same id. `create_table = false` only
--- probes that this table and the reservation `incarnation` column exist;
--- it does not CREATE or ALTER.
+-- charge a later generation of the same id. Expired holds become a
+-- compact (id, incarnation) tombstone for the same reason.
+-- `create_table = false` only probes these objects and the reservation
+-- `incarnation` column; it does not CREATE or ALTER.
 
 CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (
     id text PRIMARY KEY NOT NULL,
@@ -18,3 +19,8 @@ CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (
 
 ALTER TABLE axond_store_budget_reservation
     ADD COLUMN IF NOT EXISTS incarnation bigint NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS axond_store_budget_reservation_tombstone (
+    id          text PRIMARY KEY NOT NULL,
+    incarnation bigint NOT NULL
+);
