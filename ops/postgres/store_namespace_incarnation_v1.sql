@@ -9,8 +9,10 @@
 -- Delete bumps `n` and keeps reservation rows so a late settle cannot
 -- charge a later generation of the same id. Expired holds become a
 -- compact (id, incarnation, expires_at) tombstone for the same reason.
--- Reserve vacuums tombstones with expires_at < now(); a later settle of
--- an unknown id is a no-op.
+-- Tombstone `expires_at` is now()+reserve-TTL (not the hold's already-past
+-- deadline) so a request that outlived its hold can still settle after
+-- later admissions. Reserve vacuums tombstones past that retention;
+-- a later settle of an unknown id is a no-op.
 -- `create_table = false` probes these objects. Connect still
 -- `ADD COLUMN IF NOT EXISTS incarnation` on the reservation table after
 -- a draft rename (no-op if present); it does not CREATE tables.

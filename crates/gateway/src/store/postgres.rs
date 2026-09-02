@@ -977,40 +977,28 @@ async fn settle_tx(
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    // Claim the hold (or its tombstone) in the same statement that removes it
+    // so two settlements cannot both observe the incarnation.
     let held_incarnation: Option<i64> = tx
         .query_opt(
-            "SELECT incarnation FROM axond_store_budget_reservation WHERE id = $1",
+            "DELETE FROM axond_store_budget_reservation WHERE id = $1
+             RETURNING incarnation",
             &[&reservation_id],
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .map(|row| row.get(0));
-    tx.execute(
-        "DELETE FROM axond_store_budget_reservation WHERE id = $1",
-        &[&reservation_id],
-    )
-    .await
-    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     let held_incarnation = match held_incarnation {
         Some(n) => Some(n),
-        None => {
-            let n: Option<i64> = tx
-                .query_opt(
-                    "SELECT incarnation FROM axond_store_budget_reservation_tombstone
-                     WHERE id = $1",
-                    &[&reservation_id],
-                )
-                .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))?
-                .map(|row| row.get(0));
-            tx.execute(
-                "DELETE FROM axond_store_budget_reservation_tombstone WHERE id = $1",
+        None => tx
+            .query_opt(
+                "DELETE FROM axond_store_budget_reservation_tombstone WHERE id = $1
+                 RETURNING incarnation",
                 &[&reservation_id],
             )
             .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            n
-        }
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?
+            .map(|row| row.get(0)),
     };
     let current: i64 = tx
         .query_opt(
@@ -1069,8 +1057,9 @@ async fn hold(
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .map(|row| row.get(0))
         .unwrap_or(1);
-    // Vacuum expired tombstones first. Then copy newly expired holds so
-    // settle can still classify incarnation until the next vacuum.
+    // Vacuum tombstones whose *retention* has elapsed. Copy newly expired
+    // holds with a fresh deadline of now()+ttl so a request that outlived
+    // its hold can still settle after later admissions.
     tx.execute(
         "DELETE FROM axond_store_budget_reservation_tombstone
          WHERE expires_at < now()",
@@ -1081,12 +1070,13 @@ async fn hold(
     tx.execute(
         "INSERT INTO axond_store_budget_reservation_tombstone
             (id, incarnation, expires_at)
-         SELECT id, incarnation, expires_at FROM axond_store_budget_reservation
+         SELECT id, incarnation, now() + ($2::double precision / 1000.0) * interval '1 second'
+         FROM axond_store_budget_reservation
          WHERE namespace = $1 AND expires_at <= now()
          ON CONFLICT (id) DO UPDATE SET
             incarnation = EXCLUDED.incarnation,
             expires_at = EXCLUDED.expires_at",
-        &[&namespace],
+        &[&namespace, &ttl_ms],
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
