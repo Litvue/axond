@@ -166,6 +166,11 @@ pub struct Config {
     /// (ADR 0043, ADR 0051).
     #[serde(default)]
     pub catalog: CatalogConfig,
+    /// Background refresh of each provider's upstream `GET /models` listing.
+    /// Default interval is five minutes; first round runs at boot. Not on the
+    /// inference path.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 /// Which authority owns durable resources for the whole process (ADR 0027).
@@ -202,7 +207,7 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 32] = [
+const OVERRIDE_KEYS: [&str; 33] = [
     "mode",
     "server",
     "storage",
@@ -235,6 +240,7 @@ const OVERRIDE_KEYS: [&str; 32] = [
     "admission",
     "revocation",
     "catalog",
+    "discovery",
 ];
 
 /// Whether one segment of a namespace id is a slug: ASCII alphanumerics, `-`,
@@ -747,6 +753,31 @@ impl AdminBreakglass {
             .filter(|id| !id.trim().is_empty())
             .or_else(|| self.source().map(|(_, reference)| reference))
             .unwrap_or("<unnamed>")
+    }
+}
+
+/// Background provider-model listing. Off the inference path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoveryConfig {
+    #[serde(default = "default_discovery_refresh_interval_seconds")]
+    pub refresh_interval_seconds: u64,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_seconds: default_discovery_refresh_interval_seconds(),
+        }
+    }
+}
+
+fn default_discovery_refresh_interval_seconds() -> u64 {
+    300
+}
+
+impl DiscoveryConfig {
+    pub fn interval(&self) -> Duration {
+        Duration::from_secs(self.refresh_interval_seconds)
     }
 }
 
@@ -2878,6 +2909,11 @@ impl Config {
         // Both modes. Before the mode match so a stateful file without
         // control_plane still fails on a withdrawn backend.
         self.validate_budget()?;
+        if self.discovery.refresh_interval_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "discovery.refresh_interval_seconds must be at least 1".into(),
+            ));
+        }
         match self.mode {
             Mode::Stateless => self.validate_stateless(),
             Mode::Stateful => self.validate_stateful(),

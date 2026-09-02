@@ -405,6 +405,14 @@ impl Credentials {
         self.plan_at(config, namespace, provider, Instant::now())
     }
 
+    /// First configured credential for a provider, without advancing pool
+    /// rotation or consuming a parked-key probe. Discovery is off the request
+    /// path and must not perturb dispatch.
+    pub fn discovery_lease(&self, config: &Config, provider: &str) -> Option<CredentialLease> {
+        let (pool, _) = self.resolve_pool(config, &self.platform_ns, provider)?;
+        pool.entries.first().map(lease)
+    }
+
     /// Plan only the first configured credential for an affinity-pinned route.
     /// Provider-stored response ids are scoped to the credential's project or
     /// organization, so rotating to another key would break continuity — for the
