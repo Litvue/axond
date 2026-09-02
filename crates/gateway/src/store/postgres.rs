@@ -80,8 +80,12 @@ impl PostgresStore {
     }
 
     async fn checkin(&self, client: Client) {
-        if !client.is_closed() {
-            self.idle.lock().await.push(client);
+        if client.is_closed() {
+            return;
+        }
+        let mut idle = self.idle.lock().await;
+        if idle.len() < 8 {
+            idle.push(client);
         }
     }
 
