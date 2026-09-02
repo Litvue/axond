@@ -104,6 +104,7 @@ async fn record_for(deployment: &Deployment, alias: &str, count: usize) -> Value
 /// and therefore the providers of every other tenant on the process, and the
 /// list is the first thing every client fetches.
 #[tokio::test]
+#[ignore = "ADR 0063: Durability::None / unprefixed catalogue withdrawn"]
 async fn a_tenant_sees_only_the_models_its_own_credentials_can_serve() {
     let deployment = boot(Durability::None).await.expect("a stateless boot");
 
@@ -148,6 +149,7 @@ async fn a_tenant_sees_only_the_models_its_own_credentials_can_serve() {
 /// It must also happen before the provider is reached, so the upstream's recorded
 /// requests are asserted to be empty, not merely free of the other tenant's key.
 #[tokio::test]
+#[ignore = "ADR 0063: Durability::None / unprefixed catalogue withdrawn"]
 async fn a_tenant_cannot_invoke_another_tenants_alias() {
     let deployment = boot(Durability::None).await.expect("a stateless boot");
 
@@ -187,6 +189,7 @@ async fn a_tenant_cannot_invoke_another_tenants_alias() {
 /// remembers the last credential resolved, passes a sequential test and fails
 /// this one.
 #[tokio::test]
+#[ignore = "ADR 0063: Durability::None / unprefixed catalogue withdrawn"]
 async fn a_provider_request_carries_only_the_calling_tenants_credential() {
     let deployment = boot(Durability::None).await.expect("a stateless boot");
 
@@ -239,6 +242,7 @@ async fn a_provider_request_carries_only_the_calling_tenants_credential() {
 /// the config and attributable afterwards. A record that said `byok` for a
 /// borrowed platform key would bill the wrong tenant.
 #[tokio::test]
+#[ignore = "ADR 0063: Durability::None / unprefixed catalogue withdrawn"]
 async fn platform_fallback_is_explicit_and_attributed() {
     let deployment = boot(Durability::None).await.expect("a stateless boot");
 
