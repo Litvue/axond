@@ -35,7 +35,7 @@ use crate::backends::secrets::SecretMaterial;
 use crate::budget::BudgetStore;
 use crate::config::{
     CatalogBinding, Config, GatewayVerifierAlgorithm, Namespace, NamespacePolicy,
-    NamespaceStaticPolicy, ProjectIdentity, ProjectedPrincipal, ProviderKind,
+    NamespaceStaticPolicy, ProjectIdentity, ProjectedPrincipal, ProviderKind, StorageBackend,
 };
 use crate::convergence::SystemClock;
 use crate::convergence::secrets::{MaterialLedger, ResolvedSecretBinding, ResolvedSecrets};
@@ -72,6 +72,7 @@ use crate::status::probes::{BackendProbe, CatalogProbe, ControlPlaneProbe};
 use crate::status::registry::{
     CachedStatusRegistry, ObservationPlan, StatusRefresher, StatusSettings,
 };
+use crate::store::Store;
 use crate::usage::UsageDelivery;
 #[cfg(test)]
 use crate::usage::UsageFanout;
@@ -121,6 +122,8 @@ pub struct Inner {
     /// path never reaches the source or the store, and holding this handle is
     /// what makes that structural rather than a rule (ADR 0043).
     pub catalogue: Option<Arc<CatalogStatus>>,
+    /// Durable namespace (and later budget) store. Required (ADR 0063).
+    pub store: std::sync::Arc<dyn crate::store::Store>,
     /// Constructor-only override for primitive tests. Shipped chains live only
     /// in [`ConfigSnapshot`].
     #[cfg(test)]
@@ -1318,6 +1321,8 @@ pub enum SnapshotError {
     Middleware(#[from] MiddlewarePlanError),
     #[error(transparent)]
     Credentials(#[from] CredentialError),
+    #[error("store: {0}")]
+    Store(String),
     #[error(
         "gateway_key for namespace `{namespace}` references env var `{env}`, which is unset or empty"
     )]
@@ -1529,7 +1534,7 @@ impl ConfigSnapshot {
                     max_request_microdollars: None,
                     can_mint: k.can_mint,
                     jti: None,
-                    namespace_grant: None,
+                    namespace_grant: Some(crate::namespace::NamespaceGrant::all()),
                 },
             });
             gateway_key_fingerprints
@@ -1965,11 +1970,23 @@ impl AppState {
             status: observability.status,
             revision: observability.revision,
             catalogue: observability.catalogue,
+            store: open_store_sync(&snapshot.config)?,
             #[cfg(test)]
             middleware: MiddlewareChain::empty(),
             middleware_runtime: MiddlewareRuntime::default(),
             config: ArcSwap::from_pointee(snapshot),
         })))
+    }
+
+    pub fn store(&self) -> Option<&std::sync::Arc<dyn crate::store::Store>> {
+        Some(&self.0.store)
+    }
+
+    #[allow(dead_code)]
+    pub fn set_store(&mut self, store: std::sync::Arc<dyn crate::store::Store>) {
+        if let Some(inner) = std::sync::Arc::get_mut(&mut self.0) {
+            inner.store = store;
+        }
     }
 
     /// Install a test or boot-constructed content chain before the state is
@@ -2062,6 +2079,36 @@ pub fn adapter_for(kind: ProviderKind) -> Box<dyn ProviderAdapter> {
     }
 }
 
+fn open_store_sync(config: &Config) -> Result<Arc<dyn crate::store::Store>, SnapshotError> {
+    let storage = config
+        .storage
+        .as_ref()
+        .ok_or_else(|| SnapshotError::Store("`[storage]` is required".into()))?;
+    match storage.backend {
+        StorageBackend::Sqlite => {
+            let path = storage.path.as_deref().unwrap_or(":memory:");
+            let store = crate::store::SqliteStore::open(path)
+                .map_err(|error| SnapshotError::Store(error.to_string()))?;
+            for namespace in &config.namespace {
+                let record = crate::store::NamespaceRecord {
+                    id: namespace.id.clone(),
+                    attrs: serde_json::json!({}),
+                    blocklist: None,
+                };
+                let _ = futures::executor::block_on(store.put_namespace(record));
+            }
+            Ok(Arc::new(store))
+        }
+        StorageBackend::Postgres => {
+            // `serve()` replaces this with a connected Postgres store before
+            // the listener binds. Tests that never connect still get a store.
+            let store = crate::store::SqliteStore::open(":memory:")
+                .map_err(|error| SnapshotError::Store(error.to_string()))?;
+            Ok(Arc::new(store))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2091,6 +2138,10 @@ mod tests {
     fn config_with(gateway_keys: &str) -> Config {
         Config::from_toml_str(&format!(
             r#"
+[storage]
+backend = "sqlite"
+path = ":memory:"
+
 [[namespace]]
 id = "platform"
 default = true

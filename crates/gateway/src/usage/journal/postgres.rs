@@ -1315,6 +1315,7 @@ impl StoredRecord {
             request_id: self.request_id,
             trace_id: self.trace_id,
             namespace: self.namespace,
+            attrs: None,
             subject: self.subject,
             signer_kid: self.signer_kid,
             model: self.model,

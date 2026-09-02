@@ -1501,6 +1501,7 @@ impl Accounting {
             request_id: self.ctx.identity.request_id.to_string(),
             trace_id: self.ctx.identity.trace_id.clone(),
             namespace: self.ctx.namespace.clone(),
+            attrs: None,
             subject: self.ctx.subject.clone(),
             signer_kid: self.ctx.signer_kid.clone(),
             model: self.ctx.alias.clone(),

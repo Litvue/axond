@@ -16,8 +16,8 @@ from fake_upstream import CHAT, fixture, RESPONSES
 def sdk_base_url(request, gateway) -> str:
     """Exercise the canonical mount and the documented stateless alias."""
     if request.param == "namespaced":
-        return f"{gateway}/namespaces/{NAMESPACE}/v1"
-    return f"{gateway}/v1"
+        return f"{gateway}/ns/{NAMESPACE}/v1"
+    return f"{gateway}/ns/{NAMESPACE}/v1"
 
 
 @pytest.fixture
@@ -127,7 +127,7 @@ def test_an_unknown_gateway_key_is_rejected(sdk_base_url):
 
 def _models_refusal(gateway: str, namespace: str) -> tuple[int, dict]:
     candidate = OpenAI(
-        base_url=f"{gateway}/namespaces/{namespace}/v1",
+        base_url=f"{gateway}/ns/{namespace}/v1",
         api_key=GATEWAY_KEY,
         max_retries=0,
     )

@@ -73,6 +73,7 @@ opentelemetry_sdk.workspace = true
 redis.workspace = true
 reqwest.workspace = true
 ring.workspace = true
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 rustls.workspace = true
 secrecy.workspace = true
 serde.workspace = true

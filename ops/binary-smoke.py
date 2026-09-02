@@ -53,6 +53,10 @@ CONFIG_TEMPLATE = """# Written by ops/binary-smoke.py; ports are claimed at run 
 [server]
 bind = "{bind}"
 
+[storage]
+backend = "sqlite"
+path = "{sqlite}"
+
 [[namespace]]
 id = "platform"
 default = true
@@ -165,13 +169,13 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
     if ready.status != 200 or ready.body.strip() != "ready":
         raise SmokeFailure(f"/readyz answered {ready.status} {ready.body.strip()!r}")
 
-    anonymous = request(f"{base_url}/v1/models")
+    anonymous = request(f"{base_url}/ns/platform/v1/models")
     if anonymous.status != 401:
         raise SmokeFailure(
             f"unauthenticated /v1/models answered {anonymous.status} instead of 401"
         )
 
-    models = request(f"{base_url}/v1/models", key=GATEWAY_KEY)
+    models = request(f"{base_url}/ns/platform/v1/models", key=GATEWAY_KEY)
     if models.status != 200:
         raise SmokeFailure(
             f"authenticated /v1/models answered {models.status}: {models.body}"
@@ -181,7 +185,7 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
         raise SmokeFailure(f"/v1/models omitted the configured alias {ALIAS}: {served}")
 
     unknown = request(
-        f"{base_url}/v1/chat/completions",
+        f"{base_url}/ns/platform/v1/chat/completions",
         key=GATEWAY_KEY,
         payload={
             "model": "does-not-exist",
@@ -199,7 +203,7 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
         )
 
     completion = request(
-        f"{base_url}/v1/chat/completions",
+        f"{base_url}/ns/platform/v1/chat/completions",
         key=GATEWAY_KEY,
         payload={
             "model": ALIAS,
@@ -248,6 +252,7 @@ def smoke(binary: Path) -> None:
         config.write_text(
             CONFIG_TEMPLATE.format(
                 bind=f"127.0.0.1:{port}",
+                sqlite=tmp / "axond.sqlite",
                 upstream=upstream.base_url,
                 alias=ALIAS,
                 target_model=CHAT,

@@ -60,6 +60,10 @@ def _config(bind: str, upstream: str) -> str:
 [server]
 bind = "{bind}"
 
+[storage]
+backend = "sqlite"
+path = ":memory:"
+
 [[namespace]]
 id = "{NAMESPACE}"
 default = true

@@ -22,6 +22,7 @@
 mod admin;
 mod admission;
 mod aliases;
+mod api;
 // Derived availability and discovery evaluation (#206). Contract only: no
 // provider is polled, no observation is persisted, and no request is enforced
 // against a verdict, so `serve` constructs no index and every snapshot carries
@@ -88,6 +89,7 @@ mod state;
 // `/readyz` reflects whether a complete serving snapshot is active.
 #[allow(dead_code)]
 mod status;
+mod store;
 mod streaming;
 mod telemetry;
 // One tenant cannot reach another (#225), asserted at the layers a black-box

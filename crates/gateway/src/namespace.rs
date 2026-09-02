@@ -29,7 +29,7 @@ pub enum InvalidNamespaceId {
     #[error("a namespace identifier is over the {max}-byte limit")]
     TooLong { max: usize },
     #[error(
-        "a namespace identifier contains a character outside ASCII letters, digits, `-`, and `_`"
+        "a namespace identifier contains a character outside ASCII letters, digits, `.`, `-`, and `_`"
     )]
     Character,
     #[error("a namespace identifier must start and end with an ASCII letter or digit")]
@@ -45,7 +45,7 @@ impl fmt::Debug for InvalidNamespaceId {
 impl NamespaceId {
     /// Keeps URLs, storage keys, attribution fields, and authorization indexes
     /// bounded while leaving enough room for consumer-generated opaque ids.
-    pub const MAX_LEN: usize = 63;
+    pub const MAX_LEN: usize = 128;
 
     pub fn parse(input: &str) -> Result<Self, InvalidNamespaceId> {
         if input.is_empty() {
@@ -56,7 +56,7 @@ impl NamespaceId {
         }
         if !input
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         {
             return Err(InvalidNamespaceId::Character);
         }

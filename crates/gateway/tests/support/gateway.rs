@@ -523,7 +523,7 @@ impl Axond {
     /// waiting for this child to complain.
     async fn answers_for_this_boot(&mut self, client: &reqwest::Client, base_url: &str) -> bool {
         let identified = client
-            .get(format!("{base_url}/v1/models"))
+            .get(format!("{base_url}/api/v1/namespaces"))
             .bearer_auth(&self.boot_key)
             .send()
             .await
@@ -548,7 +548,11 @@ impl Axond {
     }
 
     pub fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
+        if path.starts_with("/v1/") {
+            format!("{}/ns/platform{path}", self.base_url)
+        } else {
+            format!("{}{path}", self.base_url)
+        }
     }
 
     /// The address this process is bound to, for a caller rendering the next
@@ -771,6 +775,12 @@ pub fn price() -> String {
 /// it, which is the order a deployment gate runs in.
 pub fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str, extra: &str) -> String {
     let price = price();
+    let sqlite = std::env::temp_dir().join(format!(
+        "axond-store-{}-{}.sqlite",
+        std::process::id(),
+        bind.port()
+    ));
+    let sqlite = sqlite.display();
     let model = |name: &str, provider: &str, target: &str| {
         format!(
             "[[model]]\nname = \"{name}\"\ntargets = [ {{ provider = \"{provider}\", model = \"{target}\", price = {price} }} ]\n\n"
@@ -780,6 +790,10 @@ pub fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str, extra: &str) 
         r#"
 [server]
 bind = "{bind}"
+
+[storage]
+backend = "sqlite"
+path = "{sqlite}"
 
 [[namespace]]
 id = "platform"

@@ -21,8 +21,8 @@ from fake_upstream import MESSAGES, fixture
 def sdk_base_url(request, gateway) -> str:
     """Anthropic appends `/v1/messages`; its base must stop at the namespace."""
     if request.param == "namespaced":
-        return f"{gateway}/namespaces/{NAMESPACE}"
-    return gateway
+        return f"{gateway}/ns/{NAMESPACE}"
+    return f"{gateway}/ns/{NAMESPACE}"
 
 
 @pytest.fixture

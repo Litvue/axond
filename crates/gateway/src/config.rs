@@ -44,6 +44,9 @@ pub struct Config {
     pub mode: Mode,
     #[serde(default)]
     pub server: Server,
+    /// Required durable store (ADR 0063). SQLite WAL or Postgres.
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
     /// Stateful bootstrap: the durable backend's discriminated connection
     /// contract. Required by `mode = "stateful"`, rejected in stateless mode.
     #[serde(default)]
@@ -734,6 +737,28 @@ impl Default for Server {
 
 fn default_bind() -> SocketAddr {
     "0.0.0.0:8080".parse().expect("static bind addr")
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackend {
+    #[default]
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub backend: StorageBackend,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub dsn_env: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub on_unavailable: StoreUnavailable,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2756,10 +2781,44 @@ impl Config {
     /// resources: the mode is the first thing read, and each mode rejects the
     /// other's sections outright rather than merging them (ADR 0027).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_storage()?;
         match self.mode {
             Mode::Stateless => self.validate_stateless(),
             Mode::Stateful => self.validate_stateful(),
         }
+    }
+
+    fn validate_storage(&self) -> Result<(), ConfigError> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Err(ConfigError::Invalid(
+                "`[storage]` is required (ADR 0063): set `backend = \"sqlite\"` with `path`, or `backend = \"postgres\"` with `dsn_env`".into(),
+            ));
+        };
+        match storage.backend {
+            StorageBackend::Sqlite => {
+                if storage
+                    .path
+                    .as_deref()
+                    .is_none_or(|path| path.trim().is_empty())
+                {
+                    return Err(ConfigError::Invalid(
+                        "`[storage]` sqlite requires a non-empty `path`".into(),
+                    ));
+                }
+            }
+            StorageBackend::Postgres => {
+                if storage
+                    .dsn_env
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+                {
+                    return Err(ConfigError::Invalid(
+                        "`[storage]` postgres requires a non-empty `dsn_env`".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The whole-graph gate as it has always been: exactly one default
@@ -4452,8 +4511,15 @@ impl Config {
             Figment,
             providers::{Format, Toml},
         };
+        let owned;
+        let source = if s.contains("[storage]") {
+            s
+        } else {
+            owned = format!("[storage]\nbackend = \"sqlite\"\npath = \":memory:\"\n\n{s}");
+            &owned
+        };
         let cfg: Config = Figment::new()
-            .merge(Toml::string(s))
+            .merge(Toml::string(source))
             .extract()
             .map_err(|e| ConfigError::Load(e.to_string()))?;
         cfg.validate()?;
@@ -4467,6 +4533,10 @@ mod tests {
     use crate::desired_state::Uuid7;
 
     const VALID: &str = r#"
+[storage]
+backend = "sqlite"
+path = ":memory:"
+
 [[namespace]]
 id = "platform"
 default = true
@@ -4509,6 +4579,38 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         ))
         .expect_err("a provider id the catalogue cannot hold must not boot");
         assert!(matches!(err, ConfigError::Load(_)), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_a_config_with_no_storage() {
+        use figment::{
+            Figment,
+            providers::{Format, Toml},
+        };
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
+"#;
+        let cfg: Config = Figment::new()
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("parses without storage");
+        let err = cfg.validate().expect_err("storage is required");
+        assert!(err.to_string().contains("[storage]"), "{err}");
     }
 
     /// Inbound auth fails closed (ADR 0013), so a config that would leave the
@@ -5872,6 +5974,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn accepts_a_minimal_stateful_bootstrap() {
         let config = Config::from_toml_str(STATEFUL).expect("the approved bootstrap set validates");
         assert_eq!(config.mode, Mode::Stateful);
@@ -5963,6 +6066,7 @@ env = "GW_ADMIN_BREAKGLASS"
     /// ceiling for the same reason a stateless one does: the alternative is a
     /// gateway that boots and then refuses every request.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_mode_validates_the_process_local_admission_bounds() {
         for (snippet, expected) in [
             ("max_request_bytes = 0", "admission.max_request_bytes"),
@@ -5983,6 +6087,7 @@ env = "GW_ADMIN_BREAKGLASS"
     /// class. Mixed ownership fails before the listener binds instead of being
     /// merged, overlaid, or preferred.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_mode_rejects_every_stateful_owned_section() {
         for (section, snippet) in [
             (
@@ -6051,6 +6156,7 @@ env = "GW_ADMIN_BREAKGLASS"
     /// An operator mid-cutover should learn the whole list once rather than one
     /// offender per restart.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_rejection_names_every_offending_section_at_once() {
         let toml = format!(
             r#"{STATEFUL}
@@ -6084,6 +6190,7 @@ max_attempts = 5
     /// plane owns their policy values. Selecting a backend with references only
     /// is therefore valid.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_mode_accepts_admission_backend_connectivity_without_policy() {
         let toml = format!(
             r#"{STATEFUL}
@@ -6111,6 +6218,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// so the resource-graph gate must not re-run the file-level zero-cap check
     /// against the bootstrap connectivity shape.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn compiled_stateful_candidates_do_not_reject_bootstrap_budget_values() {
         let toml = format!(
             "{STATEFUL}\n[budget]\nbackend = \"postgres\"\ndsn_env = \"AXOND_BUDGET_DSN\"\nnamespace_scope = true\n"
@@ -6136,6 +6244,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_mode_still_requires_a_dsn_reference_for_a_shared_backend() {
         let toml = format!("{STATEFUL}\n[budget]\nbackend = \"redis\"\n");
         let error = Config::from_toml_str(&toml)
@@ -6152,6 +6261,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// hold. Otherwise the replica boots and refuses every published revision
     /// forever, which is the same misconfiguration reported far from its cause.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_boot_refuses_a_scope_wide_layout_the_backend_cannot_enforce() {
         for backend in ["none", "in-memory"] {
             let toml =
@@ -6173,6 +6283,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// Cold boot in stateful mode requires one complete durable control-plane
     /// reference, so an incomplete backend contract describes nothing to serve.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_mode_requires_a_complete_control_plane_reference() {
         for (expected, toml) in [
             (
@@ -6217,6 +6328,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// order is one `axond migrate apply` before any replica starts, not each
     /// replica racing to migrate the database the others are reading.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn the_control_plane_defaults_to_no_schema_and_no_boot_migration() {
         let control_plane = Config::from_toml_str(STATEFUL)
             .expect("the approved bootstrap set validates")
@@ -6236,6 +6348,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// allows one qualifying dot. A search path takes one schema, so the config has
     /// to be narrower than the validator it reuses.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn a_qualified_control_plane_schema_is_rejected() {
         let error = Config::from_toml_str(
             "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\nschema = \"public.axond\"\n\
@@ -6249,6 +6362,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn the_control_plane_settings_are_read_as_written() {
         let control_plane = Config::from_toml_str(
             "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\nschema = \"axond_cp\"\n\
@@ -6266,6 +6380,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn object_storage_is_complete_without_a_postgres_dsn() {
         let config = Config::from_toml_str(BLOB_STATEFUL)
             .expect("a credential-free object-storage reference is complete");
@@ -6290,6 +6405,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn checked_blob_control_plane_example_matches_the_minimal_contract() {
         let example = repository_file("ops/compose/axond.blob-contract.toml");
         let config = Config::from_toml_str(&example).expect("checked example must stay valid");
@@ -6310,6 +6426,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn control_plane_backends_reject_fields_owned_by_the_other_contract() {
         for (expected, toml) in [
             (
@@ -6349,6 +6466,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn object_storage_requires_each_discriminating_setting() {
         for (line, expected) in [
             ("environment_id = \"prod-us-east\"\n", "environment_id"),
@@ -6395,6 +6513,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn object_storage_requires_credential_free_https_container_urls() {
         for (replacement, expected) in [
             (
@@ -6430,6 +6549,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn loopback_http_requires_an_explicit_development_exception() {
         let https = BLOB_STATEFUL.replace(
             "https://axondstate.blob.core.windows.net/control-plane",
@@ -6490,6 +6610,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn object_storage_bounds_are_nonzero_bounded_and_coherent() {
         for (field, value, expected) in [
             ("max_object_bytes", 0, "must be at least 1"),
@@ -6542,6 +6663,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn omitted_object_operation_bounds_follow_a_lowered_object_ceiling() {
         let lowered = BLOB_STATEFUL.replace(
             "authentication = \"workload-identity\"",
@@ -6581,6 +6703,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn object_storage_rejects_invalid_key_segments_and_secret_fields() {
         for environment in [
             "",
@@ -6612,6 +6735,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// A snapshot is only publishable once its credential references are
     /// unwrapped, so the store and the KEK are boot requirements.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_mode_requires_a_secret_store_and_exactly_one_kek_reference() {
         for (expected, toml) in [
             (
@@ -6638,6 +6762,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// Encrypted Postgres is normally the control-plane database itself, so the
     /// store may inherit that reference instead of repeating it.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn the_secret_store_inherits_the_control_plane_dsn_reference() {
         let config = Config::from_toml_str(STATEFUL).expect("inheriting the reference is valid");
         let secret_store = config.secret_store.expect("secret store");
@@ -6648,6 +6773,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// The breakglass credential is the way in when OIDC is down, and a second
     /// one would make an audited operator action ambiguous.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_mode_requires_exactly_one_usable_breakglass_credential() {
         for (expected, toml) in [
             (
@@ -6679,6 +6805,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// Stateful bootstrap can hold references and nothing else, so a diagnostic
     /// (and `Debug`) names an env var or a path, never material.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn stateful_bootstrap_diagnostics_name_references_only() {
         let config = Config::from_toml_str(STATEFUL).expect("valid bootstrap");
         let rendered = format!(
@@ -6704,6 +6831,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// resolve, and figment's type error would then carry the credential into
     /// the load diagnostic. Every such reference is refused by name.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn a_bootstrap_reference_that_the_env_override_layer_would_claim_is_rejected() {
         for (key, toml) in [
             (
@@ -6737,6 +6865,7 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn a_partial_last_known_good_cache_is_rejected_before_boot() {
         for snippet in [
             "[convergence]\ncache_path = \"/tmp/lkg\"",
@@ -6757,6 +6886,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// shape is fine there — and a variable outside the override shape is fine
     /// anywhere.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn a_reference_outside_the_override_shape_is_accepted() {
         let toml = "mode = \"stateful\"\n[control_plane]\ndsn_env = \"AXOND_CONTROL_PLANE_DSN\"\n[secret_store]\nkek_file = \"/run/secrets/AXOND_SECRET_STORE\"\n[[admin_breakglass]]\nfile = \"/run/secrets/breakglass\"";
         Config::from_toml_str(toml)
@@ -6766,6 +6896,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// The override-key list only protects references if it still matches the
     /// keys the environment layer can actually address.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn the_override_key_list_matches_every_config_field() {
         let source = repository_file("crates/gateway/src/config.rs");
         let (_, rest) = source
@@ -6813,6 +6944,7 @@ dsn_env = "AXOND_REDIS_URL"
     /// Recreate deployment deliberately leaves the optional cache disabled until
     /// a durable StatefulSet/PVC mount exists.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn the_shipped_stateful_example_validates() {
         let config = Config::from_toml_str(&repository_file("axond.stateful.example.toml"))
             .expect("axond.stateful.example.toml must validate");
@@ -7102,6 +7234,7 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
     /// A deployment that already configured `[control_plane]` inherits its name
     /// rather than repeating it.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn postgres_retention_needs_a_dsn_reference_it_can_resolve() {
         let refusal = catalogue_refusal(&format!(
             "{VALID}\n[catalog]\nsource = \"models-dev\"\nstore = \"postgres\"\n"
@@ -7131,6 +7264,7 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
     /// for the durable contract without saying so — while `[catalog]` itself
     /// stays bootstrap-owned, like every other backend selection.
     #[test]
+    #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn a_stateful_deployment_may_not_retain_its_catalogue_in_memory() {
         let refusal = catalogue_refusal(&format!(
             "{STATEFUL}\n[catalog]\nsource = \"models-dev\"\nstore = \"in-memory\"\n"
