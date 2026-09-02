@@ -322,6 +322,20 @@ draft of the Store DDL that used `axond_budget` with a `period` column is
 renamed at connect (needs table-rename privilege; migration-only roles
 should run the rename out of band before boot).
 
+The Store also holds the management usage index (`axond_store_usage`) that
+`GET /api/v1/namespaces/{ns}/usage` reads. Litvue reads current-period
+summaries. The gateway does not auto-prune this table: operators delete rows
+they no longer need, for example
+
+```sql
+DELETE FROM axond_store_usage WHERE recorded_at < now() - interval '90 days';
+```
+
+or drop rows whose `period` is no longer billed. See
+[`ops/postgres/store_usage_v1.sql`](../ops/postgres/store_usage_v1.sql).
+SQLite stores `recorded_at` as unix seconds; prune by `period` there, or
+`WHERE recorded_at < strftime('%s','now') - 90*24*60*60`.
+
 ## `[shutdown]` — Tier 0
 
 Bounds on the `SIGTERM`/`SIGINT` sequence

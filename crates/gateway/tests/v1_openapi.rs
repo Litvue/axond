@@ -1,6 +1,7 @@
 //! ADR 0063 slice 4: OpenAPI 3.1 and usage summary.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use support::{GATEWAY_KEY, alias, boot, client};
@@ -136,29 +137,41 @@ async fn usage_summary_matches_rows_for_namespace_and_period() {
         entry.1 += cost;
     }
 
-    let summary = http
-        .get(gateway.url("/api/v1/namespaces/wsp_use/usage?period=2026-09"))
-        .bearer_auth(GATEWAY_KEY)
-        .send()
-        .await
-        .expect("summary");
-    assert_eq!(summary.status(), 200, "{}", summary.text().await.unwrap());
-    let body: Value = summary.json().await.unwrap();
+    let mut body = Value::Null;
+    let mut matched = false;
+    for _ in 0..50 {
+        let summary = http
+            .get(gateway.url("/api/v1/namespaces/wsp_use/usage?period=2026-09"))
+            .bearer_auth(GATEWAY_KEY)
+            .send()
+            .await
+            .expect("summary");
+        assert_eq!(summary.status(), 200, "{}", summary.text().await.unwrap());
+        body = summary.json().await.unwrap();
+        let data = body["data"].as_array().expect("data");
+        matched = data.len() == expected.len()
+            && data.iter().all(|row| {
+                let key = (
+                    row["model"].as_str().unwrap().to_owned(),
+                    row["status"].as_str().unwrap().to_owned(),
+                );
+                let got = (
+                    row["count"].as_u64().unwrap(),
+                    row["cost_microdollars"].as_u64().unwrap(),
+                );
+                expected.get(&key) == Some(&got)
+            });
+        if matched {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        matched,
+        "usage index did not catch up: {body} vs {expected:?}"
+    );
     assert_eq!(body["namespace"], "wsp_use");
     assert_eq!(body["period"], "2026-09");
-    let data = body["data"].as_array().expect("data");
-    assert_eq!(data.len(), expected.len(), "{body} vs {expected:?}");
-    for row in data {
-        let key = (
-            row["model"].as_str().unwrap().to_owned(),
-            row["status"].as_str().unwrap().to_owned(),
-        );
-        let got = (
-            row["count"].as_u64().unwrap(),
-            row["cost_microdollars"].as_u64().unwrap(),
-        );
-        assert_eq!(expected.get(&key), Some(&got), "{row} vs {expected:?}");
-    }
 
     let other = http
         .get(gateway.url("/api/v1/namespaces/wsp_use/usage?period=other"))
@@ -169,4 +182,29 @@ async fn usage_summary_matches_rows_for_namespace_and_period() {
     assert_eq!(other.status(), 200);
     let body: Value = other.json().await.unwrap();
     assert_eq!(body["data"], json!([]));
+}
+
+#[tokio::test]
+async fn malformed_usage_and_list_queries_are_typed_bad_request() {
+    let (_upstream, gateway) = boot().await;
+    let http = client();
+    create_namespace(&http, &gateway, "wsp_q").await;
+
+    for path in [
+        "/api/v1/namespaces?limit=abc",
+        "/api/v1/namespaces/wsp_q/usage?period=bad/period",
+        "/api/v1/namespaces/wsp_q/usage?period=a&period=b",
+        "/api/v1/namespaces/wsp_q/usage",
+    ] {
+        let response = http
+            .get(gateway.url(path))
+            .bearer_auth(GATEWAY_KEY)
+            .send()
+            .await
+            .expect(path);
+        let status = response.status();
+        let body: Value = response.json().await.expect(path);
+        assert_eq!(status, 400, "{path} {body}");
+        assert_eq!(body["error"]["type"], "bad_request", "{path} {body}");
+    }
 }

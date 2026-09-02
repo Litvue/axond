@@ -491,6 +491,10 @@ pub struct NotDurable {
 }
 
 impl UsageDelivery {
+    /// Bound on the detached Store index write. The inference verdict must not
+    /// wait on this secondary index, and shutdown must not join it.
+    const STORE_INDEX_TIMEOUT: Duration = Duration::from_secs(2);
+
     /// Telemetry-grade: best effort, non-blocking, lossy under overload.
     pub fn telemetry(fanout: UsageFanout) -> Self {
         Self {
@@ -521,25 +525,46 @@ impl UsageDelivery {
         let _ = self.store.set(store);
     }
 
-    async fn append_store(&self, record: &UsageRecord) {
-        let Some(store) = self.store.get() else {
+    /// Best-effort management-index append. Fire-and-forget: a slow Store must
+    /// not stall inference, and a successful journal append must not wait here.
+    /// Idempotency is the Store's `request_id` primary key.
+    fn append_store(&self, record: &UsageRecord) {
+        let Some(store) = self.store.get().cloned() else {
             return;
         };
+        let request_id = record.request_id.clone();
         let event = crate::store::UsageAppend {
-            request_id: record.request_id.clone(),
+            request_id: request_id.clone(),
             namespace: record.namespace.clone(),
             period: record.period.clone(),
             model: record.model.clone(),
             status: record.status.as_str().to_owned(),
             cost_microdollars: record.cost_microdollars,
         };
-        if let Err(error) = store.append_usage(event).await {
-            tracing::error!(
-                request_id = %record.request_id,
-                error = %error,
-                "store usage append failed"
-            );
-        }
+        let _ = tokio::spawn(async move {
+            let outcome =
+                match tokio::time::timeout(Self::STORE_INDEX_TIMEOUT, store.append_usage(event))
+                    .await
+                {
+                    Ok(Ok(())) => "accepted",
+                    Ok(Err(error)) => {
+                        tracing::error!(
+                            request_id = %request_id,
+                            error = %error,
+                            "store usage append failed"
+                        );
+                        "failed"
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            request_id = %request_id,
+                            "store usage append timed out"
+                        );
+                        "timeout"
+                    }
+                };
+            crate::telemetry::metrics::record_usage_index_append(outcome);
+        });
     }
 
     pub fn mode(&self) -> DeliveryMode {
@@ -567,7 +592,7 @@ impl UsageDelivery {
     /// request was not recorded rather than being billed for nothing.
     pub async fn record(&self, record: &UsageRecord) -> Result<(), NotDurable> {
         let Some(journal) = self.journal.as_ref() else {
-            self.append_store(record).await;
+            self.append_store(record);
             self.fanout.record(record).await;
             return Ok(());
         };
@@ -589,7 +614,7 @@ impl UsageDelivery {
                         "already_present"
                     },
                 );
-                self.append_store(record).await;
+                self.append_store(record);
                 Ok(())
             }
             Err(error) => {
@@ -691,7 +716,8 @@ impl UsageDelivery {
 
     /// Flush what is buffered. Telemetry-grade only: a journal's backlog is
     /// durable, so it is drained by the worker's own bounded shutdown rather
-    /// than flushed here.
+    /// than flushed here. In-flight Store index writes are best-effort and are
+    /// not joined; they time out on their own or drop with the runtime.
     pub async fn flush(&self, budget: Duration) -> FlushReport {
         self.fanout.flush(budget).await
     }
@@ -956,6 +982,89 @@ mod tests {
         }
     }
 
+    struct SlowIndexStore;
+
+    #[async_trait]
+    impl crate::store::Store for SlowIndexStore {
+        async fn put_namespace(
+            &self,
+            _: crate::store::NamespaceRecord,
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
+        async fn get_namespace(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::store::NamespaceRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn list_namespaces(
+            &self,
+            _: Option<String>,
+            _: u32,
+        ) -> Result<(Vec<crate::store::NamespaceRecord>, Option<String>), crate::store::StoreError>
+        {
+            Ok((Vec::new(), None))
+        }
+        async fn update_namespace(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: Option<Vec<String>>,
+        ) -> Result<Option<crate::store::NamespaceRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn delete_namespace(&self, _: &str) -> Result<bool, crate::store::StoreError> {
+            Ok(false)
+        }
+        async fn put_budget(
+            &self,
+            _: &str,
+            _: &str,
+            _: u64,
+        ) -> Result<crate::store::BudgetRecord, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable("unused".into()))
+        }
+        async fn get_budget(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<crate::store::BudgetRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn reserve_budget(
+            &self,
+            _: &str,
+            _: u64,
+            _: Duration,
+            _: &str,
+        ) -> Result<crate::store::BudgetReserve, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable("unused".into()))
+        }
+        async fn settle_budget(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u64,
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
+        async fn append_usage(
+            &self,
+            _: crate::store::UsageAppend,
+        ) -> Result<(), crate::store::StoreError> {
+            std::future::pending().await
+        }
+        async fn summarize_usage(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<crate::store::UsageSummaryRow>, crate::store::StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
     #[tokio::test]
     async fn telemetry_grade_delivery_cannot_refuse_a_request() {
         let delivery = UsageDelivery::telemetry(UsageFanout::new(vec![Box::new(StdoutSink)]));
@@ -966,6 +1075,33 @@ mod tests {
             .record(&sample_record())
             .await
             .expect("telemetry-grade delivery is infallible");
+    }
+
+    #[tokio::test]
+    async fn a_store_index_append_does_not_delay_the_record_verdict() {
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::new(SlowIndexStore));
+        let started = Instant::now();
+        delivery
+            .record(&sample_record())
+            .await
+            .expect("telemetry-grade delivery is infallible");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "index writes must not stall the inference verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_journaled_append_does_not_wait_on_the_usage_index() {
+        let delivery = billing(bounded(8), UndurablePolicy::Refuse);
+        delivery.attach_store(Arc::new(SlowIndexStore));
+        let started = Instant::now();
+        delivery.record(&sample_record()).await.expect("append");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "a successful journal append must not wait on the secondary index"
+        );
     }
 
     #[tokio::test]
