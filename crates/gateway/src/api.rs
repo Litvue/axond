@@ -38,7 +38,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/namespaces/{ns}",
-            get(get_namespace).put(put_namespace),
+            get(get_namespace)
+                .put(put_namespace)
+                .delete(delete_namespace),
         )
         .route(
             "/api/v1/namespaces/{ns}/budgets/{period}",
@@ -83,7 +85,7 @@ impl Modify for GatewayKeySecurity {
     servers((url = "/", description = "This gateway")),
     tags(
         (name = "spec", description = "Generated OpenAPI document"),
-        (name = "namespaces", description = "Namespace CRUD minus delete"),
+        (name = "namespaces", description = "Namespace CRUD"),
         (name = "budgets", description = "Per-namespace per-period ledger"),
         (name = "usage", description = "Usage summary by model and status")
     ),
@@ -93,6 +95,7 @@ impl Modify for GatewayKeySecurity {
         list_namespaces,
         get_namespace,
         put_namespace,
+        delete_namespace,
         put_budget,
         get_budget,
         get_usage
@@ -336,6 +339,29 @@ async fn put_namespace(
     }
 }
 
+/// Idempotent remove. Missing id is 204; live budget rows go with it.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/namespaces/{ns}",
+    tag = "namespaces",
+    params(("ns" = String, Path, description = "Namespace id")),
+    responses(
+        (status = 204, description = "Deleted, or already absent"),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
+async fn delete_namespace(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<StatusCode, GatewayError> {
+    match store(&state)?.delete_namespace(&ns).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
+        Err(err) => Err(GatewayError::BadRequest(err.to_string())),
+    }
+}
+
 /// Set the period limit and mark it as the namespace's active period.
 #[utoipa::path(
     put,
@@ -532,10 +558,7 @@ mod tests {
         assert!(paths["/api/v1/namespaces"].get("get").is_some());
         assert!(paths["/api/v1/namespaces/{ns}"].get("get").is_some());
         assert!(paths["/api/v1/namespaces/{ns}"].get("put").is_some());
-        assert!(
-            paths["/api/v1/namespaces/{ns}"].get("delete").is_none(),
-            "DELETE is a later slice"
-        );
+        assert!(paths["/api/v1/namespaces/{ns}"].get("delete").is_some());
         assert!(
             paths["/api/v1/namespaces/{ns}/budgets/{period}"]["get"]["responses"]
                 .get("400")

@@ -55,7 +55,7 @@ async fn openapi_json_is_31_covers_mounted_routes_and_requires_the_key() {
     assert!(paths["/api/v1/namespaces"].get("get").is_some());
     assert!(paths["/api/v1/namespaces/{ns}"].get("get").is_some());
     assert!(paths["/api/v1/namespaces/{ns}"].get("put").is_some());
-    assert!(paths["/api/v1/namespaces/{ns}"].get("delete").is_none());
+    assert!(paths["/api/v1/namespaces/{ns}"].get("delete").is_some());
     assert!(
         paths["/api/v1/namespaces/{ns}/budgets/{period}"]
             .get("put")
