@@ -756,6 +756,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_late_settle_after_two_reserves_still_charges_this_incarnation() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 40, Duration::from_millis(1), "r1")
+            .await
+            .expect("hold");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        match store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
+            .await
+            .expect("second")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        match store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r3")
+            .await
+            .expect("third")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget("wsp_x", "p", "r1", 40)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 40);
+        assert_eq!(got.reserved_microdollars, 2);
+    }
+
+    #[tokio::test]
     async fn sqlite_in_flight_hold_counts_and_settle_is_one_operation() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
@@ -1123,6 +1162,34 @@ mod tests {
         let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
         assert_eq!(got.spent_microdollars, 0);
         assert_eq!(got.reserved_microdollars, 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_settle_charges_once() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (a, ns) = postgres_seeded(&dsn).await;
+        let b = PostgresStore::connect(&dsn, true).await.expect("second client");
+        a.put_budget(&ns, "p", 10_000).await.expect("put");
+        let rid = format!("once_{ns}");
+        match a
+            .reserve_budget(&ns, 50, Duration::from_secs(30), &rid)
+            .await
+            .expect("hold")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        let (left, right) = tokio::join!(
+            a.settle_budget(&ns, "p", &rid, 50),
+            b.settle_budget(&ns, "p", &rid, 50),
+        );
+        left.expect("settle a");
+        right.expect("settle b");
+        let got = a.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 50);
+        assert_eq!(got.reserved_microdollars, 0);
     }
 
     #[tokio::test]
