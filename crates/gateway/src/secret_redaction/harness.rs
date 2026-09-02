@@ -208,9 +208,21 @@ impl CandidateCompiler for SecretResolvingCompiler {
                 .any(|namespace| namespace.id == SERVING_NAMESPACE),
             "the fixture project must project as {SERVING_NAMESPACE}"
         );
-        for key in &mut config.gateway_key {
-            key.namespace = SERVING_NAMESPACE.to_owned();
-        }
+        // Inbound keys stay on the one-segment bootstrap namespace (`platform`).
+        // ADR 0063 ids are `[A-Za-z0-9._-]+`; `acme/core` is not a request-path
+        // or management-API segment. Copy projected credentials onto platform
+        // so `/ns/platform/v1` can present the resolved material.
+        let platform_creds: Vec<crate::config::Credential> = config
+            .credential
+            .iter()
+            .filter(|credential| credential.namespace == SERVING_NAMESPACE)
+            .cloned()
+            .map(|mut credential| {
+                credential.namespace = "platform".to_owned();
+                credential
+            })
+            .collect();
+        config.credential.extend(platform_creds);
         for resource in revision.state().resources() {
             if resource.reference.kind != ResourceKind::Alias {
                 continue;
@@ -634,7 +646,7 @@ fn settings() -> ConvergenceSettings {
 
 /// A caller's request, authenticated with the inbound sentinel.
 pub(crate) fn chat_request() -> Request<Body> {
-    Request::post(format!("/ns/{SERVING_NAMESPACE}/v1/chat/completions"))
+    Request::post("/ns/platform/v1/chat/completions")
         .header("content-type", "application/json")
         .header(
             axum::http::header::AUTHORIZATION,

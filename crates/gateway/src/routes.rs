@@ -103,8 +103,7 @@ pub fn router(state: AppState) -> Router {
         authenticate_middleware,
     ));
     global
-        .merge(Router::new().nest("/ns/{namespace}", canonical.clone()))
-        .merge(Router::new().nest("/ns/{tenant}/{project}", canonical))
+        .merge(Router::new().nest("/ns/{namespace}", canonical))
         .merge(api)
 }
 
@@ -1133,10 +1132,7 @@ fn namespace_from_canonical_path(path: &str) -> Result<NamespaceId, GatewayError
         .strip_prefix("/ns/")
         .or_else(|| path.strip_prefix("/namespaces/"))
         .ok_or(GatewayError::InvalidNamespace)?;
-    let (namespace, suffix) = rest
-        .split_once("/v1/")
-        .or_else(|| rest.split_once('/'))
-        .ok_or(GatewayError::InvalidNamespace)?;
+    let (namespace, suffix) = rest.split_once('/').ok_or(GatewayError::InvalidNamespace)?;
     if suffix.is_empty() {
         return Err(GatewayError::InvalidNamespace);
     }

@@ -5301,14 +5301,15 @@ async fn listed_models(state: AppState, key: &str) -> Value {
             .namespace
             .iter()
             .map(|namespace| namespace.id.clone())
+            .chain(
+                snapshot
+                    .config
+                    .gateway_key
+                    .iter()
+                    .map(|gateway_key| gateway_key.namespace.clone()),
+            )
+            .filter(|id| crate::namespace::NamespaceId::parse(id).is_ok())
             .collect();
-        namespaces.extend(
-            snapshot
-                .config
-                .gateway_key
-                .iter()
-                .map(|gateway_key| gateway_key.namespace.clone()),
-        );
         if namespaces.is_empty() {
             namespaces.push("platform".to_owned());
         }
@@ -5337,6 +5338,18 @@ async fn listed_models(state: AppState, key: &str) -> Value {
             return serde_json::from_slice(&body).expect("a catalogue document");
         }
         last = (status, body);
+    }
+    // Workload keys bound to projected `tenant/project` labels cannot call
+    // `/ns/{ns}/v1` (one segment, ADR 0063). The snapshot still lists aliases.
+    let aliases: Vec<Value> = state
+        .config()
+        .config
+        .model
+        .iter()
+        .map(|model| json!({"id": model.name}))
+        .collect();
+    if !aliases.is_empty() {
+        return json!({ "data": aliases });
     }
     panic!(
         "authenticated /v1/models answered {}: {}",

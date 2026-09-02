@@ -1419,10 +1419,17 @@ max_ttl = "15m"
                 .expect("principal");
             assert_eq!(principal.namespace, namespace);
             assert!(principal.namespace_grant.is_none());
-            assert!(
-                principal.namespace_grant().is_ok(),
-                "legacy labels that are valid namespace ids still form a grant"
-            );
+            if namespace.contains('/') {
+                assert!(
+                    principal.namespace_grant().is_err(),
+                    "slash labels are not a NamespaceId; namespaced routes refuse them"
+                );
+            } else {
+                assert!(
+                    principal.namespace_grant().is_ok(),
+                    "a one-segment namespace id is a NamespaceGrant"
+                );
+            }
         }
     }
 
