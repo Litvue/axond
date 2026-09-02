@@ -1,0 +1,22 @@
+{
+  "name": "axond-openapi-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Spectral lint and TypeScript generation smoke for GET /api/v1/openapi.json.",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=22.12.0 <23"
+  },
+  "scripts": {
+    "lint": "spectral lint --fail-severity error ../../target/openapi.json",
+    "generate": "openapi-typescript ../../target/openapi.json -o generated/schema.d.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run lint && npm run generate && npm run typecheck"
+  },
+  "devDependencies": {
+    "@stoplight/spectral-cli": "6.15.0",
+    "openapi-typescript": "7.10.1",
+    "typescript": "5.9.2"
+  }
+}

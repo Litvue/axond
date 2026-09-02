@@ -470,6 +470,9 @@ pub struct UsageDelivery {
     fanout: UsageFanout,
     journal: Option<Arc<dyn UsageJournal>>,
     on_undurable: UndurablePolicy,
+    /// Management-API index. Attached after the Store opens so `GET .../usage`
+    /// can summarize rows the request path already recorded.
+    store: std::sync::OnceLock<Arc<dyn crate::store::Store>>,
     /// Test-only witness for [`UsageDelivery::count_unheard_refusal`]: the loss
     /// counter it moves is a global instrument no test can read back.
     #[cfg(test)]
@@ -494,6 +497,7 @@ impl UsageDelivery {
             fanout,
             journal: None,
             on_undurable: UndurablePolicy::Serve,
+            store: std::sync::OnceLock::new(),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
         }
@@ -506,8 +510,35 @@ impl UsageDelivery {
             fanout: UsageFanout::new(Vec::new()),
             journal: Some(journal),
             on_undurable,
+            store: std::sync::OnceLock::new(),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Index usage for `GET /api/v1/namespaces/{ns}/usage`. Idempotent.
+    pub fn attach_store(&self, store: Arc<dyn crate::store::Store>) {
+        let _ = self.store.set(store);
+    }
+
+    async fn append_store(&self, record: &UsageRecord) {
+        let Some(store) = self.store.get() else {
+            return;
+        };
+        let event = crate::store::UsageAppend {
+            request_id: record.request_id.clone(),
+            namespace: record.namespace.clone(),
+            period: record.period.clone(),
+            model: record.model.clone(),
+            status: record.status.as_str().to_owned(),
+            cost_microdollars: record.cost_microdollars,
+        };
+        if let Err(error) = store.append_usage(event).await {
+            tracing::error!(
+                request_id = %record.request_id,
+                error = %error,
+                "store usage append failed"
+            );
         }
     }
 
@@ -536,6 +567,7 @@ impl UsageDelivery {
     /// request was not recorded rather than being billed for nothing.
     pub async fn record(&self, record: &UsageRecord) -> Result<(), NotDurable> {
         let Some(journal) = self.journal.as_ref() else {
+            self.append_store(record).await;
             self.fanout.record(record).await;
             return Ok(());
         };
@@ -557,6 +589,7 @@ impl UsageDelivery {
                         "already_present"
                     },
                 );
+                self.append_store(record).await;
                 Ok(())
             }
             Err(error) => {
