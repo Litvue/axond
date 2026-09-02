@@ -6,12 +6,23 @@
 --
 --     psql "$AXOND_STORAGE_DSN" -f ops/postgres/store_budget_v1.sql
 --
+-- Tables are `axond_store_budget*` so they never collide with the withdrawn
+-- `[budget] backend = "postgres"` ledger (`axond_budget` /
+-- `axond_budget_reservation` from budget_v1.sql: PK `(namespace, subject)`,
+-- no period). A database that already has those leftover tables keeps them;
+-- spend is not migrated (subject vs period). The gateway still creates these
+-- tables and boots.
+--
+-- An earlier draft of this file used the withdrawn names with a `period`
+-- column. Connect renames those relations to `axond_store_budget*` before
+-- probing.
+--
 -- Spend is cumulative per `(namespace, period)`. Reservations are short-lived
 -- holds; a reserve reclaims expired ones for that key before it decides.
 -- The spend row is the lock (`SELECT ... FOR UPDATE`) that serializes
 -- admissions across replicas.
 
-CREATE TABLE IF NOT EXISTS axond_budget (
+CREATE TABLE IF NOT EXISTS axond_store_budget (
     namespace           text        NOT NULL,
     period              text        NOT NULL,
     limit_microdollars  bigint      NOT NULL,
@@ -19,12 +30,12 @@ CREATE TABLE IF NOT EXISTS axond_budget (
     PRIMARY KEY (namespace, period)
 );
 
-CREATE TABLE IF NOT EXISTS axond_budget_active (
+CREATE TABLE IF NOT EXISTS axond_store_budget_active (
     namespace text PRIMARY KEY NOT NULL,
     period    text NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS axond_budget_reservation (
+CREATE TABLE IF NOT EXISTS axond_store_budget_reservation (
     id                  text        PRIMARY KEY,
     namespace           text        NOT NULL,
     period              text        NOT NULL,
@@ -32,5 +43,5 @@ CREATE TABLE IF NOT EXISTS axond_budget_reservation (
     expires_at          timestamptz NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS axond_budget_reservation_scope_idx
-    ON axond_budget_reservation (namespace, period, expires_at);
+CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx
+    ON axond_store_budget_reservation (namespace, period, expires_at);

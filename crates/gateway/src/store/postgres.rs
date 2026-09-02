@@ -40,7 +40,7 @@ impl PostgresStore {
             idle: Mutex::new(Vec::new()),
             slots: Arc::new(Semaphore::new(POOL_SIZE)),
         };
-        let client = store.connect_client().await?;
+        let mut client = store.connect_client().await?;
         if create_table {
             client
                 .batch_execute(
@@ -52,11 +52,8 @@ impl PostgresStore {
                 )
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            client
-                .batch_execute(BUDGET_DDL)
-                .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         }
+        ensure_budget_schema(&mut client, create_table).await?;
         probe_schema(&client).await?;
         store.checkin(client).await;
         Ok(store)
@@ -145,10 +142,10 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
     client
         .batch_execute(
             "SELECT namespace, period, limit_microdollars, spent_microdollars
-             FROM axond_budget LIMIT 0;
-             SELECT namespace, period FROM axond_budget_active LIMIT 0;
+             FROM axond_store_budget LIMIT 0;
+             SELECT namespace, period FROM axond_store_budget_active LIMIT 0;
              SELECT id, namespace, period, amount_microdollars, expires_at
-             FROM axond_budget_reservation LIMIT 0",
+             FROM axond_store_budget_reservation LIMIT 0",
         )
         .await
         .map_err(|e| {
@@ -157,6 +154,119 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Names the Store ledger uses. Distinct from the withdrawn `[budget]`
+/// Postgres backend (`axond_budget` / `axond_budget_reservation`).
+const STORE_BUDGET: &str = "axond_store_budget";
+const STORE_BUDGET_ACTIVE: &str = "axond_store_budget_active";
+const STORE_BUDGET_RESERVATION: &str = "axond_store_budget_reservation";
+const STORE_BUDGET_RESERVATION_IDX: &str = "axond_store_budget_reservation_scope_idx";
+const DRAFT_STORE_BUDGET: &str = "axond_budget";
+const DRAFT_STORE_BUDGET_ACTIVE: &str = "axond_budget_active";
+const DRAFT_STORE_BUDGET_RESERVATION: &str = "axond_budget_reservation";
+const DRAFT_STORE_BUDGET_RESERVATION_IDX: &str = "axond_budget_reservation_scope_idx";
+
+/// Create or rename Store budget tables so [`probe_schema`] can succeed.
+///
+/// 1. New `axond_store_budget*` with `period` + `limit_microdollars` — use them.
+/// 2. Else `axond_budget` with a `period` column (this file's previous draft) —
+///    rename to `axond_store_budget*`.
+/// 3. Else `create_table` applies [`BUDGET_DDL`].
+/// 4. Leftover `axond_budget` with a `subject` column (budget_v1.sql) is left
+///    untouched; spend is not migrated (subject vs period).
+async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result<(), StoreError> {
+    if !store_budget_ready(client).await? && draft_store_budget_present(client).await? {
+        rename_draft_store_budget(client).await?;
+    }
+    if create_table {
+        client
+            .batch_execute(BUDGET_DDL)
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn store_budget_ready(client: &impl GenericClient) -> Result<bool, StoreError> {
+    Ok(has_column(client, STORE_BUDGET, "period").await?
+        && has_column(client, STORE_BUDGET, "limit_microdollars").await?
+        && has_column(client, STORE_BUDGET_ACTIVE, "period").await?
+        && has_column(client, STORE_BUDGET_RESERVATION, "period").await?)
+}
+
+async fn draft_store_budget_present(client: &impl GenericClient) -> Result<bool, StoreError> {
+    has_column(client, DRAFT_STORE_BUDGET, "period").await
+}
+
+async fn rename_draft_store_budget(client: &mut Client) -> Result<(), StoreError> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    rename_relation(&tx, "TABLE", DRAFT_STORE_BUDGET, STORE_BUDGET).await?;
+    rename_relation(&tx, "TABLE", DRAFT_STORE_BUDGET_ACTIVE, STORE_BUDGET_ACTIVE).await?;
+    rename_relation(
+        &tx,
+        "TABLE",
+        DRAFT_STORE_BUDGET_RESERVATION,
+        STORE_BUDGET_RESERVATION,
+    )
+    .await?;
+    rename_relation(
+        &tx,
+        "INDEX",
+        DRAFT_STORE_BUDGET_RESERVATION_IDX,
+        STORE_BUDGET_RESERVATION_IDX,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    Ok(())
+}
+
+async fn rename_relation(
+    client: &impl GenericClient,
+    kind: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), StoreError> {
+    if relation_exists(client, from).await? && !relation_exists(client, to).await? {
+        client
+            .execute(&format!("ALTER {kind} {from} RENAME TO {to}"), &[])
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn relation_exists(client: &impl GenericClient, name: &str) -> Result<bool, StoreError> {
+    let exists: bool = client
+        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&name])
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .get(0);
+    Ok(exists)
+}
+
+async fn has_column(
+    client: &impl GenericClient,
+    table: &str,
+    column: &str,
+) -> Result<bool, StoreError> {
+    Ok(client
+        .query_opt(
+            "SELECT 1
+             FROM pg_attribute
+             WHERE attrelid = to_regclass($1)
+               AND attname = $2
+               AND attnum > 0
+               AND NOT attisdropped",
+            &[&table, &column],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .is_some())
+}
 
 /// Insert-only seed of addressable namespace ids.
 ///
@@ -241,16 +351,16 @@ async fn read_budget(
                  b.spent_microdollars,
                  COALESCE((
                      SELECT SUM(r.amount_microdollars)
-                     FROM axond_budget_reservation r
+                     FROM axond_store_budget_reservation r
                      WHERE r.namespace = b.namespace
                        AND r.period = b.period
                        AND r.expires_at > now()
                  ), 0)::bigint,
                  EXISTS (
-                     SELECT 1 FROM axond_budget_active a
+                     SELECT 1 FROM axond_store_budget_active a
                      WHERE a.namespace = b.namespace AND a.period = b.period
                  )
-             FROM axond_budget b
+             FROM axond_store_budget b
              WHERE b.namespace = $1 AND b.period = $2",
             &[&namespace, &period],
         )
@@ -524,14 +634,14 @@ async fn put_budget_tx(
         return Err(StoreError::NotFound(namespace.to_owned()));
     }
     tx.execute(
-        "INSERT INTO axond_budget_active (namespace, period) VALUES ($1, $2)
+        "INSERT INTO axond_store_budget_active (namespace, period) VALUES ($1, $2)
          ON CONFLICT (namespace) DO UPDATE SET period = excluded.period",
         &[&namespace, &period],
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     tx.execute(
-        "INSERT INTO axond_budget (namespace, period, limit_microdollars, spent_microdollars)
+        "INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
          VALUES ($1, $2, $3, 0)
          ON CONFLICT (namespace, period) DO UPDATE SET
             limit_microdollars = excluded.limit_microdollars",
@@ -553,27 +663,27 @@ async fn settle_tx(
 ) -> Result<(), StoreError> {
     let _ = tx
         .query_opt(
-            "SELECT period FROM axond_budget_active WHERE namespace = $1 FOR UPDATE",
+            "SELECT period FROM axond_store_budget_active WHERE namespace = $1 FOR UPDATE",
             &[&namespace],
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     let _ = tx
         .query_opt(
-            "SELECT limit_microdollars FROM axond_budget
+            "SELECT limit_microdollars FROM axond_store_budget
              WHERE namespace = $1 AND period = $2 FOR UPDATE",
             &[&namespace, &period],
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     tx.execute(
-        "DELETE FROM axond_budget_reservation WHERE id = $1",
+        "DELETE FROM axond_store_budget_reservation WHERE id = $1",
         &[&reservation_id],
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     tx.execute(
-        "UPDATE axond_budget
+        "UPDATE axond_store_budget
          SET spent_microdollars = spent_microdollars + $1
          WHERE namespace = $2 AND period = $3",
         &[&actual, &namespace, &period],
@@ -592,7 +702,7 @@ async fn hold(
 ) -> Result<BudgetReserve, StoreError> {
     let Some(active) = tx
         .query_opt(
-            "SELECT period FROM axond_budget_active WHERE namespace = $1 FOR UPDATE",
+            "SELECT period FROM axond_store_budget_active WHERE namespace = $1 FOR UPDATE",
             &[&namespace],
         )
         .await
@@ -602,7 +712,7 @@ async fn hold(
     };
     let period: String = active.get(0);
     tx.execute(
-        "DELETE FROM axond_budget_reservation
+        "DELETE FROM axond_store_budget_reservation
          WHERE namespace = $1 AND expires_at <= now()",
         &[&namespace],
     )
@@ -610,7 +720,7 @@ async fn hold(
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     let Some(row) = tx
         .query_opt(
-            "SELECT limit_microdollars, spent_microdollars FROM axond_budget
+            "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget
              WHERE namespace = $1 AND period = $2 FOR UPDATE",
             &[&namespace, &period],
         )
@@ -623,7 +733,7 @@ async fn hold(
     let spent: i64 = row.get(1);
     let reserved: i64 = tx
         .query_one(
-            "SELECT COALESCE(SUM(amount_microdollars), 0)::bigint FROM axond_budget_reservation
+            "SELECT COALESCE(SUM(amount_microdollars), 0)::bigint FROM axond_store_budget_reservation
              WHERE namespace = $1 AND period = $2 AND expires_at > now()",
             &[&namespace, &period],
         )
@@ -634,7 +744,7 @@ async fn hold(
         return Ok(BudgetReserve::Exceeded);
     }
     tx.execute(
-        "INSERT INTO axond_budget_reservation
+        "INSERT INTO axond_store_budget_reservation
             (id, namespace, period, amount_microdollars, expires_at)
          VALUES ($1, $2, $3, $4, now() + ($5::bigint * interval '1 millisecond'))",
         &[&reservation_id, &namespace, &period, &estimate, &ttl_ms],
@@ -662,7 +772,7 @@ impl PostgresStore {
         self.with_client(async move |client| {
             let count: i64 = client
                 .query_one(
-                    "SELECT count(*)::bigint FROM axond_budget_reservation WHERE namespace = $1",
+                    "SELECT count(*)::bigint FROM axond_store_budget_reservation WHERE namespace = $1",
                     &[&namespace],
                 )
                 .await
@@ -671,5 +781,26 @@ impl PostgresStore {
             Ok(count)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Coexist with leftover `budget_v1.sql` is exercised when
+    /// `AXOND_TEST_POSTGRES_DSN` is set (`postgres_legacy_budget_v1_coexists_with_store_budget`).
+    #[test]
+    fn store_budget_ddl_uses_store_prefixed_names() {
+        assert!(BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_budget ("));
+        assert!(BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_budget_active ("));
+        assert!(BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_budget_reservation ("));
+        assert!(
+            BUDGET_DDL
+                .contains("CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx")
+        );
+        assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget ("));
+        assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget_active ("));
+        assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget_reservation ("));
     }
 }
