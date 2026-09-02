@@ -162,6 +162,7 @@ fn store_namespace_incarnation_is_a_versioned_companion() {
         .unwrap_or_else(|_| panic!("store_namespace_incarnation_v1.sql is not UTF-8"));
     assert!(text.contains("CREATE TABLE IF NOT EXISTS axond_namespace_incarnation ("));
     assert!(text.contains("ADD COLUMN IF NOT EXISTS incarnation bigint NOT NULL DEFAULT 1"));
+    assert!(text.contains("CREATE TABLE IF NOT EXISTS axond_store_budget_reservation_tombstone ("));
 }
 
 /// A shipped DDL header is an operator's route into the reasoning behind the
