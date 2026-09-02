@@ -4,7 +4,14 @@ Date: 2026-08-12
 
 ## Status
 
-Accepted, partially superseded by
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+There are no operating modes. The gateway is stateful-only, namespaces
+are API resources, and `/admin/v1` is unmounted. This record is retained
+for history. Do not implement from it.
+
+Previously accepted, and previously partially superseded by
 [ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
 
 ADR 0062 replaces this record's PostgreSQL-only stateful control plane and its
