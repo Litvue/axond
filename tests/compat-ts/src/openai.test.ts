@@ -40,8 +40,7 @@ interface SdkMount {
 }
 
 const SDK_MOUNTS: readonly SdkMount[] = [
-  { name: "canonical namespace", suffix: `/namespaces/${NAMESPACE}/v1` },
-  { name: "legacy stateless", suffix: "/v1" },
+  { name: "canonical namespace", suffix: `/ns/${NAMESPACE}/v1` },
 ];
 
 function sdkClient(mount: SdkMount): OpenAI {
@@ -197,7 +196,7 @@ interface Refusal {
 
 async function modelsRefusal(namespace: string): Promise<Refusal> {
   const candidate = new OpenAI({
-    baseURL: `${harness.baseUrl}/namespaces/${namespace}/v1`,
+    baseURL: `${harness.baseUrl}/ns/${namespace}/v1`,
     apiKey: GATEWAY_KEY,
     maxRetries: 0,
   });
@@ -210,17 +209,23 @@ async function modelsRefusal(namespace: string): Promise<Refusal> {
   assert.fail("the namespace request unexpectedly succeeded");
 }
 
-test("existing and absent unauthorized namespaces are indistinguishable", async () => {
+test("a store-backed namespace is addressable and an absent one is unknown", async () => {
   const before = harness.upstream.requests.length;
-  const existing = await modelsRefusal(UNGRANTED_NAMESPACE);
-  const absent = await modelsRefusal("ghost");
+  const existing = new OpenAI({
+    baseURL: `${harness.baseUrl}/ns/${UNGRANTED_NAMESPACE}/v1`,
+    apiKey: GATEWAY_KEY,
+    maxRetries: 0,
+  });
+  const listed = await existing.models.list();
+  assert.equal(listed.object, "list");
+  assert.equal(harness.upstream.requests.length, before);
 
-  assert.deepEqual(existing, absent);
-  assert.deepEqual(existing, {
-    status: 403,
+  const absent = await modelsRefusal("ghost");
+  assert.deepEqual(absent, {
+    status: 404,
     error: {
-      type: "namespace_not_authorized",
-      message: "the authenticated grant does not authorize the selected namespace",
+      type: "unknown_namespace",
+      message: "unknown namespace",
     },
   });
   assert.equal(harness.upstream.requests.length, before);

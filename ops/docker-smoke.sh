@@ -28,8 +28,10 @@ cleanup() {
 trap cleanup EXIT
 
 # Distroless nonroot cannot create `axond.sqlite` at `/`; `/tmp` is writable.
+# mktemp is 0600; the image runs as uid 65532, so the bind mount must be world-readable.
 sed 's|^path = "axond.sqlite"$|path = "/tmp/axond.sqlite"|' \
   "${repo_root}/axond.example.toml" >"$config"
+chmod 644 "$config"
 
 docker run -d --name "$container" \
   -p "${host_port}:8080" \

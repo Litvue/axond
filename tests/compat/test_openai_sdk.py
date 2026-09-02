@@ -12,11 +12,9 @@ from conftest import GATEWAY_KEY, NAMESPACE, UNGRANTED_NAMESPACE, UPSTREAM_OPENA
 from fake_upstream import CHAT, fixture, RESPONSES
 
 
-@pytest.fixture(params=("namespaced", "legacy"))
-def sdk_base_url(request, gateway) -> str:
-    """Exercise the canonical mount and the documented stateless alias."""
-    if request.param == "namespaced":
-        return f"{gateway}/ns/{NAMESPACE}/v1"
+@pytest.fixture
+def sdk_base_url(gateway) -> str:
+    """ADR 0063: inference is served only at `/ns/{ns}/v1`."""
     return f"{gateway}/ns/{NAMESPACE}/v1"
 
 
@@ -136,24 +134,27 @@ def _models_refusal(gateway: str, namespace: str) -> tuple[int, dict]:
     return caught.value.status_code, caught.value.response.json()
 
 
-def test_existing_and_absent_unauthorized_namespaces_are_indistinguishable(
+def test_store_backed_namespace_is_addressable_and_absent_is_unknown(
     gateway, upstream
 ):
     before = len(upstream.requests)
-    existing = _models_refusal(gateway, UNGRANTED_NAMESPACE)
-    absent = _models_refusal(gateway, "ghost")
-
-    assert existing == absent == (
-        403,
-        {
-            "error": {
-                "type": "namespace_not_authorized",
-                "message": (
-                    "the authenticated grant does not authorize the selected namespace"
-                ),
-            }
-        },
+    existing = OpenAI(
+        base_url=f"{gateway}/ns/{UNGRANTED_NAMESPACE}/v1",
+        api_key=GATEWAY_KEY,
+        max_retries=0,
     )
+    listed = existing.models.list()
+    assert listed.object == "list"
+    assert len(upstream.requests) == before
+
+    status, body = _models_refusal(gateway, "ghost")
+    assert status == 404
+    assert body == {
+        "error": {
+            "type": "unknown_namespace",
+            "message": "unknown namespace",
+        }
+    }
     assert len(upstream.requests) == before
 
 

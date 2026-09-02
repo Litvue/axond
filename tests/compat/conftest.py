@@ -68,9 +68,8 @@ path = "{sqlite}"
 id = "{NAMESPACE}"
 default = true
 
-# This namespace exists but the SDK caller's key does not grant it. Keeping it
-# in the black-box fixture lets the SDK lanes prove that an existing namespace
-# and an absent namespace have the same refusal envelope.
+# A second store-backed namespace. ADR 0063 uses one deployment-wide static key;
+# this id is addressable, and a missing id is `unknown_namespace`.
 [[namespace]]
 id = "{UNGRANTED_NAMESPACE}"
 

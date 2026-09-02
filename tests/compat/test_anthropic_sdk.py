@@ -17,11 +17,9 @@ from conftest import GATEWAY_KEY, NAMESPACE, UPSTREAM_ANTHROPIC_KEY
 from fake_upstream import MESSAGES, fixture
 
 
-@pytest.fixture(params=("namespaced", "legacy"))
-def sdk_base_url(request, gateway) -> str:
-    """Anthropic appends `/v1/messages`; its base must stop at the namespace."""
-    if request.param == "namespaced":
-        return f"{gateway}/ns/{NAMESPACE}"
+@pytest.fixture
+def sdk_base_url(gateway) -> str:
+    """Anthropic appends `/v1/messages`; its base must stop at `/ns/{ns}`."""
     return f"{gateway}/ns/{NAMESPACE}"
 
 
@@ -83,9 +81,8 @@ def test_streamed_message_reassembles_thinking_and_tool_use(client, upstream):
     assert (final.usage.input_tokens, final.usage.output_tokens) == (41, 63)
 
     sent = upstream.requests[-1]
-    # Both the legacy base and `/namespaces/platform` must cause the SDK to add
-    # `/v1/messages` exactly once; axond then removes its normal `/v1` route
-    # mount and the outer namespace mount before provider dispatch.
+    # `/ns/{ns}` must cause the SDK to add `/v1/messages` exactly once; axond
+    # then removes the outer namespace mount before provider dispatch.
     assert sent["path"] == "/messages"
     assert sent["model"] == MESSAGES
     assert sent["body"]["stream"] is True

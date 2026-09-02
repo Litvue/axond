@@ -35,7 +35,7 @@ const ALIASES: ReadonlyArray<readonly [alias: string, provider: string, target: 
   ["responses-golden", "fake-openai", RESPONSES],
 ];
 
-/** The alias catalogue `GET /v1/models` must report. */
+/** The alias catalogue `GET /ns/{ns}/v1/models` must report. */
 export const ALIAS_NAMES: readonly string[] = ALIASES.map(([alias]) => alias);
 
 /** How long a gateway has to answer `/healthz`, and each probe of it. */
@@ -89,8 +89,7 @@ path = "${sqlite}"
 id = "${NAMESPACE}"
 default = true
 
-# Configured but deliberately outside the SDK caller's grant. The compatibility
-# tests compare this namespace with one that does not exist.
+# A second store-backed namespace. ADR 0063 uses one deployment-wide static key.
 [[namespace]]
 id = "${UNGRANTED_NAMESPACE}"
 
