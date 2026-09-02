@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS axond_store_budget_reservation (
 );
 CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx
     ON axond_store_budget_reservation (namespace, period, expires_at);
+CREATE TABLE IF NOT EXISTS axond_store_budget_reservation_tombstone (
+    id TEXT PRIMARY KEY NOT NULL,
+    incarnation INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS axond_store_usage (
     request_id TEXT PRIMARY KEY NOT NULL,
     namespace TEXT NOT NULL,
@@ -133,15 +137,30 @@ fn unavailable(err: rusqlite::Error) -> StoreError {
 
 /// `CREATE TABLE IF NOT EXISTS` does not add columns to an existing file.
 fn migrate_reservation_incarnation(conn: &Connection) -> Result<(), StoreError> {
-    match conn.execute(
-        "ALTER TABLE axond_store_budget_reservation
-         ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 1",
-        [],
-    ) {
-        Ok(_) => Ok(()),
-        Err(err) if err.to_string().contains("duplicate column name") => Ok(()),
-        Err(err) => Err(unavailable(err)),
+    let has_incarnation = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(axond_store_budget_reservation)")
+            .map_err(unavailable)?;
+        let mut rows = stmt.query([]).map_err(unavailable)?;
+        let mut found = false;
+        while let Some(row) = rows.next().map_err(unavailable)? {
+            let name: String = row.get(1).map_err(unavailable)?;
+            if name == "incarnation" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_incarnation {
+        conn.execute(
+            "ALTER TABLE axond_store_budget_reservation
+             ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .map_err(unavailable)?;
     }
+    Ok(())
 }
 
 fn current_incarnation(conn: &Connection, id: &str) -> Result<i64, StoreError> {
@@ -465,8 +484,16 @@ impl Store for SqliteStore {
             };
             let now = now_ms();
             let incarnation = current_incarnation(&tx, &namespace)?;
-            // Expired holds of every incarnation. Unexpired prior-generation
-            // rows stay so a late settle can still see them.
+            // Expired holds of every incarnation become tombstones so settle
+            // can still classify them. Unexpired prior-generation rows stay.
+            tx.execute(
+                "INSERT OR REPLACE INTO axond_store_budget_reservation_tombstone
+                    (id, incarnation)
+                 SELECT id, incarnation FROM axond_store_budget_reservation
+                 WHERE namespace = ?1 AND expires_at <= ?2",
+                params![namespace, now],
+            )
+            .map_err(unavailable)?;
             tx.execute(
                 "DELETE FROM axond_store_budget_reservation
                  WHERE namespace = ?1 AND expires_at <= ?2",
@@ -551,11 +578,32 @@ impl Store for SqliteStore {
                 params![reservation_id],
             )
             .map_err(unavailable)?;
+            let held_incarnation = match held_incarnation {
+                Some(n) => Some(n),
+                None => {
+                    let n = tx
+                        .query_row(
+                            "SELECT incarnation FROM axond_store_budget_reservation_tombstone
+                             WHERE id = ?1",
+                            params![reservation_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(unavailable)?;
+                    tx.execute(
+                        "DELETE FROM axond_store_budget_reservation_tombstone WHERE id = ?1",
+                        params![reservation_id],
+                    )
+                    .map_err(unavailable)?;
+                    n
+                }
+            };
             let ns_exists = namespace_exists(&tx, &namespace)?;
             let current = current_incarnation(&tx, &namespace)?;
+            // Unknown reservation id (no row, no tombstone) is a no-op.
             let charge = match held_incarnation {
                 Some(incarnation) => ns_exists && incarnation == current,
-                None => ns_exists,
+                None => false,
             };
             if charge {
                 tx.execute(
@@ -1009,6 +1057,17 @@ mod tests {
         };
         assert_eq!(old, 0, "expired prior-incarnation hold must be reclaimed");
         assert_eq!(n, 1);
+        store
+            .settle_budget("wsp_x", "p", "old", 10)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
     }
 
     #[tokio::test]
@@ -1074,7 +1133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_hold_settle_still_charges_live_namespace() {
+    async fn unknown_reservation_settle_is_a_noop() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         store
             .put_namespace(NamespaceRecord {
@@ -1103,13 +1162,13 @@ mod tests {
         store
             .settle_budget("wsp_x", "p", "r1", 11)
             .await
-            .expect("expiry settle");
+            .expect("unknown id");
         let got = store
             .get_budget("wsp_x", "p")
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(got.spent_microdollars, 11);
+        assert_eq!(got.spent_microdollars, 0);
         assert_eq!(got.reserved_microdollars, 0);
     }
 
@@ -1136,9 +1195,41 @@ mod tests {
         assert!(
             names
                 .iter()
+                .any(|n| n == "axond_store_budget_reservation_tombstone")
+        );
+        assert!(
+            names
+                .iter()
                 .any(|n| n == "axond_store_budget_reservation_scope_idx")
         );
         assert!(!names.iter().any(|n| n == "axond_budget"));
         assert!(!names.iter().any(|n| n == "axond_budget_reservation"));
+    }
+
+    #[test]
+    fn migrate_reservation_incarnation_adds_column_when_pragma_shows_it_absent() {
+        let conn = Connection::open_in_memory().expect("memory");
+        conn.execute_batch(
+            "CREATE TABLE axond_store_budget_reservation (
+                id TEXT PRIMARY KEY NOT NULL,
+                namespace TEXT NOT NULL,
+                period TEXT NOT NULL,
+                amount_microdollars INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )",
+        )
+        .expect("legacy table");
+        migrate_reservation_incarnation(&conn).expect("add");
+        migrate_reservation_incarnation(&conn).expect("idempotent");
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(axond_store_budget_reservation)")
+                .expect("pragma");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query")
+                .map(|row| row.expect("name"))
+                .collect()
+        };
+        assert!(names.iter().any(|n| n == "incarnation"));
     }
 }

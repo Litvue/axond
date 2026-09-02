@@ -164,7 +164,8 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
     client
         .batch_execute(
             "SELECT id, attrs, blocklist FROM axond_namespace LIMIT 0;
-             SELECT id, n FROM axond_namespace_incarnation LIMIT 0",
+             SELECT id, n FROM axond_namespace_incarnation LIMIT 0;
+             SELECT id, incarnation FROM axond_store_budget_reservation_tombstone LIMIT 0",
         )
         .await
         .map_err(|e| {
@@ -970,6 +971,27 @@ async fn settle_tx(
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let held_incarnation = match held_incarnation {
+        Some(n) => Some(n),
+        None => {
+            let n: Option<i64> = tx
+                .query_opt(
+                    "SELECT incarnation FROM axond_store_budget_reservation_tombstone
+                     WHERE id = $1",
+                    &[&reservation_id],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?
+                .map(|row| row.get(0));
+            tx.execute(
+                "DELETE FROM axond_store_budget_reservation_tombstone WHERE id = $1",
+                &[&reservation_id],
+            )
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            n
+        }
+    };
     let current: i64 = tx
         .query_opt(
             "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
@@ -979,9 +1001,10 @@ async fn settle_tx(
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .map(|row| row.get(0))
         .unwrap_or(1);
+    // Unknown reservation id (no row, no tombstone) is a no-op.
     let charge = match held_incarnation {
         Some(incarnation) => ns_exists && incarnation == current,
-        None => ns_exists,
+        None => false,
     };
     if charge {
         tx.execute(
@@ -1026,8 +1049,17 @@ async fn hold(
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .map(|row| row.get(0))
         .unwrap_or(1);
-    // Expired holds of every incarnation. Unexpired prior-generation rows
-    // stay so a late settle can still see them.
+    // Expired holds of every incarnation become tombstones so settle can
+    // still classify them. Unexpired prior-generation rows stay as holds.
+    tx.execute(
+        "INSERT INTO axond_store_budget_reservation_tombstone (id, incarnation)
+         SELECT id, incarnation FROM axond_store_budget_reservation
+         WHERE namespace = $1 AND expires_at <= now()
+         ON CONFLICT (id) DO UPDATE SET incarnation = EXCLUDED.incarnation",
+        &[&namespace],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     tx.execute(
         "DELETE FROM axond_store_budget_reservation
          WHERE namespace = $1 AND expires_at <= now()",
@@ -1163,6 +1195,10 @@ mod tests {
         assert!(
             INCARNATION_DDL
                 .contains("ADD COLUMN IF NOT EXISTS incarnation bigint NOT NULL DEFAULT 1")
+        );
+        assert!(
+            INCARNATION_DDL
+                .contains("CREATE TABLE IF NOT EXISTS axond_store_budget_reservation_tombstone (")
         );
     }
 }
