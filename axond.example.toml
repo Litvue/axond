@@ -74,8 +74,8 @@ id = "anthropic"
 kind = "anthropic"
 base_url = "https://api.anthropic.com/v1"
 
-# An OpenAI-compatible deployment (Azure OpenAI, a vLLM endpoint, …). Used below
-# as a failover target for the `gpt-4o` alias.
+# An OpenAI-compatible deployment (Azure OpenAI, a vLLM endpoint, …). Callers
+# address it as `azure-openai/<model-id>`; there is no alias failover onto it.
 [[provider]]
 id = "azure-openai"
 kind = "openai-compatible"
@@ -350,55 +350,59 @@ namespace = "acme"
 # (Tier 1) or Postgres (Tier 2), and `axond revoke` writes to that configured
 # store. See docs/minted-token-guide.md for the complete runbook.
 
-# ── Models (aliases) ──────────────────────────────────────────────────────────
-# Callers send the published model id (`gpt-4o`), never `provider/model`. That
-# is `name` and what `/v1/models` lists. Targets are tried in configured order,
-# failing over to the next on a retryable upstream failure (see `[failover]`).
-# A second openai-compatible target here is file-config failover. Stateful
-# imported models are one connection whose slug is the catalogue provider:
-# `axond admin model apply` (docs/getting-started.md).
+# ── Price book ────────────────────────────────────────────────────────────────
+# Callers send `provider-id/model-id` (split on the first `/`). Axond selects
+# the configured provider and forwards the bare id. There is no `[[model]]`
+# alias table: a leftover `[[model]]` is a boot error naming the prefix form.
 #
-# Each target MUST carry a `price` (micro-dollars per million tokens). Pricing is
-# what lets budgets be denominated in currency rather than raw tokens — cost is
-# computed from actual usage × price and checked against a per-subject budget.
-# An unpriced target fails at boot.
+# `[[price]]` is not a routing table. First matching `(provider, model-id glob)`
+# in file order wins; put exact ids before globs. Unmatched ids follow the
+# provider's `unpriced_models = allow | deny` (default deny → 400 unpriced_model;
+# allow → dispatch, usage `cost_microdollars` NULL).
+#
+# Wire compatibility is the provider `kind`: `/v1/messages` to an `openai`
+# provider is 400 unsupported_wire. Optional `blocklist` globs (deployment
+# default, unioned with the namespace list) refuse with 400 model_blocked.
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
-  # Failover target: served only when the primary returns a retryable failure
-  # or its circuit is open.
-  { provider = "azure-openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
-]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2_500_000
+output_microdollars_per_million = 10_000_000
+
+[[price]]
+provider = "azure-openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2_500_000
+output_microdollars_per_million = 10_000_000
+
 
 # Served on Anthropic's native /v1/messages (forwarded verbatim, streaming
-# included, with only `model` rewritten). No route translates between wires, so
-# every target of an alias must speak the route's shape: `anthropic` providers on
-# /v1/messages, OpenAI-family providers on /v1/chat/completions and
-# /v1/embeddings. A mismatch — including in a failover target — is a
-# 400 unsupported_wire before anything is dispatched. See
-# docs/adr/0012-native-provider-routes.md.
+# included, with only `model` rewritten). No route translates between wires:
+# `anthropic` providers on /v1/messages, OpenAI-family providers on
+# /v1/chat/completions and /v1/embeddings. A mismatch is 400 unsupported_wire
+# before anything is dispatched. See docs/adr/0012-native-provider-routes.md.
 
-[[model]]
-name = "claude-sonnet"
-targets = [
-  { provider = "anthropic", model = "claude-3-7-sonnet-latest", price = { input_microdollars_per_million = 3_000_000, output_microdollars_per_million = 15_000_000 } },
-]
+[[price]]
+provider = "anthropic"
+model = "claude-3-7-sonnet-latest"
+input_microdollars_per_million = 3_000_000
+output_microdollars_per_million = 15_000_000
 
-# An embeddings alias, served on /v1/embeddings against an OpenAI-family target.
-# Embeddings produce no completion, so only input tokens are ever billed and the
-# output price is unused.
 
-[[model]]
-name = "text-embedding-3-small"
-targets = [
-  { provider = "openai", model = "text-embedding-3-small", price = { input_microdollars_per_million = 20_000, output_microdollars_per_million = 0 } },
-]
+# Embeddings on /v1/embeddings against an OpenAI-family target. They produce
+# no completion, so only input tokens are billed and the output price is unused.
+
+[[price]]
+provider = "openai"
+model = "text-embedding-3-small"
+input_microdollars_per_million = 20_000
+output_microdollars_per_million = 0
+
 
 # ── Config hot-reload ─────────────────────────────────────────────────────────
 # SIGHUP always reloads this file: `kill -HUP <pid>`. The candidate goes through
-# the FULL boot-time validation, and any error (bad TOML, an alias pointing at an
+# the FULL boot-time validation, and any error (bad TOML, a price pointing at an
 # undefined provider, a credential whose env var is unset) rejects the candidate
 # and leaves the running config serving. The swap is atomic, and each request
 # holds one snapshot for its whole life, so nothing in flight is affected.

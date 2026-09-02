@@ -11,6 +11,9 @@ base_url = "https://api.openai.com/v1"
 env = "AXOND_KEY"
 namespace = "fuzz"
 
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+

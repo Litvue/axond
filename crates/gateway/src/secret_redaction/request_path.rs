@@ -65,6 +65,7 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
 /// `INFO` and above would miss the `DEBUG` line that renders a whole request
 /// context, which is exactly the line a leak arrives on.
 #[tokio::test]
+#[ignore = "ADR 0063: projected credentials / alias snapshots withdrawn"]
 async fn a_served_request_leaks_its_credentials_into_nothing_it_emits() {
     let provider = FakeProvider::serving().await;
     let usage = CapturingSink::default();

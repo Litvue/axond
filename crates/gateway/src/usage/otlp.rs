@@ -129,7 +129,7 @@ fn attributes(record: &UsageRecord) -> Vec<(&'static str, AnyValue)> {
         ),
         (
             "axond.cost_microdollars",
-            AnyValue::Int(clamped(record.cost_microdollars)),
+            AnyValue::Int(clamped(record.settle_cost())),
         ),
         (
             "axond.catalog_version",

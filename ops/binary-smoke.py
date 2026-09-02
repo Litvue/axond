@@ -9,8 +9,8 @@ the release matrix ships binaries for both. This runner is the portable subset â
 the same serving assertions, expressed with nothing but the standard library:
 
 * `/healthz` and `/readyz` answer, unauthenticated;
-* `/ns/platform/v1/models` needs a gateway key and lists the configured alias;
-* an unknown model is refused with the typed `unknown_model` error;
+* `/ns/platform/v1/models` needs a gateway key and may return an empty list;
+* an unprefixed model is refused with the typed `model_unprefixed` error;
 * one chat completion completes against a local fixture upstream.
 
 Portability, not convenience, drives the implementation choices: ports are
@@ -45,7 +45,7 @@ from fake_upstream import CHAT, FakeUpstream  # noqa: E402
 
 GATEWAY_KEY = "binary-smoke-inbound-key"
 UPSTREAM_KEY = "binary-smoke-upstream-placeholder"
-ALIAS = "smoke-chat"
+ALIAS = f"fixture-openai/{CHAT}"
 BOOT_TIMEOUT_SECONDS = 60.0
 REQUEST_TIMEOUT_SECONDS = 10.0
 TERMINATE_TIMEOUT_SECONDS = 10.0
@@ -76,11 +76,11 @@ env = "GW_SMOKE_UPSTREAM_KEY"
 env = "GW_SMOKE_INBOUND_KEY"
 namespace = "platform"
 
-[[model]]
-name = "{alias}"
-targets = [
-  {{ provider = "fixture-openai", model = "{target_model}", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }},
-]
+[[price]]
+provider = "fixture-openai"
+model = "*"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
 """
 
 
@@ -181,9 +181,9 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
         raise SmokeFailure(
             f"authenticated /v1/models answered {models.status}: {models.body}"
         )
-    served = {entry.get("id") for entry in json.loads(models.body).get("data", [])}
-    if ALIAS not in served:
-        raise SmokeFailure(f"/v1/models omitted the configured alias {ALIAS}: {served}")
+    served = json.loads(models.body).get("data", [])
+    if served != []:
+        raise SmokeFailure(f"/v1/models was not empty before discovery: {served}")
 
     unknown = request(
         f"{base_url}/ns/platform/v1/chat/completions",
@@ -193,14 +193,14 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
             "messages": [{"role": "user", "content": "hello"}],
         },
     )
-    if unknown.status != 404:
+    if unknown.status != 400:
         raise SmokeFailure(
-            f"unknown model answered {unknown.status} instead of 404: {unknown.body}"
+            f"unprefixed model answered {unknown.status} instead of 400: {unknown.body}"
         )
     error_type = json.loads(unknown.body).get("error", {}).get("type")
-    if error_type != "unknown_model":
+    if error_type != "model_unprefixed":
         raise SmokeFailure(
-            f"unknown model was refused as {error_type!r}, not 'unknown_model'"
+            f"unprefixed model was refused as {error_type!r}, not 'model_unprefixed'"
         )
 
     completion = request(
@@ -225,9 +225,9 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
             f"{CHAT}; the alias did not reach a target"
         )
 
-    print(f"healthz: ok, readyz: ready, models: {ALIAS}")
+    print("healthz: ok, readyz: ready, models: []")
     print("auth: unauthenticated /v1/models -> 401")
-    print("errors: unknown model -> 404 unknown_model")
+    print("errors: unprefixed model -> 400 model_unprefixed")
     print("serving: local fixture upstream -> 200 chat.completion")
 
 
@@ -255,8 +255,6 @@ def smoke(binary: Path) -> None:
                 bind=f"127.0.0.1:{port}",
                 sqlite=str(directory / "axond.sqlite").replace("\\", "/"),
                 upstream=upstream.base_url,
-                alias=ALIAS,
-                target_model=CHAT,
             ),
             encoding="utf-8",
         )

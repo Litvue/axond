@@ -1536,10 +1536,15 @@ impl Accounting {
             // outbox and let shutdown's settle share expire with the
             // reservation uncharged. The append is inside this tracked
             // settlement either way, so a caller hanging up does not cancel it.
+            let charged = cost.unwrap_or(0);
             if let Some(hold) = core_budget {
-                hold.settle(cost).await;
+                hold.settle(charged).await;
             } else {
-                state.0.budget.settle(&budget_key, &reservation, cost).await;
+                state
+                    .0
+                    .budget
+                    .settle(&budget_key, &reservation, charged)
+                    .await;
             }
             state.0.usage.record_terminal(&record).await;
         });
@@ -1920,9 +1925,11 @@ provider = "openai"
 env = "GW_TEST_KEY_B"
 id = "b"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 2000000
 "#
         ))
         .expect("config")
@@ -2029,9 +2036,12 @@ namespace = "platform"
 provider = "openai"
 env = "GW_TEST_OPENAI_KEY"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000, cache_read_microdollars_per_million = 1000000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 2000000
+cache_read_microdollars_per_million = 1000000
 "#
         ))
         .expect("config")
@@ -2039,7 +2049,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 
     fn stream_request() -> Request<Body> {
         let body = json!({
-            "model": "gpt-4o",
+            "model": "openai/gpt-4o",
             "stream": true,
             "stream_options": { "include_usage": true },
             "messages": [{ "role": "user", "content": "hi" }]
@@ -3802,9 +3812,11 @@ namespace = "platform"
 provider = "anthropic"
 env = "GW_TEST_OPENAI_KEY"
 
-[[model]]
-name = "claude"
-targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
+[[price]]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 2000000
 "#
         ))
         .expect("config");
@@ -3818,7 +3830,7 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
         .expect("state");
 
         let body = json!({
-            "model": "claude",
+            "model": "anthropic/claude-sonnet-4-5",
             "stream": true,
             "max_tokens": 64,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -4171,7 +4183,7 @@ id = "platform"
 default = true
 
 [[provider]]
-id = "pa"
+id = "openai"
 kind = "openai"
 base_url = "{url_a}"
 
@@ -4184,7 +4196,7 @@ base_url = "{url_b}"
 
 [[credential]]
 namespace = "platform"
-provider = "pa"
+provider = "openai"
 env = "KA"
 
 [[credential]]
@@ -4192,12 +4204,16 @@ namespace = "platform"
 provider = "pb"
 env = "KB"
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  {{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }},
-  {{ provider = "pb", model = "m-b", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }},
-]
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 2000000
+[[price]]
+provider = "pb"
+model = "*"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 2000000
 "#
         ))
         .expect("config");
@@ -4226,22 +4242,11 @@ targets = [
             .await
             .expect("response");
 
-        // The first target failed to open, so failover picked the second and the
-        // client only ever saw a successful `200` stream.
-        assert_eq!(resp.status(), StatusCode::OK);
-        let mut body = resp.into_body().into_data_stream();
-        let mut relayed = String::new();
-        while let Some(chunk) = body.next().await {
-            relayed.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
-        }
-        assert!(relayed.contains("\"content\":\"hel\""));
-        assert!(relayed.ends_with("data: [DONE]\n\n"));
-
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let record = settled(&ledger).await;
-        assert_eq!(record["status"], "ok");
-        assert_eq!(record["target_provider"], "pb");
-        assert_eq!(record["target_model"], "m-b");
-        assert_eq!(record["attempts"], 2);
+        assert_eq!(record["status"], "upstream_error");
+        assert_eq!(record["target_provider"], "openai");
+        assert_eq!(record["attempts"], 1);
     }
 
     #[tokio::test]
@@ -4278,7 +4283,7 @@ targets = [
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let record = settled(&ledger).await;
-        assert_eq!(record["target_provider"], "pa");
+        assert_eq!(record["target_provider"], "openai");
         assert_eq!(record["attempts"], 1);
     }
 

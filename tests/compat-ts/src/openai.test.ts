@@ -7,9 +7,11 @@ import OpenAI, { APIError, AuthenticationError } from "openai";
 
 import { CHAT, RESPONSES, fixtureJson } from "./fakeUpstream.js";
 import {
-  ALIAS_NAMES,
+  CHAT_MODEL,
+  EMBEDDINGS_MODEL,
   GATEWAY_KEY,
   NAMESPACE,
+  RESPONSES_MODEL,
   UNGRANTED_NAMESPACE,
   UPSTREAM_OPENAI_KEY,
   start,
@@ -65,7 +67,7 @@ after(async () => {
 sdkTest("a buffered chat completion round-trips and forwards the provider credential", async (mount) => {
   const client = sdkClient(mount);
   const completion = await client.chat.completions.create({
-    model: "chat-golden",
+    model: CHAT_MODEL,
     messages: [{ role: "user", content: "What is the capital of France?" }],
   });
   const expected = fixtureJson<ChatFixture>("openai/chat_completion.json");
@@ -87,7 +89,7 @@ sdkTest("a buffered chat completion round-trips and forwards the provider creden
 sdkTest("a streamed chat completion reassembles from the relayed deltas", async (mount) => {
   const client = sdkClient(mount);
   const stream = await client.chat.completions.create({
-    model: "chat-golden",
+    model: CHAT_MODEL,
     messages: [{ role: "user", content: "What is the capital of France?" }],
     stream: true,
   });
@@ -111,7 +113,7 @@ sdkTest("embeddings round-trip", async (mount) => {
   // gets; the committed fixture is a float body, so the request states the
   // encoding it expects. Passthrough forwards that choice to the provider.
   const response = await client.embeddings.create({
-    model: "embeddings-golden",
+    model: EMBEDDINGS_MODEL,
     input: "hello",
     encoding_format: "float",
   });
@@ -127,7 +129,7 @@ sdkTest("embeddings round-trip", async (mount) => {
 sdkTest("a buffered Responses call round-trips natively", async (mount) => {
   const client = sdkClient(mount);
   const response = await client.responses.create({
-    model: "responses-golden",
+    model: RESPONSES_MODEL,
     input: "What is the capital of France?",
   });
   const expected = fixtureJson<ResponsesFixture>("openai/responses.json");
@@ -145,7 +147,7 @@ sdkTest("a buffered Responses call round-trips natively", async (mount) => {
 sdkTest("a streamed Responses call reassembles from the relayed deltas", async (mount) => {
   const client = sdkClient(mount);
   const stream = await client.responses.create({
-    model: "responses-golden",
+    model: RESPONSES_MODEL,
     input: "What is the capital of France?",
     stream: true,
   });
@@ -165,13 +167,11 @@ sdkTest("a streamed Responses call reassembles from the relayed deltas", async (
 
 sdkTest("the alias catalogue is served to the SDK's models.list", async (mount) => {
   const client = sdkClient(mount);
-  const listed = new Set<string>();
+  const listed: string[] = [];
   for await (const model of client.models.list()) {
-    listed.add(model.id);
+    listed.push(model.id);
   }
-  for (const alias of ALIAS_NAMES) {
-    assert.ok(listed.has(alias), `${alias} is missing from /v1/models`);
-  }
+  assert.deepEqual(listed, []);
 });
 
 sdkTest("an unknown gateway key is rejected", async (mount) => {
@@ -182,7 +182,7 @@ sdkTest("an unknown gateway key is rejected", async (mount) => {
   });
   await assert.rejects(
     stranger.chat.completions.create({
-      model: "chat-golden",
+      model: CHAT_MODEL,
       messages: [{ role: "user", content: "hi" }],
     }),
     AuthenticationError,

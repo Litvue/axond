@@ -35,9 +35,10 @@ const SCHEMA_DDL: &str = include_str!("../../sql/usage_v2.sql");
 /// installations apply them before deploying a writer that emits the new
 /// columns. Nullable columns only, so a writer deployed ahead of one of them
 /// still writes rows the earlier shape can read.
-const ADDITIVE_DDL: [&str; 2] = [
+const ADDITIVE_DDL: [&str; 3] = [
     include_str!("../../sql/usage_v1_001_add_signer_kid.sql"),
     include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
+    include_str!("../../sql/usage_v2_002_nullable_cost.sql"),
 ];
 
 /// Which migration adds each column the base DDL of the current schema version
@@ -404,7 +405,7 @@ fn row(observed: &ObservedRecord) -> Vec<Box<dyn ToSql + Sync + Send>> {
         Box::new(bigint(record.cache_read_tokens)),
         Box::new(bigint(record.cache_write_tokens)),
         Box::new(bigint(record.output_tokens)),
-        Box::new(bigint(record.cost_microdollars)),
+        Box::new(record.cost_microdollars.map(bigint)),
         Box::new(bigint(record.catalog_version)),
         Box::new(record.price_book.clone()),
         Box::new(record.price_book_checksum.clone()),
@@ -482,6 +483,10 @@ mod tests {
             (
                 "usage_v2_001_add_price_identity.sql",
                 include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
+            ),
+            (
+                "usage_v2_002_nullable_cost.sql",
+                include_str!("../../sql/usage_v2_002_nullable_cost.sql"),
             ),
         ];
         for (column, file) in ADDITIVE_COLUMNS {

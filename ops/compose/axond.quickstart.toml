@@ -52,20 +52,23 @@ namespace = "platform"
 env = "GW_INBOUND_ACME_KEY"
 namespace = "acme"
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
-]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2_500_000
+output_microdollars_per_million = 10_000_000
 
-[[model]]
-name = "claude-sonnet"
-targets = [
-  { provider = "anthropic", model = "claude-3-7-sonnet-latest", price = { input_microdollars_per_million = 3_000_000, output_microdollars_per_million = 15_000_000 } },
-]
 
-[[model]]
-name = "text-embedding-3-small"
-targets = [
-  { provider = "openai", model = "text-embedding-3-small", price = { input_microdollars_per_million = 20_000, output_microdollars_per_million = 0 } },
-]
+[[price]]
+provider = "anthropic"
+model = "claude-3-7-sonnet-latest"
+input_microdollars_per_million = 3_000_000
+output_microdollars_per_million = 15_000_000
+
+
+[[price]]
+provider = "openai"
+model = "text-embedding-3-small"
+input_microdollars_per_million = 20_000
+output_microdollars_per_million = 0
+

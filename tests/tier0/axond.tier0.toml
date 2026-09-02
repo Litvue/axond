@@ -37,8 +37,9 @@ env = "GW_TIER0_VERIFIER"
 namespaces = ["platform"]
 max_ttl = "15m"
 
-[[model]]
-name = "fixture-chat"
-targets = [
-  { provider = "fake-openai", model = "fixture-chat", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } },
-]
+[[price]]
+provider = "fake-openai"
+model = "fixture-chat"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+

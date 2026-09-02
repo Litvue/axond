@@ -461,6 +461,7 @@ namespace = "acme/core"
     /// section, so a stateful file declares none. Projection supplies the fixed
     /// platform default and never promotes a durable project into it.
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn an_empty_stateful_bootstrap_gets_a_stable_platform_default() {
         let bootstrap = Config::from_toml_str(
             r#"

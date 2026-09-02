@@ -1331,9 +1331,11 @@ id = "openai"
 kind = "openai"
 base_url = "https://provider.invalid/v1"
 
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#,
         )
         .expect("serving cache fixture config");
@@ -1343,6 +1345,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn compiled_serving_cache_round_trips_opaquely_and_rejects_tampering() {
         let (snapshot, bootstrap, env) = serving_snapshot();
         let cache = cache("compiled-serving");

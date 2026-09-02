@@ -268,7 +268,9 @@ pub fn record_request(record: &UsageRecord, ttft_ms: Option<u64>, attempts: u32)
     span.record("gen_ai.usage.cache_read_tokens", record.cache_read_tokens);
     span.record("gen_ai.usage.cache_write_tokens", record.cache_write_tokens);
     span.record("gen_ai.usage.output_tokens", record.output_tokens);
-    span.record("axond.cost_microdollars", record.cost_microdollars);
+    if let Some(cost) = record.cost_microdollars {
+        span.record("axond.cost_microdollars", cost);
+    }
     span.record("axond.latency_ms", record.latency_ms);
     if let Some(ttft_ms) = ttft_ms {
         span.record("axond.ttft_ms", ttft_ms);

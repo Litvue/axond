@@ -1292,7 +1292,8 @@ struct StoredRecord {
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     output_tokens: u64,
-    cost_microdollars: u64,
+    #[serde(default)]
+    cost_microdollars: Option<u64>,
     catalog_version: u64,
     // Absent in a row a pre-#147 writer appended, which is exactly what a
     // request the file configuration priced also writes: no approved book named
@@ -1901,7 +1902,7 @@ mod tests {
         assert_eq!(first.position(), second.position());
 
         let mut different = event.record().clone();
-        different.cost_microdollars += 1;
+        different.cost_microdollars = Some(different.settle_cost() + 1);
         let conflicting =
             UsageEvent::new(ObservedRecord::now(different)).expect("a well-formed event");
         let error = journal

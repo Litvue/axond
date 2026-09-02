@@ -302,6 +302,7 @@ mod tests {
     /// The whole point of the missing-Postgres case: it is decided before a
     /// socket is opened, so it is deterministic without a database.
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn an_unset_reference_fails_before_connecting_and_names_the_variable() {
         let config = Config::from_toml_str(stateful_toml()).expect("valid stateful config");
         let env = HashMap::new();
@@ -1426,6 +1427,7 @@ mod tests {
     /// database nothing answers at is an outage, is worth retrying, and still
     /// never prints the DSN it failed to connect with.
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn an_unreachable_database_is_retryable_and_never_echoes_the_dsn() {
         let config = Config::from_toml_str(
             "mode = \"stateful\"\n\

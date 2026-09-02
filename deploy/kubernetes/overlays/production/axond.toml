@@ -26,11 +26,11 @@ id = "openai-primary"
 env = "GW_INBOUND_PLATFORM_KEY"
 namespace = "platform"
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
-]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2_500_000
+output_microdollars_per_million = 10_000_000
 
 # Sized for this manifest's pod, not for the fleet: the ceilings are per replica
 # and in process memory, so `replicas: 3` admits three times these numbers. They

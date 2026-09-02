@@ -20,8 +20,17 @@ use crate::principals::{Capability, TokenVerificationError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
+    #[allow(dead_code)]
     #[error("unknown model `{0}`")]
     UnknownModel(String),
+    #[error("model `{0}` is not prefixed as `provider-id/model-id`")]
+    ModelUnprefixed(String),
+    #[error("unknown provider `{0}`")]
+    UnknownProvider(String),
+    #[error("model `{0}` is blocked")]
+    ModelBlocked(String),
+    #[error("model `{0}` has no price")]
+    UnpricedModel(String),
     #[error("no credential for provider `{provider}` in namespace `{namespace}`")]
     NoCredential { namespace: String, provider: String },
     #[error("budget exceeded for model `{0}`")]
@@ -165,6 +174,10 @@ impl GatewayError {
     fn status(&self) -> StatusCode {
         match self {
             Self::UnknownModel(_) => StatusCode::NOT_FOUND,
+            Self::ModelUnprefixed(_)
+            | Self::UnknownProvider(_)
+            | Self::ModelBlocked(_)
+            | Self::UnpricedModel(_) => StatusCode::BAD_REQUEST,
             Self::NoCredential { .. } => StatusCode::BAD_GATEWAY,
             Self::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             // The configuration is servable and the caller's request is
@@ -243,6 +256,10 @@ impl GatewayError {
     fn code(&self) -> &str {
         match self {
             Self::UnknownModel(_) => "unknown_model",
+            Self::ModelUnprefixed(_) => "model_unprefixed",
+            Self::UnknownProvider(_) => "unknown_provider",
+            Self::ModelBlocked(_) => "model_blocked",
+            Self::UnpricedModel(_) => "unpriced_model",
             Self::NoCredential { .. } => "no_credential",
             Self::BudgetExceeded(_) => "budget_exceeded",
             Self::ModelNotPriced { .. } => "model_not_priced",

@@ -9,7 +9,7 @@ import pytest
 from openai import OpenAI
 
 from conftest import GATEWAY_KEY, NAMESPACE, UNGRANTED_NAMESPACE, UPSTREAM_OPENAI_KEY
-from fake_upstream import CHAT, fixture, RESPONSES
+from fake_upstream import CHAT, EMBEDDINGS, fixture, RESPONSES
 
 
 @pytest.fixture
@@ -25,7 +25,7 @@ def client(sdk_base_url) -> OpenAI:
 
 def test_buffered_chat_completion(client, upstream):
     completion = client.chat.completions.create(
-        model="chat-golden",
+        model=f"fake-openai/{CHAT}",
         messages=[{"role": "user", "content": "What is the capital of France?"}],
     )
     expected = json.loads(fixture("openai/chat_completion.json"))
@@ -44,7 +44,7 @@ def test_buffered_chat_completion(client, upstream):
 
 def test_streamed_chat_completion(client, upstream):
     stream = client.chat.completions.create(
-        model="chat-golden",
+        model=f"fake-openai/{CHAT}",
         messages=[{"role": "user", "content": "What is the capital of France?"}],
         stream=True,
     )
@@ -64,7 +64,7 @@ def test_streamed_chat_completion(client, upstream):
 
 
 def test_embeddings(client, upstream):
-    response = client.embeddings.create(model="embeddings-golden", input="hello")
+    response = client.embeddings.create(model=f"fake-openai/{EMBEDDINGS}", input="hello")
     expected = json.loads(fixture("openai/embeddings.json"))
     assert response.data[0].embedding == expected["data"][0]["embedding"]
     assert response.usage.prompt_tokens == expected["usage"]["prompt_tokens"]
@@ -76,7 +76,7 @@ def test_embeddings(client, upstream):
 
 def test_buffered_responses(client, upstream):
     response = client.responses.create(
-        model="responses-golden",
+        model=f"fake-openai/{RESPONSES}",
         input="What is the capital of France?",
     )
     expected = json.loads(fixture("openai/responses.json"))
@@ -92,7 +92,7 @@ def test_buffered_responses(client, upstream):
 
 def test_streamed_responses(client, upstream):
     stream = client.responses.create(
-        model="responses-golden",
+        model=f"fake-openai/{RESPONSES}",
         input="What is the capital of France?",
         stream=True,
     )
@@ -106,19 +106,14 @@ def test_streamed_responses(client, upstream):
 
 
 def test_models_are_listed(client):
-    assert {model.id for model in client.models.list()} >= {
-        "chat-golden",
-        "messages-golden",
-        "embeddings-golden",
-        "responses-golden",
-    }
+    assert [model.id for model in client.models.list()] == []
 
 
 def test_an_unknown_gateway_key_is_rejected(sdk_base_url):
     stranger = OpenAI(base_url=sdk_base_url, api_key="not-a-gateway-key", max_retries=0)
     with pytest.raises(openai.AuthenticationError):
         stranger.chat.completions.create(
-            model="chat-golden",
+            model=f"fake-openai/{CHAT}",
             messages=[{"role": "user", "content": "hi"}],
         )
 

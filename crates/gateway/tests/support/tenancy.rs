@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::gateway::{Axond, INPUT_PRICE, OUTPUT_PRICE};
-use super::upstream::{FakeUpstream, target};
+use super::upstream::FakeUpstream;
 
 /// One tenant of the deployment: its namespace, the key that authenticates to
 /// it, the alias only it can serve, and the upstream credential its requests
@@ -48,7 +48,7 @@ pub const ACME: Tenant = Tenant {
     namespace: "acme/core",
     key: "test-inbound-key-acme",
     key_env: "GW_KEY_ACME",
-    alias: "acme-chat",
+    alias: "acme-openai/fixture-chat",
     provider: "acme-openai",
     upstream_key: "test-upstream-acme-key",
     upstream_key_env: "GW_FAKE_ACME_KEY",
@@ -60,7 +60,7 @@ pub const GLOBEX: Tenant = Tenant {
     namespace: "globex/core",
     key: "test-inbound-key-globex",
     key_env: "GW_KEY_GLOBEX",
-    alias: "globex-chat",
+    alias: "globex-openai/fixture-chat",
     provider: "globex-openai",
     upstream_key: "test-upstream-globex-key",
     upstream_key_env: "GW_FAKE_GLOBEX_KEY",
@@ -79,7 +79,7 @@ pub const FALLBACK_KEY_ENV: &str = "GW_KEY_INITECH";
 
 /// The platform's own namespace, pool, and alias.
 pub const PLATFORM_NAMESPACE: &str = "platform";
-pub const PLATFORM_ALIAS: &str = "platform-chat";
+pub const PLATFORM_ALIAS: &str = "platform-openai/fixture-chat";
 pub const PLATFORM_PROVIDER: &str = "platform-openai";
 pub const PLATFORM_CREDENTIAL_ID: &str = "platform-openai-primary";
 pub const PLATFORM_UPSTREAM_KEY: &str = "test-upstream-platform-key";
@@ -498,16 +498,9 @@ fn config_toml(
     budget_table: &str,
     outbox_schema: &str,
 ) -> String {
-    let price = format!(
-        "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
-    );
-    let model = |name: &str, namespace: Option<&str>, provider: &str| {
-        let namespace = namespace
-            .map(|namespace| format!("namespace = \"{namespace}\"\n"))
-            .unwrap_or_default();
+    let model = |provider: &str| {
         format!(
-            "[[model]]\nname = \"{name}\"\n{namespace}targets = [ {{ provider = \"{provider}\", model = \"{target}\", price = {price} }} ]\n\n",
-            target = target::CHAT,
+            "[[price]]\nprovider = \"{provider}\"\nmodel = \"*\"\ninput_microdollars_per_million = {INPUT_PRICE}\noutput_microdollars_per_million = {OUTPUT_PRICE}\n\n"
         )
     };
     let provider = |id: &str| {
@@ -575,6 +568,10 @@ create_table = true
 [server]
 bind = "{bind}"
 
+[storage]
+backend = "sqlite"
+path = "{sqlite}"
+
 [[namespace]]
 id = "{PLATFORM_NAMESPACE}"
 default = true
@@ -605,6 +602,13 @@ max_attempts = 1
 overall_timeout_ms = 30000
 {durable}
 {models}"#,
+        sqlite = std::env::temp_dir()
+            .join(format!(
+                "axond-tenancy-{}-{}.sqlite",
+                std::process::id(),
+                bind.port()
+            ))
+            .display(),
         acme_ns = ACME.namespace,
         globex_ns = GLOBEX.namespace,
         providers = [ACME.provider, GLOBEX.provider, PLATFORM_PROVIDER]
@@ -639,9 +643,9 @@ overall_timeout_ms = 30000
         ]
         .concat(),
         models = [
-            model(ACME.alias, Some(ACME.namespace), ACME.provider),
-            model(GLOBEX.alias, Some(GLOBEX.namespace), GLOBEX.provider),
-            model(PLATFORM_ALIAS, None, PLATFORM_PROVIDER),
+            model(ACME.provider),
+            model(GLOBEX.provider),
+            model(PLATFORM_PROVIDER),
         ]
         .concat(),
     )

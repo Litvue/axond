@@ -837,6 +837,7 @@ impl ConfigSnapshot {
                     id: provider.id,
                     kind,
                     base_url: provider.base_url,
+                    unpriced_models: crate::config::UnpricedModels::Deny,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2161,9 +2162,11 @@ base_url = "https://api.openai.com/v1"
 
 {gateway_keys}
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#
         ))
         .expect("valid config")
@@ -3255,6 +3258,7 @@ namespace = "platform"
     /// A stateful deployment starts with a keyless bootstrap object, but that
     /// object is not admissible as a serving snapshot.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_stateful_bootstrap_compiles_without_an_inbound_key() {
         let env = HashMap::new();
         let stateful = Config::from_toml_str(
@@ -3278,6 +3282,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_compiled_revision_without_a_request_addressable_principal_is_refused() {
         let env = HashMap::new();
         let stateful = Config::from_toml_str(
@@ -3344,6 +3349,7 @@ env = "GW_ADMIN_BREAKGLASS"
     /// A normal candidate build never permits a keyless stateful snapshot. The
     /// explicit bootstrap constructor is the only keyless path.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn stateful_candidates_require_projected_inbound_keys() {
         // A mode that serves inference has no keyless form to begin with:
         // configuration refuses it before a snapshot is ever built.

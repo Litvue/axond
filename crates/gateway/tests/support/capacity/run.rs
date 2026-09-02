@@ -143,8 +143,8 @@ const ACME: Tenant = Tenant {
     inbound_env: "GW_CAPACITY_ACME_KEY",
     upstream_key: "test-upstream-capacity-acme",
     upstream_env: "GW_CAPACITY_ACME_UPSTREAM",
-    chat_alias: "capacity-acme-chat",
-    slow_alias: "capacity-acme-chat-slow",
+    chat_alias: "fake-openai/fixture-chat#capacity-acme",
+    slow_alias: "fake-openai/slow-stream#capacity-acme",
 };
 
 const GLOBEX: Tenant = Tenant {
@@ -153,8 +153,8 @@ const GLOBEX: Tenant = Tenant {
     inbound_env: "GW_CAPACITY_GLOBEX_KEY",
     upstream_key: "test-upstream-capacity-globex",
     upstream_env: "GW_CAPACITY_GLOBEX_UPSTREAM",
-    chat_alias: "capacity-globex-chat",
-    slow_alias: "capacity-globex-chat-slow",
+    chat_alias: "fake-openai/fixture-chat#capacity-globex",
+    slow_alias: "fake-openai/slow-stream#capacity-globex",
 };
 
 /// The tenants a multi-tenant run serves, in rotation order.
@@ -258,23 +258,10 @@ id = "{namespace}-openai"
 [[gateway_key]]
 env = "{inbound_env}"
 namespace = "{namespace}"
-
-[[model]]
-name = "{chat_alias}"
-targets = [ {{ provider = "fake-openai", model = "{chat_target}{CALLER_TAG}{namespace}", price = {price} }} ]
-
-[[model]]
-name = "{slow_alias}"
-targets = [ {{ provider = "fake-openai", model = "{slow_target}{CALLER_TAG}{namespace}", price = {price} }} ]
 "#,
             namespace = tenant.namespace,
             upstream_env = tenant.upstream_env,
             inbound_env = tenant.inbound_env,
-            chat_alias = tenant.chat_alias,
-            slow_alias = tenant.slow_alias,
-            chat_target = target::CHAT,
-            slow_target = target::SLOW_STREAM,
-            price = crate::support::gateway::price(),
         );
         config
     })

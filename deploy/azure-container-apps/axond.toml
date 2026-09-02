@@ -47,17 +47,19 @@ id = "anthropic-primary"
 env = "GW_INBOUND_PLATFORM_KEY"
 namespace = "platform"
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
-]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2_500_000
+output_microdollars_per_million = 10_000_000
 
-[[model]]
-name = "claude-sonnet"
-targets = [
-  { provider = "anthropic", model = "claude-3-7-sonnet-latest", price = { input_microdollars_per_million = 3_000_000, output_microdollars_per_million = 15_000_000 } },
-]
+
+[[price]]
+provider = "anthropic"
+model = "claude-3-7-sonnet-latest"
+input_microdollars_per_million = 3_000_000
+output_microdollars_per_million = 15_000_000
+
 
 # Per replica. Size with the container memory limit; see
 # deploy/kubernetes/base/axond.toml for the arithmetic.

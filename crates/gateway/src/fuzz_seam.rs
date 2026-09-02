@@ -1117,11 +1117,11 @@ namespace = "fuzz"
 provider = "fuzz-provider"
 env = "AXOND_FUZZ_PROVIDER_KEY"
 
-[[model]]
-name = "fuzz-alias"
-targets = [
-  { provider = "fuzz-provider", model = "fuzz-upstream-model", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
-]
+[[price]]
+provider = "fuzz-provider"
+model = "fuzz-upstream-model"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#;
 
 /// The configuration this seam compiles: the one an assertion about the request

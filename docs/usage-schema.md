@@ -20,7 +20,7 @@ meaning, and how they are allowed to change. The design rationale is
 | `namespace` | `text` | Tenant/namespace the request was served under. |
 | `subject` | `text` | Authenticated caller — the gateway key's env-var label or file path for static authentication, or the token's `sub` claim for token authentication. Switching a static key from `env` to `file` changes this value and therefore the corresponding budget subject; file paths are emitted as written. |
 | `signer_kid` | `text` | Configured JWS signer that vouched for a token caller; NULL for static gateway-key authentication. |
-| `model` | `text` | Alias the caller asked for (`gpt-4o`). |
+| `model` | `text` | Prefixed id the caller asked for (`openai/gpt-4o`). |
 | `target_provider` | `text` | Provider that served it. |
 | `target_model` | `text` | Concrete upstream model / deployment. |
 | `credential_source` | `text` | `platform` or `byok`. |
@@ -31,7 +31,7 @@ meaning, and how they are allowed to change. The design rationale is
 | `reasoning_tokens` | `bigint` | Reserved; NULL today. |
 | `cache_read_tokens` | `bigint` | Prompt tokens read from the provider cache, disjoint from `input_tokens`. |
 | `cache_write_tokens` | `bigint` | Prompt tokens written to the provider cache. |
-| `cost_microdollars` | `bigint` | Cost in micro-dollars, priced from the target's catalog entry. |
+| `cost_microdollars` | `bigint` | Cost in micro-dollars from the matching price-book rule × tokens. NULL when the request was admitted unpriced (`unpriced_models = allow`). |
 | `catalog_version` | `bigint` | Resource version of the catalogue the approved price book was computed against, or `0` for configuration-priced rows and retained legacy v1 price books without catalogue-version provenance. |
 | `price_book` | `text` | Exact price-book resource reference and version the rates came from, rendered `price/<resource id>@v<version>` (e.g. `price/res_0190f2c1-6f6a-7c2e-9d3a-6f1c2b4d5e60@v3`); NULL for a file-priced row. |
 | `price_book_checksum` | `text` | Canonical checksum of that book's body — the same rates always produce the same checksum, so a republished (rolled-back) book is recognisable as the one that was audited before. NULL for a file-priced row. |
@@ -65,7 +65,8 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
   `usage_v<N>.sql`. Fresh installations apply the base DDL followed by every
   additive file in filename order — currently
   `usage_v1_001_add_signer_kid.sql` then
-  `usage_v2_001_add_price_identity.sql`; existing installations apply only the
+  `usage_v2_001_add_price_identity.sql` then
+  `usage_v2_002_nullable_cost.sql`; existing installations apply only the
   new additive file **before** deploying a writer that emits its column.
   Ordering is enforced rather than trusted: the Postgres sink checks every
   column the writer binds while it connects and refuses to boot naming the

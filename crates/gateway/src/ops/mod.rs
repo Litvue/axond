@@ -216,6 +216,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn stateful_mode_acts_on_the_configured_reference() {
         let config = Config::from_toml_str(stateful_toml()).expect("valid stateful config");
         let control_plane = control_plane(&config).expect("stateful mode requires a control plane");

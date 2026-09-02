@@ -78,6 +78,7 @@ impl RevisionProjection for FlatNamespaceProjection {
                 id: provider.id.to_string(),
                 kind: provider.kind.into(),
                 base_url: provider.base_url.clone(),
+                unpriced_models: crate::config::UnpricedModels::Deny,
             });
         }
 
@@ -439,6 +440,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn two_namespaces_compile_with_isolated_aliases_and_token_epochs() {
         let state = state_with(vec![grant(
             NamespaceGrant::one(NamespaceId::parse("acme").unwrap()),
@@ -489,6 +491,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn production_projection_selects_flat_v2_from_the_revision() {
         let state = state_with(vec![grant(NamespaceGrant::all(), None, 1)]);
         let config = StateModelProjection
@@ -505,6 +508,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn shared_provider_ids_enable_explicit_platform_credential_fallback() {
         let reference = SecretRef::first(fixtures::secret_id(9));
         let credential = NamespaceCredential {
@@ -687,6 +691,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn flat_policy_middleware_and_recovery_stay_namespace_native() {
         let base = namespace("acme", true, "shared", "gpt-acme", 303);
         let mut policy = base.policy().clone();
@@ -762,6 +767,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn single_set_and_all_grants_project_without_hidden_routing_context() {
         let acme = NamespaceId::parse("acme").unwrap();
         let globex = NamespaceId::parse("globex").unwrap();

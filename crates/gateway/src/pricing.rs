@@ -44,6 +44,7 @@ pub struct PriceIdentity {
 
 impl PriceIdentity {
     /// The identity of the pricing a snapshot serves under.
+    #[allow(dead_code)]
     pub const fn of(pricing: &PricingSnapshot) -> Self {
         Self {
             book: pricing.book(),
@@ -95,38 +96,48 @@ impl PriceIdentity {
 /// pricing the request started under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestPrice {
-    rates: ModelPrice,
+    rates: Option<ModelPrice>,
     identity: Option<PriceIdentity>,
 }
 
 impl RequestPrice {
-    /// Rates a `[[model]]` target declared, in a deployment whose revision
-    /// published no price book — or whose book prices other offerings.
+    /// Rates a deployment price-book rule matched, or a `[[model]]` target
+    /// declared in leftover catalogue-priced tests.
     pub const fn configured(rates: ModelPrice) -> Self {
         Self {
-            rates,
+            rates: Some(rates),
+            identity: None,
+        }
+    }
+
+    /// Unpriced + `allow`: dispatch, record `cost_microdollars` as NULL.
+    pub const fn unpriced() -> Self {
+        Self {
+            rates: None,
             identity: None,
         }
     }
 
     /// Rates an approved price book put in force, named by the identity that
     /// approved them.
+    #[allow(dead_code)]
     pub const fn approved(rates: ModelPrice, identity: PriceIdentity) -> Self {
         Self {
-            rates,
+            rates: Some(rates),
             identity: Some(identity),
         }
     }
 
-    /// The integer micro-dollar cost of a usage report at these rates.
-    pub fn cost_microdollars(&self, usage: Usage) -> u64 {
-        self.rates.cost_microdollars(usage)
+    /// The integer micro-dollar cost of a usage report at these rates, or
+    /// `None` when the request was admitted unpriced.
+    pub fn cost_microdollars(&self, usage: Usage) -> Option<u64> {
+        self.rates.map(|rates| rates.cost_microdollars(usage))
     }
 
     /// The rates themselves. Charging goes through `cost_microdollars`, so this
     /// is for tests that assert *which* rates a target resolved to.
     #[cfg(test)]
-    pub const fn rates(&self) -> ModelPrice {
+    pub const fn rates(&self) -> Option<ModelPrice> {
         self.rates
     }
 
@@ -162,6 +173,7 @@ impl RequestPrice {
 /// operator log, and [`Ineligible::reason`] is what crosses the boundary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Ineligible {
+    #[allow(dead_code)]
     #[error("no price is in force for this model")]
     Unpriced {
         provider: String,
@@ -209,6 +221,7 @@ pub struct AliasPrices {
 
 impl AliasPrices {
     /// Resolve every target of an alias against a snapshot's approved pricing.
+    #[allow(dead_code)]
     pub fn resolve(snapshot: &ConfigSnapshot, model: &Model) -> Self {
         Self {
             priced: model
@@ -216,6 +229,13 @@ impl AliasPrices {
                 .iter()
                 .map(|target| price_of(snapshot.pricing(), target))
                 .collect(),
+        }
+    }
+
+    /// One observed target, already priced (or explicitly unpriced + allow).
+    pub fn single(price: RequestPrice) -> Self {
+        Self {
+            priced: vec![Ok(price)],
         }
     }
 
@@ -255,6 +275,7 @@ impl AliasPrices {
 }
 
 /// Which authority prices one routed target, under one snapshot's pricing.
+#[allow(dead_code)]
 fn price_of(
     pricing: Option<&PricingSnapshot>,
     target: &Target,
@@ -376,7 +397,7 @@ mod tests {
     fn a_deployment_with_no_price_book_is_priced_by_its_file() {
         let resolved = price_of(None, &target(Some(binding("openai", "gpt-4o"))))
             .expect("a file-priced target is chargeable");
-        assert_eq!(resolved.rates(), configured());
+        assert_eq!(resolved.rates(), Some(configured()));
         assert_eq!(resolved.catalog_version(), 0);
         assert!(resolved.identity().is_none());
     }
@@ -386,7 +407,7 @@ mod tests {
         let pricing = fixtures::approved_pricing_snapshot();
         let resolved =
             price_of(Some(&pricing), &target(None)).expect("an unbound target is chargeable");
-        assert_eq!(resolved.rates(), configured());
+        assert_eq!(resolved.rates(), Some(configured()));
         assert!(resolved.identity().is_none());
     }
 
@@ -397,9 +418,11 @@ mod tests {
             .expect("an approved target is chargeable");
         assert_eq!(
             resolved.rates(),
-            pricing
-                .price(&binding("openai", "gpt-4o").provider, "gpt-4o")
-                .expect("the fixture book prices it")
+            Some(
+                pricing
+                    .price(&binding("openai", "gpt-4o").provider, "gpt-4o")
+                    .expect("the fixture book prices it")
+            )
         );
         let identity = resolved.identity().expect("the charge names its book");
         assert_eq!(identity.version(), pricing.book().version.get());
@@ -538,8 +561,14 @@ mod tests {
         let later = price_of(Some(&published), &bound()).expect("a later request is priced too");
 
         // 2 000 000 nano-dollars per million tokens is 2 000 micro-dollars.
-        assert_eq!(opened.cost_microdollars(usage(1_000_000, 1_000_000)), 6_000);
-        assert_eq!(later.cost_microdollars(usage(1_000_000, 1_000_000)), 12_000);
+        assert_eq!(
+            opened.cost_microdollars(usage(1_000_000, 1_000_000)),
+            Some(6_000)
+        );
+        assert_eq!(
+            later.cost_microdollars(usage(1_000_000, 1_000_000)),
+            Some(12_000)
+        );
         assert_eq!(opened.catalog_version(), 3);
         assert_eq!(later.catalog_version(), 3);
     }
@@ -615,7 +644,7 @@ mod tests {
             cache_read_tokens: 1_000_000,
             cache_write_tokens: 1_000_000,
         });
-        assert_eq!(cost, 26_000);
+        assert_eq!(cost, Some(26_000));
     }
 
     /// Charging is integer micro-dollars throughout: a partial micro-dollar of
@@ -627,9 +656,9 @@ mod tests {
             price_of(Some(&pricing(&book(2_000_000, 4_000_000), 1)), &bound()).expect("priced");
         // 2 000 micro-dollars per million tokens: half a micro-dollar of input
         // is one micro-dollar's worth at 500 tokens and nothing below it.
-        assert_eq!(resolved.cost_microdollars(usage(499, 0)), 0);
-        assert_eq!(resolved.cost_microdollars(usage(500, 0)), 1);
-        assert_eq!(resolved.cost_microdollars(usage(999, 0)), 1);
+        assert_eq!(resolved.cost_microdollars(usage(499, 0)), Some(0));
+        assert_eq!(resolved.cost_microdollars(usage(500, 0)), Some(1));
+        assert_eq!(resolved.cost_microdollars(usage(999, 0)), Some(1));
     }
 
     /// An alias is refused only when *nothing* it could route to is chargeable:

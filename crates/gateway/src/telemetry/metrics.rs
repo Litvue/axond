@@ -533,7 +533,7 @@ pub(super) fn record_request(record: &UsageRecord, ttft_ms: Option<u64>) {
     instruments
         .output_tokens
         .add(record.output_tokens, &attributes);
-    instruments.cost.add(record.cost_microdollars, &attributes);
+    instruments.cost.add(record.settle_cost(), &attributes);
     if record.status.is_error() {
         instruments.upstream_errors.add(1, &attributes);
     }

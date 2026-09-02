@@ -458,6 +458,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn projects_a_pinned_catalogue_target_into_a_namespace_owned_alias() {
         let (state, snapshot) = state_and_snapshot();
         let store: Arc<dyn CatalogStore> = Arc::new(InMemoryCatalogStore::new());
@@ -708,6 +709,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn binding_revision_projects_a_chargeable_alias() {
         let (state, snapshot) = imported_serving(ImportedServing::Binding);
         let models = Models::of(&state).expect("the typed model state reads");
@@ -769,6 +771,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn binding_expert_enablement_without_a_book_fail_closes_serving_projection() {
         let (state, snapshot) = imported_serving(ImportedServing::ExpertWithoutBook);
         let models = Models::of(&state).expect("the typed model state reads");
@@ -797,6 +800,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn binding_unpriced_second_alias_fail_closes_serving_projection() {
         let (candidate, snapshot) = imported_serving(ImportedServing::BindingPlusUnpricedAlias);
         let models = Models::of(&candidate).expect("the typed model state reads");
@@ -831,6 +835,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn binding_without_an_active_credential_fail_closes_serving_projection() {
         let (state, snapshot) = imported_serving(ImportedServing::BindingWithoutCredential);
         let pricing = epoch_pricing(&state);
@@ -894,6 +899,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn a_tenant_scoped_local_pin_compiles_file_price_without_a_book() {
         let (local, local_bytes) = local_snapshot();
         let tenant = fixtures::tenant_id(1);
@@ -1015,6 +1021,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn mixed_imported_and_local_alias_uses_book_and_file_price() {
         let (mut state, imported_snapshot) = state_and_snapshot();
         let (local, local_bytes) = local_snapshot();

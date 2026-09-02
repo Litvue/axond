@@ -41,8 +41,8 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use gateway_core::{
     CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareScope,
-    MiddlewareSurface, ModelUsage, NativeMessagesDecoder, ProviderError, ProviderRequest,
-    ProviderResponse, ProviderStreamDecoder, Surface, Usage,
+    MiddlewareSurface, ModelPrice, ModelUsage, NativeMessagesDecoder, ProviderError,
+    ProviderRequest, ProviderResponse, ProviderStreamDecoder, Surface, Usage,
 };
 use gateway_transport::{
     AuthScheme, Deadline, NativeCall, TimeoutBound, TimeoutKind, TransportError, Upstream,
@@ -58,7 +58,7 @@ use crate::admission::{AdmissionPermit, DiagnosticCredential, RequestKind};
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{
-    Config, CoreAccountingMode, Model, Provider, ProviderKind, ProviderWire, Target,
+    Config, CoreAccountingMode, Model, Provider, ProviderKind, ProviderWire, Target, UnpricedModels,
 };
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::desired_state::policy::BufferedResponseRoute;
@@ -898,37 +898,11 @@ fn hex_digit(byte: u8) -> Option<u8> {
 /// no control-plane read happens here, and a disabled alias is absent from the
 /// snapshot rather than filtered out of one.
 async fn list_models(
-    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
-    Extension(caller): Extension<InboundKey>,
+    Extension(_snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(_caller): Extension<InboundKey>,
 ) -> Result<Json<Value>, GatewayError> {
-    let cfg = &snapshot.config;
-    let data: Vec<Value> = cfg
-        .model
-        .iter()
-        .filter(|m| {
-            m.reachable_from(&caller.namespace)
-                && caller
-                    .alias_scope
-                    .as_ref()
-                    .is_none_or(|scope| scope.permits(&m.name))
-                && m.targets.iter().any(|t| {
-                    snapshot
-                        .credentials
-                        .is_present(cfg, &caller.namespace, &t.provider)
-                })
-        })
-        // One row per name, matching resolution: a namespace that owns `fast`
-        // shadows the unowned `fast` for itself, so the list does not offer the
-        // same name twice over different targets.
-        .filter(|m| {
-            m.namespace.is_some()
-                || !cfg.model.iter().any(|other| {
-                    other.name == m.name && other.namespace.as_deref() == Some(&caller.namespace)
-                })
-        })
-        .map(|m| json!({ "id": m.name, "object": "model", "owned_by": "axond" }))
-        .collect();
-    Ok(Json(json!({ "object": "list", "data": data })))
+    // Discovery is a later slice. Keep the SDK-shaped list empty until then.
+    Ok(Json(json!({ "object": "list", "data": [] })))
 }
 
 /// The credential a request presents, before anything is known about whether it
@@ -1142,21 +1116,11 @@ fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capa
     let Some(route) = route else {
         return true;
     };
-    snapshot.config.model.iter().any(|model| {
-        model.reachable_from(namespace)
-            && model.targets.iter().any(|target| {
-                snapshot
-                    .config
-                    .provider(&target.provider)
-                    .is_some_and(|provider| {
-                        route.serves(provider.kind)
-                            && snapshot.credentials.is_present(
-                                &snapshot.config,
-                                namespace,
-                                &target.provider,
-                            )
-                    })
-            })
+    snapshot.config.provider.iter().any(|provider| {
+        route.serves(provider.kind)
+            && snapshot
+                .credentials
+                .is_present(&snapshot.config, namespace, &provider.id)
     })
 }
 
@@ -1416,6 +1380,7 @@ impl Wire {
     /// anything is reserved or dispatched: no route translates between wires,
     /// and failing over into a target that cannot serve the shape would turn a
     /// config mistake into a confusing upstream `404`.
+    #[allow(dead_code)]
     fn check_targets(
         &self,
         cfg: &crate::config::Config,
@@ -1481,7 +1446,7 @@ async fn chat_completions(
         Route::ChatCompletions,
         snapshot,
         caller,
-        record.map(|Extension(record)| record.attrs),
+        record.map(|Extension(record)| record),
     )
     .await
 }
@@ -1505,7 +1470,7 @@ async fn native_messages(
         Route::NativeMessages,
         snapshot,
         caller,
-        record.map(|Extension(record)| record.attrs),
+        record.map(|Extension(record)| record),
     )
     .await
 }
@@ -1525,7 +1490,7 @@ async fn embeddings(
         Route::Embeddings,
         snapshot,
         caller,
-        record.map(|Extension(record)| record.attrs),
+        record.map(|Extension(record)| record),
     )
     .await
 }
@@ -1545,14 +1510,14 @@ async fn responses(
         Route::Responses,
         snapshot,
         caller,
-        record.map(|Extension(record)| record.attrs),
+        record.map(|Extension(record)| record),
     )
     .await
 }
 
-/// The one request path every route shares: use the authenticated request
-/// context, resolve the alias, hold a budget estimate, dispatch through the
-/// failover walk, then settle the hold and record exactly one usage record.
+/// The one request path every route shares: split `provider-id/model-id`,
+/// hold a budget estimate, dispatch (credential-pool rotation, no alias
+/// failover), then settle the hold and record exactly one usage record.
 /// Routes differ only in the wire they speak — where the body goes upstream and
 /// how usage is read back out (see [`Route`]).
 async fn serve(
@@ -1562,9 +1527,14 @@ async fn serve(
     route: Route,
     snapshot: Arc<ConfigSnapshot>,
     caller: InboundKey,
-    attrs: Option<Value>,
+    namespace: Option<NamespaceRecord>,
 ) -> Result<Response, GatewayError> {
     let cfg = &snapshot.config;
+    let ns_blocklist = namespace
+        .as_ref()
+        .and_then(|record| record.blocklist.clone())
+        .unwrap_or_default();
+    let attrs = namespace.map(|record| record.attrs);
 
     route.validate_routing_controls(&body)?;
 
@@ -1584,18 +1554,38 @@ async fn serve(
         ));
     }
 
-    // Resolved for the caller's namespace, never deployment-wide: an alias
-    // another namespace owns is `unknown_model` here, exactly as it is absent
-    // from `/v1/models`. A caller must not be able to discover, by the shape of
-    // a refusal, that a name it cannot use exists.
-    let model = cfg
-        .model_for(&caller.namespace, &alias)
-        .ok_or_else(|| GatewayError::UnknownModel(alias.clone()))?;
+    let (provider_id, model_id) = split_model_id(&alias)?;
+    let provider = cfg
+        .provider(provider_id)
+        .ok_or_else(|| GatewayError::UnknownProvider(provider_id.to_owned()))?;
+    if cfg.is_blocked(&alias, model_id, &ns_blocklist) {
+        return Err(GatewayError::ModelBlocked(alias));
+    }
     let wire = Wire {
         route,
         headers: route.wire_headers(&headers),
     };
-    wire.check_targets(cfg, model, &alias)?;
+    if !wire.route.serves(provider.kind) {
+        return Err(GatewayError::UnsupportedWire {
+            route: wire.route.label(),
+            alias: alias.clone(),
+            provider: provider.id.clone(),
+        });
+    }
+    let book_price = cfg.price_for(&provider.id, model_id);
+    let request_price = match book_price {
+        Some(rates) => RequestPrice::configured(rates),
+        None => match provider.unpriced_models {
+            UnpricedModels::Deny => return Err(GatewayError::UnpricedModel(alias)),
+            UnpricedModels::Allow => RequestPrice::unpriced(),
+        },
+    };
+    let routed = Model::single(
+        provider.id.clone(),
+        model_id.to_owned(),
+        book_price.unwrap_or(UNPRICED_TARGET),
+    );
+    let model = &routed;
 
     #[cfg(not(test))]
     let middleware = snapshot.middleware(&caller.namespace);
@@ -1622,15 +1612,10 @@ async fn serve(
     let limits = state.0.admission.limits();
     check_estimate_bounds(&body, estimate, limits)?;
 
-    // What each target is charged at, resolved once from the snapshot this
-    // request is already holding (#147). A price book published while the request
-    // is in flight replaces a later request's snapshot, never this one's, so the
-    // hold, the settlement, and the usage row all name one immutable pricing.
-    //
-    // Resolved here, with the other pure refusals and before admission: an alias
-    // whose every target is unpriced cannot be served at all, so it must not
-    // occupy admission capacity or spend a rate-limit round trip to find out.
-    let prices = AliasPrices::resolve(&snapshot, model);
+    // What the observed target is charged at, resolved once from the snapshot
+    // this request is already holding. A price book published while the request
+    // is in flight replaces a later request's snapshot, never this one's.
+    let prices = AliasPrices::single(request_price);
     // Responses affinity pins every request to the first target. A later priced
     // target therefore cannot make an unpriced pin chargeable, and must not be
     // used to size a budget hold for work this route can never send there.
@@ -1787,8 +1772,8 @@ async fn serve(
     };
     let estimated_cost = prices
         .estimate()
-        .expect("an alias with no chargeable target was refused above")
-        .cost_microdollars(estimate);
+        .and_then(|price| price.cost_microdollars(estimate))
+        .unwrap_or(0);
     if let Some(ceiling) = caller.max_request_microdollars
         && estimated_cost > ceiling
     {
@@ -1982,7 +1967,7 @@ async fn serve(
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                     output_tokens: 0,
-                    cost_microdollars: 0,
+                    cost_microdollars: Some(0),
                     price: served.price,
                     latency_ms: outcome.latency_ms,
                     ttft_ms: outcome.ttft_ms,
@@ -2918,11 +2903,11 @@ fn spawn_buffered_response_accounting(
                 state
                     .0
                     .budget
-                    .settle(&key, &reservation, record.cost_microdollars)
+                    .settle(&key, &reservation, record.settle_cost())
                     .await;
             }
             BufferedBudgetHold::Core(hold) => {
-                hold.settle(record.cost_microdollars).await;
+                hold.settle(record.settle_cost()).await;
             }
         }
         telemetry::record_request(&record, ttft_ms, attempts);
@@ -3013,6 +2998,30 @@ impl FailoverWalk {
 /// aliases pointing at the same concrete target share one breaker.
 pub(crate) fn target_key(target: &Target) -> String {
     FailoverTarget::new(&target.provider, &target.model).qualified_model()
+}
+
+const UNPRICED_TARGET: ModelPrice = ModelPrice {
+    input_microdollars_per_million: 0,
+    output_microdollars_per_million: 0,
+    reasoning_microdollars_per_million: None,
+    cache_read_microdollars_per_million: None,
+    cache_write_microdollars_per_million: None,
+};
+
+/// Split `provider-id/model-id` on the first `/`.
+fn split_model_id(model: &str) -> Result<(&str, &str), GatewayError> {
+    let Some((provider, id)) = model.split_once('/') else {
+        return Err(GatewayError::ModelUnprefixed(model.to_owned()));
+    };
+    if provider.is_empty() {
+        return Err(GatewayError::UnknownProvider(provider.to_owned()));
+    }
+    if id.is_empty() {
+        return Err(GatewayError::BadRequest(
+            "model id after `/` must not be empty".into(),
+        ));
+    }
+    Ok((provider, id))
 }
 
 fn auth_scheme(kind: ProviderKind) -> AuthScheme {
@@ -3345,7 +3354,7 @@ struct RecordArgs<'a> {
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     output_tokens: u64,
-    cost_microdollars: u64,
+    cost_microdollars: Option<u64>,
     /// The pricing the cost was computed at, so the row names the immutable
     /// state it was charged against rather than "whatever is approved now".
     price: RequestPrice,
@@ -3542,7 +3551,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             output_tokens: 5,
-            cost_microdollars: 40,
+            cost_microdollars: Some(40),
             price,
             latency_ms: 12,
             ttft_ms: None,
@@ -3628,7 +3637,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             output_tokens: 1,
-            cost_microdollars: 1,
+            cost_microdollars: Some(1),
             price: RequestPrice::configured(gateway_core::catalog::ModelPrice {
                 input_microdollars_per_million: 1,
                 output_microdollars_per_million: 1,
@@ -3795,13 +3804,11 @@ env = "JWT_SECRET"
 namespaces = ["platform"]
 max_ttl = "15m"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
-
-[[model]]
-name = "claude-3"
-targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
 "#
         ))
         .unwrap();
@@ -3859,9 +3866,11 @@ env = "AXOND_PLATFORM_OPENAI"
 
 {GATEWAY_KEY}
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }}, catalog = {{ provider = "openai", model = "o3" }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
 "#
         ))
         .expect("a catalogue binding parses");
@@ -3889,6 +3898,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     /// charged for it is refused as a typed unavailability rather than served
     /// for free against an unapproved rate.
     #[tokio::test]
+    #[ignore = "ADR 0063: catalogue-approved books superseded by deployment [[price]]"]
     async fn a_model_without_an_approved_price_is_discoverable_but_not_chargeable() {
         let state = state_bound_to_an_unpriced_offering();
 
@@ -3921,7 +3931,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 authorized("/v1/chat/completions")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "model": "gpt-4o",
+                            "model": "openai/gpt-4o",
                             "messages": [{ "role": "user", "content": "hi" }]
                         }))
                         .expect("body"),
@@ -3988,12 +3998,16 @@ env = "AXOND_PLATFORM_OPENAI"
 
 {GATEWAY_KEY}
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  {{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }}, catalog = {{ provider = "openai", model = "o3" }} }},
-  {{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }},
-]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+[[price]]
+provider = "openai"
+model = "gpt-4o-mini"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
 "#
         ))
         .expect("a catalogue binding parses");
@@ -4026,6 +4040,7 @@ targets = [
     /// and it must disclose no more about the price book than the alias-wide
     /// refusal does.
     #[tokio::test]
+    #[ignore = "ADR 0063: catalogue-approved books superseded by deployment [[price]]"]
     async fn a_pinned_target_without_an_approved_price_is_a_typed_pricing_refusal() {
         let state = state_pinned_to_an_unpriced_offering();
         let refused = router(state.clone())
@@ -4033,7 +4048,7 @@ targets = [
                 authorized("/v1/responses")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "model": "gpt-4o",
+                            "model": "openai/gpt-4o",
                             "input": "hi"
                         }))
                         .expect("body"),
@@ -4082,7 +4097,7 @@ targets = [
                 authorized("/v1/responses")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "model": "gpt-4o",
+                            "model": "openai/gpt-4o",
                             "input": "hi",
                             "stream": true
                         }))
@@ -4109,7 +4124,7 @@ targets = [
                 authorized("/v1/responses")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "model": "gpt-4o",
+                            "model": "openai/gpt-4o",
                             "input": "hi",
                             "previous_response_id": "resp-from-unpriced-target"
                         }))
@@ -4136,7 +4151,7 @@ targets = [
                 authorized("/v1/responses")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "model": "gpt-4o",
+                            "model": "openai/gpt-4o",
                             "input": "hi",
                             "stream": true,
                             "previous_response_id": "resp-from-unpriced-target"
@@ -4646,21 +4661,29 @@ env = "JWT_SECRET"
 namespaces = ["platform"]
 max_ttl = "15m"
 
-[[model]]
-name = "chat-model"
-targets = [{{ provider = "chat", model = "chat-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+[[price]]
+provider = "chat"
+model = "chat-model"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 
-[[model]]
-name = "messages-model"
-targets = [{{ provider = "messages", model = "messages-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+[[price]]
+provider = "messages"
+model = "messages-model"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 
-[[model]]
-name = "embeddings-model"
-targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+[[price]]
+provider = "embeddings"
+model = "embeddings-model"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 
-[[model]]
-name = "responses-model"
-targets = [{{ provider = "responses", model = "responses-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+[[price]]
+provider = "responses"
+model = "responses-model"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#
         ))
         .expect("scope test config");
@@ -5292,7 +5315,8 @@ max_ttl = "15m"
     #[tokio::test]
     #[ignore = "ADR 0063: minted tokens / per-key namespace isolation withdrawn"]
     async fn scoped_token_cannot_grant_a_route_the_namespace_lacks() {
-        let body = serde_json::to_vec(&json!({ "model": "gpt-4o", "messages": [] })).expect("body");
+        let body =
+            serde_json::to_vec(&json!({ "model": "openai/gpt-4o", "messages": [] })).expect("body");
         let response = router(test_state())
             .oneshot(
                 Request::post("/ns/platform/v1/messages")
@@ -5337,8 +5361,11 @@ max_ttl = "15m"
     /// credential, and no credential at all, are both `401`.
     #[tokio::test]
     async fn a_request_without_a_valid_gateway_key_is_rejected() {
-        let body =
-            || Body::from(serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap());
+        let body = || {
+            Body::from(
+                serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []})).unwrap(),
+            )
+        };
         for request in [
             Request::post("/ns/platform/v1/chat/completions")
                 .header("content-type", "application/json")
@@ -5866,9 +5893,11 @@ namespace = "platform"
 provider = "openai"
 env = "UPSTREAM_KEY"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 1000000
 "#
         ))
         .expect("token test config");
@@ -5915,7 +5944,8 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(
-                serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).expect("body"),
+                serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []}))
+                    .expect("body"),
             ))
             .expect("request");
         let response = router(state).oneshot(request).await.expect("response");
@@ -6000,7 +6030,7 @@ min_iat = {}
                     .header("content-type", "application/json")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::from(
-                        serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []}))
+                        serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []}))
                             .expect("body"),
                     ))
                     .expect("request"),
@@ -6293,7 +6323,7 @@ min_iat = {}
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["data"][0]["id"], "gpt-4o");
+        assert_eq!(json["data"], json!([]));
     }
 
     #[tokio::test]
@@ -6319,8 +6349,7 @@ min_iat = {}
             .into_response();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["data"].as_array().unwrap().len(), 1);
-        assert_eq!(json["data"][0]["id"], "gpt-4o");
+        assert_eq!(json["data"], json!([]));
     }
 
     /// A caller sees only the aliases it could invoke: a BYOK namespace with no
@@ -6357,9 +6386,11 @@ namespace = "platform"
 env = "GK_ACME"
 namespace = "acme"
 
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#,
         )
         .unwrap();
@@ -6430,19 +6461,23 @@ namespace = "platform"
 env = "GK_ACME"
 namespace = "acme"
 
-[[model]]
-name = "shared"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 
-[[model]]
-name = "shared"
-namespace = "acme"
-targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+[[price]]
+provider = "openai"
+model = "gpt-4o-mini"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 
-[[model]]
-name = "private"
-namespace = "acme"
-targets = [{ provider = "openai", model = "o3", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+[[price]]
+provider = "openai"
+model = "o3"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#,
         )
         .unwrap();
@@ -6536,8 +6571,8 @@ targets = [{ provider = "openai", model = "o3", price = { input_microdollars_per
     }
 
     #[tokio::test]
-    async fn unknown_model_is_typed_404_not_a_missing_route() {
-        let body = serde_json::to_vec(&json!({"model": "nope", "messages": []})).unwrap();
+    async fn unprefixed_model_is_typed_400() {
+        let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
         let resp = router(test_state())
             .oneshot(
                 authorized("/v1/chat/completions")
@@ -6546,10 +6581,196 @@ targets = [{ provider = "openai", model = "o3", price = { input_microdollars_per
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["error"]["type"], "unknown_model");
+        assert_eq!(json["error"]["type"], "model_unprefixed");
+    }
+
+    #[tokio::test]
+    async fn a_blocklist_glob_is_typed_400_and_not_dispatched() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+{GATEWAY_KEY}
+
+[blocklist]
+models = ["*-preview"]
+
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
+"#
+        ))
+        .unwrap();
+        let state = AppState::new(
+            cfg,
+            &env_with([]),
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .unwrap();
+        let body =
+            serde_json::to_vec(&json!({"model": "openai/gpt-4o-preview", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "model_blocked");
+    }
+
+    #[tokio::test]
+    async fn a_namespace_blocklist_is_unioned_and_not_dispatched() {
+        let (base_url, hits) = controllable_upstream(
+            Arc::new(AtomicBool::new(false)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let state = test_state_with_base_url(&base_url);
+        state
+            .store()
+            .expect("store")
+            .update_namespace("platform", json!({}), Some(vec!["secret-*".into()]))
+            .await
+            .expect("update")
+            .expect("platform");
+        let body =
+            serde_json::to_vec(&json!({"model": "openai/secret-x", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "model_blocked");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unpriced_deny_is_typed_400() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+{GATEWAY_KEY}
+"#
+        ))
+        .unwrap();
+        let state = AppState::new(
+            cfg,
+            &env_with([]),
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unpriced_model");
+    }
+
+    #[tokio::test]
+    async fn unpriced_allow_dispatches_with_null_cost() {
+        let base_url = rate_limiting_upstream("never-matches").await;
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+unpriced_models = "allow"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+{GATEWAY_KEY}
+"#
+        ))
+        .unwrap();
+        let captured = CapturingSink::default();
+        let state = AppState::new(
+            cfg,
+            &env_with([("AXOND_PLATFORM_OPENAI", "sk-good")]),
+            UsageFanout::new(vec![Box::new(captured.clone())]),
+            Box::new(NoBudget),
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK,);
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cost_microdollars, None);
+        assert_eq!(records[0].target_model, "gpt-4o");
+        assert_eq!(records[0].target_provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_prefix_is_typed_400() {
+        let body = serde_json::to_vec(&json!({"model": "nope/x", "messages": []})).unwrap();
+        let resp = router(test_state())
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unknown_provider");
     }
 
     #[tokio::test]
@@ -6597,7 +6818,7 @@ targets = [{ provider = "openai", model = "o3", price = { input_microdollars_per
         let resp = router(test_state_with_base_url(&base_url))
             .oneshot(
                 authorized("/v1/responses")
-                    .body(Body::from(r#"{"model":"gpt-4o","input":"hello"}"#))
+                    .body(Body::from(r#"{"model":"openai/gpt-4o","input":"hello"}"#))
                     .unwrap(),
             )
             .await
@@ -6613,7 +6834,8 @@ targets = [{ provider = "openai", model = "o3", price = { input_microdollars_per
     /// no translation to fall back on for a native route.
     #[tokio::test]
     async fn an_openai_only_alias_on_the_native_route_is_a_typed_4xx() {
-        let body = serde_json::to_vec(&json!({ "model": "gpt-4o", "messages": [] })).unwrap();
+        let body =
+            serde_json::to_vec(&json!({ "model": "openai/gpt-4o", "messages": [] })).unwrap();
         let resp = router(test_state())
             .oneshot(authorized("/v1/messages").body(Body::from(body)).unwrap())
             .await
@@ -6642,9 +6864,11 @@ base_url = "https://api.anthropic.com/v1"
 
 {GATEWAY_KEY}
 
-[[model]]
-name = "claude"
-targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
+[[price]]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 2000000
 "#
         ))
         .unwrap();
@@ -6657,7 +6881,9 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
         )
         .expect("no credentials to resolve");
 
-        let body = serde_json::to_vec(&json!({ "model": "claude", "messages": [] })).unwrap();
+        let body =
+            serde_json::to_vec(&json!({ "model": "anthropic/claude-sonnet-4-5", "messages": [] }))
+                .unwrap();
         let resp = router(state)
             .oneshot(
                 authorized("/v1/chat/completions")
@@ -6790,9 +7016,11 @@ provider = "openai"
 env = "K2"
 id = "openai-b"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 1000000
 "#
         ))
         .unwrap();
@@ -6829,9 +7057,11 @@ provider = "openai"
 env = "K2"
 id = "openai-b"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
 "#
         ))
         .unwrap();
@@ -6840,7 +7070,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured.clone())];
         let state = AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap();
 
-        let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
+        let body = serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []})).unwrap();
         let resp = router(state)
             .oneshot(
                 authorized("/v1/chat/completions")
@@ -6899,9 +7129,11 @@ provider = "openai"
 env = "K_SERVED"
 id = "served"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#
         ))
         .unwrap();
@@ -6935,7 +7167,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             .build();
         let subscriber = tracing_subscriber::registry()
             .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("axond-test")));
-        let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
+        let body = serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []})).unwrap();
         let dispatch = tracing::Dispatch::new(subscriber);
         // The subscriber travels with the future, not with the thread that
         // spawned it: `set_default` is thread-local, so a task the runtime
@@ -7088,7 +7320,7 @@ id = "platform"
 default = true
 
 [[provider]]
-id = "pa"
+id = "openai"
 kind = "openai"
 base_url = "{url_a}"
 
@@ -7101,7 +7333,7 @@ base_url = "{url_b}"
 
 [[credential]]
 namespace = "platform"
-provider = "pa"
+provider = "openai"
 env = "KA"
 id = "cred-a"
 
@@ -7113,12 +7345,16 @@ id = "cred-b"
 
 {failover}
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  {{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }},
-  {{ provider = "pb", model = "m-b", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }},
-]
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 1000000
+[[price]]
+provider = "pb"
+model = "*"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 1000000
 "#
         ))
         .unwrap();
@@ -7128,14 +7364,14 @@ targets = [
     }
 
     fn chat_request() -> Request<Body> {
-        let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
+        let body = serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []})).unwrap();
         authorized("/v1/chat/completions")
             .body(Body::from(body))
             .unwrap()
     }
 
     fn responses_request(previous_response_id: Option<&str>) -> Request<Body> {
-        let mut body = json!({"model": "gpt-4o", "input": "hello"});
+        let mut body = json!({"model": "openai/gpt-4o", "input": "hello"});
         if let Some(id) = previous_response_id {
             body["previous_response_id"] = json!(id);
         }
@@ -7145,7 +7381,7 @@ targets = [
     }
 
     fn streaming_responses_request(previous_response_id: Option<&str>) -> Request<Body> {
-        let mut body = json!({"model": "gpt-4o", "input": "hello", "stream": true});
+        let mut body = json!({"model": "openai/gpt-4o", "input": "hello", "stream": true});
         if let Some(id) = previous_response_id {
             body["previous_response_id"] = json!(id);
         }
@@ -7156,7 +7392,7 @@ targets = [
 
     fn responses_request_with_null_previous_id() -> Request<Body> {
         let body = json!({
-            "model": "gpt-4o",
+            "model": "openai/gpt-4o",
             "input": "hello",
             "previous_response_id": null
         });
@@ -7488,7 +7724,7 @@ targets = [
         assert_eq!(records[0].status, Status::ClientCancelled);
         assert_eq!(records[0].input_tokens, 10);
         assert_eq!(records[0].output_tokens, 5);
-        assert_eq!(records[0].cost_microdollars, 15);
+        assert_eq!(records[0].cost_microdollars, Some(15));
         drop(records);
         let reservations = budget.0.lock().expect("budget");
         assert_eq!(reservations.len(), 1);
@@ -7546,7 +7782,7 @@ targets = [
         let records = captured.0.lock().expect("records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, Status::Ok);
-        assert_eq!(records[0].cost_microdollars, 15);
+        assert_eq!(records[0].cost_microdollars, Some(15));
     }
 
     impl Middleware for StreamMarkerMiddleware {
@@ -7898,9 +8134,11 @@ namespace = "platform"
 provider = "anthropic"
 env = "NATIVE_KEY"
 
-[[model]]
-name = "claude"
-targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+[[price]]
+provider = "anthropic"
+model = "claude-test"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#,
         ))
         .expect("native stream config");
@@ -7926,7 +8164,7 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         authorized("/v1/messages")
             .body(Body::from(
                 serde_json::to_vec(&json!({
-                    "model": "claude",
+                    "model": "anthropic/claude-test",
                     "stream": true,
                     "max_tokens": 8,
                     "messages": [{"role": "user", "content": "hello"}]
@@ -8183,7 +8421,7 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         authorized("/v1/messages")
             .body(Body::from(
                 serde_json::to_vec(&json!({
-                    "model": "claude",
+                    "model": "anthropic/claude-test",
                     "stream": true,
                     "max_tokens": 8,
                     "messages": [{"role": "user", "content": secret}]
@@ -8358,7 +8596,7 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         let mut request = authorized("/v1/messages")
             .body(Body::from(
                 serde_json::to_vec(&json!({
-                    "model": "claude",
+                    "model": "anthropic/claude-test",
                     "stream": true,
                     "max_tokens": 8,
                     "messages": [{"role": "user", "content": [
@@ -8540,7 +8778,7 @@ targets = [{{ provider = "anthropic", model = "claude-test", price = {{ input_mi
         secret: &str,
         previous_response_id: Option<&str>,
     ) -> Request<Body> {
-        let mut body = json!({"model": "gpt-4o", "input": secret, "stream": true});
+        let mut body = json!({"model": "openai/gpt-4o", "input": secret, "stream": true});
         if let Some(id) = previous_response_id {
             body["previous_response_id"] = json!(id);
         }
@@ -8571,7 +8809,7 @@ id = "platform"
 default = true
 
 [[provider]]
-id = "pa"
+id = "openai"
 kind = "openai"
 base_url = "{url_a}"
 
@@ -8584,7 +8822,7 @@ base_url = "{url_b}"
 
 [[credential]]
 namespace = "platform"
-provider = "pa"
+provider = "openai"
 env = "RESPONSES_KEY_A"
 
 [[credential]]
@@ -8595,12 +8833,16 @@ env = "RESPONSES_KEY_B"
 [failover]
 max_attempts = 3
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  {{ provider = "pa", model = "model-a", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
-  {{ provider = "pb", model = "model-b", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
-]
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
+[[price]]
+provider = "pb"
+model = "*"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#,
         ))
         .expect("Responses stream config");
@@ -8880,9 +9122,9 @@ targets = [
         );
 
         for body in [
-            json!({"model": "gpt-4o", "input": "ordinary", "stream": SECRET}),
+            json!({"model": "openai/gpt-4o", "input": "ordinary", "stream": SECRET}),
             json!({
-                "model": "gpt-4o",
+                "model": "openai/gpt-4o",
                 "input": "ordinary",
                 "stream": true,
                 "previous_response_id": {"value": SECRET}
@@ -9166,9 +9408,11 @@ namespace = "platform"
 provider = "openai"
 env = "K1"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 1000000
 "#
         ))
         .unwrap();
@@ -9209,9 +9453,11 @@ namespace = "platform"
 provider = "openai"
 env = "K1"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 1000000
 
 [admission]
 {admission}
@@ -9335,7 +9581,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         );
 
         let long_prompt = json!({
-            "model": "gpt-4o",
+            "model": "openai/gpt-4o",
             "messages": [{"role": "user", "content": "sensitive ".repeat(32)}]
         });
         let response = router(state.clone())
@@ -9353,7 +9599,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert!(!body.to_string().contains("sensitive"), "{body}");
 
         let large_output = json!({
-            "model": "gpt-4o",
+            "model": "openai/gpt-4o",
             "messages": [],
             "max_tokens": 4096
         });
@@ -9472,7 +9718,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             attrs: None,
         };
         let body = json!({
-            "model": "gpt-4o",
+            "model": "openai/gpt-4o",
             "messages": [],
             "max_tokens": 1
         });
@@ -9511,7 +9757,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         .with_middleware_chain(BodyGrowthMiddleware::chain(512));
 
         let original = json!({
-            "model": "gpt-4o",
+            "model": "openai/gpt-4o",
             "messages": [],
             "max_tokens": 1
         });
@@ -9635,9 +9881,11 @@ namespace = "beta"
 provider = "openai"
 env = "BETA_PROVIDER"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#,
         ))
         .expect("production guardrail route config");
@@ -9706,7 +9954,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             )
             .body(Body::from(
                 serde_json::to_vec(&json!({
-                    "model": "gpt-4o",
+                    "model": "openai/gpt-4o",
                     "messages": messages,
                     "stream": stream,
                 }))
@@ -9800,7 +10048,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             authorized("/v1/chat/completions")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "model": "gpt-4o",
+                        "model": "openai/gpt-4o",
                         "messages": [{"role": "user", "content": SECRET}],
                         "stream": stream,
                     }))
@@ -9844,7 +10092,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 authorized("/v1/chat/completions")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "model": "gpt-4o",
+                            "model": "openai/gpt-4o",
                             "messages": [{"role": "user", "content": MATCHED}],
                         }))
                         .unwrap(),
@@ -9870,7 +10118,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     #[tokio::test]
     async fn an_empty_chain_keeps_the_two_estimate_passes_identical() {
         let body = json!({
-            "model": "gpt-4o",
+            "model": "openai/gpt-4o",
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 12
         });
@@ -9902,7 +10150,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 authorized("/v1/chat/completions")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "model": "gpt-4o",
+                            "model": "openai/gpt-4o",
                             "messages": [{"role": "user", "content": "x".repeat(4096)}]
                         }))
                         .unwrap(),
@@ -10067,7 +10315,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             namespace_grant: None,
             attrs: None,
         };
-        let body = json!({"model": "gpt-4o", "messages": []});
+        let body = json!({"model": "openai/gpt-4o", "messages": []});
 
         let error = serve(
             state,
@@ -10110,7 +10358,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             namespace_grant: None,
             attrs: None,
         };
-        let body = json!({"model": "gpt-4o", "messages": []});
+        let body = json!({"model": "openai/gpt-4o", "messages": []});
 
         let response = serve(
             state,
@@ -10340,9 +10588,10 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         // `max_tokens` bounds the reserved output allowance, so the estimate is
         // small and known: 16 output tokens plus the body's input estimate.
         let capped_request = || {
-            let body =
-                serde_json::to_vec(&json!({"model": "gpt-4o", "messages": [], "max_tokens": 16}))
-                    .unwrap();
+            let body = serde_json::to_vec(
+                &json!({"model": "openai/gpt-4o", "messages": [], "max_tokens": 16}),
+            )
+            .unwrap();
             authorized("/v1/chat/completions")
                 .body(Body::from(body))
                 .unwrap()
@@ -10376,7 +10625,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     }
 
     #[tokio::test]
-    async fn a_retryable_first_target_fails_over_to_the_second() {
+    async fn a_retryable_upstream_error_does_not_fail_over_to_another_provider() {
         let (url_a, hits_a) = controllable_upstream(
             Arc::new(AtomicBool::new(false)),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10389,17 +10638,16 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 
         let resp = router(state).oneshot(chat_request()).await.unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
         let records = captured.0.lock().unwrap();
         assert_eq!(records.len(), 1);
-        // The second target served, and both target attempts are attributed.
-        assert_eq!(records[0].status.as_str(), "ok");
-        assert_eq!(records[0].target_provider, "pb");
-        assert_eq!(records[0].target_model, "m-b");
-        assert_eq!(records[0].credential_id, "cred-b");
-        assert_eq!(records[0].attempts, 2);
+        assert_eq!(records[0].status.as_str(), "upstream_error");
+        assert_eq!(records[0].target_provider, "openai");
+        assert_eq!(records[0].target_model, "gpt-4o");
+        assert_eq!(records[0].credential_id, "cred-a");
+        assert_eq!(records[0].attempts, 1);
     }
 
     /// One provider that answers, whose usage delivery is billing-grade over the
@@ -10412,7 +10660,7 @@ id = "platform"
 default = true
 
 [[provider]]
-id = "pa"
+id = "openai"
 kind = "openai"
 base_url = "{base_url}"
 
@@ -10420,13 +10668,15 @@ base_url = "{base_url}"
 
 [[credential]]
 namespace = "platform"
-provider = "pa"
+provider = "openai"
 env = "KA"
 id = "cred-a"
 
-[[model]]
-name = "gpt-4o"
-targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 1000000
 "#
         ))
         .unwrap();
@@ -10468,7 +10718,7 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
         assert_eq!(claimed.len(), 1, "the served request is journaled");
         let record = claimed[0].event.record();
         assert_eq!(record.status.as_str(), "ok");
-        assert_eq!(record.target_provider, "pa");
+        assert_eq!(record.target_provider, "openai");
         RequestId::parse(&record.request_id).expect("the journaled event carries its identity");
     }
 
@@ -10831,11 +11081,10 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        // Chat over the same alias still fails over: pinning is scoped to the
-        // Responses wire, not to the alias.
+        // Chat over the same provider also does not walk to pb.
         let chat = router(state).oneshot(chat_request()).await.unwrap();
-        assert_eq!(chat.status(), StatusCode::OK);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(chat.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -10852,13 +11101,11 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
 
         let records = captured.0.lock().unwrap();
         assert_eq!(records.len(), 5);
-        for record in records.iter().take(4) {
+        for record in records.iter() {
             assert_eq!(record.status.as_str(), "upstream_error");
             assert_eq!(record.attempts, 1);
-            assert_eq!(record.target_provider, "pa");
+            assert_eq!(record.target_provider, "openai");
         }
-        assert_eq!(records[4].status.as_str(), "ok");
-        assert_eq!(records[4].target_provider, "pb");
     }
 
     /// Initial and continuation requests share the pin but not its error
@@ -11061,7 +11308,7 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
         let records = captured.0.lock().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status.as_str(), "upstream_error");
-        assert_eq!(records[0].target_provider, "pa");
+        assert_eq!(records[0].target_provider, "openai");
         assert_eq!(records[0].attempts, 1);
     }
 
@@ -11114,9 +11361,11 @@ provider = "p"
 env = "K1"
 id = "cred-a"
 
-[[model]]
-name = "alias"
-targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+[[price]]
+provider = "p"
+model = "upstream-model"
+input_microdollars_per_million = 1000000
+output_microdollars_per_million = 1000000
 "#
         ))
         .unwrap();
@@ -11152,7 +11401,7 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         let state = native_state("anthropic", &base_url, captured.clone());
 
         let sent = json!({
-            "model": "alias",
+            "model": "p/upstream-model",
             "max_tokens": 64,
             "thinking": { "type": "enabled", "budget_tokens": 32 },
             "messages": [{
@@ -11192,7 +11441,7 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         assert_eq!(records[0].input_tokens, 10);
         assert_eq!(records[0].output_tokens, 5);
         // Anthropic's cache counters are billed too, at the input rate here.
-        assert_eq!(records[0].cost_microdollars, 18);
+        assert_eq!(records[0].cost_microdollars, Some(18));
         assert_eq!(records[0].status.as_str(), "ok");
     }
 
@@ -11210,7 +11459,7 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         let captured = CapturingSink::default();
         let state = native_state("openai", &base_url, captured.clone());
 
-        let sent = json!({ "model": "alias", "input": ["one", "two"], "dimensions": 2 });
+        let sent = json!({ "model": "p/upstream-model", "input": ["one", "two"], "dimensions": 2 });
         let resp = router(state)
             .oneshot(
                 authorized("/v1/embeddings")
@@ -11236,7 +11485,7 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         let records = captured.0.lock().unwrap();
         assert_eq!(records[0].input_tokens, 8);
         assert_eq!(records[0].output_tokens, 0);
-        assert_eq!(records[0].cost_microdollars, 8);
+        assert_eq!(records[0].cost_microdollars, Some(8));
     }
 
     #[tokio::test]
@@ -11251,25 +11500,21 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         let failover = "[failover]\nmax_attempts = 3\noverall_timeout_ms = 30000\nfailure_threshold = 1\ncooldown_seconds = 1";
         let state = two_target_state(&url_a, &url_b, failover, captured.clone());
 
-        // Request 1: pa fails (trips its circuit) and pb serves.
+        // Request 1: openai fails and trips its circuit. There is no alias
+        // failover onto pb.
         let resp = router(state.clone()).oneshot(chat_request()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
 
-        // Request 2: pa's circuit is open, so it is skipped entirely — pb serves
-        // on the first attempt without pa being touched again.
+        // Request 2: the circuit is open, so the observed (provider, model) is
+        // skipped and nothing is dispatched.
         let resp = router(state.clone()).oneshot(chat_request()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 2);
-        {
-            let records = captured.0.lock().unwrap();
-            assert_eq!(records[1].target_provider, "pb");
-            assert_eq!(records[1].attempts, 1);
-        }
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
 
-        // pa recovers; after the cooldown a single half-open probe reaches it.
+        // After cooldown a half-open probe reaches the recovered provider.
         healthy_a.store(true, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
 
@@ -11277,9 +11522,9 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(hits_a.load(Ordering::SeqCst), 2);
         let records = captured.0.lock().unwrap();
-        assert_eq!(records.len(), 3);
-        assert_eq!(records[2].target_provider, "pa");
-        assert_eq!(records[2].attempts, 1);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].target_provider, "openai");
+        assert_eq!(records[1].attempts, 1);
     }
 
     // ----------------------------------------------------------------

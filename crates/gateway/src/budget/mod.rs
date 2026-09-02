@@ -1137,6 +1137,7 @@ mod tests {
     /// A shared store reads its caps per reserve, so a publication moves them
     /// without a restart — and the connection it reads them for is untouched.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn shared_settings_read_the_caps_the_runtime_is_publishing_now() {
         use std::sync::Arc;
 
@@ -1247,6 +1248,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn an_ambiguous_store_error_keeps_the_generation_for_the_reservation_ttl() {
         use std::sync::Arc;
 

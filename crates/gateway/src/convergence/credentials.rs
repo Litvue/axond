@@ -188,6 +188,7 @@ impl RevisionProjection for ProviderProjection {
                 id,
                 kind,
                 base_url: provider.body.endpoint().to_owned(),
+                unpriced_models: crate::config::UnpricedModels::Deny,
             });
         }
         Ok(config)

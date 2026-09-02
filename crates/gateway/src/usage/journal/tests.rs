@@ -146,7 +146,7 @@ async fn the_same_identity_with_different_content_is_a_conflict() {
     journal.append(&event).await.expect("append");
 
     let mut mutated = event.record().clone();
-    mutated.cost_microdollars += 1;
+    mutated.cost_microdollars = Some(mutated.settle_cost() + 1);
     let mutated = UsageEvent::new(ObservedRecord {
         record: mutated,
         observed_at: event.observed_at(),

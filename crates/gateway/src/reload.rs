@@ -1018,9 +1018,11 @@ env = "PLATFORM_OPENAI_KEY"
 env = "AXOND_INBOUND_KEY"
 namespace = "platform"
 
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
 "#;
 
     /// The BYOK onboarding this feature exists for: a new namespace, its
@@ -1052,13 +1054,17 @@ namespace = "acme"
 provider = "openai"
 env = "ACME_OPENAI_KEY"
 
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
 
-[[model]]
-name = "acme-fast"
-targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 } }]
+[[price]]
+provider = "openai"
+model = "gpt-4o-mini"
+input_microdollars_per_million = 150000
+output_microdollars_per_million = 600000
 "#;
 
     const WITH_MINTED_NAMESPACES: &str = r#"
@@ -1205,7 +1211,7 @@ scope = ["chat", "models"]
         let file = ConfigFile::new(PLATFORM_ONLY);
         let state = state_from(&file);
         let reloader = Reloader::new(file.path(), state.clone());
-        assert_eq!(listed_aliases(&state).await, vec!["gpt-4o".to_string()]);
+        assert_eq!(listed_aliases(&state).await, Vec::<String>::new());
 
         file.rewrite(WITH_BYOK_TENANT);
         let summary = reloader
@@ -1214,7 +1220,7 @@ scope = ["chat", "models"]
             .expect("candidate is valid");
 
         assert_eq!(summary.namespaces.added, vec!["acme".to_string()]);
-        assert_eq!(summary.models.added, vec!["acme-fast".to_string()]);
+        assert_eq!(summary.models.added, Vec::<String>::new());
         assert_eq!(
             summary.credentials.added,
             vec!["acme/openai/ACME_OPENAI_KEY".to_string()]
@@ -1229,7 +1235,7 @@ scope = ["chat", "models"]
                 .is_some()
         );
         let aliases = listed_aliases(&state).await;
-        assert!(aliases.contains(&"acme-fast".to_string()));
+        assert_eq!(aliases, Vec::<String>::new());
     }
 
     /// A file reload republishes the snapshot, and the durable material the
@@ -1315,7 +1321,7 @@ env = "GW_ADMIN_BREAKGLASS"
         assert!(message.contains("stateless"), "{message}");
         assert!(message.contains("stateful"), "{message}");
         assert_eq!(state.config().generation, 0, "the old config keeps serving");
-        assert_eq!(listed_aliases(&state).await, vec!["gpt-4o".to_string()]);
+        assert_eq!(listed_aliases(&state).await, Vec::<String>::new());
     }
 
     /// An epoch-only edit is visible in the applied reload summary, while a
@@ -1698,6 +1704,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: minted tokens withdrawn"]
     async fn invalid_verifier_file_reload_keeps_previous_snapshot_serving() {
         let material = ConfigFile::new("reload-secret-012345678901234567890");
         let file = ConfigFile::new(&format!(
@@ -1831,9 +1838,11 @@ env = "GW_ADMIN_BREAKGLASS"
         // A real edit, so the candidate is published rather than skipped.
         file.rewrite(&format!(
             r#"{PLATFORM_ONLY}
-[[model]]
-name = "gpt-4o-mini"
-targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o-mini"
+input_microdollars_per_million = 150000
+output_microdollars_per_million = 600000
 "#
         ));
         Reloader::new(file.path(), state.clone())
@@ -1844,10 +1853,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         let after = state.config();
         assert_eq!(after.generation, 8);
         assert_eq!(after.pricing(), Some(&pricing));
-        assert_eq!(
-            listed_aliases(&state).await,
-            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
-        );
+        assert_eq!(listed_aliases(&state).await, Vec::<String>::new());
     }
 
     /// Availability is derived from the revision and from discovery, neither of
@@ -1905,9 +1911,11 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
 
         file.rewrite(&format!(
             r#"{PLATFORM_ONLY}
-[[model]]
-name = "gpt-4o-mini"
-targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o-mini"
+input_microdollars_per_million = 150000
+output_microdollars_per_million = 600000
 "#
         ));
         Reloader::new(file.path(), state.clone())
@@ -1977,9 +1985,11 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         // A real edit, so the candidate is published rather than skipped.
         file.rewrite(&format!(
             r#"{PLATFORM_ONLY}
-[[model]]
-name = "gpt-4o-mini"
-targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o-mini"
+input_microdollars_per_million = 150000
+output_microdollars_per_million = 600000
 "#
         ));
         Reloader::new(file.path(), state.clone())
@@ -2036,9 +2046,11 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
 
         file.rewrite(&format!(
             r#"{PLATFORM_ONLY}
-[[model]]
-name = "gpt-4o-mini"
-targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 }} }}]
+[[price]]
+provider = "openai"
+model = "gpt-4o-mini"
+input_microdollars_per_million = 150000
+output_microdollars_per_million = 600000
 "#
         ));
         Reloader::new(file.path(), state.clone())
@@ -2062,6 +2074,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: projected alias snapshots withdrawn"]
     async fn a_stateful_file_reload_cannot_replace_a_projected_snapshot() {
         let file = ConfigFile::new(
             r#"
@@ -2136,33 +2149,36 @@ default = true
 
         assert!(matches!(err, ReloadError::Config(ConfigError::Invalid(_))));
         assert!(Arc::ptr_eq(&before, &state.config()));
-        assert_eq!(listed_aliases(&state).await, vec!["gpt-4o".to_string()]);
+        assert_eq!(listed_aliases(&state).await, Vec::<String>::new());
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: [[model]] aliases withdrawn"]
     async fn a_cross_wire_alias_is_rejected_and_the_previous_config_keeps_serving() {
         let file = ConfigFile::new(PLATFORM_ONLY);
         let state = state_from(&file);
         let reloader = Reloader::new(file.path(), state.clone());
         let before = state.config();
 
-        file.rewrite(
-            &format!(
-                r#"{PLATFORM_ONLY}
+        file.rewrite(&format!(
+            r#"{PLATFORM_ONLY}
 [[provider]]
 id = "anthropic"
 kind = "anthropic"
 base_url = "https://api.anthropic.com/v1"
 
-[[model]]
-name = "mixed"
-targets = [
-    {{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
-    {{ provider = "anthropic", model = "claude", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
-]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
+[[price]]
+provider = "anthropic"
+model = "claude"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#
-            ),
-        );
+        ));
         let err = reloader
             .reload_with_env(TRIGGER_WATCH, &inbound_env())
             .await
@@ -2247,6 +2263,7 @@ targets = [
     /// A request holds its snapshot for its whole life, so a reload that lands
     /// mid-flight cannot move the alias out from under it.
     #[tokio::test]
+    #[ignore = "ADR 0063: [[model]] aliases withdrawn"]
     async fn an_in_flight_snapshot_is_unaffected_by_a_reload() {
         let file = ConfigFile::new(WITH_BYOK_TENANT);
         let config = Config::load(file.path()).expect("valid boot config");

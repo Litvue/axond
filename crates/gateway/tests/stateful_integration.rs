@@ -1688,7 +1688,7 @@ async fn stateful_revision_compiles_rotates_and_recovers() {
                 "approval_citation": "IG-09 live price identity",
                 "rules": [{
                     "provider": "openai",
-                    "model": "gpt-4o",
+                    "model": "openai/gpt-4o",
                     "precedence": "baseline",
                     "from_millis": 0,
                     "input_nano_dollars_per_million": 2_500_000_000_u64,
