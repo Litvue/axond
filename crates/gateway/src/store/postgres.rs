@@ -7,7 +7,8 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, from_sql_amount, sql_amount,
+    from_sql_amount, sql_amount, sql_amount_saturating, BudgetRecord, BudgetReserve,
+    NamespaceRecord, Store, StoreError,
 };
 use crate::backends::health::{BackendHealth, PostgresHealth};
 
@@ -15,6 +16,11 @@ const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
 const POOL_SIZE: usize = 32;
+/// Same order as `lock_timeout` / `statement_timeout`: fail 503 rather than hang.
+#[cfg(not(test))]
+const POOL_WAIT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const POOL_WAIT: Duration = Duration::from_millis(50);
 const PROBE_BOUND: Duration = Duration::from_secs(CONNECT_TIMEOUT.as_secs() + 5);
 
 pub struct PostgresStore {
@@ -78,12 +84,20 @@ impl PostgresStore {
     }
 
     async fn checkout(&self) -> Result<(Client, OwnedSemaphorePermit), StoreError> {
-        let permit = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| StoreError::Unavailable("postgres store pool is closed".into()))?;
+        let permit = match tokio::time::timeout(POOL_WAIT, self.slots.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(StoreError::Unavailable(
+                    "postgres store pool is closed".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(StoreError::Unavailable(
+                    "postgres store pool saturated".into(),
+                ));
+            }
+        };
         {
             let mut idle = self.idle.lock().await;
             while let Some(client) = idle.pop() {
@@ -167,14 +181,16 @@ const DRAFT_STORE_BUDGET_RESERVATION_IDX: &str = "axond_budget_reservation_scope
 
 /// Create or rename Store budget tables so [`probe_schema`] can succeed.
 ///
-/// 1. New `axond_store_budget*` with `period` + `limit_microdollars` — use them.
-/// 2. Else `axond_budget` with a `period` column (this file's previous draft) —
-///    rename to `axond_store_budget*`.
+/// 1. New `axond_store_budget*` with spend rows — use them (already migrated).
+/// 2. Draft `axond_budget*` with a `period` column, and new tables missing or
+///    empty while the draft has rows — drop empty new relations, then rename.
+///    Needs table-rename privilege; migration-only roles should run this out
+///    of band before boot.
 /// 3. Else `create_table` applies [`BUDGET_DDL`].
 /// 4. Leftover `axond_budget` with a `subject` column (budget_v1.sql) is left
 ///    untouched; spend is not migrated (subject vs period).
 async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result<(), StoreError> {
-    if !store_budget_ready(client).await? && draft_store_budget_present(client).await? {
+    if draft_store_budget_present(client).await? && should_rename_draft(client).await? {
         rename_draft_store_budget(client).await?;
     }
     if create_table {
@@ -184,6 +200,26 @@ async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     }
     Ok(())
+}
+
+async fn should_rename_draft(client: &impl GenericClient) -> Result<bool, StoreError> {
+    if !store_budget_ready(client).await? {
+        return Ok(true);
+    }
+    Ok(ledger_has_rows(
+        client,
+        DRAFT_STORE_BUDGET,
+        DRAFT_STORE_BUDGET_ACTIVE,
+        DRAFT_STORE_BUDGET_RESERVATION,
+    )
+    .await?
+        && !ledger_has_rows(
+            client,
+            STORE_BUDGET,
+            STORE_BUDGET_ACTIVE,
+            STORE_BUDGET_RESERVATION,
+        )
+        .await?)
 }
 
 async fn store_budget_ready(client: &impl GenericClient) -> Result<bool, StoreError> {
@@ -202,6 +238,7 @@ async fn rename_draft_store_budget(client: &mut Client) -> Result<(), StoreError
         .transaction()
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    drop_empty_store_budget(&tx).await?;
     rename_relation(&tx, "TABLE", DRAFT_STORE_BUDGET, STORE_BUDGET).await?;
     rename_relation(&tx, "TABLE", DRAFT_STORE_BUDGET_ACTIVE, STORE_BUDGET_ACTIVE).await?;
     rename_relation(
@@ -222,6 +259,58 @@ async fn rename_draft_store_budget(client: &mut Client) -> Result<(), StoreError
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     Ok(())
+}
+
+/// Drop `axond_store_budget*` only when every relation is missing or empty.
+/// Never drops a new table that already has spend.
+async fn drop_empty_store_budget(client: &impl GenericClient) -> Result<(), StoreError> {
+    if ledger_has_rows(
+        client,
+        STORE_BUDGET,
+        STORE_BUDGET_ACTIVE,
+        STORE_BUDGET_RESERVATION,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    for (kind, name) in [
+        ("TABLE", STORE_BUDGET_RESERVATION),
+        ("TABLE", STORE_BUDGET_ACTIVE),
+        ("TABLE", STORE_BUDGET),
+        ("INDEX", STORE_BUDGET_RESERVATION_IDX),
+    ] {
+        if relation_exists(client, name).await? {
+            client
+                .execute(&format!("DROP {kind} IF EXISTS {name}"), &[])
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+async fn ledger_has_rows(
+    client: &impl GenericClient,
+    budget: &str,
+    active: &str,
+    reservation: &str,
+) -> Result<bool, StoreError> {
+    Ok(relation_has_rows(client, budget).await?
+        || relation_has_rows(client, active).await?
+        || relation_has_rows(client, reservation).await?)
+}
+
+async fn relation_has_rows(client: &impl GenericClient, table: &str) -> Result<bool, StoreError> {
+    if !relation_exists(client, table).await? {
+        return Ok(false);
+    }
+    let has_rows: bool = client
+        .query_one(&format!("SELECT EXISTS (SELECT 1 FROM {table})"), &[])
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .get(0);
+    Ok(has_rows)
 }
 
 async fn rename_relation(
@@ -534,7 +623,7 @@ impl Store for PostgresStore {
     ) -> Result<BudgetRecord, StoreError> {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
-        let limit = sql_amount(limit_microdollars)?;
+        let limit = sql_amount_saturating(limit_microdollars);
         self.with_client(async move |client| {
             let tx = client
                 .transaction()
@@ -602,7 +691,7 @@ impl Store for PostgresStore {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
         let reservation_id = reservation_id.to_owned();
-        let actual = sql_amount(actual_microdollars)?;
+        let actual = sql_amount_saturating(actual_microdollars);
         self.with_client(async move |client| {
             let tx = client
                 .transaction()
@@ -756,6 +845,16 @@ async fn hold(
 
 #[cfg(test)]
 impl PostgresStore {
+    fn test_pool(slots: Arc<Semaphore>) -> Self {
+        let config = tokio_postgres::Config::new();
+        Self {
+            health: Arc::new(PostgresHealth::new("store", config.clone(), PROBE_BOUND)),
+            config,
+            idle: Mutex::new(Vec::new()),
+            slots,
+        }
+    }
+
     /// Kill the next idle session so the following Store call must reconnect.
     pub(super) async fn drop_idle_connection(&self) -> Result<(), StoreError> {
         let (client, permit) = self.checkout().await?;
@@ -788,6 +887,22 @@ impl PostgresStore {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn checkout_times_out_when_pool_is_saturated() {
+        let slots = Arc::new(Semaphore::new(POOL_SIZE));
+        let mut held = Vec::with_capacity(POOL_SIZE);
+        for _ in 0..POOL_SIZE {
+            held.push(slots.clone().acquire_owned().await.expect("permit"));
+        }
+        let store = PostgresStore::test_pool(slots);
+        let err = store.checkout().await.expect_err("saturated");
+        assert!(
+            matches!(err, StoreError::Unavailable(ref message) if message.contains("pool saturated")),
+            "{err:?}"
+        );
+        drop(held);
+    }
+
     /// Coexist with leftover `budget_v1.sql` is exercised when
     /// `AXOND_TEST_POSTGRES_DSN` is set (`postgres_legacy_budget_v1_coexists_with_store_budget`).
     #[test]
@@ -795,10 +910,8 @@ mod tests {
         assert!(BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_budget ("));
         assert!(BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_budget_active ("));
         assert!(BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_budget_reservation ("));
-        assert!(
-            BUDGET_DDL
-                .contains("CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx")
-        );
+        assert!(BUDGET_DDL
+            .contains("CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx"));
         assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget ("));
         assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget_active ("));
         assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget_reservation ("));
