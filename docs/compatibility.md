@@ -14,7 +14,7 @@ breaking them is a deliberate, documented act — not that they are frozen.
 | `POST /v1/chat/completions` | **supported** | OpenAI chat completions | yes (`stream: true`) |
 | `POST /v1/messages` | **supported** | Anthropic Messages, native | yes |
 | `POST /v1/embeddings` | **supported** | OpenAI embeddings | n/a |
-| `GET /v1/models` | **supported** | the alias catalogue, gated + namespace-scoped | n/a |
+| `GET /v1/models` | **supported** | cached `provider-id/model-id` listings, minus the namespace blocklist | n/a |
 | `GET /v1/credentials` | **supported** | replica-local credential labels and circuit state, scoped | n/a |
 | `GET /admin/v1/status` | **supported** | this replica's cached dependency status, scoped and redacted | n/a |
 | `GET /admin/v1/catalogue` | **supported** (stateful only) | one tenant's management catalogue, including imported offerings that are not enabled (`unavailable` may contain `not-enabled`) | n/a |

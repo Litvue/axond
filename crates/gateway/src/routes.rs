@@ -72,7 +72,7 @@ use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::status::{StatusResponse, StatusScope};
-use crate::store::NamespaceRecord;
+use crate::store::{NamespaceRecord, StoreError};
 use crate::streaming::{self, Framing, StreamContext, StreamDelivery};
 use crate::telemetry;
 use crate::usage::identity::EventIdentity;
@@ -880,29 +880,46 @@ fn hex_digit(byte: u8) -> Option<u8> {
 }
 
 /// The model catalog, gated behind a gateway key and scoped to the caller's
-/// namespace: a caller sees only the aliases it could actually invoke.
+/// namespace.
 ///
-/// Three filters, all of them the caller's own namespace:
-///
-/// 1. **Ownership.** An alias another namespace owns is not listed at all, so an
-///    alias name is a tenant's name rather than the deployment's — even when both
-///    tenants can reach the provider behind it (ADR 0058).
-/// 2. **Alias scope.** A minted token narrowing what its bearer may name narrows
-///    what it may enumerate, so a list never advertises what a key would be
-///    refused for.
-/// 3. **Entitlement.** At least one target must resolve a credential for the
-///    caller's namespace — its own, or the platform's when fallback is allowed —
-///    so a BYOK tenant cannot enumerate aliases it is not entitled to.
-///
-/// Answered entirely from the immutable snapshot the request was admitted with:
-/// no control-plane read happens here, and a disabled alias is absent from the
-/// snapshot rather than filtered out of one.
+/// Listed from the Store's discovery cache as `provider-id/model-id`, minus the
+/// effective blocklist (deployment default ∪ namespace extras). Never calls
+/// upstream: a background timer in `serve` refreshes the cache.
 async fn list_models(
-    Extension(_snapshot): Extension<Arc<ConfigSnapshot>>,
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(_caller): Extension<InboundKey>,
+    record: Option<Extension<NamespaceRecord>>,
 ) -> Result<Json<Value>, GatewayError> {
-    // Discovery is a later slice. Keep the SDK-shaped list empty until then.
-    Ok(Json(json!({ "object": "list", "data": [] })))
+    let extra = record
+        .as_ref()
+        .and_then(|Extension(record)| record.blocklist.clone())
+        .unwrap_or_default();
+    let store = state.store().ok_or(GatewayError::StoreUnavailable)?;
+    let cached = match store.list_provider_models().await {
+        Ok(rows) => rows,
+        Err(StoreError::Unavailable(_)) => return Err(GatewayError::StoreUnavailable),
+        Err(err) => return Err(GatewayError::BadRequest(err.to_string())),
+    };
+    let mut data = Vec::new();
+    for provider in &snapshot.config.provider {
+        let models = cached
+            .iter()
+            .find(|row| row.provider == provider.id)
+            .map(|row| row.data.as_slice())
+            .unwrap_or(&[]);
+        for model in models {
+            let Some(bare) = model.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let prefixed = format!("{}/{bare}", provider.id);
+            if snapshot.config.is_blocked(&prefixed, bare, &extra) {
+                continue;
+            }
+            data.push(json!({ "id": prefixed, "object": "model" }));
+        }
+    }
+    Ok(Json(json!({ "object": "list", "data": data })))
 }
 
 /// The credential a request presents, before anything is known about whether it
@@ -5456,6 +5473,8 @@ max_ttl = "15m"
             ("GET", "/api/v1/namespaces/platform/budgets/harness"),
             ("PUT", "/api/v1/namespaces/platform/budgets/harness"),
             ("GET", "/api/v1/namespaces/platform/usage?period=harness"),
+            ("GET", "/api/v1/providers/models"),
+            ("GET", "/api/v1/providers/fake-openai/models"),
         ] {
             let request = Request::builder()
                 .method(method)
@@ -6582,26 +6601,20 @@ min_iat = {}
 
     #[tokio::test]
     async fn models_intersect_namespace_access_with_alias_scope() {
-        let state = test_state();
-        let snapshot = state.config();
-        let caller = InboundKey {
-            namespace: "platform".to_owned(),
-            subject: "restricted".to_owned(),
-            authority: PrincipalAuthority::MintedToken,
-            signer_kid: Some("test-kid".to_owned()),
-            scope: None,
-            alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
-            max_request_microdollars: None,
-            can_mint: false,
-            jti: None,
-            namespace_grant: None,
-            attrs: None,
-        };
-        let response = list_models(Extension(snapshot), Extension(caller))
+        let resp = router(test_state())
+            .oneshot(
+                Request::get("/ns/platform/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .unwrap()
-            .into_response();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["data"], json!([]));
     }

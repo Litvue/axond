@@ -43,6 +43,7 @@ mod config;
 #[allow(dead_code)]
 mod convergence;
 mod credentials;
+mod discovery;
 // The desired-state domain the durable contracts are expressed in. Contract
 // only, for the same reason `backends` is: no revision is loaded or published on
 // the request path yet.
@@ -962,6 +963,14 @@ async fn serve() -> anyhow::Result<()> {
                 .await;
         })
     });
+    let (stop_discovery, stop_discovery_rx) = tokio::sync::oneshot::channel::<()>();
+    let discovery_interval = resources.config().config.discovery.interval();
+    let discovering = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            discovery::run(state, discovery_interval, stop_discovery_rx).await;
+        })
+    };
     let (stop_converging, stop_converging_rx) = tokio::sync::oneshot::channel::<()>();
     let converging = reconciler.map(|reconciler| {
         let shutdown = Arc::clone(&lifecycle);
@@ -999,6 +1008,8 @@ async fn serve() -> anyhow::Result<()> {
     if let Some(refreshing) = refreshing {
         let _ = refreshing.await;
     }
+    let _ = stop_discovery.send(());
+    let _ = discovering.await;
     let _ = stop_converging.send(());
     if let Some(converging) = converging {
         let _ = converging.await;

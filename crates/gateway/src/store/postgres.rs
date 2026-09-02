@@ -7,14 +7,15 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, UsageAppend, UsageSummaryRow,
-    budget_would_exceed, from_sql_amount, sql_amount, sql_amount_saturating,
+    BudgetRecord, BudgetReserve, NamespaceRecord, ProviderModels, Store, StoreError, UsageAppend,
+    UsageSummaryRow, budget_would_exceed, from_sql_amount, sql_amount, sql_amount_saturating,
 };
 use crate::backends::health::{BackendHealth, PostgresHealth};
 
 const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
 const INCARNATION_DDL: &str = include_str!("../../sql/store_namespace_incarnation_v1.sql");
 const USAGE_DDL: &str = include_str!("../../sql/store_usage_v1.sql");
+const MODELS_DDL: &str = include_str!("../../sql/store_provider_models_v1.sql");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
 const POOL_SIZE: usize = 32;
@@ -70,6 +71,10 @@ impl PostgresStore {
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
             client
                 .batch_execute(USAGE_DDL)
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            client
+                .batch_execute(MODELS_DDL)
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         }
@@ -195,6 +200,17 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
         .map_err(|e| {
             StoreError::Unavailable(format!(
                 "axond_store_usage schema missing or incompatible: {e}"
+            ))
+        })?;
+    client
+        .batch_execute(
+            "SELECT provider, fetched_at, stale, models
+             FROM axond_store_provider_models LIMIT 0",
+        )
+        .await
+        .map_err(|e| {
+            StoreError::Unavailable(format!(
+                "axond_store_provider_models schema missing or incompatible: {e}"
             ))
         })?;
     Ok(())
@@ -865,6 +881,85 @@ impl Store for PostgresStore {
         })
         .await
     }
+
+    async fn get_provider_models(
+        &self,
+        provider: &str,
+    ) -> Result<Option<ProviderModels>, StoreError> {
+        let provider = provider.to_owned();
+        self.with_client(async move |client| {
+            let row = client
+                .query_opt(
+                    "SELECT provider, fetched_at, stale, models
+                     FROM axond_store_provider_models WHERE provider = $1",
+                    &[&provider],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            row.map(|row| postgres_provider_models(row.get(0), row.get(1), row.get(2), row.get(3)))
+                .transpose()
+        })
+        .await
+    }
+
+    async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
+        self.with_client(async move |client| {
+            let rows = client
+                .query(
+                    "SELECT provider, fetched_at, stale, models
+                     FROM axond_store_provider_models ORDER BY provider",
+                    &[],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            rows.into_iter()
+                .map(|row| postgres_provider_models(row.get(0), row.get(1), row.get(2), row.get(3)))
+                .collect()
+        })
+        .await
+    }
+
+    async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
+        self.with_client(async move |client| {
+            let models = Value::Array(row.data);
+            client
+                .execute(
+                    "INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (provider) DO UPDATE SET
+                        fetched_at = excluded.fetched_at,
+                        stale = excluded.stale,
+                        models = excluded.models",
+                    &[&row.provider, &row.fetched_at, &row.stale, &models],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn postgres_provider_models(
+    provider: String,
+    fetched_at: Option<String>,
+    stale: bool,
+    models: Value,
+) -> Result<ProviderModels, StoreError> {
+    let data = match models {
+        Value::Array(items) => items,
+        other => {
+            return Err(StoreError::Unavailable(format!(
+                "provider `{provider}` models: expected array, got {other}"
+            )));
+        }
+    };
+    Ok(ProviderModels {
+        provider,
+        fetched_at,
+        stale,
+        data,
+    })
 }
 
 /// Transaction-scoped advisory lock on the namespace id. Shared by CREATE,
@@ -1263,5 +1358,10 @@ mod tests {
         assert!(INCARNATION_DDL.contains(
             "CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_tombstone_expires_idx"
         ));
+    }
+
+    #[test]
+    fn store_provider_models_ddl_is_embedded() {
+        assert!(MODELS_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_provider_models ("));
     }
 }
