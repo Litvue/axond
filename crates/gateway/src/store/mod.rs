@@ -312,10 +312,19 @@ pub fn validate_period(period: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Fail-closed conversion for reserve (and other pre-dispatch amounts).
+/// An estimate above `i64::MAX` is rejected before the provider runs.
 pub(crate) fn sql_amount(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| {
         StoreError::Invalid("microdollar amount exceeds the store integer range".into())
     })
+}
+
+/// PUT limits and settlement actuals that exceed `i64::MAX` charge the
+/// representable cap rather than dropping the write. Settlement of an admitted
+/// request must not vanish because the actual overflowed the column type.
+pub(crate) fn sql_amount_saturating(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 pub(crate) fn from_sql_amount(value: i64) -> u64 {
@@ -325,6 +334,22 @@ pub(crate) fn from_sql_amount(value: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_amount_rejects_unrepresentable_reserve() {
+        assert!(sql_amount(u64::MAX).is_err());
+        assert!(sql_amount(i64::MAX as u64 + 1).is_err());
+        assert_eq!(sql_amount(i64::MAX as u64).expect("max"), i64::MAX);
+        assert_eq!(sql_amount(640).expect("in range"), 640);
+    }
+
+    #[test]
+    fn sql_amount_saturating_charges_the_representable_cap() {
+        assert_eq!(sql_amount_saturating(u64::MAX), i64::MAX);
+        assert_eq!(sql_amount_saturating(i64::MAX as u64 + 1), i64::MAX);
+        assert_eq!(sql_amount_saturating(i64::MAX as u64), i64::MAX);
+        assert_eq!(sql_amount_saturating(640), 640);
+    }
 
     #[tokio::test]
     async fn sqlite_round_trip_and_duplicate() {
@@ -555,6 +580,44 @@ mod tests {
         assert_eq!(after.spent_microdollars, 25);
         assert_eq!(after.reserved_microdollars, 0);
         assert_eq!(after.remaining_microdollars, 75);
+    }
+
+    #[tokio::test]
+    async fn sqlite_settle_saturates_oversized_actual_and_releases_the_hold() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        match store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r1")
+            .await
+            .expect("reserve")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget("wsp_x", "p", "r1", i64::MAX as u64 + 1)
+            .await
+            .expect("settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, i64::MAX as u64);
+        assert_eq!(got.reserved_microdollars, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_reserve_rejects_unrepresentable_estimate() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        let err = store
+            .reserve_budget("wsp_x", i64::MAX as u64 + 1, Duration::from_secs(30), "r")
+            .await
+            .expect_err("fail closed");
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -997,5 +1060,168 @@ mod tests {
             .expect("old name")
             .get(0);
         assert!(old_gone, "draft axond_budget must be renamed, not copied");
+    }
+
+    /// Hand-applying `store_budget_v1.sql` creates empty new tables. Connect
+    /// must still rename draft spend onto those names.
+    #[tokio::test]
+    async fn postgres_renames_draft_spend_past_empty_store_budget_ddl() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        setup
+            .batch_execute(
+                "CREATE TABLE axond_namespace (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+                     blocklist JSONB
+                 );
+                 CREATE TABLE axond_budget (
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     limit_microdollars  bigint      NOT NULL,
+                     spent_microdollars  bigint      NOT NULL DEFAULT 0,
+                     PRIMARY KEY (namespace, period)
+                 );
+                 CREATE TABLE axond_budget_active (
+                     namespace text PRIMARY KEY NOT NULL,
+                     period    text NOT NULL
+                 );
+                 CREATE TABLE axond_budget_reservation (
+                     id                  text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     amount_microdollars bigint      NOT NULL,
+                     expires_at          timestamptz NOT NULL
+                 );
+                 CREATE INDEX axond_budget_reservation_scope_idx
+                     ON axond_budget_reservation (namespace, period, expires_at);
+                 INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
+                 INSERT INTO axond_budget
+                     (namespace, period, limit_microdollars, spent_microdollars)
+                     VALUES ('wsp_x', '2026-09', 1000, 40);
+                 INSERT INTO axond_budget_active (namespace, period)
+                     VALUES ('wsp_x', '2026-09');",
+            )
+            .await
+            .expect("draft store tables");
+        setup
+            .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
+            .await
+            .expect("empty store_budget_v1");
+        let store = PostgresStore::connect(&scoped, false)
+            .await
+            .expect("rename past empty new tables");
+        let rec = store
+            .get_budget("wsp_x", "2026-09")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(rec.spent_microdollars, 40);
+        assert_eq!(rec.limit_microdollars, 1_000);
+        assert!(rec.active);
+        let old_gone: bool = setup
+            .query_one("SELECT to_regclass('axond_budget') IS NULL", &[])
+            .await
+            .expect("old name")
+            .get(0);
+        assert!(
+            old_gone,
+            "draft axond_budget must be renamed, not left beside empty new tables"
+        );
+    }
+
+    /// Non-empty `axond_store_budget*` already hold migrated spend; leave them.
+    #[tokio::test]
+    async fn postgres_keeps_nonempty_store_budget_beside_draft() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        setup
+            .batch_execute(
+                "CREATE TABLE axond_namespace (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+                     blocklist JSONB
+                 );
+                 CREATE TABLE axond_budget (
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     limit_microdollars  bigint      NOT NULL,
+                     spent_microdollars  bigint      NOT NULL DEFAULT 0,
+                     PRIMARY KEY (namespace, period)
+                 );
+                 CREATE TABLE axond_budget_active (
+                     namespace text PRIMARY KEY NOT NULL,
+                     period    text NOT NULL
+                 );
+                 INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
+                 INSERT INTO axond_budget
+                     (namespace, period, limit_microdollars, spent_microdollars)
+                     VALUES ('wsp_x', '2026-09', 1000, 40);
+                 INSERT INTO axond_budget_active (namespace, period)
+                     VALUES ('wsp_x', '2026-09');",
+            )
+            .await
+            .expect("draft");
+        setup
+            .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
+            .await
+            .expect("new ddl");
+        setup
+            .batch_execute(
+                "INSERT INTO axond_store_budget
+                     (namespace, period, limit_microdollars, spent_microdollars)
+                     VALUES ('wsp_x', '2026-09', 1000, 7);
+                 INSERT INTO axond_store_budget_active (namespace, period)
+                     VALUES ('wsp_x', '2026-09');",
+            )
+            .await
+            .expect("new spend");
+        let store = PostgresStore::connect(&scoped, false)
+            .await
+            .expect("keep new spend");
+        let rec = store
+            .get_budget("wsp_x", "2026-09")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(rec.spent_microdollars, 7);
+        let draft_remains: bool = setup
+            .query_one("SELECT to_regclass('axond_budget') IS NOT NULL", &[])
+            .await
+            .expect("draft")
+            .get(0);
+        assert!(
+            draft_remains,
+            "must not drop draft when new tables have rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_settle_saturates_oversized_actual_and_releases_the_hold() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("put");
+        match store
+            .reserve_budget(&ns, 1, Duration::from_secs(30), "r1")
+            .await
+            .expect("reserve")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget(&ns, "p", "r1", i64::MAX as u64 + 1)
+            .await
+            .expect("settle");
+        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, i64::MAX as u64);
+        assert_eq!(got.reserved_microdollars, 0);
+        assert_eq!(store.reservation_count(&ns).await.expect("count"), 0);
     }
 }
