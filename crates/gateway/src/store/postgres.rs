@@ -61,6 +61,7 @@ impl PostgresStore {
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         }
+        ensure_namespace_incarnation(&client).await?;
         ensure_budget_schema(&mut client, create_table).await?;
         if create_table {
             client
@@ -157,7 +158,10 @@ impl PostgresStore {
 
 async fn probe_schema(client: &Client) -> Result<(), StoreError> {
     client
-        .batch_execute("SELECT id, attrs, blocklist FROM axond_namespace LIMIT 0")
+        .batch_execute(
+            "SELECT id, attrs, blocklist FROM axond_namespace LIMIT 0;
+             SELECT id, n FROM axond_namespace_incarnation LIMIT 0",
+        )
         .await
         .map_err(|e| {
             StoreError::Unavailable(format!(
@@ -169,7 +173,7 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
             "SELECT namespace, period, limit_microdollars, spent_microdollars
              FROM axond_store_budget LIMIT 0;
              SELECT namespace, period FROM axond_store_budget_active LIMIT 0;
-             SELECT id, namespace, period, amount_microdollars, expires_at
+             SELECT id, namespace, period, amount_microdollars, expires_at, incarnation
              FROM axond_store_budget_reservation LIMIT 0",
         )
         .await
@@ -224,6 +228,35 @@ async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     }
+    ensure_reservation_incarnation(client).await?;
+    Ok(())
+}
+
+async fn ensure_namespace_incarnation(client: &impl GenericClient) -> Result<(), StoreError> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (
+                id TEXT PRIMARY KEY NOT NULL,
+                n INTEGER NOT NULL
+            )",
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    Ok(())
+}
+
+async fn ensure_reservation_incarnation(client: &impl GenericClient) -> Result<(), StoreError> {
+    if !relation_exists(client, STORE_BUDGET_RESERVATION).await? {
+        return Ok(());
+    }
+    client
+        .execute(
+            "ALTER TABLE axond_store_budget_reservation
+             ADD COLUMN IF NOT EXISTS incarnation integer NOT NULL DEFAULT 1",
+            &[],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     Ok(())
 }
 
@@ -486,6 +519,9 @@ async fn read_budget(
                      WHERE r.namespace = b.namespace
                        AND r.period = b.period
                        AND r.expires_at > now()
+                       AND r.incarnation = COALESCE((
+                           SELECT n FROM axond_namespace_incarnation i WHERE i.id = b.namespace
+                       ), 1)
                  ), 0)::bigint,
                  EXISTS (
                      SELECT 1 FROM axond_store_budget_active a
@@ -522,14 +558,30 @@ impl Store for PostgresStore {
                 .blocklist
                 .as_ref()
                 .map(|list| serde_json::to_value(list).unwrap_or(Value::Null));
-            match client
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            match tx
                 .execute(
                     "INSERT INTO axond_namespace (id, attrs, blocklist) VALUES ($1, $2, $3)",
                     &[&ns.id, &ns.attrs, &blocklist],
                 )
                 .await
             {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    tx.execute(
+                        "INSERT INTO axond_namespace_incarnation (id, n) VALUES ($1, 1)
+                         ON CONFLICT (id) DO NOTHING",
+                        &[&ns.id],
+                    )
+                    .await
+                    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+                    Ok(())
+                }
                 Err(err) if err.code().is_some_and(|c| c.code() == "23505") => {
                     Err(StoreError::Duplicate(ns.id))
                 }
@@ -809,7 +861,7 @@ impl Store for PostgresStore {
 /// Namespace row, then active, then spend: PUT and reserve/settle take the
 /// same locks in this order, so a concurrent delete cannot deadlock them.
 async fn delete_namespace_tx(tx: &Transaction<'_>, id: &str) -> Result<bool, StoreError> {
-    let _ = tx
+    let ns_row = tx
         .query_opt(
             "SELECT id FROM axond_namespace WHERE id = $1 FOR UPDATE",
             &[&id],
@@ -831,12 +883,16 @@ async fn delete_namespace_tx(tx: &Transaction<'_>, id: &str) -> Result<bool, Sto
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    tx.execute(
-        "DELETE FROM axond_store_budget_reservation WHERE namespace = $1",
-        &[&id],
-    )
-    .await
-    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let existed = ns_row.is_some();
+    if existed {
+        tx.execute(
+            "INSERT INTO axond_namespace_incarnation (id, n) VALUES ($1, 2)
+             ON CONFLICT (id) DO UPDATE SET n = axond_namespace_incarnation.n + 1",
+            &[&id],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    }
     tx.execute(
         "DELETE FROM axond_store_budget WHERE namespace = $1",
         &[&id],
@@ -902,6 +958,14 @@ async fn settle_tx(
     reservation_id: &str,
     actual: i64,
 ) -> Result<(), StoreError> {
+    let ns_exists = tx
+        .query_opt(
+            "SELECT id FROM axond_namespace WHERE id = $1 FOR UPDATE",
+            &[&namespace],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .is_some();
     let _ = tx
         .query_opt(
             "SELECT period FROM axond_store_budget_active WHERE namespace = $1 FOR UPDATE",
@@ -917,23 +981,46 @@ async fn settle_tx(
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let held_incarnation: Option<i32> = tx
+        .query_opt(
+            "SELECT incarnation FROM axond_store_budget_reservation WHERE id = $1",
+            &[&reservation_id],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .map(|row| row.get(0));
     tx.execute(
         "DELETE FROM axond_store_budget_reservation WHERE id = $1",
         &[&reservation_id],
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    tx.execute(
-        "UPDATE axond_store_budget
-         SET spent_microdollars = CASE
-             WHEN spent_microdollars >= 9223372036854775807 - $1 THEN 9223372036854775807
-             ELSE spent_microdollars + $1
-         END
-         WHERE namespace = $2 AND period = $3",
-        &[&actual, &namespace, &period],
-    )
-    .await
-    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let current: i32 = tx
+        .query_opt(
+            "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
+            &[&namespace],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .map(|row| row.get(0))
+        .unwrap_or(1);
+    let charge = match held_incarnation {
+        Some(incarnation) => ns_exists && incarnation == current,
+        None => ns_exists,
+    };
+    if charge {
+        tx.execute(
+            "UPDATE axond_store_budget
+             SET spent_microdollars = CASE
+                 WHEN spent_microdollars >= 9223372036854775807 - $1 THEN 9223372036854775807
+                 ELSE spent_microdollars + $1
+             END
+             WHERE namespace = $2 AND period = $3",
+            &[&actual, &namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -955,10 +1042,19 @@ async fn hold(
         return Ok(BudgetReserve::Exceeded);
     };
     let period: String = active.get(0);
+    let incarnation: i32 = tx
+        .query_opt(
+            "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
+            &[&namespace],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .map(|row| row.get(0))
+        .unwrap_or(1);
     tx.execute(
         "DELETE FROM axond_store_budget_reservation
-         WHERE namespace = $1 AND expires_at <= now()",
-        &[&namespace],
+         WHERE namespace = $1 AND expires_at <= now() AND incarnation = $2",
+        &[&namespace, &incarnation],
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -978,8 +1074,9 @@ async fn hold(
     let reserved: i64 = tx
         .query_one(
             "SELECT COALESCE(SUM(amount_microdollars), 0)::bigint FROM axond_store_budget_reservation
-             WHERE namespace = $1 AND period = $2 AND expires_at > now()",
-            &[&namespace, &period],
+             WHERE namespace = $1 AND period = $2 AND expires_at > now()
+               AND incarnation = $3",
+            &[&namespace, &period, &incarnation],
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
@@ -989,9 +1086,16 @@ async fn hold(
     }
     tx.execute(
         "INSERT INTO axond_store_budget_reservation
-            (id, namespace, period, amount_microdollars, expires_at)
-         VALUES ($1, $2, $3, $4, now() + ($5::bigint * interval '1 millisecond'))",
-        &[&reservation_id, &namespace, &period, &estimate, &ttl_ms],
+            (id, namespace, period, amount_microdollars, expires_at, incarnation)
+         VALUES ($1, $2, $3, $4, now() + ($5::bigint * interval '1 millisecond'), $6)",
+        &[
+            &reservation_id,
+            &namespace,
+            &period,
+            &estimate,
+            &ttl_ms,
+            &incarnation,
+        ],
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
