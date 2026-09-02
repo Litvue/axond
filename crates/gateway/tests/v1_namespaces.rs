@@ -40,6 +40,15 @@ async fn namespaced_completion_and_namespace_api() {
         .expect("oversized");
     assert_eq!(oversized.status(), 400);
 
+    let unknown_field = http
+        .put(gateway.url("/api/v1/namespaces/wsp_x"))
+        .bearer_auth(GATEWAY_KEY)
+        .json(&json!({"attr": {"org": "typo"}}))
+        .send()
+        .await
+        .expect("unknown field");
+    assert_eq!(unknown_field.status(), 400);
+
     let dup = http
         .post(gateway.url("/api/v1/namespaces"))
         .bearer_auth(GATEWAY_KEY)

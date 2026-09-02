@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -35,6 +36,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateBody {
     id: String,
     #[serde(default)]
@@ -44,6 +46,7 @@ struct CreateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplaceBody {
     #[serde(default)]
     attrs: Value,
@@ -98,10 +101,22 @@ fn validate_payload(attrs: &Value, blocklist: &Option<Vec<String>>) -> Result<()
     Ok(())
 }
 
+fn json_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, GatewayError> {
+    match body {
+        Ok(Json(body)) => Ok(body),
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            Err(GatewayError::RequestTooLarge)
+        }
+        Err(JsonRejection::MissingJsonContentType(_)) => Err(GatewayError::UnsupportedMediaType),
+        Err(err) => Err(GatewayError::BadRequest(err.body_text())),
+    }
+}
+
 async fn create_namespace(
     State(state): State<AppState>,
-    Json(body): Json<CreateBody>,
+    body: Result<Json<CreateBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<NamespaceRecord>), GatewayError> {
+    let body = json_body(body)?;
     validate_namespace_id(&body.id).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
     validate_payload(&body.attrs, &body.blocklist)?;
     let rec = NamespaceRecord {
@@ -132,8 +147,9 @@ async fn get_namespace(
 async fn put_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
-    Json(body): Json<ReplaceBody>,
+    body: Result<Json<ReplaceBody>, JsonRejection>,
 ) -> Result<Json<NamespaceRecord>, GatewayError> {
+    let body = json_body(body)?;
     validate_payload(&body.attrs, &body.blocklist)?;
     let attrs = normalize_attrs(body.attrs)?;
     match store(&state)?

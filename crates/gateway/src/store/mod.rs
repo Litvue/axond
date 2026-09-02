@@ -101,6 +101,8 @@ pub async fn seed_config_namespaces(
 ) -> Result<(), StoreError> {
     for namespace in namespaces {
         validate_namespace_id(&namespace.id)?;
+    }
+    for namespace in namespaces {
         let record = NamespaceRecord {
             id: namespace.id.clone(),
             attrs: serde_json::json!({}),

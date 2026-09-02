@@ -28,6 +28,14 @@ impl PostgresStore {
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         }
+        client
+            .batch_execute("SELECT id, attrs, blocklist FROM axond_namespace LIMIT 0")
+            .await
+            .map_err(|e| {
+                StoreError::Unavailable(format!(
+                    "axond_namespace schema missing or incompatible: {e}"
+                ))
+            })?;
         Ok(Self { client })
     }
 }

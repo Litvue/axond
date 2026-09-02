@@ -31,7 +31,7 @@ targets = [
 ]
 
 # Sized for this manifest's pod, not for the fleet: the ceilings are per replica
-# and in process memory, so `replicas: 2` admits twice these numbers. They are
+# and in process memory, so extra replicas would admit extra capacity. They are
 # set deliberately below axond's own defaults because the container's memory
 # limit is 512Mi, and the worst case is every admitted request carrying a
 # maximum-size body: 32 * 1 MiB is 32 MiB of raw bodies, and a body costs

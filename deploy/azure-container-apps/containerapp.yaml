@@ -37,7 +37,7 @@ properties:
     terminationGracePeriodSeconds: 30
     scale:
       minReplicas: 1
-      maxReplicas: 3
+      maxReplicas: 1
       rules:
         - name: http-concurrency
           http:
