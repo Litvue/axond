@@ -74,6 +74,16 @@ async fn delete_namespace_is_idempotent_and_fail_closed_on_recreate() {
         .expect("missing");
     assert_eq!(missing.status(), 204);
 
+    let configured = http
+        .delete(gateway.url("/api/v1/namespaces/platform"))
+        .bearer_auth(GATEWAY_KEY)
+        .send()
+        .await
+        .expect("configured");
+    assert_eq!(configured.status(), 409);
+    let body: Value = configured.json().await.expect("configured body");
+    assert_eq!(body["error"]["type"], "namespace_conflict");
+
     for path in [
         "/api/v1/namespaces/wsp_del",
         "/api/v1/namespaces/wsp_del/budgets/2026-09",

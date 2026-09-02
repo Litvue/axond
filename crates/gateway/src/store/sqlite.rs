@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS axond_store_budget_reservation_tombstone (
     incarnation INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_tombstone_expires_idx
+    ON axond_store_budget_reservation_tombstone (expires_at);
 CREATE TABLE IF NOT EXISTS axond_store_usage (
     request_id TEXT PRIMARY KEY NOT NULL,
     namespace TEXT NOT NULL,
@@ -278,6 +280,20 @@ impl Store for SqliteStore {
                 }
                 Err(err) => Err(unavailable(err)),
             }
+        })
+        .await
+    }
+
+    async fn namespace_incarnation(&self, id: &str) -> Result<Option<i64>, StoreError> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT n FROM axond_namespace_incarnation WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(unavailable)
         })
         .await
     }
@@ -962,6 +978,51 @@ mod tests {
         };
         assert_eq!((budget, active, reservations, usage), (0, 0, 1, 1));
         assert!(store.get_namespace("wsp_x").await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn seed_does_not_resurrect_a_deleted_namespace() {
+        let path = std::env::temp_dir().join(format!(
+            "axond-seed-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let path_str = path.to_str().expect("utf8 path");
+        let store = SqliteStore::open(path_str).expect("open");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_seed".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("put");
+        assert!(store.delete_namespace("wsp_seed").await.expect("delete"));
+        drop(store);
+        let store = SqliteStore::open(path_str).expect("reopen");
+        let toml_ns = crate::config::Namespace {
+            id: "wsp_seed".into(),
+            default: false,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+            static_policy: None,
+        };
+        super::super::seed_config_namespaces(&store, &[toml_ns])
+            .await
+            .expect("seed");
+        assert!(
+            store
+                .get_namespace("wsp_seed")
+                .await
+                .expect("get")
+                .is_none(),
+            "TOML seed must not recreate a deleted id"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
