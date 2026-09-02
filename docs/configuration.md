@@ -309,7 +309,7 @@ until restart — the live `Store` is opened once.
 | `path` | string | — | SQLite file path. Required for `sqlite`. `:memory:` is refused by `Config::load`. |
 | `dsn_env` | env-var name | — | Postgres DSN environment variable. Required for `postgres`. The DSN's `sslmode` selects TLS. |
 | `create_table` | bool | `true` | Apply namespace DDL at connect. Postgres deployments that migrate out of band set `false`. |
-| `on_unavailable` | `deny` \| `allow` | `deny` | Budget/store outage stance used by later slices. |
+| `on_unavailable` | `deny` \| `allow` | `deny` | When the Store cannot reserve: `deny` answers `503 budget_unavailable`; `allow` serves without a hold. |
 
 SQLite rejects a set `dsn_env`; Postgres rejects a set `path`.
 

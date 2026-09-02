@@ -2,15 +2,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio_postgres::{Client, Config};
+use tokio::sync::Mutex;
+use tokio_postgres::{Client, Config, GenericClient, Transaction};
 
-use super::{NamespaceRecord, Store, StoreError};
+use super::{
+    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, from_sql_amount, sql_amount,
+};
+
+const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
 
 const SEED_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
 
 pub struct PostgresStore {
-    client: Client,
+    client: Mutex<Client>,
     /// DSN for short-lived seed connections. The request-path `client` is bound
     /// to the process Tokio runtime and must not be driven with `block_on`.
     dsn: String,
@@ -35,6 +40,10 @@ impl PostgresStore {
                 )
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            client
+                .batch_execute(BUDGET_DDL)
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         }
         client
             .batch_execute("SELECT id, attrs, blocklist FROM axond_namespace LIMIT 0")
@@ -44,8 +53,17 @@ impl PostgresStore {
                     "axond_namespace schema missing or incompatible: {e}"
                 ))
             })?;
+        client
+            .batch_execute(
+                "SELECT namespace, period, limit_microdollars, spent_microdollars
+                 FROM axond_budget LIMIT 0",
+            )
+            .await
+            .map_err(|e| {
+                StoreError::Unavailable(format!("axond_budget schema missing or incompatible: {e}"))
+            })?;
         Ok(Self {
-            client,
+            client: Mutex::new(client),
             dsn: dsn.to_owned(),
         })
     }
@@ -120,10 +138,55 @@ fn record_from(
     })
 }
 
+async fn read_budget(
+    client: &impl GenericClient,
+    namespace: &str,
+    period: &str,
+) -> Result<Option<BudgetRecord>, StoreError> {
+    let row = client
+        .query_opt(
+            "SELECT limit_microdollars, spent_microdollars FROM axond_budget
+             WHERE namespace = $1 AND period = $2",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let limit: i64 = row.get(0);
+    let spent: i64 = row.get(1);
+    let reserved: i64 = client
+        .query_one(
+            "SELECT COALESCE(SUM(amount_microdollars), 0)::bigint FROM axond_budget_reservation
+             WHERE namespace = $1 AND period = $2 AND expires_at > now()",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .get(0);
+    let active = client
+        .query_opt(
+            "SELECT period FROM axond_budget_active WHERE namespace = $1",
+            &[&namespace],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .is_some_and(|row| row.get::<_, String>(0) == period);
+    Ok(Some(BudgetRecord::new(
+        namespace,
+        period,
+        from_sql_amount(limit),
+        from_sql_amount(spent),
+        from_sql_amount(reserved),
+        active,
+    )))
+}
+
 #[async_trait]
 impl Store for PostgresStore {
     async fn put_namespace(&self, ns: NamespaceRecord) -> Result<(), StoreError> {
-        let client = &self.client;
+        let client = self.client.lock().await;
         let blocklist = ns
             .blocklist
             .as_ref()
@@ -144,7 +207,7 @@ impl Store for PostgresStore {
     }
 
     async fn get_namespace(&self, id: &str) -> Result<Option<NamespaceRecord>, StoreError> {
-        let client = &self.client;
+        let client = self.client.lock().await;
         let row = client
             .query_opt(
                 "SELECT id, attrs, blocklist FROM axond_namespace WHERE id = $1",
@@ -163,7 +226,7 @@ impl Store for PostgresStore {
     ) -> Result<(Vec<NamespaceRecord>, Option<String>), StoreError> {
         let limit = i64::from(limit.clamp(1, 1000));
         let fetch = limit + 1;
-        let client = &self.client;
+        let client = self.client.lock().await;
         let rows = client
             .query(
                 "SELECT id, attrs, blocklist FROM axond_namespace
@@ -199,7 +262,7 @@ impl Store for PostgresStore {
         blocklist: Option<Vec<String>>,
     ) -> Result<Option<NamespaceRecord>, StoreError> {
         let blocklist = blocklist.map(|list| serde_json::to_value(list).unwrap_or(Value::Null));
-        let client = &self.client;
+        let client = self.client.lock().await;
         let row = client
             .query_opt(
                 "UPDATE axond_namespace SET attrs = $1, blocklist = $2 WHERE id = $3
@@ -213,7 +276,7 @@ impl Store for PostgresStore {
     }
 
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError> {
-        let client = &self.client;
+        let client = self.client.lock().await;
         let n = client
             .execute("DELETE FROM axond_namespace WHERE id = $1", &[&id])
             .await
@@ -248,4 +311,196 @@ impl Store for PostgresStore {
             }
         })
     }
+
+    async fn put_budget(
+        &self,
+        namespace: &str,
+        period: &str,
+        limit_microdollars: u64,
+    ) -> Result<BudgetRecord, StoreError> {
+        let limit = sql_amount(limit_microdollars)?;
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        let exists = tx
+            .query_opt("SELECT 1 FROM axond_namespace WHERE id = $1", &[&namespace])
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?
+            .is_some();
+        if !exists {
+            return Err(StoreError::NotFound(namespace.to_owned()));
+        }
+        tx.execute(
+            "INSERT INTO axond_budget (namespace, period, limit_microdollars, spent_microdollars)
+             VALUES ($1, $2, $3, 0)
+             ON CONFLICT (namespace, period) DO UPDATE SET
+                limit_microdollars = excluded.limit_microdollars",
+            &[&namespace, &period, &limit],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO axond_budget_active (namespace, period) VALUES ($1, $2)
+             ON CONFLICT (namespace) DO UPDATE SET period = excluded.period",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        let rec = read_budget(&tx, namespace, period)
+            .await?
+            .ok_or_else(|| StoreError::Unavailable("budget row missing after put".into()))?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        Ok(rec)
+    }
+
+    async fn get_budget(
+        &self,
+        namespace: &str,
+        period: &str,
+    ) -> Result<Option<BudgetRecord>, StoreError> {
+        let client = self.client.lock().await;
+        read_budget(&*client, namespace, period).await
+    }
+
+    async fn reserve_budget(
+        &self,
+        namespace: &str,
+        estimate_microdollars: u64,
+        reservation_ttl: Duration,
+        reservation_id: &str,
+    ) -> Result<BudgetReserve, StoreError> {
+        let estimate = sql_amount(estimate_microdollars)?;
+        let ttl_ms = sql_amount(reservation_ttl.as_millis().min(i64::MAX as u128) as u64)?;
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        let outcome = hold(&tx, namespace, estimate, ttl_ms, reservation_id).await?;
+        match &outcome {
+            BudgetReserve::Allowed { .. } => tx
+                .commit()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?,
+            BudgetReserve::Exceeded => tx
+                .rollback()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?,
+        }
+        Ok(outcome)
+    }
+
+    async fn settle_budget(
+        &self,
+        namespace: &str,
+        period: &str,
+        reservation_id: &str,
+        actual_microdollars: u64,
+    ) -> Result<(), StoreError> {
+        let actual = sql_amount(actual_microdollars)?;
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        // Active row first, then spend row: the same order `hold` takes them.
+        let _ = tx
+            .query_opt(
+                "SELECT period FROM axond_budget_active WHERE namespace = $1 FOR UPDATE",
+                &[&namespace],
+            )
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        let _ = tx
+            .query_opt(
+                "SELECT limit_microdollars FROM axond_budget
+                 WHERE namespace = $1 AND period = $2 FOR UPDATE",
+                &[&namespace, &period],
+            )
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM axond_budget_reservation WHERE id = $1",
+            &[&reservation_id],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        tx.execute(
+            "UPDATE axond_budget
+             SET spent_microdollars = spent_microdollars + $1
+             WHERE namespace = $2 AND period = $3",
+            &[&actual, &namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        Ok(())
+    }
+}
+
+async fn hold(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    estimate: i64,
+    ttl_ms: i64,
+    reservation_id: &str,
+) -> Result<BudgetReserve, StoreError> {
+    let Some(active) = tx
+        .query_opt(
+            "SELECT period FROM axond_budget_active WHERE namespace = $1 FOR UPDATE",
+            &[&namespace],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+    else {
+        return Ok(BudgetReserve::Exceeded);
+    };
+    let period: String = active.get(0);
+    tx.execute(
+        "DELETE FROM axond_budget_reservation
+         WHERE namespace = $1 AND period = $2 AND expires_at <= now()",
+        &[&namespace, &period],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let Some(row) = tx
+        .query_opt(
+            "SELECT limit_microdollars, spent_microdollars FROM axond_budget
+             WHERE namespace = $1 AND period = $2 FOR UPDATE",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+    else {
+        return Ok(BudgetReserve::Exceeded);
+    };
+    let limit: i64 = row.get(0);
+    let spent: i64 = row.get(1);
+    let reserved: i64 = tx
+        .query_one(
+            "SELECT COALESCE(SUM(amount_microdollars), 0)::bigint FROM axond_budget_reservation
+             WHERE namespace = $1 AND period = $2 AND expires_at > now()",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .get(0);
+    if spent.saturating_add(reserved).saturating_add(estimate) > limit {
+        return Ok(BudgetReserve::Exceeded);
+    }
+    tx.execute(
+        "INSERT INTO axond_budget_reservation
+            (id, namespace, period, amount_microdollars, expires_at)
+         VALUES ($1, $2, $3, $4, now() + ($5::bigint * interval '1 millisecond'))",
+        &[&reservation_id, &namespace, &period, &estimate, &ttl_ms],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    Ok(BudgetReserve::Allowed { period })
 }

@@ -4547,6 +4547,7 @@ impl Config {
         self.namespace.iter().find(|n| n.id == id)
     }
 
+    #[allow(dead_code)]
     pub fn distinct_namespace_count(&self) -> usize {
         self.namespace
             .iter()
