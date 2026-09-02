@@ -1,10 +1,12 @@
 # Fault qualification
 
-How a replica behaves when the provider, the network to it, or a state tier
-fails — and the evidence that says so. This page is the fault half of the
-production qualification programme; the load half is
+How a replica behaves when the provider or the network to it fails — and the
+evidence that says so. This page is the fault half of the production
+qualification programme; the load half is
 [Capacity qualification](./capacity.md). The design and its boundaries are
-[ADR 0048](../adr/0048-fault-qualification-harness.md).
+[ADR 0048](../adr/0048-fault-qualification-harness.md). Redis budget and
+rate-limit rows skip because those backends are withdrawn (ADR 0063), not
+because of a missing tier-matrix service.
 
 The two are deliberately separate. A capacity profile qualifies a healthy
 replica and treats any error as a finding. A fault row expects the failure and
@@ -24,7 +26,8 @@ injected fault and the properties it must produce.
 | The path to the provider | Unresolvable DNS, refused connect, a TLS handshake answered with garbage, headers that never arrive, a buffered body that never finishes. |
 | Streams | Idle before the first provider event, idle after output is committed, truncated mid-event. |
 | Bounded bodies | An oversized success body and an oversized provider *error* body. |
-| State tiers | Redis and Postgres under injected latency, outage under `on_unavailable = "deny"`, outage under `on_unavailable = "allow"`, and recovery without a restart. |
+| Withdrawn Redis backends | Latency, fail-closed, fail-open, recovery — skipped; skip reason is ADR 0063, not a missing service. |
+| Optional Postgres HA | The same four shapes against a budget store, skipped unless `AXOND_TEST_POSTGRES_DSN` is set. |
 
 Every fault is injected locally and deterministically: a fake provider on
 loopback, a TCP listener that never speaks TLS, a closed port, and — for the
@@ -68,29 +71,14 @@ fails on is a property that does not move with the machine.
 ## Run it
 
 ```bash
-# Provider and transport rows. No datastore needed.
+# Provider and transport rows on SQLite + /ns/{ns}/v1.
 AXOND_FAULT_MATRIX=1 \
-  cargo test --locked --all-features --test faults -- --nocapture --test-threads=1
-
-# All rows, including the state tiers, against the containers CONTRIBUTING.md
-# starts for the other stateful suites.
-AXOND_FAULT_MATRIX=1 \
-AXOND_TEST_REDIS_URL=redis://127.0.0.1:6399 \
-AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
   cargo test --locked --all-features --test faults -- --nocapture --test-threads=1
 ```
 
-Or `just faults`, which runs whichever rows the environment can serve: the
-state-tier connection strings are the suite's own, so exporting them adds the
-state-tier rows and leaving them unset skips those rows rather than failing on
-a datastore that is not there. The connection string must be one the harness can
-point at its fault proxy: a plaintext `redis://` or `postgres://` DSN. A TLS
-endpoint is skipped with that reason rather than redirected, because the proxy
-speaks TCP and would break the handshake instead of injecting the fault.
-
-State-tier rows skip when their connection string is unset and **fail** when
-`AXOND_TEST_REQUIRE_SERVICES=1`, which the CI stateful lane sets — so a skipped
-backend row there is a failure, not a quiet gap.
+Or `just faults`. Redis rows always skip (ADR 0063). Postgres HA rows skip
+unless `AXOND_TEST_POSTGRES_DSN` is a plaintext `postgres://` URL the harness
+can redirect through its TCP fault proxy. Required CI does not set Redis.
 
 The rows run one at a time, in a lane of their own. Each boots its own process,
 and a matrix that shared a replica between rows could not attribute what it

@@ -126,7 +126,7 @@ drill before treating the upgraded fleet as recoverable.
 
 This sequence is executed on every change against a fleet of real replicas behind
 a readiness-driven balancer, including the rollback limits below:
-[rollout qualification](./rollout.md).
+[Kubernetes deployment](../deployment/kubernetes.md).
 
 A billing-grade replica also drains its usage outbox within that budget, and
 reports what it could not deliver. Undelivered events are not lost — the

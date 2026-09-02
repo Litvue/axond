@@ -4,7 +4,9 @@ Date: 2026-08-09
 
 ## Status
 
-Accepted
+Accepted historically. Amended by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md): the gate still runs,
+but it boots a temp SQLite file. It is not a no-datastore promise.
 
 ## Context
 
@@ -104,3 +106,12 @@ therefore remains the stable required aggregate.
 - Tier 1 and Tier 2 still need their own integration tests for unavailable
   stores, timeouts, fail-closed behavior, and recovery; this gate does not
   qualify those deployments.
+
+## Amendment: temp SQLite is the single-replica boot (ADR 0063)
+
+The “no datastore / hermetic Tier 0” product promise is withdrawn. CI still
+runs `ops/tier0-gate.sh` inside a network namespace so an *external* Redis or
+Postgres dependency cannot hide, but the process boots a throwaway SQLite
+file and serves `/ns/{ns}/v1`. A missing store is a boot failure, not a
+supported mode. The network namespace is isolation from other hosts, not
+evidence that Axond runs without a store.

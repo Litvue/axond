@@ -4,7 +4,15 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+The stateful-endurance harness existed only to prove the removed tier / mode
+matrix. `qualification/stateful-endurance` is gone. Request-path endurance
+remains [ADR 0040](./0040-endurance-qualification-harness.md). This record is
+retained for history. Do not implement from it.
+
+Accepted historically.
 
 Extends [ADR 0040](./0040-endurance-qualification-harness.md) from *whether one
 stateless replica is still the same process after half a day* to *whether a

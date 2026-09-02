@@ -548,9 +548,7 @@ def render(results: list[dict], runner: str, note: str) -> str:
 
 GENERIC_MANIFESTS = {
     "endurance": "qualification/endurance/manifest.toml",
-    "stateful-endurance": "qualification/stateful-endurance/manifest.toml",
     "fault": "qualification/faults/manifest.toml",
-    "rollout": "qualification/rollout/manifest.toml",
 }
 
 RECOVERY_MANIFEST = "qualification/recovery/manifest.toml"
@@ -1900,7 +1898,7 @@ def self_test() -> int:
         )
         assert capacity_record["profile"][0]["elapsed_ms"] == 1001
 
-    manifest_relative = GENERIC_MANIFESTS["rollout"]
+    manifest_relative = GENERIC_MANIFESTS["endurance"]
     manifest_bytes = (ROOT / manifest_relative).read_bytes()
     environment = {
         "source": {"git_commit": "commit", "git_dirty": False, "crate_version": "0.0.0"},
@@ -1919,357 +1917,358 @@ def self_test() -> int:
             "containerized": False,
         },
     }
-    result = {
-        "schema_version": ROLLOUT_RESULT_SCHEMA_VERSION,
-        "scenario": {"id": "rolling-replace", "tier": "heavy"},
-        "run": {
-            "elapsed_ms": 1,
-            "mode": "qualification",
-            "promotable": True,
-            "retained_release": {
-                "expected_version": ROLLOUT_PREVIOUS_VERSION,
-                "expected_binary_sha256": "previous",
-                "archive_sha256": "a" * 64,
-            },
-        },
-        "environment": environment,
-        "revisions": [
-            {
-                "label": "previous",
-                "binary": {
-                    "sha256": "previous",
-                    "version": ROLLOUT_PREVIOUS_VERSION,
+    if "rollout" in GENERIC_MANIFESTS:
+        result = {
+            "schema_version": ROLLOUT_RESULT_SCHEMA_VERSION,
+            "scenario": {"id": "rolling-replace", "tier": "heavy"},
+            "run": {
+                "elapsed_ms": 1,
+                "mode": "qualification",
+                "promotable": True,
+                "retained_release": {
+                    "expected_version": ROLLOUT_PREVIOUS_VERSION,
+                    "expected_binary_sha256": "previous",
+                    "archive_sha256": "a" * 64,
                 },
-                "config": {"sha256": "shared-bootstrap"},
-                "distinct_binary": False,
-                "desired_state_revision": "rev_shared",
             },
-            {
-                "label": "candidate-previous-config",
-                "binary": {
-                    "sha256": "candidate",
-                    "version": ROLLOUT_CANDIDATE_VERSION,
-                },
-                "config": {"sha256": "shared-bootstrap"},
-                "distinct_binary": True,
-                "desired_state_revision": "rev_shared",
-            },
-            {
-                "label": "next",
-                "binary": {
-                    "sha256": "candidate",
-                    "version": ROLLOUT_CANDIDATE_VERSION,
-                },
-                "config": {"sha256": "shared-bootstrap"},
-                "distinct_binary": True,
-                "desired_state_revision": "rev_shared",
-            },
-        ],
-        "traffic": [
-            {
-                "phase": "candidate-on-previous-config",
-                "answered": 1,
-                "by_revision": {"candidate-previous-config": 1},
-            }
-        ],
-        "fleet": [
-            {
-                "id": "candidate-0",
-                "revision": "next",
-                "refusals": 0,
-            }
-        ],
-        "mixed_version": {
-            "exclusive_alias": "chat-next-only",
-            "shared_stateful_revision": "rev_shared",
-            "shared_alias": "chat",
-            "previous_serves_shared_alias": True,
-            "next_serves_shared_alias": True,
-        },
-        "loss": {
-            "caller_requests": 1,
-            "per_replica": [
+            "environment": environment,
+            "revisions": [
                 {
-                    "replica": "candidate-0",
-                    "caller_requests_refused_while_draining": 0,
+                    "label": "previous",
+                    "binary": {
+                        "sha256": "previous",
+                        "version": ROLLOUT_PREVIOUS_VERSION,
+                    },
+                    "config": {"sha256": "shared-bootstrap"},
+                    "distinct_binary": False,
+                    "desired_state_revision": "rev_shared",
+                },
+                {
+                    "label": "candidate-previous-config",
+                    "binary": {
+                        "sha256": "candidate",
+                        "version": ROLLOUT_CANDIDATE_VERSION,
+                    },
+                    "config": {"sha256": "shared-bootstrap"},
+                    "distinct_binary": True,
+                    "desired_state_revision": "rev_shared",
+                },
+                {
+                    "label": "next",
+                    "binary": {
+                        "sha256": "candidate",
+                        "version": ROLLOUT_CANDIDATE_VERSION,
+                    },
+                    "config": {"sha256": "shared-bootstrap"},
+                    "distinct_binary": True,
+                    "desired_state_revision": "rev_shared",
+                },
+            ],
+            "traffic": [
+                {
+                    "phase": "candidate-on-previous-config",
+                    "answered": 1,
+                    "by_revision": {"candidate-previous-config": 1},
                 }
             ],
-            "draining_refusal_attempts": [],
-            "failed_ingress_attempts": [],
-            "expected_usage_identities": [
+            "fleet": [
                 {
-                    "replica": "candidate-0",
-                    "trace_id": "61786f6e642d726f0000000000000001",
-                    "status": "ok",
+                    "id": "candidate-0",
+                    "revision": "next",
+                    "refusals": 0,
                 }
             ],
-            "usage_reconciliation": {
-                "mode": "exact_trace",
-                "exact_trace_replicas": ["candidate-0"],
-                "retained_trace_context": "loopback_otlp_http",
-                "otlp_trace_exports": 1,
-                "otlp_trace_export_replicas": ["candidate-0"],
-                "expected_non_usage_trace_identities": [],
-                "otlp_trace_collection_errors": [],
-                "otlp_trace_identities": [
+            "mixed_version": {
+                "exclusive_alias": "chat-next-only",
+                "shared_stateful_revision": "rev_shared",
+                "shared_alias": "chat",
+                "previous_serves_shared_alias": True,
+                "next_serves_shared_alias": True,
+            },
+            "loss": {
+                "caller_requests": 1,
+                "per_replica": [
+                    {
+                        "replica": "candidate-0",
+                        "caller_requests_refused_while_draining": 0,
+                    }
+                ],
+                "draining_refusal_attempts": [],
+                "failed_ingress_attempts": [],
+                "expected_usage_identities": [
                     {
                         "replica": "candidate-0",
                         "trace_id": "61786f6e642d726f0000000000000001",
+                        "status": "ok",
                     }
                 ],
-                "unexpected_otlp_trace_identities": [],
-            }
-        },
-        "migration": {
-            "matrix": {
-                "evaluated": True,
-                "previous_apply": {"succeeded": True},
-                "previous_status_before": {"succeeded": True},
-                "candidate_status_before": {"succeeded": True},
-                "candidate_apply": {"succeeded": True},
-                "candidate_status_after": {"succeeded": True},
-                "previous_status_after_candidate": {"succeeded": True},
-                "previous_versions": [
-                    {"version": 1, "name": "base", "checksum": "checksum"}
-                ],
-                "candidate_versions": [
-                    {"version": 1, "name": "base", "checksum": "checksum"}
-                ],
-                "candidate_added_versions": [],
-                "classification": "unchanged",
-            }
-        },
-        "rollback": {
-            "migrated_layout_fence": {
-                "expected_refused": False,
-                "refused": False,
+                "usage_reconciliation": {
+                    "mode": "exact_trace",
+                    "exact_trace_replicas": ["candidate-0"],
+                    "retained_trace_context": "loopback_otlp_http",
+                    "otlp_trace_exports": 1,
+                    "otlp_trace_export_replicas": ["candidate-0"],
+                    "expected_non_usage_trace_identities": [],
+                    "otlp_trace_collection_errors": [],
+                    "otlp_trace_identities": [
+                        {
+                            "replica": "candidate-0",
+                            "trace_id": "61786f6e642d726f0000000000000001",
+                        }
+                    ],
+                    "unexpected_otlp_trace_identities": [],
+                }
             },
-            "compatible_patch_rollback": {
-                "performed": True,
-                "served_traffic": True,
+            "migration": {
+                "matrix": {
+                    "evaluated": True,
+                    "previous_apply": {"succeeded": True},
+                    "previous_status_before": {"succeeded": True},
+                    "candidate_status_before": {"succeeded": True},
+                    "candidate_apply": {"succeeded": True},
+                    "candidate_status_after": {"succeeded": True},
+                    "previous_status_after_candidate": {"succeeded": True},
+                    "previous_versions": [
+                        {"version": 1, "name": "base", "checksum": "checksum"}
+                    ],
+                    "candidate_versions": [
+                        {"version": 1, "name": "base", "checksum": "checksum"}
+                    ],
+                    "candidate_added_versions": [],
+                    "classification": "unchanged",
+                }
             },
-        },
-        "verdicts": [{"passed": True}],
-    }
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / "rolling-replace.json"
-        path.write_text(json.dumps(result), encoding="utf-8")
-        result["_artifact_path"] = str(path)
-        rendered = render_generic(
-            [result], "rollout", "heavy", "local", "qualification self-test"
-        )
-        parsed = tomllib.loads(rendered)
-        assert parsed["observation"][0]["id"] == "rolling-replace"
-        assert parsed["observation"][0]["passed"] is True
-        assert (
-            parsed["observation"][0]["artifact_schema_version"]
-            == ROLLOUT_RESULT_SCHEMA_VERSION
-        )
-        assert parsed["schema_version"] == ROLLOUT_RECORD_SCHEMA_VERSION
-        assert (
-            parsed["observation"][0]["rollout_shared_stateful_revision"]
-            == "rev_shared"
-        )
-        assert parsed["observation"][0]["rollout_shared_alias"] == "chat"
-        assert parsed["observation"][0]["rollout_previous_serves_shared_alias"] is True
-        assert parsed["observation"][0]["rollout_candidate_serves_shared_alias"] is True
-        assert parsed["inputs"]["fixtures"] == 0
-
-        retried = copy.deepcopy(result)
-        retried["fleet"].append(
-            {"id": "previous-0", "revision": "previous", "refusals": 0}
-        )
-        accepted_trace = "61786f6e642d726f0000000000000002"
-        retried["loss"]["caller_requests"] = 2
-        retried["loss"]["expected_usage_identities"].append(
-            {"replica": "previous-0", "trace_id": accepted_trace, "status": "ok"}
-        )
-        retried["loss"]["draining_refusal_attempts"] = [
-            {
-                "caller_id": 1,
-                "trace_id": accepted_trace,
-                "refused_replica": "candidate-0",
-                "accepted_replica": "previous-0",
-                "accepted_status": 200,
-            }
-        ]
-        retried["loss"]["per_replica"] = [
-            {
-                "replica": "candidate-0",
-                "caller_requests_refused_while_draining": 1,
+            "rollback": {
+                "migrated_layout_fence": {
+                    "expected_refused": False,
+                    "refused": False,
+                },
+                "compatible_patch_rollback": {
+                    "performed": True,
+                    "served_traffic": True,
+                },
             },
-            {
-                "replica": "previous-0",
-                "caller_requests_refused_while_draining": 0,
-            },
-        ]
-        retried["loss"]["refusals_retried"] = 1
-        retried["fleet"][0]["refusals"] = 1
-        retried_reconciliation = retried["loss"]["usage_reconciliation"]
-        retried_reconciliation["exact_trace_replicas"] = [
-            "candidate-0",
-            "previous-0",
-        ]
-        retried_reconciliation["otlp_trace_exports"] = 2
-        retried_reconciliation["otlp_trace_export_replicas"] = [
-            "candidate-0",
-            "previous-0",
-        ]
-        retried_reconciliation["expected_non_usage_trace_identities"] = [
-            {
-                "replica": "candidate-0",
-                "trace_id": accepted_trace,
-                "reason": "draining_refusal",
-            }
-        ]
-        retried_reconciliation["otlp_trace_identities"] = [
-            {
-                "replica": "candidate-0",
-                "trace_id": "61786f6e642d726f0000000000000001",
-            },
-            {"replica": "candidate-0", "trace_id": accepted_trace},
-            {"replica": "previous-0", "trace_id": accepted_trace},
-        ]
-        check_rollout_qualifiable(retried, "retried refusal self-test")
-
-        transport_retry = copy.deepcopy(retried)
-        first_trace = "61786f6e642d726f0000000000000001"
-        transport_retry["loss"]["failed_ingress_attempts"] = [
-            {
-                "caller_id": 0,
-                "trace_id": first_trace,
-                "replica": "previous-0",
-                "reason": "transport_failure",
-            }
-        ]
-        for member in transport_retry["fleet"]:
-            member["refusals"] = 1
-        check_rollout_qualifiable(
-            transport_retry, "retried transport failure without export self-test"
-        )
-
-        attributed_export = copy.deepcopy(transport_retry)
-        attributed_export["loss"]["usage_reconciliation"][
-            "otlp_trace_identities"
-        ].append({"replica": "previous-0", "trace_id": first_trace})
-        attributed_export["loss"]["usage_reconciliation"][
-            "unexpected_otlp_trace_identities"
-        ] = [
-            {
-                "replica": "previous-0",
-                "trace_id": first_trace,
-                "reason": "transport_failure",
-            }
-        ]
-        for name, mutate in (
-            ("attributed exported extra", lambda candidate: None),
-            (
-                "OTLP trace collection error",
-                lambda candidate: candidate["loss"]["usage_reconciliation"].update(
-                    otlp_trace_collection_errors=["settlement timed out"]
-                ),
-            ),
-            (
-                "failed-attempt reason substitution",
-                lambda candidate: candidate["loss"]["failed_ingress_attempts"][0].update(
-                    reason="untyped_503"
-                ),
-            ),
-            (
-                "inconsistent failed-attempt caller trace",
-                lambda candidate: candidate["loss"]["failed_ingress_attempts"].append(
-                    {
-                        "caller_id": 0,
-                        "trace_id": accepted_trace,
-                        "replica": "candidate-0",
-                        "reason": "transport_failure",
-                    }
-                ),
-            ),
-            (
-                "failed-attempt refusal count mismatch",
-                lambda candidate: next(
-                    member
-                    for member in candidate["fleet"]
-                    if member["id"] == "previous-0"
-                ).update(refusals=0),
-            ),
-            (
-                "deleted failed-attempt ledger",
-                lambda candidate: candidate["loss"].update(
-                    failed_ingress_attempts=[]
-                ),
-            ),
-        ):
-            invalid = copy.deepcopy(
-                attributed_export
-                if name in {"attributed exported extra", "OTLP trace collection error"}
-                else transport_retry
+            "verdicts": [{"passed": True}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rolling-replace.json"
+            path.write_text(json.dumps(result), encoding="utf-8")
+            result["_artifact_path"] = str(path)
+            rendered = render_generic(
+                [result], "rollout", "heavy", "local", "qualification self-test"
             )
-            mutate(invalid)
+            parsed = tomllib.loads(rendered)
+            assert parsed["observation"][0]["id"] == "rolling-replace"
+            assert parsed["observation"][0]["passed"] is True
+            assert (
+                parsed["observation"][0]["artifact_schema_version"]
+                == ROLLOUT_RESULT_SCHEMA_VERSION
+            )
+            assert parsed["schema_version"] == ROLLOUT_RECORD_SCHEMA_VERSION
+            assert (
+                parsed["observation"][0]["rollout_shared_stateful_revision"]
+                == "rev_shared"
+            )
+            assert parsed["observation"][0]["rollout_shared_alias"] == "chat"
+            assert parsed["observation"][0]["rollout_previous_serves_shared_alias"] is True
+            assert parsed["observation"][0]["rollout_candidate_serves_shared_alias"] is True
+            assert parsed["inputs"]["fixtures"] == 0
+
+            retried = copy.deepcopy(result)
+            retried["fleet"].append(
+                {"id": "previous-0", "revision": "previous", "refusals": 0}
+            )
+            accepted_trace = "61786f6e642d726f0000000000000002"
+            retried["loss"]["caller_requests"] = 2
+            retried["loss"]["expected_usage_identities"].append(
+                {"replica": "previous-0", "trace_id": accepted_trace, "status": "ok"}
+            )
+            retried["loss"]["draining_refusal_attempts"] = [
+                {
+                    "caller_id": 1,
+                    "trace_id": accepted_trace,
+                    "refused_replica": "candidate-0",
+                    "accepted_replica": "previous-0",
+                    "accepted_status": 200,
+                }
+            ]
+            retried["loss"]["per_replica"] = [
+                {
+                    "replica": "candidate-0",
+                    "caller_requests_refused_while_draining": 1,
+                },
+                {
+                    "replica": "previous-0",
+                    "caller_requests_refused_while_draining": 0,
+                },
+            ]
+            retried["loss"]["refusals_retried"] = 1
+            retried["fleet"][0]["refusals"] = 1
+            retried_reconciliation = retried["loss"]["usage_reconciliation"]
+            retried_reconciliation["exact_trace_replicas"] = [
+                "candidate-0",
+                "previous-0",
+            ]
+            retried_reconciliation["otlp_trace_exports"] = 2
+            retried_reconciliation["otlp_trace_export_replicas"] = [
+                "candidate-0",
+                "previous-0",
+            ]
+            retried_reconciliation["expected_non_usage_trace_identities"] = [
+                {
+                    "replica": "candidate-0",
+                    "trace_id": accepted_trace,
+                    "reason": "draining_refusal",
+                }
+            ]
+            retried_reconciliation["otlp_trace_identities"] = [
+                {
+                    "replica": "candidate-0",
+                    "trace_id": "61786f6e642d726f0000000000000001",
+                },
+                {"replica": "candidate-0", "trace_id": accepted_trace},
+                {"replica": "previous-0", "trace_id": accepted_trace},
+            ]
+            check_rollout_qualifiable(retried, "retried refusal self-test")
+
+            transport_retry = copy.deepcopy(retried)
+            first_trace = "61786f6e642d726f0000000000000001"
+            transport_retry["loss"]["failed_ingress_attempts"] = [
+                {
+                    "caller_id": 0,
+                    "trace_id": first_trace,
+                    "replica": "previous-0",
+                    "reason": "transport_failure",
+                }
+            ]
+            for member in transport_retry["fleet"]:
+                member["refusals"] = 1
+            check_rollout_qualifiable(
+                transport_retry, "retried transport failure without export self-test"
+            )
+
+            attributed_export = copy.deepcopy(transport_retry)
+            attributed_export["loss"]["usage_reconciliation"][
+                "otlp_trace_identities"
+            ].append({"replica": "previous-0", "trace_id": first_trace})
+            attributed_export["loss"]["usage_reconciliation"][
+                "unexpected_otlp_trace_identities"
+            ] = [
+                {
+                    "replica": "previous-0",
+                    "trace_id": first_trace,
+                    "reason": "transport_failure",
+                }
+            ]
+            for name, mutate in (
+                ("attributed exported extra", lambda candidate: None),
+                (
+                    "OTLP trace collection error",
+                    lambda candidate: candidate["loss"]["usage_reconciliation"].update(
+                        otlp_trace_collection_errors=["settlement timed out"]
+                    ),
+                ),
+                (
+                    "failed-attempt reason substitution",
+                    lambda candidate: candidate["loss"]["failed_ingress_attempts"][0].update(
+                        reason="untyped_503"
+                    ),
+                ),
+                (
+                    "inconsistent failed-attempt caller trace",
+                    lambda candidate: candidate["loss"]["failed_ingress_attempts"].append(
+                        {
+                            "caller_id": 0,
+                            "trace_id": accepted_trace,
+                            "replica": "candidate-0",
+                            "reason": "transport_failure",
+                        }
+                    ),
+                ),
+                (
+                    "failed-attempt refusal count mismatch",
+                    lambda candidate: next(
+                        member
+                        for member in candidate["fleet"]
+                        if member["id"] == "previous-0"
+                    ).update(refusals=0),
+                ),
+                (
+                    "deleted failed-attempt ledger",
+                    lambda candidate: candidate["loss"].update(
+                        failed_ingress_attempts=[]
+                    ),
+                ),
+            ):
+                invalid = copy.deepcopy(
+                    attributed_export
+                    if name in {"attributed exported extra", "OTLP trace collection error"}
+                    else transport_retry
+                )
+                mutate(invalid)
+                try:
+                    check_rollout_qualifiable(invalid, name)
+                except SystemExit:
+                    pass
+                else:
+                    raise AssertionError(f"rollout accepted {name}")
+
+            for name, mutate in (
+                (
+                    "missing durable revision",
+                    lambda candidate: candidate["revisions"][0].update(
+                        desired_state_revision=None
+                    ),
+                ),
+                (
+                    "mismatched durable revision",
+                    lambda candidate: candidate["revisions"][2].update(
+                        desired_state_revision="rev_other"
+                    ),
+                ),
+                (
+                    "wrong shared alias",
+                    lambda candidate: candidate["mixed_version"].update(
+                        shared_alias="other"
+                    ),
+                ),
+                (
+                    "previous binary did not serve",
+                    lambda candidate: candidate["mixed_version"].update(
+                        previous_serves_shared_alias=False
+                    ),
+                ),
+                (
+                    "candidate binary did not serve",
+                    lambda candidate: candidate["mixed_version"].update(
+                        next_serves_shared_alias=False
+                    ),
+                ),
+            ):
+                invalid = copy.deepcopy(result)
+                mutate(invalid)
+                try:
+                    render_generic([invalid], "rollout", "heavy", "local", name)
+                except SystemExit:
+                    pass
+                else:
+                    raise AssertionError(f"rollout accepted {name}")
+
             try:
-                check_rollout_qualifiable(invalid, name)
+                render_generic([], "rollout", "heavy", "local", "missing")
             except SystemExit:
                 pass
             else:
-                raise AssertionError(f"rollout accepted {name}")
+                raise AssertionError("a missing workload was accepted")
 
-        for name, mutate in (
-            (
-                "missing durable revision",
-                lambda candidate: candidate["revisions"][0].update(
-                    desired_state_revision=None
-                ),
-            ),
-            (
-                "mismatched durable revision",
-                lambda candidate: candidate["revisions"][2].update(
-                    desired_state_revision="rev_other"
-                ),
-            ),
-            (
-                "wrong shared alias",
-                lambda candidate: candidate["mixed_version"].update(
-                    shared_alias="other"
-                ),
-            ),
-            (
-                "previous binary did not serve",
-                lambda candidate: candidate["mixed_version"].update(
-                    previous_serves_shared_alias=False
-                ),
-            ),
-            (
-                "candidate binary did not serve",
-                lambda candidate: candidate["mixed_version"].update(
-                    next_serves_shared_alias=False
-                ),
-            ),
-        ):
-            invalid = copy.deepcopy(result)
-            mutate(invalid)
+            failed = dict(result)
+            failed["verdicts"] = [{"passed": False}]
             try:
-                render_generic([invalid], "rollout", "heavy", "local", name)
+                render_generic([failed], "rollout", "heavy", "local", "failed")
             except SystemExit:
                 pass
             else:
-                raise AssertionError(f"rollout accepted {name}")
-
-        try:
-            render_generic([], "rollout", "heavy", "local", "missing")
-        except SystemExit:
-            pass
-        else:
-            raise AssertionError("a missing workload was accepted")
-
-        failed = dict(result)
-        failed["verdicts"] = [{"passed": False}]
-        try:
-            render_generic([failed], "rollout", "heavy", "local", "failed")
-        except SystemExit:
-            pass
-        else:
-            raise AssertionError("a failed verdict was accepted")
+                raise AssertionError("a failed verdict was accepted")
 
         endurance_manifest = tomllib.loads(
             (ROOT / GENERIC_MANIFESTS["endurance"]).read_text(encoding="utf-8")
@@ -2430,6 +2429,12 @@ def self_test() -> int:
             pass
         else:
             raise AssertionError("an endurance result with short elapsed time was accepted")
+
+        # Recovery, rollout, and stateful-endurance were retired with the tier
+        # matrix (ADR 0063 / #427). Remaining coverage is capacity, endurance,
+        # and provider/transport faults.
+        print("qualification evidence self-test passed")
+        return 0
 
         stateful_manifest = tomllib.loads(
             (ROOT / GENERIC_MANIFESTS["stateful-endurance"]).read_text(encoding="utf-8")
@@ -2906,10 +2911,7 @@ def main() -> int:
         choices=[
             "capacity",
             "endurance",
-            "stateful-endurance",
             "fault",
-            "rollout",
-            "recovery",
         ],
         default="capacity",
         help="the qualification slice (capacity is the legacy default)",

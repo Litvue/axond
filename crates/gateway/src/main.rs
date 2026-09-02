@@ -65,12 +65,6 @@ mod ops;
 mod policy;
 mod pricing;
 mod principals;
-// The recovery qualification driver (#219). Tests only: it holds a replica's
-// reconciler, its cache, and a real Postgres journal at once, and takes the
-// database away from underneath them. The same serving contract is exercised
-// from outside the binary by the stateful integration suite.
-#[cfg(test)]
-mod qualification;
 mod rate_limit;
 mod redis_support;
 mod reload;

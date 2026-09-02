@@ -2,13 +2,14 @@
 """Boot a release binary and prove it serves, on every supported target.
 
 `ops/tier0-gate.sh` is the stronger Linux gate: it boots the musl binary inside
-a kernel-enforced network namespace, so a datastore or egress dependency shows
-up as a boot or serving failure. That gate cannot run on macOS or Windows, and
+a kernel-enforced network namespace against a temp SQLite file, so an external
+datastore or egress dependency shows up as a boot or serving failure. That is
+not a no-datastore promise. That gate cannot run on macOS or Windows, and
 the release matrix ships binaries for both. This runner is the portable subset —
 the same serving assertions, expressed with nothing but the standard library:
 
 * `/healthz` and `/readyz` answer, unauthenticated;
-* `/v1/models` needs a gateway key and lists the configured alias;
+* `/ns/platform/v1/models` needs a gateway key and lists the configured alias;
 * an unknown model is refused with the typed `unknown_model` error;
 * one chat completion completes against a local fixture upstream.
 

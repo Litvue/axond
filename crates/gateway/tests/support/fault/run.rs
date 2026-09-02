@@ -132,6 +132,14 @@ struct Wiring {
 
 pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
     let service = row.service();
+    if service == Some(Service::Redis) {
+        return Outcome::Skipped {
+            row: row.id.clone(),
+            reason: "Redis budget and rate-limit backends are withdrawn (ADR 0063); \
+                     request-path faults run on SQLite"
+                .to_owned(),
+        };
+    }
     let dsn = match service {
         Some(service) => match dsn_for(service) {
             Some(dsn) => Some(dsn),
@@ -139,9 +147,9 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
                 return Outcome::Skipped {
                     row: row.id.clone(),
                     reason: format!(
-                        "{} is not configured, so the {} row cannot run",
-                        service.dsn_env(),
-                        service.as_str()
+                        "Postgres HA store is optional; request-path faults run on SQLite \
+                         ({} unset)",
+                        service.dsn_env()
                     ),
                 };
             }

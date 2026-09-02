@@ -4,7 +4,14 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+The recovery qualification harness existed only to prove the removed tier /
+mode matrix. `qualification/recovery` is gone. This record is retained for
+history. Do not implement from it.
+
+Accepted historically.
 
 Extends the qualification approach of
 [ADR 0033](./0033-capacity-qualification-harness.md) from *what does a stateless
@@ -95,10 +102,9 @@ default suite stays runnable with no datastore.
 - The scenarios are settled while nobody is under delivery pressure to shrink
   them. When a slice lands, the question is "write this driver", not "decide what
   recovery means".
-- A reader is told plainly how much has been observed. The
-  [operations page](../operations/recovery-qualification.md) states which stages
-  run and which are declared, and no scenario is executable, so neither file can
-  be cited as a passing qualification.
+- A reader is told plainly how much has been observed. The operations page that
+  used to list these stages is gone with the harness. Neither this record nor
+  a deleted tree can be cited as a passing qualification.
 - The contract will be wrong in places, and that is the cheaper direction of
   error: a gate written against a surface that does not exist may need
   correcting, and correcting it is a reviewed change to a committed file rather

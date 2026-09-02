@@ -1,9 +1,11 @@
 //! Provider and backend fault qualification (issue #218).
 //!
 //! Every row in `qualification/faults/manifest.toml` is injected against a real
-//! `axond` process and a deterministic fake provider — and, for the state-tier
-//! rows, a TCP fault proxy in front of a real Redis or Postgres — and each row
-//! writes a machine-readable artifact under `target/faults/` carrying the
+//! `axond` process and a deterministic fake provider — and, for optional
+//! Postgres HA rows, a TCP fault proxy in front of a real Postgres. Redis
+//! budget and rate-limit rows skip because those backends are withdrawn
+//! (ADR 0063). Each running row writes a machine-readable artifact under
+//! `target/faults/` carrying the
 //! injected fault and timing, the classification, the bound that ended the
 //! request, the retries it cost, the upstream cleanup, the settled usage
 //! outcome, the telemetry it exported, and the leakage scan of every surface a
@@ -76,7 +78,7 @@ async fn every_committed_fault_row_qualifies_and_publishes_its_evidence() {
     );
     if !skipped.is_empty() {
         eprintln!(
-            "skipped {} state-tier rows without a datastore: {}",
+            "skipped {} backend rows (Redis withdrawn / Postgres HA optional): {}",
             skipped.len(),
             skipped.join(", ")
         );

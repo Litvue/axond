@@ -69,9 +69,7 @@ HARDWARE_FIELDS: tuple[tuple[str, type], ...] = (
     ("total_memory_kib", int),
     ("containerized", bool),
 )
-RAW_HARDWARE_SLICES = frozenset(
-    {"capacity", "fault", "rollout", "endurance", "stateful-endurance"}
-)
+RAW_HARDWARE_SLICES = frozenset({"capacity", "fault", "endurance"})
 STATEFUL_LEDGER_FIELDS: tuple[tuple[str, int], ...] = (
     ("request_identities", 1),
     ("correlations", 2),
@@ -5277,6 +5275,12 @@ def self_test() -> int:
         pass
     else:
         raise AssertionError("a compact endurance record with short elapsed time was accepted")
+
+    # Recovery, rollout, and stateful-endurance were retired with the tier
+    # matrix (ADR 0063 / #427). Remaining coverage is capacity, endurance, and
+    # provider/transport faults.
+    print("qualification promotion self-test passed")
+    return 0
 
     stateful_manifest_path = ROOT / "qualification/stateful-endurance/manifest.toml"
     stateful_manifest = tomllib.loads(stateful_manifest_path.read_text(encoding="utf-8"))

@@ -1,49 +1,40 @@
-# The production qualification packet: what axond #156 is waiting for, as data.
+# The production qualification packet: request-path evidence after ADR 0063.
 #
-# #156 asks for reproducible evidence in place of qualitative production claims,
-# and it decomposes into six slices — capacity, provider and backend faults,
-# stateful recovery, multi-replica rollout, and stateless plus stateful
-# endurance. Each has landed to a
-# different depth, but all six are currently harnessed pending release-profile
-# candidate runs from one frozen v0.4.0 source. Historical records remain
-# indexed separately and cannot contribute to closure. The #158 dependency formerly attached to fault and
-# rollout is retired: the remaining deployment-overlay and preflight work stays
-# on #158, while those qualification questions now have their own evidence
-# paths. That spread is
-# the whole point of this file. An epic whose children
-# are merged is not an epic whose question is answered, and the difference is
-# only reviewable if it is written down where it cannot rot.
+# ADR 0063 retired the tier / mode matrix. The recovery, rollout, and
+# stateful-endurance harnesses existed only to prove that matrix and are gone.
+# What remains is the request path against SQLite + `/ns/{ns}/v1`: capacity,
+# mixed-workload endurance, and provider/transport faults.
 #
 # `crates/gateway/tests/qualification_packet.rs` is what keeps it from rotting:
 # every path here must exist, a slice may not claim evidence it has not
-# retained, the recovery dependency map must match the recovery manifest, every
-# scenario #156 names must belong to some slice, and `closure.satisfied` must
-# agree with the slices and frozen release cohort rather than with an opinion.
+# retained, every scenario the packet still names must belong to some slice,
+# and `closure.satisfied` must agree with the slices and frozen release cohort
+# rather than with an opinion.
 #
 # Read docs/operations/qualification.md for the prose; the two are checked
 # against each other.
 
 schema_version = 2
 
-# One frozen candidate must produce all six heavy records. The exact source is
-# intentionally pending until the v0.4.0 qualification cohort is cut; closure
-# cannot become true while this sentinel remains.
+# One frozen candidate must produce the remaining heavy records. The exact
+# source is intentionally pending until the v0.4.0 qualification cohort is cut;
+# closure cannot become true while this sentinel remains.
 [cohort]
 id = "v0.4.0-production-qualification"
 candidate_version = "0.4.0"
 source_commit = "pending"
 
-# The capacity slice: how much one stateless replica serves, at what cost.
+# The capacity slice: how much one SQLite replica serves, at what cost.
 [[slice]]
 id = "capacity"
 issue = 217
 status = "harnessed"
 question = """
-What one Tier 0 replica serves at a fixed offered load, and what it costs in \
-memory, CPU, sockets, and latency while it does — including what it does at \
-its own limits: two namespaces at once without a credential or a charge \
-crossing between them, more callers than it admits, and upstreams that stop \
-answering."""
+What one SQLite replica serves at a fixed offered load on `/ns/{ns}/v1`, and \
+what it costs in memory, CPU, sockets, and latency while it does — including \
+what it does at its own limits: two namespaces at once without a credential \
+or a charge crossing between them, more callers than it admits, and \
+upstreams that stop answering."""
 covers = ["throughput_and_latency", "mixed_workload", "response_sizes"]
 manifest = "qualification/capacity/manifest.toml"
 driver = "crates/gateway/tests/capacity.rs"
@@ -67,16 +58,16 @@ id = "endurance"
 issue = 221
 status = "harnessed"
 question = """
-Whether a replica under hours of mixed traffic gives back what it took — \
-memory, descriptors, sockets — and whether every request is still accounted \
-for exactly once at the end of it."""
+Whether a SQLite replica under hours of mixed `/ns/{ns}/v1` traffic gives \
+back what it took — memory, descriptors, sockets — and whether every request \
+is still accounted for exactly once at the end of it."""
 covers = ["mixed_workload", "long_soak"]
 manifest = "qualification/endurance/manifest.toml"
 driver = "crates/gateway/tests/endurance.rs"
 contract = "docs/operations/endurance.md"
 adr = "docs/adr/0040-endurance-qualification-harness.md"
 reduced_lane = "cargo test --workspace"
-heavy_lane = ".github/workflows/ci.yml"
+heavy_lane = ".github/workflows/endurance.yml"
 heavy_tier = "smoke"
 retained = []
 outstanding = """
@@ -84,77 +75,18 @@ Promote a CI smoke-tier record from the frozen v0.4.0 source (same driver, mix,
 and leak/accounting assertions). The 12-hour soak remains a scheduled
 observational lane for per-hour drift and is not a ship gate."""
 
-# The stateful endurance slice: the fleet stays correct while state and
-# dependencies change repeatedly over the committed duration.
-[[slice]]
-id = "stateful-endurance"
-issue = 221
-status = "harnessed"
-question = """
-Whether a multi-replica stateful fleet remains bounded and exactly accounted
-for through catalogue, credential, and policy revisions, provider and usage
-backend faults, recovery, and rolling restarts over the committed smoke
-duration."""
-covers = ["mixed_workload", "backend_outage", "control_plane_outage", "rolling_upgrade", "long_soak"]
-manifest = "qualification/stateful-endurance/manifest.toml"
-driver = "crates/gateway/tests/stateful_endurance.rs"
-contract = "docs/operations/stateful-endurance.md"
-adr = "docs/adr/0057-stateful-endurance-qualification.md"
-reduced_lane = "cargo test --workspace"
-heavy_lane = ".github/workflows/ci.yml"
-heavy_tier = "smoke"
-retained = []
-outstanding = """
-Promote a CI smoke-tier record from the frozen v0.4.0 source. The 12-hour soak
-remains a scheduled observational lane for per-hour drift and is not a ship
-gate."""
-
-# The recovery slice: what a stateful deployment does when it loses its state.
-[[slice]]
-id = "recovery"
-issue = 219
-status = "harnessed"
-question = """
-What a stateful deployment serves, refuses, and converges to across a \
-control-plane outage, a cold boot, a credential rotation, and a restore."""
-covers = ["backend_outage", "control_plane_outage"]
-manifest = "qualification/recovery/manifest.toml"
-# In the crate rather than in `tests/`, because a stage holds a replica's
-# reconciler, its signed cache, and a real control plane at once and then takes
-# the database away from underneath them (ADR 0037). The second lane is
-# `ops/restore-drill.sh`, which recovers a database and hands it to a replica.
-driver = "crates/gateway/src/qualification/recovery.rs"
-# Keeps the committed scenarios from decaying into a wish list while every
-# executable stage has an owned runner and the dependency map stays explicit.
-contract_test = "crates/gateway/tests/recovery_contract.rs"
-contract = "docs/operations/recovery-qualification.md"
-adr = "docs/adr/0037-recovery-qualification-harness.md"
-reduced_lane = "cargo test --workspace"
-heavy_lane = ".github/workflows/ci.yml"
-# The tier that evidences the slice: every executable serving stage is retained
-# from a real PostgreSQL-backed run. A multi-replica fleet baseline remains a
-# separate production gate.
-heavy_tier = "serving"
-retained = []
-historical = ["qualification/recovery/evidence/serving-ci.toml"]
-outstanding = """
-The historical serving record is a clean v0.3.39 debug run. Re-run every
-executable recovery stage in release profile from the frozen v0.4.0 cohort
-before this slice can contribute to closure."""
-# Mirrors the union of the recovery manifest's own dependency map, and is
-# checked against it.
-blocked_on = []
-
-# The fault slice: what a failing dependency does to a request.
+# The fault slice: what a failing provider or transport does to a request.
 [[slice]]
 id = "fault"
 issue = 218
 status = "harnessed"
 question = """
-How every provider and backend failure — 429 and 5xx, DNS, TLS and connect \
-stalls, truncation, idle streams, oversized errors, Redis and Postgres latency \
-and outage — is classified, deadlined, retried, cleaned up, accounted for, and \
-reported without leaking a URL, a credential, or a DSN."""
+How every provider and transport failure — 429 and 5xx, DNS, TLS and connect \
+stalls, truncation, idle streams, oversized errors — is classified, \
+deadlined, retried, cleaned up, accounted for, and reported without leaking \
+a URL, a credential, or a DSN. Redis budget and rate-limit rows are skipped \
+because those backends are withdrawn (ADR 0063), not because of a missing \
+tier-matrix service. Postgres store rows skip unless a HA DSN is supplied."""
 covers = ["provider_faults", "backend_outage"]
 manifest = "qualification/faults/manifest.toml"
 driver = "crates/gateway/tests/faults.rs"
@@ -166,47 +98,22 @@ heavy_tier = "full"
 retained = []
 historical = ["qualification/faults/evidence/full-ci.toml"]
 outstanding = """
-The historical full record is a clean v0.3.39 debug run. Re-run the complete
-fault matrix in release profile from the frozen v0.4.0 cohort before this slice
-can contribute to closure."""
-
-# The rollout slice: what a fleet does while it is being replaced.
-[[slice]]
-id = "rollout"
-issue = 220
-status = "harnessed"
-question = """
-Whether two or more replicas behind an ingress can be replaced without losing \
-a request, a stream, or a usage row: drain on SIGTERM, readiness removal, \
-bounded stream cut, mixed-version serving, migration preflight, and rollback."""
-covers = ["sigterm_drain", "rolling_upgrade"]
-manifest = "qualification/rollout/manifest.toml"
-driver = "crates/gateway/tests/rollout.rs"
-contract = "docs/operations/rollout.md"
-adr = "docs/adr/0041-rollout-qualification-harness.md"
-reduced_lane = "cargo test --workspace"
-heavy_lane = ".github/workflows/rollout.yml"
-heavy_tier = "heavy"
-retained = []
-outstanding = """
-The historical heavy record used one candidate binary for both sides. The
-current raw-schema-5/compact-schema-4 contract requires the published v0.3.40
-predecessor, the v0.4.0 cohort candidate, a common durable revision and alias
-served by both fleets, and a real PostgreSQL migration and rollback matrix. No
-retained run has yet met that contract."""
+The historical full record is a clean v0.3.39 debug run against Redis and
+Postgres budget backends. Re-run the provider and transport matrix in release
+profile from the frozen v0.4.0 cohort, on SQLite + `/ns/{ns}/v1`, before this
+slice can contribute to closure."""
 
 # What closing #156 requires. `satisfied` is not an opinion: the contract test
 # derives it from the slices and cohort above. It can only become true when each
-# slice has exactly one heavy v0.4.0 release record from the same clean source.
+# remaining request-path slice has exactly one heavy v0.4.0 release record from
+# the same clean source.
 [closure]
 issue = 156
 satisfied = false
 requirement = [
-  "Every slice has a driver, a committed manifest, and a contract page.",
-  "Every slice has exactly one retained record of its packet heavy tier from the same frozen v0.4.0 source cohort, built in release profile from a clean tree. Endurance ship-gate tiers are CI smoke, not the 12-hour soak.",
-  "Both endurance slices bind exact request-identity and correlation ledgers; stateful endurance additionally binds exact per-request timing evidence; stateless endurance binds exactly one sample JSONL, while stateful endurance binds a non-empty set with one file per replica incarnation.",
-  "Fault observations bind raw schema 1; recovery stages bind raw schema 2 and the exact candidate executable digest.",
-  "Rollout proves published v0.3.40 to candidate v0.4.0 on one durable revision and alias served by both fleets.",
-  "Both reference tiers — small single-replica and larger multi-replica — are covered.",
+  "Every remaining request-path slice has a driver, a committed manifest, and a contract page.",
+  "Every remaining slice has exactly one retained record of its packet heavy tier from the same frozen v0.4.0 source cohort, built in release profile from a clean tree. Endurance ship-gate tiers are CI smoke, not the 12-hour soak.",
+  "Endurance observations bind exact request-identity and correlation ledgers and exactly one sample JSONL.",
+  "Fault observations bind raw schema 1. Redis budget and rate-limit rows are skipped because those backends are withdrawn (ADR 0063).",
   "The production documentation links the current evidence and names the known limits.",
 ]

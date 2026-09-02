@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that the stateless fault lane left complete, fresh evidence.
+"""Check that the request-path fault lane left complete, fresh evidence.
 
 The provider and transport rows in ``qualification/faults/manifest.toml`` are
 the first bounded qualification slice that needs a post-run evidence gate. The
@@ -7,8 +7,8 @@ Rust test writes one JSON artifact per row, but an upload directory on its own
 cannot distinguish a row that ran from one that was skipped, left by an older
 run, or failed after writing its artifact.
 
-This checker deliberately covers only provider and transport rows. Redis and
-Postgres rows belong to the stateful lane and are outside this stateless slice.
+This checker deliberately covers only provider and transport rows. Redis budget
+and rate-limit rows are withdrawn (ADR 0063). Postgres HA rows are optional.
 It is intended to run after the dedicated fault test:
 
     python3 ops/check-fault-evidence.py --since-unix-ms "$lane_started_ms"
@@ -101,7 +101,7 @@ def check_artifact(
     )
     if not artifact_path.exists():
         return [
-            f"{key}: {display_path} is missing; the stateless fault row did not "
+            f"{key}: {display_path} is missing; the request-path fault row did not "
             "run or did not retain its evidence"
         ]
 
@@ -297,13 +297,13 @@ def self_test() -> int:
 
     if complaints:
         print(
-            "the stateless fault evidence checker does not catch what it claims:",
+            "the request-path fault evidence checker does not catch what it claims:",
             file=sys.stderr,
         )
         for complaint in complaints:
             print(f"  {complaint}", file=sys.stderr)
         return 1
-    print(f"the stateless fault evidence checker catches {len(cases) + 1} invalid cases")
+    print(f"the request-path fault evidence checker catches {len(cases) + 1} invalid cases")
     return 0
 
 
@@ -334,11 +334,11 @@ def main() -> int:
     rows = [row for row in manifest["row"] if row.get("family") in STATELESS_FAMILIES]
     problems = check(args.dir, rows, manifest_digest, args.since_unix_ms, args.require_clean)
     if problems:
-        print("stateless fault evidence is incomplete:", file=sys.stderr)
+        print("request-path fault evidence is incomplete:", file=sys.stderr)
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         return 1
-    print(f"stateless fault evidence is complete: {len(rows)} rows")
+    print(f"request-path fault evidence is complete: {len(rows)} rows")
     return 0
 
 

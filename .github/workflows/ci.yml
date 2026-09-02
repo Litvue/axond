@@ -5,15 +5,15 @@ on:
   push:
     branches: [main]
   merge_group:
-  # Historical PostgreSQL fault and recovery records must name an exact head,
-  # not GitHub's ephemeral pull-request merge ref. They are available only when
-  # a manual dispatch also enables the explicit legacy qualification input.
+  # Kubernetes stateful overlay drills remain behind an explicit opt-in. They
+  # are not request-path qualification and do not require Redis.
   workflow_dispatch:
     inputs:
       run_legacy_postgres_qualification:
         description: >-
-          Run the historical PostgreSQL stateful-v1 qualification lanes. These
-          lanes do not qualify ADR 0062's blob-backed stateful-v2 target.
+          Run the historical PostgreSQL Kubernetes stateful overlay drills.
+          Request-path qualification is SQLite + /ns/{ns}/v1 and does not use
+          this input.
         required: true
         default: false
         type: boolean
@@ -154,22 +154,11 @@ jobs:
             target/endurance/smoke/**/*.bin
           if-no-files-found: warn
           retention-days: 90
-      # Likewise for the reduced rollout scenarios (ADR 0041). This lane has no
-      # database, so their rollback fence records itself as skipped; a manually
-      # opted-in legacy `stateful-tests` lane can still evaluate stateful-v1.
-      - name: Publish the reduced rollout results
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: rollout-results-reduced
-          path: target/rollout/**/*.json
-          if-no-files-found: warn
-          retention-days: 90
       # The fault matrix qualifies timing, so it does not run beside the rest of
-      # the suite: this step has the machine to itself, one row at a time. The
-      # state-tier rows skip without a datastore and remain available only in
-      # the manually opted-in legacy PostgreSQL lane.
-      - name: Note the stateless fault lane start
+      # the suite: this step has the machine to itself, one row at a time.
+      # Provider and transport rows run on the SQLite boot. Redis budget and
+      # rate-limit rows skip because those backends are withdrawn (ADR 0063).
+      - name: Note the request-path fault lane start
         run: echo "fault_lane_started_ms=$(($(date +%s%N) / 1000000))" >>"$GITHUB_ENV"
       - name: Qualify the provider and transport fault rows
         run: cargo test -p axond --all-features --locked --release --test faults -- --test-threads=1
@@ -178,13 +167,13 @@ jobs:
       # A passing test can still leave no artifact if its row set or writer is
       # accidentally bypassed. Require every provider/transport row to have
       # fresh, passing evidence before publishing the directory.
-      - name: Check the stateless fault evidence
+      - name: Check the request-path fault evidence
         run: python3 ops/check-fault-evidence.py --since-unix-ms "$fault_lane_started_ms"
-      - name: Publish the stateless fault-matrix results
+      - name: Publish the request-path fault-matrix results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fault-results-stateless
+          name: fault-results-request-path
           path: target/faults/**/*.json
           if-no-files-found: error
           retention-days: 90
@@ -246,261 +235,6 @@ jobs:
       - name: Replay the committed fuzz corpora
         working-directory: fuzz
         run: cargo run --no-default-features --locked --bin fuzz-smoke
-
-  # ADR 0062 replaced this PostgreSQL stateful-v1 qualification cohort. Keep the
-  # historical lanes available for deliberate compatibility investigations, but
-  # never spend pull-request, push, or merge-queue runners on them. The workflow
-  # policy gate requires this exact opt-in on every legacy job below.
-  #
-  # Build the release executable once for the two recovery source lanes. ThinLTO
-  # does not promise byte-for-byte reproducibility across independent Cargo
-  # invocations, so two builds from one commit are not one executable identity.
-  # The source lanes download this immutable artifact and retain their own copy;
-  # the aggregate then proves both copies and every raw stage name the same bytes.
-  recovery-binary:
-    name: Legacy PostgreSQL recovery qualification binary
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - name: Build and freeze the recovery provenance binary
-        run: |
-          set -euo pipefail
-          cargo build -p axond --locked --release
-          install -D -m 0755 target/release/axond target/recovery-binary/axond
-          (cd target/recovery-binary && sha256sum axond >axond.sha256)
-          (cd target/recovery-binary && sha256sum --check --strict axond.sha256)
-      - name: Publish the immutable recovery binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: recovery-binary-input
-          path: target/recovery-binary/
-          if-no-files-found: error
-          retention-days: 1
-
-  stateful-tests:
-    name: Legacy PostgreSQL stateful tests
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
-    needs: recovery-binary
-    runs-on: ubuntu-latest
-    # Nothing in this lane may cut the endurance smoke tier off mid-run: its
-    # ninety seconds are the workload's own duration, after which the driver
-    # settles, reconciles and writes its artifact — a run killed part-way
-    # publishes no evidence and proves nothing. The bound here is a hang bound,
-    # far above the whole lane's work, so a wedged replica or backend ends the
-    # job instead of holding a runner for the default six hours.
-    timeout-minutes: 60
-    services:
-      redis:
-        image: redis:7.4.2-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      postgres:
-        image: postgres:17.6-alpine
-        env:
-          POSTGRES_PASSWORD: axond-ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - name: Download the immutable recovery binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: recovery-binary-input
-          path: target/release/qualification
-      # Artifact downloads deliberately erase executable mode. Restore it only
-      # after the producer's checksum has authenticated the downloaded bytes.
-      - name: Verify and bind the recovery provenance binary
-        run: |
-          set -euo pipefail
-          (cd target/release/qualification && sha256sum --check --strict axond.sha256)
-          chmod 0755 target/release/qualification/axond
-          digest="$(sha256sum target/release/qualification/axond | awk '{print $1}')"
-          test "${#digest}" -eq 64
-          echo "AXOND_RECOVERY_EXECUTABLE_SHA256=$digest" >>"$GITHUB_ENV"
-      - name: Note when this lane started
-        run: echo "lane_started_ms=$(($(date +%s%N) / 1000000))" >>"$GITHUB_ENV"
-      - run: cargo test -p axond --all-features --locked --release
-        env:
-          AXOND_BIN: ${{ github.workspace }}/target/release/qualification/axond
-          AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
-          AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
-          AXOND_TEST_REQUIRE_SERVICES: "1"
-      # The recovery stages that run today are part of the suite above, and
-      # their point is the evidence they retain (ADR 0037). A passing suite that
-      # left no artifact is the failure an evidence directory cannot describe on
-      # its own, so it is checked against the manifest rather than inferred from
-      # the upload: every stage the manifest gives this lane owes a file here.
-      - name: Check the stateful lane retained its evidence
-        env:
-          AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
-          AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: |
-          python3 ops/check-recovery-evidence.py --runner stateful-tests \
-            --since-unix-ms "$lane_started_ms" \
-            --executable target/release/qualification/axond \
-            --forbid-env AXOND_TEST_POSTGRES_DSN \
-            --forbid-env AXOND_TEST_REDIS_URL
-      # `warn` on the upload: an earlier target failing stops the suite before
-      # the recovery stages run, and that lane's finding is the failing test.
-      - name: Publish the recovery evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: recovery-evidence
-          path: target/recovery/*.json
-          if-no-files-found: warn
-          retention-days: 90
-      - name: Publish the stateful-test binary provenance
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: recovery-binary-stateful
-          path: target/release/qualification/axond
-          if-no-files-found: warn
-          retention-days: 90
-      # This lane has the control plane the forward-only rollback fence needs, so
-      # its rollout artifacts are the ones that record the fence as evaluated.
-      - name: Publish the stateful rollout results
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: rollout-results-stateful
-          path: target/rollout/**/*.json
-          if-no-files-found: warn
-          retention-days: 90
-      # The full fault matrix, state tiers included: `AXOND_TEST_REQUIRE_SERVICES`
-      # makes a skipped backend row a failure here rather than a quiet gap, and
-      # the step runs the binary alone so an injected latency is the only load
-      # the row is measuring.
-      - name: Qualify the full fault matrix against Redis and Postgres
-        run: cargo test -p axond --all-features --locked --release --test faults -- --test-threads=1
-        env:
-          AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
-          AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
-          AXOND_TEST_REQUIRE_SERVICES: "1"
-          AXOND_FAULT_MATRIX: "1"
-      - name: Publish the fault-matrix results
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: fault-results
-          path: target/faults/**/*.json
-          if-no-files-found: warn
-          retention-days: 90
-      # The raw matrix is the diagnosis; this compact record is the packet's
-      # promotable index. It is emitted only after the full service-backed lane
-      # passes, and keeps the manifest/binary/machine provenance beside every
-      # fault row rather than asking a later editor to reconstruct it.
-      - name: Build the full fault qualification record
-        if: success()
-        run: |
-          python3 ops/qualification-evidence.py target/faults \
-            --slice fault --tier full --runner github-actions \
-            --note "GitHub Actions ubuntu-latest, full pinned Redis/Postgres matrix" \
-            --out target/qualification-records/fault-full.toml
-      - name: Verify the full fault record and raw artifacts
-        if: success()
-        run: |
-          python3 ops/promote-qualification.py \
-            target/qualification-records/fault-full.toml \
-            --artifacts target/faults \
-            --out target/qualification-records/validated-fault-full.toml
-      - name: Publish the full fault qualification record
-        if: success()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: qualification-record-fault
-          path: target/qualification-records/validated-fault-full.toml
-          if-no-files-found: error
-          retention-days: 90
-
-  # Keep the 90-second endurance qualification out of the shared stateful test
-  # invocation. It is opt-in in the test binary and gets its own runner, so the
-  # ordinary stateful checks cannot unexpectedly spend their budget on a load
-  # test with process replacement and database fault injection.
-  stateful-endurance-smoke:
-    name: Legacy PostgreSQL stateful endurance smoke
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
-    runs-on: ubuntu-latest
-    # A hang bound, not a budget, and it has to sit above the committed smoke
-    # contract rather than near it: the cache is keyed with `cache-targets:
-    # false`, so the whole gateway is compiled with every feature from cold
-    # before the run starts, and the run itself is the manifest's 90 s workload
-    # plus the tail the rolling restart may add plus two 120 s settles (the
-    # driver's and the durable table's) plus the worst case of what the script
-    # waits on inside it — each replica retiring on its bound with its
-    # replacement taking the whole unready allowance, and three revisions
-    # converging only at `max_convergence_ms`. Ten minutes left almost nothing
-    # for the build, so a slow runner failed a required gate for a reason that
-    # had nothing to do with the change under test. Thirty leaves the build room
-    # and still ends a wedged replica or backend well before the default six
-    # hours. `the_endurance_smoke_lane_is_bounded_above_its_committed_contract`
-    # computes that worst case from the manifest and fails if it ever grows into
-    # this bound.
-    timeout-minutes: 30
-    services:
-      postgres:
-        image: postgres:17.6-alpine
-        env:
-          POSTGRES_PASSWORD: axond-ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - name: Run the opt-in stateful endurance smoke
-        run: |
-          cargo test -p axond --all-features --locked --test stateful_endurance -- \
-            the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence \
-            --exact --nocapture --test-threads=1
-        env:
-          AXOND_STATEFUL_ENDURANCE_SMOKE: "1"
-          AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
-          AXOND_TEST_REQUIRE_SERVICES: "1"
-      - name: Publish the stateful endurance smoke results
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: stateful-endurance-results-smoke
-          path: |
-            target/stateful-endurance/smoke/*.json
-            target/stateful-endurance/smoke/*.samples.jsonl
-            target/stateful-endurance/smoke/**/*.bin
-          if-no-files-found: warn
-          retention-days: 90
 
   sdk-compat:
     name: Provider-SDK compatibility
@@ -590,13 +324,12 @@ jobs:
           python3 ops/check-docs.py
           python3 ops/check-release-config.py --self-test
           python3 ops/check-release-config.py
-          python3 ops/check-recovery-evidence.py --self-test
           python3 ops/qualification-evidence.py --self-test
           python3 ops/promote-qualification.py --self-test
           shellcheck install.sh ops/publish-image-index.sh \
             ops/verify-image-evidence.sh ops/check-compose-platform.sh \
             ops/check-installer-download.sh ops/check-index-promotion.sh \
-            ops/pin-image-digest.sh ops/restore-drill.sh ops/rollout-drill.sh \
+            ops/pin-image-digest.sh ops/rollout-drill.sh \
             ops/stateful-deploy-drill.sh
           # A failed download must name the kind of failure: the older-release
           # explanation belongs to a 404, and a transport failure must read as
@@ -775,7 +508,7 @@ jobs:
           # Either is fully static — a dynamic build would say "dynamically linked".
           file "$bin" | grep -Eq 'static-pie linked|statically linked'
           ! file "$bin" | grep -q 'dynamically linked'
-      - name: Tier-0 hermetic boot and serve
+      - name: SQLite boot and serve
         run: ops/tier0-gate.sh target/x86_64-unknown-linux-musl/release/axond
 
   # Every target in the release `binaries` matrix, booted and served through the
@@ -859,136 +592,6 @@ jobs:
         run: |
           shellcheck ops/check-cosign-format.sh
           bash ops/check-cosign-format.sh
-
-  # The recovery objectives in docs/operations/backup-and-recovery.md, executed:
-  # a backup procedure nobody has restored from is a hypothesis, and a
-  # point-in-time restore that quietly replays to the end of the WAL passes every
-  # "the rows are there" check while being useless for the incident it exists for.
-  # The drill asserts the asymmetry — committed-before-target present, the write
-  # after the target absent — with `axond migrate status` as the acceptance test.
-  restore-drill:
-    name: Legacy PostgreSQL restore and PITR drill
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
-    needs: recovery-binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Download the immutable recovery binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: recovery-binary-input
-          path: target/release/qualification
-      - name: Verify and bind the recovery provenance binary
-        run: |
-          set -euo pipefail
-          (cd target/release/qualification && sha256sum --check --strict axond.sha256)
-          chmod 0755 target/release/qualification/axond
-          digest="$(sha256sum target/release/qualification/axond | awk '{print $1}')"
-          test "${#digest}" -eq 64
-          echo "AXOND_RECOVERY_EXECUTABLE_SHA256=$digest" >>"$GITHUB_ENV"
-      # The lane's Python runs on the floor the contributor flow supports, not on
-      # whatever the runner ships, so the recovery scripts are exercised there
-      # rather than only on a Python that happens to have `tomllib`.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.10'
-      - name: Provision the ops venv the contributor recipes use
-        run: |
-          python3 -m venv target/ops-venv
-          target/ops-venv/bin/pip install --quiet --require-virtualenv \
-            --require-hashes -r ops/deploy-requirements.txt
-      # The drill checks itself at the end — it runs the same evidence checker
-      # for its own lane — so a drill that skipped a stage fails here rather than
-      # uploading a partial directory.
-      - name: Restore a logical dump and recover to a chosen point in time
-        env:
-          AXOND_PYTHON: ${{ github.workspace }}/target/ops-venv/bin/python
-          AXOND_BIN: ${{ github.workspace }}/target/release/qualification/axond
-        run: |
-          target/ops-venv/bin/python --version
-          target/ops-venv/bin/python ops/check-recovery-evidence.py --self-test
-          bash ops/restore-drill.sh
-      - name: Publish the restore evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: restore-drill-evidence
-          path: target/recovery/*.json
-          if-no-files-found: warn
-          retention-days: 90
-      - name: Publish the restore-drill binary provenance
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: recovery-binary-restore
-          path: target/release/qualification/axond
-          if-no-files-found: warn
-          retention-days: 90
-
-  # The #219 packet record is assembled only after both real-service lanes have
-  # completed: stateful-tests owns the live outage/cache/rotation stages, while
-  # restore-drill owns logical restore, PITR, and the durable usage boundary.
-  # Neither partial upload is evidence of the recovery slice by itself.
-  recovery-record:
-    name: Build the legacy PostgreSQL recovery qualification record
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
-    needs:
-      - stateful-tests
-      - restore-drill
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require both recovery source lanes
-        run: |
-          test "${{ needs.stateful-tests.result }}" = success
-          test "${{ needs.restore-drill.result }}" = success
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Download stateful-test recovery stages
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: recovery-evidence
-          path: target/recovery
-      - name: Download restore-drill recovery stages
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: restore-drill-evidence
-          path: target/recovery
-      - name: Download the stateful-test binary provenance
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: recovery-binary-stateful
-          path: target/recovery-binaries/stateful
-      - name: Download the restore-drill binary provenance
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: recovery-binary-restore
-          path: target/recovery-binaries/restore
-      - name: Require one binary identity across both recovery lanes
-        run: |
-          test -f target/recovery-binaries/stateful/axond
-          test -f target/recovery-binaries/restore/axond
-          test "$(sha256sum target/recovery-binaries/stateful/axond | awk '{print $1}')" = \
-            "$(sha256sum target/recovery-binaries/restore/axond | awk '{print $1}')"
-      - name: Build the complete recovery qualification record
-        run: |
-          python3 ops/qualification-evidence.py target/recovery \
-            --slice recovery --tier serving --runner github-actions \
-            --binary target/recovery-binaries/stateful/axond \
-            --note "GitHub Actions ubuntu-latest, stateful-tests plus restore-drill" \
-            --out target/qualification-records/recovery-serving.toml
-      - name: Verify the recovery record and raw artifacts
-        run: |
-          python3 ops/promote-qualification.py \
-            target/qualification-records/recovery-serving.toml \
-            --artifacts target/recovery \
-            --out target/qualification-records/validated-recovery-serving.toml
-      - name: Publish the complete recovery qualification record
-        if: success()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: qualification-record-recovery
-          path: target/qualification-records/validated-recovery-serving.toml
-          if-no-files-found: error
-          retention-days: 90
 
   # Whether a rolling update completes is a scheduling outcome, not a manifest
   # property: kube-scheduler counting skew across ReplicaSets decides it, and no
@@ -1127,9 +730,6 @@ jobs:
       - build
       - tests
       - fuzz-smoke
-      - recovery-binary
-      - stateful-tests
-      - stateful-endurance-smoke
       - sdk-compat
       - sdk-compat-ts
       - docs
@@ -1140,15 +740,13 @@ jobs:
       - binary-smoke
       - docker-smoke
       - cosign-format
-      - restore-drill
       - rollout-drill
       - stateful-deploy-drill
       - stateful-persistent-drill
-      - recovery-record
       - quickstart-smoke
     runs-on: ubuntu-latest
     steps:
-      - name: Require active lanes and account for paused legacy lanes
+      - name: Require active lanes and account for paused overlay drills
         run: |
           test "${{ needs.fmt.result }}" = success
           test "${{ needs.clippy.result }}" = success
@@ -1171,19 +769,9 @@ jobs:
           test "${{ needs.quickstart-smoke.result }}" = success
           if [[ "${{ github.event_name }}" == workflow_dispatch && \
             "${{ inputs.run_legacy_postgres_qualification }}" == true ]]; then
-            test "${{ needs.recovery-binary.result }}" = success
-            test "${{ needs.stateful-tests.result }}" = success
-            test "${{ needs.stateful-endurance-smoke.result }}" = success
-            test "${{ needs.restore-drill.result }}" = success
             test "${{ needs.stateful-deploy-drill.result }}" = success
             test "${{ needs.stateful-persistent-drill.result }}" = success
-            test "${{ needs.recovery-record.result }}" = success
           else
-            test "${{ needs.recovery-binary.result }}" = skipped
-            test "${{ needs.stateful-tests.result }}" = skipped
-            test "${{ needs.stateful-endurance-smoke.result }}" = skipped
-            test "${{ needs.restore-drill.result }}" = skipped
             test "${{ needs.stateful-deploy-drill.result }}" = skipped
             test "${{ needs.stateful-persistent-drill.result }}" = skipped
-            test "${{ needs.recovery-record.result }}" = skipped
           fi
