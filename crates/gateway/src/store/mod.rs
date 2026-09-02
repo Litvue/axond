@@ -195,6 +195,22 @@ pub trait Store: Send + Sync {
     /// `request_id` is ignored (at-least-once).
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError>;
 
+    /// When true, [`append_usage`] runs blocking I/O inside `spawn_blocking`
+    /// and dropping its future cannot cancel the work. The usage-index worker
+    /// then calls [`append_usage_sync`] on one OS thread instead.
+    fn blocking_usage_index(&self) -> bool {
+        false
+    }
+
+    /// Insert one usage-index row on the caller's thread. SQLite only; must
+    /// not schedule `spawn_blocking`.
+    fn append_usage_sync(&self, event: UsageAppend) -> Result<(), StoreError> {
+        let _ = event;
+        Err(StoreError::Unavailable(
+            "this store has no synchronous usage-index path".into(),
+        ))
+    }
+
     /// Per-model per-status counts and cost totals for `namespace`+`period`.
     async fn summarize_usage(
         &self,
