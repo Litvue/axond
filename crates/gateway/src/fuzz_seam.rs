@@ -34,8 +34,8 @@ mod budget;
 mod config;
 mod convergence;
 mod credentials;
-mod discovery;
 mod desired_state;
+mod discovery;
 mod error;
 mod key_material;
 #[allow(dead_code)]

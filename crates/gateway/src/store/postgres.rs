@@ -970,6 +970,27 @@ impl Store for PostgresStore {
         })
         .await
     }
+
+    async fn mark_provider_models_stale_unless_source(
+        &self,
+        provider: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let provider = provider.to_owned();
+        let source = source.to_owned();
+        self.with_client(async move |client| {
+            client
+                .execute(
+                    "UPDATE axond_store_provider_models SET stale = TRUE
+                     WHERE provider = $1 AND source IS DISTINCT FROM $2",
+                    &[&provider, &source],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 fn postgres_provider_models(
