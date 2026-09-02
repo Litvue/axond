@@ -72,6 +72,7 @@ use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::status::{StatusResponse, StatusScope};
+use crate::store::NamespaceRecord;
 use crate::streaming::{self, Framing, StreamContext, StreamDelivery};
 use crate::telemetry;
 use crate::usage::identity::EventIdentity;
@@ -1038,22 +1039,12 @@ async fn authenticate_middleware(
             .namespace_grant()
             .map_err(|_| GatewayError::NamespaceNotAuthorized)?;
         let authorized = grant.permits(&namespace);
-        let row = match state.store() {
-            Some(store) => match store.get_namespace(namespace.as_str()).await {
-                Ok(row) => row,
-                Err(_) => return Err(GatewayError::StoreUnavailable),
-            },
-            None => {
-                if snapshot.config.namespace(namespace.as_str()).is_some() {
-                    Some(crate::store::NamespaceRecord {
-                        id: namespace.to_string(),
-                        attrs: serde_json::json!({}),
-                        blocklist: None,
-                    })
-                } else {
-                    None
-                }
-            }
+        let record = match state.store() {
+            Some(store) => store
+                .get_namespace(namespace.as_str())
+                .await
+                .map_err(GatewayError::from)?,
+            None => None,
         };
         if !authorized {
             debug!(
@@ -1064,7 +1055,7 @@ async fn authenticate_middleware(
             );
             return Err(GatewayError::NamespaceNotAuthorized);
         }
-        let Some(row) = row else {
+        let Some(record) = record else {
             return Err(GatewayError::UnknownNamespace);
         };
 
@@ -1074,8 +1065,9 @@ async fn authenticate_middleware(
         // copied at admission so usage records carry the workspace metadata
         // Litvue stored (ADR 0063).
         caller.namespace = namespace.to_string();
-        caller.attrs = Some(row.attrs);
+        caller.attrs = Some(record.attrs.clone());
         request.extensions_mut().insert(namespace);
+        request.extensions_mut().insert(record);
     }
     // Route capability is evaluated only after the canonical path has selected
     // the effective namespace. That ordering prevents an outside-grant path
@@ -1479,6 +1471,7 @@ async fn chat_completions(
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
+    record: Option<Extension<NamespaceRecord>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1488,6 +1481,7 @@ async fn chat_completions(
         Route::ChatCompletions,
         snapshot,
         caller,
+        record.map(|Extension(record)| record.attrs),
     )
     .await
 }
@@ -1501,6 +1495,7 @@ async fn native_messages(
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
+    record: Option<Extension<NamespaceRecord>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1510,6 +1505,7 @@ async fn native_messages(
         Route::NativeMessages,
         snapshot,
         caller,
+        record.map(|Extension(record)| record.attrs),
     )
     .await
 }
@@ -1519,6 +1515,7 @@ async fn embeddings(
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
+    record: Option<Extension<NamespaceRecord>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1528,6 +1525,7 @@ async fn embeddings(
         Route::Embeddings,
         snapshot,
         caller,
+        record.map(|Extension(record)| record.attrs),
     )
     .await
 }
@@ -1537,6 +1535,7 @@ async fn responses(
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
+    record: Option<Extension<NamespaceRecord>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1546,6 +1545,7 @@ async fn responses(
         Route::Responses,
         snapshot,
         caller,
+        record.map(|Extension(record)| record.attrs),
     )
     .await
 }
@@ -1562,6 +1562,7 @@ async fn serve(
     route: Route,
     snapshot: Arc<ConfigSnapshot>,
     caller: InboundKey,
+    attrs: Option<Value>,
 ) -> Result<Response, GatewayError> {
     let cfg = &snapshot.config;
 
@@ -1839,6 +1840,7 @@ async fn serve(
             snapshot.clone(),
             &caller,
             model,
+            attrs.clone(),
             StreamRequest {
                 alias,
                 body,
@@ -1907,6 +1909,7 @@ async fn serve(
                 latency_ms: outcome.latency_ms,
                 ttft_ms: outcome.ttft_ms,
                 attempts: outcome.attempts,
+                attrs: attrs.clone(),
             });
             let accounting = match middleware_execution.take_core_budget() {
                 Some(hold) => BufferedResponseAccounting::from_core(
@@ -1984,6 +1987,7 @@ async fn serve(
                     latency_ms: outcome.latency_ms,
                     ttft_ms: outcome.ttft_ms,
                     attempts: outcome.attempts,
+                    attrs: attrs.clone(),
                 },
             )
             .await;
@@ -2343,6 +2347,7 @@ async fn stream_with_failover(
     snapshot: Arc<ConfigSnapshot>,
     caller: &InboundKey,
     model: &Model,
+    attrs: Option<Value>,
     request: StreamRequest<'_>,
 ) -> Result<Response, GatewayError> {
     let StreamRequest {
@@ -2469,7 +2474,7 @@ async fn stream_with_failover(
             let span = attempt_span.as_ref().expect("attempt span");
             let mut ctx = StreamContext {
                 namespace: caller.namespace.clone(),
-                attrs: caller.attrs.clone(),
+                attrs: attrs.clone().or_else(|| caller.attrs.clone()),
                 subject: caller.subject.clone(),
                 signer_kid: caller.signer_kid.clone(),
                 alias: alias.clone(),
@@ -2539,6 +2544,7 @@ async fn stream_with_failover(
                     let estimate_for_open = hold.estimated_input_tokens;
                     let source_for_open = plan.source;
                     let identity_for_open = identity.clone();
+                    let attrs_for_open = attrs.clone();
                     let parent_context_for_open =
                         attempt_span.as_ref().expect("attempt span").context();
                     let opener =
@@ -2554,10 +2560,11 @@ async fn stream_with_failover(
                             let reservation = reservation_for_open.clone();
                             let parent_context = parent_context_for_open.clone();
                             let identity = identity_for_open.clone();
+                            let attrs = attrs_for_open.clone();
                             Box::pin(async move {
                                 let ctx = StreamContext {
                                     namespace: caller.namespace,
-                                    attrs: caller.attrs,
+                                    attrs: attrs.or(caller.attrs),
                                     subject: caller.subject,
                                     signer_kid: caller.signer_kid,
                                     alias,
@@ -3347,6 +3354,7 @@ struct RecordArgs<'a> {
     ttft_ms: Option<u64>,
     /// Upstream attempts made; the retry count is one less.
     attempts: u32,
+    attrs: Option<serde_json::Value>,
 }
 
 /// Record where the request is already ending for another reason, so a failure
@@ -3380,7 +3388,7 @@ fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
         request_id: args.identity.request_id.to_string(),
         trace_id: args.identity.trace_id.clone(),
         namespace: args.caller.namespace.clone(),
-        attrs: args.caller.attrs.clone(),
+        attrs: args.attrs.clone().or_else(|| args.caller.attrs.clone()),
         subject: args.caller.subject.clone(),
         signer_kid: args.caller.signer_kid.clone(),
         model: args.alias.to_string(),
@@ -3539,6 +3547,7 @@ mod tests {
             latency_ms: 12,
             ttft_ms: None,
             attempts: 1,
+            attrs: None,
         };
 
         let pricing = approved_pricing_snapshot();
@@ -3585,6 +3594,55 @@ mod tests {
         assert_eq!(row.price_book, None);
         assert_eq!(row.price_book_checksum, None);
         assert_eq!(row.price_catalog, None);
+    }
+
+    #[test]
+    fn usage_record_copies_admission_attrs() {
+        let identity = EventIdentity {
+            request_id: crate::usage::identity::next_request_id(),
+            trace_id: None,
+        };
+        let caller = InboundKey {
+            namespace: "wsp_x".to_owned(),
+            subject: "GW_TEST_INBOUND_KEY".to_owned(),
+            authority: PrincipalAuthority::StaticKey,
+            signer_kid: None,
+            scope: None,
+            alias_scope: None,
+            max_request_microdollars: None,
+            can_mint: false,
+            jti: None,
+            namespace_grant: None,
+            attrs: None,
+        };
+        let (row, _, _) = build_record(RecordArgs {
+            identity: &identity,
+            caller: &caller,
+            alias: "fast",
+            target_provider: "openai",
+            target_model: "gpt-4o",
+            source: CredentialSource::Platform,
+            credential_id: "openai-primary",
+            status: Status::Ok,
+            input_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 1,
+            cost_microdollars: 1,
+            price: RequestPrice::configured(gateway_core::catalog::ModelPrice {
+                input_microdollars_per_million: 1,
+                output_microdollars_per_million: 1,
+                reasoning_microdollars_per_million: None,
+                cache_read_microdollars_per_million: None,
+                cache_write_microdollars_per_million: None,
+            }),
+            latency_ms: 1,
+            ttft_ms: None,
+            attempts: 1,
+            attrs: Some(json!({"org": "acme"})),
+        });
+        assert_eq!(row.attrs, Some(json!({"org": "acme"})));
+        assert_eq!(row.namespace, "wsp_x");
     }
 
     /// An unusable spelling of the output allowance never hides a usable one, so
@@ -6509,6 +6567,7 @@ targets = [{ provider = "openai", model = "o3", price = { input_microdollars_per
                     namespace_grant: None,
                     attrs: None,
                 },
+                None,
             )
             .await
             .unwrap_err()
@@ -9417,6 +9476,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             Route::ChatCompletions,
             snapshot,
             caller,
+            None,
         )
         .await
         .expect_err("post-middleware estimate exceeds the caller ceiling");
@@ -10008,6 +10068,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             Route::ChatCompletions,
             snapshot,
             caller,
+            None,
         )
         .await
         .expect_err("the estimate exceeds the caller ceiling");
@@ -10050,6 +10111,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             Route::ChatCompletions,
             snapshot,
             caller,
+            None,
         )
         .await
         .expect("the estimate is under the caller ceiling");

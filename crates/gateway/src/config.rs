@@ -2781,14 +2781,18 @@ impl Config {
     /// resources: the mode is the first thing read, and each mode rejects the
     /// other's sections outright rather than merging them (ADR 0027).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_storage()?;
+        self.validate_inner(false)
+    }
+
+    fn validate_inner(&self, allow_memory_sqlite: bool) -> Result<(), ConfigError> {
+        self.validate_storage(allow_memory_sqlite)?;
         match self.mode {
             Mode::Stateless => self.validate_stateless(),
             Mode::Stateful => self.validate_stateful(),
         }
     }
 
-    fn validate_storage(&self) -> Result<(), ConfigError> {
+    fn validate_storage(&self, allow_memory_sqlite: bool) -> Result<(), ConfigError> {
         let Some(storage) = self.storage.as_ref() else {
             return Err(ConfigError::Invalid(
                 "`[storage]` is required (ADR 0063): set `backend = \"sqlite\"` with `path`, or `backend = \"postgres\"` with `dsn_env`".into(),
@@ -2803,6 +2807,16 @@ impl Config {
                 {
                     return Err(ConfigError::Invalid(
                         "`[storage]` sqlite requires a non-empty `path`".into(),
+                    ));
+                }
+                if !allow_memory_sqlite
+                    && storage
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| path.trim() == ":memory:")
+                {
+                    return Err(ConfigError::Invalid(
+                        "`[storage]` sqlite `:memory:` is not durable; use a file path".into(),
                     ));
                 }
             }
@@ -4522,7 +4536,7 @@ impl Config {
             .merge(Toml::string(source))
             .extract()
             .map_err(|e| ConfigError::Load(e.to_string()))?;
-        cfg.validate()?;
+        cfg.validate_inner(true)?;
         Ok(cfg)
     }
 }
@@ -4611,6 +4625,44 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
             .expect("parses without storage");
         let err = cfg.validate().expect_err("storage is required");
         assert!(err.to_string().contains("[storage]"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_sqlite_memory() {
+        let path = std::env::temp_dir().join(format!(
+            "axond-memory-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, VALID).expect("write fixture");
+        let err = Config::load(path.to_str().expect("utf8 path")).expect_err(":memory: refused");
+        let _ = std::fs::remove_file(&path);
+        assert!(err.to_string().contains(":memory:"), "{err}");
+    }
+
+    #[test]
+    fn shipped_runnable_configs_load_without_test_storage_injection() {
+        for relative in [
+            "axond.example.toml",
+            "axond.stateful.example.toml",
+            "ops/compose/axond.quickstart.toml",
+            "ops/compose/axond.stateful.toml",
+            "ops/compose/axond.blob-contract.toml",
+            "tests/tier0/axond.tier0.toml",
+            "tests/tier0/axond.stateful-bootstrap.toml",
+            "deploy/kubernetes/base/axond.toml",
+            "deploy/kubernetes/components/stateful/axond.toml",
+            "deploy/azure-container-apps/axond.toml",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(relative);
+            Config::load(path.to_str().expect("utf8 path"))
+                .unwrap_or_else(|error| panic!("{relative} must load via Config::load: {error}"));
+        }
     }
 
     /// Inbound auth fails closed (ADR 0013), so a config that would leave the

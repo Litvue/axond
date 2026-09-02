@@ -25,6 +25,10 @@
 [server]
 bind = "0.0.0.0:8080"
 
+[storage]
+backend = "sqlite"
+path = "axond.sqlite"
+
 # ── Termination (optional) ────────────────────────────────────────────────────
 # What SIGTERM does. `/readyz` starts failing at once so a load balancer can
 # drain the replica, while `/healthz` keeps answering `ok` — a terminating

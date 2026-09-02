@@ -11,6 +11,10 @@ mode = "stateful"
 [server]
 bind = "0.0.0.0:8080"
 
+[storage]
+backend = "sqlite"
+path = "axond.sqlite"
+
 [control_plane]
 backend = "object-storage"
 environment_id = "prod-us-east"

@@ -103,7 +103,11 @@ closed-route, fail-closed, immutable-generation, and anonymous-before-
 convergence regression floor. Sections 2 and 8 of the security review, and the
 inbound authentication section of the
 [deployment security model](./deployment-model.md), are the statements to
-re-confirm or amend.
+re-confirm or amend. [ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)
+supersedes minted inbound tokens for v1.0: one deployment-wide static API key
+authenticates both management and inference; minted `axt1.` secrets are rejected
+at boot. Namespace is selected from the canonical `/ns/{ns}/v1` path after
+authentication.
 
 **Release impact.** A claim, scope, or audience change is a token-format change:
 tokens minted before the upgrade must still verify, or the migration note must
@@ -145,7 +149,11 @@ boundary and its charging policy; section 6 of the security review is the BYOK
 isolation argument, and section 8 records what the namespace boundary
 deliberately does *not* defend (OS-level isolation, availability between
 tenants). A second exception to one-directional fallback needs an ADR, not a
-configuration key.
+configuration key. [ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)
+makes the API-created namespace the tenant unit: path `/ns/{ns}` is
+authoritative, store lookup fails closed (`404 unknown_namespace` vs
+`503 store_unavailable`), and API-created namespaces inherit the platform
+credential pool until BYOK lands.
 
 **Release impact.** A key-derivation change is a data migration for the shared
 backends: say whether existing Redis keys or Postgres rows are still read, and

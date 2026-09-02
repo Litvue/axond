@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
 use super::{NamespaceRecord, Store, StoreError};
 
@@ -10,7 +10,7 @@ pub struct PostgresStore {
 
 impl PostgresStore {
     pub async fn connect(dsn: &str) -> Result<Self, StoreError> {
-        let (client, connection) = tokio_postgres::connect(dsn, NoTls)
+        let (client, connection) = tokio_postgres::connect(dsn, crate::usage::tls_connector())
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         tokio::spawn(async move {
@@ -32,13 +32,22 @@ impl PostgresStore {
     }
 }
 
-fn record_from(id: String, attrs: Value, blocklist: Option<Value>) -> NamespaceRecord {
-    let blocklist = blocklist.and_then(|value| serde_json::from_value(value).ok());
-    NamespaceRecord {
+fn record_from(
+    id: String,
+    attrs: Value,
+    blocklist: Option<Value>,
+) -> Result<NamespaceRecord, StoreError> {
+    let blocklist = match blocklist {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(serde_json::from_value(value).map_err(|error| {
+            StoreError::Invalid(format!("namespace `{id}` blocklist: {error}"))
+        })?),
+    };
+    Ok(NamespaceRecord {
         id,
         attrs,
         blocklist,
-    }
+    })
 }
 
 #[async_trait]
@@ -73,7 +82,8 @@ impl Store for PostgresStore {
             )
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        Ok(row.map(|row| record_from(row.get(0), row.get(1), row.get(2))))
+        row.map(|row| record_from(row.get(0), row.get(1), row.get(2)))
+            .transpose()
     }
 
     async fn list_namespaces(
@@ -93,10 +103,10 @@ impl Store for PostgresStore {
             )
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        let out: Vec<_> = rows
-            .into_iter()
-            .map(|row| record_from(row.get(0), row.get(1), row.get(2)))
-            .collect();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(record_from(row.get(0), row.get(1), row.get(2))?);
+        }
         let next = if out.len() == limit as usize {
             out.last().map(|row| row.id.clone())
         } else {
@@ -113,19 +123,16 @@ impl Store for PostgresStore {
     ) -> Result<Option<NamespaceRecord>, StoreError> {
         let blocklist = blocklist.map(|list| serde_json::to_value(list).unwrap_or(Value::Null));
         let client = self.client.lock().await;
-        let n = client
-            .execute(
-                "UPDATE axond_namespace SET attrs = $1, blocklist = $2 WHERE id = $3",
+        let row = client
+            .query_opt(
+                "UPDATE axond_namespace SET attrs = $1, blocklist = $2 WHERE id = $3
+                 RETURNING id, attrs, blocklist",
                 &[&attrs, &blocklist, &id],
             )
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        drop(client);
-        if n == 0 {
-            Ok(None)
-        } else {
-            self.get_namespace(id).await
-        }
+        row.map(|row| record_from(row.get(0), row.get(1), row.get(2)))
+            .transpose()
     }
 
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError> {

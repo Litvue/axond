@@ -18,6 +18,27 @@ async fn namespaced_completion_and_namespace_api() {
         .await
         .expect("create");
     assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let created_body: Value = created.json().await.unwrap();
+    assert_eq!(created_body["attrs"]["org"], "acme");
+
+    let fetched = http
+        .get(gateway.url("/api/v1/namespaces/wsp_x"))
+        .bearer_auth(GATEWAY_KEY)
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(fetched.status(), 200);
+    let fetched_body: Value = fetched.json().await.unwrap();
+    assert_eq!(fetched_body["attrs"]["org"], "acme");
+
+    let oversized = http
+        .post(gateway.url("/api/v1/namespaces"))
+        .bearer_auth(GATEWAY_KEY)
+        .json(&json!({"id": "wsp_huge", "attrs": {"blob": "x".repeat(5000)}}))
+        .send()
+        .await
+        .expect("oversized");
+    assert_eq!(oversized.status(), 400);
 
     let dup = http
         .post(gateway.url("/api/v1/namespaces"))
@@ -31,7 +52,7 @@ async fn namespaced_completion_and_namespace_api() {
     assert_eq!(body["error"]["type"], "namespace_conflict");
 
     let completion = http
-        .post(gateway.url("/v1/chat/completions"))
+        .post(format!("{}/ns/wsp_x/v1/chat/completions", gateway.base_url))
         .bearer_auth(GATEWAY_KEY)
         .json(&json!({
             "model": alias::CHAT,

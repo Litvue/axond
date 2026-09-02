@@ -1505,6 +1505,12 @@ impl ConfigSnapshot {
                     shape: WorkloadKey::PREFIX,
                 });
             }
+            if secret.starts_with("axt1.") {
+                return Err(SnapshotError::ReservedGatewayKeyShape {
+                    namespace: k.namespace.clone(),
+                    shape: "axt1.",
+                });
+            }
             // Two keys resolving to one secret is ambiguous authority — one
             // namespace would silently win — so reject it. Compared here on the
             // operator-supplied values at boot, never at request time.
@@ -1926,6 +1932,7 @@ impl AppState {
             revocation,
             policy,
             observability,
+            None,
         )
     }
 
@@ -1941,6 +1948,7 @@ impl AppState {
         revocation: Box<dyn RevocationStore>,
         policy: Arc<PolicyRuntime>,
         observability: ReplicaObservability,
+        store: Option<Arc<dyn crate::store::Store>>,
     ) -> Result<Self, SnapshotError> {
         // The transport bounds configure the shared client, so they are read
         // once here: a reload validates a change and reports that it needs a
@@ -1970,7 +1978,10 @@ impl AppState {
             status: observability.status,
             revision: observability.revision,
             catalogue: observability.catalogue,
-            store: open_store_sync(&snapshot.config)?,
+            store: match store {
+                Some(store) => store,
+                None => open_store_sync(&snapshot.config)?,
+            },
             #[cfg(test)]
             middleware: MiddlewareChain::empty(),
             middleware_runtime: MiddlewareRuntime::default(),
@@ -1980,16 +1991,6 @@ impl AppState {
 
     pub fn store(&self) -> Option<&std::sync::Arc<dyn crate::store::Store>> {
         Some(&self.0.store)
-    }
-
-    /// Replace the boot store before this state is shared with the router.
-    ///
-    /// Postgres boot opens a placeholder in [`open_store_sync`]; `serve` swaps
-    /// in the connected store before any clone, so [`Arc::get_mut`] succeeds.
-    pub fn set_store(&mut self, store: std::sync::Arc<dyn crate::store::Store>) {
-        std::sync::Arc::get_mut(&mut self.0)
-            .expect("store must be attached before AppState is shared")
-            .store = store;
     }
 
     /// Install a test or boot-constructed content chain before the state is
@@ -2099,13 +2100,9 @@ fn open_store_sync(config: &Config) -> Result<Arc<dyn crate::store::Store>, Snap
             .map_err(|error| SnapshotError::Store(error.to_string()))?;
             Ok(Arc::new(store))
         }
-        StorageBackend::Postgres => {
-            // `serve()` replaces this with a connected Postgres store before
-            // the listener binds. Tests that never connect still get a store.
-            let store = crate::store::SqliteStore::open(":memory:")
-                .map_err(|error| SnapshotError::Store(error.to_string()))?;
-            Ok(Arc::new(store))
-        }
+        StorageBackend::Postgres => Err(SnapshotError::Store(
+            "postgres must be opened asynchronously in `serve`; tests should use sqlite".into(),
+        )),
     }
 }
 
@@ -3129,6 +3126,20 @@ env = "GW_ADMIN_BREAKGLASS"
         assert!(matches!(
             error,
             SnapshotError::ReservedGatewayKeyShape { .. }
+        ));
+    }
+
+    #[test]
+    fn a_static_key_cannot_use_the_minted_token_prefix() {
+        let config = config_with(PLATFORM_KEY);
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "axt1.not-a-static-key".to_owned())]);
+        let error = match ConfigSnapshot::build(config, &env, 0) {
+            Ok(_) => panic!("the reserved minted-token shape must remain unambiguous"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SnapshotError::ReservedGatewayKeyShape { shape: "axt1.", .. }
         ));
     }
 

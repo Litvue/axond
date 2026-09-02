@@ -153,4 +153,35 @@ mod tests {
         let err = store.put_namespace(rec).await.expect_err("duplicate");
         assert!(matches!(err, StoreError::Duplicate(_)));
     }
+
+    #[tokio::test]
+    async fn sqlite_file_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "axond-store-persist-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let rec = NamespaceRecord {
+            id: "wsp_x".into(),
+            attrs: serde_json::json!({"org": "acme"}),
+            blocklist: None,
+        };
+        {
+            let store = SqliteStore::open(path.to_str().expect("utf8")).expect("open");
+            store.put_namespace(rec.clone()).await.expect("insert");
+        }
+        let store = SqliteStore::open(path.to_str().expect("utf8")).expect("reopen");
+        let got = store
+            .get_namespace("wsp_x")
+            .await
+            .expect("get")
+            .expect("row");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        assert_eq!(got, rec);
+    }
 }

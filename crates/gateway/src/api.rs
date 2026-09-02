@@ -78,11 +78,32 @@ fn normalize_attrs(attrs: Value) -> Result<Value, GatewayError> {
     Ok(attrs)
 }
 
+const MAX_BLOCKLIST_BYTES: usize = 4096;
+const MAX_BLOCKLIST_ENTRIES: usize = 64;
+
+fn validate_payload(attrs: &Value, blocklist: &Option<Vec<String>>) -> Result<(), GatewayError> {
+    validate_attrs(attrs).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
+    if let Some(list) = blocklist {
+        if list.len() > MAX_BLOCKLIST_ENTRIES {
+            return Err(GatewayError::BadRequest(
+                "namespace blocklist exceeds 64 entries".into(),
+            ));
+        }
+        if serde_json::to_string(list).unwrap_or_default().len() > MAX_BLOCKLIST_BYTES {
+            return Err(GatewayError::BadRequest(
+                "namespace blocklist exceeds 4 KiB".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn create_namespace(
     State(state): State<AppState>,
     Json(body): Json<CreateBody>,
 ) -> Result<(StatusCode, Json<NamespaceRecord>), GatewayError> {
     validate_namespace_id(&body.id).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
+    validate_payload(&body.attrs, &body.blocklist)?;
     let rec = NamespaceRecord {
         id: body.id,
         attrs: normalize_attrs(body.attrs)?,
@@ -113,6 +134,7 @@ async fn put_namespace(
     Path(ns): Path<String>,
     Json(body): Json<ReplaceBody>,
 ) -> Result<Json<NamespaceRecord>, GatewayError> {
+    validate_payload(&body.attrs, &body.blocklist)?;
     let attrs = normalize_attrs(body.attrs)?;
     match store(&state)?
         .update_namespace(&ns, attrs, body.blocklist)

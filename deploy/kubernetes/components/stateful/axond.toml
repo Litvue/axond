@@ -24,6 +24,10 @@ mode = "stateful"
 [server]
 bind = "0.0.0.0:8080"
 
+[storage]
+backend = "postgres"
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
 [control_plane]
 dsn_env = "GW_CONTROL_PLANE_DSN"
 connect_timeout_ms = 5000

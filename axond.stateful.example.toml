@@ -33,6 +33,10 @@ mode = "stateful"
 [server]
 bind = "0.0.0.0:8080"
 
+[storage]
+backend = "postgres"
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
 # ── Stateful serving snapshot cache ─────────────────────────────────────────
 # Both references are required together when a last-known-good cache is used.
 # The cache is authenticated and contains projected state, never plaintext
