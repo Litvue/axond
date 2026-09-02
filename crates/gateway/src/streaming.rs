@@ -48,6 +48,8 @@ use crate::usage::{Status, UsageRecord};
 /// Everything the relay needs to attribute a streamed request once it ends.
 pub struct StreamContext {
     pub namespace: String,
+    /// Opaque namespace attrs copied at admission (ADR 0063).
+    pub attrs: Option<serde_json::Value>,
     pub subject: String,
     pub signer_kid: Option<String>,
     pub alias: String,
@@ -1501,7 +1503,7 @@ impl Accounting {
             request_id: self.ctx.identity.request_id.to_string(),
             trace_id: self.ctx.identity.trace_id.clone(),
             namespace: self.ctx.namespace.clone(),
-            attrs: None,
+            attrs: self.ctx.attrs.clone(),
             subject: self.ctx.subject.clone(),
             signer_kid: self.ctx.signer_kid.clone(),
             model: self.ctx.alias.clone(),
@@ -2040,6 +2042,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     fn context() -> StreamContext {
         StreamContext {
             namespace: "platform".to_owned(),
+            attrs: None,
             subject: "GW_TEST_INBOUND_KEY".to_owned(),
             signer_kid: Some("test-kid".to_owned()),
             alias: "gpt-4o".to_owned(),

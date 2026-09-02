@@ -1038,13 +1038,22 @@ async fn authenticate_middleware(
             .namespace_grant()
             .map_err(|_| GatewayError::NamespaceNotAuthorized)?;
         let authorized = grant.permits(&namespace);
-        let exists = match state.store() {
-            Some(store) => store
-                .get_namespace(namespace.as_str())
-                .await
-                .map(|row| row.is_some())
-                .unwrap_or(false),
-            None => snapshot.config.namespace(namespace.as_str()).is_some(),
+        let row = match state.store() {
+            Some(store) => match store.get_namespace(namespace.as_str()).await {
+                Ok(row) => row,
+                Err(_) => return Err(GatewayError::StoreUnavailable),
+            },
+            None => {
+                if snapshot.config.namespace(namespace.as_str()).is_some() {
+                    Some(crate::store::NamespaceRecord {
+                        id: namespace.to_string(),
+                        attrs: serde_json::json!({}),
+                        blocklist: None,
+                    })
+                } else {
+                    None
+                }
+            }
         };
         if !authorized {
             debug!(
@@ -1055,14 +1064,17 @@ async fn authenticate_middleware(
             );
             return Err(GatewayError::NamespaceNotAuthorized);
         }
-        if !exists {
+        let Some(row) = row else {
             return Err(GatewayError::UnknownNamespace);
-        }
+        };
 
         // Downstream code reads one effective namespace from the caller
         // context. Replacing it here makes the path authoritative when a later
-        // grant implementation permits a set or all namespaces.
+        // grant implementation permits a set or all namespaces. Attrs are
+        // copied at admission so usage records carry the workspace metadata
+        // Litvue stored (ADR 0063).
         caller.namespace = namespace.to_string();
+        caller.attrs = Some(row.attrs);
         request.extensions_mut().insert(namespace);
     }
     // Route capability is evaluated only after the canonical path has selected
@@ -2457,6 +2469,7 @@ async fn stream_with_failover(
             let span = attempt_span.as_ref().expect("attempt span");
             let mut ctx = StreamContext {
                 namespace: caller.namespace.clone(),
+                attrs: caller.attrs.clone(),
                 subject: caller.subject.clone(),
                 signer_kid: caller.signer_kid.clone(),
                 alias: alias.clone(),
@@ -2544,6 +2557,7 @@ async fn stream_with_failover(
                             Box::pin(async move {
                                 let ctx = StreamContext {
                                     namespace: caller.namespace,
+                                    attrs: caller.attrs,
                                     subject: caller.subject,
                                     signer_kid: caller.signer_kid,
                                     alias,
@@ -3366,7 +3380,7 @@ fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
         request_id: args.identity.request_id.to_string(),
         trace_id: args.identity.trace_id.clone(),
         namespace: args.caller.namespace.clone(),
-        attrs: None,
+        attrs: args.caller.attrs.clone(),
         subject: args.caller.subject.clone(),
         signer_kid: args.caller.signer_kid.clone(),
         model: args.alias.to_string(),
@@ -3505,6 +3519,7 @@ mod tests {
             can_mint: false,
             jti: None,
             namespace_grant: None,
+            attrs: None,
         };
         let args = |price| RecordArgs {
             identity: &identity,
@@ -6230,6 +6245,7 @@ min_iat = {}
             can_mint: false,
             jti: None,
             namespace_grant: None,
+            attrs: None,
         };
         let response = list_models(Extension(snapshot), Extension(caller))
             .await
@@ -6491,6 +6507,7 @@ targets = [{ provider = "openai", model = "o3", price = { input_microdollars_per
                     can_mint: false,
                     jti: None,
                     namespace_grant: None,
+                    attrs: None,
                 },
             )
             .await
@@ -9385,6 +9402,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             can_mint: false,
             jti: None,
             namespace_grant: None,
+            attrs: None,
         };
         let body = json!({
             "model": "gpt-4o",
@@ -9979,6 +9997,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             can_mint: false,
             jti: None,
             namespace_grant: None,
+            attrs: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 
@@ -10020,6 +10039,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             can_mint: false,
             jti: None,
             namespace_grant: None,
+            attrs: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 

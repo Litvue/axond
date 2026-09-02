@@ -108,7 +108,7 @@ use std::time::Instant;
 
 use budget::BudgetStore;
 use clap::{Arg, ArgAction, Command};
-use config::{Config, Mode};
+use config::{Config, Mode, StorageBackend};
 use convergence::{
     ConvergenceSettings, LastKnownGood, MaterialLedger, Reconciler, RevisionCompiler,
     RevisionStatus, SnapshotSink, SystemClock,
@@ -827,7 +827,7 @@ async fn serve() -> anyhow::Result<()> {
 
     let bind = config.server.bind;
     let watching = config.reload.watch;
-    let state = AppState::new_with_policy(
+    let mut state = AppState::new_with_policy(
         config.clone(),
         &env,
         usage,
@@ -838,6 +838,28 @@ async fn serve() -> anyhow::Result<()> {
         observability,
     )
     .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
+
+    // Postgres needs an async connect; the sync constructor left a placeholder.
+    // Attach the real store (and seed TOML namespaces) before any clone shares
+    // the Arc — after this point `set_store` cannot succeed.
+    if config
+        .storage
+        .as_ref()
+        .is_some_and(|storage| storage.backend == StorageBackend::Postgres)
+    {
+        let storage = config
+            .storage
+            .as_ref()
+            .expect("postgres backend checked above");
+        let store = store::open(storage, &env)
+            .await
+            .map_err(|e| anyhow::anyhow!("store configuration failed: {e}"))?;
+        store::seed_config_namespaces(store.as_ref(), &config.namespace)
+            .await
+            .map_err(|e| anyhow::anyhow!("store namespace seed failed: {e}"))?;
+        state.set_store(store);
+        tracing::info!(backend = "postgres", "durable store connected");
+    }
 
     tracing::info!(
         gateway_keys = state.config().inbound_key_count(),

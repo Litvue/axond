@@ -13,12 +13,14 @@ use serde_json::Value;
 use crate::config::{StorageBackend, StorageConfig};
 use crate::namespace::NamespaceId;
 
-#[allow(dead_code)]
 mod postgres;
 mod sqlite;
 
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
+
+/// ADR 0063: opaque namespace `attrs` are capped at 4 KiB (serialized JSON).
+pub const MAX_ATTRS_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceRecord {
@@ -58,7 +60,6 @@ pub trait Store: Send + Sync {
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError>;
 }
 
-#[allow(dead_code)]
 pub async fn open(
     config: &StorageConfig,
     env: &std::collections::HashMap<String, String>,
@@ -88,10 +89,45 @@ pub async fn open(
     }
 }
 
+/// Insert TOML `[[namespace]]` rows so black-box fixtures keep working.
+///
+/// `put_namespace` is insert-only: a restart against an existing file correctly
+/// hits [`StoreError::Duplicate`], which is ignored. Any other failure fails boot.
+pub async fn seed_config_namespaces(
+    store: &dyn Store,
+    namespaces: &[crate::config::Namespace],
+) -> Result<(), StoreError> {
+    for namespace in namespaces {
+        let record = NamespaceRecord {
+            id: namespace.id.clone(),
+            attrs: serde_json::json!({}),
+            blocklist: None,
+        };
+        match store.put_namespace(record).await {
+            Ok(()) | Err(StoreError::Duplicate(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_namespace_id(id: &str) -> Result<(), StoreError> {
     NamespaceId::parse(id)
         .map(|_| ())
         .map_err(|err| StoreError::Invalid(err.to_string()))
+}
+
+/// Refuse attrs whose serialized JSON exceeds [`MAX_ATTRS_BYTES`].
+pub fn validate_attrs(attrs: &Value) -> Result<(), StoreError> {
+    let len = serde_json::to_vec(attrs)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if len > MAX_ATTRS_BYTES {
+        return Err(StoreError::Invalid(format!(
+            "attrs exceeds {MAX_ATTRS_BYTES} byte limit"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

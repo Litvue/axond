@@ -72,7 +72,6 @@ use crate::status::probes::{BackendProbe, CatalogProbe, ControlPlaneProbe};
 use crate::status::registry::{
     CachedStatusRegistry, ObservationPlan, StatusRefresher, StatusSettings,
 };
-use crate::store::Store;
 use crate::usage::UsageDelivery;
 #[cfg(test)]
 use crate::usage::UsageFanout;
@@ -1535,6 +1534,7 @@ impl ConfigSnapshot {
                     can_mint: k.can_mint,
                     jti: None,
                     namespace_grant: Some(crate::namespace::NamespaceGrant::all()),
+                    attrs: None,
                 },
             });
             gateway_key_fingerprints
@@ -1982,11 +1982,14 @@ impl AppState {
         Some(&self.0.store)
     }
 
-    #[allow(dead_code)]
+    /// Replace the boot store before this state is shared with the router.
+    ///
+    /// Postgres boot opens a placeholder in [`open_store_sync`]; `serve` swaps
+    /// in the connected store before any clone, so [`Arc::get_mut`] succeeds.
     pub fn set_store(&mut self, store: std::sync::Arc<dyn crate::store::Store>) {
-        if let Some(inner) = std::sync::Arc::get_mut(&mut self.0) {
-            inner.store = store;
-        }
+        std::sync::Arc::get_mut(&mut self.0)
+            .expect("store must be attached before AppState is shared")
+            .store = store;
     }
 
     /// Install a test or boot-constructed content chain before the state is
@@ -2089,14 +2092,11 @@ fn open_store_sync(config: &Config) -> Result<Arc<dyn crate::store::Store>, Snap
             let path = storage.path.as_deref().unwrap_or(":memory:");
             let store = crate::store::SqliteStore::open(path)
                 .map_err(|error| SnapshotError::Store(error.to_string()))?;
-            for namespace in &config.namespace {
-                let record = crate::store::NamespaceRecord {
-                    id: namespace.id.clone(),
-                    attrs: serde_json::json!({}),
-                    blocklist: None,
-                };
-                let _ = futures::executor::block_on(store.put_namespace(record));
-            }
+            futures::executor::block_on(crate::store::seed_config_namespaces(
+                &store,
+                &config.namespace,
+            ))
+            .map_err(|error| SnapshotError::Store(error.to_string()))?;
             Ok(Arc::new(store))
         }
         StorageBackend::Postgres => {

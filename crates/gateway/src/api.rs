@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, response::IntoResponse};
@@ -12,7 +12,13 @@ use serde_json::Value;
 
 use crate::error::GatewayError;
 use crate::state::AppState;
-use crate::store::{NamespaceRecord, Store, StoreError, validate_namespace_id};
+use crate::store::{NamespaceRecord, Store, StoreError, validate_attrs, validate_namespace_id};
+
+/// Bound for the whole management request body. Attrs alone are capped at
+/// 4 KiB ([`crate::store::MAX_ATTRS_BYTES`]); this leaves room for id and
+/// blocklist without letting a single key write multi-megabyte rows into the
+/// store.
+const MANAGEMENT_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -24,6 +30,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/namespaces/{ns}",
             get(get_namespace).put(put_namespace),
         )
+        .layer(DefaultBodyLimit::max(MANAGEMENT_MAX_REQUEST_BYTES))
         .with_state(state)
 }
 
@@ -61,6 +68,16 @@ fn store(state: &AppState) -> Result<&Arc<dyn Store>, GatewayError> {
     state.store().ok_or(GatewayError::StoreUnavailable)
 }
 
+fn normalize_attrs(attrs: Value) -> Result<Value, GatewayError> {
+    let attrs = if attrs.is_null() {
+        Value::Object(Default::default())
+    } else {
+        attrs
+    };
+    validate_attrs(&attrs).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
+    Ok(attrs)
+}
+
 async fn create_namespace(
     State(state): State<AppState>,
     Json(body): Json<CreateBody>,
@@ -68,11 +85,7 @@ async fn create_namespace(
     validate_namespace_id(&body.id).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
     let rec = NamespaceRecord {
         id: body.id,
-        attrs: if body.attrs.is_null() {
-            Value::Object(Default::default())
-        } else {
-            body.attrs
-        },
+        attrs: normalize_attrs(body.attrs)?,
         blocklist: body.blocklist,
     };
     match store(&state)?.put_namespace(rec.clone()).await {
@@ -100,8 +113,9 @@ async fn put_namespace(
     Path(ns): Path<String>,
     Json(body): Json<ReplaceBody>,
 ) -> Result<Json<NamespaceRecord>, GatewayError> {
+    let attrs = normalize_attrs(body.attrs)?;
     match store(&state)?
-        .update_namespace(&ns, body.attrs, body.blocklist)
+        .update_namespace(&ns, attrs, body.blocklist)
         .await
     {
         Ok(Some(rec)) => Ok(Json(rec)),
