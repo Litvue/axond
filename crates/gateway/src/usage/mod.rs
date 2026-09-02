@@ -850,7 +850,7 @@ mod tests {
             request_id: identity::next_request_id().to_string(),
             trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
             namespace: "acme".to_string(),
-            attrs: None,
+            attrs: Some(serde_json::json!({"org": "acme", "env": "prod"})),
             subject: "GW_INBOUND_ACME_KEY".to_string(),
             signer_kid: Some("verifier-1".to_string()),
             model: "gpt-4o".to_string(),

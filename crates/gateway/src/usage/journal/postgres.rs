@@ -1275,6 +1275,10 @@ struct StoredRecord {
     #[serde(default)]
     trace_id: Option<String>,
     namespace: String,
+    // Absent in a row a pre-ADR-0063 writer appended; default so claim/replay
+    // of older events still decodes.
+    #[serde(default)]
+    attrs: Option<serde_json::Value>,
     subject: String,
     #[serde(default)]
     signer_kid: Option<String>,
@@ -1315,7 +1319,7 @@ impl StoredRecord {
             request_id: self.request_id,
             trace_id: self.trace_id,
             namespace: self.namespace,
-            attrs: None,
+            attrs: self.attrs,
             subject: self.subject,
             signer_kid: self.signer_kid,
             model: self.model,
