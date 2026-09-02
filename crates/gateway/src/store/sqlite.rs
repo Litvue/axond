@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -500,13 +501,12 @@ impl Store for SqliteStore {
         let namespace = namespace.to_string();
         let period = period.to_string();
         self.with_conn(move |conn| {
+            // SQLite SUM overflows INTEGER (and then becomes REAL); fold in Rust.
             let mut stmt = conn
                 .prepare(
-                    "SELECT model, status, COUNT(*), COALESCE(SUM(COALESCE(cost_microdollars, 0)), 0)
+                    "SELECT model, status, COALESCE(cost_microdollars, 0)
                      FROM axond_store_usage
-                     WHERE namespace = ?1 AND period = ?2
-                     GROUP BY model, status
-                     ORDER BY model, status",
+                     WHERE namespace = ?1 AND period = ?2",
                 )
                 .map_err(unavailable)?;
             let rows = stmt
@@ -515,21 +515,25 @@ impl Store for SqliteStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
                     ))
                 })
                 .map_err(unavailable)?;
-            let mut out = Vec::new();
+            let mut grouped = BTreeMap::<(String, String), (u64, i64)>::new();
             for row in rows {
-                let (model, status, count, cost) = row.map_err(unavailable)?;
-                out.push(UsageSummaryRow {
+                let (model, status, cost) = row.map_err(unavailable)?;
+                let entry = grouped.entry((model, status)).or_default();
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.saturating_add(cost);
+            }
+            Ok(grouped
+                .into_iter()
+                .map(|((model, status), (count, cost))| UsageSummaryRow {
                     model,
                     status,
-                    count: from_sql_amount(count),
+                    count,
                     cost_microdollars: from_sql_amount(cost),
-                });
-            }
-            Ok(out)
+                })
+                .collect())
         })
         .await
     }
