@@ -182,6 +182,10 @@ pub trait Store: Send + Sync {
     /// Charge `actual` and release the hold in one operation. A missing hold
     /// (expired) still records spend against `period` when the namespace row
     /// exists. A hold from a prior incarnation is dropped without charging.
+    ///
+    /// TTL expiry of an old incarnation is not protected: once the hold row
+    /// is gone, settle sees missing-hold + live namespace and charges, same
+    /// as live-ns expiry. The reincarnation guard is for unexpired holds.
     async fn settle_budget(
         &self,
         namespace: &str,
@@ -714,6 +718,45 @@ mod tests {
             .expect("row");
         assert_eq!(got.spent_microdollars, 0);
         assert_eq!(got.reserved_microdollars, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_delete_recreate_expires_any_incarnation_hold() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "old")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        seeded(&store).await;
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("recreate");
+        match store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "new")
+            .await
+            .expect("expire path")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget("wsp_x", "p", "old", 10)
+            .await
+            .expect("late settle after TTL");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        // Hold row is gone, so this is missing-hold + live ns and charges —
+        // TTL expiry of an old incarnation is not protected.
+        assert_eq!(got.spent_microdollars, 10);
+        assert_eq!(got.reserved_microdollars, 1);
     }
 
     #[tokio::test]
@@ -1342,10 +1385,15 @@ mod tests {
                      namespace           text        NOT NULL,
                      period              text        NOT NULL,
                      amount_microdollars bigint      NOT NULL,
-                     expires_at          timestamptz NOT NULL
+                     expires_at          timestamptz NOT NULL,
+                     incarnation         bigint      NOT NULL DEFAULT 1
                  );
                  CREATE INDEX axond_budget_reservation_scope_idx
                      ON axond_budget_reservation (namespace, period, expires_at);
+                 CREATE TABLE axond_namespace_incarnation (
+                     id text PRIMARY KEY NOT NULL,
+                     n  bigint NOT NULL
+                 );
                  INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
                  INSERT INTO axond_budget
                      (namespace, period, limit_microdollars, spent_microdollars)
@@ -1420,10 +1468,15 @@ mod tests {
                      namespace           text        NOT NULL,
                      period              text        NOT NULL,
                      amount_microdollars bigint      NOT NULL,
-                     expires_at          timestamptz NOT NULL
+                     expires_at          timestamptz NOT NULL,
+                     incarnation         bigint      NOT NULL DEFAULT 1
                  );
                  CREATE INDEX axond_budget_reservation_scope_idx
                      ON axond_budget_reservation (namespace, period, expires_at);
+                 CREATE TABLE axond_namespace_incarnation (
+                     id text PRIMARY KEY NOT NULL,
+                     n  bigint NOT NULL
+                 );
                  INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
                  INSERT INTO axond_budget
                      (namespace, period, limit_microdollars, spent_microdollars)
@@ -1515,6 +1568,10 @@ mod tests {
             .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
             .await
             .expect("new ddl");
+        setup
+            .batch_execute(include_str!("../../sql/store_namespace_incarnation_v1.sql"))
+            .await
+            .expect("incarnation ddl");
         setup
             .batch_execute(
                 "INSERT INTO axond_store_budget
@@ -1680,6 +1737,77 @@ mod tests {
             Ok(_) => panic!("partial dest reservation with rows must fail boot"),
         };
         assert_partial_dest_boot_error(err, "axond_store_budget_reservation");
+    }
+
+    /// `create_table = false` probes incarnation objects; it must not CREATE
+    /// or ALTER them.
+    #[tokio::test]
+    async fn postgres_create_table_false_does_not_apply_incarnation_ddl() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        setup
+            .batch_execute(
+                "CREATE TABLE axond_namespace (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+                     blocklist JSONB
+                 );
+                 CREATE TABLE axond_store_usage (
+                     request_id          text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text,
+                     model               text        NOT NULL,
+                     status              text        NOT NULL,
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
+                 );",
+            )
+            .await
+            .expect("ns and usage");
+        setup
+            .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
+            .await
+            .expect("budget v1");
+        let err = match PostgresStore::connect(&scoped, false).await {
+            Err(error) => error,
+            Ok(_) => panic!("missing incarnation must fail closed"),
+        };
+        assert!(
+            matches!(err, StoreError::Unavailable(ref message) if message.contains("schema missing")),
+            "{err:?}"
+        );
+        let table: bool = setup
+            .query_one(
+                "SELECT to_regclass('axond_namespace_incarnation') IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("regclass")
+            .get(0);
+        assert!(
+            !table,
+            "create_table=false must not CREATE axond_namespace_incarnation"
+        );
+        let column: bool = setup
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_attribute
+                     WHERE attrelid = to_regclass('axond_store_budget_reservation')
+                       AND attname = 'incarnation'
+                       AND attnum > 0
+                       AND NOT attisdropped
+                 )",
+                &[],
+            )
+            .await
+            .expect("col")
+            .get(0);
+        assert!(
+            !column,
+            "create_table=false must not ALTER reservation incarnation"
+        );
     }
 
     #[tokio::test]
