@@ -378,6 +378,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_hold_is_outstanding_until_it_exits_and_only_then_stops_draining() {
         let runtime = runtime();
         let first = generation(&body(scope(), 1, 1_000), 1);
@@ -449,6 +450,7 @@ mod tests {
     /// they wait on one timer: the count is exact, the later deadline wins, and
     /// the number of tasks does not follow the request rate.
     #[tokio::test(start_paused = true)]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn holds_lingering_under_one_generation_share_a_single_deadline() {
         let runtime = std::sync::Arc::new(runtime());
         let held = generation(&body(scope(), 1, 1_000), 1);
@@ -483,6 +485,7 @@ mod tests {
     /// missed: deciding the deadline has passed and removing the entry is one
     /// step, so nothing can be added in between and released early.
     #[tokio::test(start_paused = true)]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn a_hold_lingering_at_the_deadline_still_waits_out_its_own_ttl() {
         let runtime = std::sync::Arc::new(runtime());
         let held = generation(&body(scope(), 1, 1_000), 1);
@@ -510,6 +513,7 @@ mod tests {
     /// A namespace served under the bootstrap file has no generation, so it has
     /// nothing to drain and cannot be made to look like it does.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_bootstrap_hold_is_not_counted() {
         let runtime = runtime();
         runtime.enter(None);

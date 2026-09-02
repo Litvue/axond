@@ -223,17 +223,17 @@ const DRAFT_STORE_BUDGET_RESERVATION_IDX: &str = "axond_budget_reservation_scope
 /// 3. Else `create_table` applies [`BUDGET_DDL`].
 /// 4. Leftover `axond_budget` with a `subject` column (budget_v1.sql) is left
 ///    untouched; spend is not migrated (subject vs period).
+///
 /// Then `ADD COLUMN IF NOT EXISTS incarnation` on the reservation table so a
 /// draft rename cannot drop it (`create_table = false` included).
 async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result<(), StoreError> {
-    let renamed = if draft_store_budget_present(client).await?
-        && should_rename_draft(client).await?
-    {
-        rename_draft_store_budget(client).await?;
-        true
-    } else {
-        false
-    };
+    let renamed =
+        if draft_store_budget_present(client).await? && should_rename_draft(client).await? {
+            rename_draft_store_budget(client).await?;
+            true
+        } else {
+            false
+        };
     if create_table {
         client
             .batch_execute(BUDGET_DDL)
@@ -577,6 +577,15 @@ impl Store for PostgresStore {
                 .await
             {
                 Ok(_) => {
+                    // Keep n if this id was deleted earlier. Advisory lock is
+                    // the lifecycle mutex; this row is the settle generation.
+                    tx.execute(
+                        "INSERT INTO axond_namespace_incarnation (id, n) VALUES ($1, 1)
+                         ON CONFLICT (id) DO NOTHING",
+                        &[&ns.id],
+                    )
+                    .await
+                    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
                     tx.commit()
                         .await
                         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -902,8 +911,12 @@ async fn delete_namespace_tx(tx: &Transaction<'_>, id: &str) -> Result<bool, Sto
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     if n > 0 {
+        // Missing companion row (upgraded DB, or create that skipped the
+        // insert): start at 2 so leftover incarnation=1 holds cannot match
+        // a later recreate that inserts n=1 ON CONFLICT DO NOTHING.
         tx.execute(
-            "UPDATE axond_namespace_incarnation SET n = n + 1 WHERE id = $1",
+            "INSERT INTO axond_namespace_incarnation (id, n) VALUES ($1, 2)
+             ON CONFLICT (id) DO UPDATE SET n = axond_namespace_incarnation.n + 1",
             &[&id],
         )
         .await
