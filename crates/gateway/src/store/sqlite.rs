@@ -2,11 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, from_sql_amount, sql_amount,
+    from_sql_amount, sql_amount, sql_amount_saturating, BudgetRecord, BudgetReserve,
+    NamespaceRecord, Store, StoreError,
 };
 
 pub struct SqliteStore {
@@ -285,7 +286,7 @@ impl Store for SqliteStore {
     ) -> Result<BudgetRecord, StoreError> {
         let namespace = namespace.to_string();
         let period = period.to_string();
-        let limit = sql_amount(limit_microdollars)?;
+        let limit = sql_amount_saturating(limit_microdollars);
         self.with_conn(move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -415,7 +416,7 @@ impl Store for SqliteStore {
         let namespace = namespace.to_string();
         let period = period.to_string();
         let reservation_id = reservation_id.to_string();
-        let actual = sql_amount(actual_microdollars)?;
+        let actual = sql_amount_saturating(actual_microdollars);
         self.with_conn(move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -620,11 +621,9 @@ mod tests {
         assert!(names.iter().any(|n| n == "axond_store_budget"));
         assert!(names.iter().any(|n| n == "axond_store_budget_active"));
         assert!(names.iter().any(|n| n == "axond_store_budget_reservation"));
-        assert!(
-            names
-                .iter()
-                .any(|n| n == "axond_store_budget_reservation_scope_idx")
-        );
+        assert!(names
+            .iter()
+            .any(|n| n == "axond_store_budget_reservation_scope_idx"));
         assert!(!names.iter().any(|n| n == "axond_budget"));
         assert!(!names.iter().any(|n| n == "axond_budget_reservation"));
     }

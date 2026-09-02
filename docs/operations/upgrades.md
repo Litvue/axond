@@ -67,8 +67,12 @@ instead of being rewritten.
    any replica that sets `[storage] backend = "postgres"`. The Store ledger is
    `axond_store_budget*`. A leftover withdrawn-backend `axond_budget` (PK
    `(namespace, subject)`) is left in place; spend is not migrated (subject vs
-   period). Connect renames an earlier draft that used `axond_budget` with a
-   `period` column.
+   period). Connect may RENAME leftover draft Store tables (`axond_budget*`
+   with a `period` column) to `axond_store_budget*`, including when empty new
+   tables already exist from a hand-applied `store_budget_v1.sql` and the draft
+   still has spend (empty new relations are dropped first; non-empty new
+   tables are kept). That needs table-rename privilege; migration-only roles
+   should run the rename out of band before boot.
 7. Complete any stop-the-fleet Redis/Postgres budget migration before starting
    namespace-cap-aware replicas.
 8. Verify ingress streaming behavior and client retries.

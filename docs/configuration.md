@@ -319,7 +319,8 @@ Postgres Store budget tables are `axond_store_budget`,
 already has those leftover tables keeps them; spend is not migrated (subject
 vs period). Connect still creates the Store tables and boots. An earlier
 draft of the Store DDL that used `axond_budget` with a `period` column is
-renamed at connect.
+renamed at connect (needs table-rename privilege; migration-only roles
+should run the rename out of band before boot).
 
 ## `[shutdown]` — Tier 0
 

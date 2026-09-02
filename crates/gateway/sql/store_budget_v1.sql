@@ -14,8 +14,11 @@
 -- tables and boots.
 --
 -- An earlier draft of this file used the withdrawn names with a `period`
--- column. Connect renames those relations to `axond_store_budget*` before
--- probing.
+-- column. Connect may RENAME those leftover relations to `axond_store_budget*`
+-- before probing, including when this file has already created empty new
+-- tables and the draft still has spend (empty new relations are dropped
+-- first). That needs table-rename privilege; migration-only roles should run
+-- the rename out of band before boot.
 --
 -- Spend is cumulative per `(namespace, period)`. Reservations are short-lived
 -- holds; a reserve reclaims expired ones for that key before it decides.
