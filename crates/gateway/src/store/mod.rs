@@ -1078,6 +1078,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_expired_tombstone_is_vacuumed_on_reserve_and_late_settle_is_noop() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("put");
+        let stale = format!("vac_{ns}");
+        store
+            .insert_expired_reservation_tombstone(&stale, 1)
+            .await
+            .expect("past tombstone");
+        match store
+            .reserve_budget(&ns, 1, Duration::from_secs(30), &format!("live_{ns}"))
+            .await
+            .expect("reserve vacuums")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget(&ns, "p", &stale, 99)
+            .await
+            .expect("late settle");
+        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
+    }
+
+    #[tokio::test]
     async fn postgres_reconnects_after_a_dropped_connection() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
@@ -1415,7 +1444,8 @@ mod tests {
                  );
                  CREATE TABLE axond_store_budget_reservation_tombstone (
                      id          text PRIMARY KEY NOT NULL,
-                     incarnation bigint NOT NULL
+                     incarnation bigint NOT NULL,
+                     expires_at  timestamptz NOT NULL
                  );
                  INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
                  INSERT INTO axond_budget
@@ -1502,7 +1532,8 @@ mod tests {
                  );
                  CREATE TABLE axond_store_budget_reservation_tombstone (
                      id          text PRIMARY KEY NOT NULL,
-                     incarnation bigint NOT NULL
+                     incarnation bigint NOT NULL,
+                     expires_at  timestamptz NOT NULL
                  );
                  INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
                  INSERT INTO axond_budget
@@ -1545,6 +1576,98 @@ mod tests {
         assert!(
             old_gone,
             "draft axond_budget must be renamed, not left beside empty new tables"
+        );
+    }
+
+    /// Draft period tables with spend, then both shipped Store SQLs, then
+    /// `connect(false)`: rename drops the incarnation-bearing reservation
+    /// table, so connect must ADD COLUMN. Skipped without
+    /// `AXOND_TEST_POSTGRES_DSN`.
+    #[tokio::test]
+    async fn postgres_connect_false_recovers_incarnation_after_draft_rename() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        setup
+            .batch_execute(
+                "CREATE TABLE axond_namespace (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+                     blocklist JSONB
+                 );
+                 CREATE TABLE axond_budget (
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     limit_microdollars  bigint      NOT NULL,
+                     spent_microdollars  bigint      NOT NULL DEFAULT 0,
+                     PRIMARY KEY (namespace, period)
+                 );
+                 CREATE TABLE axond_budget_active (
+                     namespace text PRIMARY KEY NOT NULL,
+                     period    text NOT NULL
+                 );
+                 CREATE TABLE axond_budget_reservation (
+                     id                  text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     amount_microdollars bigint      NOT NULL,
+                     expires_at          timestamptz NOT NULL
+                 );
+                 CREATE INDEX axond_budget_reservation_scope_idx
+                     ON axond_budget_reservation (namespace, period, expires_at);
+                 INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
+                 INSERT INTO axond_budget
+                     (namespace, period, limit_microdollars, spent_microdollars)
+                     VALUES ('wsp_x', '2026-09', 1000, 40);
+                 INSERT INTO axond_budget_active (namespace, period)
+                     VALUES ('wsp_x', '2026-09');
+                 CREATE TABLE axond_store_usage (
+                     request_id          text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text,
+                     model               text        NOT NULL,
+                     status              text        NOT NULL,
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
+                 );",
+            )
+            .await
+            .expect("draft period tables");
+        setup
+            .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
+            .await
+            .expect("budget v1");
+        setup
+            .batch_execute(include_str!("../../sql/store_namespace_incarnation_v1.sql"))
+            .await
+            .expect("incarnation v1");
+        let store = PostgresStore::connect(&scoped, false)
+            .await
+            .expect("connect false after draft rename");
+        let rec = store
+            .get_budget("wsp_x", "2026-09")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(rec.spent_microdollars, 40);
+        let has_incarnation: bool = setup
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_attribute
+                     WHERE attrelid = to_regclass('axond_store_budget_reservation')
+                       AND attname = 'incarnation'
+                       AND attnum > 0
+                       AND NOT attisdropped
+                 )",
+                &[],
+            )
+            .await
+            .expect("col")
+            .get(0);
+        assert!(
+            has_incarnation,
+            "reservation must have incarnation after draft rename"
         );
     }
 
@@ -1767,7 +1890,8 @@ mod tests {
     }
 
     /// `create_table = false` probes incarnation objects; it must not CREATE
-    /// or ALTER them.
+    /// them. Additive `incarnation` on an existing reservation table is
+    /// recovered so a draft rename cannot drop the column.
     #[tokio::test]
     async fn postgres_create_table_false_does_not_apply_incarnation_ddl() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
@@ -1832,8 +1956,8 @@ mod tests {
             .expect("col")
             .get(0);
         assert!(
-            !column,
-            "create_table=false must not ALTER reservation incarnation"
+            column,
+            "create_table=false still ADD COLUMN incarnation on an existing reservation table"
         );
         let tombstone: bool = setup
             .query_one(

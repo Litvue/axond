@@ -48,7 +48,8 @@ CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx
     ON axond_store_budget_reservation (namespace, period, expires_at);
 CREATE TABLE IF NOT EXISTS axond_store_budget_reservation_tombstone (
     id TEXT PRIMARY KEY NOT NULL,
-    incarnation INTEGER NOT NULL
+    incarnation INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS axond_store_usage (
     request_id TEXT PRIMARY KEY NOT NULL,
@@ -72,6 +73,7 @@ impl SqliteStore {
             .map_err(unavailable)?;
         conn.execute_batch(SCHEMA).map_err(unavailable)?;
         migrate_reservation_incarnation(&conn)?;
+        migrate_tombstone_expires_at(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -136,26 +138,41 @@ fn unavailable(err: rusqlite::Error) -> StoreError {
 }
 
 /// `CREATE TABLE IF NOT EXISTS` does not add columns to an existing file.
-fn migrate_reservation_incarnation(conn: &Connection) -> Result<(), StoreError> {
-    let has_incarnation = {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(axond_store_budget_reservation)")
-            .map_err(unavailable)?;
-        let mut rows = stmt.query([]).map_err(unavailable)?;
-        let mut found = false;
-        while let Some(row) = rows.next().map_err(unavailable)? {
-            let name: String = row.get(1).map_err(unavailable)?;
-            if name == "incarnation" {
-                found = true;
-                break;
-            }
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(unavailable)?;
+    let mut rows = stmt.query([]).map_err(unavailable)?;
+    while let Some(row) = rows.next().map_err(unavailable)? {
+        let name: String = row.get(1).map_err(unavailable)?;
+        if name == column {
+            return Ok(true);
         }
-        found
-    };
-    if !has_incarnation {
+    }
+    Ok(false)
+}
+
+fn migrate_reservation_incarnation(conn: &Connection) -> Result<(), StoreError> {
+    if !table_has_column(conn, "axond_store_budget_reservation", "incarnation")? {
         conn.execute(
             "ALTER TABLE axond_store_budget_reservation
              ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
+
+fn migrate_tombstone_expires_at(conn: &Connection) -> Result<(), StoreError> {
+    if !table_has_column(
+        conn,
+        "axond_store_budget_reservation_tombstone",
+        "expires_at",
+    )? {
+        conn.execute(
+            "ALTER TABLE axond_store_budget_reservation_tombstone
+             ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0",
             [],
         )
         .map_err(unavailable)?;
@@ -484,12 +501,18 @@ impl Store for SqliteStore {
             };
             let now = now_ms();
             let incarnation = current_incarnation(&tx, &namespace)?;
-            // Expired holds of every incarnation become tombstones so settle
-            // can still classify them. Unexpired prior-generation rows stay.
+            // Vacuum expired tombstones first. Then copy newly expired holds
+            // so settle can still classify incarnation until the next vacuum.
+            tx.execute(
+                "DELETE FROM axond_store_budget_reservation_tombstone
+                 WHERE expires_at < ?1",
+                params![now],
+            )
+            .map_err(unavailable)?;
             tx.execute(
                 "INSERT OR REPLACE INTO axond_store_budget_reservation_tombstone
-                    (id, incarnation)
-                 SELECT id, incarnation FROM axond_store_budget_reservation
+                    (id, incarnation, expires_at)
+                 SELECT id, incarnation, expires_at FROM axond_store_budget_reservation
                  WHERE namespace = ?1 AND expires_at <= ?2",
                 params![namespace, now],
             )
@@ -1172,6 +1195,58 @@ mod tests {
         assert_eq!(got.reserved_microdollars, 0);
     }
 
+    #[tokio::test]
+    async fn expired_tombstone_is_vacuumed_on_reserve_and_late_settle_is_noop() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO axond_store_budget_reservation_tombstone
+                    (id, incarnation, expires_at) VALUES ('stale', 1, 1)",
+                [],
+            )
+            .expect("past tombstone");
+        }
+        store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "live")
+            .await
+            .expect("reserve vacuums");
+        let leftover: i64 = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation_tombstone
+                 WHERE id = 'stale'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(leftover, 0, "past-expiry tombstone must be vacuumed");
+        store
+            .settle_budget("wsp_x", "p", "stale", 99)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
+    }
+
     #[test]
     fn budget_tables_use_store_prefix() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
@@ -1231,5 +1306,29 @@ mod tests {
                 .collect()
         };
         assert!(names.iter().any(|n| n == "incarnation"));
+    }
+
+    #[test]
+    fn migrate_tombstone_expires_at_adds_column_when_pragma_shows_it_absent() {
+        let conn = Connection::open_in_memory().expect("memory");
+        conn.execute_batch(
+            "CREATE TABLE axond_store_budget_reservation_tombstone (
+                id TEXT PRIMARY KEY NOT NULL,
+                incarnation INTEGER NOT NULL
+            )",
+        )
+        .expect("legacy table");
+        migrate_tombstone_expires_at(&conn).expect("add");
+        migrate_tombstone_expires_at(&conn).expect("idempotent");
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(axond_store_budget_reservation_tombstone)")
+                .expect("pragma");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query")
+                .map(|row| row.expect("name"))
+                .collect()
+        };
+        assert!(names.iter().any(|n| n == "expires_at"));
     }
 }

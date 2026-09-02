@@ -165,7 +165,7 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
         .batch_execute(
             "SELECT id, attrs, blocklist FROM axond_namespace LIMIT 0;
              SELECT id, n FROM axond_namespace_incarnation LIMIT 0;
-             SELECT id, incarnation FROM axond_store_budget_reservation_tombstone LIMIT 0",
+             SELECT id, incarnation, expires_at FROM axond_store_budget_reservation_tombstone LIMIT 0",
         )
         .await
         .map_err(|e| {
@@ -223,6 +223,8 @@ const DRAFT_STORE_BUDGET_RESERVATION_IDX: &str = "axond_budget_reservation_scope
 /// 3. Else `create_table` applies [`BUDGET_DDL`].
 /// 4. Leftover `axond_budget` with a `subject` column (budget_v1.sql) is left
 ///    untouched; spend is not migrated (subject vs period).
+/// Then `ADD COLUMN IF NOT EXISTS incarnation` on the reservation table so a
+/// draft rename cannot drop it (`create_table = false` included).
 async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result<(), StoreError> {
     if draft_store_budget_present(client).await? && should_rename_draft(client).await? {
         rename_draft_store_budget(client).await?;
@@ -233,6 +235,24 @@ async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     }
+    ensure_reservation_incarnation(client).await?;
+    Ok(())
+}
+
+/// Draft `axond_budget_reservation` predates incarnation. Additive ALTER;
+/// no-op if the column already exists. Not CREATE TABLE.
+async fn ensure_reservation_incarnation(client: &impl GenericClient) -> Result<(), StoreError> {
+    if !relation_exists(client, STORE_BUDGET_RESERVATION).await? {
+        return Ok(());
+    }
+    client
+        .execute(
+            "ALTER TABLE axond_store_budget_reservation
+             ADD COLUMN IF NOT EXISTS incarnation bigint NOT NULL DEFAULT 1",
+            &[],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     Ok(())
 }
 
@@ -1049,13 +1069,23 @@ async fn hold(
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .map(|row| row.get(0))
         .unwrap_or(1);
-    // Expired holds of every incarnation become tombstones so settle can
-    // still classify them. Unexpired prior-generation rows stay as holds.
+    // Vacuum expired tombstones first. Then copy newly expired holds so
+    // settle can still classify incarnation until the next vacuum.
     tx.execute(
-        "INSERT INTO axond_store_budget_reservation_tombstone (id, incarnation)
-         SELECT id, incarnation FROM axond_store_budget_reservation
+        "DELETE FROM axond_store_budget_reservation_tombstone
+         WHERE expires_at < now()",
+        &[],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    tx.execute(
+        "INSERT INTO axond_store_budget_reservation_tombstone
+            (id, incarnation, expires_at)
+         SELECT id, incarnation, expires_at FROM axond_store_budget_reservation
          WHERE namespace = $1 AND expires_at <= now()
-         ON CONFLICT (id) DO UPDATE SET incarnation = EXCLUDED.incarnation",
+         ON CONFLICT (id) DO UPDATE SET
+            incarnation = EXCLUDED.incarnation,
+            expires_at = EXCLUDED.expires_at",
         &[&namespace],
     )
     .await
@@ -1146,6 +1176,27 @@ impl PostgresStore {
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?
                 .get(0);
             Ok(count)
+        })
+        .await
+    }
+
+    pub(super) async fn insert_expired_reservation_tombstone(
+        &self,
+        id: &str,
+        incarnation: i64,
+    ) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        self.with_client(async move |client| {
+            client
+                .execute(
+                    "INSERT INTO axond_store_budget_reservation_tombstone
+                        (id, incarnation, expires_at)
+                     VALUES ($1, $2, now() - interval '1 second')",
+                    &[&id, &incarnation],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(())
         })
         .await
     }
