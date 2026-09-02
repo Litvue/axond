@@ -501,20 +501,22 @@ impl Store for SqliteStore {
             };
             let now = now_ms();
             let incarnation = current_incarnation(&tx, &namespace)?;
-            // Vacuum expired tombstones first. Then copy newly expired holds
-            // so settle can still classify incarnation until the next vacuum.
+            // Vacuum tombstones whose retention has elapsed. Copy newly
+            // expired holds with now()+ttl so a late settle after later
+            // admissions can still charge this incarnation.
             tx.execute(
                 "DELETE FROM axond_store_budget_reservation_tombstone
                  WHERE expires_at < ?1",
                 params![now],
             )
             .map_err(unavailable)?;
+            let retained_until = now.saturating_add(ttl_ms);
             tx.execute(
                 "INSERT OR REPLACE INTO axond_store_budget_reservation_tombstone
                     (id, incarnation, expires_at)
-                 SELECT id, incarnation, expires_at FROM axond_store_budget_reservation
+                 SELECT id, incarnation, ?3 FROM axond_store_budget_reservation
                  WHERE namespace = ?1 AND expires_at <= ?2",
-                params![namespace, now],
+                params![namespace, now, retained_until],
             )
             .map_err(unavailable)?;
             tx.execute(
@@ -590,36 +592,24 @@ impl Store for SqliteStore {
                 .map_err(unavailable)?;
             let held_incarnation: Option<i64> = tx
                 .query_row(
-                    "SELECT incarnation FROM axond_store_budget_reservation WHERE id = ?1",
+                    "DELETE FROM axond_store_budget_reservation WHERE id = ?1
+                     RETURNING incarnation",
                     params![reservation_id],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(unavailable)?;
-            tx.execute(
-                "DELETE FROM axond_store_budget_reservation WHERE id = ?1",
-                params![reservation_id],
-            )
-            .map_err(unavailable)?;
             let held_incarnation = match held_incarnation {
                 Some(n) => Some(n),
-                None => {
-                    let n = tx
-                        .query_row(
-                            "SELECT incarnation FROM axond_store_budget_reservation_tombstone
-                             WHERE id = ?1",
-                            params![reservation_id],
-                            |row| row.get(0),
-                        )
-                        .optional()
-                        .map_err(unavailable)?;
-                    tx.execute(
-                        "DELETE FROM axond_store_budget_reservation_tombstone WHERE id = ?1",
+                None => tx
+                    .query_row(
+                        "DELETE FROM axond_store_budget_reservation_tombstone WHERE id = ?1
+                         RETURNING incarnation",
                         params![reservation_id],
+                        |row| row.get(0),
                     )
-                    .map_err(unavailable)?;
-                    n
-                }
+                    .optional()
+                    .map_err(unavailable)?,
             };
             let ns_exists = namespace_exists(&tx, &namespace)?;
             let current = current_incarnation(&tx, &namespace)?;
