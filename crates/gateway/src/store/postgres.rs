@@ -7,8 +7,8 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
-    from_sql_amount, sql_amount, sql_amount_saturating, BudgetRecord, BudgetReserve,
-    NamespaceRecord, Store, StoreError,
+    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, from_sql_amount, sql_amount,
+    sql_amount_saturating,
 };
 use crate::backends::health::{BackendHealth, PostgresHealth};
 
@@ -379,10 +379,7 @@ fn seed_on_dedicated_runtime(
     })
 }
 
-async fn seed_namespaces(
-    config: tokio_postgres::Config,
-    ids: &[&str],
-) -> Result<(), StoreError> {
+async fn seed_namespaces(config: tokio_postgres::Config, ids: &[&str]) -> Result<(), StoreError> {
     let (client, connection) = config
         .connect(crate::usage::tls_connector())
         .await
@@ -623,7 +620,7 @@ impl Store for PostgresStore {
     ) -> Result<BudgetRecord, StoreError> {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
-        let limit = sql_amount_saturating(limit_microdollars);
+        let limit = sql_amount(limit_microdollars)?;
         self.with_client(async move |client| {
             let tx = client
                 .transaction()
@@ -773,7 +770,10 @@ async fn settle_tx(
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     tx.execute(
         "UPDATE axond_store_budget
-         SET spent_microdollars = spent_microdollars + $1
+         SET spent_microdollars = CASE
+             WHEN spent_microdollars >= 9223372036854775807 - $1 THEN 9223372036854775807
+             ELSE spent_microdollars + $1
+         END
          WHERE namespace = $2 AND period = $3",
         &[&actual, &namespace, &period],
     )
@@ -910,8 +910,10 @@ mod tests {
         assert!(BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_budget ("));
         assert!(BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_budget_active ("));
         assert!(BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_store_budget_reservation ("));
-        assert!(BUDGET_DDL
-            .contains("CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx"));
+        assert!(
+            BUDGET_DDL
+                .contains("CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx")
+        );
         assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget ("));
         assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget_active ("));
         assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget_reservation ("));
