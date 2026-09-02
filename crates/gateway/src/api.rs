@@ -552,16 +552,16 @@ async fn get_provider_models(
     Path(id): Path<String>,
 ) -> Result<Json<ProviderModels>, GatewayError> {
     let snapshot = state.config();
-    if !snapshot
+    let Some(provider) = snapshot
         .config
         .provider
         .iter()
-        .any(|provider| provider.id == id)
-    {
+        .find(|provider| provider.id == id)
+    else {
         return Err(GatewayError::UnknownProvider(id));
-    }
+    };
     match store(&state)?.get_provider_models(&id).await {
-        Ok(Some(row)) => Ok(Json(row)),
+        Ok(Some(row)) => Ok(Json(row.against_source(&provider.base_url))),
         Ok(None) => Ok(Json(ProviderModels::empty_stale(id))),
         Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
         Err(err) => Err(GatewayError::BadRequest(err.to_string())),
@@ -597,6 +597,7 @@ async fn list_provider_models(
                 .iter()
                 .find(|row| row.provider == provider.id)
                 .cloned()
+                .map(|row| row.against_source(&provider.base_url))
                 .unwrap_or_else(|| ProviderModels::empty_stale(provider.id.clone()))
         })
         .collect();
@@ -680,6 +681,9 @@ mod tests {
         let scheme = &spec["components"]["securitySchemes"]["gateway_key"];
         assert_eq!(scheme["type"], "http");
         assert_eq!(scheme["scheme"], "bearer");
+
+        let models = &spec["components"]["schemas"]["ProviderModels"]["properties"];
+        assert!(models.get("source").is_none(), "cache source is internal");
 
         if let Ok(path) = std::env::var("AXOND_OPENAPI_OUT") {
             let pretty = serde_json::to_vec_pretty(&spec).expect("pretty spec");

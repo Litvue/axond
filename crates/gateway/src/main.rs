@@ -964,11 +964,10 @@ async fn serve() -> anyhow::Result<()> {
         })
     });
     let (stop_discovery, stop_discovery_rx) = tokio::sync::oneshot::channel::<()>();
-    let discovery_interval = resources.config().config.discovery.interval();
     let discovering = {
         let state = state.clone();
         tokio::spawn(async move {
-            discovery::run(state, discovery_interval, stop_discovery_rx).await;
+            discovery::run(state, stop_discovery_rx).await;
         })
     };
     let (stop_converging, stop_converging_rx) = tokio::sync::oneshot::channel::<()>();
