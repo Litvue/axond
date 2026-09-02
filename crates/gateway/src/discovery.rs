@@ -123,26 +123,72 @@ async fn refresh_one(
     stale_if_source_changed(state, provider_id, base_url).await;
 
     let snapshot = state.config();
-    let Some(lease) = snapshot
+    let leases = snapshot
         .credentials
-        .discovery_lease(&snapshot.config, provider_id)
-    else {
+        .discovery_leases(&snapshot.config, provider_id);
+    if leases.is_empty() {
         return Err(RefreshError::Failed("no credential".into()));
     };
-    let mut headers = Vec::new();
+    let mut headers: Vec<(&'static str, String)> = Vec::new();
     if kind == ProviderKind::Anthropic {
         headers.push(("anthropic-version", AnthropicAdapter::VERSION.to_owned()));
     }
-    let upstream = Upstream {
-        base_url: base_url.to_owned(),
-        api_key: lease.secret.clone(),
-        auth: match kind {
-            ProviderKind::Anthropic => AuthScheme::Header("x-api-key"),
-            ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
-        },
-    };
     drop(snapshot);
 
+    let mut last_error = None;
+    for lease in leases {
+        if stopped(stop) {
+            return Err(RefreshError::Stopped);
+        }
+        let upstream = Upstream {
+            base_url: base_url.to_owned(),
+            api_key: lease.secret.clone(),
+            auth: match kind {
+                ProviderKind::Anthropic => AuthScheme::Header("x-api-key"),
+                ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
+            },
+        };
+        match fetch_listing(state, provider_id, &upstream, &headers, stop).await {
+            Ok(data) => {
+                let row = ProviderModels {
+                    provider: provider_id.to_owned(),
+                    fetched_at: Some(rfc3339_utc(SystemTime::now())),
+                    stale: false,
+                    data,
+                    source: Some(base_url.to_owned()),
+                };
+                state
+                    .store()
+                    .ok_or_else(|| RefreshError::Failed("store unavailable".to_owned()))?
+                    .put_provider_models(row)
+                    .await
+                    .map_err(|error| RefreshError::Failed(error.to_string()))?;
+                return Ok(());
+            }
+            Err(RefreshError::Stopped) => return Err(RefreshError::Stopped),
+            Err(RefreshError::Failed(error)) => {
+                tracing::debug!(
+                    provider = provider_id,
+                    credential = %lease.id,
+                    error = %error,
+                    "discovery credential failed; trying next"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(RefreshError::Failed(last_error.unwrap_or_else(|| {
+        "every discovery credential failed".into()
+    })))
+}
+
+async fn fetch_listing(
+    state: &AppState,
+    provider_id: &str,
+    upstream: &Upstream,
+    headers: &[(&'static str, String)],
+    stop: &mut oneshot::Receiver<()>,
+) -> Result<Vec<Value>, RefreshError> {
     let mut data = Vec::new();
     let mut after_id: Option<String> = None;
     for page in 0..MAX_PAGES {
@@ -155,9 +201,9 @@ async fn refresh_one(
             _ = &mut *stop => return Err(RefreshError::Stopped),
             result = state.0.dispatcher.get_json(
                 provider_id,
-                &upstream,
+                upstream,
                 &path,
-                &headers,
+                headers,
                 Deadline::at(Instant::now() + Duration::from_secs(30)),
             ) => result.map_err(|error| RefreshError::Failed(error.to_string()))?,
         };
@@ -177,20 +223,7 @@ async fn refresh_one(
             None => break,
         }
     }
-    let row = ProviderModels {
-        provider: provider_id.to_owned(),
-        fetched_at: Some(rfc3339_utc(SystemTime::now())),
-        stale: false,
-        data,
-        source: Some(base_url.to_owned()),
-    };
-    state
-        .store()
-        .ok_or_else(|| RefreshError::Failed("store unavailable".to_owned()))?
-        .put_provider_models(row)
-        .await
-        .map_err(|error| RefreshError::Failed(error.to_string()))?;
-    Ok(())
+    Ok(data)
 }
 
 async fn stale_if_source_changed(state: &AppState, provider: &str, base_url: &str) {
