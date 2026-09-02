@@ -785,6 +785,7 @@ async fn stateful_boot_serves_administration_and_refuses_inference() {
 /// instead — which would leave this scenario passing for a reason it does not
 /// state, and passing on a day the bootstrap check had regressed.
 #[test]
+#[ignore = "ADR 0063: stateful control-plane bootstrap withdrawn"]
 fn stateful_boot_refuses_an_unresolved_reference() {
     // The references the config names are deliberately left out of the
     // environment, and nothing else is in it either: an inherited DSN would let
@@ -4011,6 +4012,7 @@ async fn cold_boot_cache_refusals_are_ready_only_when_authenticated_and_projecte
 /// failure-recovery evidence, including convergence under load and a rolling
 /// upgrade.
 #[test]
+#[ignore = "ADR 0063: stateful control-plane bootstrap withdrawn"]
 fn stateful_qualification_profiles_are_published() {
     let (config, env, _) = stateful_bootstrap();
     let run = stateful::run(&config, &["check", "preflight"], &env);
