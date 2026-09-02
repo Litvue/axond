@@ -409,8 +409,16 @@ impl Credentials {
     /// rotation or consuming a parked-key probe. Discovery is off the request
     /// path and must not perturb dispatch.
     pub fn discovery_lease(&self, config: &Config, provider: &str) -> Option<CredentialLease> {
-        let (pool, _) = self.resolve_pool(config, &self.platform_ns, provider)?;
-        pool.entries.first().map(lease)
+        if let Some((pool, _)) = self.resolve_pool(config, &self.platform_ns, provider) {
+            return pool.entries.first().map(lease);
+        }
+        // Tenant-only BYOK: no platform pool, but some namespace can still
+        // dispatch this provider. Discovery lists that catalog without rotating
+        // request-path health.
+        self.pools
+            .iter()
+            .find(|((_, name), _)| name == provider)
+            .and_then(|(_, pool)| pool.entries.first().map(lease))
     }
 
     /// Plan only the first configured credential for an affinity-pinned route.
