@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_does_not_resurrect_a_deleted_namespace() {
+    async fn seed_restores_a_toml_listed_id_after_store_delete() {
         let path = std::env::temp_dir().join(format!(
             "axond-seed-{}-{}.sqlite",
             std::process::id(),
@@ -1019,8 +1019,8 @@ mod tests {
                 .get_namespace("wsp_seed")
                 .await
                 .expect("get")
-                .is_none(),
-            "TOML seed must not recreate a deleted id"
+                .is_some(),
+            "a TOML-listed id is restored on seed; HTTP DELETE of those ids is 409"
         );
         let _ = std::fs::remove_file(&path);
     }
