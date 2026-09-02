@@ -231,6 +231,17 @@ impl Reloader {
                 let mut summary = ReloadSummary::between(&self.boot, &current, &candidate_snapshot);
                 summary.catalog_changed = catalog_changed;
                 summary.storage_changed = storage_changed;
+                if let Some(store) = self.state.store()
+                    && let Err(error) =
+                        futures::executor::block_on(crate::store::seed_config_namespaces(
+                            store.as_ref(),
+                            &candidate_snapshot.config.namespace,
+                        ))
+                {
+                    return Err(ReloadError::Snapshot(SnapshotError::Store(
+                        error.to_string(),
+                    )));
+                }
                 let generation = candidate_snapshot.generation;
                 self.state.publish(candidate_snapshot);
                 telemetry::finish_config_reload(

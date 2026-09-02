@@ -18,7 +18,7 @@ bind = "0.0.0.0:8080"
 
 [storage]
 backend = "sqlite"
-path = "axond.sqlite"
+path = "/var/lib/axond/axond.sqlite"
 
 [[namespace]]
 id = "platform"

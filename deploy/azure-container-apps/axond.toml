@@ -7,7 +7,7 @@ bind = "0.0.0.0:8080"
 
 [storage]
 backend = "sqlite"
-path = "/var/lib/axond/axond.sqlite"
+path = "/tmp/axond.sqlite"
 
 [shutdown]
 drain_grace_ms = 5_000

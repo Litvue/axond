@@ -100,6 +100,7 @@ pub async fn seed_config_namespaces(
     namespaces: &[crate::config::Namespace],
 ) -> Result<(), StoreError> {
     for namespace in namespaces {
+        validate_namespace_id(&namespace.id)?;
         let record = NamespaceRecord {
             id: namespace.id.clone(),
             attrs: serde_json::json!({}),

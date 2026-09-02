@@ -23,6 +23,7 @@ services:
       AXOND_USAGE_POSTGRES_DSN: ${AXOND_USAGE_POSTGRES_DSN:-postgres://postgres:axond-quickstart@postgres:5432/axond}
     volumes:
       - ${AXOND_QUICKSTART_CONFIG:-./ops/compose/axond.quickstart.toml}:/etc/axond/axond.toml:ro
+      - axond-store:/var/lib/axond
     # Compose's default 10s would SIGKILL the drain partway through: it has to
     # cover drain_grace_ms + deadline_ms + flush_timeout_ms, or buffered usage
     # records are lost on every `docker compose down`.
@@ -49,3 +50,6 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+volumes:
+  axond-store:
