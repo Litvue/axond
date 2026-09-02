@@ -15,11 +15,12 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -231,6 +232,8 @@ pub fn credential_digest(presented: &str) -> String {
 struct ModelsScript {
     status: u16,
     ids: Vec<String>,
+    page_size: Option<usize>,
+    fail_when_paged: bool,
 }
 
 impl Default for ModelsScript {
@@ -242,8 +245,15 @@ impl Default for ModelsScript {
                 "gpt-4o-preview".into(),
                 "fixture-chat".into(),
             ],
+            page_size: None,
+            fail_when_paged: false,
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelsQuery {
+    after_id: Option<String>,
 }
 
 pub struct UpstreamState {
@@ -316,6 +326,17 @@ impl UpstreamState {
         self.models.lock().expect("upstream lock").ids =
             ids.iter().map(|id| (*id).to_owned()).collect();
     }
+
+    /// Serve the listing in Anthropic-sized pages (`has_more` / `last_id`).
+    pub fn set_models_page_size(&self, size: usize) {
+        self.models.lock().expect("upstream lock").page_size = Some(size);
+    }
+
+    /// Fail every paged request (`after_id` present) so a later page cannot
+    /// replace a previously cached listing.
+    pub fn set_models_fail_when_paged(&self, fail: bool) {
+        self.models.lock().expect("upstream lock").fail_when_paged = fail;
+    }
 }
 
 /// Decrements the open-response count whenever a response body — or a handler
@@ -378,27 +399,52 @@ impl Drop for FakeUpstream {
     }
 }
 
-async fn list_models(State(state): State<Arc<UpstreamState>>) -> Response {
+async fn list_models(
+    State(state): State<Arc<UpstreamState>>,
+    Query(query): Query<ModelsQuery>,
+) -> Response {
     state.counters.models.fetch_add(1, Ordering::SeqCst);
     let script = state.models.lock().expect("upstream lock").clone();
-    if script.status != 200 {
+    if script.status != 200 || (script.fail_when_paged && query.after_id.is_some()) {
+        let status = if script.status != 200 {
+            script.status
+        } else {
+            500
+        };
         return (
-            StatusCode::from_u16(script.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             [("content-type", "application/json")],
             json!({ "error": { "type": "server_error", "message": "models listing failed" } })
                 .to_string(),
         )
             .into_response();
     }
-    let data: Vec<Value> = script
-        .ids
+    let start = query
+        .after_id
+        .as_deref()
+        .and_then(|id| script.ids.iter().position(|item| item == id).map(|i| i + 1))
+        .unwrap_or(0);
+    let end = match script.page_size {
+        Some(size) => start.saturating_add(size).min(script.ids.len()),
+        None => script.ids.len(),
+    };
+    let page = &script.ids[start.min(script.ids.len())..end];
+    let data: Vec<Value> = page
         .iter()
         .map(|id| json!({ "id": id, "object": "model" }))
         .collect();
+    let mut body = json!({ "object": "list", "data": data });
+    if script.page_size.is_some() {
+        let has_more = end < script.ids.len();
+        body["has_more"] = json!(has_more);
+        if let Some(last_id) = page.last() {
+            body["last_id"] = json!(last_id);
+        }
+    }
     (
         StatusCode::OK,
         [("content-type", "application/json")],
-        json!({ "object": "list", "data": data }).to_string(),
+        body.to_string(),
     )
         .into_response()
 }

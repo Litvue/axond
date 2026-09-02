@@ -120,6 +120,11 @@ pub struct ProviderModels {
     /// returned; empty + stale if never fetched.
     pub stale: bool,
     pub data: Vec<Value>,
+    /// Provider `base_url` this row was fetched from. Internal cache key;
+    /// omitted from the management JSON.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub source: Option<String>,
 }
 
 impl ProviderModels {
@@ -129,7 +134,16 @@ impl ProviderModels {
             fetched_at: None,
             stale: true,
             data: Vec::new(),
+            source: None,
         }
+    }
+
+    /// Last-good rows fetched from a different upstream are stale.
+    pub fn against_source(mut self, source: &str) -> Self {
+        if self.source.as_deref() != Some(source) {
+            self.stale = true;
+        }
+        self
     }
 }
 
