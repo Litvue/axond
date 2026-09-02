@@ -10,7 +10,8 @@
 -- `GET /models` `data` array (OpenAI-compatible; Anthropic/xAI use the same
 -- shape). `fetched_at` is RFC3339 of the last successful fetch; NULL if none
 -- has succeeded. `stale` is true when the last attempt failed: the last-good
--- `models` (or an empty array) are still returned.
+-- `models` (or an empty array) are still returned. `source` is the provider
+-- `base_url` the row was fetched from; a later URL change is treated as stale.
 --
 -- Azure Foundry's data-plane listing omits deployments; this table still
 -- stores whatever `GET /models` returned.
@@ -21,5 +22,6 @@ CREATE TABLE IF NOT EXISTS axond_store_provider_models (
     provider    text PRIMARY KEY NOT NULL,
     fetched_at  text,
     stale       boolean NOT NULL,
-    models      jsonb NOT NULL
+    models      jsonb NOT NULL,
+    source      text
 );

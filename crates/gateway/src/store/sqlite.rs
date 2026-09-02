@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS axond_store_provider_models (
     provider TEXT PRIMARY KEY NOT NULL,
     fetched_at TEXT,
     stale INTEGER NOT NULL,
-    models TEXT NOT NULL
+    models TEXT NOT NULL,
+    source TEXT
 );
 ";
 
@@ -82,6 +83,7 @@ impl SqliteStore {
         conn.execute_batch(SCHEMA).map_err(unavailable)?;
         migrate_reservation_incarnation(&conn)?;
         migrate_tombstone_expires_at(&conn)?;
+        migrate_provider_models_source(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -181,6 +183,17 @@ fn migrate_tombstone_expires_at(conn: &Connection) -> Result<(), StoreError> {
         conn.execute(
             "ALTER TABLE axond_store_budget_reservation_tombstone
              ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
+
+fn migrate_provider_models_source(conn: &Connection) -> Result<(), StoreError> {
+    if !table_has_column(conn, "axond_store_provider_models", "source")? {
+        conn.execute(
+            "ALTER TABLE axond_store_provider_models ADD COLUMN source TEXT",
             [],
         )
         .map_err(unavailable)?;
@@ -726,7 +739,7 @@ impl Store for SqliteStore {
         let provider = provider.to_string();
         self.with_conn(move |conn| {
             conn.query_row(
-                "SELECT provider, fetched_at, stale, models
+                "SELECT provider, fetched_at, stale, models, source
                  FROM axond_store_provider_models WHERE provider = ?1",
                 params![provider],
                 |row| {
@@ -735,13 +748,14 @@ impl Store for SqliteStore {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
             .optional()
             .map_err(unavailable)?
-            .map(|(provider, fetched_at, stale, models)| {
-                sqlite_provider_models(provider, fetched_at, stale, models)
+            .map(|(provider, fetched_at, stale, models, source)| {
+                sqlite_provider_models(provider, fetched_at, stale, models, source)
             })
             .transpose()
         })
@@ -752,7 +766,7 @@ impl Store for SqliteStore {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT provider, fetched_at, stale, models
+                    "SELECT provider, fetched_at, stale, models, source
                      FROM axond_store_provider_models ORDER BY provider",
                 )
                 .map_err(unavailable)?;
@@ -763,13 +777,16 @@ impl Store for SqliteStore {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })
                 .map_err(unavailable)?;
             let mut out = Vec::new();
             for row in rows {
-                let (provider, fetched_at, stale, models) = row.map_err(unavailable)?;
-                out.push(sqlite_provider_models(provider, fetched_at, stale, models)?);
+                let (provider, fetched_at, stale, models, source) = row.map_err(unavailable)?;
+                out.push(sqlite_provider_models(
+                    provider, fetched_at, stale, models, source,
+                )?);
             }
             Ok(out)
         })
@@ -782,17 +799,19 @@ impl Store for SqliteStore {
                 StoreError::Unavailable(format!("provider `{}` models: {error}", row.provider))
             })?;
             conn.execute(
-                "INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (provider) DO UPDATE SET
                     fetched_at = excluded.fetched_at,
                     stale = excluded.stale,
-                    models = excluded.models",
+                    models = excluded.models,
+                    source = excluded.source",
                 params![
                     row.provider,
                     row.fetched_at,
                     if row.stale { 1 } else { 0 },
                     models,
+                    row.source,
                 ],
             )
             .map_err(unavailable)?;
@@ -807,6 +826,7 @@ fn sqlite_provider_models(
     fetched_at: Option<String>,
     stale: i64,
     models: String,
+    source: Option<String>,
 ) -> Result<ProviderModels, StoreError> {
     let data: Vec<Value> = serde_json::from_str(&models).map_err(|error| {
         StoreError::Unavailable(format!("provider `{provider}` models: {error}"))
@@ -816,6 +836,7 @@ fn sqlite_provider_models(
         fetched_at,
         stale: stale != 0,
         data,
+        source,
     })
 }
 
@@ -1497,6 +1518,7 @@ mod tests {
             fetched_at: Some("2026-09-02T12:00:00Z".into()),
             stale: false,
             data: vec![serde_json::json!({"id": "gpt-4o", "object": "model"})],
+            source: Some("https://api.openai.com/v1".into()),
         };
         store.put_provider_models(good.clone()).await.expect("put");
         let got = store
@@ -1520,6 +1542,7 @@ mod tests {
         assert!(stale.stale);
         assert_eq!(stale.data, good.data);
         assert_eq!(stale.fetched_at, good.fetched_at);
+        assert_eq!(stale.source, good.source);
         assert!(
             store
                 .get_provider_models("missing")
