@@ -3,7 +3,9 @@
 //! SQLite WAL is the single-replica implementation; Postgres is HA. Boot
 //! requires a reachable backend. Namespace rows are loaded on demand — never
 //! preloaded at process start. The budget ledger (`spent + reserved` per
-//! `(namespace, period)`) lives here, not in Redis.
+//! `(namespace, period)`) lives here, not in Redis. Postgres tables are
+//! `axond_store_budget*` so they do not collide with leftover `axond_budget`
+//! from the withdrawn `[budget]` backend.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -831,5 +833,169 @@ mod tests {
         };
         let store = PostgresStore::connect(&dsn, true).await.expect("connect");
         assert!(store.health().is_some());
+    }
+
+    /// Isolated schema on the shared test Postgres, with `search_path` set on
+    /// both the setup client and the Store DSN.
+    async fn postgres_isolated(dsn: &str) -> (String, tokio_postgres::Client) {
+        let schema = unique_ns("store").replace('-', "_");
+        let (setup, connection) = tokio_postgres::connect(dsn, crate::usage::tls_connector())
+            .await
+            .expect("setup");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        setup
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema}; SET search_path TO {schema}"
+            ))
+            .await
+            .expect("schema");
+        let sep = if dsn.contains('?') { '&' } else { '?' };
+        (format!("{dsn}{sep}options=-csearch_path%3D{schema}"), setup)
+    }
+
+    /// Leftover `budget_v1.sql` (`axond_budget` PK `(namespace, subject)`) must
+    /// not block Store boot. Spend is not migrated.
+    #[tokio::test]
+    async fn postgres_legacy_budget_v1_coexists_with_store_budget() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        setup
+            .batch_execute(include_str!("../../sql/budget_v1.sql"))
+            .await
+            .expect("legacy budget_v1");
+        setup
+            .batch_execute(
+                "INSERT INTO axond_budget (namespace, subject, spent_microdollars)
+                 VALUES ('wsp_legacy', 'user-1', 42)",
+            )
+            .await
+            .expect("legacy row");
+        let store = PostgresStore::connect(&scoped, true)
+            .await
+            .expect("boot beside leftover budget_v1");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        let rec = store
+            .put_budget("wsp_x", "2026-09", 1_000)
+            .await
+            .expect("store budget");
+        assert_eq!(rec.limit_microdollars, 1_000);
+        let legacy_spent: i64 = setup
+            .query_one(
+                "SELECT spent_microdollars FROM axond_budget
+                 WHERE namespace = 'wsp_legacy' AND subject = 'user-1'",
+                &[],
+            )
+            .await
+            .expect("legacy intact")
+            .get(0);
+        assert_eq!(legacy_spent, 42);
+        let has_subject: bool = setup
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_attribute
+                     WHERE attrelid = to_regclass('axond_budget')
+                       AND attname = 'subject'
+                       AND attnum > 0
+                       AND NOT attisdropped
+                 )",
+                &[],
+            )
+            .await
+            .expect("legacy shape")
+            .get(0);
+        assert!(
+            has_subject,
+            "legacy axond_budget must keep its subject column"
+        );
+        let store_limit: i64 = setup
+            .query_one(
+                "SELECT limit_microdollars FROM axond_store_budget
+                 WHERE namespace = 'wsp_x' AND period = '2026-09'",
+                &[],
+            )
+            .await
+            .expect("store row")
+            .get(0);
+        assert_eq!(store_limit, 1_000);
+    }
+
+    /// Earlier draft Store DDL reused `axond_budget` with a `period` column.
+    /// Connect renames those relations even when `create_table` is false.
+    #[tokio::test]
+    async fn postgres_renames_draft_store_budget_tables() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        setup
+            .batch_execute(
+                "CREATE TABLE axond_namespace (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+                     blocklist JSONB
+                 );
+                 CREATE TABLE axond_budget (
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     limit_microdollars  bigint      NOT NULL,
+                     spent_microdollars  bigint      NOT NULL DEFAULT 0,
+                     PRIMARY KEY (namespace, period)
+                 );
+                 CREATE TABLE axond_budget_active (
+                     namespace text PRIMARY KEY NOT NULL,
+                     period    text NOT NULL
+                 );
+                 CREATE TABLE axond_budget_reservation (
+                     id                  text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     amount_microdollars bigint      NOT NULL,
+                     expires_at          timestamptz NOT NULL
+                 );
+                 CREATE INDEX axond_budget_reservation_scope_idx
+                     ON axond_budget_reservation (namespace, period, expires_at);
+                 INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
+                 INSERT INTO axond_budget
+                     (namespace, period, limit_microdollars, spent_microdollars)
+                     VALUES ('wsp_x', '2026-09', 1000, 40);
+                 INSERT INTO axond_budget_active (namespace, period)
+                     VALUES ('wsp_x', '2026-09');",
+            )
+            .await
+            .expect("draft store tables");
+        let store = PostgresStore::connect(&scoped, false)
+            .await
+            .expect("rename draft tables");
+        let rec = store
+            .get_budget("wsp_x", "2026-09")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(rec.spent_microdollars, 40);
+        assert_eq!(rec.limit_microdollars, 1_000);
+        assert!(rec.active);
+        let renamed: bool = setup
+            .query_one("SELECT to_regclass('axond_store_budget') IS NOT NULL", &[])
+            .await
+            .expect("renamed")
+            .get(0);
+        assert!(renamed);
+        let old_gone: bool = setup
+            .query_one("SELECT to_regclass('axond_budget') IS NULL", &[])
+            .await
+            .expect("old name")
+            .get(0);
+        assert!(old_gone, "draft axond_budget must be renamed, not copied");
     }
 }

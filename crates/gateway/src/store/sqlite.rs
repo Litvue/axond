@@ -19,26 +19,26 @@ CREATE TABLE IF NOT EXISTS axond_namespace (
     attrs TEXT NOT NULL DEFAULT '{}',
     blocklist TEXT
 );
-CREATE TABLE IF NOT EXISTS axond_budget (
+CREATE TABLE IF NOT EXISTS axond_store_budget (
     namespace TEXT NOT NULL,
     period TEXT NOT NULL,
     limit_microdollars INTEGER NOT NULL,
     spent_microdollars INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (namespace, period)
 );
-CREATE TABLE IF NOT EXISTS axond_budget_active (
+CREATE TABLE IF NOT EXISTS axond_store_budget_active (
     namespace TEXT PRIMARY KEY NOT NULL,
     period TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS axond_budget_reservation (
+CREATE TABLE IF NOT EXISTS axond_store_budget_reservation (
     id TEXT PRIMARY KEY NOT NULL,
     namespace TEXT NOT NULL,
     period TEXT NOT NULL,
     amount_microdollars INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS axond_budget_reservation_scope
-    ON axond_budget_reservation (namespace, period, expires_at);
+CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx
+    ON axond_store_budget_reservation (namespace, period, expires_at);
 ";
 
 impl SqliteStore {
@@ -303,13 +303,13 @@ impl Store for SqliteStore {
                 return Err(StoreError::NotFound(namespace));
             }
             tx.execute(
-                "INSERT INTO axond_budget_active (namespace, period) VALUES (?1, ?2)
+                "INSERT INTO axond_store_budget_active (namespace, period) VALUES (?1, ?2)
                  ON CONFLICT (namespace) DO UPDATE SET period = excluded.period",
                 params![namespace, period],
             )
             .map_err(unavailable)?;
             tx.execute(
-                "INSERT INTO axond_budget (namespace, period, limit_microdollars, spent_microdollars)
+                "INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
                  VALUES (?1, ?2, ?3, 0)
                  ON CONFLICT (namespace, period) DO UPDATE SET
                     limit_microdollars = excluded.limit_microdollars",
@@ -351,7 +351,7 @@ impl Store for SqliteStore {
                 .map_err(unavailable)?;
             let Some(period) = tx
                 .query_row(
-                    "SELECT period FROM axond_budget_active WHERE namespace = ?1",
+                    "SELECT period FROM axond_store_budget_active WHERE namespace = ?1",
                     params![namespace],
                     |row| row.get::<_, String>(0),
                 )
@@ -362,14 +362,14 @@ impl Store for SqliteStore {
             };
             let now = now_ms();
             tx.execute(
-                "DELETE FROM axond_budget_reservation
+                "DELETE FROM axond_store_budget_reservation
                  WHERE namespace = ?1 AND expires_at <= ?2",
                 params![namespace, now],
             )
             .map_err(unavailable)?;
             let (limit, spent) = match tx
                 .query_row(
-                    "SELECT limit_microdollars, spent_microdollars FROM axond_budget
+                    "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget
                      WHERE namespace = ?1 AND period = ?2",
                     params![namespace, period],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
@@ -382,7 +382,7 @@ impl Store for SqliteStore {
             };
             let reserved: i64 = tx
                 .query_row(
-                    "SELECT COALESCE(SUM(amount_microdollars), 0) FROM axond_budget_reservation
+                    "SELECT COALESCE(SUM(amount_microdollars), 0) FROM axond_store_budget_reservation
                      WHERE namespace = ?1 AND period = ?2 AND expires_at > ?3",
                     params![namespace, period, now],
                     |row| row.get(0),
@@ -393,7 +393,7 @@ impl Store for SqliteStore {
             }
             let expires_at = now.saturating_add(ttl_ms);
             tx.execute(
-                "INSERT INTO axond_budget_reservation
+                "INSERT INTO axond_store_budget_reservation
                     (id, namespace, period, amount_microdollars, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![reservation_id, namespace, period, estimate, expires_at],
@@ -421,12 +421,12 @@ impl Store for SqliteStore {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(unavailable)?;
             tx.execute(
-                "DELETE FROM axond_budget_reservation WHERE id = ?1",
+                "DELETE FROM axond_store_budget_reservation WHERE id = ?1",
                 params![reservation_id],
             )
             .map_err(unavailable)?;
             tx.execute(
-                "UPDATE axond_budget
+                "UPDATE axond_store_budget
                  SET spent_microdollars = spent_microdollars + ?1
                  WHERE namespace = ?2 AND period = ?3",
                 params![actual, namespace, period],
@@ -458,16 +458,16 @@ fn read_budget(
              b.spent_microdollars,
              COALESCE((
                  SELECT SUM(r.amount_microdollars)
-                 FROM axond_budget_reservation r
+                 FROM axond_store_budget_reservation r
                  WHERE r.namespace = b.namespace
                    AND r.period = b.period
                    AND r.expires_at > ?3
              ), 0),
              EXISTS (
-                 SELECT 1 FROM axond_budget_active a
+                 SELECT 1 FROM axond_store_budget_active a
                  WHERE a.namespace = b.namespace AND a.period = b.period
              )
-         FROM axond_budget b
+         FROM axond_store_budget b
          WHERE b.namespace = ?1 AND b.period = ?2",
         params![namespace, period, now],
         |row| {
@@ -591,12 +591,41 @@ mod tests {
         let n: i64 = {
             let conn = store.conn.lock().expect("lock");
             conn.query_row(
-                "SELECT count(*) FROM axond_budget_reservation WHERE namespace = 'wsp_x'",
+                "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
                 [],
                 |row| row.get(0),
             )
             .expect("count")
         };
         assert_eq!(n, 1, "expired holds from the old period must be reclaimed");
+    }
+
+    #[test]
+    fn budget_tables_use_store_prefix() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let conn = store.conn.lock().expect("lock");
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type IN ('table', 'index')
+                     ORDER BY name",
+                )
+                .expect("prep");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query")
+                .map(|row| row.expect("name"))
+                .collect()
+        };
+        assert!(names.iter().any(|n| n == "axond_store_budget"));
+        assert!(names.iter().any(|n| n == "axond_store_budget_active"));
+        assert!(names.iter().any(|n| n == "axond_store_budget_reservation"));
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "axond_store_budget_reservation_scope_idx")
+        );
+        assert!(!names.iter().any(|n| n == "axond_budget"));
+        assert!(!names.iter().any(|n| n == "axond_budget_reservation"));
     }
 }

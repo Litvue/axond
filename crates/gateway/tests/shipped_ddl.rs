@@ -126,6 +126,26 @@ fn the_secret_store_declares_no_index_its_statements_would_not_plan_against() {
     );
 }
 
+/// Store budget tables must not reuse the withdrawn `[budget]` Postgres
+/// backend names. `CREATE TABLE IF NOT EXISTS axond_budget` would leave a
+/// leftover `budget_v1.sql` ledger in place and fail `probe_schema`.
+#[test]
+fn store_budget_tables_do_not_reuse_withdrawn_budget_backend_names() {
+    let (_, contents) = sql_files(&operator_dir())
+        .into_iter()
+        .find(|(name, _)| name == "store_budget_v1.sql")
+        .expect("store budget DDL is shipped");
+    let text =
+        String::from_utf8(contents).unwrap_or_else(|_| panic!("store_budget_v1.sql is not UTF-8"));
+    assert!(text.contains("CREATE TABLE IF NOT EXISTS axond_store_budget ("));
+    assert!(text.contains("CREATE TABLE IF NOT EXISTS axond_store_budget_active ("));
+    assert!(text.contains("CREATE TABLE IF NOT EXISTS axond_store_budget_reservation ("));
+    assert!(text.contains("CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx"));
+    assert!(!text.contains("CREATE TABLE IF NOT EXISTS axond_budget ("));
+    assert!(!text.contains("CREATE TABLE IF NOT EXISTS axond_budget_active ("));
+    assert!(!text.contains("CREATE TABLE IF NOT EXISTS axond_budget_reservation ("));
+}
+
 /// A shipped DDL header is an operator's route into the reasoning behind the
 /// schema, and ADR 0009 forbids editing the file once it has been applied — so a
 /// pointer at an ADR that does not exist (a number two branches both claimed, a
