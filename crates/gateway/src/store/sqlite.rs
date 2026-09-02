@@ -837,6 +837,25 @@ impl Store for SqliteStore {
         })
         .await
     }
+
+    async fn mark_provider_models_stale_if_source(
+        &self,
+        provider: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let provider = provider.to_string();
+        let source = source.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE axond_store_provider_models SET stale = 1
+                 WHERE provider = ?1 AND source IS NOT NULL AND source = ?2",
+                params![provider, source],
+            )
+            .map_err(unavailable)?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 fn sqlite_provider_models(
@@ -1165,6 +1184,13 @@ mod tests {
                 .expect("get")
                 .is_some(),
             "a TOML-listed id is restored on seed; HTTP DELETE of those ids is 409"
+        );
+        assert!(
+            store
+                .namespace_incarnation("wsp_seed")
+                .await
+                .expect("incarnation")
+                .is_some()
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1616,5 +1642,40 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got, fresh);
+    }
+
+    #[tokio::test]
+    async fn provider_models_failed_refresh_does_not_stale_a_newer_source() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let fresh = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(fresh.clone()).await.expect("put");
+        store
+            .mark_provider_models_stale_if_source("openai", "https://api.openai.com/v1")
+            .await
+            .expect("old source");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, fresh);
+        store
+            .mark_provider_models_stale_if_source("openai", "https://example.invalid/v1")
+            .await
+            .expect("matching source");
+        let stale = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(stale.stale);
+        assert_eq!(stale.data, fresh.data);
+        assert_eq!(stale.source, fresh.source);
     }
 }

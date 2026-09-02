@@ -100,7 +100,7 @@ async fn refresh_all(state: &AppState, stop: &mut oneshot::Receiver<()>) -> Roun
                         error = %error,
                         "provider model discovery failed"
                     );
-                    mark_stale(state, id).await;
+                    mark_stale(state, id, base_url).await;
                 }
             }
         }
@@ -245,11 +245,14 @@ async fn stale_if_source_changed(state: &AppState, provider: &str, base_url: &st
     }
 }
 
-async fn mark_stale(state: &AppState, provider: &str) {
+async fn mark_stale(state: &AppState, provider: &str, source: &str) {
     let Some(store) = state.store() else {
         return;
     };
-    if let Err(error) = store.mark_provider_models_stale(provider).await {
+    if let Err(error) = store
+        .mark_provider_models_stale_if_source(provider, source)
+        .await
+    {
         tracing::warn!(
             provider,
             error = %error,
