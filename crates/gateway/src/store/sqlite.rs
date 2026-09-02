@@ -127,6 +127,7 @@ impl Store for SqliteStore {
     ) -> Result<(Vec<NamespaceRecord>, Option<String>), StoreError> {
         let limit = limit.clamp(1, 1000);
         self.with_conn(move |conn| {
+            let fetch = i64::from(limit) + 1;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, attrs, blocklist FROM axond_namespace
@@ -136,7 +137,7 @@ impl Store for SqliteStore {
                 )
                 .map_err(unavailable)?;
             let rows = stmt
-                .query_map(params![cursor, limit], |row| {
+                .query_map(params![cursor, fetch], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -149,7 +150,8 @@ impl Store for SqliteStore {
                 let (id, attrs, blocklist) = row.map_err(unavailable)?;
                 out.push(row_to_record(id, attrs, blocklist)?);
             }
-            let next = if out.len() == limit as usize {
+            let next = if out.len() > limit as usize {
+                out.pop();
                 out.last().map(|row| row.id.clone())
             } else {
                 None

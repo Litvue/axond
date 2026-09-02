@@ -189,4 +189,34 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
         assert_eq!(got, rec);
     }
+
+    #[tokio::test]
+    async fn sqlite_list_cursor_only_when_another_row_exists() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        for id in ["a", "b", "c"] {
+            store
+                .put_namespace(NamespaceRecord {
+                    id: id.into(),
+                    attrs: serde_json::json!({}),
+                    blocklist: None,
+                })
+                .await
+                .expect("insert");
+        }
+        let (page, next) = store.list_namespaces(None, 3).await.expect("full page");
+        assert_eq!(page.len(), 3);
+        assert_eq!(next, None);
+        let (page, next) = store.list_namespaces(None, 2).await.expect("partial");
+        assert_eq!(
+            page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(next.as_deref(), Some("b"));
+        let (page, next) = store.list_namespaces(next, 2).await.expect("remainder");
+        assert_eq!(
+            page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["c"]
+        );
+        assert_eq!(next, None);
+    }
 }

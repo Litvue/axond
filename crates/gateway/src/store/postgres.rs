@@ -102,6 +102,7 @@ impl Store for PostgresStore {
         limit: u32,
     ) -> Result<(Vec<NamespaceRecord>, Option<String>), StoreError> {
         let limit = i64::from(limit.clamp(1, 1000));
+        let fetch = limit + 1;
         let client = &self.client;
         let rows = client
             .query(
@@ -109,7 +110,7 @@ impl Store for PostgresStore {
                  WHERE ($1::text IS NULL OR id > $1)
                  ORDER BY id
                  LIMIT $2",
-                &[&cursor, &limit],
+                &[&cursor, &fetch],
             )
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -117,7 +118,8 @@ impl Store for PostgresStore {
         for row in rows {
             out.push(record_from(row.get(0), row.get(1), row.get(2))?);
         }
-        let next = if out.len() == limit as usize {
+        let next = if out.len() as i64 > limit {
+            out.pop();
             out.last().map(|row| row.id.clone())
         } else {
             None
