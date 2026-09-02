@@ -133,23 +133,15 @@ fn unavailable(err: rusqlite::Error) -> StoreError {
 
 /// `CREATE TABLE IF NOT EXISTS` does not add columns to an existing file.
 fn migrate_reservation_incarnation(conn: &Connection) -> Result<(), StoreError> {
-    let has: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('axond_store_budget_reservation')
-             WHERE name = 'incarnation'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(unavailable)?;
-    if has == 0 {
-        conn.execute(
-            "ALTER TABLE axond_store_budget_reservation
-             ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 1",
-            [],
-        )
-        .map_err(unavailable)?;
+    match conn.execute(
+        "ALTER TABLE axond_store_budget_reservation
+         ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 1",
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(err) if err.to_string().contains("duplicate column name") => Ok(()),
+        Err(err) => Err(unavailable(err)),
     }
-    Ok(())
 }
 
 fn current_incarnation(conn: &Connection, id: &str) -> Result<i64, StoreError> {
@@ -473,10 +465,12 @@ impl Store for SqliteStore {
             };
             let now = now_ms();
             let incarnation = current_incarnation(&tx, &namespace)?;
+            // Expired holds of every incarnation. Unexpired prior-generation
+            // rows stay so a late settle can still see them.
             tx.execute(
                 "DELETE FROM axond_store_budget_reservation
-                 WHERE namespace = ?1 AND expires_at <= ?2 AND incarnation = ?3",
-                params![namespace, now, incarnation],
+                 WHERE namespace = ?1 AND expires_at <= ?2",
+                params![namespace, now],
             )
             .map_err(unavailable)?;
             let (limit, spent) = match tx
@@ -964,6 +958,119 @@ mod tests {
             .expect("count")
         };
         assert_eq!(holds, 0, "old hold is dropped even when spend is skipped");
+    }
+
+    #[tokio::test]
+    async fn reserve_reclaims_expired_holds_of_any_incarnation() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "old")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("new ledger");
+        store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "new")
+            .await
+            .expect("expire path");
+        let (old, n): (i64, i64) = {
+            let conn = store.conn.lock().expect("lock");
+            let count = |sql: &str| conn.query_row(sql, [], |row| row.get(0)).expect("count");
+            (
+                count("SELECT count(*) FROM axond_store_budget_reservation WHERE id = 'old'"),
+                count(
+                    "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
+                ),
+            )
+        };
+        assert_eq!(old, 0, "expired prior-incarnation hold must be reclaimed");
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn unexpired_prior_incarnation_hold_survives_reserve() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_secs(30), "old")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("new ledger");
+        store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "new")
+            .await
+            .expect("live hold");
+        let n: i64 = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(
+            n, 2,
+            "unexpired prior-incarnation hold stays until settle or TTL"
+        );
+        store
+            .settle_budget("wsp_x", "p", "old", 10)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
     }
 
     #[tokio::test]
