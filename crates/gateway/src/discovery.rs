@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 
 use crate::config::ProviderKind;
 use crate::state::AppState;
-use crate::store::{ProviderModels, StoreError};
+use crate::store::ProviderModels;
 
 /// Anthropic `GET /v1/models` default page is 20; 20 pages is a hard ceiling
 /// so a `has_more` loop cannot run unbounded.
@@ -226,38 +226,12 @@ async fn mark_stale(state: &AppState, provider: &str) {
     let Some(store) = state.store() else {
         return;
     };
-    let existing = store.get_provider_models(provider).await;
-    let Some(row) = stale_row(existing, provider) else {
-        return;
-    };
-    if let Err(error) = store.put_provider_models(row).await {
+    if let Err(error) = store.mark_provider_models_stale(provider).await {
         tracing::warn!(
             provider,
             error = %error,
             "could not persist stale provider model cache"
         );
-    }
-}
-
-/// `Err` must not overwrite last-good. Only `Ok(None)` writes empty+stale.
-fn stale_row(
-    existing: Result<Option<ProviderModels>, StoreError>,
-    provider: &str,
-) -> Option<ProviderModels> {
-    match existing {
-        Ok(Some(mut row)) => {
-            row.stale = true;
-            Some(row)
-        }
-        Ok(None) => Some(ProviderModels::empty_stale(provider)),
-        Err(error) => {
-            tracing::warn!(
-                provider,
-                error = %error,
-                "could not read provider model cache to mark stale"
-            );
-            None
-        }
     }
 }
 
@@ -424,29 +398,6 @@ mod tests {
             models_path(Some("claude-3 opus")),
             "/models?after_id=claude-3%20opus"
         );
-    }
-
-    #[test]
-    fn stale_row_preserves_last_good_and_ignores_read_errors() {
-        let good = ProviderModels {
-            provider: "openai".into(),
-            fetched_at: Some("2026-09-02T12:00:00Z".into()),
-            stale: false,
-            data: vec![json!({"id": "gpt-4o"})],
-            source: Some("https://api.openai.com/v1".into()),
-        };
-        let marked = stale_row(Ok(Some(good.clone())), "openai").expect("row");
-        assert!(marked.stale);
-        assert_eq!(marked.data, good.data);
-        assert_eq!(marked.fetched_at, good.fetched_at);
-        assert_eq!(marked.source, good.source);
-
-        let empty = stale_row(Ok(None), "openai").expect("empty");
-        assert!(empty.stale);
-        assert!(empty.data.is_empty());
-        assert!(empty.fetched_at.is_none());
-
-        assert!(stale_row(Err(StoreError::Unavailable("down".into())), "openai").is_none());
     }
 
     #[test]

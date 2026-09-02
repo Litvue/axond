@@ -280,6 +280,13 @@ pub trait Store: Send + Sync {
         let _ = row;
         Ok(())
     }
+
+    /// Set `stale = true` on the existing cache row. Does not replace
+    /// `data`/`fetched_at`/`source`. Missing row is a no-op.
+    async fn mark_provider_models_stale(&self, provider: &str) -> Result<(), StoreError> {
+        let _ = provider;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +353,9 @@ impl Store for UnavailableStore {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn put_provider_models(&self, _: ProviderModels) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn mark_provider_models_stale(&self, _: &str) -> Result<(), StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
 }
