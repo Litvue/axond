@@ -5294,24 +5294,55 @@ fn serve_snapshot(mut snapshot: crate::state::ConfigSnapshot) -> AppState {
 }
 
 async fn listed_models(state: AppState, key: &str) -> Value {
-    let response = inference_router(state)
-        .oneshot(
-            Request::get("/v1/models")
-                .header(axum::http::header::AUTHORIZATION, format!("Bearer {key}"))
-                .body(Body::empty())
-                .expect("a request"),
-        )
-        .await
-        .expect("a response");
-    let status = response.status();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("a body")
-        .to_bytes();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    serde_json::from_slice(&body).expect("a catalogue document")
+    let namespaces: Vec<String> = {
+        let snapshot = state.config();
+        let mut namespaces: Vec<String> = snapshot
+            .config
+            .namespace
+            .iter()
+            .map(|namespace| namespace.id.clone())
+            .collect();
+        namespaces.extend(
+            snapshot
+                .config
+                .gateway_key
+                .iter()
+                .map(|gateway_key| gateway_key.namespace.clone()),
+        );
+        if namespaces.is_empty() {
+            namespaces.push("platform".to_owned());
+        }
+        namespaces
+    };
+    let mut last = (StatusCode::NOT_FOUND, Vec::new());
+    for namespace in namespaces {
+        let response = inference_router(state.clone())
+            .oneshot(
+                Request::get(format!("/ns/{namespace}/v1/models"))
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .expect("a request"),
+            )
+            .await
+            .expect("a response");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes()
+            .to_vec();
+        if status == StatusCode::OK {
+            return serde_json::from_slice(&body).expect("a catalogue document");
+        }
+        last = (status, body);
+    }
+    panic!(
+        "authenticated /v1/models answered {}: {}",
+        last.0,
+        String::from_utf8_lossy(&last.1)
+    );
 }
 
 fn assert_charges_stated_rates(snapshot: &crate::state::ConfigSnapshot) {
@@ -5543,7 +5574,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
 
     let listed = inference_router(state.clone())
         .oneshot(
-            Request::get("/v1/models")
+            Request::get("/ns/platform/v1/models")
                 .header(axum::http::header::AUTHORIZATION, "Bearer inbound-secret")
                 .body(Body::empty())
                 .expect("a request"),
@@ -5564,7 +5595,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
 
     let refused = inference_router(state)
         .oneshot(
-            Request::post("/v1/chat/completions")
+            Request::post("/ns/platform/v1/chat/completions")
                 .header(axum::http::header::AUTHORIZATION, "Bearer inbound-secret")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(Body::from(

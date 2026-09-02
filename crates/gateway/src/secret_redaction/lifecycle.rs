@@ -19,8 +19,8 @@ use http_body_util::BodyExt as _;
 use tower::util::ServiceExt as _;
 
 use super::harness::{
-    FakeProvider, PROVIDER_MATERIAL, ROTATED_MATERIAL, Replica, bootstrap, bootstrap_env,
-    chat_request, first, material, owner, state_pinning, state_sharing, sweep,
+    FakeProvider, INBOUND_MATERIAL, PROVIDER_MATERIAL, ROTATED_MATERIAL, Replica, bootstrap,
+    bootstrap_env, chat_request, first, material, owner, state_pinning, state_sharing, sweep,
 };
 use crate::backends::fakes::InMemorySecrets;
 use crate::backends::secrets::{SecretResolver as _, SecretStore as _};
@@ -412,7 +412,16 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
         .expect("the config is servable");
 
     let response = router(state.clone())
-        .oneshot(chat_request())
+        .oneshot(
+            axum::http::Request::post("/ns/platform/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {INBOUND_MATERIAL}"),
+                )
+                .body(axum::body::Body::from(r#"{"model":"fast","messages":[]}"#))
+                .expect("a valid request"),
+        )
         .await
         .expect("a response");
     assert_eq!(response.status(), StatusCode::OK);

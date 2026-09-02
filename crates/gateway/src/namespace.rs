@@ -54,13 +54,20 @@ impl NamespaceId {
         if input.len() > Self::MAX_LEN {
             return Err(InvalidNamespaceId::TooLong { max: Self::MAX_LEN });
         }
-        if !input
+        if let Some((left, right)) = input.split_once('/') {
+            // Projected tenant/project ids (`acme/core`) are two URL segments
+            // under `/ns/{tenant}/{project}/v1`. Each slug matches the durable
+            // identifier grammar; a third slash or a percent-encoded slash is
+            // still a different spelling and is refused.
+            if right.contains('/') || !slug_segment(left) || !slug_segment(right) {
+                return Err(InvalidNamespaceId::Character);
+            }
+        } else if !input
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         {
             return Err(InvalidNamespaceId::Character);
-        }
-        if !input
+        } else if !input
             .as_bytes()
             .first()
             .is_some_and(u8::is_ascii_alphanumeric)
@@ -77,6 +84,16 @@ impl NamespaceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn slug_segment(segment: &str) -> bool {
+    let alphanumeric = |byte: &u8| byte.is_ascii_alphanumeric();
+    !segment.is_empty()
+        && segment.as_bytes().first().is_some_and(alphanumeric)
+        && segment.as_bytes().last().is_some_and(alphanumeric)
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 impl fmt::Debug for NamespaceId {
@@ -201,6 +218,7 @@ mod tests {
             "acme.core",
             "a.b",
             "a..b",
+            "acme/core",
             longest.as_str(),
         ] {
             let id = NamespaceId::parse(input).expect("canonical namespace id");
@@ -216,7 +234,7 @@ mod tests {
             Err(InvalidNamespaceId::TooLong { .. })
         ));
         for input in [
-            "acme/core",
+            "acme/core/extra",
             "acme%2fcore",
             "acme%2Fcore",
             "café",
@@ -241,8 +259,8 @@ mod tests {
 
     #[test]
     fn parser_refusals_do_not_echo_the_input() {
-        let material = "sk-live-0123456789abcdefghij/secret";
-        let error = NamespaceId::parse(material).expect_err("slash is refused");
+        let material = "sk-live-0123456789abcdefghij/secret/extra";
+        let error = NamespaceId::parse(material).expect_err("a third slash is refused");
         assert!(!error.to_string().contains(material));
         assert!(!format!("{error:?}").contains(material));
     }
@@ -256,7 +274,12 @@ mod tests {
             id
         );
 
-        for invalid in [r#"""#, r#""acme/core""#, r#""acme%2Fcore""#, r#""café""#] {
+        for invalid in [
+            r#"""#,
+            r#""acme/core/extra""#,
+            r#""acme%2Fcore""#,
+            r#""café""#,
+        ] {
             assert!(
                 serde_json::from_str::<NamespaceId>(invalid).is_err(),
                 "{invalid}"

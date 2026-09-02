@@ -253,7 +253,7 @@ def smoke(binary: Path) -> None:
         config.write_text(
             CONFIG_TEMPLATE.format(
                 bind=f"127.0.0.1:{port}",
-                sqlite=directory / "axond.sqlite",
+                sqlite=str(directory / "axond.sqlite").replace("\\", "/"),
                 upstream=upstream.base_url,
                 alias=ALIAS,
                 target_model=CHAT,

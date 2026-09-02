@@ -222,8 +222,8 @@ Use `sslmode=require` in production DSNs. Axond uses rustls and webpki roots.
 
 | Backend | Supported | Exercised in CI | Floor is enforced by |
 | --- | --- | --- | --- |
-| PostgreSQL | 14, 15, 16, 17 | `postgres:17.6-alpine` | The control-plane backend: boot and `axond check preflight` read `server_version_num` and refuse an older server. A usage sink, budget backend, or revocation table on Postgres is not version-checked. |
-| Redis | 6.2, 7.x, 8.x | `redis:7.4.2-alpine` | Nothing at boot; an older server fails the first enforcement write instead. |
+| PostgreSQL | 14, 15, 16, 17 | opt-in overlay drill `postgres:17.6-alpine` | The control-plane backend: boot and `axond check preflight` read `server_version_num` and refuse an older server. A usage sink, budget backend, or revocation table on Postgres is not version-checked. |
+| Redis | 6.2, 7.x, 8.x | not exercised (ADR 0063) | Nothing at boot; an older server fails the first enforcement write instead. Redis budget and rate-limit backends are withdrawn from required CI. |
 
 The floors are the oldest servers the shipped statements can run on, not a
 preference. PostgreSQL 14 is where the journal's identity columns and
@@ -232,7 +232,11 @@ preference. PostgreSQL 14 is where the journal's identity columns and
 the revocation liveness write uses; on 6.0 that write is a command error, so a
 revocation backend on an older Redis fails closed at the first probe rather than
 silently. `ops/check-deploy-manifests.py` keeps this table, the enforced
-PostgreSQL floor, and the CI service images from drifting apart.
+PostgreSQL floor, and required-CI service images from drifting apart.
+Request-path qualification boots SQLite and does not attach Redis or
+Postgres; a backtick-only "Exercised in CI" cell is a required-CI claim
+and fails if that service is missing. Opt-in overlay drills and
+explicit "not exercised" markers are not treated as required-CI success.
 
 The version refusal is the control plane's alone, because that is the only store
 whose schema axond owns and migrates. The other Postgres-backed features run DDL

@@ -2093,11 +2093,9 @@ fn open_store_sync(config: &Config) -> Result<Arc<dyn crate::store::Store>, Snap
             let path = storage.path.as_deref().unwrap_or(":memory:");
             let store = crate::store::SqliteStore::open(path)
                 .map_err(|error| SnapshotError::Store(error.to_string()))?;
-            futures::executor::block_on(crate::store::seed_config_namespaces(
-                &store,
-                &config.namespace,
-            ))
-            .map_err(|error| SnapshotError::Store(error.to_string()))?;
+            store
+                .seed_config_namespaces_sync(&config.namespace)
+                .map_err(|error| SnapshotError::Store(error.to_string()))?;
             Ok(Arc::new(store))
         }
         StorageBackend::Postgres => Err(SnapshotError::Store(

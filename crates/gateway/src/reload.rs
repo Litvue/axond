@@ -968,14 +968,14 @@ mod tests {
 
     impl ConfigFile {
         fn with_storage(contents: &str, toml_path: &std::path::Path) -> String {
-            if contents.contains("[storage]") {
+            // Secret files (JWT material) are also written through this helper
+            // and must stay verbatim. Config TOML always contains a table.
+            if contents.contains("[storage]") || !contents.contains('[') {
                 contents.to_string()
             } else {
                 let sqlite = toml_path.with_extension("sqlite");
-                format!(
-                    "[storage]\nbackend = \"sqlite\"\npath = \"{}\"\n\n{contents}",
-                    sqlite.display()
-                )
+                let sqlite = sqlite.to_string_lossy().replace('\\', "/");
+                format!("{contents}\n\n[storage]\nbackend = \"sqlite\"\npath = \"{sqlite}\"\n")
             }
         }
 
@@ -1193,7 +1193,7 @@ scope = ["chat", "models"]
     async fn listed_aliases(state: &AppState) -> Vec<String> {
         let resp = routes::router(state.clone())
             .oneshot(
-                Request::get("/v1/models")
+                Request::get("/ns/platform/v1/models")
                     .header(axum::http::header::AUTHORIZATION, "Bearer inbound-secret")
                     .body(Body::empty())
                     .unwrap(),

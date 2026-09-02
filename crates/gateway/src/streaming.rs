@@ -1993,9 +1993,19 @@ namespace = "platform"
         ])
     }
 
+    fn ns_path(uri: &str) -> String {
+        if uri.starts_with("/ns/") {
+            uri.to_owned()
+        } else if let Some(rest) = uri.strip_prefix("/v1/") {
+            format!("/ns/platform/v1/{rest}")
+        } else {
+            uri.to_owned()
+        }
+    }
+
     /// A JSON `POST` that already carries the caller's gateway key.
     fn authorized(uri: &str) -> axum::http::request::Builder {
-        Request::post(uri)
+        Request::post(ns_path(uri))
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::AUTHORIZATION, format!("Bearer {CALLER_SECRET}"))
     }

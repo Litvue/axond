@@ -4557,7 +4557,9 @@ impl Config {
         let source = if s.contains("[storage]") {
             s
         } else {
-            owned = format!("[storage]\nbackend = \"sqlite\"\npath = \":memory:\"\n\n{s}");
+            // Append, never prepend: a leading `[storage]` table would capture
+            // subsequent root keys (`mode = "stateful"`) as storage fields.
+            owned = format!("{s}\n\n[storage]\nbackend = \"sqlite\"\npath = \":memory:\"\n");
             &owned
         };
         let cfg: Config = Figment::new()

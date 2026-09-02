@@ -634,7 +634,7 @@ fn settings() -> ConvergenceSettings {
 
 /// A caller's request, authenticated with the inbound sentinel.
 pub(crate) fn chat_request() -> Request<Body> {
-    Request::post("/v1/chat/completions")
+    Request::post(format!("/ns/{SERVING_NAMESPACE}/v1/chat/completions"))
         .header("content-type", "application/json")
         .header(
             axum::http::header::AUTHORIZATION,

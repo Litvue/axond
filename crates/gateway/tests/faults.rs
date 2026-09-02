@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use support::fault::result::{Cleanup, Outage};
-use support::fault::{self, Fault, Outcome, Row};
+use support::fault::{self, Fault, Outcome, Row, Service};
 
 /// Set by the lane that runs this binary alone, and by nothing else.
 const LANE: &str = "AXOND_FAULT_MATRIX";
@@ -56,7 +56,7 @@ async fn every_committed_fault_row_qualifies_and_publishes_its_evidence() {
         match fault::run(row, &text).await {
             Outcome::Skipped { row, reason } => {
                 eprintln!("skipped {row}: {reason}");
-                skipped.push(row);
+                skipped.push((row, reason));
             }
             Outcome::Ran(result) => {
                 let path = result.write();
@@ -76,12 +76,57 @@ async fn every_committed_fault_row_qualifies_and_publishes_its_evidence() {
         "the fault matrix did not qualify:\n{}",
         failures.join("\n")
     );
+    for row in manifest
+        .rows
+        .iter()
+        .filter(|row| row.service() == Some(Service::Redis))
+    {
+        let reason = skipped
+            .iter()
+            .find(|(id, _)| id == &row.id)
+            .map(|(_, reason)| reason.as_str());
+        assert!(
+            reason.is_some_and(|reason| reason.contains("ADR 0063")),
+            "{} must skip for ADR 0063, got {reason:?}",
+            row.id
+        );
+    }
     if !skipped.is_empty() {
         eprintln!(
             "skipped {} backend rows (Redis withdrawn / Postgres HA optional): {}",
             skipped.len(),
-            skipped.join(", ")
+            skipped
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
+    }
+}
+
+#[tokio::test]
+async fn redis_backend_rows_skip_because_adr_0063_withdrew_them() {
+    let (manifest, text) = fault::manifest::load();
+    let redis_rows: Vec<&Row> = manifest
+        .rows
+        .iter()
+        .filter(|row| row.service() == Some(Service::Redis))
+        .collect();
+    assert!(
+        !redis_rows.is_empty(),
+        "the manifest still lists Redis rows so the skip reason stays testable"
+    );
+    for row in redis_rows {
+        match fault::run(row, &text).await {
+            Outcome::Skipped { reason, .. } => {
+                assert!(
+                    reason.contains("ADR 0063"),
+                    "{} skip reason must cite ADR 0063, got {reason}",
+                    row.id
+                );
+            }
+            Outcome::Ran(_) => panic!("{} ran; Redis rows must skip", row.id),
+        }
     }
 }
 

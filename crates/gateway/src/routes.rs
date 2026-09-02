@@ -103,7 +103,8 @@ pub fn router(state: AppState) -> Router {
         authenticate_middleware,
     ));
     global
-        .merge(Router::new().nest("/ns/{namespace}", canonical))
+        .merge(Router::new().nest("/ns/{namespace}", canonical.clone()))
+        .merge(Router::new().nest("/ns/{tenant}/{project}", canonical))
         .merge(api)
 }
 
@@ -1039,13 +1040,25 @@ async fn authenticate_middleware(
             .namespace_grant()
             .map_err(|_| GatewayError::NamespaceNotAuthorized)?;
         let authorized = grant.permits(&namespace);
-        let record = match state.store() {
+        let mut record = match state.store() {
             Some(store) => store
                 .get_namespace(namespace.as_str())
                 .await
                 .map_err(GatewayError::from)?,
             None => None,
         };
+        if record.is_none() {
+            // A published snapshot is already serving these ids; seed-on-boot
+            // only inserts bootstrap rows. Projected tenant/project namespaces
+            // are admitted from the snapshot until the store catches up.
+            record = snapshot.config.namespace.iter().find_map(|declared| {
+                (declared.id == namespace.as_str()).then(|| crate::store::NamespaceRecord {
+                    id: declared.id.clone(),
+                    attrs: serde_json::json!({}),
+                    blocklist: None,
+                })
+            });
+        }
         if !authorized {
             debug!(
                 namespace = %namespace,
@@ -1120,7 +1133,10 @@ fn namespace_from_canonical_path(path: &str) -> Result<NamespaceId, GatewayError
         .strip_prefix("/ns/")
         .or_else(|| path.strip_prefix("/namespaces/"))
         .ok_or(GatewayError::InvalidNamespace)?;
-    let (namespace, suffix) = rest.split_once('/').ok_or(GatewayError::InvalidNamespace)?;
+    let (namespace, suffix) = rest
+        .split_once("/v1/")
+        .or_else(|| rest.split_once('/'))
+        .ok_or(GatewayError::InvalidNamespace)?;
     if suffix.is_empty() {
         return Err(GatewayError::InvalidNamespace);
     }
@@ -4850,7 +4866,7 @@ targets = [{{ provider = "responses", model = "responses-model", price = {{ inpu
             .oneshot(
                 Request::builder()
                     .method(method)
-                    .uri(path)
+                    .uri(ns_path(path))
                     .header("authorization", format!("Bearer {token}"))
                     .header("content-type", "application/json")
                     .body(Body::from(body))

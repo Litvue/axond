@@ -45,6 +45,7 @@ overlay="${root}/deploy/kubernetes/overlays/production"
 version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' \
   "${root}/Cargo.toml" | head -n 1)"
 image="${AXOND_ROLLOUT_IMAGE:-ghcr.io/litvue/axond:${version}}"
+postgres_image="${AXOND_ROLLOUT_POSTGRES_IMAGE:-postgres:17.6-alpine}"
 
 workdir="$(mktemp -d)"
 cleanup() {
@@ -105,6 +106,55 @@ step "Loading ${image}"
 docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image" >/dev/null ||
   fail "cannot pull ${image}; set AXOND_ROLLOUT_IMAGE to a published tag"
 kind load docker-image "$image" --name "$cluster" >/dev/null
+docker image inspect "$postgres_image" >/dev/null 2>&1 ||
+  docker pull "$postgres_image" >/dev/null || fail "cannot pull ${postgres_image}"
+kind load docker-image "$postgres_image" --name "$cluster" >/dev/null
+
+step "Standing up the shared Postgres store"
+# Production overlay replicas share one namespace registry (ADR 0063). The drill
+# supplies that database; required request-path CI does not.
+kube create namespace axond >/dev/null 2>&1 || true
+cat >"${workdir}/postgres.yaml" <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: axond
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: ${postgres_image}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_PASSWORD
+              value: rollout-drill
+          ports:
+            - containerPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: axond
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+EOF
+kube apply -f "${workdir}/postgres.yaml" >/dev/null
+kube -n axond rollout status deployment/postgres --timeout=180s >/dev/null ||
+  fail "the drill's Postgres never became ready"
 
 step "Applying the production overlay"
 # `kustomize edit` is not used: the sentinel is replaced in the rendered output,
@@ -122,6 +172,7 @@ kube apply -f "${workdir}/rendered.yaml" >/dev/null
 kube -n axond create secret generic axond-secrets \
   --from-literal=GW_PLATFORM_OPENAI_API_KEY=rollout-drill-openai-key \
   --from-literal=GW_INBOUND_PLATFORM_KEY=rollout-drill-inbound-key \
+  --from-literal=AXOND_STORAGE_DSN='postgres://postgres:rollout-drill@postgres.axond.svc:5432/postgres' \
   --dry-run=client -o yaml | kube apply -f - >/dev/null
 # The whole overlay is applied, NetworkPolicies included, so the drill deploys
 # what an operator would rather than a subset. kindnet does not implement

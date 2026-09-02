@@ -118,7 +118,11 @@ class ArtifactClaim:
 
 def manifest_workloads(slice_id: str, manifest: dict[str, Any]) -> set[str]:
     if slice_id == "fault":
-        return {row["id"] for row in manifest["row"]}
+        return {
+            row["id"]
+            for row in manifest["row"]
+            if row.get("family") != "backend"
+        }
     if slice_id == "rollout":
         return {scenario["id"] for scenario in manifest["scenario"]}
     if slice_id == "recovery":

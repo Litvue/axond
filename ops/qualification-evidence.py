@@ -18,17 +18,6 @@ Usage:
         --note "GitHub Actions ubuntu-latest" \\
         --out target/qualification-records/fault-full.toml
 
-    ops/qualification-evidence.py target/recovery \\
-        --slice recovery --tier serving --runner github-actions \\
-        --binary target/recovery-binaries/stateful/axond \\
-        --note "GitHub Actions stateful-tests plus restore-drill" \\
-        --out target/qualification-records/recovery-serving.toml
-
-    ops/qualification-evidence.py target/stateful-endurance/soak \\
-        --slice stateful-endurance --tier soak --runner github-actions \\
-        --note "GitHub Actions stateful endurance soak" \\
-        --out target/qualification-records/stateful-endurance-soak.toml
-
 Every field written here comes from the artifacts; nothing is supplied by hand
 except the runner classification and its note, which say where the run happened
 and are the reader's warning about what may be compared with what.
@@ -55,24 +44,6 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
-from recovery_contract import (
-    CHECK_RECONSTRUCTIONS,
-    GATE_RECONSTRUCTIONS,
-    LOWER_SHA256,
-    RECOVERY_RESULT_SCHEMA_VERSION,
-    REQUIRED_GATE_NAMES,
-    STAGE_REQUIRED_NULL_OBSERVATIONS,
-    deferred_gate_detail,
-    derive_verdict_outcome,
-    gate_owner,
-    reconstruct_required_check,
-    reconstruct_required_gate,
-    required_checks,
-    required_observations,
-    validate_gate_ownership_model,
-    validate_recovery_artifact,
-)
-
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 ops floor
@@ -81,8 +52,6 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 ops floor
 
 ROOT = Path(__file__).resolve().parent.parent
 CAPACITY_RESULT_SCHEMA_VERSION = 2
-ROLLOUT_PREVIOUS_VERSION = "0.3.40"
-ROLLOUT_CANDIDATE_VERSION = "0.4.0"
 STATEFUL_LEDGER_SHARDS = 64
 STATEFUL_MAX_SHARD_ROWS = 1_500_000
 STATEFUL_LEDGER_FIELDS: tuple[tuple[str, int], ...] = (
@@ -223,37 +192,6 @@ def stateful_ledger_claim(
     return {"sha256": digest.hexdigest(), "files": len(entries), "bytes": total_bytes}
 
 
-def stateful_ledger_claims(result: dict, workload: str) -> dict[str, dict[str, object]]:
-    raw_path = Path(result["_artifact_path"])
-    usage = result.get("usage", {})
-    claims: dict[str, dict[str, object]] = {}
-    for field, files_per_shard in STATEFUL_LEDGER_FIELDS:
-        evidence = usage.get(field, {})
-        shards = evidence.get("shards")
-        if shards != STATEFUL_LEDGER_SHARDS:
-            raise SystemExit(
-                f"{workload}: {field} has {shards!r} shards, expected "
-                f"schema-3 count {STATEFUL_LEDGER_SHARDS}"
-            )
-        directory = resolve_stateful_ledger(
-            raw_path, evidence.get("path"), f"{workload}: {field}"
-        )
-        claim = stateful_ledger_claim(
-            directory,
-            f"{workload}: {field}",
-            field,
-            evidence,
-            schema_label="stateful-endurance schema 3",
-            digest_domain=b"axond-stateful-ledger-v2\0",
-        )
-        expected_files = shards * files_per_shard
-        if claim["files"] != expected_files or claim["bytes"] <= 0:
-            raise SystemExit(
-                f"{workload}: {field} retained {claim['files']} shards, "
-                f"expected {expected_files}, with non-empty evidence"
-            )
-        claims[field] = claim
-    return claims
 
 
 def endurance_ledger_claims(result: dict, workload: str) -> dict[str, dict[str, object]]:
@@ -551,79 +489,15 @@ GENERIC_MANIFESTS = {
     "fault": "qualification/faults/manifest.toml",
 }
 
-RECOVERY_MANIFEST = "qualification/recovery/manifest.toml"
 ENDURANCE_RESULT_SCHEMA_VERSION = 4
 FAULT_RESULT_SCHEMA_VERSION = 1
-ROLLOUT_RESULT_SCHEMA_VERSION = 5
-ROLLOUT_RECORD_SCHEMA_VERSION = 4
-STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION = 3
 ENDURANCE_SURPLUS_VERDICT = "max_unexpected_usage_records"
 
 
-def recovery_expected_stages(manifest_path: Path) -> dict[str, dict[str, Any]]:
-    manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-    expected: dict[str, dict[str, Any]] = {}
-    for scenario in manifest["scenario"]:
-        for stage in scenario["stage"]:
-            if stage["status"] != "executable":
-                continue
-            key = f"{scenario['id']}/{stage['id']}"
-            expected[key] = {
-                "capability": scenario["capability"],
-                "evidence": stage["evidence"],
-                "runner": stage.get("runner", ""),
-                "driver": stage.get("driver", ""),
-                "scenario": scenario,
-                "stage": stage,
-            }
-    return expected
 
 
-def recovery_id(result: dict) -> str:
-    return f"{result['scenario']}/{result['stage']}"
 
 
-def check_recovery_complete(results: list[dict], manifest_path: Path) -> None:
-    expected = recovery_expected_stages(manifest_path)
-    scenarios = {
-        contract["scenario"]["id"]: contract["scenario"] for contract in expected.values()
-    }
-    ownership_problems = validate_gate_ownership_model(list(scenarios.values()))
-    if ownership_problems:
-        raise SystemExit(
-            "recovery: malformed gate ownership model: " + "; ".join(ownership_problems)
-        )
-    observed = [recovery_id(result) for result in results]
-    if set(observed) != set(expected) or len(observed) != len(expected):
-        raise SystemExit(
-            f"recovery: artifacts cover {sorted(set(observed))}, expected "
-            f"{sorted(expected)}; do not retain a partial stage set"
-        )
-
-    for result in results:
-        key = recovery_id(result)
-        contract = expected[key]
-        if result.get("schema_version") != RECOVERY_RESULT_SCHEMA_VERSION:
-            raise SystemExit(f"{key}: unsupported recovery artifact schema")
-        if result.get("runner") != contract["runner"]:
-            raise SystemExit(
-                f"{key}: artifact runner {result.get('runner')!r} does not match "
-                f"the manifest's {contract['runner']!r}"
-            )
-        if result.get("capability") != contract["capability"]:
-            raise SystemExit(f"{key}: artifact capability does not match the manifest")
-        if result.get("evidence") != contract["evidence"]:
-            raise SystemExit(f"{key}: artifact evidence classes do not match the manifest")
-        problems = validate_recovery_artifact(
-            result,
-            contract["scenario"],
-            contract["stage"],
-        )
-        if problems:
-            raise SystemExit(f"{key}: malformed recovery evidence: {'; '.join(problems)}")
-        executable = result.get("run", {}).get("axond_executable_sha256")
-        if not isinstance(executable, str) or not LOWER_SHA256.fullmatch(executable):
-            raise SystemExit(f"{key}: artifact has no exact release executable digest")
 
 
 def shell_output(*args: str) -> str:
@@ -722,191 +596,26 @@ def read_cpu_model() -> str | None:
         return platform.processor() or None
 
 
-def agreed_recovery_cargo_profile(results: list[dict]) -> str:
-    profiles = {
-        result.get("run", {}).get("cargo_profile")
-        for result in results
-    }
-    if len(profiles) != 1:
-        raise SystemExit(
-            "recovery: raw stage Cargo profiles disagree; retain one exact build profile"
-        )
-    profile = next(iter(profiles))
-    if profile not in {"debug", "release"}:
-        raise SystemExit(
-            f"recovery: raw stages name unsupported Cargo profile {profile!r}"
-        )
-    return profile
 
 
-def collect_recovery_provenance(
-    binary_path: Path, cargo_profile: str
-) -> dict[str, Any]:
-    if not binary_path.is_file():
-        raise SystemExit(f"{binary_path}: the recovery binary does not exist")
-    manifest_path = ROOT / RECOVERY_MANIFEST
-    manifest_bytes = manifest_path.read_bytes()
-    binary_bytes = binary_path.read_bytes()
-    commit = shell_output("git", "rev-parse", "HEAD")
-    dirty = bool(shell_output("git", "status", "--porcelain", "--untracked-files=all"))
-    crate = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-    version = str(crate["workspace"]["package"]["version"])
-    rustc = shell_output("rustc", "-V")
-    cpu_count = os.cpu_count()
-    memory = read_memory_kib()
-    cpu_model = read_cpu_model()
-    kernel = platform.release()
-    cgroup = Path("/proc/1/cgroup")
-    containerized = Path("/.dockerenv").exists()
-    if cgroup.exists():
-        containerized = containerized or "kubepods" in cgroup.read_text(
-            encoding="utf-8", errors="ignore"
-        )
-    if not cpu_count or memory is None or not cpu_model or not kernel:
-        raise SystemExit(
-            "the host did not provide complete recovery hardware provenance "
-            "(CPU count/model, memory, or kernel)"
-        )
-    return {
-        "source": {
-            "git_commit": commit,
-            "git_dirty": dirty,
-            "crate_version": version,
-        },
-        "binary": {
-            "sha256": hashlib.sha256(binary_bytes).hexdigest(),
-            "version": version,
-            "cargo_profile": cargo_profile,
-            "rustc": rustc,
-        },
-        "inputs": {
-            "manifest": RECOVERY_MANIFEST,
-            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-            "fixtures": 0,
-        },
-        "hardware": {
-            "os": platform.system().lower(),
-            "arch": platform.machine().lower(),
-            "kernel": kernel,
-            "cpu_model": cpu_model,
-            "cpus": cpu_count,
-            "total_memory_kib": memory,
-            "containerized": containerized,
-        },
-    }
 
 
-def render_recovery(
-    results: list[dict],
-    runner: str,
-    note: str,
-    binary_path: Path,
-    provenance: dict[str, Any] | None = None,
-) -> str:
-    manifest_path = ROOT / RECOVERY_MANIFEST
-    check_recovery_complete(results, manifest_path)
-    expected = recovery_expected_stages(manifest_path)
-    cargo_profile = agreed_recovery_cargo_profile(results)
-    provenance = provenance or collect_recovery_provenance(binary_path, cargo_profile)
-    if provenance.get("binary", {}).get("cargo_profile") != cargo_profile:
-        raise SystemExit(
-            "recovery: retained binary Cargo profile does not match the agreed raw stages"
-        )
-    for result in results:
-        if result["run"].get("axond_version") != provenance["source"]["crate_version"]:
-            raise SystemExit(
-                f"{recovery_id(result)}: stage binary version "
-                f"{result['run'].get('axond_version')!r} does not match the "
-                f"recorded {provenance['source']['crate_version']!r}"
-            )
-        if result["run"].get("axond_executable_sha256") != provenance["binary"]["sha256"]:
-            raise SystemExit(
-                f"{recovery_id(result)}: stage executable digest does not match "
-                "the retained recovery binary"
-            )
-        if result["run"].get("cargo_profile") != provenance["binary"]["cargo_profile"]:
-            raise SystemExit(
-                f"{recovery_id(result)}: stage Cargo profile does not match the record"
-            )
-    lines = [
-        "# A retained recovery qualification run, reduced to executable stage observations.",
-        "# Each stage binds its raw JSON artifact by digest; the raw artifacts remain",
-        "# the detailed diagnosis for the outage, cache, restore, and convergence windows.",
-        "",
-        "schema_version = 1",
-        'slice = "recovery"',
-        'tier = "serving"',
-        f"runner = {toml_string(runner)}",
-        f"runner_note = {toml_string(note)}",
-        "",
-        "[source]",
-        f"git_commit = {toml_string(provenance['source']['git_commit'])}",
-        f"git_dirty = {str(provenance['source']['git_dirty']).lower()}",
-        f"crate_version = {toml_string(provenance['source']['crate_version'])}",
-        "",
-        "[binary]",
-        f"sha256 = {toml_string(provenance['binary']['sha256'])}",
-        f"version = {toml_string(provenance['binary']['version'])}",
-        f"cargo_profile = {toml_string(provenance['binary']['cargo_profile'])}",
-        f"rustc = {toml_string(provenance['binary']['rustc'])}",
-        "",
-        "[inputs]",
-        f"manifest = {toml_string(provenance['inputs']['manifest'])}",
-        f"manifest_sha256 = {toml_string(provenance['inputs']['manifest_sha256'])}",
-        f"fixtures = {provenance['inputs']['fixtures']}",
-        "",
-        "[hardware]",
-        f"os = {toml_string(provenance['hardware']['os'])}",
-        f"arch = {toml_string(provenance['hardware']['arch'])}",
-        f"kernel = {toml_string(provenance['hardware']['kernel'])}",
-        f"cpu_model = {toml_string(provenance['hardware']['cpu_model'])}",
-        f"cpus = {provenance['hardware']['cpus']}",
-        f"total_memory_kib = {provenance['hardware']['total_memory_kib']}",
-        f"containerized = {str(provenance['hardware']['containerized']).lower()}",
-    ]
-    for result in sorted(results, key=recovery_id):
-        verdicts = result.get("gates", []) + result.get("checks", [])
-        run = result["run"]
-        lines += [
-            "",
-            "[[stage]]",
-            f"id = {toml_string(recovery_id(result))}",
-            f"runner = {toml_string(result['runner'])}",
-            f"driver = {toml_string(expected[recovery_id(result)]['driver'])}",
-            f"artifact_schema_version = {result['schema_version']}",
-            f"binary_sha256 = {toml_string(run['axond_executable_sha256'])}",
-            "artifact_sha256 = "
-            f"{toml_string(hashlib.sha256(Path(result['_artifact_path']).read_bytes()).hexdigest())}",
-            f"elapsed_ms = {run['elapsed_ms']}",
-            f"verdicts = {len(verdicts)}",
-            f"passed = {str(not any(v.get('outcome') == 'failed' for v in verdicts)).lower()}",
-        ]
-        if run.get("axond_execution_bound") is not None:
-            lines += [
-                f"executed_binary_sha256 = {toml_string(run['axond_executed_sha256'])}",
-                f"execution_bound = {str(run['axond_execution_bound']).lower()}",
-            ]
-    return "\n".join(lines) + "\n"
 
 
 def generic_id(result: dict, slice_id: str) -> str:
     if slice_id == "fault":
         return result["row"]["id"]
-    if slice_id == "rollout":
-        return result["scenario"]["id"]
     return result["profile"]["id"]
 
 
 def generic_tier(result: dict, slice_id: str) -> str | None:
     if slice_id == "fault":
         return None
-    if slice_id == "rollout":
-        return result["scenario"]["tier"]
     return result["profile"]["tier"]
 
 
 def binary_identity(result: dict) -> dict[str, str]:
-    """Normalize the common binary block and rollout's per-revision blocks."""
+    """The binary block every remaining slice writes on the artifact."""
     environment = result["environment"]
     if "binary" in environment:
         return environment["binary"]
@@ -938,9 +647,13 @@ def binary_identity(result: dict) -> dict[str, str]:
 def expected_generic_ids(slice_id: str, manifest_path: Path) -> set[str]:
     manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
     if slice_id == "fault":
-        return {row["id"] for row in manifest["row"]}
-    if slice_id == "rollout":
-        return {scenario["id"] for scenario in manifest["scenario"]}
+        # Request-path evidence: provider and transport rows. Redis is retired
+        # (ADR 0063); Postgres HA is optional and not this set.
+        return {
+            row["id"]
+            for row in manifest["row"]
+            if row.get("family") != "backend"
+        }
     return {profile["id"] for profile in manifest["profile"]}
 
 
@@ -1006,10 +719,6 @@ def check_generic_complete(
                 raise SystemExit(
                     f"{workload}: the surplus usage verdict does not match reconciliation"
                 )
-        if slice_id == "rollout":
-            check_rollout_qualifiable(result, workload)
-        if slice_id == "stateful-endurance":
-            check_stateful_endurance_exact(result, workload)
         environment = result["environment"]
         if environment["manifest"]["path"] != manifest_relative:
             raise SystemExit(
@@ -1039,7 +748,7 @@ def check_generic_complete(
         elapsed = result.get("run", {}).get("elapsed_ms")
         if not isinstance(elapsed, int) or elapsed <= 0:
             raise SystemExit(f"{workload}: the run has no positive elapsed duration")
-        if slice_id in ("endurance", "stateful-endurance"):
+        if slice_id == "endurance":
             profile = result["profile"]
             run = result["run"]
             committed_duration = next(
@@ -1078,549 +787,8 @@ def check_generic_complete(
                 raise SystemExit(f"{workload}: the duration source is missing")
 
 
-def check_rollout_qualifiable(result: dict, workload: str) -> None:
-    """Refuse same-binary, diagnostic, or synthetic migration rollout evidence."""
-    if result.get("schema_version") != ROLLOUT_RESULT_SCHEMA_VERSION:
-        raise SystemExit(
-            f"{workload}: unsupported rollout artifact schema "
-            f"{result.get('schema_version')!r}"
-        )
-    run = result.get("run", {})
-    if run.get("mode") != "qualification" or run.get("promotable") is not True:
-        raise SystemExit(f"{workload}: rollout artifact is diagnostic, not promotable")
-    if result.get("environment", {}).get("toolchain", {}).get("cargo_profile") != "release":
-        raise SystemExit(f"{workload}: promotable rollout did not use the release profile")
-    revisions = result.get("revisions", [])
-    by_label = {
-        revision.get("label"): revision
-        for revision in revisions
-        if isinstance(revision, dict)
-    }
-    expected = {"previous", "candidate-previous-config", "next"}
-    if set(by_label) != expected or len(revisions) != len(expected):
-        raise SystemExit(f"{workload}: rollout revision set is incomplete")
-    previous = by_label["previous"]
-    compatibility = by_label["candidate-previous-config"]
-    candidate = by_label["next"]
-    retained = run.get("retained_release", {})
-    previous_binary = previous.get("binary", {})
-    if (
-        previous_binary.get("version") != ROLLOUT_PREVIOUS_VERSION
-        or candidate.get("binary", {}).get("version") != ROLLOUT_CANDIDATE_VERSION
-        or retained.get("expected_version") != previous_binary.get("version")
-        or retained.get("expected_binary_sha256") != previous_binary.get("sha256")
-        or not isinstance(retained.get("archive_sha256"), str)
-        or len(retained["archive_sha256"]) != 64
-    ):
-        raise SystemExit(f"{workload}: retained release pin does not match the previous revision")
-    loss = result.get("loss", {})
-    usage_reconciliation = loss.get("usage_reconciliation", {})
-    expected_usage_identities = loss.get("expected_usage_identities")
-    expected_non_usage_trace_identities = usage_reconciliation.get(
-        "expected_non_usage_trace_identities"
-    )
-    draining_refusal_attempts = loss.get("draining_refusal_attempts")
-    failed_ingress_attempts = loss.get("failed_ingress_attempts")
-    otlp_trace_identities = usage_reconciliation.get("otlp_trace_identities")
-    unexpected_otlp_trace_identities = usage_reconciliation.get(
-        "unexpected_otlp_trace_identities"
-    )
-    fleet = result.get("fleet")
-    fleet_replicas = (
-        sorted(member.get("id") for member in fleet)
-        if isinstance(fleet, list)
-        and fleet
-        and all(
-            isinstance(member, dict)
-            and isinstance(member.get("id"), str)
-            and member.get("id")
-            for member in fleet
-        )
-        else None
-    )
-    if (
-        usage_reconciliation.get("mode") != "exact_trace"
-        or usage_reconciliation.get("retained_trace_context") != "loopback_otlp_http"
-        or usage_reconciliation.get("otlp_trace_collection_errors") != []
-        or not isinstance(usage_reconciliation.get("exact_trace_replicas"), list)
-        or fleet_replicas is None
-        or len(set(fleet_replicas)) != len(fleet_replicas)
-        or usage_reconciliation["exact_trace_replicas"] != fleet_replicas
-        or usage_reconciliation.get("otlp_trace_export_replicas") != fleet_replicas
-        or not isinstance(expected_usage_identities, list)
-        or not isinstance(expected_non_usage_trace_identities, list)
-        or not isinstance(draining_refusal_attempts, list)
-        or not isinstance(failed_ingress_attempts, list)
-        or not isinstance(otlp_trace_identities, list)
-        or not isinstance(unexpected_otlp_trace_identities, list)
-        or not otlp_trace_identities
-        or any(
-            not isinstance(identity, dict)
-            or identity.get("replica") not in fleet_replicas
-            or not isinstance(identity.get("trace_id"), str)
-            or len(identity["trace_id"]) != 32
-            or not identity["trace_id"].startswith("61786f6e642d726f")
-            for identity in expected_usage_identities
-        )
-        or any(
-            not isinstance(identity, dict)
-            or identity.get("replica") not in fleet_replicas
-            or not isinstance(identity.get("trace_id"), str)
-            or len(identity["trace_id"]) != 32
-            or not identity["trace_id"].startswith("61786f6e642d726f")
-            for identity in otlp_trace_identities
-        )
-        or any(
-            not isinstance(identity, dict)
-            or identity.get("replica") not in fleet_replicas
-            or not isinstance(identity.get("trace_id"), str)
-            or len(identity["trace_id"]) != 32
-            or not identity["trace_id"].startswith("61786f6e642d726f")
-            or identity.get("reason") != "draining_refusal"
-            for identity in expected_non_usage_trace_identities
-        )
-        or sorted(
-            {
-                identity["replica"]
-                for identity in otlp_trace_identities
-            }
-        )
-        != fleet_replicas
-        or not isinstance(usage_reconciliation.get("otlp_trace_exports"), int)
-        or isinstance(usage_reconciliation.get("otlp_trace_exports"), bool)
-        or usage_reconciliation.get("otlp_trace_exports", 0) < len(fleet_replicas)
-    ):
-        raise SystemExit(
-            f"{workload}: rollout does not prove exact trace reconciliation through its loopback OTLP receiver"
-        )
-    expected_usage_keys = {
-        (identity["replica"], identity["trace_id"])
-        for identity in expected_usage_identities
-    }
-    caller_request_count = loss.get("caller_requests")
-    canonical_refusal_attempts = []
-    seen_refusal_keys = set()
-    seen_caller_refusals = set()
-    caller_trace_ids = {}
-    trace_caller_ids = {}
-    for attempt in draining_refusal_attempts:
-        if not isinstance(attempt, dict):
-            raise SystemExit(f"{workload}: rollout drain-refusal attempt is malformed")
-        caller_id = attempt.get("caller_id")
-        trace_id = attempt.get("trace_id")
-        refused_replica = attempt.get("refused_replica")
-        accepted_replica = attempt.get("accepted_replica")
-        accepted_status = attempt.get("accepted_status")
-        refusal_key = (refused_replica, trace_id)
-        caller_refusal = (caller_id, refused_replica)
-        if (
-            not isinstance(caller_request_count, int)
-            or isinstance(caller_request_count, bool)
-            or not isinstance(caller_id, int)
-            or isinstance(caller_id, bool)
-            or not 0 <= caller_id < caller_request_count
-            or refused_replica not in fleet_replicas
-            or accepted_replica not in fleet_replicas
-            or refused_replica == accepted_replica
-            or not isinstance(accepted_status, int)
-            or isinstance(accepted_status, bool)
-            or not 200 <= accepted_status < 300
-            or not isinstance(trace_id, str)
-            or len(trace_id) != 32
-            or not trace_id.startswith("61786f6e642d726f")
-            or refusal_key in expected_usage_keys
-            or refusal_key in seen_refusal_keys
-            or caller_refusal in seen_caller_refusals
-            or caller_trace_ids.get(caller_id, trace_id) != trace_id
-            or trace_caller_ids.get(trace_id, caller_id) != caller_id
-            or (accepted_replica, trace_id) not in expected_usage_keys
-        ):
-            raise SystemExit(
-                f"{workload}: rollout drain-refusal attempt is not canonical"
-            )
-        seen_refusal_keys.add(refusal_key)
-        seen_caller_refusals.add(caller_refusal)
-        caller_trace_ids[caller_id] = trace_id
-        trace_caller_ids[trace_id] = caller_id
-        canonical_refusal_attempts.append(
-            {
-                "caller_id": caller_id,
-                "trace_id": trace_id,
-                "refused_replica": refused_replica,
-                "accepted_replica": accepted_replica,
-                "accepted_status": accepted_status,
-            }
-        )
-    canonical_refusal_attempts.sort(
-        key=lambda attempt: (
-            attempt["caller_id"],
-            attempt["trace_id"],
-            attempt["refused_replica"],
-            attempt["accepted_replica"],
-            attempt["accepted_status"],
-        )
-    )
-    derived_non_usage_trace_identities = sorted(
-        [
-            {
-                "replica": attempt["refused_replica"],
-                "trace_id": attempt["trace_id"],
-                "reason": "draining_refusal",
-            }
-            for attempt in canonical_refusal_attempts
-        ],
-        key=lambda identity: (
-            identity["replica"],
-            identity["trace_id"],
-            identity["reason"],
-        ),
-    )
-    if (
-        draining_refusal_attempts != canonical_refusal_attempts
-        or expected_non_usage_trace_identities
-        != derived_non_usage_trace_identities
-    ):
-        raise SystemExit(
-            f"{workload}: rollout non-usage traces do not match exact refusal attempts"
-        )
-    expected_otlp_trace_identities = sorted(
-        [
-            {"replica": identity.get("replica"), "trace_id": identity.get("trace_id")}
-            for identity in expected_usage_identities
-        ]
-        + [
-            {"replica": identity["replica"], "trace_id": identity["trace_id"]}
-            for identity in expected_non_usage_trace_identities
-        ],
-        key=lambda identity: (identity["replica"], identity["trace_id"]),
-    )
-    canonical_failed_attempts = []
-    failed_reasons_by_identity = {}
-    seen_failed_attempts = set()
-    usage_trace_owners = defaultdict(set)
-    for identity in expected_usage_identities:
-        usage_trace_owners[identity["trace_id"]].add(identity["replica"])
-    transport_failures_by_replica = Counter()
-    for attempt in failed_ingress_attempts:
-        if not isinstance(attempt, dict):
-            raise SystemExit(f"{workload}: rollout failed ingress attempt is malformed")
-        caller_id = attempt.get("caller_id")
-        replica = attempt.get("replica")
-        trace_id = attempt.get("trace_id")
-        reason = attempt.get("reason")
-        attempt_key = (caller_id, trace_id, replica, reason)
-        identity_key = (replica, trace_id)
-        if reason == "untyped_503":
-            raise SystemExit(
-                f"{workload}: an untyped 503 attempt is not promotable"
-            )
-        if (
-            not isinstance(caller_request_count, int)
-            or isinstance(caller_request_count, bool)
-            or not isinstance(caller_id, int)
-            or isinstance(caller_id, bool)
-            or not 0 <= caller_id < caller_request_count
-            or replica not in fleet_replicas
-            or not isinstance(trace_id, str)
-            or len(trace_id) != 32
-            or not trace_id.startswith("61786f6e642d726f")
-            or reason != "transport_failure"
-            or attempt_key in seen_failed_attempts
-            or identity_key in failed_reasons_by_identity
-            or caller_trace_ids.get(caller_id, trace_id) != trace_id
-            or trace_caller_ids.get(trace_id, caller_id) != caller_id
-            or not (usage_trace_owners.get(trace_id, set()) - {replica})
-        ):
-            raise SystemExit(
-                f"{workload}: rollout failed ingress attempt is not canonical"
-            )
-        seen_failed_attempts.add(attempt_key)
-        failed_reasons_by_identity[identity_key] = reason
-        caller_trace_ids[caller_id] = trace_id
-        trace_caller_ids[trace_id] = caller_id
-        transport_failures_by_replica[replica] += 1
-        canonical_failed_attempts.append(
-            {
-                "caller_id": caller_id,
-                "trace_id": trace_id,
-                "replica": replica,
-                "reason": reason,
-            }
-        )
-    canonical_failed_attempts.sort(
-        key=lambda attempt: (
-            attempt["caller_id"],
-            attempt["trace_id"],
-            attempt["replica"],
-            attempt["reason"],
-        )
-    )
-    fleet_refusals = {}
-    for member in fleet:
-        replica = member.get("id")
-        refusals = member.get("refusals")
-        if (
-            not isinstance(refusals, int)
-            or isinstance(refusals, bool)
-            or refusals < 0
-        ):
-            raise SystemExit(
-                f"{workload}: rollout failed attempts lack fleet refusal evidence"
-            )
-        fleet_refusals[replica] = refusals
-    draining_refusals = {}
-    per_replica = loss.get("per_replica")
-    if not isinstance(per_replica, list):
-        raise SystemExit(
-            f"{workload}: rollout failed attempts lack per-replica evidence"
-        )
-    for row in per_replica:
-        if not isinstance(row, dict):
-            raise SystemExit(
-                f"{workload}: rollout failed attempts have malformed per-replica evidence"
-            )
-        replica = row.get("replica")
-        refusals = row.get("caller_requests_refused_while_draining")
-        if (
-            replica not in fleet_refusals
-            or replica in draining_refusals
-            or not isinstance(refusals, int)
-            or isinstance(refusals, bool)
-            or not 0 <= refusals <= fleet_refusals[replica]
-        ):
-            raise SystemExit(
-                f"{workload}: rollout failed attempts have malformed refusal evidence"
-            )
-        draining_refusals[replica] = refusals
-    expected_transport_failures = Counter(
-        {
-            replica: fleet_refusals[replica]
-            - draining_refusals.get(replica, 0)
-            for replica in fleet_refusals
-            if fleet_refusals[replica] - draining_refusals.get(replica, 0) > 0
-        }
-    )
-    if transport_failures_by_replica != expected_transport_failures:
-        raise SystemExit(
-            f"{workload}: rollout transport attempts do not match fleet refusals"
-        )
-    expected_trace_keys = {
-        (identity["replica"], identity["trace_id"])
-        for identity in expected_otlp_trace_identities
-    }
-    observed_trace_keys = {
-        (identity["replica"], identity["trace_id"])
-        for identity in otlp_trace_identities
-    }
-    derived_unexpected_trace_identities = sorted(
-        [
-            {
-                "replica": replica,
-                "trace_id": trace_id,
-                "reason": failed_reasons_by_identity.get(
-                    (replica, trace_id), "unattributed"
-                ),
-            }
-            for replica, trace_id in observed_trace_keys - expected_trace_keys
-        ],
-        key=lambda identity: (
-            identity["replica"],
-            identity["trace_id"],
-            identity["reason"],
-        ),
-    )
-    if (
-        failed_ingress_attempts != canonical_failed_attempts
-        or unexpected_otlp_trace_identities
-        != derived_unexpected_trace_identities
-    ):
-        raise SystemExit(
-            f"{workload}: rollout failed-attempt trace attribution is not canonical"
-        )
-    if (
-        len(
-            {
-                (identity["replica"], identity["trace_id"])
-                for identity in expected_otlp_trace_identities
-            }
-        )
-        != len(expected_otlp_trace_identities)
-        or otlp_trace_identities != expected_otlp_trace_identities
-    ):
-        raise SystemExit(
-            f"{workload}: rollout OTLP witness does not match its complete caller trace ledger"
-        )
-    if expected_non_usage_trace_identities:
-        per_replica = loss.get("per_replica")
-        if not isinstance(per_replica, list):
-            raise SystemExit(
-                f"{workload}: rollout drain-refusal trace ledger has no per-replica witness"
-            )
-        expected_refusals = {
-            row.get("replica"): row.get("caller_requests_refused_while_draining")
-            for row in per_replica
-            if isinstance(row, dict)
-            and isinstance(row.get("caller_requests_refused_while_draining"), int)
-            and row.get("caller_requests_refused_while_draining") > 0
-        }
-        observed_refusals = Counter(
-            identity["replica"] for identity in expected_non_usage_trace_identities
-        )
-        usage_trace_owners: dict[str, set[str]] = defaultdict(set)
-        for identity in expected_usage_identities:
-            usage_trace_owners[identity["trace_id"]].add(identity["replica"])
-        if (
-            dict(observed_refusals) != expected_refusals
-            or loss.get("refusals_retried") != sum(observed_refusals.values())
-            or any(
-                not (
-                    usage_trace_owners.get(identity["trace_id"], set())
-                    - {identity["replica"]}
-                )
-                for identity in expected_non_usage_trace_identities
-            )
-        ):
-            raise SystemExit(
-                f"{workload}: rollout non-usage traces are not exact retried drain refusals"
-            )
-    digests = {revision.get("binary", {}).get("sha256") for revision in revisions}
-    if None in digests or len(digests) != 2:
-        raise SystemExit(f"{workload}: rollout did not use exactly two binary digests")
-    desired_state_revisions = {
-        revision.get("desired_state_revision") for revision in revisions
-    }
-    config_digests = {
-        revision.get("config", {}).get("sha256") for revision in revisions
-    }
-    if (
-        previous["binary"]["sha256"] == compatibility["binary"]["sha256"]
-        or compatibility["binary"]["sha256"] != candidate["binary"]["sha256"]
-        or previous.get("distinct_binary") is not False
-        or compatibility.get("distinct_binary") is not True
-        or candidate.get("distinct_binary") is not True
-        or None in config_digests
-        or len(config_digests) != 1
-        or None in desired_state_revisions
-        or "" in desired_state_revisions
-        or len(desired_state_revisions) != 1
-    ):
-        raise SystemExit(
-            f"{workload}: stateful binary/config/revision phases are inconsistent"
-        )
-    traffic = result.get("traffic", [])
-    compatibility_traffic = [
-        phase for phase in traffic if phase.get("phase") == "candidate-on-previous-config"
-    ]
-    if (
-        len(compatibility_traffic) != 1
-        or compatibility_traffic[0].get("answered", 0) <= 0
-        or compatibility_traffic[0]
-        .get("by_revision", {})
-        .get("candidate-previous-config", 0)
-        <= 0
-    ):
-        raise SystemExit(f"{workload}: candidate did not serve with previous config")
-    mixed = result.get("mixed_version", {})
-    if (
-        mixed.get("shared_stateful_revision") not in desired_state_revisions
-        or mixed.get("shared_alias") != "chat"
-        or mixed.get("shared_alias") == mixed.get("exclusive_alias")
-        or mixed.get("previous_serves_shared_alias") is not True
-        or mixed.get("next_serves_shared_alias") is not True
-    ):
-        raise SystemExit(
-            f"{workload}: both binaries did not serve the shared durable alias and revision"
-        )
-    matrix = result.get("migration", {}).get("matrix", {})
-    if matrix.get("evaluated") is not True:
-        raise SystemExit(f"{workload}: migration matrix was not evaluated")
-    for command in (
-        "previous_apply",
-        "previous_status_before",
-        "candidate_apply",
-        "candidate_status_after",
-    ):
-        if matrix.get(command, {}).get("succeeded") is not True:
-            raise SystemExit(f"{workload}: migration matrix command {command} did not pass")
-    previous_versions = matrix.get("previous_versions")
-    candidate_versions = matrix.get("candidate_versions")
-    if (
-        not isinstance(previous_versions, list)
-        or not previous_versions
-        or not isinstance(candidate_versions, list)
-        or candidate_versions[: len(previous_versions)] != previous_versions
-    ):
-        raise SystemExit(f"{workload}: candidate migration ledger does not extend retained rows")
-    added = matrix.get("candidate_added_versions")
-    recomputed_added = [
-        migration.get("version")
-        for migration in candidate_versions[len(previous_versions) :]
-        if isinstance(migration, dict)
-    ]
-    if added != recomputed_added:
-        raise SystemExit(f"{workload}: migration added-version ledger is not exact")
-    classification = matrix.get("classification")
-    forward_only = bool(added)
-    if classification != ("forward-only" if forward_only else "unchanged"):
-        raise SystemExit(f"{workload}: migration classification disagrees with ledger")
-    candidate_before = matrix.get("candidate_status_before", {})
-    if candidate_before.get("succeeded") is not (not forward_only):
-        raise SystemExit(f"{workload}: candidate pre-apply status disagrees with ledger")
-    if forward_only and "migration(s) pending" not in candidate_before.get("output", ""):
-        raise SystemExit(f"{workload}: candidate did not name its pending migrations")
-    previous_after = matrix.get("previous_status_after_candidate", {})
-    fence = result.get("rollback", {}).get("migrated_layout_fence", {})
-    rollback = result.get("rollback", {}).get("compatible_patch_rollback", {})
-    if forward_only:
-        valid = (
-            previous_after.get("succeeded") is False
-            and fence.get("expected_refused") is True
-            and fence.get("refused") is True
-            and fence.get("refusal_names_newer_build") is True
-            and rollback.get("performed") is False
-        )
-    else:
-        valid = (
-            previous_after.get("succeeded") is True
-            and fence.get("expected_refused") is False
-            and fence.get("refused") is False
-            and rollback.get("performed") is True
-            and rollback.get("served_traffic") is True
-        )
-    if not valid:
-        raise SystemExit(f"{workload}: rollback evidence contradicts migration classification")
 
 
-def check_stateful_endurance_exact(result: dict, workload: str) -> None:
-    if result.get("schema_version") != STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION:
-        raise SystemExit(
-            f"{workload}: unsupported stateful endurance artifact schema "
-            f"{result.get('schema_version')!r}"
-        )
-    usage = result.get("usage", {})
-    for field in (
-        "request_identities",
-        "correlations",
-        "durable_identities",
-        "durable_outside_identities",
-        "correlation_windows",
-    ):
-        evidence = usage.get(field, {})
-        if evidence.get("exact") is not True or not evidence.get("path"):
-            raise SystemExit(f"{workload}: {field} is not exact retained evidence")
-    for field in (
-        "missing",
-        "unexpected_records",
-        "unexpected_statuses",
-        "concurrent_ending_membership_mismatches",
-        "unidentified",
-        "uncorrelated",
-        "refusal_records",
-        "durable_loss_outside_windows",
-        "durable_unexpected_rows",
-    ):
-        if usage.get(field) != 0:
-            raise SystemExit(f"{workload}: stateful reconciliation has nonzero {field}")
 
 
 def check_one_run_generic(results: list[dict]) -> None:
@@ -1629,8 +797,6 @@ def check_one_run_generic(results: list[dict]) -> None:
         "the binary": binary_identity,
         "the toolchain": lambda result: result["environment"]["toolchain"],
         "the manifest": lambda result: result["environment"]["manifest"],
-        # Rollout artifacts have no fixture set; absence is the same explicit
-        # zero-fixture input as an empty list on the other generic slices.
         "the fixtures": lambda result: result["environment"].get("fixtures", []),
         "the hardware": lambda result: result["environment"]["hardware"],
     }
@@ -1660,7 +826,7 @@ def render_generic(
         "# The raw JSON artifacts remain alongside the workflow result; each",
         "# observation below binds one workload to its artifact digest and verdicts.",
         "",
-        f"schema_version = {ROLLOUT_RECORD_SCHEMA_VERSION if slice_id == 'rollout' else 1}",
+        "schema_version = 1",
         f"slice = {toml_string(slice_id)}",
         f"tier = {toml_string(tier)}",
         f"runner = {toml_string(runner)}",
@@ -1702,7 +868,7 @@ def render_generic(
             f"verdicts = {len(result['verdicts'])}",
             f"passed = {str(all(v['passed'] for v in result['verdicts'])).lower()}",
         ]
-        if slice_id in ("endurance", "stateful-endurance"):
+        if slice_id == "endurance":
             profile = result["profile"]
             run = result["run"]
             lines += [
@@ -1711,26 +877,15 @@ def render_generic(
                 f"requested_duration_ms = {run.get('requested_duration_ms', profile['duration_ms'])}",
                 f"duration_source = {toml_string(run['duration_source'])}",
             ]
-            if slice_id in ("endurance", "stateful-endurance"):
-                lines.append(f"artifact_schema_version = {result['schema_version']}")
-            if slice_id == "stateful-endurance":
-                for field, claim in stateful_ledger_claims(
-                    result, generic_id(result, slice_id)
-                ).items():
-                    lines += [
-                        f"{field}_sha256 = {toml_string(str(claim['sha256']))}",
-                        f"{field}_files = {claim['files']}",
-                        f"{field}_bytes = {claim['bytes']}",
-                    ]
-            if slice_id == "endurance":
-                for field, claim in endurance_ledger_claims(
-                    result, generic_id(result, slice_id)
-                ).items():
-                    lines += [
-                        f"{field}_sha256 = {toml_string(str(claim['sha256']))}",
-                        f"{field}_files = {claim['files']}",
-                        f"{field}_bytes = {claim['bytes']}",
-                    ]
+            lines.append(f"artifact_schema_version = {result['schema_version']}")
+            for field, claim in endurance_ledger_claims(
+                result, generic_id(result, slice_id)
+            ).items():
+                lines += [
+                    f"{field}_sha256 = {toml_string(str(claim['sha256']))}",
+                    f"{field}_files = {claim['files']}",
+                    f"{field}_bytes = {claim['bytes']}",
+                ]
             claim = sample_claim(result, generic_id(result, slice_id))
             lines += [
                 f"samples_sha256 = {toml_string(str(claim['sha256']))}",
@@ -1739,42 +894,6 @@ def render_generic(
             ]
         if slice_id == "fault":
             lines.append(f"artifact_schema_version = {result['schema_version']}")
-        if slice_id == "rollout":
-            revisions = {revision["label"]: revision for revision in result["revisions"]}
-            retained = result["run"]["retained_release"]
-            mixed = result["mixed_version"]
-            reconciliation = result["loss"]["usage_reconciliation"]
-            trace_identities_sha256 = hashlib.sha256(
-                json.dumps(
-                    reconciliation["otlp_trace_identities"],
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-            lines += [
-                f"artifact_schema_version = {result['schema_version']}",
-                f"rollout_previous_version = {toml_string(revisions['previous']['binary']['version'])}",
-                f"rollout_previous_binary_sha256 = {toml_string(revisions['previous']['binary']['sha256'])}",
-                f"rollout_candidate_version = {toml_string(revisions['next']['binary']['version'])}",
-                f"rollout_candidate_binary_sha256 = {toml_string(revisions['next']['binary']['sha256'])}",
-                f"rollout_retained_archive_sha256 = {toml_string(retained['archive_sha256'])}",
-                f"rollout_shared_stateful_revision = {toml_string(mixed['shared_stateful_revision'])}",
-                f"rollout_shared_alias = {toml_string(mixed['shared_alias'])}",
-                "rollout_previous_serves_shared_alias = "
-                f"{str(mixed['previous_serves_shared_alias']).lower()}",
-                "rollout_candidate_serves_shared_alias = "
-                f"{str(mixed['next_serves_shared_alias']).lower()}",
-                f"rollout_usage_reconciliation = {toml_string(reconciliation['mode'])}",
-                f"rollout_exact_trace_replicas = {len(reconciliation['exact_trace_replicas'])}",
-                f"rollout_retained_trace_context = {toml_string(reconciliation['retained_trace_context'])}",
-                f"rollout_otlp_trace_exports = {reconciliation['otlp_trace_exports']}",
-                "rollout_otlp_trace_export_replicas = "
-                f"{len(reconciliation['otlp_trace_export_replicas'])}",
-                "rollout_otlp_trace_identities = "
-                f"{len(reconciliation['otlp_trace_identities'])}",
-                "rollout_otlp_trace_identities_sha256 = "
-                f"{toml_string(trace_identities_sha256)}",
-            ]
     return "\n".join(lines) + "\n"
 
 
@@ -1917,359 +1036,19 @@ def self_test() -> int:
             "containerized": False,
         },
     }
-    if "rollout" in GENERIC_MANIFESTS:
-        result = {
-            "schema_version": ROLLOUT_RESULT_SCHEMA_VERSION,
-            "scenario": {"id": "rolling-replace", "tier": "heavy"},
-            "run": {
-                "elapsed_ms": 1,
-                "mode": "qualification",
-                "promotable": True,
-                "retained_release": {
-                    "expected_version": ROLLOUT_PREVIOUS_VERSION,
-                    "expected_binary_sha256": "previous",
-                    "archive_sha256": "a" * 64,
-                },
-            },
-            "environment": environment,
-            "revisions": [
-                {
-                    "label": "previous",
-                    "binary": {
-                        "sha256": "previous",
-                        "version": ROLLOUT_PREVIOUS_VERSION,
-                    },
-                    "config": {"sha256": "shared-bootstrap"},
-                    "distinct_binary": False,
-                    "desired_state_revision": "rev_shared",
-                },
-                {
-                    "label": "candidate-previous-config",
-                    "binary": {
-                        "sha256": "candidate",
-                        "version": ROLLOUT_CANDIDATE_VERSION,
-                    },
-                    "config": {"sha256": "shared-bootstrap"},
-                    "distinct_binary": True,
-                    "desired_state_revision": "rev_shared",
-                },
-                {
-                    "label": "next",
-                    "binary": {
-                        "sha256": "candidate",
-                        "version": ROLLOUT_CANDIDATE_VERSION,
-                    },
-                    "config": {"sha256": "shared-bootstrap"},
-                    "distinct_binary": True,
-                    "desired_state_revision": "rev_shared",
-                },
-            ],
-            "traffic": [
-                {
-                    "phase": "candidate-on-previous-config",
-                    "answered": 1,
-                    "by_revision": {"candidate-previous-config": 1},
-                }
-            ],
-            "fleet": [
-                {
-                    "id": "candidate-0",
-                    "revision": "next",
-                    "refusals": 0,
-                }
-            ],
-            "mixed_version": {
-                "exclusive_alias": "chat-next-only",
-                "shared_stateful_revision": "rev_shared",
-                "shared_alias": "chat",
-                "previous_serves_shared_alias": True,
-                "next_serves_shared_alias": True,
-            },
-            "loss": {
-                "caller_requests": 1,
-                "per_replica": [
-                    {
-                        "replica": "candidate-0",
-                        "caller_requests_refused_while_draining": 0,
-                    }
-                ],
-                "draining_refusal_attempts": [],
-                "failed_ingress_attempts": [],
-                "expected_usage_identities": [
-                    {
-                        "replica": "candidate-0",
-                        "trace_id": "61786f6e642d726f0000000000000001",
-                        "status": "ok",
-                    }
-                ],
-                "usage_reconciliation": {
-                    "mode": "exact_trace",
-                    "exact_trace_replicas": ["candidate-0"],
-                    "retained_trace_context": "loopback_otlp_http",
-                    "otlp_trace_exports": 1,
-                    "otlp_trace_export_replicas": ["candidate-0"],
-                    "expected_non_usage_trace_identities": [],
-                    "otlp_trace_collection_errors": [],
-                    "otlp_trace_identities": [
-                        {
-                            "replica": "candidate-0",
-                            "trace_id": "61786f6e642d726f0000000000000001",
-                        }
-                    ],
-                    "unexpected_otlp_trace_identities": [],
-                }
-            },
-            "migration": {
-                "matrix": {
-                    "evaluated": True,
-                    "previous_apply": {"succeeded": True},
-                    "previous_status_before": {"succeeded": True},
-                    "candidate_status_before": {"succeeded": True},
-                    "candidate_apply": {"succeeded": True},
-                    "candidate_status_after": {"succeeded": True},
-                    "previous_status_after_candidate": {"succeeded": True},
-                    "previous_versions": [
-                        {"version": 1, "name": "base", "checksum": "checksum"}
-                    ],
-                    "candidate_versions": [
-                        {"version": 1, "name": "base", "checksum": "checksum"}
-                    ],
-                    "candidate_added_versions": [],
-                    "classification": "unchanged",
-                }
-            },
-            "rollback": {
-                "migrated_layout_fence": {
-                    "expected_refused": False,
-                    "refused": False,
-                },
-                "compatible_patch_rollback": {
-                    "performed": True,
-                    "served_traffic": True,
-                },
-            },
-            "verdicts": [{"passed": True}],
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "rolling-replace.json"
-            path.write_text(json.dumps(result), encoding="utf-8")
-            result["_artifact_path"] = str(path)
-            rendered = render_generic(
-                [result], "rollout", "heavy", "local", "qualification self-test"
-            )
-            parsed = tomllib.loads(rendered)
-            assert parsed["observation"][0]["id"] == "rolling-replace"
-            assert parsed["observation"][0]["passed"] is True
-            assert (
-                parsed["observation"][0]["artifact_schema_version"]
-                == ROLLOUT_RESULT_SCHEMA_VERSION
-            )
-            assert parsed["schema_version"] == ROLLOUT_RECORD_SCHEMA_VERSION
-            assert (
-                parsed["observation"][0]["rollout_shared_stateful_revision"]
-                == "rev_shared"
-            )
-            assert parsed["observation"][0]["rollout_shared_alias"] == "chat"
-            assert parsed["observation"][0]["rollout_previous_serves_shared_alias"] is True
-            assert parsed["observation"][0]["rollout_candidate_serves_shared_alias"] is True
-            assert parsed["inputs"]["fixtures"] == 0
+    fault_manifest = tomllib.loads(
+        (ROOT / GENERIC_MANIFESTS["fault"]).read_text(encoding="utf-8")
+    )
+    expected_fault = expected_generic_ids("fault", ROOT / GENERIC_MANIFESTS["fault"])
+    manifest_fault = {row["id"] for row in fault_manifest["row"]}
+    retired = manifest_fault - expected_fault
+    assert all(row.get("family") != "backend" for row in fault_manifest["row"] if row["id"] in expected_fault)
+    assert any(row_id.startswith("redis-") for row_id in retired), retired
+    assert "provider-rate-limited" in expected_fault
 
-            retried = copy.deepcopy(result)
-            retried["fleet"].append(
-                {"id": "previous-0", "revision": "previous", "refusals": 0}
-            )
-            accepted_trace = "61786f6e642d726f0000000000000002"
-            retried["loss"]["caller_requests"] = 2
-            retried["loss"]["expected_usage_identities"].append(
-                {"replica": "previous-0", "trace_id": accepted_trace, "status": "ok"}
-            )
-            retried["loss"]["draining_refusal_attempts"] = [
-                {
-                    "caller_id": 1,
-                    "trace_id": accepted_trace,
-                    "refused_replica": "candidate-0",
-                    "accepted_replica": "previous-0",
-                    "accepted_status": 200,
-                }
-            ]
-            retried["loss"]["per_replica"] = [
-                {
-                    "replica": "candidate-0",
-                    "caller_requests_refused_while_draining": 1,
-                },
-                {
-                    "replica": "previous-0",
-                    "caller_requests_refused_while_draining": 0,
-                },
-            ]
-            retried["loss"]["refusals_retried"] = 1
-            retried["fleet"][0]["refusals"] = 1
-            retried_reconciliation = retried["loss"]["usage_reconciliation"]
-            retried_reconciliation["exact_trace_replicas"] = [
-                "candidate-0",
-                "previous-0",
-            ]
-            retried_reconciliation["otlp_trace_exports"] = 2
-            retried_reconciliation["otlp_trace_export_replicas"] = [
-                "candidate-0",
-                "previous-0",
-            ]
-            retried_reconciliation["expected_non_usage_trace_identities"] = [
-                {
-                    "replica": "candidate-0",
-                    "trace_id": accepted_trace,
-                    "reason": "draining_refusal",
-                }
-            ]
-            retried_reconciliation["otlp_trace_identities"] = [
-                {
-                    "replica": "candidate-0",
-                    "trace_id": "61786f6e642d726f0000000000000001",
-                },
-                {"replica": "candidate-0", "trace_id": accepted_trace},
-                {"replica": "previous-0", "trace_id": accepted_trace},
-            ]
-            check_rollout_qualifiable(retried, "retried refusal self-test")
-
-            transport_retry = copy.deepcopy(retried)
-            first_trace = "61786f6e642d726f0000000000000001"
-            transport_retry["loss"]["failed_ingress_attempts"] = [
-                {
-                    "caller_id": 0,
-                    "trace_id": first_trace,
-                    "replica": "previous-0",
-                    "reason": "transport_failure",
-                }
-            ]
-            for member in transport_retry["fleet"]:
-                member["refusals"] = 1
-            check_rollout_qualifiable(
-                transport_retry, "retried transport failure without export self-test"
-            )
-
-            attributed_export = copy.deepcopy(transport_retry)
-            attributed_export["loss"]["usage_reconciliation"][
-                "otlp_trace_identities"
-            ].append({"replica": "previous-0", "trace_id": first_trace})
-            attributed_export["loss"]["usage_reconciliation"][
-                "unexpected_otlp_trace_identities"
-            ] = [
-                {
-                    "replica": "previous-0",
-                    "trace_id": first_trace,
-                    "reason": "transport_failure",
-                }
-            ]
-            for name, mutate in (
-                ("attributed exported extra", lambda candidate: None),
-                (
-                    "OTLP trace collection error",
-                    lambda candidate: candidate["loss"]["usage_reconciliation"].update(
-                        otlp_trace_collection_errors=["settlement timed out"]
-                    ),
-                ),
-                (
-                    "failed-attempt reason substitution",
-                    lambda candidate: candidate["loss"]["failed_ingress_attempts"][0].update(
-                        reason="untyped_503"
-                    ),
-                ),
-                (
-                    "inconsistent failed-attempt caller trace",
-                    lambda candidate: candidate["loss"]["failed_ingress_attempts"].append(
-                        {
-                            "caller_id": 0,
-                            "trace_id": accepted_trace,
-                            "replica": "candidate-0",
-                            "reason": "transport_failure",
-                        }
-                    ),
-                ),
-                (
-                    "failed-attempt refusal count mismatch",
-                    lambda candidate: next(
-                        member
-                        for member in candidate["fleet"]
-                        if member["id"] == "previous-0"
-                    ).update(refusals=0),
-                ),
-                (
-                    "deleted failed-attempt ledger",
-                    lambda candidate: candidate["loss"].update(
-                        failed_ingress_attempts=[]
-                    ),
-                ),
-            ):
-                invalid = copy.deepcopy(
-                    attributed_export
-                    if name in {"attributed exported extra", "OTLP trace collection error"}
-                    else transport_retry
-                )
-                mutate(invalid)
-                try:
-                    check_rollout_qualifiable(invalid, name)
-                except SystemExit:
-                    pass
-                else:
-                    raise AssertionError(f"rollout accepted {name}")
-
-            for name, mutate in (
-                (
-                    "missing durable revision",
-                    lambda candidate: candidate["revisions"][0].update(
-                        desired_state_revision=None
-                    ),
-                ),
-                (
-                    "mismatched durable revision",
-                    lambda candidate: candidate["revisions"][2].update(
-                        desired_state_revision="rev_other"
-                    ),
-                ),
-                (
-                    "wrong shared alias",
-                    lambda candidate: candidate["mixed_version"].update(
-                        shared_alias="other"
-                    ),
-                ),
-                (
-                    "previous binary did not serve",
-                    lambda candidate: candidate["mixed_version"].update(
-                        previous_serves_shared_alias=False
-                    ),
-                ),
-                (
-                    "candidate binary did not serve",
-                    lambda candidate: candidate["mixed_version"].update(
-                        next_serves_shared_alias=False
-                    ),
-                ),
-            ):
-                invalid = copy.deepcopy(result)
-                mutate(invalid)
-                try:
-                    render_generic([invalid], "rollout", "heavy", "local", name)
-                except SystemExit:
-                    pass
-                else:
-                    raise AssertionError(f"rollout accepted {name}")
-
-            try:
-                render_generic([], "rollout", "heavy", "local", "missing")
-            except SystemExit:
-                pass
-            else:
-                raise AssertionError("a missing workload was accepted")
-
-            failed = dict(result)
-            failed["verdicts"] = [{"passed": False}]
-            try:
-                render_generic([failed], "rollout", "heavy", "local", "failed")
-            except SystemExit:
-                pass
-            else:
-                raise AssertionError("a failed verdict was accepted")
-
+    with tempfile.TemporaryDirectory() as endurance_directory:
+        endurance_dir = Path(endurance_directory)
+        endurance_path = endurance_dir / "mixed-endurance.json"
         endurance_manifest = tomllib.loads(
             (ROOT / GENERIC_MANIFESTS["endurance"]).read_text(encoding="utf-8")
         )
@@ -2325,14 +1104,15 @@ def self_test() -> int:
                 }
             ],
         }
-        endurance_result["_artifact_path"] = str(path)
+        endurance_path.write_text(json.dumps(endurance_result), encoding="utf-8")
+        endurance_result["_artifact_path"] = str(endurance_path)
         request_identity = bytearray(16)
         request_identity[6] = 0x70
         request_identity[8] = 0x80
         request_identity[15] = 1
         request_identity_bytes = bytes(request_identity)
-        endurance_request_ledger = path.parent / "endurance-request-ledger"
-        endurance_correlation_ledger = path.parent / "endurance-correlation-ledger"
+        endurance_request_ledger = endurance_dir / "endurance-request-ledger"
+        endurance_correlation_ledger = endurance_dir / "endurance-correlation-ledger"
         endurance_request_ledger.mkdir()
         endurance_correlation_ledger.mkdir()
         for shard in range(STATEFUL_LEDGER_SHARDS):
@@ -2345,7 +1125,7 @@ def self_test() -> int:
             (endurance_correlation_ledger / f"observed-shard-{shard:02}.bin").write_bytes(
                 bytes(17) if shard == 0 else b""
             )
-        (path.parent / "endurance.samples.jsonl").write_text(
+        (endurance_dir / "endurance.samples.jsonl").write_text(
             '{"at_ms":0,"rss_kib":1,"cpu_ticks":0,"fds":1,"sockets":0}\n',
             encoding="utf-8",
         )
@@ -2430,472 +1210,52 @@ def self_test() -> int:
         else:
             raise AssertionError("an endurance result with short elapsed time was accepted")
 
-        # Recovery, rollout, and stateful-endurance were retired with the tier
-        # matrix (ADR 0063 / #427). Remaining coverage is capacity, endurance,
-        # and provider/transport faults.
-        print("qualification evidence self-test passed")
-        return 0
-
-        stateful_manifest = tomllib.loads(
-            (ROOT / GENERIC_MANIFESTS["stateful-endurance"]).read_text(encoding="utf-8")
-        )
-        stateful_duration = stateful_manifest["profile"][0]["soak"]["duration_ms"]
-        stateful_environment = dict(environment)
-        stateful_environment["manifest"] = {
-            "path": GENERIC_MANIFESTS["stateful-endurance"],
+    with tempfile.TemporaryDirectory() as fault_directory:
+        fault_dir = Path(fault_directory)
+        fault_environment = dict(environment)
+        fault_environment["manifest"] = {
+            "path": GENERIC_MANIFESTS["fault"],
             "sha256": hashlib.sha256(
-                (ROOT / GENERIC_MANIFESTS["stateful-endurance"]).read_bytes()
+                (ROOT / GENERIC_MANIFESTS["fault"]).read_bytes()
             ).hexdigest(),
         }
-        stateful_environment["binary"] = {"sha256": "binary", "version": "0.0.0"}
-        stateful_result = {
-            "schema_version": STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION,
-            "profile": {
-                "id": "mixed-stateful-endurance",
-                "tier": "soak",
-                "seed": 1,
-                "duration_ms": stateful_duration,
-                "manifest_duration_ms": stateful_duration,
-            },
-            "run": {
-                "elapsed_ms": stateful_duration,
-                "duration_source": "manifest",
-                "samples_paths": [
-                    "stateful-replica-0.samples.jsonl",
-                    "stateful-replica-1.samples.jsonl",
-                ],
-            },
-            "environment": stateful_environment,
-            "usage": {
-                "missing": 0,
-                "unexpected_records": 0,
-                "unexpected_statuses": 0,
-                "concurrent_endings": 0,
-                "concurrent_ending_membership_mismatches": 0,
-                "unidentified": 0,
-                "uncorrelated": 0,
-                "refusal_records": 0,
-                "durable_loss_outside_windows": 0,
-                "durable_unexpected_rows": 0,
-                "request_identities": {
-                    "exact": True,
-                    "path": "request-ledger",
-                    "shards": STATEFUL_LEDGER_SHARDS,
+        fault_environment["binary"] = {"sha256": "binary", "version": "0.0.0"}
+        fault_results = []
+        for row in fault_manifest["row"]:
+            if row.get("family") == "backend":
+                continue
+            result = {
+                "schema_version": FAULT_RESULT_SCHEMA_VERSION,
+                "row": {
+                    "id": row["id"],
+                    "family": row["family"],
+                    "fault": row["fault"],
                 },
-                "correlations": {
-                    "exact": True,
-                    "path": "correlation-ledger",
-                    "shards": STATEFUL_LEDGER_SHARDS,
-                },
-                "durable_identities": {
-                    "exact": True,
-                    "path": "durable-ledger",
-                    "shards": STATEFUL_LEDGER_SHARDS,
-                },
-                "durable_outside_identities": {
-                    "exact": True,
-                    "path": "durable-outside-ledger",
-                    "shards": STATEFUL_LEDGER_SHARDS,
-                },
-                "correlation_windows": {
-                    "exact": True,
-                    "path": "correlation-window-ledger",
-                    "shards": STATEFUL_LEDGER_SHARDS,
-                },
-            },
-            "verdicts": [{"passed": True}],
-        }
-        stateful_result["_artifact_path"] = str(path)
-        for sample_name in stateful_result["run"]["samples_paths"]:
-            (path.parent / sample_name).write_text(
-                '{"at_ms":0,"rss_kib":1,"cpu_ticks":0,"fds":1,"sockets":0}\n',
-                encoding="utf-8",
-            )
-        for field, files_per_shard in STATEFUL_LEDGER_FIELDS:
-            ledger = path.parent / stateful_result["usage"][field]["path"]
-            ledger.mkdir()
-            for stem in STATEFUL_LEDGER_STEMS[field]:
-                for shard in range(STATEFUL_LEDGER_SHARDS):
-                    width = STATEFUL_LEDGER_WIDTHS[field]
-                    payload = bytes(width) if shard == 0 else b""
-                    (ledger / f"{stem}-shard-{shard:02}.bin").write_bytes(payload)
-            for count_field in STATEFUL_LEDGER_COUNTS[field]:
-                stateful_result["usage"][field][count_field] = 1
+                "run": {"elapsed_ms": 1},
+                "environment": fault_environment,
+                "verdicts": [{"passed": True}],
+            }
+            path = fault_dir / f"{row['id']}.json"
+            path.write_text(json.dumps(result), encoding="utf-8")
+            result["_artifact_path"] = str(path)
+            fault_results.append(result)
         rendered = render_generic(
-            [stateful_result],
-            "stateful-endurance",
-            "soak",
-            "github-actions",
-            "stateful endurance self-test",
+            fault_results, "fault", "full", "local", "fault self-test"
         )
         parsed = tomllib.loads(rendered)
-        assert parsed["slice"] == "stateful-endurance"
-        assert parsed["observation"][0]["manifest_duration_ms"] == stateful_duration
-        assert parsed["observation"][0]["requested_duration_ms"] == stateful_duration
-        assert (
-            parsed["observation"][0]["artifact_schema_version"]
-            == STATEFUL_ENDURANCE_RESULT_SCHEMA_VERSION
-        )
-        for field, files_per_shard in STATEFUL_LEDGER_FIELDS:
-            assert (
-                parsed["observation"][0][f"{field}_files"]
-                == STATEFUL_LEDGER_SHARDS * files_per_shard
-            )
-            assert len(parsed["observation"][0][f"{field}_sha256"]) == 64
-        assert parsed["observation"][0]["samples_files"] == 2
-
-        inexact_correlation_windows = copy.deepcopy(stateful_result)
-        inexact_correlation_windows["usage"]["correlation_windows"]["exact"] = False
+        assert {obs["id"] for obs in parsed["observation"]} == expected_fault
         try:
             render_generic(
-                [inexact_correlation_windows],
-                "stateful-endurance",
-                "soak",
-                "github-actions",
-                "inexact stateful correlation windows",
+                fault_results[:1], "fault", "full", "local", "partial fault"
             )
         except SystemExit:
             pass
         else:
-            raise AssertionError("inexact stateful correlation-window evidence was accepted")
-
-        mismatched_correlation_windows = copy.deepcopy(stateful_result)
-        mismatched_correlation_windows["usage"][
-            "concurrent_ending_membership_mismatches"
-        ] = 1
-        try:
-            render_generic(
-                [mismatched_correlation_windows],
-                "stateful-endurance",
-                "soak",
-                "github-actions",
-                "mismatched stateful correlation windows",
-            )
-        except SystemExit:
-            pass
-        else:
-            raise AssertionError(
-                "stateful correlation-window membership mismatches were accepted"
-            )
-
-        short_stateful = dict(stateful_result)
-        short_stateful["profile"] = dict(stateful_result["profile"])
-        short_stateful["run"] = dict(stateful_result["run"])
-        short_stateful["profile"]["duration_ms"] = stateful_duration - 1
-        short_stateful["run"]["elapsed_ms"] = stateful_duration - 1
-        try:
-            render_generic(
-                [short_stateful],
-                "stateful-endurance",
-                "soak",
-                "github-actions",
-                "short stateful endurance",
-            )
-        except SystemExit:
-            pass
-        else:
-            raise AssertionError("a shortened stateful endurance result was accepted")
-
-        missing_ledger = path.parent / "request-ledger" / "request-shard-00.bin"
-        missing_ledger.unlink()
-        try:
-            render_generic(
-                [stateful_result],
-                "stateful-endurance",
-                "soak",
-                "github-actions",
-                "missing stateful ledger",
-            )
-        except SystemExit:
-            pass
-        else:
-            raise AssertionError("stateful evidence missing an exact shard was accepted")
-
-        recovery_expected = recovery_expected_stages(ROOT / RECOVERY_MANIFEST)
-        recovery_provenance = {
-            "source": {"git_commit": "commit", "git_dirty": False, "crate_version": "0.0.0"},
-            "binary": {
-                "sha256": "b" * 64,
-                "version": "0.0.0",
-                "cargo_profile": "release",
-                "rustc": "rustc test",
-            },
-            "inputs": {
-                "manifest": RECOVERY_MANIFEST,
-                "manifest_sha256": hashlib.sha256(
-                    (ROOT / RECOVERY_MANIFEST).read_bytes()
-                ).hexdigest(),
-                "fixtures": 0,
-            },
-            "hardware": {
-                "os": "test",
-                "arch": "test",
-                "kernel": "kernel",
-                "cpu_model": "cpu",
-                "cpus": 1,
-                "total_memory_kib": 1,
-                "containerized": False,
-            },
-        }
-        recovery_results = []
-
-        def satisfy_operand(
-            operand: tuple[str, ...], desired: Any, observations: dict[str, Any]
-        ) -> None:
-            operation, *arguments = operand
-            if operation == "literal":
-                return
-            if operation == "observation":
-                observations[arguments[0]] = desired
-                return
-            if operation in {"all_positive", "positive"}:
-                for key in arguments:
-                    observations[key] = 1 if desired == "true" else 0
-                return
-            if operation in {"canonical_request_id", "canonical_request_id_pair"}:
-                identities = (
-                    "req_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-                    "req_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-                )
-                for index, key in enumerate(arguments):
-                    observations[key] = identities[index]
-                return
-            if operation == "distinct":
-                observations[arguments[0]] = (
-                    "req_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-                )
-                observations[arguments[1]] = (
-                    "req_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-                )
-                return
-            if operation == "accepted_revision":
-                observations[arguments[0]] = (
-                    "refused" if desired == "refused" else "rev-self-test"
-                )
-                return
-            if operation == "boolean_label":
-                observations[arguments[0]] = desired == arguments[1]
-                return
-            if operation == "positive_label":
-                observations[arguments[0]] = 1 if desired == arguments[1] else 0
-                return
-            if operation == "null_label":
-                observations[arguments[0]] = (
-                    None if desired == arguments[1] else "present"
-                )
-                return
-            if operation == "zero_if_equal_pairs":
-                for index in range(0, len(arguments), 2):
-                    observations[arguments[index]] = "same"
-                    observations[arguments[index + 1]] = "same"
-                return
-            if operation == "zero_if_equal_pairs_and_literal":
-                for index in range(0, len(arguments) - 2, 2):
-                    observations[arguments[index]] = "same"
-                    observations[arguments[index + 1]] = "same"
-                observations[arguments[-2]] = arguments[-1]
-                return
-            if operation.startswith("http_"):
-                if operation == "http_unauthenticated_successes":
-                    observations[arguments[0]] = 200 if desired == "1" else 401
-                else:
-                    success = desired in {"0", "0.0", "serves", "accepted"}
-                    observations[arguments[0]] = 200 if success else 503
-                return
-            raise AssertionError(f"unsupported synthetic recovery operand {operand!r}")
-
-        def default_operand_value(operand: tuple[str, ...]) -> str:
-            operation, *arguments = operand
-            if operation == "literal":
-                return arguments[0]
-            if operation in {
-                "all_positive",
-                "positive",
-                "canonical_request_id",
-                "canonical_request_id_pair",
-                "distinct",
-            }:
-                return "true"
-            if operation == "accepted_revision":
-                return "accepted"
-            if operation in {"boolean_label", "positive_label", "null_label"}:
-                return arguments[1]
-            return "self-test"
-
-        with tempfile.TemporaryDirectory() as recovery_directory:
-            for key, contract in recovery_expected.items():
-                scenario, stage = key.split("/", 1)
-                contract_scenario = contract["scenario"]
-                contract_stage = contract["stage"]
-                observations = {
-                    name: "self-test"
-                    for name in required_observations(
-                        contract_scenario, contract_stage
-                    )
-                }
-                for name in STAGE_REQUIRED_NULL_OBSERVATIONS.get(
-                    key, frozenset()
-                ):
-                    observations[name] = None
-                check_bindings = CHECK_RECONSTRUCTIONS.get(key, {})
-                for check in sorted(required_checks(contract_scenario, contract_stage)):
-                    expected_operand, observed_operand = check_bindings[check]
-                    desired = (
-                        observations[expected_operand[1]]
-                        if expected_operand[0] == "observation"
-                        else default_operand_value(expected_operand)
-                    )
-                    satisfy_operand(expected_operand, desired, observations)
-                    satisfy_operand(observed_operand, desired, observations)
-                gate_bindings = GATE_RECONSTRUCTIONS.get(key, {})
-                for gate, operand in gate_bindings.items():
-                    desired = (
-                        "0"
-                        if gate.startswith("max_")
-                        else str(contract_scenario["gate"][gate])
-                    )
-                    satisfy_operand(operand, desired, observations)
-
-                gates = []
-                for gate in REQUIRED_GATE_NAMES:
-                    bound = str(contract_scenario["gate"][gate])
-                    if gate_owner(contract_scenario, gate) == stage:
-                        observed = reconstruct_required_gate(
-                            contract_scenario, contract_stage, gate, observations
-                        )
-                        outcome = derive_verdict_outcome(
-                            "gate", gate, bound, observed
-                        )
-                        detail = "the synthetic fixture evaluates its owned gate"
-                    else:
-                        observed = "not measured"
-                        outcome = "not_evaluated"
-                        detail = deferred_gate_detail(
-                            gate,
-                            contract_stage["evidence"],
-                            "the synthetic fixture assigns this gate to its owner",
-                        )
-                    gates.append(
-                        {
-                            "gate": gate,
-                            "bound": bound,
-                            "observed": observed,
-                            "outcome": outcome,
-                            "detail": detail,
-                        }
-                    )
-
-                checks = []
-                for check in sorted(required_checks(contract_scenario, contract_stage)):
-                    bound, observed = reconstruct_required_check(
-                        contract_scenario, contract_stage, check, observations
-                    )
-                    checks.append(
-                        {
-                            "gate": check,
-                            "bound": bound,
-                            "observed": observed,
-                            "outcome": "met" if bound == observed else "failed",
-                            "detail": "the synthetic fixture retains the reconstructed check",
-                        }
-                    )
-                result = {
-                    "schema_version": 2,
-                    "scenario": scenario,
-                    "stage": stage,
-                    "runner": contract["runner"],
-                    "capability": contract["capability"],
-                    "evidence": contract["evidence"],
-                    "run": {
-                        "started_at_unix_ms": 1,
-                        "elapsed_ms": 1,
-                        "axond_version": "0.0.0",
-                        "control_plane": "postgres",
-                        "schema": "test",
-                        "schema_identity": "test",
-                        "axond_executable_sha256": "b" * 64,
-                        "cargo_profile": "release",
-                    },
-                    "timeline": [{"at_ms": 0, "event": "complete", "detail": "test"}],
-                    "observations": observations,
-                    "gates": gates,
-                    "checks": checks,
-                }
-                if contract["driver"] in {"stateful-integration", "restore-drill"}:
-                    result["run"].update(
-                        {
-                            "axond_executed_sha256": "b" * 64,
-                            "axond_executable_path": "/workspace/target/release/axond",
-                            "axond_execution_bound": True,
-                        }
-                    )
-                path = Path(recovery_directory) / f"{scenario}.{stage}.json"
-                path.write_text(json.dumps(result), encoding="utf-8")
-                result["_artifact_path"] = str(path)
-                recovery_results.append(result)
-            rendered = render_recovery(
-                recovery_results,
-                "github-actions",
-                "qualification self-test",
-                Path("synthetic-binary"),
-                recovery_provenance,
-            )
-            parsed = tomllib.loads(rendered)
-            assert agreed_recovery_cargo_profile(recovery_results) == "release"
-            assert len(parsed["stage"]) == len(recovery_expected)
-            assert all(
-                stage["artifact_schema_version"] == RECOVERY_RESULT_SCHEMA_VERSION
-                and stage["binary_sha256"] == "b" * 64
-                and stage["driver"] in {"stateful-integration", "restore-drill"}
-                for stage in parsed["stage"]
-            )
-            mixed_profiles = copy.deepcopy(recovery_results)
-            mixed_profiles[0]["run"]["cargo_profile"] = "debug"
-            try:
-                render_recovery(
-                    mixed_profiles,
-                    "github-actions",
-                    "mixed-profile qualification self-test",
-                    Path("downloaded-recovery-binary"),
-                    recovery_provenance,
-                )
-            except SystemExit:
-                pass
-            else:
-                raise AssertionError("disagreeing recovery Cargo profiles were accepted")
-            wrong_profile_provenance = copy.deepcopy(recovery_provenance)
-            wrong_profile_provenance["binary"]["cargo_profile"] = "debug"
-            try:
-                render_recovery(
-                    recovery_results,
-                    "github-actions",
-                    "downloaded-path qualification self-test",
-                    Path("downloaded-recovery-binary"),
-                    wrong_profile_provenance,
-                )
-            except SystemExit:
-                pass
-            else:
-                raise AssertionError(
-                    "recovery provenance disagreeing with raw profiles was accepted"
-                )
-            try:
-                check_recovery_complete(recovery_results[:-1], ROOT / RECOVERY_MANIFEST)
-            except SystemExit:
-                pass
-            else:
-                raise AssertionError("a partial recovery stage set was accepted")
-            failed = copy.deepcopy(recovery_results[0])
-            failed["gates"][0].update(observed="1", outcome="failed")
-            try:
-                check_recovery_complete([failed, *recovery_results[1:]], ROOT / RECOVERY_MANIFEST)
-            except SystemExit:
-                pass
-            else:
-                raise AssertionError("a failed recovery stage was accepted")
+            raise AssertionError("a partial fault matrix was accepted")
 
     print("qualification evidence self-test passed")
     return 0
+
 
 
 def main() -> int:
@@ -2922,11 +1282,6 @@ def main() -> int:
     )
     parser.add_argument("--out", type=Path, help="the record to write")
     parser.add_argument(
-        "--binary",
-        type=Path,
-        help="the binary whose provenance the recovery record should retain",
-    )
-    parser.add_argument(
         "--runner",
         choices=["local", "github-actions"],
         help="where the run happened, which is what bounds who may compare it",
@@ -2950,15 +1305,6 @@ def main() -> int:
     if arguments.slice == "capacity":
         record = render(
             load_results(arguments.results), arguments.runner, arguments.note
-        )
-    elif arguments.slice == "recovery":
-        if arguments.binary is None:
-            parser.error("--binary is required for recovery records")
-        record = render_recovery(
-            load_results(arguments.results, recursive=True),
-            arguments.runner,
-            arguments.note,
-            arguments.binary,
         )
     else:
         results = load_results(arguments.results, recursive=True)

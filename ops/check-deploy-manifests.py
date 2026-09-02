@@ -630,15 +630,24 @@ def ci_service_images(workflow: dict[str, Any]) -> dict[str, str]:
     return images
 
 
+REQUIRED_CI_IMAGE = re.compile(r"^`([^`]+)`$")
+
+
 def documented_backends(page: str) -> dict[str, tuple[str, str]]:
-    """The supported-version table, as `{backend: (supported column, CI image)}`."""
+    """The supported-version table, as `{backend: (supported column, exercised)}`."""
     rows: dict[str, tuple[str, str]] = {}
     for line in page.splitlines():
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         if len(cells) < 3 or cells[0] not in {"PostgreSQL", "Redis"}:
             continue
-        rows[cells[0]] = (cells[1], cells[2].strip("`"))
+        rows[cells[0]] = (cells[1], cells[2])
     return rows
+
+
+def claimed_required_ci_image(exercised: str) -> str | None:
+    """A backtick-only cell is a required-CI image claim; anything else is not."""
+    match = REQUIRED_CI_IMAGE.fullmatch(exercised.strip())
+    return match.group(1) if match else None
 
 
 def enforced_postgres_floor(source: str) -> int:
@@ -670,9 +679,28 @@ def check_supported_backends(
                 f"docs/deployment/stateful-backends.md: no supported-version row for {backend}"
             )
             continue
-        supported, documented_image = rows[backend]
+        supported, exercised = rows[backend]
         running = images.get(service)
-        if running is not None and documented_image != running:
+        documented_image = claimed_required_ci_image(exercised)
+        if documented_image is None:
+            marker = exercised.lower()
+            if "not exercised" not in marker and "opt-in" not in marker:
+                failures.append(
+                    f"docs/deployment/stateful-backends.md: {backend} exercised-in-CI cell "
+                    f"{exercised!r} is neither a required-CI image nor an explicit "
+                    "opt-in / not-exercised marker"
+                )
+            elif "not exercised" in marker and running is not None:
+                failures.append(
+                    f"docs/deployment/stateful-backends.md: {backend} is documented as not "
+                    f"exercised, but required CI runs `{running}`"
+                )
+        elif running is None:
+            failures.append(
+                f"docs/deployment/stateful-backends.md: {backend} is documented as exercised on "
+                f"`{documented_image}`, but required CI runs no `{service}` service"
+            )
+        elif documented_image != running:
             failures.append(
                 f"docs/deployment/stateful-backends.md: {backend} is documented as exercised on "
                 f"`{documented_image}`, but CI runs `{running}`"
@@ -1823,9 +1851,25 @@ def self_test() -> int:
 
     if check_supported_backends(backends, images, floor, revocation):
         failures.append("self-test: the committed support window must pass the gate")
+    required_redis = backends.replace(
+        "| Redis | 6.2, 7.x, 8.x | not exercised (ADR 0063) |",
+        "| Redis | 6.2, 7.x, 8.x | `redis:7.4.2-alpine` |",
+    )
+    expect_failure(
+        "required-CI image with no CI service",
+        check_supported_backends(required_redis, images, floor, revocation),
+    )
     expect_failure(
         "backend image drift",
-        check_supported_backends(backends, {**images, "postgres": "postgres:13-alpine"}, floor, revocation),
+        check_supported_backends(
+            required_redis, {**images, "redis": "redis:6.0-alpine"}, floor, revocation
+        ),
+    )
+    expect_failure(
+        "not-exercised backend that CI still runs",
+        check_supported_backends(
+            backends, {**images, "redis": "redis:7.4.2-alpine"}, floor, revocation
+        ),
     )
     expect_failure(
         "documented floor below what the gateway accepts",

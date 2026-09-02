@@ -30,6 +30,37 @@ impl SqliteStore {
         })
     }
 
+    /// Seed TOML `[[namespace]]` rows without `spawn_blocking`.
+    ///
+    /// `AppState::new` opens SQLite on the caller's thread (including
+    /// `#[tokio::test]` and plain `#[test]`). Going through the async `Store`
+    /// trait would `block_on` a `spawn_blocking` future, which panics when no
+    /// Tokio runtime is on the stack and can stall a worker when one is.
+    pub fn seed_config_namespaces_sync(
+        &self,
+        namespaces: &[crate::config::Namespace],
+    ) -> Result<(), StoreError> {
+        for namespace in namespaces {
+            super::validate_namespace_id(&namespace.id)?;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        for namespace in namespaces {
+            match conn.execute(
+                "INSERT INTO axond_namespace (id, attrs, blocklist) VALUES (?1, '{}', NULL)",
+                params![namespace.id],
+            ) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation => {}
+                Err(err) => return Err(unavailable(err)),
+            }
+        }
+        Ok(())
+    }
+
     async fn with_conn<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,

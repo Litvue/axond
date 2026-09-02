@@ -1420,8 +1420,8 @@ max_ttl = "15m"
             assert_eq!(principal.namespace, namespace);
             assert!(principal.namespace_grant.is_none());
             assert!(
-                principal.namespace_grant().is_err(),
-                "only the canonical namespaced route rejects the legacy label"
+                principal.namespace_grant().is_ok(),
+                "legacy labels that are valid namespace ids still form a grant"
             );
         }
     }

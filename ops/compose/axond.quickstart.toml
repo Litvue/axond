@@ -1,15 +1,15 @@
 # Lean Docker Compose quickstart configuration.
 #
 # Secrets stay in `.env`; every `env` value below is an environment-variable
-# name, not a provider key. The default path is Tier 0: no datastore, with
-# usage emitted to the container log.
+# name, not a provider key. SQLite lives at `/tmp` so the distroless nonroot
+# image can create the file without a pre-chowned volume.
 
 [server]
 bind = "0.0.0.0:8080"
 
 [storage]
 backend = "sqlite"
-path = "/var/lib/axond/axond.sqlite"
+path = "/tmp/axond.sqlite"
 
 [[namespace]]
 id = "platform"
