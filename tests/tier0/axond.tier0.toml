@@ -42,4 +42,3 @@ provider = "fake-openai"
 model = "fixture-chat"
 input_microdollars_per_million = 2500000
 output_microdollars_per_million = 10000000
-

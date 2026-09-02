@@ -71,4 +71,3 @@ provider = "openai"
 model = "text-embedding-3-small"
 input_microdollars_per_million = 20_000
 output_microdollars_per_million = 0
-

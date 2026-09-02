@@ -313,12 +313,8 @@ impl Reloader {
         let storage_changed = self.boot.storage != config.storage;
         let price_changed = self.boot.price != config.price;
         let blocklist_changed = self.boot.blocklist != config.blocklist;
-        let unpriced_models_changed = config.provider.iter().any(|provider| {
-            self.boot
-                .unpriced_models
-                .get(&provider.id)
-                .is_some_and(|booted| *booted != provider.unpriced_models)
-        });
+        let unpriced_models_changed =
+            unpriced_models_differ(&self.boot.unpriced_models, &config.provider);
         // `[catalog]` selects the importer built before the listener binds. A
         // reload validates the edited values and reports the difference, but it
         // cannot safely replace that task, its client, or its retained store.
@@ -332,9 +328,8 @@ impl Reloader {
         config.price = self.boot.price.clone();
         config.blocklist = self.boot.blocklist.clone();
         for provider in &mut config.provider {
-            if let Some(policy) = self.boot.unpriced_models.get(&provider.id) {
-                provider.unpriced_models = *policy;
-            }
+            provider.unpriced_models =
+                booted_unpriced_models(&self.boot.unpriced_models, &provider.id);
         }
         carry_policy_forward(&mut config, &current.config);
         // Stateful convergence owns the projected inbound identities. A file
@@ -662,11 +657,10 @@ impl ReloadSummary {
             storage_changed: boot.storage != after_config.storage,
             price_changed: boot.price != after_config.price,
             blocklist_changed: boot.blocklist != after_config.blocklist,
-            unpriced_models_changed: after_config.provider.iter().any(|provider| {
-                boot.unpriced_models
-                    .get(&provider.id)
-                    .is_some_and(|booted| *booted != provider.unpriced_models)
-            }),
+            unpriced_models_changed: unpriced_models_differ(
+                &boot.unpriced_models,
+                &after_config.provider,
+            ),
         }
     }
 
@@ -816,6 +810,27 @@ impl ReloadSummary {
             );
         }
     }
+}
+
+/// Boot-owned unpriced policy for one provider. A provider the process did not
+/// boot with has no live `allow` until restart: it inherits the product default
+/// (`deny`).
+fn booted_unpriced_models(
+    boot: &HashMap<String, UnpricedModels>,
+    provider_id: &str,
+) -> UnpricedModels {
+    boot.get(provider_id)
+        .copied()
+        .unwrap_or(UnpricedModels::Deny)
+}
+
+fn unpriced_models_differ(
+    boot: &HashMap<String, UnpricedModels>,
+    providers: &[crate::config::Provider],
+) -> bool {
+    providers
+        .iter()
+        .any(|provider| booted_unpriced_models(boot, &provider.id) != provider.unpriced_models)
 }
 
 /// An alias as the reload summary names it: `namespace/name` for one a namespace
@@ -2540,6 +2555,68 @@ output_microdollars_per_million = 10000000
         assert_eq!(
             state.config().config.provider[0].unpriced_models,
             crate::config::UnpricedModels::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_provider_with_allow_inherits_deny_until_restart() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state.clone());
+        file.rewrite(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+unpriced_models = "allow"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "PLATFORM_OPENAI_KEY"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+"#,
+        );
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("new provider is valid; unpriced_models stays boot-owned");
+        assert!(summary.unpriced_models_changed);
+        assert!(summary.restart_required());
+        assert!(
+            summary.providers.added.iter().any(|id| id == "anthropic"),
+            "the provider itself is live-reloaded: {:?}",
+            summary.providers.added
+        );
+        let snapshot = state.config();
+        let anthropic = snapshot
+            .config
+            .provider
+            .iter()
+            .find(|provider| provider.id == "anthropic")
+            .expect("anthropic was added");
+        assert_eq!(
+            anthropic.unpriced_models,
+            crate::config::UnpricedModels::Deny,
+            "new providers inherit deny until restart"
         );
     }
 
