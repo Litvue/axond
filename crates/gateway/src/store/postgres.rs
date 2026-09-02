@@ -153,4 +153,12 @@ impl Store for PostgresStore {
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         Ok(n > 0)
     }
+
+    fn seed_namespaces_blocking(
+        &self,
+        namespaces: &[crate::config::Namespace],
+    ) -> Result<(), StoreError> {
+        let _ = namespaces;
+        Ok(())
+    }
 }

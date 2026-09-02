@@ -58,6 +58,11 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<NamespaceRecord>, StoreError>;
     #[allow(dead_code)]
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError>;
+    /// Seed addressable namespace ids without `spawn_blocking`.
+    fn seed_namespaces_blocking(
+        &self,
+        namespaces: &[crate::config::Namespace],
+    ) -> Result<(), StoreError>;
 }
 
 pub async fn open(
@@ -100,9 +105,9 @@ pub async fn seed_config_namespaces(
     namespaces: &[crate::config::Namespace],
 ) -> Result<(), StoreError> {
     for namespace in namespaces {
-        validate_namespace_id(&namespace.id)?;
-    }
-    for namespace in namespaces {
+        if validate_namespace_id(&namespace.id).is_err() {
+            continue;
+        }
         let record = NamespaceRecord {
             id: namespace.id.clone(),
             attrs: serde_json::json!({}),

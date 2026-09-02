@@ -40,9 +40,10 @@ impl SqliteStore {
         &self,
         namespaces: &[crate::config::Namespace],
     ) -> Result<(), StoreError> {
-        for namespace in namespaces {
-            super::validate_namespace_id(&namespace.id)?;
-        }
+        let namespaces: Vec<_> = namespaces
+            .iter()
+            .filter(|namespace| super::validate_namespace_id(&namespace.id).is_ok())
+            .collect();
         let conn = self
             .conn
             .lock()
@@ -230,6 +231,13 @@ impl Store for SqliteStore {
             Ok(n > 0)
         })
         .await
+    }
+
+    fn seed_namespaces_blocking(
+        &self,
+        namespaces: &[crate::config::Namespace],
+    ) -> Result<(), StoreError> {
+        self.seed_config_namespaces_sync(namespaces)
     }
 }
 
