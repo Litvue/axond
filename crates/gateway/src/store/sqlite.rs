@@ -124,6 +124,25 @@ fn unavailable(err: rusqlite::Error) -> StoreError {
     StoreError::Unavailable(err.to_string())
 }
 
+fn insert_usage(conn: &Connection, event: &UsageAppend) -> Result<(), StoreError> {
+    let cost = event.cost_microdollars.map(sql_amount).transpose()?;
+    conn.execute(
+        "INSERT OR IGNORE INTO axond_store_usage
+            (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))",
+        params![
+            event.request_id,
+            event.namespace,
+            event.period,
+            event.model,
+            event.status,
+            cost,
+        ],
+    )
+    .map_err(unavailable)?;
+    Ok(())
+}
+
 fn row_to_record(
     id: String,
     attrs: String,
@@ -458,25 +477,19 @@ impl Store for SqliteStore {
     }
 
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
-        let cost = event.cost_microdollars.map(sql_amount).transpose()?;
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT OR IGNORE INTO axond_store_usage
-                    (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))",
-                params![
-                    event.request_id,
-                    event.namespace,
-                    event.period,
-                    event.model,
-                    event.status,
-                    cost,
-                ],
-            )
-            .map_err(unavailable)?;
-            Ok(())
-        })
-        .await
+        self.with_conn(move |conn| insert_usage(conn, &event)).await
+    }
+
+    fn blocking_usage_index(&self) -> bool {
+        true
+    }
+
+    fn append_usage_sync(&self, event: UsageAppend) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        insert_usage(&conn, &event)
     }
 
     async fn summarize_usage(
