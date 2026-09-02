@@ -5311,7 +5311,7 @@ fn serve_snapshot(snapshot: crate::state::ConfigSnapshot) -> AppState {
         Box::new(NoBudget),
     )
     .expect("the file bootstrap is a serving snapshot");
-    state.publish(rebuilt);
+    state.publish(rebuilt).expect("publish");
     state
 }
 
@@ -5557,11 +5557,13 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         Box::new(NoBudget),
     )
     .expect("credentials resolve");
-    state.publish(
-        crate::state::ConfigSnapshot::build(cfg, &env, 1)
-            .expect("the expert snapshot compiles")
-            .with_pricing(fixtures::approved_pricing_snapshot()),
-    );
+    state
+        .publish(
+            crate::state::ConfigSnapshot::build(cfg, &env, 1)
+                .expect("the expert snapshot compiles")
+                .with_pricing(fixtures::approved_pricing_snapshot()),
+        )
+        .expect("publish");
 
     let listed = inference_router(state.clone())
         .oneshot(

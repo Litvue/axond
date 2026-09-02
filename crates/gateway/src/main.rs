@@ -126,10 +126,11 @@ impl SnapshotSink for ServingSnapshotSink {
         SnapshotSink::admit(&self.state, snapshot)
     }
 
-    fn publish(&self, snapshot: state::ConfigSnapshot) {
+    fn publish(&self, snapshot: state::ConfigSnapshot) -> Result<(), state::SnapshotError> {
         let authorization = snapshot.admin_authorization_handle();
-        SnapshotSink::publish(&self.state, snapshot);
+        SnapshotSink::publish(&self.state, snapshot)?;
         self.authorization.update(authorization);
+        Ok(())
     }
 
     fn generation(&self) -> u64 {
@@ -911,7 +912,7 @@ async fn serve() -> anyhow::Result<()> {
         reconciler
             .restore_cached(revision, snapshot)
             .map_err(|error| {
-                anyhow::anyhow!("compiled serving cache could not be admitted: {error}")
+                anyhow::anyhow!("compiled serving cache could not be restored: {error}")
             })?;
         tracing::info!(%revision, "restored compiled serving snapshot from last-known-good cache");
     }

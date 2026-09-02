@@ -2039,15 +2039,16 @@ impl AppState {
 
     /// Publish a new snapshot. In-flight requests keep the snapshot they already
     /// hold; every request that starts after this call sees the new one.
-    pub fn publish(&self, snapshot: ConfigSnapshot) {
-        if let Err(error) = self
-            .0
+    ///
+    /// Addressable namespace rows are seeded first. A seed failure returns
+    /// [`SnapshotError::Store`] and leaves the previous snapshot in place.
+    pub fn publish(&self, snapshot: ConfigSnapshot) -> Result<(), SnapshotError> {
+        self.0
             .store
             .seed_namespaces_blocking(&snapshot.config.namespace)
-        {
-            tracing::warn!(error = %error, "namespace seed on snapshot publish failed");
-        }
+            .map_err(|error| SnapshotError::Store(error.to_string()))?;
         self.0.config.store(Arc::new(snapshot));
+        Ok(())
     }
 
     /// The stateful policy this replica enforces.
@@ -2120,7 +2121,9 @@ mod tests {
     use crate::desired_state::fixtures::{policy_body, revision_id, secret_ref, tenant_id};
     use crate::desired_state::policy::{ContentGuardrailRegistration, PolicyScope};
     use crate::desired_state::{TenantId, Uuid7};
+    use crate::store::{Store, StoreError};
     use crate::usage::UsageSink;
+    use async_trait::async_trait;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -2168,6 +2171,106 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 env = "AXOND_KEY"
 namespace = "platform"
 "#;
+
+    struct FailingSeedStore;
+
+    #[async_trait]
+    impl Store for FailingSeedStore {
+        async fn put_namespace(
+            &self,
+            _ns: crate::store::NamespaceRecord,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn get_namespace(
+            &self,
+            _id: &str,
+        ) -> Result<Option<crate::store::NamespaceRecord>, StoreError> {
+            Ok(None)
+        }
+        async fn list_namespaces(
+            &self,
+            _cursor: Option<String>,
+            _limit: u32,
+        ) -> Result<(Vec<crate::store::NamespaceRecord>, Option<String>), StoreError> {
+            Ok((Vec::new(), None))
+        }
+        async fn update_namespace(
+            &self,
+            _id: &str,
+            _attrs: serde_json::Value,
+            _blocklist: Option<Vec<String>>,
+        ) -> Result<Option<crate::store::NamespaceRecord>, StoreError> {
+            Ok(None)
+        }
+        async fn delete_namespace(&self, _id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+        fn seed_namespaces_blocking(
+            &self,
+            _namespaces: &[crate::config::Namespace],
+        ) -> Result<(), StoreError> {
+            Err(StoreError::Unavailable("seed refused".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_when_namespace_seed_fails() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+        let config = config_with(PLATFORM_KEY);
+        let state = AppState::new_with_policy(
+            config.clone(),
+            &env,
+            Arc::new(UsageDelivery::telemetry(UsageFanout::new(sinks))),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            Arc::new(PolicyRuntime::bootstrap(&config)),
+            ReplicaObservability::stateless(),
+            Some(Arc::new(FailingSeedStore)),
+        )
+        .expect("state");
+        let generation = state.config().generation;
+        let snapshot =
+            ConfigSnapshot::build(config, &env, generation + 1).expect("snapshot compiles");
+        let err = state.publish(snapshot).expect_err("seed fails");
+        assert!(matches!(err, SnapshotError::Store(_)), "{err:?}");
+        assert_eq!(state.config().generation, generation);
+    }
+
+    #[tokio::test]
+    async fn publish_seeds_sqlite_namespaces() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+        let mut config = config_with(PLATFORM_KEY);
+        config.namespace.push(crate::config::Namespace {
+            id: "wsp_x".into(),
+            default: false,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+            static_policy: None,
+        });
+        let state = AppState::new(
+            config.clone(),
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("state");
+        let store = Arc::clone(state.store().expect("store"));
+        let snapshot = ConfigSnapshot::build(config, &env, 1).expect("snapshot compiles");
+        state.publish(snapshot).expect("publish");
+        assert_eq!(state.config().generation, 1);
+        let got = store
+            .get_namespace("wsp_x")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.id, "wsp_x");
+        assert_eq!(got.attrs, serde_json::json!({}));
+    }
 
     fn middleware_policy(epoch: u64, id: &str) -> NamespacePolicy {
         let body = policy_body(PolicyScope::Tenant(tenant_id(1)), epoch)
@@ -2240,7 +2343,9 @@ namespace = "platform"
 
         let mut added = config_with(PLATFORM_KEY);
         added.namespace[0].policy = Some(middleware_policy(1, "test.policy-marker"));
-        state.publish(ConfigSnapshot::build(added, &env, 1).expect("addition compiles"));
+        state
+            .publish(ConfigSnapshot::build(added, &env, 1).expect("addition compiles"))
+            .expect("publish");
         let held_added = state.config();
         let mut request = gateway_core::ProviderRequest {
             model: "alias".to_owned(),
@@ -2254,7 +2359,9 @@ namespace = "platform"
         assert_eq!(request.body["policy_middleware"], "test.policy-marker");
 
         let removed = config_with(PLATFORM_KEY);
-        state.publish(ConfigSnapshot::build(removed, &env, 2).expect("removal compiles"));
+        state
+            .publish(ConfigSnapshot::build(removed, &env, 2).expect("removal compiles"))
+            .expect("publish");
         assert!(state.config().middleware("platform").is_empty());
         assert_eq!(held_added.middleware("platform").len(), 1);
 
@@ -2269,7 +2376,9 @@ namespace = "platform"
 
         let mut rollback = config_with(PLATFORM_KEY);
         rollback.namespace[0].policy = Some(middleware_policy(4, "test.policy-marker"));
-        state.publish(ConfigSnapshot::build(rollback, &env, 4).expect("rollback compiles"));
+        state
+            .publish(ConfigSnapshot::build(rollback, &env, 4).expect("rollback compiles"))
+            .expect("publish");
         assert_eq!(state.config().middleware("platform").len(), 1);
     }
 

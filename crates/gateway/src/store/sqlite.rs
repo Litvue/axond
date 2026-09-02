@@ -260,6 +260,49 @@ mod tests {
         assert!(matches!(err, StoreError::Unavailable(_)), "{err:?}");
     }
 
+    fn namespace(id: &str) -> crate::config::Namespace {
+        crate::config::Namespace {
+            id: id.to_owned(),
+            default: false,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+            static_policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_namespaces_insert_only_and_ignore_duplicates() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .seed_namespaces_blocking(&[
+                namespace("wsp_x"),
+                namespace("wsp_x"),
+                namespace("acme/core"),
+                namespace(""),
+            ])
+            .expect("seed");
+        let got = store
+            .get_namespace("wsp_x")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.id, "wsp_x");
+        assert_eq!(got.attrs, serde_json::json!({}));
+        assert!(
+            store
+                .get_namespace("acme/core")
+                .await
+                .expect("slash id skipped")
+                .is_none()
+        );
+        store
+            .seed_namespaces_blocking(&[namespace("wsp_x")])
+            .expect("duplicate ignored");
+        store.seed_namespaces_blocking(&[]).expect("empty seed");
+        assert!(store.get_namespace("wsp_x").await.expect("get").is_some());
+    }
+
     #[tokio::test]
     async fn update_returns_the_written_row() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");

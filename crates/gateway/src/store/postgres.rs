@@ -6,6 +6,9 @@ use super::{NamespaceRecord, Store, StoreError};
 
 pub struct PostgresStore {
     client: Client,
+    /// DSN for short-lived seed connections. The request-path `client` is bound
+    /// to the process Tokio runtime and must not be driven with `block_on`.
+    dsn: String,
 }
 
 impl PostgresStore {
@@ -36,8 +39,37 @@ impl PostgresStore {
                     "axond_namespace schema missing or incompatible: {e}"
                 ))
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            dsn: dsn.to_owned(),
+        })
     }
+}
+
+fn seed_on_dedicated_runtime(dsn: &str, ids: &[&str]) -> Result<(), StoreError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+    runtime.block_on(async {
+        let (client, connection) = tokio_postgres::connect(dsn, crate::usage::tls_connector())
+            .await
+            .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        for id in ids {
+            client
+                .execute(
+                    "INSERT INTO axond_namespace (id, attrs, blocklist) \
+                     VALUES ($1, '{}'::jsonb, NULL) ON CONFLICT (id) DO NOTHING",
+                    &[&*id],
+                )
+                .await
+                .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+        }
+        Ok(())
+    })
 }
 
 fn record_from(
@@ -158,7 +190,24 @@ impl Store for PostgresStore {
         &self,
         namespaces: &[crate::config::Namespace],
     ) -> Result<(), StoreError> {
-        let _ = namespaces;
-        Ok(())
+        let ids: Vec<&str> = namespaces
+            .iter()
+            .filter(|namespace| super::validate_namespace_id(&namespace.id).is_ok())
+            .map(|namespace| namespace.id.as_str())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        std::thread::scope(|scope| {
+            match scope
+                .spawn(|| seed_on_dedicated_runtime(&self.dsn, &ids))
+                .join()
+            {
+                Ok(result) => result,
+                Err(_) => Err(StoreError::Unavailable(
+                    "namespace seed thread panicked".into(),
+                )),
+            }
+        })
     }
 }

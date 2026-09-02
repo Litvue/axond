@@ -138,13 +138,12 @@ impl PolicyRuntime {
     /// Install `candidate` as the policy this replica enforces from the next
     /// admission on.
     ///
-    /// Infallible by design, and called only from
-    /// [`AppState::publish`](crate::state::AppState::publish): the refusal happens
-    /// at the compile gate, where a candidate can still be dropped without
-    /// touching a serving replica. Reaching a refusal here would mean the snapshot
-    /// being installed disagrees with the policy view derived from it, so it is
-    /// logged loudly and the view still follows the snapshot — a replica must not
-    /// serve a configuration under a policy it does not hold.
+    /// Infallible by design, and called only after a snapshot has been published:
+    /// the refusal happens at the compile gate, where a candidate can still be
+    /// dropped without touching a serving replica. Reaching a refusal here would
+    /// mean the snapshot being installed disagrees with the policy view derived
+    /// from it, so it is logged loudly and the view still follows the snapshot —
+    /// a replica must not serve a configuration under a policy it does not hold.
     pub fn install(&self, candidate: PolicyView) -> Activation {
         let activation = match self.plan(&candidate) {
             Ok(activation) => activation,

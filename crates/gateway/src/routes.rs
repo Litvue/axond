@@ -3874,11 +3874,13 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             Box::new(NoBudget),
         )
         .expect("credentials resolve");
-        state.publish(
-            ConfigSnapshot::build(cfg, &env, 1)
-                .expect("minting snapshot")
-                .with_pricing(approved_pricing_snapshot()),
-        );
+        state
+            .publish(
+                ConfigSnapshot::build(cfg, &env, 1)
+                    .expect("minting snapshot")
+                    .with_pricing(approved_pricing_snapshot()),
+            )
+            .expect("publish");
         state
     }
 
@@ -4007,11 +4009,13 @@ targets = [
             Box::new(crate::budget::InMemoryBudget::new(0)),
         )
         .expect("credentials resolve");
-        state.publish(
-            ConfigSnapshot::build(cfg, &env, 1)
-                .expect("minting snapshot")
-                .with_pricing(approved_pricing_snapshot()),
-        );
+        state
+            .publish(
+                ConfigSnapshot::build(cfg, &env, 1)
+                    .expect("minting snapshot")
+                    .with_pricing(approved_pricing_snapshot()),
+            )
+            .expect("publish");
         state
     }
 
@@ -4412,7 +4416,9 @@ max_request_microdollars = 1000
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             ),
         ]);
-        state.publish(ConfigSnapshot::build(config, &env, 0).expect("minting snapshot"));
+        state
+            .publish(ConfigSnapshot::build(config, &env, 0).expect("minting snapshot"))
+            .expect("publish");
 
         let (status, body) =
             mint_request_with_credential(state.clone(), "static-key", json!({"sub": "agent"}))
@@ -5679,7 +5685,7 @@ max_ttl = "15m"
             ),
         ]);
         let unauthorized = ConfigSnapshot::build(config, &env, 0).unwrap();
-        state.publish(unauthorized);
+        state.publish(unauthorized).expect("publish");
         let (status, body) = mint_request(state, json!({"sub": "agent"})).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["type"], "mint_not_authorized");
@@ -5753,7 +5759,9 @@ max_ttl = "15m"
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             ),
         ]);
-        state.publish(ConfigSnapshot::build(config, &env, 1).unwrap());
+        state
+            .publish(ConfigSnapshot::build(config, &env, 1).unwrap())
+            .expect("publish");
         let response = app
             .oneshot(
                 Request::post("/ns/platform/v1/tokens")

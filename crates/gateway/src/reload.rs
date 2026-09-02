@@ -229,19 +229,8 @@ impl Reloader {
                 let mut summary = ReloadSummary::between(&self.boot, &current, &candidate_snapshot);
                 summary.catalog_changed = catalog_changed;
                 summary.storage_changed = storage_changed;
-                if let Some(store) = self.state.store()
-                    && let Err(error) = crate::store::seed_config_namespaces(
-                        store.as_ref(),
-                        &candidate_snapshot.config.namespace,
-                    )
-                    .await
-                {
-                    return Err(ReloadError::Snapshot(SnapshotError::Store(
-                        error.to_string(),
-                    )));
-                }
                 let generation = candidate_snapshot.generation;
-                self.state.publish(candidate_snapshot);
+                self.state.publish(candidate_snapshot)?;
                 telemetry::finish_config_reload(
                     &span,
                     trigger,
@@ -1262,15 +1251,17 @@ scope = ["chat", "models"]
         // A replica that converged once: the reconciler's snapshot, owning the
         // versions its compilation resolved.
         let state = state_from(&file);
-        state.publish(
-            ConfigSnapshot::build_with(
-                Config::load(file.path()).expect("valid boot config"),
-                &inbound_env(),
-                0,
-                resolved,
+        state
+            .publish(
+                ConfigSnapshot::build_with(
+                    Config::load(file.path()).expect("valid boot config"),
+                    &inbound_env(),
+                    0,
+                    resolved,
+                )
+                .expect("a servable snapshot"),
             )
-            .expect("a servable snapshot"),
-        );
+            .expect("publish");
         let reloader = Reloader::new(file.path(), state.clone());
 
         file.rewrite(&format!("{PLATFORM_ONLY}\n[reload]\nwatch = false\n"));
@@ -1835,7 +1826,7 @@ env = "GW_ADMIN_BREAKGLASS"
         )
         .expect("the boot config compiles")
         .with_pricing(pricing.clone());
-        state.publish(converged);
+        state.publish(converged).expect("publish");
 
         // A real edit, so the candidate is published rather than skipped.
         file.rewrite(&format!(
@@ -1900,15 +1891,17 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
 
         let file = ConfigFile::new(PLATFORM_ONLY);
         let state = state_from(&file);
-        state.publish(
-            ConfigSnapshot::build(
-                Config::load(file.path()).expect("valid boot config"),
-                &inbound_env(),
-                7,
+        state
+            .publish(
+                ConfigSnapshot::build(
+                    Config::load(file.path()).expect("valid boot config"),
+                    &inbound_env(),
+                    7,
+                )
+                .expect("the boot config compiles")
+                .with_availability(Arc::new(derived)),
             )
-            .expect("the boot config compiles")
-            .with_availability(Arc::new(derived)),
-        );
+            .expect("publish");
 
         file.rewrite(&format!(
             r#"{PLATFORM_ONLY}
@@ -1979,7 +1972,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
             converged.gateway_token_epoch("platform", "someone"),
             Some(1_700_000_000)
         );
-        state.publish(converged);
+        state.publish(converged).expect("publish");
 
         // A real edit, so the candidate is published rather than skipped.
         file.rewrite(&format!(
@@ -2039,7 +2032,7 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         config.namespace.push(projected);
         let converged =
             ConfigSnapshot::build(config, &inbound_env(), 7).expect("the boot config compiles");
-        state.publish(converged);
+        state.publish(converged).expect("publish");
 
         file.rewrite(&format!(
             r#"{PLATFORM_ONLY}
