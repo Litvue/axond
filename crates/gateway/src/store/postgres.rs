@@ -955,7 +955,9 @@ impl Store for PostgresStore {
                         fetched_at = excluded.fetched_at,
                         stale = excluded.stale,
                         models = excluded.models,
-                        source = excluded.source",
+                        source = excluded.source
+                     WHERE axond_store_provider_models.source IS NULL
+                        OR axond_store_provider_models.source IS NOT DISTINCT FROM excluded.source",
                     &[
                         &row.provider,
                         &row.fetched_at,
