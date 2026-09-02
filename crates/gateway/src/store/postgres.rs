@@ -7,12 +7,13 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, budget_would_exceed,
-    from_sql_amount, sql_amount, sql_amount_saturating,
+    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, UsageAppend, UsageSummaryRow,
+    budget_would_exceed, from_sql_amount, sql_amount, sql_amount_saturating,
 };
 use crate::backends::health::{BackendHealth, PostgresHealth};
 
 const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
+const USAGE_DDL: &str = include_str!("../../sql/store_usage_v1.sql");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
 const POOL_SIZE: usize = 32;
@@ -61,6 +62,12 @@ impl PostgresStore {
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         }
         ensure_budget_schema(&mut client, create_table).await?;
+        if create_table {
+            client
+                .batch_execute(USAGE_DDL)
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        }
         probe_schema(&client).await?;
         store.checkin(client).await;
         Ok(store)
@@ -168,6 +175,17 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
         .await
         .map_err(|e| {
             StoreError::Unavailable(format!("budget schema missing or incompatible: {e}"))
+        })?;
+    client
+        .batch_execute(
+            "SELECT request_id, namespace, period, model, status, cost_microdollars
+             FROM axond_store_usage LIMIT 0",
+        )
+        .await
+        .map_err(|e| {
+            StoreError::Unavailable(format!(
+                "axond_store_usage schema missing or incompatible: {e}"
+            ))
         })?;
     Ok(())
 }
@@ -719,6 +737,64 @@ impl Store for PostgresStore {
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
+        let cost = event.cost_microdollars.map(sql_amount).transpose()?;
+        self.with_client(async move |client| {
+            client
+                .execute(
+                    "INSERT INTO axond_store_usage
+                        (request_id, namespace, period, model, status, cost_microdollars)
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (request_id) DO NOTHING",
+                    &[
+                        &event.request_id,
+                        &event.namespace,
+                        &event.period,
+                        &event.model,
+                        &event.status,
+                        &cost,
+                    ],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn summarize_usage(
+        &self,
+        namespace: &str,
+        period: &str,
+    ) -> Result<Vec<UsageSummaryRow>, StoreError> {
+        let namespace = namespace.to_owned();
+        let period = period.to_owned();
+        self.with_client(async move |client| {
+            let rows = client
+                .query(
+                    "SELECT model, status, COUNT(*)::bigint,
+                            COALESCE(SUM(COALESCE(cost_microdollars, 0)), 0)::bigint
+                     FROM axond_store_usage
+                     WHERE namespace = $1 AND period = $2
+                     GROUP BY model, status
+                     ORDER BY model, status",
+                    &[&namespace, &period],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|row| UsageSummaryRow {
+                    model: row.get(0),
+                    status: row.get(1),
+                    count: from_sql_amount(row.get(2)),
+                    cost_microdollars: from_sql_amount(row.get(3)),
+                })
+                .collect())
         })
         .await
     }

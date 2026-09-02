@@ -14,3 +14,7 @@ __pycache__/
 # Installed and compiled output of the TypeScript compatibility lane
 /tests/compat-ts/node_modules/
 /tests/compat-ts/build/
+
+# OpenAPI smoke: installed tools and generated client types
+/tests/openapi-smoke/node_modules/
+/tests/openapi-smoke/generated/
