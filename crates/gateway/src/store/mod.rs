@@ -626,4 +626,169 @@ mod tests {
             "exactly one replica may take the last dollar: {results:?}"
         );
     }
+
+    fn unique_ns(prefix: &str) -> String {
+        format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        )
+    }
+
+    async fn postgres_seeded(dsn: &str) -> (PostgresStore, String) {
+        let store = PostgresStore::connect(dsn, true).await.expect("connect");
+        let ns = unique_ns("wsp");
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        (store, ns)
+    }
+
+    #[tokio::test]
+    async fn postgres_reconnects_after_a_dropped_connection() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("budget");
+        store.drop_idle_connection().await.expect("drop");
+        match store
+            .reserve_budget(&ns, 1, Duration::from_secs(30), "after-drop")
+            .await
+            .expect("reserve after drop")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_put_races_reserve_and_settle_without_deadlock() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (putter, ns) = postgres_seeded(&dsn).await;
+        putter.put_budget(&ns, "p", 10_000).await.expect("budget");
+        let reserver = PostgresStore::connect(&dsn, true).await.expect("connect b");
+        let ns_put = ns.clone();
+        let ns_res = ns.clone();
+        let raced = tokio::time::timeout(Duration::from_secs(10), async move {
+            let puts = tokio::spawn(async move {
+                for i in 0..80u64 {
+                    putter
+                        .put_budget(&ns_put, "p", 10_000 + i)
+                        .await
+                        .expect("put");
+                }
+            });
+            let holds = tokio::spawn(async move {
+                for i in 0..80 {
+                    let id = format!("r{i}");
+                    match reserver
+                        .reserve_budget(&ns_res, 1, Duration::from_secs(30), &id)
+                        .await
+                        .expect("reserve")
+                    {
+                        BudgetReserve::Allowed { period } => {
+                            assert_eq!(period, "p");
+                            reserver
+                                .settle_budget(&ns_res, "p", &id, 1)
+                                .await
+                                .expect("settle");
+                        }
+                        BudgetReserve::Exceeded => {}
+                    }
+                }
+            });
+            puts.await.expect("put join");
+            holds.await.expect("hold join");
+        })
+        .await;
+        assert!(raced.is_ok(), "PUT vs reserve/settle deadlocked");
+    }
+
+    #[tokio::test]
+    async fn postgres_get_does_not_mix_spend_and_reserved_across_a_settlement() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 100).await.expect("budget");
+        store
+            .reserve_budget(&ns, 60, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        let reader = PostgresStore::connect(&dsn, true).await.expect("reader");
+        let ns_get = ns.clone();
+        let getter = tokio::spawn(async move {
+            let mut samples = Vec::new();
+            for _ in 0..200 {
+                samples.push(
+                    reader
+                        .get_budget(&ns_get, "p")
+                        .await
+                        .expect("get")
+                        .expect("row"),
+                );
+            }
+            samples
+        });
+        store
+            .settle_budget(&ns, "p", "r1", 60)
+            .await
+            .expect("settle");
+        let samples = getter.await.expect("join");
+        assert!(!samples.is_empty());
+        for rec in samples {
+            assert_eq!(
+                rec.remaining_microdollars,
+                remaining(
+                    rec.limit_microdollars,
+                    rec.spent_microdollars,
+                    rec.reserved_microdollars
+                )
+            );
+            assert_eq!(
+                rec.spent_microdollars + rec.reserved_microdollars,
+                60,
+                "GET mixed pre- and post-settle snapshots: {rec:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_boot_probes_active_and_reservation_tables() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let schema = unique_ns("probe").replace('-', "_");
+        let (setup, connection) = tokio_postgres::connect(&dsn, crate::usage::tls_connector())
+            .await
+            .expect("setup");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        setup
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("schema");
+        let sep = if dsn.contains('?') { '&' } else { '?' };
+        let scoped = format!("{dsn}{sep}options=-csearch_path%3D{schema}");
+        let err = match PostgresStore::connect(&scoped, false).await {
+            Err(error) => error,
+            Ok(_) => panic!("empty schema must fail boot"),
+        };
+        assert!(
+            matches!(err, StoreError::Unavailable(ref message) if message.contains("schema missing")),
+            "{err:?}"
+        );
+    }
 }
