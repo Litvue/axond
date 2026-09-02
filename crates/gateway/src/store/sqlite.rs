@@ -6,8 +6,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, from_sql_amount, sql_amount,
-    sql_amount_saturating,
+    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, UsageAppend, UsageSummaryRow,
+    from_sql_amount, sql_amount, sql_amount_saturating,
 };
 
 pub struct SqliteStore {
@@ -40,6 +40,16 @@ CREATE TABLE IF NOT EXISTS axond_store_budget_reservation (
 );
 CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx
     ON axond_store_budget_reservation (namespace, period, expires_at);
+CREATE TABLE IF NOT EXISTS axond_store_usage (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    namespace TEXT NOT NULL,
+    period TEXT,
+    model TEXT NOT NULL,
+    status TEXT NOT NULL,
+    cost_microdollars INTEGER
+);
+CREATE INDEX IF NOT EXISTS axond_store_usage_ns_period
+    ON axond_store_usage (namespace, period);
 ";
 
 impl SqliteStore {
@@ -442,6 +452,70 @@ impl Store for SqliteStore {
             .map_err(unavailable)?;
             tx.commit().map_err(unavailable)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
+        let cost = event.cost_microdollars.map(sql_amount).transpose()?;
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO axond_store_usage
+                    (request_id, namespace, period, model, status, cost_microdollars)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event.request_id,
+                    event.namespace,
+                    event.period,
+                    event.model,
+                    event.status,
+                    cost,
+                ],
+            )
+            .map_err(unavailable)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn summarize_usage(
+        &self,
+        namespace: &str,
+        period: &str,
+    ) -> Result<Vec<UsageSummaryRow>, StoreError> {
+        let namespace = namespace.to_string();
+        let period = period.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT model, status, COUNT(*), COALESCE(SUM(COALESCE(cost_microdollars, 0)), 0)
+                     FROM axond_store_usage
+                     WHERE namespace = ?1 AND period = ?2
+                     GROUP BY model, status
+                     ORDER BY model, status",
+                )
+                .map_err(unavailable)?;
+            let rows = stmt
+                .query_map(params![namespace, period], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(unavailable)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (model, status, count, cost) = row.map_err(unavailable)?;
+                out.push(UsageSummaryRow {
+                    model,
+                    status,
+                    count: from_sql_amount(count),
+                    cost_microdollars: from_sql_amount(cost),
+                });
+            }
+            Ok(out)
         })
         .await
     }

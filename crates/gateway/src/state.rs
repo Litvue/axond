@@ -1930,6 +1930,11 @@ impl AppState {
         } else {
             ConfigSnapshot::build(config, env, 0)?
         };
+        let store = match store {
+            Some(store) => store,
+            None => open_store_sync(&snapshot.config)?,
+        };
+        usage.attach_store(Arc::clone(&store));
         Ok(AppState(Arc::new(Inner {
             dispatcher: HttpDispatcher::with_limits(
                 build_client(&limits).expect("the upstream HTTP client builds"),
@@ -1946,10 +1951,7 @@ impl AppState {
             status: observability.status,
             revision: observability.revision,
             catalogue: observability.catalogue,
-            store: match store {
-                Some(store) => store,
-                None => open_store_sync(&snapshot.config)?,
-            },
+            store,
             #[cfg(test)]
             middleware: MiddlewareChain::empty(),
             middleware_runtime: MiddlewareRuntime::default(),
