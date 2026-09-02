@@ -417,7 +417,8 @@ impl Credentials {
         // request-path health.
         self.pools
             .iter()
-            .find(|((_, name), _)| name == provider)
+            .filter(|((_, name), _)| name.as_str() == provider)
+            .min_by_key(|((namespace, _), _)| namespace.as_str())
             .and_then(|(_, pool)| pool.entries.first().map(lease))
     }
 
