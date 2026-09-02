@@ -2631,7 +2631,7 @@ output_microdollars_per_million = 10000000
         let reloader = Reloader::new(file.path(), state);
 
         file.rewrite(&format!(
-            "{PLATFORM_ONLY}\n[budget]\nbackend = \"in-memory\"\nlimit_microdollars = 1_000\nreservation_ttl_seconds = 60\nidle_ttl_seconds = 120\nmax_subjects = 32\n"
+            "{PLATFORM_ONLY}\n[budget]\nreservation_ttl_seconds = 60\n"
         ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())

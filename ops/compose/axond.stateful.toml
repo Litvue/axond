@@ -83,10 +83,7 @@ output_microdollars_per_million = 0
 
 
 [budget]
-backend = "redis"
-limit_microdollars = 10_000_000
-dsn_env = "AXOND_BUDGET_REDIS_URL"
-on_unavailable = "deny"
+reservation_ttl_seconds = 300
 
 [rate_limit]
 backend = "redis"

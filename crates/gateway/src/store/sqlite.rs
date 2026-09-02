@@ -303,17 +303,17 @@ impl Store for SqliteStore {
                 return Err(StoreError::NotFound(namespace));
             }
             tx.execute(
+                "INSERT INTO axond_budget_active (namespace, period) VALUES (?1, ?2)
+                 ON CONFLICT (namespace) DO UPDATE SET period = excluded.period",
+                params![namespace, period],
+            )
+            .map_err(unavailable)?;
+            tx.execute(
                 "INSERT INTO axond_budget (namespace, period, limit_microdollars, spent_microdollars)
                  VALUES (?1, ?2, ?3, 0)
                  ON CONFLICT (namespace, period) DO UPDATE SET
                     limit_microdollars = excluded.limit_microdollars",
                 params![namespace, period, limit],
-            )
-            .map_err(unavailable)?;
-            tx.execute(
-                "INSERT INTO axond_budget_active (namespace, period) VALUES (?1, ?2)
-                 ON CONFLICT (namespace) DO UPDATE SET period = excluded.period",
-                params![namespace, period],
             )
             .map_err(unavailable)?;
             let rec = read_budget(&tx, &namespace, &period, now_ms())?;
@@ -452,43 +452,37 @@ fn read_budget(
     period: &str,
     now: i64,
 ) -> Result<Option<BudgetRecord>, StoreError> {
-    let Some((limit, spent)) = conn
-        .query_row(
-            "SELECT limit_microdollars, spent_microdollars FROM axond_budget
-             WHERE namespace = ?1 AND period = ?2",
-            params![namespace, period],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(unavailable)?
-    else {
-        return Ok(None);
-    };
-    let reserved: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(amount_microdollars), 0) FROM axond_budget_reservation
-             WHERE namespace = ?1 AND period = ?2 AND expires_at > ?3",
-            params![namespace, period, now],
-            |row| row.get(0),
-        )
-        .map_err(unavailable)?;
-    let active = conn
-        .query_row(
-            "SELECT period FROM axond_budget_active WHERE namespace = ?1",
-            params![namespace],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(unavailable)?
-        .is_some_and(|active| active == period);
-    Ok(Some(BudgetRecord::new(
-        namespace,
-        period,
-        from_sql_amount(limit),
-        from_sql_amount(spent),
-        from_sql_amount(reserved),
-        active,
-    )))
+    conn.query_row(
+        "SELECT
+             b.limit_microdollars,
+             b.spent_microdollars,
+             COALESCE((
+                 SELECT SUM(r.amount_microdollars)
+                 FROM axond_budget_reservation r
+                 WHERE r.namespace = b.namespace
+                   AND r.period = b.period
+                   AND r.expires_at > ?3
+             ), 0),
+             EXISTS (
+                 SELECT 1 FROM axond_budget_active a
+                 WHERE a.namespace = b.namespace AND a.period = b.period
+             )
+         FROM axond_budget b
+         WHERE b.namespace = ?1 AND b.period = ?2",
+        params![namespace, period, now],
+        |row| {
+            Ok(BudgetRecord::new(
+                namespace,
+                period,
+                from_sql_amount(row.get(0)?),
+                from_sql_amount(row.get(1)?),
+                from_sql_amount(row.get(2)?),
+                row.get(3)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(unavailable)
 }
 
 #[cfg(test)]
