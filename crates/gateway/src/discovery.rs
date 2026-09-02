@@ -168,12 +168,9 @@ async fn refresh_one(
         match page_body.next_after {
             Some(next) => {
                 if page + 1 == MAX_PAGES {
-                    tracing::warn!(
-                        provider = provider_id,
-                        pages = MAX_PAGES,
-                        "provider model listing hit the page bound"
-                    );
-                    break;
+                    return Err(RefreshError::Failed(
+                        "provider model listing exceeded the page bound".into(),
+                    ));
                 }
                 after_id = Some(next);
             }
