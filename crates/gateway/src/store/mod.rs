@@ -193,10 +193,7 @@ impl Store for UnavailableStore {
     async fn delete_namespace(&self, _: &str) -> Result<bool, StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
-    fn seed_namespaces_blocking(
-        &self,
-        _: &[crate::config::Namespace],
-    ) -> Result<(), StoreError> {
+    fn seed_namespaces_blocking(&self, _: &[crate::config::Namespace]) -> Result<(), StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn put_budget(&self, _: &str, _: &str, _: u64) -> Result<BudgetRecord, StoreError> {
@@ -320,9 +317,8 @@ pub(crate) fn sql_amount(value: u64) -> Result<i64, StoreError> {
     })
 }
 
-/// PUT limits and settlement actuals that exceed `i64::MAX` charge the
-/// representable cap rather than dropping the write. Settlement of an admitted
-/// request must not vanish because the actual overflowed the column type.
+/// Settlement actuals that exceed `i64::MAX` charge the representable cap
+/// rather than dropping the write. PUT limits use [`sql_amount`] and reject.
 pub(crate) fn sql_amount_saturating(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -583,10 +579,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_put_budget_rejects_unrepresentable_limit() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        let err = store
+            .put_budget("wsp_x", "p", i64::MAX as u64 + 1)
+            .await
+            .expect_err("limit must match the response");
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+        assert!(store.get_budget("wsp_x", "p").await.expect("get").is_none());
+    }
+
+    #[tokio::test]
     async fn sqlite_settle_saturates_oversized_actual_and_releases_the_hold() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        match store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r0")
+            .await
+            .expect("prior")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget("wsp_x", "p", "r0", 40)
+            .await
+            .expect("prior spend");
         match store
             .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r1")
             .await
@@ -1207,6 +1227,18 @@ mod tests {
         };
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "p", 10_000).await.expect("put");
+        match store
+            .reserve_budget(&ns, 1, Duration::from_secs(30), "r0")
+            .await
+            .expect("prior")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget(&ns, "p", "r0", 40)
+            .await
+            .expect("prior spend");
         match store
             .reserve_budget(&ns, 1, Duration::from_secs(30), "r1")
             .await

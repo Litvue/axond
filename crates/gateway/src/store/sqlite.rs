@@ -2,12 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use super::{
-    from_sql_amount, sql_amount, sql_amount_saturating, BudgetRecord, BudgetReserve,
-    NamespaceRecord, Store, StoreError,
+    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, from_sql_amount, sql_amount,
+    sql_amount_saturating,
 };
 
 pub struct SqliteStore {
@@ -286,7 +286,7 @@ impl Store for SqliteStore {
     ) -> Result<BudgetRecord, StoreError> {
         let namespace = namespace.to_string();
         let period = period.to_string();
-        let limit = sql_amount_saturating(limit_microdollars);
+        let limit = sql_amount(limit_microdollars)?;
         self.with_conn(move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -428,7 +428,10 @@ impl Store for SqliteStore {
             .map_err(unavailable)?;
             tx.execute(
                 "UPDATE axond_store_budget
-                 SET spent_microdollars = spent_microdollars + ?1
+                 SET spent_microdollars = CASE
+                     WHEN spent_microdollars >= 9223372036854775807 - ?1 THEN 9223372036854775807
+                     ELSE spent_microdollars + ?1
+                 END
                  WHERE namespace = ?2 AND period = ?3",
                 params![actual, namespace, period],
             )
@@ -621,9 +624,11 @@ mod tests {
         assert!(names.iter().any(|n| n == "axond_store_budget"));
         assert!(names.iter().any(|n| n == "axond_store_budget_active"));
         assert!(names.iter().any(|n| n == "axond_store_budget_reservation"));
-        assert!(names
-            .iter()
-            .any(|n| n == "axond_store_budget_reservation_scope_idx"));
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "axond_store_budget_reservation_scope_idx")
+        );
         assert!(!names.iter().any(|n| n == "axond_budget"));
         assert!(!names.iter().any(|n| n == "axond_budget_reservation"));
     }
