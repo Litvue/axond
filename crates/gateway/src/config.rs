@@ -4016,6 +4016,11 @@ impl Config {
                  Remove `[budget]` or leave `backend` unset. `[budget] reservation_ttl_seconds` still sets the hold TTL."
             )));
         }
+        if budget.reservation_ttl_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "`[budget]` reservation_ttl_seconds must be at least 1".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -5400,6 +5405,17 @@ env = "SIGN"
         assert_eq!(cfg.budget.backend, BudgetBackend::None);
         assert_eq!(cfg.budget.on_unavailable, StoreUnavailable::Deny);
         assert_eq!(cfg.budget.reservation_ttl_seconds, 300);
+    }
+
+    #[test]
+    fn reservation_ttl_zero_is_rejected_without_a_backend() {
+        let error =
+            Config::from_toml_str(&format!("{VALID}\n[budget]\nreservation_ttl_seconds = 0\n"))
+                .expect_err("zero TTL must fail at load");
+        assert!(
+            error.to_string().contains("reservation_ttl_seconds"),
+            "{error}"
+        );
     }
 
     #[test]

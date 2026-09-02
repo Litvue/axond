@@ -38,10 +38,9 @@ egress: upstream provider calls still use the network at Tier 0.
 | `[[usage_sink]] kind = "postgres"` | Tier 2: durable usage rows. |
 | `[usage_journal]` omitted or `backend = "none"` | Tier 0: telemetry-grade usage delivery, exactly as before. |
 | `[usage_journal] backend = "postgres"` | Tier 2: a durable usage outbox on the request path. |
-| `[budget] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
-| `[budget] backend = "redis"`, `[rate_limit] backend = "redis"`, or `[revocation] backend = "redis"` | Tier 1: exact shared admission and precise token revocation through Redis. |
+| `[budget]` omitted or only `reservation_ttl_seconds` | Hold TTL for Store-backed namespace period caps (ADR 0063). `backend = redis\|postgres\|in-memory` is a boot error. |
+| `[rate_limit] backend = "redis"` or `[revocation] backend = "redis"` | Tier 1: exact shared inbound concurrency and precise token revocation through Redis. |
 | `[rate_limit] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
-| `[budget] backend = "postgres"` | Tier 2: shared caps. |
 | `[revocation] backend = "postgres"` | Tier 2: durable precise token revocation. |
 | `[shutdown]` | Tier 0: process-level bounds on termination. |
 | `/healthz`, `/readyz` | Tier 0. |
@@ -923,34 +922,21 @@ accounting for availability, and each is counted
 (`axond.usage.journal.lost`). A configuration that sets either one logs a warning
 at boot saying so.
 
-## `[budget]` — opt-in budget enforcement (Tier 0, 1, or 2 by backend)
+## `[budget]` — hold TTL (ADR 0063)
 
-Omit the section for the default: no cap, no datastore
-([ADR 0010](./adr/0010-shared-budget-backends-and-charging-policy.md)). The cap
-is per `(namespace, subject)` — that is, per gateway key — in micro-dollars.
-`namespace_limit_microdollars` adds an optional second cap on everything a
-*namespace* spends, which is what bounds a namespace whose holder can mint fresh
-subjects; omit it and enforcement is per-subject only, exactly as before.
+Spend caps live on the Store:
+`PUT /api/v1/namespaces/{ns}/budgets/{period}` sets `{limit_microdollars}` and
+marks that period active for admission. The ledger is `(namespace, period)`
+spent + reserved, not Redis, in-memory, or a `[budget] backend`.
+`backend = "redis"`, `"postgres"`, and `"in-memory"` are boot errors.
 
-`backend = "none"` and `"in-memory"` are Tier 0; in-memory enforcement is
-per-replica and approximate. `backend = "redis"` is Tier 1; with the default
-`on_unavailable = "deny"`, an unavailable Redis answers `503 budget_unavailable`.
-`backend = "postgres"` is
-Tier 2 and shares the cap through Postgres.
+Outage stance is `[storage].on_unavailable` (`deny` → `503 budget_unavailable`,
+`allow` → serve without a hold). A namespace with no budget row is
+`429 budget_exceeded`.
 
-| Key | Type | Default | Applies to | Meaning |
-| --- | --- | --- | --- | --- |
-| `backend` | `none` \| `in-memory` \| `redis` \| `postgres` | `none` | all | `in-memory` holds state per replica, so a fleet of N enforces N caps; `redis` and `postgres` share one cap atomically. |
-| `limit_microdollars` | integer | `0` | every backend but `none` | The cap. `10_000_000` µ$ = $10. Zero would deny everything, so it is rejected. |
-| `namespace_limit_microdollars` | integer | unset | `redis`, `postgres` | An additional cap on the whole namespace — every subject in it combined. Unset means per-subject-only enforcement. Only the shared backends can enforce it *exactly*, so `none` and `in-memory` reject it at boot; zero is rejected. Both backends need a one-time migration first (below). |
-| `on_unavailable` | `deny` \| `allow` | `deny` | `in-memory`, `redis`, `postgres` | What to do when the budget cannot enforce the cap. `deny` answers `503 budget_unavailable`; `allow` serves unenforced and warns. |
-| `dsn_env` | string | — | `redis`, `postgres` | *Name* of the env var holding the connection string (`redis://`/`rediss://`, or a libpq DSN). Required and non-empty. |
-| `table` | string | `axond_budget` | `postgres` | Base table; reservations live in `<table>_reservation`. Validated as an identifier. |
-| `create_table` | bool | `false` | `postgres` | Apply the shipped DDL at boot. |
-| `key_prefix` | string | `axond:budget` | `redis` | Key namespace for budget state. |
-| `reservation_ttl_seconds` | integer | `300` | every backend but `none` | How long a hold survives a replica that died mid-request. Should exceed the longest expected request. Zero is rejected. |
-| `idle_ttl_seconds` | integer | `3600` | `in-memory` | Idle time before an unheld ledger may be pruned when `max_subjects` is reached. In-memory state is per-replica and approximate; zero is rejected. |
-| `max_subjects` | integer | `10000` | `in-memory` | Maximum retained `(namespace, subject)` ledgers. Configured namespaces derive an equal guaranteed floor (`max_subjects / namespace_count`, minimum 1); a namespace may use headroom only when it is not reserved for another configured namespace's unmet floor. Eviction is same-namespace-only and lazy. If no namespaces are configured, or the ceiling is smaller than their count, the previous global behavior is retained. The namespace count is captured at boot, so this and `max_subjects` require a restart; exact cross-replica retention and enforcement still needs Redis. Zero is rejected. |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `reservation_ttl_seconds` | integer | `300` | How long a hold survives a replica that died mid-request. Should exceed the longest expected request. Zero is rejected. |
 
 Enforcement holds a priced estimate before dispatch and settles it against
 measured spend afterwards, so concurrent requests cannot collectively overshoot.
@@ -966,66 +952,9 @@ reserve reclaims. That TTL is therefore the upper bound on how long a failed
 settlement can hold budget out of circulation, which is why it should exceed the
 longest expected request rather than be set generously.
 
-### The namespace cap
-
-With `namespace_limit_microdollars` set, a request is admitted only if it fits
-*both* caps, and the reservation is one logical hold recorded in both scopes
-atomically — Redis in one Lua script, Postgres in one transaction. Settlement
-charges both or neither. A denial by either cap is the same
-`429 budget_exceeded` response the subject cap already returned; the
-`axond.budget.namespace_denials` counter is what distinguishes them
-([observability](./observability.md)). `on_unavailable` still applies to the
-whole operation: `deny` answers `503 budget_unavailable` and `allow` serves the
-request with nothing held in either scope, so one scope is never enforced while
-the other is not.
-
-"Exact" means settled spend plus live reservations, under the same estimate and
-reservation-TTL semantics as the subject cap — not provider billing. A namespace
-cap also concentrates load: every subject in a namespace contends on one spend
-row (Postgres) or one counter and reservation hash (Redis), so a very large
-namespace pays for that exactness in contention on its hottest key.
-
-**Redis** needs a one-time migration, because the namespace cap uses a
-cluster-safe key layout tagged by namespace rather than by
-`(namespace, subject)`. Stop every replica, then:
-
-```console
-$ axond budget migrate-redis --config axond.toml
-```
-
-The namespaces are read from `[[namespace]]`. A stateful deployment declares
-none there — they belong to the control plane — so it names them on the command
-line instead, once per namespace served under this key prefix:
-`--namespace acme/core --namespace acme/edge`. Without a list the command
-refuses before it reads a single key.
-
-It carries accumulated spend forward — claimed out of each v1 counter and added
-to the v2 ones at most once, so an interrupted run loses nothing, a re-run adds
-nothing twice, and spend a stray v1 replica wrote *after* the first run is added
-rather than dropped — sums namespace totals from it, and stamps a layout marker.
-A legacy key whose `{namespace|subject}` tag matches no configured namespace, or
-more than one, stops the migration before anything is moved, deleted, or stamped
-rather than guessing where the namespace ends. A gateway with
-the cap set refuses to boot until that marker exists, refuses to boot while any
-v1 key remains — that is, while a version without namespace-cap support is still
-writing — and, once migrated, refuses to boot *without* the cap, since the v1
-keys no longer hold the spend. Do not run mixed binaries during the migration:
-the two layouts would each enforce a share of the traffic. Reservation state is
-not carried over, so migrate with traffic stopped.
-
-**Postgres** needs `ops/postgres/budget_v2.sql`, which is additive on top of
-`budget_v1.sql`: a namespace spend table, an index for namespace-wide
-reservation cleanup, and a backfill that seeds each namespace's total from the
-subject rows already there. Custom `table` names are substituted as usual
-(`<table>_namespace`), and `create_table = true` applies both files. Apply it with
-the fleet stopped and drained: the backfill's sum would otherwise miss a
-settlement committing behind it, leaving a namespace total permanently short (the
-file takes an `EXCLUSIVE` lock so such a settlement blocks rather than being
-lost). It also installs a fence trigger, so a replica configured *without* the
-namespace cap can neither boot against that database nor write to it — its spend
-would never reach the namespace total. The gateway refuses to boot if the fence is
-missing, or if a namespace with spend has no backfilled row, so the cap cannot
-start from zero or be bypassed by an old configuration.
+A successful PUT marks that period as the namespace's active period. Inference
+does not carry a period. Plan change is PUT the same period with a new limit;
+a new billing period is PUT a new period key.
 
 ## `[rate_limit]` — opt-in inbound concurrency enforcement
 

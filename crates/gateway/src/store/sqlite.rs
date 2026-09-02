@@ -363,8 +363,8 @@ impl Store for SqliteStore {
             let now = now_ms();
             tx.execute(
                 "DELETE FROM axond_budget_reservation
-                 WHERE namespace = ?1 AND period = ?2 AND expires_at <= ?3",
-                params![namespace, period, now],
+                 WHERE namespace = ?1 AND expires_at <= ?2",
+                params![namespace, now],
             )
             .map_err(unavailable)?;
             let (limit, spent) = match tx
@@ -564,5 +564,39 @@ mod tests {
             .expect("update")
             .expect("row");
         assert_eq!(got.attrs["org"], "acme");
+    }
+
+    #[tokio::test]
+    async fn reserve_expires_old_period_holds_for_the_namespace() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store.put_budget("wsp_x", "old", 10_000).await.expect("old");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "stale")
+            .await
+            .expect("stale hold");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store.put_budget("wsp_x", "new", 10_000).await.expect("new");
+        store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "live")
+            .await
+            .expect("live");
+        let n: i64 = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row(
+                "SELECT count(*) FROM axond_budget_reservation WHERE namespace = 'wsp_x'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(n, 1, "expired holds from the old period must be reclaimed");
     }
 }

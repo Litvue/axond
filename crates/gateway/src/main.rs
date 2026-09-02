@@ -692,7 +692,7 @@ async fn serve() -> anyhow::Result<()> {
     let budget: Box<dyn BudgetStore> = Box::new(StoreBudget::new(
         Arc::clone(&store),
         storage.on_unavailable,
-        Duration::from_secs(config.budget.reservation_ttl_seconds.max(1)),
+        Duration::from_secs(config.budget.reservation_ttl_seconds),
     ));
     tracing::info!(backend = budget.name(), "budget enforcement");
     let rate_limiter: Box<dyn RateLimiter> = rate_limit::build(

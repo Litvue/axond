@@ -1,23 +1,30 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
     BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, from_sql_amount, sql_amount,
 };
+use crate::backends::health::{BackendHealth, PostgresHealth};
 
 const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
+const POOL_SIZE: usize = 32;
+const PROBE_BOUND: Duration = Duration::from_secs(CONNECT_TIMEOUT.as_secs() + 5);
 
 pub struct PostgresStore {
     config: tokio_postgres::Config,
     /// Idle sessions. The lock is only held while taking or returning a client,
     /// never across a query, so namespace reads and admissions can run together.
     idle: Mutex<Vec<Client>>,
+    /// Caps live + idle sessions. Waiters queue here instead of opening more.
+    slots: Arc<Semaphore>,
+    health: Arc<PostgresHealth>,
 }
 
 impl PostgresStore {
@@ -28,8 +35,10 @@ impl PostgresStore {
         config.connect_timeout(CONNECT_TIMEOUT);
         config.application_name(crate::telemetry::SERVICE_NAME);
         let store = Self {
+            health: Arc::new(PostgresHealth::new("store", config.clone(), PROBE_BOUND)),
             config,
             idle: Mutex::new(Vec::new()),
+            slots: Arc::new(Semaphore::new(POOL_SIZE)),
         };
         let client = store.connect_client().await?;
         if create_table {
@@ -64,43 +73,63 @@ impl PostgresStore {
                 tracing::warn!(error = %e, "postgres store connection closed");
             }
         });
+        client
+            .batch_execute("SET lock_timeout = '2s'; SET statement_timeout = '5s'")
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         Ok(client)
     }
 
-    async fn checkout(&self) -> Result<Client, StoreError> {
+    async fn checkout(&self) -> Result<(Client, OwnedSemaphorePermit), StoreError> {
+        let permit = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StoreError::Unavailable("postgres store pool is closed".into()))?;
         {
             let mut idle = self.idle.lock().await;
             while let Some(client) = idle.pop() {
                 if !client.is_closed() {
-                    return Ok(client);
+                    return Ok((client, permit));
                 }
             }
         }
-        self.connect_client().await
+        match self.connect_client().await {
+            Ok(client) => Ok((client, permit)),
+            Err(error) => Err(error),
+        }
     }
 
     async fn checkin(&self, client: Client) {
         if client.is_closed() {
             return;
         }
-        let mut idle = self.idle.lock().await;
-        if idle.len() < 8 {
-            idle.push(client);
-        }
+        self.idle.lock().await.push(client);
+    }
+
+    fn keep_session(error: &StoreError) -> bool {
+        matches!(
+            error,
+            StoreError::Duplicate(_) | StoreError::NotFound(_) | StoreError::Invalid(_)
+        )
     }
 
     async fn with_client<T>(
         &self,
         operation: impl AsyncFnOnce(&mut Client) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let mut client = self.checkout().await?;
-        match operation(&mut client).await {
-            Ok(value) => {
-                self.checkin(client).await;
-                Ok(value)
-            }
-            Err(error) => Err(error),
+        let (mut client, permit) = self.checkout().await?;
+        let result = operation(&mut client).await;
+        let reuse = match &result {
+            Ok(_) => !client.is_closed(),
+            Err(error) => Self::keep_session(error) && !client.is_closed(),
+        };
+        if reuse {
+            self.checkin(client).await;
         }
+        drop(permit);
+        result
     }
 }
 
@@ -242,6 +271,10 @@ async fn read_budget(
 
 #[async_trait]
 impl Store for PostgresStore {
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        Some(Arc::clone(&self.health) as Arc<dyn BackendHealth>)
+    }
+
     async fn put_namespace(&self, ns: NamespaceRecord) -> Result<(), StoreError> {
         self.with_client(async move |client| {
             let blocklist = ns
@@ -570,8 +603,8 @@ async fn hold(
     let period: String = active.get(0);
     tx.execute(
         "DELETE FROM axond_budget_reservation
-         WHERE namespace = $1 AND period = $2 AND expires_at <= now()",
-        &[&namespace, &period],
+         WHERE namespace = $1 AND expires_at <= now()",
+        &[&namespace],
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -615,11 +648,28 @@ async fn hold(
 impl PostgresStore {
     /// Kill the next idle session so the following Store call must reconnect.
     pub(super) async fn drop_idle_connection(&self) -> Result<(), StoreError> {
-        let client = self.checkout().await?;
+        let (client, permit) = self.checkout().await?;
         let _ = client
             .execute("SELECT pg_terminate_backend(pg_backend_pid())", &[])
             .await;
         self.checkin(client).await;
+        drop(permit);
         Ok(())
+    }
+
+    pub(super) async fn reservation_count(&self, namespace: &str) -> Result<i64, StoreError> {
+        let namespace = namespace.to_owned();
+        self.with_client(async move |client| {
+            let count: i64 = client
+                .query_one(
+                    "SELECT count(*)::bigint FROM axond_budget_reservation WHERE namespace = $1",
+                    &[&namespace],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?
+                .get(0);
+            Ok(count)
+        })
+        .await
     }
 }
