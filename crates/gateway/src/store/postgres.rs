@@ -39,8 +39,10 @@ fn record_from(
 ) -> Result<NamespaceRecord, StoreError> {
     let blocklist = match blocklist {
         None | Some(Value::Null) => None,
+        // Corrupt stored JSON is an operational store failure (503), not a
+        // client bad_request: the caller did not supply this payload.
         Some(value) => Some(serde_json::from_value(value).map_err(|error| {
-            StoreError::Invalid(format!("namespace `{id}` blocklist: {error}"))
+            StoreError::Unavailable(format!("namespace `{id}` blocklist: {error}"))
         })?),
     };
     Ok(NamespaceRecord {

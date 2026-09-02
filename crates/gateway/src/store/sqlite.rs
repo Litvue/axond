@@ -56,12 +56,14 @@ fn row_to_record(
     attrs: String,
     blocklist: Option<String>,
 ) -> Result<NamespaceRecord, StoreError> {
+    // Corrupt stored JSON is an operational store failure (503), not a client
+    // bad_request: the caller did not supply this payload.
     let attrs: Value = serde_json::from_str(&attrs)
-        .map_err(|error| StoreError::Invalid(format!("namespace `{id}` attrs: {error}")))?;
+        .map_err(|error| StoreError::Unavailable(format!("namespace `{id}` attrs: {error}")))?;
     let blocklist = match blocklist {
         None => None,
         Some(raw) => Some(serde_json::from_str(&raw).map_err(|error| {
-            StoreError::Invalid(format!("namespace `{id}` blocklist: {error}"))
+            StoreError::Unavailable(format!("namespace `{id}` blocklist: {error}"))
         })?),
     };
     Ok(NamespaceRecord {
@@ -205,7 +207,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn corrupt_attrs_are_invalid() {
+    async fn corrupt_attrs_are_unavailable() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         {
             let conn = store.conn.lock().expect("lock");
@@ -215,8 +217,8 @@ mod tests {
             )
             .expect("insert corrupt row");
         }
-        let err = store.get_namespace("bad").await.expect_err("invalid");
-        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+        let err = store.get_namespace("bad").await.expect_err("unavailable");
+        assert!(matches!(err, StoreError::Unavailable(_)), "{err:?}");
     }
 
     #[tokio::test]
