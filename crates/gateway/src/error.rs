@@ -136,6 +136,8 @@ pub enum GatewayError {
     InvalidNamespace,
     #[error("unknown namespace")]
     UnknownNamespace,
+    #[error("unknown budget")]
+    UnknownBudget,
     #[error("namespace already exists")]
     NamespaceConflict,
     #[error("store is unavailable")]
@@ -222,6 +224,7 @@ impl GatewayError {
             Self::ScopeInsufficient(_) => StatusCode::FORBIDDEN,
             Self::InvalidNamespace => StatusCode::BAD_REQUEST,
             Self::UnknownNamespace => StatusCode::NOT_FOUND,
+            Self::UnknownBudget => StatusCode::NOT_FOUND,
             Self::NamespaceConflict => StatusCode::CONFLICT,
             Self::StoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::NamespaceNotAuthorized => StatusCode::FORBIDDEN,
@@ -284,6 +287,7 @@ impl GatewayError {
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
             Self::InvalidNamespace => "invalid_namespace",
             Self::UnknownNamespace => "unknown_namespace",
+            Self::UnknownBudget => "unknown_budget",
             Self::NamespaceConflict => "namespace_conflict",
             Self::StoreUnavailable => "store_unavailable",
             Self::NamespaceNotAuthorized => "namespace_not_authorized",

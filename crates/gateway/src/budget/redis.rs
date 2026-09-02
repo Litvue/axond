@@ -39,6 +39,8 @@
 //! contends on one spend counter, and every reserve scans that namespace's whole
 //! reservation hash. That is the cost of exactness (see ADR 0010).
 
+#![allow(dead_code)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -851,6 +853,7 @@ impl BudgetStore for RedisBudget {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
             generation: governing.generation,
+            period: None,
         };
         // Counted before the round-trip, so a publication landing mid-admission
         // cannot see an empty drain list while this request is being admitted

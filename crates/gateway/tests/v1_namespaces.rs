@@ -69,6 +69,15 @@ async fn namespaced_completion_and_namespace_api() {
     let body: Value = dup.json().await.unwrap();
     assert_eq!(body["error"]["type"], "namespace_conflict");
 
+    let budget = http
+        .put(gateway.url("/api/v1/namespaces/wsp_x/budgets/2026-09"))
+        .bearer_auth(GATEWAY_KEY)
+        .json(&json!({"limit_microdollars": 1_000_000_000}))
+        .send()
+        .await
+        .expect("budget");
+    assert_eq!(budget.status(), 200, "{}", budget.text().await.unwrap());
+
     let completion = http
         .post(format!("{}/ns/wsp_x/v1/chat/completions", gateway.base_url))
         .bearer_auth(GATEWAY_KEY)

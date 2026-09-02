@@ -66,8 +66,11 @@ struct Instruments {
     revision_convergence: Histogram<f64>,
     revision_failures: Gauge<u64>,
     last_known_good: Counter<u64>,
+    #[allow(dead_code)]
     budget_capacity_denials: Counter<u64>,
+    #[allow(dead_code)]
     budget_namespace_denials: Counter<u64>,
+    #[allow(dead_code)]
     budget_retained_subjects: Gauge<u64>,
     middleware_capacity_wait: Histogram<f64>,
     middleware_capacity_timeouts: Counter<u64>,
@@ -908,6 +911,7 @@ pub(crate) fn record_binding_refusal(code: &'static str) {
 }
 
 /// Record an in-memory budget admission denied by the subject bound.
+#[allow(dead_code)]
 pub fn record_budget_capacity_denial() {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
@@ -918,6 +922,7 @@ pub fn record_budget_capacity_denial() {
 /// Record an admission denied by the namespace-wide spend cap rather than by
 /// the subject's own. Both answer `429`, so this is how an operator tells a
 /// tenant-wide exhaustion from one noisy key.
+#[allow(dead_code)]
 pub fn record_budget_namespace_denial() {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
@@ -926,6 +931,7 @@ pub fn record_budget_namespace_denial() {
 }
 
 /// Record the retained in-memory ledger count after capacity-pressure pruning.
+#[allow(dead_code)]
 pub fn record_budget_retained_subjects(subjects: usize) {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;

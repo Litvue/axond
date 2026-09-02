@@ -1812,6 +1812,7 @@ async fn serve(
             }
         }
     };
+    let period = reservation.period.clone();
 
     // The request is now admitted and will produce exactly one usage event, so
     // its identity is minted here — once, while the server span is still current
@@ -1895,6 +1896,7 @@ async fn serve(
                 ttft_ms: outcome.ttft_ms,
                 attempts: outcome.attempts,
                 attrs: attrs.clone(),
+                period: period.clone(),
             });
             let accounting = match middleware_execution.take_core_budget() {
                 Some(hold) => BufferedResponseAccounting::from_core(
@@ -1973,6 +1975,7 @@ async fn serve(
                     ttft_ms: outcome.ttft_ms,
                     attempts: outcome.attempts,
                     attrs: attrs.clone(),
+                    period: period.clone(),
                 },
             )
             .await;
@@ -3376,6 +3379,7 @@ struct RecordArgs<'a> {
     /// Upstream attempts made; the retry count is one less.
     attempts: u32,
     attrs: Option<serde_json::Value>,
+    period: Option<String>,
 }
 
 /// Record where the request is already ending for another reason, so a failure
@@ -3410,6 +3414,7 @@ fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
         trace_id: args.identity.trace_id.clone(),
         namespace: args.caller.namespace.clone(),
         attrs: args.attrs.clone().or_else(|| args.caller.attrs.clone()),
+        period: args.period.clone(),
         subject: args.caller.subject.clone(),
         signer_kid: args.caller.signer_kid.clone(),
         model: args.alias.to_string(),
@@ -3569,6 +3574,7 @@ mod tests {
             ttft_ms: None,
             attempts: 1,
             attrs: None,
+            period: None,
         };
 
         let pricing = approved_pricing_snapshot();
@@ -3661,9 +3667,11 @@ mod tests {
             ttft_ms: None,
             attempts: 1,
             attrs: Some(json!({"org": "acme"})),
+            period: Some("2026-09".into()),
         });
         assert_eq!(row.attrs, Some(json!({"org": "acme"})));
         assert_eq!(row.namespace, "wsp_x");
+        assert_eq!(row.period.as_deref(), Some("2026-09"));
     }
 
     /// An unusable spelling of the output allowance never hides a usable one, so
@@ -7486,6 +7494,7 @@ output_microdollars_per_million = 1000000
                 id: "recording".to_owned(),
                 estimate_microdollars: estimated_microdollars,
                 generation: None,
+                period: None,
             })
         }
         async fn settle(
@@ -7518,6 +7527,7 @@ output_microdollars_per_million = 1000000
                 id: "blocking-settlement".to_owned(),
                 estimate_microdollars: estimated_microdollars,
                 generation: None,
+                period: None,
             })
         }
 
@@ -10646,6 +10656,43 @@ output_microdollars_per_million = 1
             assert_eq!(resp.status(), expected);
         }
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn store_unavailable_deny_is_budget_unavailable_and_skips_upstream() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = crate::budget::StoreBudget::new(
+            Arc::new(crate::store::UnavailableStore),
+            crate::config::StoreUnavailable::Deny,
+            Duration::from_secs(30),
+        );
+        let resp = router(budgeted_state(&base_url, Box::new(budget)))
+            .oneshot(chat_request())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["error"]["type"], "budget_unavailable", "{body}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn store_unavailable_allow_serves_without_a_hold() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = crate::budget::StoreBudget::new(
+            Arc::new(crate::store::UnavailableStore),
+            crate::config::StoreUnavailable::Allow,
+            Duration::from_secs(30),
+        );
+        let resp = router(budgeted_state(&base_url, Box::new(budget)))
+            .oneshot(chat_request())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     /// The cap is per `(namespace, subject)`, and two gateways sharing one store

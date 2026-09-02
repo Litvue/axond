@@ -98,9 +98,9 @@ mod usage;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use budget::BudgetStore;
+use budget::{BudgetStore, StoreBudget};
 use clap::{Arg, ArgAction, Command};
 use config::{Config, Mode};
 use convergence::{
@@ -679,14 +679,21 @@ async fn serve() -> anyhow::Result<()> {
     // without rebuilding a connection (#150). Until a control plane publishes,
     // it holds exactly the bootstrap file's values.
     let policy = Arc::new(policy::PolicyRuntime::bootstrap(&config));
-    let budget: Box<dyn BudgetStore> = budget::build(
-        &config.budget,
-        &env,
-        config.distinct_namespace_count(),
-        policy::Ceilings::published(&policy),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("budget configuration failed: {e}"))?;
+    let storage = config
+        .storage
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("`[storage]` is required (ADR 0063)"))?;
+    let store = crate::store::open(storage, &env)
+        .await
+        .map_err(|e| anyhow::anyhow!("store: {e}"))?;
+    crate::store::seed_config_namespaces(store.as_ref(), &config.namespace)
+        .await
+        .map_err(|e| anyhow::anyhow!("store seed: {e}"))?;
+    let budget: Box<dyn BudgetStore> = Box::new(StoreBudget::new(
+        Arc::clone(&store),
+        storage.on_unavailable,
+        Duration::from_secs(config.budget.reservation_ttl_seconds.max(1)),
+    ));
     tracing::info!(backend = budget.name(), "budget enforcement");
     let rate_limiter: Box<dyn RateLimiter> = rate_limit::build(
         &config.rate_limit,
@@ -822,16 +829,6 @@ async fn serve() -> anyhow::Result<()> {
 
     let bind = config.server.bind;
     let watching = config.reload.watch;
-    let storage = config
-        .storage
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("`[storage]` is required (ADR 0063)"))?;
-    let store = crate::store::open(storage, &env)
-        .await
-        .map_err(|e| anyhow::anyhow!("store: {e}"))?;
-    crate::store::seed_config_namespaces(store.as_ref(), &config.namespace)
-        .await
-        .map_err(|e| anyhow::anyhow!("store seed: {e}"))?;
     let state = AppState::new_with_policy(
         config.clone(),
         &env,

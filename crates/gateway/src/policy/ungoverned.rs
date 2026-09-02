@@ -77,6 +77,7 @@ pub(crate) enum Unenforceable {
     /// No published document governs the namespace.
     Ungoverned,
     /// The published cap and the key layout this process booted on disagree.
+    #[allow(dead_code)]
     Layout,
 }
 
