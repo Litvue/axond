@@ -775,10 +775,11 @@ impl Store for PostgresStore {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
         self.with_client(async move |client| {
+            // SUM(bigint) is numeric; clamp before ::bigint so overflow saturates.
             let rows = client
                 .query(
                     "SELECT model, status, COUNT(*)::bigint,
-                            COALESCE(SUM(COALESCE(cost_microdollars, 0)), 0)::bigint
+                            LEAST(COALESCE(SUM(COALESCE(cost_microdollars, 0)), 0), 9223372036854775807)::bigint
                      FROM axond_store_usage
                      WHERE namespace = $1 AND period = $2
                      GROUP BY model, status
