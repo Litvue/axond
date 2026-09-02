@@ -109,6 +109,30 @@ pub struct UsageSummary {
     pub data: Vec<UsageSummaryRow>,
 }
 
+/// Cached upstream `GET /models` listing for one configured provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ProviderModels {
+    pub provider: String,
+    /// RFC3339 of the last successful fetch. Absent if none has succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+    /// True when the last upstream fetch failed. Last-good `data` is still
+    /// returned; empty + stale if never fetched.
+    pub stale: bool,
+    pub data: Vec<Value>,
+}
+
+impl ProviderModels {
+    pub fn empty_stale(provider: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            fetched_at: None,
+            stale: true,
+            data: Vec::new(),
+        }
+    }
+}
+
 /// Outcome of a pre-dispatch hold against the namespace's active period.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetReserve {
@@ -229,6 +253,26 @@ pub trait Store: Send + Sync {
         namespace: &str,
         period: &str,
     ) -> Result<Vec<UsageSummaryRow>, StoreError>;
+
+    /// Cached upstream listing for one provider, or `None` if never written.
+    async fn get_provider_models(
+        &self,
+        provider: &str,
+    ) -> Result<Option<ProviderModels>, StoreError> {
+        let _ = provider;
+        Ok(None)
+    }
+
+    /// Every cached provider listing. Missing configured providers are absent.
+    async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Insert or replace one provider's cached listing.
+    async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
+        let _ = row;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +330,15 @@ impl Store for UnavailableStore {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn summarize_usage(&self, _: &str, _: &str) -> Result<Vec<UsageSummaryRow>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn get_provider_models(&self, _: &str) -> Result<Option<ProviderModels>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn put_provider_models(&self, _: ProviderModels) -> Result<(), StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
 }
@@ -1675,6 +1728,10 @@ mod tests {
             )
             .await
             .expect("draft store tables");
+        setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
         let store = PostgresStore::connect(&scoped, false)
             .await
             .expect("rename draft tables");
@@ -1763,6 +1820,10 @@ mod tests {
             )
             .await
             .expect("draft store tables");
+        setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
         setup
             .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
             .await
@@ -1924,6 +1985,10 @@ mod tests {
             )
             .await
             .expect("draft");
+        setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
         setup
             .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
             .await

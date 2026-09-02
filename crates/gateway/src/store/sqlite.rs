@@ -7,8 +7,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, UsageAppend, UsageSummaryRow,
-    from_sql_amount, sql_amount, sql_amount_saturating,
+    BudgetRecord, BudgetReserve, NamespaceRecord, ProviderModels, Store, StoreError, UsageAppend,
+    UsageSummaryRow, from_sql_amount, sql_amount, sql_amount_saturating,
 };
 
 pub struct SqliteStore {
@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS axond_store_usage (
 );
 CREATE INDEX IF NOT EXISTS axond_store_usage_ns_period
     ON axond_store_usage (namespace, period);
+CREATE TABLE IF NOT EXISTS axond_store_provider_models (
+    provider TEXT PRIMARY KEY NOT NULL,
+    fetched_at TEXT,
+    stale INTEGER NOT NULL,
+    models TEXT NOT NULL
+);
 ";
 
 impl SqliteStore {
@@ -712,6 +718,105 @@ impl Store for SqliteStore {
         })
         .await
     }
+
+    async fn get_provider_models(
+        &self,
+        provider: &str,
+    ) -> Result<Option<ProviderModels>, StoreError> {
+        let provider = provider.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT provider, fetched_at, stale, models
+                 FROM axond_store_provider_models WHERE provider = ?1",
+                params![provider],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(unavailable)?
+            .map(|(provider, fetched_at, stale, models)| {
+                sqlite_provider_models(provider, fetched_at, stale, models)
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT provider, fetched_at, stale, models
+                     FROM axond_store_provider_models ORDER BY provider",
+                )
+                .map_err(unavailable)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(unavailable)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (provider, fetched_at, stale, models) = row.map_err(unavailable)?;
+                out.push(sqlite_provider_models(provider, fetched_at, stale, models)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
+        self.with_conn(move |conn| {
+            let models = serde_json::to_string(&row.data).map_err(|error| {
+                StoreError::Unavailable(format!("provider `{}` models: {error}", row.provider))
+            })?;
+            conn.execute(
+                "INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (provider) DO UPDATE SET
+                    fetched_at = excluded.fetched_at,
+                    stale = excluded.stale,
+                    models = excluded.models",
+                params![
+                    row.provider,
+                    row.fetched_at,
+                    if row.stale { 1 } else { 0 },
+                    models,
+                ],
+            )
+            .map_err(unavailable)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn sqlite_provider_models(
+    provider: String,
+    fetched_at: Option<String>,
+    stale: i64,
+    models: String,
+) -> Result<ProviderModels, StoreError> {
+    let data: Vec<Value> = serde_json::from_str(&models).map_err(|error| {
+        StoreError::Unavailable(format!("provider `{provider}` models: {error}"))
+    })?;
+    Ok(ProviderModels {
+        provider,
+        fetched_at,
+        stale: stale != 0,
+        data,
+    })
 }
 
 fn now_ms() -> i64 {
@@ -1328,6 +1433,7 @@ mod tests {
                 .iter()
                 .any(|n| n == "axond_store_budget_reservation_scope_idx")
         );
+        assert!(names.iter().any(|n| n == "axond_store_provider_models"));
         assert!(!names.iter().any(|n| n == "axond_budget"));
         assert!(!names.iter().any(|n| n == "axond_budget_reservation"));
     }
@@ -1381,5 +1487,48 @@ mod tests {
                 .collect()
         };
         assert!(names.iter().any(|n| n == "expires_at"));
+    }
+
+    #[tokio::test]
+    async fn provider_models_cache_keeps_last_good_when_marked_stale() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let good = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:00:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "gpt-4o", "object": "model"})],
+        };
+        store.put_provider_models(good.clone()).await.expect("put");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, good);
+        store
+            .put_provider_models(ProviderModels {
+                stale: true,
+                ..good.clone()
+            })
+            .await
+            .expect("stale");
+        let stale = store
+            .get_provider_models("openai")
+            .await
+            .expect("get stale")
+            .expect("row");
+        assert!(stale.stale);
+        assert_eq!(stale.data, good.data);
+        assert_eq!(stale.fetched_at, good.fetched_at);
+        assert!(
+            store
+                .get_provider_models("missing")
+                .await
+                .expect("missing")
+                .is_none()
+        );
+        let listed = store.list_provider_models().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].provider, "openai");
     }
 }
