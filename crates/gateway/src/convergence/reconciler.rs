@@ -92,13 +92,8 @@ impl SnapshotSink for AppState {
         Ok(())
     }
 
-    /// Seed and swap first; only then install policy. A seed failure leaves
-    /// both the running config and the running policy exactly as they were.
     fn publish(&self, snapshot: ConfigSnapshot) -> Result<(), crate::state::SnapshotError> {
-        let view = PolicyView::of(&snapshot.config);
-        AppState::publish(self, snapshot)?;
-        self.policy().install(view);
-        Ok(())
+        AppState::publish(self, snapshot)
     }
 
     fn generation(&self) -> u64 {

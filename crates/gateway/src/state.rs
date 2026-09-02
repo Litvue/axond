@@ -56,7 +56,7 @@ use crate::desired_state::{
 use crate::desired_state::{ProjectId, RevisionId, SecretRef, TenantId, WorkloadKey};
 use crate::key_material::{self, KeyMaterialError};
 use crate::middleware::{MiddlewareChain, MiddlewarePlan, MiddlewarePlanError, MiddlewareRuntime};
-use crate::policy::PolicyRuntime;
+use crate::policy::{PolicyRuntime, PolicyView};
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
     PrincipalShapeError, PrincipalStoreChain, ProjectedPrincipals, TokenVerifier,
@@ -2040,13 +2040,16 @@ impl AppState {
     /// Publish a new snapshot. In-flight requests keep the snapshot they already
     /// hold; every request that starts after this call sees the new one.
     ///
-    /// Addressable namespace rows are seeded first. A seed failure returns
-    /// [`SnapshotError::Store`] and leaves the previous snapshot in place.
+    /// Seed durable namespaces, install policy, then swap the snapshot. A request
+    /// never observes a new snapshot under the previous policy. A seed failure
+    /// returns [`SnapshotError::Store`] and leaves both the previous snapshot and
+    /// the previous policy in place.
     pub fn publish(&self, snapshot: ConfigSnapshot) -> Result<(), SnapshotError> {
         self.0
             .store
             .seed_namespaces_blocking(&snapshot.config.namespace)
             .map_err(|error| SnapshotError::Store(error.to_string()))?;
+        self.policy().install(PolicyView::of(&snapshot.config));
         self.0.config.store(Arc::new(snapshot));
         Ok(())
     }
@@ -2172,10 +2175,15 @@ env = "AXOND_KEY"
 namespace = "platform"
 "#;
 
-    struct FailingSeedStore;
+    struct ScriptedSeedStore<F> {
+        seed: F,
+    }
 
     #[async_trait]
-    impl Store for FailingSeedStore {
+    impl<F> Store for ScriptedSeedStore<F>
+    where
+        F: Fn() -> Result<(), StoreError> + Send + Sync,
+    {
         async fn put_namespace(
             &self,
             _ns: crate::store::NamespaceRecord,
@@ -2210,33 +2218,103 @@ namespace = "platform"
             &self,
             _namespaces: &[crate::config::Namespace],
         ) -> Result<(), StoreError> {
-            Err(StoreError::Unavailable("seed refused".into()))
+            (self.seed)()
         }
+    }
+
+    fn publish_test_state(
+        config: &Config,
+        env: &HashMap<String, String>,
+        store: Arc<dyn Store>,
+    ) -> AppState {
+        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+        AppState::new_with_policy(
+            config.clone(),
+            env,
+            Arc::new(UsageDelivery::telemetry(UsageFanout::new(sinks))),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            Arc::new(PolicyRuntime::bootstrap(config)),
+            ReplicaObservability::stateless(),
+            Some(store),
+        )
+        .expect("state")
+    }
+
+    fn platform_cap(state: &AppState) -> u64 {
+        state
+            .policy()
+            .active("platform")
+            .budget
+            .expect("platform is governed")
+            .subject_microdollars
     }
 
     #[tokio::test]
     async fn publish_rejects_when_namespace_seed_fails() {
         let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
         let config = config_with(PLATFORM_KEY);
-        let state = AppState::new_with_policy(
-            config.clone(),
+        let state = publish_test_state(
+            &config,
             &env,
-            Arc::new(UsageDelivery::telemetry(UsageFanout::new(sinks))),
-            Box::new(NoBudget),
-            Box::new(NoLimit),
-            Box::new(crate::revocation::NoDenylist),
-            Arc::new(PolicyRuntime::bootstrap(&config)),
-            ReplicaObservability::stateless(),
-            Some(Arc::new(FailingSeedStore)),
-        )
-        .expect("state");
+            Arc::new(ScriptedSeedStore {
+                seed: || Err(StoreError::Unavailable("seed refused".into())),
+            }),
+        );
         let generation = state.config().generation;
+        let before = platform_cap(&state);
+        let mut next = config;
+        next.budget.limit_microdollars = 42;
         let snapshot =
-            ConfigSnapshot::build(config, &env, generation + 1).expect("snapshot compiles");
+            ConfigSnapshot::build(next, &env, generation + 1).expect("snapshot compiles");
         let err = state.publish(snapshot).expect_err("seed fails");
         assert!(matches!(err, SnapshotError::Store(_)), "{err:?}");
         assert_eq!(state.config().generation, generation);
+        assert_eq!(platform_cap(&state), before);
+    }
+
+    #[tokio::test]
+    async fn publish_does_not_expose_new_snapshot_under_old_policy() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
+        let config = config_with(PLATFORM_KEY);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(Some(release_rx));
+        let state = publish_test_state(
+            &config,
+            &env,
+            Arc::new(ScriptedSeedStore {
+                seed: move || {
+                    let _ = started_tx.send(());
+                    if let Some(release) = release_rx.lock().expect("not poisoned").take() {
+                        let _ = release.recv();
+                    }
+                    Ok(())
+                },
+            }),
+        );
+        let generation = state.config().generation;
+        let before = platform_cap(&state);
+        let mut next = config;
+        next.budget.limit_microdollars = 42;
+        let snapshot =
+            ConfigSnapshot::build(next, &env, generation + 1).expect("snapshot compiles");
+        let publisher = {
+            let state = state.clone();
+            std::thread::spawn(move || state.publish(snapshot))
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("seed started");
+        let during_generation = state.config().generation;
+        let during_cap = platform_cap(&state);
+        release_tx.send(()).expect("release seed");
+        publisher.join().expect("publisher").expect("publish");
+        assert_eq!(during_generation, generation);
+        assert_eq!(during_cap, before);
+        assert_eq!(state.config().generation, generation + 1);
+        assert_eq!(platform_cap(&state), 42);
     }
 
     #[tokio::test]

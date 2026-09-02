@@ -1,8 +1,13 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, Config};
 
 use super::{NamespaceRecord, Store, StoreError};
+
+const SEED_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SEED_DEADLINE: Duration = Duration::from_secs(15);
 
 pub struct PostgresStore {
     client: Client,
@@ -46,30 +51,53 @@ impl PostgresStore {
     }
 }
 
+/// Insert-only seed of addressable namespace ids.
+///
+/// Publish is rare (reload / convergence). This path is `ON CONFLICT DO NOTHING`,
+/// so reseeding existing ids is a no-op rather than a rewrite. A dedicated
+/// runtime is used because the request-path client is bound to the process
+/// Tokio runtime and must not be driven with `block_on`.
 fn seed_on_dedicated_runtime(dsn: &str, ids: &[&str]) -> Result<(), StoreError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| StoreError::Unavailable(error.to_string()))?;
     runtime.block_on(async {
-        let (client, connection) = tokio_postgres::connect(dsn, crate::usage::tls_connector())
-            .await
-            .map_err(|error| StoreError::Unavailable(error.to_string()))?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        for id in ids {
-            client
-                .execute(
-                    "INSERT INTO axond_namespace (id, attrs, blocklist) \
-                     VALUES ($1, '{}'::jsonb, NULL) ON CONFLICT (id) DO NOTHING",
-                    &[&*id],
-                )
-                .await
-                .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+        match tokio::time::timeout(SEED_DEADLINE, seed_namespaces(dsn, ids)).await {
+            Ok(result) => result,
+            Err(_) => Err(StoreError::Unavailable("namespace seed timed out".into())),
         }
-        Ok(())
     })
+}
+
+async fn seed_namespaces(dsn: &str, ids: &[&str]) -> Result<(), StoreError> {
+    let mut config = dsn
+        .parse::<Config>()
+        .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+    config.connect_timeout(SEED_CONNECT_TIMEOUT);
+    let (client, connection) = config
+        .connect(crate::usage::tls_connector())
+        .await
+        .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute("SET lock_timeout = '2s'; SET statement_timeout = '5s'")
+        .await
+        .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+    let ids: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+    client
+        .execute(
+            "INSERT INTO axond_namespace (id, attrs, blocklist) \
+             SELECT u.id, '{}'::jsonb, NULL \
+             FROM UNNEST($1::text[]) AS u(id) \
+             ON CONFLICT (id) DO NOTHING",
+            &[&ids],
+        )
+        .await
+        .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+    Ok(())
 }
 
 fn record_from(
@@ -195,6 +223,9 @@ impl Store for PostgresStore {
             .filter(|namespace| super::validate_namespace_id(&namespace.id).is_ok())
             .map(|namespace| namespace.id.as_str())
             .collect();
+        // Reload/convergence is rare and seed is insert-only. Skip the seed
+        // connection when the filtered list is empty so publish cannot hang
+        // on Postgres for a no-op.
         if ids.is_empty() {
             return Ok(());
         }
