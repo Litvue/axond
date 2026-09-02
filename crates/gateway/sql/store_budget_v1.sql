@@ -44,15 +44,8 @@ CREATE TABLE IF NOT EXISTS axond_store_budget_reservation (
     namespace           text        NOT NULL,
     period              text        NOT NULL,
     amount_microdollars bigint      NOT NULL,
-    expires_at          timestamptz NOT NULL,
-    -- Generation of `axond_namespace_incarnation.n` at reserve. Delete bumps
-    -- that counter and keeps this row so settle cannot charge a later id.
-    incarnation         integer     NOT NULL DEFAULT 1
+    expires_at          timestamptz NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx
     ON axond_store_budget_reservation (namespace, period, expires_at);
-
--- CREATE TABLE IF NOT EXISTS does not add columns to an existing relation.
-ALTER TABLE axond_store_budget_reservation
-    ADD COLUMN IF NOT EXISTS incarnation integer NOT NULL DEFAULT 1;

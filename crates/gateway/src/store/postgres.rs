@@ -13,6 +13,7 @@ use super::{
 use crate::backends::health::{BackendHealth, PostgresHealth};
 
 const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
+const INCARNATION_DDL: &str = include_str!("../../sql/store_namespace_incarnation_v1.sql");
 const USAGE_DDL: &str = include_str!("../../sql/store_usage_v1.sql");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
@@ -61,9 +62,12 @@ impl PostgresStore {
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         }
-        ensure_namespace_incarnation(&client).await?;
         ensure_budget_schema(&mut client, create_table).await?;
         if create_table {
+            client
+                .batch_execute(INCARNATION_DDL)
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
             client
                 .batch_execute(USAGE_DDL)
                 .await
@@ -228,35 +232,6 @@ async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     }
-    ensure_reservation_incarnation(client).await?;
-    Ok(())
-}
-
-async fn ensure_namespace_incarnation(client: &impl GenericClient) -> Result<(), StoreError> {
-    client
-        .batch_execute(
-            "CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (
-                id TEXT PRIMARY KEY NOT NULL,
-                n INTEGER NOT NULL
-            )",
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    Ok(())
-}
-
-async fn ensure_reservation_incarnation(client: &impl GenericClient) -> Result<(), StoreError> {
-    if !relation_exists(client, STORE_BUDGET_RESERVATION).await? {
-        return Ok(());
-    }
-    client
-        .execute(
-            "ALTER TABLE axond_store_budget_reservation
-             ADD COLUMN IF NOT EXISTS incarnation integer NOT NULL DEFAULT 1",
-            &[],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     Ok(())
 }
 
@@ -981,7 +956,7 @@ async fn settle_tx(
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    let held_incarnation: Option<i32> = tx
+    let held_incarnation: Option<i64> = tx
         .query_opt(
             "SELECT incarnation FROM axond_store_budget_reservation WHERE id = $1",
             &[&reservation_id],
@@ -995,7 +970,7 @@ async fn settle_tx(
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    let current: i32 = tx
+    let current: i64 = tx
         .query_opt(
             "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
             &[&namespace],
@@ -1042,7 +1017,7 @@ async fn hold(
         return Ok(BudgetReserve::Exceeded);
     };
     let period: String = active.get(0);
-    let incarnation: i32 = tx
+    let incarnation: i64 = tx
         .query_opt(
             "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
             &[&namespace],
@@ -1051,10 +1026,12 @@ async fn hold(
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .map(|row| row.get(0))
         .unwrap_or(1);
+    // Expired holds of every incarnation. Unexpired prior-generation rows
+    // stay so a late settle can still see them.
     tx.execute(
         "DELETE FROM axond_store_budget_reservation
-         WHERE namespace = $1 AND expires_at <= now() AND incarnation = $2",
-        &[&namespace, &incarnation],
+         WHERE namespace = $1 AND expires_at <= now()",
+        &[&namespace],
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -1176,5 +1153,16 @@ mod tests {
         assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget ("));
         assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget_active ("));
         assert!(!BUDGET_DDL.contains("CREATE TABLE IF NOT EXISTS axond_budget_reservation ("));
+        assert!(
+            !BUDGET_DDL.contains("incarnation"),
+            "incarnation is store_namespace_incarnation_v1.sql, not a v1 row-shape edit"
+        );
+        assert!(
+            INCARNATION_DDL.contains("CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (")
+        );
+        assert!(
+            INCARNATION_DDL
+                .contains("ADD COLUMN IF NOT EXISTS incarnation bigint NOT NULL DEFAULT 1")
+        );
     }
 }
