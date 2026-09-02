@@ -210,6 +210,10 @@ mod tests {
             assert_eq!(input.parse::<NamespaceId>().unwrap(), id);
         }
 
+        assert_eq!(
+            NamespaceId::parse("acme/core"),
+            Err(InvalidNamespaceId::Character)
+        );
         assert_eq!(NamespaceId::parse(""), Err(InvalidNamespaceId::Empty));
         assert!(matches!(
             NamespaceId::parse(&"a".repeat(NamespaceId::MAX_LEN + 1)),

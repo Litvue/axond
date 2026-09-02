@@ -7,10 +7,10 @@
 #
 # Boot refuses a credential or gateway key whose env var is unset, so every env
 # var the example config references is supplied with a placeholder. Nothing here
-# is dispatched upstream: /healthz is unauthenticated, and /v1/models is probed
-# with the platform gateway key (it now fails closed like every request path),
-# so the placeholders are never used as provider keys. Two gateway keys may not
-# share a secret, so the inbound placeholders differ.
+# is dispatched upstream: /healthz is unauthenticated, and /ns/platform/v1/models
+# is probed with the platform gateway key (it now fails closed like every request
+# path), so the placeholders are never used as provider keys. Two gateway keys
+# may not share a secret, so the inbound placeholders differ.
 #
 # Usage: ops/docker-smoke.sh <image-ref>
 set -euo pipefail
@@ -19,11 +19,17 @@ image="${1:?usage: ops/docker-smoke.sh <image-ref>}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 container="axond-smoke-$$"
 host_port=18080
+config="$(mktemp "${TMPDIR:-/tmp}/axond-docker-smoke.XXXXXX.toml")"
 
 cleanup() {
   docker rm -f "$container" >/dev/null 2>&1 || true
+  rm -f "$config"
 }
 trap cleanup EXIT
+
+# Distroless nonroot cannot create `axond.sqlite` at `/`; `/tmp` is writable.
+sed 's|^path = "axond.sqlite"$|path = "/tmp/axond.sqlite"|' \
+  "${repo_root}/axond.example.toml" >"$config"
 
 docker run -d --name "$container" \
   -p "${host_port}:8080" \
@@ -35,7 +41,7 @@ docker run -d --name "$container" \
   -e GW_ACME_OPENAI_API_KEY=smoke-placeholder \
   -e GW_INBOUND_PLATFORM_KEY=smoke-placeholder-platform \
   -e GW_INBOUND_ACME_KEY=smoke-placeholder-acme \
-  -v "${repo_root}/axond.example.toml:/etc/axond/axond.toml:ro" \
+  -v "${config}:/etc/axond/axond.toml:ro" \
   "$image" >/dev/null
 
 for attempt in $(seq 1 30); do
@@ -45,7 +51,7 @@ for attempt in $(seq 1 30); do
       echo "healthz: $body"
       curl --fail --silent \
         -H "Authorization: Bearer smoke-placeholder-platform" \
-        "http://127.0.0.1:${host_port}/v1/models" | tee /tmp/axond-models
+        "http://127.0.0.1:${host_port}/ns/platform/v1/models" | tee /tmp/axond-models
       echo
       echo "axond image smoke passed"
       exit 0

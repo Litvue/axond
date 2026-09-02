@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # Boot and serve axond in a kernel-enforced, network-denied namespace.
 #
-# This is the mechanical Tier 0 guarantee from ADR 0017 and ADR 0002: the
-# default gateway starts and serves without a datastore or outbound network.
-# Loopback remains available by design, so a local fake provider can exercise
-# the real serving path. The namespace itself excludes every external
-# datastore; an external Redis or Postgres dependency therefore fails boot or
-# serving. After boot, the gate also requires exactly its gateway and
-# fake-upstream listeners, catching a datastore or sidecar started in-namespace.
+# ADR 0063 requires a Store. This gate boots a temp SQLite file and serves
+# `/ns/{ns}/v1`. It is not a no-datastore promise. The namespace still excludes
+# external Redis or Postgres: an outbound datastore dependency fails boot or
+# serving. After boot, the gate requires exactly its gateway and fake-upstream
+# listeners, catching a sidecar started in-namespace.
 #
 # Usage: ops/tier0-gate.sh [axond-binary]
 #
@@ -16,8 +14,8 @@
 # asserted; only the two guarantees the namespace itself provides — egress denial
 # and the listener set — are skipped, loudly. It exists for the release lanes,
 # where a sandbox restriction on a hosted runner must not fail an otherwise valid
-# release. CI leaves it unset, so the hermetic guarantee is enforced on every
-# change.
+# release. CI leaves it unset, so the network-isolation guarantee is enforced on
+# every change.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -116,24 +114,22 @@ command -v python3 >/dev/null 2>&1 ||
 # Outside a namespace the listener set is the host's, so it is not an invariant.
 [[ "$degraded" != 1 ]] || check_listeners=0
 
-config="$repo_root/tests/tier0/axond.tier0.toml"
-stateful_config="$repo_root/tests/tier0/axond.stateful-bootstrap.toml"
-# Read here, not beside its probe below: the degraded pre-check has to reserve
-# this port too. Taken from the config rather than a literal, so a port moved
-# there cannot leave the probe dialling a port nothing was ever going to use.
-stateful_port="$(sed -n 's/^bind = "127\.0\.0\.1:\([0-9]\+\)"$/\1/p' "$stateful_config")"
-[[ -n "$stateful_port" ]] || {
-  echo "TIER 0 INVARIANT FAILED: could not read the stateful bootstrap's bind port; the listener probe would prove nothing." >&2
+committed_config="$repo_root/tests/tier0/axond.tier0.toml"
+runtime_config="$(mktemp "$tmpdir/axond-sqlite-boot.XXXXXX.toml")"
+sqlite_path="$(mktemp "$tmpdir/axond-store.XXXXXX.sqlite")"
+rm -f "$sqlite_path"
+sed "s|^path = \"axond-tier0.sqlite\"$|path = \"${sqlite_path}\"|" \
+  "$committed_config" >"$runtime_config"
+grep -Fq "path = \"${sqlite_path}\"" "$runtime_config" || {
+  echo "TIER 0 INVARIANT FAILED: could not bind the gate to a temp SQLite file." >&2
   exit 1
 }
 
 if [[ "$degraded" == 1 ]]; then
   # Outside a namespace the fixed ports are the host's, so a stale listener would
   # be mistaken for the gateway or the fake upstream. The gateway always binds
-  # 18081; 18082 is only bound when the fixture upstream runs. The stateful
-  # bootstrap's port belongs here as much as those: nothing is ever meant to
-  # answer on it, so a stranger's listener would read as a boot that bound one.
-  required_free=(18081 "$stateful_port")
+  # 18081; 18082 is only bound when the fixture upstream runs.
+  required_free=(18081)
   [[ "$check_serving" != 1 ]] || required_free+=(18082)
   if command -v ss >/dev/null 2>&1; then
     for port in "${required_free[@]}"; do
@@ -159,21 +155,16 @@ ready_probe_body=""
 models_probe_body=""
 unknown_body=""
 fixture_body=""
-stateful_log=""
 
 failure() {
   echo >&2
   echo "TIER 0 INVARIANT FAILED: $*" >&2
-  echo "ADR 0017/0002 require config-only axond to have no datastore or network dependency at boot or on the serving path." >&2
-  echo "If a feature added this dependency, gate it behind an opt-in higher tier." >&2
+  echo "ADR 0063 requires a Store: this gate boots a temp SQLite file and serves /ns/{ns}/v1. It is not a no-datastore promise." >&2
+  echo "External Redis or Postgres must not be required for this single-replica boot." >&2
   echo "--- gateway log ($gateway_log) ---" >&2
   cat "$gateway_log" >&2 || true
   echo "--- fake-upstream log ($upstream_log) ---" >&2
   cat "$upstream_log" >&2 || true
-  if [[ -n "$stateful_log" ]]; then
-    echo "--- stateful bootstrap log ($stateful_log) ---" >&2
-    cat "$stateful_log" >&2 || true
-  fi
   exit 1
 }
 
@@ -189,7 +180,8 @@ cleanup() {
     wait "$pid" 2>/dev/null || true
   done
   rm -f "$gateway_log" "$upstream_log" "$health_probe_body" "$ready_probe_body" \
-    "$models_probe_body" "$unknown_body" "$fixture_body" "$stateful_log"
+    "$models_probe_body" "$unknown_body" "$fixture_body" "$runtime_config" \
+    "$sqlite_path" "${sqlite_path}-wal" "${sqlite_path}-shm"
 }
 trap cleanup EXIT
 
@@ -231,7 +223,7 @@ if [[ "$check_serving" == 1 ]]; then
 fi
 
 env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
-AXOND_CONFIG="$config" \
+AXOND_CONFIG="$runtime_config" \
 GW_TIER0_UPSTREAM_KEY=tier0-upstream-placeholder \
 GW_TIER0_INBOUND_KEY=tier0-gateway-key \
 GW_TIER0_VERIFIER=tier0-verifier-secret-012345678901234567890123 \
@@ -247,11 +239,11 @@ for _ in $(seq 1 60); do
     break
   fi
   if ! kill -0 "$gateway_pid" 2>/dev/null; then
-    failure "gateway exited before /healthz; Tier 0 must boot without a datastore or network"
+    failure "gateway exited before /healthz; a temp SQLite file must be enough to boot"
   fi
   sleep 0.1
 done
-[[ "$ready" == 1 ]] || failure "gateway did not serve /healthz; Tier 0 boot is not available"
+[[ "$ready" == 1 ]] || failure "gateway did not serve /healthz; SQLite boot is not available"
 
 # The listener set is only an invariant inside the namespace: on a shared host any
 # unrelated service would break it, which is why a degraded run cannot assert it.
@@ -298,24 +290,24 @@ ready_probe_body=""
 models_probe_body="$(mktemp "$tmpdir/axond-tier0-models.XXXXXX")"
 models_status="$(curl --silent --show-error --max-time 5 --output "$models_probe_body" \
   --write-out '%{http_code}' -H 'Authorization: Bearer tier0-gateway-key' \
-  "$base_url/v1/models" || true)"
+  "$base_url/ns/platform/v1/models" || true)"
 [[ "$models_status" == 200 ]] ||
-  failure "authenticated /v1/models returned HTTP $models_status instead of 200"
+  failure "authenticated /ns/platform/v1/models returned HTTP $models_status instead of 200"
 models="$(cat "$models_probe_body")"
-grep -q '"id":"fixture-chat"' <<<"$models" || failure "authenticated /v1/models omitted configured alias fixture-chat"
+grep -q '"id":"fixture-chat"' <<<"$models" || failure "authenticated /ns/platform/v1/models omitted configured alias fixture-chat"
 rm -f "$models_probe_body"
 models_probe_body=""
 
 unauth_status="$(curl --silent --max-time 5 --output /dev/null \
-  --write-out '%{http_code}' "$base_url/v1/models" || true)"
-[[ "$unauth_status" == 401 ]] || failure "unauthenticated /v1/models returned $unauth_status instead of 401"
+  --write-out '%{http_code}' "$base_url/ns/platform/v1/models" || true)"
+[[ "$unauth_status" == 401 ]] || failure "unauthenticated /ns/platform/v1/models returned $unauth_status instead of 401"
 
 unknown_body="$(mktemp "$tmpdir/axond-tier0-unknown.XXXXXX")"
 unknown_status="$(curl --silent --max-time 5 --output "$unknown_body" \
   --write-out '%{http_code}' \
   -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
   -d '{"model":"does-not-exist","messages":[{"role":"user","content":"hello"}]}' \
-  "$base_url/v1/chat/completions" || true)"
+  "$base_url/ns/platform/v1/chat/completions" || true)"
 [[ "$unknown_status" == 404 ]] || failure "unknown model returned $unknown_status instead of 404"
 grep -q '"type":"unknown_model"' "$unknown_body" || failure "unknown model response lacked typed unknown_model error"
 rm -f "$unknown_body"
@@ -326,7 +318,7 @@ if [[ "$check_serving" == 1 ]]; then
     --write-out '%{http_code}' \
     -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
     -d '{"model":"fixture-chat","messages":[{"role":"user","content":"What is the capital of France?"}]}' \
-    "$base_url/v1/chat/completions" || true)"
+    "$base_url/ns/platform/v1/chat/completions" || true)"
   [[ "$fixture_status" == 200 ]] || failure "local fake-upstream request returned $fixture_status instead of 200"
   grep -Eq '"object"[[:space:]]*:[[:space:]]*"chat.completion"' "$fixture_body" ||
     failure "fake-upstream response was not fixture-shaped"
@@ -334,75 +326,19 @@ if [[ "$check_serving" == 1 ]]; then
   fixture_body=""
 fi
 
-# Stateful bootstrap validates without a database: the same namespace that
-# denies egress is where a config-parse connection attempt would fail, so a
-# clean refusal here is evidence that parsing connects to nothing.
-#
-# The refusal is about *this* namespace, not about stateful mode in general: a
-# replica that reaches its control plane boots and serves `/admin/v1` while it
-# refuses inference (docs/deployment/kubernetes.md#stateful-mode). Here every
-# referenced env var is unset and nothing is reachable, so the boot must fail
-# loudly and bind no listener, and its refusal must come from an unresolved
-# *reference* — named, never with its value (ADR 0027) — rather than from a
-# connection this namespace would have had to allow.
-stateful_log="$(mktemp "$tmpdir/axond-tier0-stateful.XXXXXX.log")"
-stateful_status=0
-env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
-  -u GW_TIER0_CONTROL_PLANE_DSN -u GW_TIER0_SECRET_STORE_KEK \
-  -u GW_TIER0_ADMIN_BREAKGLASS \
-  AXOND_CONFIG="$stateful_config" RUST_LOG=warn \
-  timeout 10 "$bin" >"$stateful_log" 2>&1 &
-stateful_pid=$!
-# Observed rather than read out of the log: the startup line is emitted at info
-# level and before `bind` returns, so a log search proves neither that a socket
-# was opened nor, under this gate's `RUST_LOG`, that one was not.
-stateful_bound=no
-while kill -0 "$stateful_pid" 2>/dev/null; do
-  if (exec 3<>"/dev/tcp/127.0.0.1/${stateful_port}") 2>/dev/null; then
-    stateful_bound=yes
-    break
-  fi
-  sleep 0.1
-done
-wait "$stateful_pid" || stateful_status=$?
-# The process may have exited between the last liveness sample and `wait`.
-# Take one post-mortem refusal sample as well; otherwise the loop's lifetime
-# would become the evidence and a short-lived listener could be missed simply
-# because the failed boot ended before the next iteration.
-if (exec 3<>"/dev/tcp/127.0.0.1/${stateful_port}") 2>/dev/null; then
-  stateful_bound=yes
-fi
-[[ "$stateful_status" != 0 ]] ||
-  failure "a stateful process started with no control plane reachable and its control-plane, KEK, and breakglass references unset; it must fail loudly rather than serve an empty snapshot"
-[[ "$stateful_status" != 124 ]] ||
-  failure "a stateful process kept running with an unreachable control plane instead of failing at boot"
-grep -q 'stateful' "$stateful_log" ||
-  failure "stateful refusal did not explain the mode"
-# Without this the gate would pass on any boot failure, including a datastore
-# connection the namespace denied — the opposite of what it claims to prove.
-grep -q 'GW_TIER0_' "$stateful_log" ||
-  failure "stateful refusal did not name the unresolved reference, so it is not evidence that boot stopped at the reference rather than at a connection"
-[[ "$stateful_bound" == no ]] ||
-  failure "a stateful boot that cannot reach a control plane accepted a connection on 127.0.0.1:${stateful_port}; it must bind nothing"
-if grep -Eq 'postgres(ql)?://|dbname=' "$stateful_log"; then
-  failure "stateful diagnostics must name references, never a resolved DSN"
-fi
-rm -f "$stateful_log"
-stateful_log=""
-
 echo "healthz: $health"
 echo "readyz: $ready_body"
 echo "models: fixture-chat"
-echo "auth: unauthenticated /v1/models -> 401"
+echo "auth: unauthenticated /ns/platform/v1/models -> 401"
 echo "errors: unknown model -> 404 unknown_model"
+echo "store: temp SQLite file $sqlite_path"
 if [[ "$check_serving" == 1 ]]; then
-  echo "serving: local fixture upstream -> 200 chat.completion"
+  echo "serving: local fixture upstream -> 200 chat.completion on /ns/platform/v1"
 else
   echo "serving: DEGRADED, fixture upstream path not checked"
 fi
-echo "stateful: bootstrap validates with no datastore, then fails loudly on an unresolved reference"
 if [[ "$degraded" == 1 || "$check_listeners" != 1 || "$check_serving" != 1 ]]; then
-  echo "Tier 0 boot and serve passed (DEGRADED: a runner prerequisite was unavailable, so the assertions marked DEGRADED above were not proven)"
+  echo "SQLite boot and serve passed (DEGRADED: a runner prerequisite was unavailable, so the assertions marked DEGRADED above were not proven)"
 else
-  echo "Tier 0 hermetic boot and serve passed"
+  echo "SQLite boot and serve passed"
 fi

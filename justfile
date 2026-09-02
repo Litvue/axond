@@ -62,8 +62,6 @@ docs-check: ops-venv
     bash -n ops/publish-image-index.sh
     bash -n ops/verify-image-evidence.sh
     bash -n ops/pin-image-digest.sh
-    bash -n ops/restore-drill.sh
-    target/ops-venv/bin/python ops/check-recovery-evidence.py --self-test
     bash -n ops/rollout-drill.sh
     bash -n ops/stateful-deploy-drill.sh
     bash -n ops/stateful-persistent-drill.sh
@@ -85,14 +83,6 @@ deploy-check:
     target/deploy-venv/bin/pip install --quiet --require-virtualenv --require-hashes -r ops/deploy-requirements.txt
     target/deploy-venv/bin/python ops/check-deploy-manifests.py --self-test
     target/deploy-venv/bin/python ops/check-deploy-manifests.py
-
-# Restore a logical dump and recover to a chosen point in time against the
-# supported Postgres, with `axond migrate status` as the acceptance test. Needs
-# Docker. About a minute; documented in
-# docs/operations/backup-and-recovery.md.
-restore-drill: ops-venv
-    cargo build -p axond --locked
-    AXOND_PYTHON="$PWD/target/ops-venv/bin/python" bash ops/restore-drill.sh
 
 # Roll the production overlay out on a real three-worker kind cluster, then prove
 # the same rollout deadlocks once the per-node skew stops being counted per
@@ -247,34 +237,19 @@ capacity:
 endurance duration_ms="":
     AXOND_ENDURANCE=1 AXOND_ENDURANCE_DURATION_MS={{ duration_ms }} cargo test --locked --all-features --test endurance -- the_endurance_soak_tier_qualifies_and_publishes_its_evidence --exact --nocapture --test-threads=1
 
-# The twelve-hour stateful endurance soak (issue #221), writing its result and
-# time series to target/stateful-endurance/soak. Needs AXOND_TEST_POSTGRES_DSN:
-# the durable usage sink, the revisions, and the database outage are the point,
-# and a run without a database is not a shorter one. The smoke tier of the same
-# driver runs in `just test` wherever that DSN is set.
-stateful-endurance duration_ms="":
-    AXOND_STATEFUL_ENDURANCE=1 AXOND_STATEFUL_ENDURANCE_DURATION_MS={{ duration_ms }} cargo test --locked --all-features --test stateful_endurance -- the_stateful_endurance_soak_tier_qualifies_and_publishes_its_evidence --exact --nocapture --test-threads=1
-
-# The heavy rollout scenarios, writing result artifacts to target/rollout/heavy.
-# The reduced tier of the same driver runs in `just test` (ADR 0038).
-# Set AXOND_TEST_POSTGRES_DSN to also evaluate the forward-only rollback fence;
-# without it the artifact records the fence as skipped rather than as passing.
-rollout:
-    AXOND_ROLLOUT=1 cargo test --locked --all-features --test rollout -- --nocapture --test-threads=1
-
 # One row at a time, in a lane of its own: each boots its own replica, and a
 # matrix that qualifies timing beside the rest of the suite would be measuring
 # the machine. AXOND_FAULT_MATRIX is what admits the rows, so `just test` runs
-# this binary's assertions without them. The provider and
-# transport rows need nothing; the state-tier rows take the same
-# AXOND_TEST_REDIS_URL / AXOND_TEST_POSTGRES_DSN the stateful suites do
-# (CONTRIBUTING.md has the container recipe), and skip when they are unset.
-# The committed fault matrix, publishing its evidence to target/faults/.
+# this binary's assertions without them. Provider and transport rows run on the
+# SQLite boot. Redis budget and rate-limit rows skip because those backends are
+# withdrawn (ADR 0063). Postgres HA rows skip unless AXOND_TEST_POSTGRES_DSN is
+# set. The committed fault matrix, publishing its evidence to target/faults/.
 faults:
     AXOND_FAULT_MATRIX=1 cargo test --locked --all-features --test faults -- --nocapture --test-threads=1
 
-# Check the stateless provider and transport rows after a fault run. CI passes
-# its lane-start timestamp too, so an old artifact cannot satisfy the gate.
+# Check the request-path provider and transport rows after a fault run. CI
+# passes its lane-start timestamp too, so an old artifact cannot satisfy the
+# gate.
 fault-evidence:
     python3 ops/check-fault-evidence.py --self-test
     python3 ops/check-fault-evidence.py
@@ -287,7 +262,8 @@ run:
 build-static:
     cargo build --release --target x86_64-unknown-linux-musl -p axond
 
-# Build the static binary if needed and prove the Tier 0 default is hermetic.
+# Build the static binary if needed and prove a temp SQLite file boots and
+# serves /ns/{ns}/v1 inside a network-denied namespace.
 tier0:
     cargo build --release --target x86_64-unknown-linux-musl -p axond
     ops/tier0-gate.sh target/x86_64-unknown-linux-musl/release/axond

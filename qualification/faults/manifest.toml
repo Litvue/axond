@@ -10,9 +10,9 @@
 # many dispatches the provider saw, what the request settled as, and that the
 # bound the row names is what ended it. Milliseconds appear only as ceilings.
 #
-# Rows whose `fault` names Redis or Postgres are skipped when
-# `AXOND_TEST_REDIS_URL` / `AXOND_TEST_POSTGRES_DSN` are unset, and CI sets
-# `AXOND_TEST_REQUIRE_SERVICES=1` so a skip there is a failure.
+# Redis budget and rate-limit rows always skip: those backends are withdrawn
+# (ADR 0063), and the skip reason is that withdrawal, not a missing tier-matrix
+# service. Postgres HA rows skip when `AXOND_TEST_POSTGRES_DSN` is unset.
 
 schema_version = 1
 

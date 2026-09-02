@@ -31,6 +31,15 @@ async fn namespaced_completion_and_namespace_api() {
     let fetched_body: Value = fetched.json().await.unwrap();
     assert_eq!(fetched_body["attrs"]["org"], "acme");
 
+    let slash_id = http
+        .post(gateway.url("/api/v1/namespaces"))
+        .bearer_auth(GATEWAY_KEY)
+        .json(&json!({"id": "acme/core"}))
+        .send()
+        .await
+        .expect("slash id");
+    assert_eq!(slash_id.status(), 400, "{}", slash_id.text().await.unwrap());
+
     let oversized = http
         .post(gateway.url("/api/v1/namespaces"))
         .bearer_auth(GATEWAY_KEY)

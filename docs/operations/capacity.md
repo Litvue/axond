@@ -9,9 +9,8 @@ What a replica costs over hours rather than minutes — leaks, descriptor balanc
 and usage-record reconciliation — is
 [endurance qualification](./endurance.md), which uses the same conventions.
 
-This page qualifies the **stateless request path only** — a Tier 0 process with
-no Redis, no Postgres, and no control plane. It is not evidence about stateful
-serving, revision convergence, or any store-backed control. Where that leaves
+This page qualifies the **SQLite request path** on `/ns/{ns}/v1`. It is not
+HA/Postgres evidence and not the retired tier matrix. Where that leaves
 production qualification as a whole, and which runs are retained as evidence, is
 the [qualification packet](./qualification.md).
 

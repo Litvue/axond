@@ -1217,7 +1217,10 @@ async fn attempt(
     // ends, so an attempt that never gets one cannot pin the gauge.
     let waiting = &mut true;
     let sent = client
-        .post(format!("{base_url}{}", shape.route))
+        .post(format!(
+            "{base_url}/ns/{}{}",
+            shape.tenant.namespace, shape.route
+        ))
         .bearer_auth(shape.tenant.inbound_key)
         .json(&shape.body())
         .send()

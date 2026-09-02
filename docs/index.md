@@ -73,26 +73,14 @@ and operate it.
 - [Backup, restore, and PITR](./operations/backup-and-recovery.md) — what is
   durable, the recovery objectives, the archiving and dump mechanisms, and the
   drill that proves a restore lands where it was aimed.
-- [Qualification packet](./operations/qualification.md) — what production
-  qualification has measured, what is only declared, what is unbuilt, and the
-  retained evidence behind each.
-- [Capacity qualification](./operations/capacity.md) — per-replica envelopes,
-  candidate SLOs, the committed load profiles, and what a capacity run gates on.
-- [Fault qualification](./operations/fault-qualification.md) — the committed
-  provider, transport, and state-tier fault matrix, and the evidence each row
-  retains.
-- [Recovery qualification](./operations/recovery-qualification.md) — the
-  committed outage, cold-boot, convergence, rotation, and restore scenarios, the
-  evidence each retains, and the slices the harness still waits on.
-- [Endurance qualification](./operations/endurance.md) — the mixed-workload
-  workload, what a long run leaves behind, and the leak and accounting
-  properties it gates on.
-- [Stateful endurance qualification](./operations/stateful-endurance.md) — the
-  same mixed workload offered to a fleet with a durable usage sink while its
-  catalogue, credentials, policy, provider, database, and processes change.
-- [Rollout qualification](./operations/rollout.md) — the rolling upgrade executed
-  against a real fleet: drain, readiness removal, replacement, mixed-version
-  windows, rollback limits, and the evidence a run leaves behind.
+- [Qualification packet](./operations/qualification.md) — request-path
+  evidence after ADR 0063: what is harnessed, what is retained, what is gone.
+- [Capacity qualification](./operations/capacity.md) — per-replica envelopes
+  on SQLite + `/ns/{ns}/v1`.
+- [Fault qualification](./operations/fault-qualification.md) — provider and
+  transport faults on SQLite; Redis rows skipped (ADR 0063).
+- [Endurance qualification](./operations/endurance.md) — mixed-workload soak
+  on SQLite + `/ns/{ns}/v1`.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
 - [Administering a stateful deployment](./operations/admin-api.md) — make a

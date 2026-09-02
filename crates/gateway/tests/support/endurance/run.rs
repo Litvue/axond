@@ -495,7 +495,10 @@ async fn attempt(
     };
 
     let sent = client
-        .post(format!("{base_url}{}", plan.shape.route))
+        .post(format!(
+            "{base_url}/ns/{}{}",
+            plan.tenant.namespace, plan.shape.route
+        ))
         .bearer_auth(&plan.tenant.key)
         .header("traceparent", plan.correlation.traceparent())
         .json(&body(&plan))

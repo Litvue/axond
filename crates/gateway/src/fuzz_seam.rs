@@ -828,7 +828,7 @@ pub fn publication_moves_runtime_routes() -> bool {
     });
     let snapshot = ConfigSnapshot::build(config, &seam_env(), 1)
         .expect("the seam's config resolves with one more alias");
-    state.publish(snapshot);
+    state.publish(snapshot).expect("publish");
     routes_of(&state.config()) != before
 }
 

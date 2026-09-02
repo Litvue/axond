@@ -42,15 +42,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-The Redis/Postgres-backed tests skip when their services are not configured.
-To run them locally, start pinned service containers and set the same variables
-as CI:
+Request-path tests boot a temp SQLite file and hit `/ns/{ns}/v1`. Redis is
+not required. Optional Postgres HA tests skip when `AXOND_TEST_POSTGRES_DSN`
+is unset:
 
 ```bash
-docker run -d --name axond-test-redis -p 6399:6379 redis:7.4.2-alpine
 docker run -d --name axond-test-postgres -e POSTGRES_PASSWORD=axond-ci \
   -p 55432:5432 postgres:17.6-alpine
-AXOND_TEST_REDIS_URL=redis://127.0.0.1:6399 \
 AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
 AXOND_TEST_REQUIRE_SERVICES=1 cargo test -p axond --all-features --locked
 ```
@@ -98,8 +96,7 @@ fails rather than measuring the floor with a newer compiler.
 manifests, so it needs `kustomize` or `kubectl` on `PATH` and network access the
 first time it builds its venv from
 [`ops/deploy-requirements.txt`](./ops/deploy-requirements.txt) (refreshed with
-`just deploy-lock`). `just restore-drill` is deliberately outside `just check`:
-it needs Docker and takes about a minute.
+`just deploy-lock`).
 
 A break fails CI. If it is intentional, add a reviewed entry to
 [`ops/api-compat-overrides.toml`](./ops/api-compat-overrides.toml) in the same PR

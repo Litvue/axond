@@ -6,6 +6,10 @@ Date: 2026-08-05
 
 Accepted
 
+Amended by [ADR 0063](./0063-stateful-only-namespaced-gateway.md): the
+black-box and soak lanes boot SQLite and hit `/ns/{ns}/v1`. Fixtures are
+unchanged.
+
 ## Context
 
 Everything the beta promises about the request path is a *wire* promise. A
@@ -113,6 +117,13 @@ nightly cannot rot into something nobody runs.
   fixtures stays a deliberate, reviewed act.
 - The long soak can only fail out of band, so a leak introduced at a scale the
   short run does not reach is caught within a week rather than at the PR.
+
+## Amendment: namespaced SQLite request path (ADR 0063)
+
+The black-box process still boots from `crates/gateway/tests/support/gateway.rs`.
+That boot writes a temp SQLite file and rewrites `/v1/...` callers onto
+`/ns/platform/v1/...`. Soak fixtures under `tests/fixtures/` are not deleted.
+Unprefixed `/v1` inference is not the qualified path.
 
 ## Amendment: a second SDK runtime
 

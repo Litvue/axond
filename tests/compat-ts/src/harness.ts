@@ -71,7 +71,7 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-function config(bind: string, upstream: string): string {
+function config(bind: string, upstream: string, sqlite: string): string {
   const models = ALIASES.map(
     ([alias, provider, target]) =>
       `[[model]]\nname = "${alias}"\n` +
@@ -80,6 +80,10 @@ function config(bind: string, upstream: string): string {
   return `
 [server]
 bind = "${bind}"
+
+[storage]
+backend = "sqlite"
+path = "${sqlite}"
 
 [[namespace]]
 id = "${NAMESPACE}"
@@ -141,7 +145,8 @@ async function boot(
   const bind = `127.0.0.1:${await freePort()}`;
   const directory = await mkdtemp(join(tmpdir(), "axond-compat-ts-"));
   const configPath = join(directory, "axond.toml");
-  await writeFile(configPath, config(bind, upstream.baseUrl), "utf8");
+  const sqlite = join(directory, "axond.sqlite").replace(/\\/g, "/");
+  await writeFile(configPath, config(bind, upstream.baseUrl, sqlite), "utf8");
 
   const environment = { ...process.env };
   delete environment["OTEL_EXPORTER_OTLP_ENDPOINT"];

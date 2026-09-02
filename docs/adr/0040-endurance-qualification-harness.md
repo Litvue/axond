@@ -6,6 +6,10 @@ Date: 2026-08-13
 
 Accepted
 
+Amended by [ADR 0063](./0063-stateful-only-namespaced-gateway.md): the subject
+is a SQLite replica serving `/ns/{ns}/v1`. The stateful-endurance slice is
+withdrawn.
+
 Extends [ADR 0033](./0033-capacity-qualification-harness.md) from *what one
 replica costs at a fixed offered load* to *whether the same process is still the
 same process after half a day of mixed traffic*. It reuses that ADR's

@@ -79,24 +79,22 @@ pending; skipped PostgreSQL stateful-v1 lanes do not satisfy or replace them.
 The required pull-request CI aggregate covers:
 
 - formatting, clippy, workspace tests, and rustdoc with warnings denied;
-- deterministic unit/integration tests and short stateless fault, rollout, and
-  endurance coverage that do not require PostgreSQL;
+- deterministic unit/integration tests and short SQLite request-path fault
+  and endurance coverage;
 - provider SDK compatibility;
 - dependency and license policy;
 - crates.io package/publish dry runs;
-- static musl build and hermetic Tier 0 boot;
+- static musl build and SQLite boot-and-serve gate;
 - a boot-and-serve smoke of every released binary target, on a runner of that
   target's own platform;
 - Docker image and Compose quickstart smoke tests.
 
-The historical PostgreSQL stateful-v1 tests, restore/PITR, recovery record,
-stateful endurance, and Kubernetes stateful/PVC drills are excluded from pull
-requests, pushes, merge queues, and schedules. They remain manually available
-only when `run_legacy_postgres_qualification=true` is explicitly supplied. Their
-result is compatibility evidence for the shipped stateful-v1 implementation,
-not production evidence for ADR 0062. Blob-backed publication, namespace
-isolation, recovery, secret lifecycle, migration, and endurance gates must be
-implemented and directly evidenced before stateful-v2 can be release-qualified.
+Kubernetes stateful overlay drills are excluded from pull requests, pushes,
+merge queues, and schedules. They remain manually available only when
+`run_legacy_postgres_qualification=true` is explicitly supplied. Recovery,
+rollout, and stateful-endurance qualification harnesses were retired with the
+tier matrix (ADR 0063 / #427). Request-path qualification is SQLite +
+`/ns/{ns}/v1` and does not require Redis.
 
 Release jobs add archive/image SBOMs, provenance attestations, cosign signing,
 native per-architecture archive smoke — the same binary smoke against the exact

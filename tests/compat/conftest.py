@@ -45,7 +45,7 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _config(bind: str, upstream: str) -> str:
+def _config(bind: str, upstream: str, sqlite: str) -> str:
     models = "".join(
         f'[[model]]\nname = "{alias}"\n'
         f'targets = [ {{ provider = "{provider}", model = "{target}", price = {PRICE} }} ]\n\n'
@@ -62,7 +62,7 @@ bind = "{bind}"
 
 [storage]
 backend = "sqlite"
-path = ":memory:"
+path = "{sqlite}"
 
 [[namespace]]
 id = "{NAMESPACE}"
@@ -110,8 +110,10 @@ def upstream():
 @pytest.fixture(scope="session")
 def gateway(upstream, tmp_path_factory):
     bind = f"127.0.0.1:{_free_port()}"
-    config = tmp_path_factory.mktemp("axond") / "axond.toml"
-    config.write_text(_config(bind, upstream.base_url))
+    workspace = tmp_path_factory.mktemp("axond")
+    config = workspace / "axond.toml"
+    sqlite = str(workspace / "axond.sqlite").replace("\\", "/")
+    config.write_text(_config(bind, upstream.base_url, sqlite))
 
     env = {
         **os.environ,

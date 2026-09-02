@@ -1,9 +1,9 @@
 # Backup, restore, and point-in-time recovery
 
-What axond keeps, how to get it back, and how long that is allowed to take. A
-backup procedure nobody has restored from is a hypothesis, so the objectives on
-this page have an executable form: `ops/restore-drill.sh` performs both recoveries
-against the supported PostgreSQL and runs in CI on every change.
+What axond keeps, how to get it back, and how long that is allowed to take.
+RPO and RTO below are the operator contract. The recovery qualification drill
+that used to execute them in CI was retired with the tier matrix
+([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md) / #427).
 
 ## What is durable, and what is not
 
@@ -133,48 +133,21 @@ Forward-only migrations mean a recovery to a point before an upgrade must be
 served by the binary of that time. See
 [Upgrades and rollback](./upgrades.md).
 
-## The drill
+## Rehearsal
 
-```bash
-ops/restore-drill.sh
-```
+<a id="the-drill"></a>
 
-About a minute, needs Docker and a `cargo` build. It starts the supported
-PostgreSQL with WAL archiving, installs the schema with `axond migrate apply`,
-applies the usage, budget, and revocation DDL, writes control-plane state and an
-audit event, and then performs both recoveries:
+Rehearse a logical dump and a point-in-time restore against *your* backups.
+The former CI qualification drill is gone with the tier matrix. The assertions
+that still matter:
 
-- a `pg_dump`/`pg_restore` round trip, asserting the head, the revision
-  checksums, the encrypted secret lifecycle, the retained catalogue and active
-  pointer, and the approved price-book checksum, catalogue pin, effective-dated
-  rules, rates, approval, and provenance come back with the audit trail;
+- a `pg_dump`/`pg_restore` round trip restores head, revisions, and usage;
 - a `pg_basebackup` plus archived WAL recovery to a target between two published
-  revisions, asserting the first revision is present, the second is **not**, and
-  the usage, budget, and revocation schemas survived.
+  revisions keeps the first and drops the second.
 
-The logical-restore lane also exercises the durable state introduced by the
-secret and catalogue slices. It stages and activates a throwaway encrypted
-secret through `axond admin`, configures the bundled catalogue seed in the
-Postgres-backed catalogue store, and publishes a catalogue resource pinned to
-its content id. After `pg_restore`, it checks the secret's owner, version,
-lifecycle, and metadata-only resolvability, plus the catalogue's active pointer,
-retained snapshot history, and payload bytes. The drill never writes those rows
-by hand and the evidence checker rejects the generated provider material as
-well as the breakglass credential.
-
-Approved, effective-dated price-book history is asserted by this procedure. The
-drill publishes the approved resource through the operator/admin path, records
-its catalogue pin, approval citation, rates, and provenance, and verifies that
-the exact history survives logical restore. This is restore evidence for the
-durable pricing surface; the qualification packet still requires a retained
-fleet-level recovery record before #219 or #156 can close.
-
-Both restored databases are accepted by `axond migrate status` or the drill
-fails. The `Restore and PITR drill` CI lane runs it on every change, so the
-procedure on this page cannot rot into something that no longer restores.
-
-Run it against your own backups too: the drill proves the mechanism, while only
-a restore of your archive proves your archive.
+A restore that replayed the whole WAL passes every "the rows are there" check
+and still contains the change the incident was about. Only a restore of your
+archive proves your archive.
 
 ## See also
 
@@ -186,9 +159,8 @@ a restore of your archive proves your archive.
   limits.
 - [Production checklist](../deployment/production-checklist.md) — the review this
   page is the recovery half of.
-- [Recovery qualification](./recovery-qualification.md) — the fleet-level
-  contract its `backup-restore` and `point-in-time-recovery` scenarios rehearse
-  this procedure under, once its harness exists.
+- [Qualification packet](./qualification.md) — request-path evidence after the
+  recovery harness retired.
 - [ADR 0044](../adr/0044-recovery-objectives-and-supported-backends.md) — why
   these objectives are numbers, why Redis is outside them, and what changing them
   costs.
