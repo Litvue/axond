@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS axond_store_usage (
     period TEXT,
     model TEXT NOT NULL,
     status TEXT NOT NULL,
-    cost_microdollars INTEGER
+    cost_microdollars INTEGER,
+    recorded_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
 );
 CREATE INDEX IF NOT EXISTS axond_store_usage_ns_period
     ON axond_store_usage (namespace, period);
@@ -461,8 +462,8 @@ impl Store for SqliteStore {
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO axond_store_usage
-                    (request_id, namespace, period, model, status, cost_microdollars)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))",
                 params![
                     event.request_id,
                     event.namespace,

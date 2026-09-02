@@ -27,6 +27,8 @@ REQUIRED_METHODS = {
     "/api/v1/namespaces/{ns}/usage": {"get"},
 }
 
+HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
+
 FORBIDDEN_SUBSTRINGS = ("/providers",)
 
 
@@ -46,18 +48,23 @@ def check(spec: dict) -> list[str]:
         if not isinstance(item, dict):
             failures.append(f"missing path {path}")
             continue
-        for method in methods:
-            if method not in item:
-                failures.append(f"missing {method.upper()} {path}")
+        present = {method for method in item if method.lower() in HTTP_METHODS}
+        required = {method.lower() for method in methods}
+        for method in sorted(required - present):
+            failures.append(f"missing {method.upper()} {path}")
+        for method in sorted(present - required):
+            failures.append(f"unexpected {method.upper()} {path}")
+
+    for path in paths:
+        if path not in REQUIRED_METHODS:
+            failures.append(f"unexpected path {path}")
+        for forbidden in FORBIDDEN_SUBSTRINGS:
+            if forbidden in path:
+                failures.append(f"unmounted discovery path claimed: {path}")
 
     ns = paths.get("/api/v1/namespaces/{ns}")
     if isinstance(ns, dict) and "delete" in ns:
         failures.append("DELETE /api/v1/namespaces/{ns} is not mounted in this slice")
-
-    for path in paths:
-        for forbidden in FORBIDDEN_SUBSTRINGS:
-            if forbidden in path:
-                failures.append(f"unmounted discovery path claimed: {path}")
 
     usage = paths.get("/api/v1/namespaces/{ns}/usage", {}).get("get", {})
     params = usage.get("parameters") if isinstance(usage, dict) else None
@@ -114,6 +121,16 @@ def self_test() -> int:
     assert any("DELETE" in f for f in found), found
     assert any("discovery" in f for f in found), found
     assert any("gateway_key" in f for f in found), found
+
+    extra_path = json.loads(json.dumps(good))
+    extra_path["paths"]["/api/v1/extra"] = {"get": {}}
+    found = check(extra_path)
+    assert any("unexpected path" in f and "/api/v1/extra" in f for f in found), found
+
+    extra_method = json.loads(json.dumps(good))
+    extra_method["paths"]["/api/v1/namespaces"]["patch"] = {}
+    found = check(extra_method)
+    assert any("unexpected PATCH" in f and "/api/v1/namespaces" in f for f in found), found
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
         json.dump(good, handle)

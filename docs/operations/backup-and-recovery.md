@@ -12,6 +12,7 @@ that used to execute them in CI was retired with the tier matrix
 | Control-plane revisions, resource versions, blobs, mutations, audit events, idempotency records, head | PostgreSQL (`axond_cp_*`) | Configuration history and the audit trail. Not recoverable from anywhere else. |
 | Schema version and migration ledger | PostgreSQL (`axond_cp_schema_migration`) | The record of what was applied; without it a database is [`Unrecorded`](./control-plane-journal.md#schema-status-and-what-each-state-means) and a replica refuses it. |
 | Usage rows | PostgreSQL (`axond_usage`) | Billing and analytics history. |
+| Management usage index | PostgreSQL or SQLite (`axond_store_usage`) | Current-period `GET /api/v1/namespaces/{ns}/usage` summaries, not the billing warehouse. Operators prune rows older than 90 days (or whose `period` is no longer billed); the gateway does not auto-prune. |
 | Namespace and subject spend, reservations | PostgreSQL (`axond_budget*`) when a Postgres budget backend is configured | Accumulated spend against caps. |
 | Namespace period spend, reservations | PostgreSQL (`axond_store_budget*`) when `[storage] backend = "postgres"` | Accumulated spend against namespace period caps. Leftover `axond_budget*` from the withdrawn budget backend is not this ledger and is not migrated. |
 | Revocation entries | PostgreSQL (`axond_revocation`) | Denylisted token identifiers, which is a security regression, not just a data one. |

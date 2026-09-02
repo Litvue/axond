@@ -178,7 +178,8 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
         })?;
     client
         .batch_execute(
-            "SELECT request_id, namespace, period, model, status, cost_microdollars
+            "SELECT request_id, namespace, period, model, status, cost_microdollars,
+                    recorded_at
              FROM axond_store_usage LIMIT 0",
         )
         .await
@@ -747,8 +748,8 @@ impl Store for PostgresStore {
             client
                 .execute(
                     "INSERT INTO axond_store_usage
-                        (request_id, namespace, period, model, status, cost_microdollars)
-                     VALUES ($1, $2, $3, $4, $5, $6)
+                        (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, now())
                      ON CONFLICT (request_id) DO NOTHING",
                     &[
                         &event.request_id,

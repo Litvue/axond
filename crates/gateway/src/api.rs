@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -209,6 +209,13 @@ fn json_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, GatewayError>
     }
 }
 
+fn query_value<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, GatewayError> {
+    match query {
+        Ok(Query(value)) => Ok(value),
+        Err(rejection) => Err(GatewayError::BadRequest(rejection.body_text())),
+    }
+}
+
 fn required_period(period: Option<String>) -> Result<String, GatewayError> {
     let Some(period) = period.filter(|value| !value.is_empty()) else {
         return Err(GatewayError::BadRequest("`period` is required".into()));
@@ -379,6 +386,7 @@ async fn put_budget(
     ),
     responses(
         (status = 200, description = "Ledger", body = BudgetRecord),
+        (status = 400, description = "Invalid period", body = ErrorEnvelope),
         (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
         (status = 404, description = "`unknown_namespace` or `unknown_budget`", body = ErrorEnvelope),
         (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
@@ -422,8 +430,9 @@ async fn get_budget(
 )]
 async fn list_namespaces(
     State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
+    query: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<ListBody>, GatewayError> {
+    let query = query_value(query)?;
     let limit = query.limit.unwrap_or(100);
     if !(1..=1000).contains(&limit) {
         return Err(GatewayError::BadRequest(
@@ -457,8 +466,9 @@ async fn list_namespaces(
 async fn get_usage(
     State(state): State<AppState>,
     Path(ns): Path<String>,
-    Query(query): Query<UsageQuery>,
+    query: Result<Query<UsageQuery>, QueryRejection>,
 ) -> Result<Json<UsageSummary>, GatewayError> {
+    let query = query_value(query)?;
     let period = required_period(query.period)?;
     let store = store(&state)?;
     match store.get_namespace(&ns).await {
@@ -525,6 +535,12 @@ mod tests {
         assert!(
             paths["/api/v1/namespaces/{ns}"].get("delete").is_none(),
             "DELETE is a later slice"
+        );
+        assert!(
+            paths["/api/v1/namespaces/{ns}/budgets/{period}"]["get"]["responses"]
+                .get("400")
+                .is_some(),
+            "invalid period is a typed 400"
         );
         assert!(
             paths.keys().all(|path| !path.contains("/providers")),
