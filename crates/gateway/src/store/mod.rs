@@ -1132,7 +1132,8 @@ mod tests {
                      period              text,
                      model               text        NOT NULL,
                      status              text        NOT NULL,
-                     cost_microdollars   bigint
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
                  );",
             )
             .await
