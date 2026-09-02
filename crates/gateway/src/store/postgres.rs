@@ -114,12 +114,17 @@ impl Store for PostgresStore {
             )
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        let has_more = rows.len() as i64 > limit;
+        let rows: Vec<_> = if has_more {
+            rows.into_iter().take(limit as usize).collect()
+        } else {
+            rows
+        };
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(record_from(row.get(0), row.get(1), row.get(2))?);
         }
-        let next = if out.len() as i64 > limit {
-            out.pop();
+        let next = if has_more {
             out.last().map(|row| row.id.clone())
         } else {
             None

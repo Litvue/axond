@@ -145,13 +145,19 @@ impl Store for SqliteStore {
                     ))
                 })
                 .map_err(unavailable)?;
-            let mut out = Vec::new();
+            let mut raw = Vec::new();
             for row in rows {
-                let (id, attrs, blocklist) = row.map_err(unavailable)?;
+                raw.push(row.map_err(unavailable)?);
+            }
+            let has_more = raw.len() > limit as usize;
+            if has_more {
+                raw.truncate(limit as usize);
+            }
+            let mut out = Vec::with_capacity(raw.len());
+            for (id, attrs, blocklist) in raw {
                 out.push(row_to_record(id, attrs, blocklist)?);
             }
-            let next = if out.len() > limit as usize {
-                out.pop();
+            let next = if has_more {
                 out.last().map(|row| row.id.clone())
             } else {
                 None
