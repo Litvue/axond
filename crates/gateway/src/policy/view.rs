@@ -372,6 +372,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_stateless_deployment_enforces_the_file_for_every_namespace() {
         let view = PolicyView::of(&stateless_config());
         let policy = view.policy("platform");
