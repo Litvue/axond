@@ -1008,7 +1008,16 @@ async fn serve() -> anyhow::Result<()> {
         let _ = refreshing.await;
     }
     let _ = stop_discovery.send(());
-    let _ = discovering.await;
+    // Best-effort cache: do not spend the settle/flush budget on a stuck
+    // store write. Abort if cooperative stop does not finish immediately.
+    let mut discovering = discovering;
+    if tokio::time::timeout(Duration::from_millis(50), &mut discovering)
+        .await
+        .is_err()
+    {
+        discovering.abort();
+        tracing::debug!("discovery task aborted at shutdown");
+    }
     let _ = stop_converging.send(());
     if let Some(converging) = converging {
         let _ = converging.await;
