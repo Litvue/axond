@@ -743,7 +743,7 @@ impl Store for PostgresStore {
     }
 
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
-        let cost = event.cost_microdollars.map(sql_amount).transpose()?;
+        let cost = event.cost_microdollars.map(sql_amount_saturating);
         self.with_client(async move |client| {
             client
                 .execute(
