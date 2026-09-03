@@ -283,6 +283,10 @@ pub trait Store: Send + Sync {
     }
 
     /// Insert or replace one provider's cached listing.
+    ///
+    /// A write for a different `source` applies only when the existing row is
+    /// missing or `stale`. A lagged replica still on the old URL cannot replace
+    /// a fresh listing published for a new URL.
     async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
         let _ = row;
         Ok(())
@@ -2373,6 +2377,39 @@ mod tests {
                 cost_microdollars: i64::MAX as u64,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_put_provider_models_does_not_replace_a_newer_source() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let store = PostgresStore::connect(&dsn, true).await.expect("connect");
+        let provider = unique_ns("prov");
+        let neu = ProviderModels {
+            provider: provider.clone(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(neu.clone()).await.expect("new");
+        store
+            .put_provider_models(ProviderModels {
+                provider: provider.clone(),
+                fetched_at: Some("2026-09-02T12:02:00Z".into()),
+                stale: false,
+                data: vec![serde_json::json!({"id": "old", "object": "model"})],
+                source: Some("https://api.openai.com/v1".into()),
+            })
+            .await
+            .expect("old");
+        let got = store
+            .get_provider_models(&provider)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, neu);
     }
 
     #[tokio::test]
