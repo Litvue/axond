@@ -284,20 +284,6 @@ impl Store for SqliteStore {
         .await
     }
 
-    async fn namespace_incarnation(&self, id: &str) -> Result<Option<i64>, StoreError> {
-        let id = id.to_string();
-        self.with_conn(move |conn| {
-            conn.query_row(
-                "SELECT n FROM axond_namespace_incarnation WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(unavailable)
-        })
-        .await
-    }
-
     async fn get_namespace(&self, id: &str) -> Result<Option<NamespaceRecord>, StoreError> {
         let id = id.to_string();
         self.with_conn(move |conn| {

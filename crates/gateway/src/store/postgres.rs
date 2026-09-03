@@ -600,21 +600,6 @@ impl Store for PostgresStore {
         .await
     }
 
-    async fn namespace_incarnation(&self, id: &str) -> Result<Option<i64>, StoreError> {
-        let id = id.to_owned();
-        self.with_client(async move |client| {
-            Ok(client
-                .query_opt(
-                    "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
-                    &[&id],
-                )
-                .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))?
-                .map(|row| row.get(0)))
-        })
-        .await
-    }
-
     async fn get_namespace(&self, id: &str) -> Result<Option<NamespaceRecord>, StoreError> {
         let id = id.to_owned();
         self.with_client(async move |client| {

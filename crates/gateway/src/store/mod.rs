@@ -132,13 +132,6 @@ pub enum StoreError {
 pub trait Store: Send + Sync {
     async fn put_namespace(&self, ns: NamespaceRecord) -> Result<(), StoreError>;
     async fn get_namespace(&self, id: &str) -> Result<Option<NamespaceRecord>, StoreError>;
-
-    /// Live or deleted generation for `id`. `None` if this id was never created.
-    /// Seeding skips ids that already have a generation so DELETE survives restart.
-    async fn namespace_incarnation(&self, id: &str) -> Result<Option<i64>, StoreError> {
-        let _ = id;
-        Ok(None)
-    }
     async fn list_namespaces(
         &self,
         cursor: Option<String>,
