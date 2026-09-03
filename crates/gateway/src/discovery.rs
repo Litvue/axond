@@ -519,6 +519,11 @@ mod tests {
         assert!(stale.stale);
         assert_eq!(stale.data, row.data);
         assert!(!row.clone().against_source("https://old.example/v1").stale);
+        assert!(
+            row.data_if_source("https://new.example/v1").is_empty(),
+            "namespaced /v1/models must not advertise another URL's ids"
+        );
+        assert_eq!(row.data_if_source("https://old.example/v1").len(), 1);
     }
 
     #[test]

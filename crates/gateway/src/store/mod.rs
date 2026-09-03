@@ -145,6 +145,16 @@ impl ProviderModels {
         }
         self
     }
+
+    /// Inference `/v1/models` lists last-good ids only when this row was
+    /// fetched from `source`. A foreign URL's catalog is omitted.
+    pub fn data_if_source(&self, source: &str) -> &[Value] {
+        if self.source.as_deref() == Some(source) {
+            &self.data
+        } else {
+            &[]
+        }
+    }
 }
 
 /// Outcome of a pre-dispatch hold against the namespace's active period.

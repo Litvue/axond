@@ -906,7 +906,7 @@ async fn list_models(
         let models = cached
             .iter()
             .find(|row| row.provider == provider.id)
-            .map(|row| row.data.as_slice())
+            .map(|row| row.data_if_source(&provider.base_url))
             .unwrap_or(&[]);
         for model in models {
             let Some(bare) = model.get("id").and_then(Value::as_str) else {
