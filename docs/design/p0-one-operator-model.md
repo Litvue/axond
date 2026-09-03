@@ -1,5 +1,7 @@
 # P0: One operator model for availability and usage
 
+> **Superseded ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** Historical design; not the live operator model.
+
 | Field | Value |
 | --- | --- |
 | **Author** | axond maintainers / Grok design skill |

@@ -1,4 +1,4 @@
-//! Axond — a stateless, single-binary, self-hosted AI gateway.
+//! Axond — a store-backed, single-binary, self-hosted AI gateway.
 //!
 //! Boot sequence: install telemetry (logs always, OTLP only when configured),
 //! load + validate config (fail fast, delta B2), snapshot the environment for

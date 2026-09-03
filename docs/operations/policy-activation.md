@@ -1,5 +1,7 @@
 # Policy activation
 
+> **Withdrawn ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** Control-plane policy generations are gone. Historical record; do not follow as a runbook.
+
 In stateful mode, a tenant's or project's limits — spend cap, reservation TTL,
 concurrency ceiling, lease TTL, token floor — and its ordered content middleware
 are published as a

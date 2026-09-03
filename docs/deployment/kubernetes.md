@@ -31,7 +31,7 @@ kubectl -n axond port-forward service/axond 8080:8080
 curl --fail http://127.0.0.1:8080/healthz
 curl --fail \
   -H 'Authorization: Bearer replace-before-exposing' \
-  http://127.0.0.1:8080/v1/models
+  http://127.0.0.1:8080/ns/platform/v1/models
 ```
 
 ## Production overlay
@@ -183,6 +183,11 @@ Autoscaling on CPU does not make `[admission]` ceilings fleet-wide — read
 `axond.admission.rejections` as the saturation signal that CPU may not show.
 
 ## Stateful mode
+
+> **Withdrawn ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).**
+> `mode = "stateful"` and `/admin/v1` are not served. Use the production overlay
+> with `[storage]` (SQLite or Postgres). The rest of this section is a
+> historical record of the control-plane overlay.
 
 `deploy/kubernetes/overlays/production-stateful` is the production overlay plus
 the `deploy/kubernetes/components/stateful` component, and it deploys a fleet
@@ -457,7 +462,7 @@ Both probes stay unauthenticated.
 
 ## Scaling
 
-The HTTP process is stateless, so replicas can scale horizontally. These parts
+The HTTP process shares the Store, so replicas can scale horizontally. These parts
 remain replica-local unless a shared backend is selected:
 
 - credential and target circuit state;

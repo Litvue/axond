@@ -112,8 +112,8 @@ curl --fail "https://$FQDN/healthz"
 curl --fail "https://$FQDN/readyz"
 curl --fail \
   -H "Authorization: Bearer $INBOUND" \
-  "https://$FQDN/v1/models"
-curl -sS -o /dev/null -w '%{http_code}\n' "https://$FQDN/v1/models"
+  "https://$FQDN/ns/platform/v1/models"
+curl -sS -o /dev/null -w '%{http_code}\n' "https://$FQDN/ns/platform/v1/models"
 ```
 
 Expect `ok`, `ready`, a catalogue, and `401` without a key.
@@ -121,19 +121,19 @@ Expect `ok`, `ready`, a catalogue, and `401` without a key.
 Real inference:
 
 ```bash
-curl --fail "https://$FQDN/v1/chat/completions" \
+curl --fail "https://$FQDN/ns/platform/v1/chat/completions" \
   -H "Authorization: Bearer $INBOUND" \
   -H 'content-type: application/json' \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
+  -d '{"model":"openai/gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
 ```
 
 Streamed:
 
 ```bash
-curl --fail -N "https://$FQDN/v1/chat/completions" \
+curl --fail -N "https://$FQDN/ns/platform/v1/chat/completions" \
   -H "Authorization: Bearer $INBOUND" \
   -H 'content-type: application/json' \
-  -d '{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"Count to five."}]}'
+  -d '{"model":"openai/gpt-4o","stream":true,"messages":[{"role":"user","content":"Count to five."}]}'
 ```
 
 Credential labels (never secret values):
@@ -141,7 +141,7 @@ Credential labels (never secret values):
 ```bash
 curl --fail \
   -H "Authorization: Bearer $INBOUND" \
-  "https://$FQDN/v1/credentials"
+  "https://$FQDN/ns/platform/v1/credentials"
 ```
 
 Usage: one JSON object per completed request on stdout, collected by Log
@@ -165,10 +165,10 @@ that file in place. Container Apps secret volumes are populated at revision
 start, so watching does not pick up a Key Vault edit by itself. Treat a new
 revision as the reload.
 
-Stateful mode (`mode = "stateful"`, `/admin/v1/secrets`) is a different
-deploy: Postgres control plane, envelope-encrypted secret store, keys rotated
-without a TOML edit. Do not mix TOML-owned credentials with store-owned ones
-in one process. See [operating modes](../adr/0027-stateless-and-stateful-operating-modes.md).
+`mode = "stateful"` and `/admin/v1/secrets` are withdrawn
+([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)). Rotate provider
+keys by changing the env var behind `[[credential]]` and replacing the
+revision.
 
 ## Ingress limits that affect streams
 

@@ -1,5 +1,7 @@
 # Minted inbound identity: operator guide and rotation runbook
 
+> **Withdrawn ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)).** Minted `axt1.` tokens are not verified and not issued. `POST /v1/tokens` is unmounted. Use the one static `[[gateway_key]]`. Historical record; do not follow as a runbook.
+
 This guide covers the Tier 0, config-only minted identity path. It uses the
 same `axond` binary for key generation, offline minting, and gateway
 verification. The gateway does not keep an issuance registry and verification

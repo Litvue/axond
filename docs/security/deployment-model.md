@@ -14,11 +14,11 @@ Axond require that reasoning to be re-examined.
   placeholders for matched content rather than the original values; restoration
   state exists only for that request and is never written to telemetry or a
   durable store.
-- Provider credentials are never returned by `/v1/models`,
-  `/v1/credentials`, logs, usage rows, spans, or metrics.
+- Provider credentials are never returned by `/ns/{ns}/v1/models`,
+  `/ns/{ns}/v1/credentials`, logs, usage rows, spans, or metrics.
 - Namespace configuration decides which credential pool a caller may use.
-- Redis/Postgres become admission dependencies only for the features explicitly
-  configured to use them.
+- The Store (`[storage]`) is an admission dependency for period budgets.
+  Redis/in-memory budget backends are withdrawn.
 
 `axond.redact` is deterministic pseudonymization, not protection against guessing
 low-entropy secrets. Providers see its tokens; equal values produce equal tokens

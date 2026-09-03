@@ -4,42 +4,48 @@ Use this page as the task-oriented entry point. The architecture decision
 records explain *why* Axond works this way; the guides below explain how to use
 and operate it.
 
+The live product is [ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md):
+a store-backed, namespace-scoped gateway. Historical ADRs that described
+stateless mode, `/admin/v1`, minted tokens, or `[[model]]` aliases remain on
+disk as records.
+
 ## Evaluate Axond
 
-- [Getting started](./getting-started.md) — boot the public image, prove
-  authentication and routing, make a first provider request, and in
-  `mode = "stateful"` apply one imported model (`gpt-4o`).
+- [Getting started](./getting-started.md) — boot the public image, publish a
+  period budget, prove `/ns/{ns}/v1` authentication and routing, make a first
+  provider request.
 - [Compatibility contract](./compatibility.md) — supported routes, provider
   wires, client behavior, and the `0.x` stability policy.
-- [State tiers](./configuration.md#state-tiers) — decide whether a deployment
-  needs Redis, Postgres, or neither.
-- [Operating modes](./adr/0027-stateless-and-stateful-operating-modes.md) —
-  the accepted stateless/stateful ownership, failure, and request-path design
-  (stateless is today's behavior and the default).
+- [Store](./configuration.md#state-tiers) — required SQLite or Postgres; Redis
+  and in-memory budget backends are withdrawn.
+- [ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md) — current product
+  shape. [ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) is
+  superseded.
 
 ## Install
 
 - [Installation and verification](./installation.md) — crates.io, signed
   binaries, OCI images, checksums, SBOMs, signatures, and attestations.
-- [Docker Compose](./deployment/docker-compose.md) — pull-first Tier 0 and
-  stateful local stacks.
+- [Docker Compose](./deployment/docker-compose.md) — pull-first SQLite
+  quickstart and Postgres overlay.
 
 ## Connect a client
 
 - [OpenAI clients](./clients/openai.md) — chat completions, Responses,
-  embeddings, streaming, Python, and TypeScript.
+  embeddings, streaming, Python, and TypeScript. Base URL
+  `/ns/{namespace}/v1`; model `provider-id/model-id`.
 - [Anthropic clients](./clients/anthropic.md) — native Messages and streaming.
+  Base URL `/ns/{namespace}`.
 - [Compatibility contract](./compatibility.md) — route and wire-family matrix.
 
 ## Configure
 
 - [Configuration reference](./configuration.md) — every key, default, and
-  validation rule. File `[[model]]` is the stateless form; stateful apply uses
-  the same published id (`gpt-4o`).
+  validation rule. `[[model]]` and `mode` are boot errors.
 - [`axond.example.toml`](../axond.example.toml) — the complete annotated
   configuration surface.
-- [Minted-token guide](./minted-token-guide.md) — key generation, issuance,
-  scopes, rotation, delegation, and revocation.
+- Management API — `/api/v1` (OpenAPI at `/api/v1/openapi.json`): namespaces,
+  period budgets, usage, cached provider models.
 
 ## Deploy
 
@@ -54,15 +60,15 @@ and operate it.
   replica: GHCR image, Key Vault keys, TOML mount, probes, telemetry, usage.
 - [Managed containers](./deployment/managed-containers.md) — the portable
   contract for ECS/Fargate, Cloud Run, Azure Container Apps, and Nomad.
-- [Stateful backends](./deployment/stateful-backends.md) — Redis/Postgres
-  availability, migrations, and scaling consequences.
+- [Store backends](./deployment/stateful-backends.md) — SQLite vs Postgres.
+  Redis/control-plane pages are historical.
 - [Production checklist](./deployment/production-checklist.md) — security,
   streaming, rollout, observability, and recovery review.
 
 ## Operate
 
 - [Observability and runbook](./observability.md) — traces, metrics, logs,
-  usage records, alerts, boot failures, and reloads.
+  usage records, alerts, and boot failures.
 - [Observability runbook](./operations/observability-runbook.md) — first
   response per failure mode, bounded drill-downs, and the shipped dashboards and
   alert rules.
@@ -83,32 +89,10 @@ and operate it.
   on SQLite + `/ns/{ns}/v1`.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
-- [Administering a stateful deployment](./operations/admin-api.md) — make a
-  model callable with `axond admin model apply` (`POST /admin/v1/bindings`);
-  `/admin/v1` preconditions, catalogue browse, and the expert four-resource
-  graph in the appendix.
-- [Stateful Kubernetes deployment runbook](./operations/stateful-deployment-runbook.md)
-  — apply, migrate, verify readiness, publish a model, upgrade, and roll back
-  the shipped stateful overlay.
 - [Billing-grade usage outbox](./operations/usage-outbox.md) — the opt-in durable
   outbox: setup, guarantees, refusals, recovery, poison, upgrades, and alerts.
-- [Control-plane revision journal](./operations/control-plane-journal.md) — the
-  stateful mode's Postgres schema, migrations, schema-status refusals, and
-  outage behaviour.
-- [Revision convergence](./operations/revision-convergence.md) — how a published
-  revision reaches replicas, convergence targets, what a replica reports, and
-  the signed last-known-good cache.
-- [Stateful integration](./operations/stateful-integration.md) — the #160
-  release gates, who owns each slice, and the harness scenario that proves each
-  gate.
-- [Policy activation](./operations/policy-activation.md) — publishing limits
-  without a redeploy: preflight, live/drain/migration classification, generation
-  and rollback semantics, and writer fencing.
 - [Deployment security model](./security/deployment-model.md) — trust
   boundaries, TLS termination, secret delivery, and image verification.
-- [Secret material in the stateful control plane](./security/secret-material.md)
-  — what a stored secret reference guarantees, and the regression suite that
-  proves material stays out of state, responses, logs, and telemetry.
 - [Tenant isolation evidence](./security/tenant-isolation-evidence.md) — which
   layer enforces each part of isolation, the test that proves it, and what is
   not covered yet.
@@ -116,6 +100,20 @@ and operate it.
   supported-version window, response targets, and how a fix and advisory ship.
 - [Fuzzing](./security/fuzzing.md) — the config, token, and query targets, the
   properties they assert, and the required-versus-scheduled lanes.
+
+### Withdrawn operator surfaces (historical)
+
+These pages describe the pre-0063 control plane, minted tokens, or `/admin/v1`.
+They are not runbooks for a current deployment:
+
+- [Minted-token guide](./minted-token-guide.md)
+- [Administering a stateful deployment](./operations/admin-api.md)
+- [Stateful Kubernetes deployment runbook](./operations/stateful-deployment-runbook.md)
+- [Control-plane revision journal](./operations/control-plane-journal.md)
+- [Revision convergence](./operations/revision-convergence.md)
+- [Stateful integration](./operations/stateful-integration.md)
+- [Policy activation](./operations/policy-activation.md)
+- [Secret material in the stateful control plane](./security/secret-material.md)
 
 ## Develop and maintain
 
@@ -130,17 +128,13 @@ and operate it.
   eight responsibility-specific backend contracts, which paths they may be
   called from, and why there is no universal state backend.
 - [Namespace and blob control-plane migration](./maintainers/namespace-control-plane-migration.md)
-  — the staged route, storage, domain, migration, deployment, and qualification
-  work required by the accepted stateful-v2 architecture.
+  — historical staged work for the superseded ADR 0062 target.
 - [Release runbook](./maintainers/releasing.md) — release-please, artifact
   repair, crates.io ordering, and verification.
 - [Release readiness](../RELEASE.md) — current public-beta evidence and known
   limitations.
 - [Architecture decisions](./adr) — accepted design decisions and consequences.
-- [ADR 0062: blob-backed flat namespace control plane](./adr/0062-blob-backed-flat-namespace-control-plane.md)
-  — the accepted target stateful architecture: flat namespace ownership,
-  provider-compatible namespaced routes, immutable object graphs, and one CAS
-  publication head.
-- [ADR 0027: stateless and stateful operating modes](./adr/0027-stateless-and-stateful-operating-modes.md)
-  — the implemented PostgreSQL stateful-v1 record; its stateless default,
-  immutable request snapshot, and outage boundaries remain in force.
+- [ADR 0063: stateful-only namespaced gateway](./adr/0063-stateful-only-namespaced-gateway.md)
+  — current product shape.
+- [ADR 0062](./adr/0062-blob-backed-flat-namespace-control-plane.md) and
+  [ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) — superseded.

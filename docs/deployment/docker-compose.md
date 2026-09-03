@@ -46,7 +46,7 @@ docker compose up -d
 curl --fail http://127.0.0.1:8080/healthz
 curl --fail \
   -H 'Authorization: Bearer quickstart-platform-key' \
-  http://127.0.0.1:8080/v1/models
+  http://127.0.0.1:8080/ns/platform/v1/models
 ```
 
 The service intentionally has no restart policy. A missing secret or invalid
@@ -125,10 +125,10 @@ docker compose \
   --profile stateful stop redis
 ```
 
-The dispatch path returns `503 rate_limit_unavailable` or
-`budget_unavailable` under the default fail-closed policy, while `/v1/models`
-still answers. After Redis restarts, allow its connection manager several
-seconds to recover before treating a transient `503` as a defect.
+Period budgets live in the Store, not Redis. A missing budget is `429
+budget_exceeded`. A Store outage is `503 budget_unavailable` under the default
+`[storage].on_unavailable = deny`. Catalogue reads
+(`GET /ns/{ns}/v1/models`) do not take a budget hold.
 
 ## Teardown
 
