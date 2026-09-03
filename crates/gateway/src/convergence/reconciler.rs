@@ -77,7 +77,10 @@ pub trait SnapshotSink: Send + Sync {
 
     /// Replace the serving snapshot atomically. In-flight requests keep the
     /// snapshot they already hold.
-    fn publish(&self, snapshot: ConfigSnapshot);
+    ///
+    /// Seeding durable namespace rows is part of publication: a failure must
+    /// leave the previous snapshot, policy, and authorization in place.
+    fn publish(&self, snapshot: ConfigSnapshot) -> Result<(), crate::state::SnapshotError>;
 
     /// The generation currently serving, which the next candidate increments.
     fn generation(&self) -> u64;
@@ -89,13 +92,8 @@ impl SnapshotSink for AppState {
         Ok(())
     }
 
-    /// The policy is installed first and the config second, both atomically. The
-    /// order matters only for the instant between them, and this is the harmless
-    /// one: a request in that window is priced by the new limits under the old
-    /// catalogue, never routed by a new catalogue under limits nobody published.
-    fn publish(&self, snapshot: ConfigSnapshot) {
-        self.policy().install(PolicyView::of(&snapshot.config));
-        AppState::publish(self, snapshot);
+    fn publish(&self, snapshot: ConfigSnapshot) -> Result<(), crate::state::SnapshotError> {
+        AppState::publish(self, snapshot)
     }
 
     fn generation(&self) -> u64 {
@@ -421,13 +419,17 @@ impl Reconciler {
         &self,
         revision: RevisionId,
         snapshot: ConfigSnapshot,
-    ) -> Result<(), ActivationRefusal> {
-        self.sink.admit(&snapshot)?;
+    ) -> Result<(), CompileError> {
+        if let Err(source) = self.sink.admit(&snapshot) {
+            return Err(CompileError::Activation { revision, source });
+        }
         let pricing_boundary = snapshot
             .pricing()
             .and_then(|pricing| pricing.effective().ends());
         let generation = snapshot.generation;
-        self.sink.publish(snapshot);
+        if let Err(source) = self.sink.publish(snapshot) {
+            return Err(CompileError::Snapshot { revision, source });
+        }
         self.pricing_schedule
             .lock()
             .expect("not poisoned")
@@ -798,7 +800,13 @@ impl Reconciler {
             .pricing()
             .and_then(|pricing| pricing.effective().ends());
 
-        self.sink.publish(snapshot);
+        if let Err(source) = self.sink.publish(snapshot) {
+            self.compiler.abandoned();
+            return Err(CompileError::Snapshot {
+                revision: id,
+                source,
+            });
+        }
         self.pricing_schedule
             .lock()
             .expect("not poisoned")

@@ -1,8 +1,13 @@
-# Tier 0 is config-only: adding a datastore here, or to the default path, is
-# the violation that ops/tier0-gate.sh exists to catch (ADR 0017).
+# Single-replica boot: a temp SQLite file is the store. ops/tier0-gate.sh
+# rewrites `path` to a throwaway file. This is not a no-datastore promise
+# (ADR 0063 / ADR 0018).
 
 [server]
 bind = "127.0.0.1:18081"
+
+[storage]
+backend = "sqlite"
+path = "axond-tier0.sqlite"
 
 [[namespace]]
 id = "platform"

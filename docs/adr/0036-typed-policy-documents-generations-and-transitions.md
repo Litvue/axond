@@ -4,7 +4,15 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+Tenant/project policy documents, generations, and transition
+classification are withdrawn. Budgets are per-namespace per-period
+ledgers on the `Store`. This record is retained for history. Do not
+implement from it.
+
+Accepted historically.
 
 Types the limits half of the stateful mode chosen in
 [ADR 0027](./0027-stateless-and-stateful-operating-modes.md), on the tenant and

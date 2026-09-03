@@ -4,7 +4,15 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+The multi-replica rollout qualification harness existed only to prove the
+removed tier / mode matrix. `qualification/rollout` is gone. Kubernetes
+overlay drills are a separate scheduling proof. This record is retained for
+history. Do not implement from it.
+
+Accepted historically.
 
 Extends the capacity harness of
 [ADR 0033](./0033-capacity-qualification-harness.md) from *one replica under

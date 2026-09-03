@@ -35,7 +35,7 @@ const ALIASES: ReadonlyArray<readonly [alias: string, provider: string, target: 
   ["responses-golden", "fake-openai", RESPONSES],
 ];
 
-/** The alias catalogue `GET /v1/models` must report. */
+/** The alias catalogue `GET /ns/{ns}/v1/models` must report. */
 export const ALIAS_NAMES: readonly string[] = ALIASES.map(([alias]) => alias);
 
 /** How long a gateway has to answer `/healthz`, and each probe of it. */
@@ -71,7 +71,7 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-function config(bind: string, upstream: string): string {
+function config(bind: string, upstream: string, sqlite: string): string {
   const models = ALIASES.map(
     ([alias, provider, target]) =>
       `[[model]]\nname = "${alias}"\n` +
@@ -81,12 +81,15 @@ function config(bind: string, upstream: string): string {
 [server]
 bind = "${bind}"
 
+[storage]
+backend = "sqlite"
+path = "${sqlite}"
+
 [[namespace]]
 id = "${NAMESPACE}"
 default = true
 
-# Configured but deliberately outside the SDK caller's grant. The compatibility
-# tests compare this namespace with one that does not exist.
+# A second store-backed namespace. ADR 0063 uses one deployment-wide static key.
 [[namespace]]
 id = "${UNGRANTED_NAMESPACE}"
 
@@ -141,7 +144,8 @@ async function boot(
   const bind = `127.0.0.1:${await freePort()}`;
   const directory = await mkdtemp(join(tmpdir(), "axond-compat-ts-"));
   const configPath = join(directory, "axond.toml");
-  await writeFile(configPath, config(bind, upstream.baseUrl), "utf8");
+  const sqlite = join(directory, "axond.sqlite").replace(/\\/g, "/");
+  await writeFile(configPath, config(bind, upstream.baseUrl, sqlite), "utf8");
 
   const environment = { ...process.env };
   delete environment["OTEL_EXPORTER_OTLP_ENDPOINT"];

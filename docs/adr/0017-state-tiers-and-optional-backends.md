@@ -4,7 +4,14 @@ Date: 2026-08-09
 
 ## Status
 
-Accepted, partially superseded by
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+The Tier 0 / 1 / 2 matrix, Redis as a budget/rate-limit/revocation tier,
+and the hermetic no-datastore default are withdrawn. This record is
+retained for history. Do not implement from it.
+
+Previously accepted, and previously partially superseded by
 [ADR 0027](./0027-stateless-and-stateful-operating-modes.md) and
 [ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
 

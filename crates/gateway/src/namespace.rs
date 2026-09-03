@@ -29,7 +29,7 @@ pub enum InvalidNamespaceId {
     #[error("a namespace identifier is over the {max}-byte limit")]
     TooLong { max: usize },
     #[error(
-        "a namespace identifier contains a character outside ASCII letters, digits, `-`, and `_`"
+        "a namespace identifier contains a character outside ASCII letters, digits, `.`, `-`, and `_`"
     )]
     Character,
     #[error("a namespace identifier must start and end with an ASCII letter or digit")]
@@ -45,7 +45,7 @@ impl fmt::Debug for InvalidNamespaceId {
 impl NamespaceId {
     /// Keeps URLs, storage keys, attribution fields, and authorization indexes
     /// bounded while leaving enough room for consumer-generated opaque ids.
-    pub const MAX_LEN: usize = 63;
+    pub const MAX_LEN: usize = 128;
 
     pub fn parse(input: &str) -> Result<Self, InvalidNamespaceId> {
         if input.is_empty() {
@@ -56,7 +56,7 @@ impl NamespaceId {
         }
         if !input
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         {
             return Err(InvalidNamespaceId::Character);
         }
@@ -194,7 +194,15 @@ mod tests {
     #[test]
     fn parser_accepts_only_one_canonical_opaque_url_segment() {
         let longest = "z".repeat(NamespaceId::MAX_LEN);
-        for input in ["a", "platform", "Acme_01-prod", longest.as_str()] {
+        for input in [
+            "a",
+            "platform",
+            "Acme_01-prod",
+            "acme.core",
+            "a.b",
+            "a..b",
+            longest.as_str(),
+        ] {
             let id = NamespaceId::parse(input).expect("canonical namespace id");
             assert_eq!(id.as_str(), input);
             assert_eq!(id.to_string(), input);
@@ -202,6 +210,10 @@ mod tests {
             assert_eq!(input.parse::<NamespaceId>().unwrap(), id);
         }
 
+        assert_eq!(
+            NamespaceId::parse("acme/core"),
+            Err(InvalidNamespaceId::Character)
+        );
         assert_eq!(NamespaceId::parse(""), Err(InvalidNamespaceId::Empty));
         assert!(matches!(
             NamespaceId::parse(&"a".repeat(NamespaceId::MAX_LEN + 1)),
@@ -209,11 +221,8 @@ mod tests {
         ));
         for input in [
             "acme/core",
-            "acme.core",
             "acme%2fcore",
             "acme%2Fcore",
-            ".",
-            "..",
             "café",
             "acme core",
             "acme\\core",
@@ -226,7 +235,7 @@ mod tests {
                 "`{input}` must not have an alternate URL interpretation"
             );
         }
-        for input in ["-acme", "acme-", "_acme", "acme_"] {
+        for input in ["-acme", "acme-", "_acme", "acme_", ".", ".."] {
             assert!(matches!(
                 NamespaceId::parse(input),
                 Err(InvalidNamespaceId::Boundary)

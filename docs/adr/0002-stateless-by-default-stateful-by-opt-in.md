@@ -4,7 +4,14 @@ Date: 2026-08-03
 
 ## Status
 
-Accepted
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+Axond is stateful-only: a required `Store` (SQLite WAL or Postgres), no
+stateless default, no in-memory or Redis budget/rate-limit tier. This
+record is retained for history. Do not implement from it.
+
+Accepted historically.
 
 ## Context
 

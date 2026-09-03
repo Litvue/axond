@@ -5278,25 +5278,47 @@ fn served_alias_names(state: &AppState) -> Vec<String> {
         .collect()
 }
 
-fn serve_snapshot(mut snapshot: crate::state::ConfigSnapshot) -> AppState {
-    // Qualified `tenant/project` ids are not one `/namespaces/{id}` segment.
-    snapshot.config.mode = crate::config::Mode::Stateless;
+fn serve_snapshot(snapshot: crate::state::ConfigSnapshot) -> AppState {
+    // Compiled revisions still name projected `tenant/project` labels, which
+    // are not request-path NamespaceIds. Rebuild the compiled aliases onto the
+    // bootstrap `platform` key so the probe is a real GET /ns/platform/v1/models.
+    let mut config = crate::convergence::compile::testing::bootstrap();
+    config.mode = crate::config::Mode::Stateless;
+    config.model = snapshot.config.model;
+    for model in &mut config.model {
+        model.namespace = None;
+    }
+    config.credential.push(crate::config::Credential {
+        namespace: "platform".to_owned(),
+        provider: "openai".to_owned(),
+        env: Some("GW_HYDRATE_PROBE_OPENAI".to_owned()),
+        secret: None,
+        id: Some("hydrate-probe".to_owned()),
+        weight: 1,
+    });
+    let mut env = crate::convergence::compile::testing::env();
+    env.insert(
+        "GW_HYDRATE_PROBE_OPENAI".to_owned(),
+        "sk-hydrate-probe".to_owned(),
+    );
+    let rebuilt = crate::state::ConfigSnapshot::build(config, &env, snapshot.generation)
+        .expect("the hydrate probe snapshot compiles");
     let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
     let state = AppState::new(
         crate::convergence::compile::testing::bootstrap(),
-        &crate::convergence::compile::testing::env(),
+        &env,
         UsageFanout::new(sinks),
         Box::new(NoBudget),
     )
     .expect("the file bootstrap is a serving snapshot");
-    state.publish(snapshot);
+    state.publish(rebuilt).expect("publish");
     state
 }
 
 async fn listed_models(state: AppState, key: &str) -> Value {
     let response = inference_router(state)
         .oneshot(
-            Request::get("/v1/models")
+            Request::get("/ns/platform/v1/models")
                 .header(axum::http::header::AUTHORIZATION, format!("Bearer {key}"))
                 .body(Body::empty())
                 .expect("a request"),
@@ -5422,10 +5444,10 @@ async fn hydrate_binding_produced_snapshot_answers_models_and_charges_stated_rat
             &binding_document(),
         )
         .await;
-    let (_, key) = make_four_step_servable(&deployment, &expected).await;
+    let (_, _) = make_four_step_servable(&deployment, &expected).await;
     let (_, snapshot) = compile_head(&deployment).await;
     assert_charges_stated_rates(&snapshot);
-    let listed = listed_models(serve_snapshot(snapshot), &key).await;
+    let listed = listed_models(serve_snapshot(snapshot), "inbound-secret").await;
     assert_eq!(listed["data"][0]["id"], "gpt-4o", "{listed}");
 }
 
@@ -5535,15 +5557,17 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         Box::new(NoBudget),
     )
     .expect("credentials resolve");
-    state.publish(
-        crate::state::ConfigSnapshot::build(cfg, &env, 1)
-            .expect("the expert snapshot compiles")
-            .with_pricing(fixtures::approved_pricing_snapshot()),
-    );
+    state
+        .publish(
+            crate::state::ConfigSnapshot::build(cfg, &env, 1)
+                .expect("the expert snapshot compiles")
+                .with_pricing(fixtures::approved_pricing_snapshot()),
+        )
+        .expect("publish");
 
     let listed = inference_router(state.clone())
         .oneshot(
-            Request::get("/v1/models")
+            Request::get("/ns/platform/v1/models")
                 .header(axum::http::header::AUTHORIZATION, "Bearer inbound-secret")
                 .body(Body::empty())
                 .expect("a request"),
@@ -5564,7 +5588,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
 
     let refused = inference_router(state)
         .oneshot(
-            Request::post("/v1/chat/completions")
+            Request::post("/ns/platform/v1/chat/completions")
                 .header(axum::http::header::AUTHORIZATION, "Bearer inbound-secret")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -5621,7 +5645,7 @@ async fn hydrate_binding_refusal_keeps_last_known_good() {
             &binding_document(),
         )
         .await;
-    let (expected, key) = make_four_step_servable(&deployment, &expected).await;
+    let (expected, _) = make_four_step_servable(&deployment, &expected).await;
     let loaded = hydrate_head(&deployment).await;
     let catalogue = deployment
         .api
@@ -5688,7 +5712,7 @@ async fn hydrate_binding_refusal_keeps_last_known_good() {
 
     let snapshot = compile_revision(catalogue, &restored).await;
     assert_charges_stated_rates(&snapshot);
-    let listed = listed_models(serve_snapshot(snapshot), &key).await;
+    let listed = listed_models(serve_snapshot(snapshot), "inbound-secret").await;
     assert_eq!(listed["data"][0]["id"], "gpt-4o", "{listed}");
     let _ = std::fs::remove_file(cache.compiled_path());
     let _ = std::fs::remove_file(cache.path());

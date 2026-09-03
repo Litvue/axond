@@ -228,11 +228,14 @@ async fn a_rejected_caller_learns_nothing_about_the_key_it_failed_to_present() {
     let mut wrong = super::harness::INBOUND_MATERIAL.to_owned();
     wrong.pop();
     wrong.push('9');
-    let request = axum::http::Request::post("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .header(axum::http::header::AUTHORIZATION, format!("Bearer {wrong}"))
-        .body(axum::body::Body::from(r#"{"model":"fast","messages":[]}"#))
-        .expect("a valid request");
+    let request = axum::http::Request::post(format!(
+        "/ns/{}/v1/chat/completions",
+        super::harness::SERVING_PATH_NS
+    ))
+    .header("content-type", "application/json")
+    .header(axum::http::header::AUTHORIZATION, format!("Bearer {wrong}"))
+    .body(axum::body::Body::from(r#"{"model":"fast","messages":[]}"#))
+    .expect("a valid request");
     let response = tokio::spawn(async move {
         let _default = tracing::dispatcher::set_default(&dispatch);
         router(state).oneshot(request).await.expect("a response")

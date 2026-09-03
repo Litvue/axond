@@ -33,7 +33,7 @@ there" check while being useless for the incident it exists for.
 **The objectives are numbers, and they are executable.** RPO ≤ 5 minutes and
 RTO ≤ 30 minutes for control-plane recovery, per PostgreSQL cluster, documented
 in [Backup, restore, and PITR](../operations/backup-and-recovery.md) with what
-each requires of the deployment. `ops/restore-drill.sh` performs both recoveries
+each requires of the deployment. Operator rehearsal of both recoveries
 on every change and asserts the asymmetry a PITR exists for — committed before
 the target present, the write after it absent — with `axond migrate status` as
 the acceptance test. Redis is deliberately outside the objectives: it is hot

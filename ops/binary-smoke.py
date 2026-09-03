@@ -2,13 +2,14 @@
 """Boot a release binary and prove it serves, on every supported target.
 
 `ops/tier0-gate.sh` is the stronger Linux gate: it boots the musl binary inside
-a kernel-enforced network namespace, so a datastore or egress dependency shows
-up as a boot or serving failure. That gate cannot run on macOS or Windows, and
+a kernel-enforced network namespace against a temp SQLite file, so an external
+datastore or egress dependency shows up as a boot or serving failure. That is
+not a no-datastore promise. That gate cannot run on macOS or Windows, and
 the release matrix ships binaries for both. This runner is the portable subset —
 the same serving assertions, expressed with nothing but the standard library:
 
 * `/healthz` and `/readyz` answer, unauthenticated;
-* `/v1/models` needs a gateway key and lists the configured alias;
+* `/ns/platform/v1/models` needs a gateway key and lists the configured alias;
 * an unknown model is refused with the typed `unknown_model` error;
 * one chat completion completes against a local fixture upstream.
 
@@ -52,6 +53,10 @@ TERMINATE_TIMEOUT_SECONDS = 10.0
 CONFIG_TEMPLATE = """# Written by ops/binary-smoke.py; ports are claimed at run time.
 [server]
 bind = "{bind}"
+
+[storage]
+backend = "sqlite"
+path = "{sqlite}"
 
 [[namespace]]
 id = "platform"
@@ -165,13 +170,13 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
     if ready.status != 200 or ready.body.strip() != "ready":
         raise SmokeFailure(f"/readyz answered {ready.status} {ready.body.strip()!r}")
 
-    anonymous = request(f"{base_url}/v1/models")
+    anonymous = request(f"{base_url}/ns/platform/v1/models")
     if anonymous.status != 401:
         raise SmokeFailure(
             f"unauthenticated /v1/models answered {anonymous.status} instead of 401"
         )
 
-    models = request(f"{base_url}/v1/models", key=GATEWAY_KEY)
+    models = request(f"{base_url}/ns/platform/v1/models", key=GATEWAY_KEY)
     if models.status != 200:
         raise SmokeFailure(
             f"authenticated /v1/models answered {models.status}: {models.body}"
@@ -181,7 +186,7 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
         raise SmokeFailure(f"/v1/models omitted the configured alias {ALIAS}: {served}")
 
     unknown = request(
-        f"{base_url}/v1/chat/completions",
+        f"{base_url}/ns/platform/v1/chat/completions",
         key=GATEWAY_KEY,
         payload={
             "model": "does-not-exist",
@@ -199,7 +204,7 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
         )
 
     completion = request(
-        f"{base_url}/v1/chat/completions",
+        f"{base_url}/ns/platform/v1/chat/completions",
         key=GATEWAY_KEY,
         payload={
             "model": ALIAS,
@@ -248,6 +253,7 @@ def smoke(binary: Path) -> None:
         config.write_text(
             CONFIG_TEMPLATE.format(
                 bind=f"127.0.0.1:{port}",
+                sqlite=str(directory / "axond.sqlite").replace("\\", "/"),
                 upstream=upstream.base_url,
                 alias=ALIAS,
                 target_model=CHAT,

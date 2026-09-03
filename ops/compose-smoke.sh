@@ -72,18 +72,18 @@ echo
 printf 'platform models: '
 curl --fail --silent \
   -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
-  "${base_url}/v1/models" >"$platform_models_file"
+  "${base_url}/ns/platform/v1/models" >"$platform_models_file"
 cat "$platform_models_file"
 echo
 printf 'acme models: '
 curl --fail --silent \
   -H "Authorization: Bearer ${GW_INBOUND_ACME_KEY}" \
-  "${base_url}/v1/models" >"$acme_models_file"
+  "${base_url}/ns/acme/v1/models" >"$acme_models_file"
 cat "$acme_models_file"
 echo
 printf 'unauthenticated models: '
 unauth_status="$(curl --silent --show-error --output "$unauth_file" \
-  --write-out '%{http_code}' "${base_url}/v1/models")"
+  --write-out '%{http_code}' "${base_url}/ns/platform/v1/models")"
 [[ "$unauth_status" == 401 ]]
 printf '%s ' "$unauth_status"
 cat "$unauth_file"
@@ -96,7 +96,7 @@ if chat_status="$(curl --silent --show-error --output "$chat_file" \
     -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
     -H 'content-type: application/json' \
     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}' \
-    "${base_url}/v1/chat/completions")"; then
+    "${base_url}/ns/platform/v1/chat/completions")"; then
   :
 else
   curl_status=$?

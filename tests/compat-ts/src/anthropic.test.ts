@@ -39,8 +39,7 @@ interface SdkMount {
 }
 
 const SDK_MOUNTS: readonly SdkMount[] = [
-  { name: "canonical namespace", suffix: `/namespaces/${NAMESPACE}` },
-  { name: "legacy stateless", suffix: "" },
+  { name: "canonical namespace", suffix: `/ns/${NAMESPACE}` },
 ];
 
 function sdkClient(mount: SdkMount): Anthropic {

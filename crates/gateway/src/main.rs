@@ -22,6 +22,7 @@
 mod admin;
 mod admission;
 mod aliases;
+mod api;
 // Derived availability and discovery evaluation (#206). Contract only: no
 // provider is polled, no observation is persisted, and no request is enforced
 // against a verdict, so `serve` constructs no index and every snapshot carries
@@ -64,12 +65,6 @@ mod ops;
 mod policy;
 mod pricing;
 mod principals;
-// The recovery qualification driver (#219). Tests only: it holds a replica's
-// reconciler, its cache, and a real Postgres journal at once, and takes the
-// database away from underneath them. The same serving contract is exercised
-// from outside the binary by the stateful integration suite.
-#[cfg(test)]
-mod qualification;
 mod rate_limit;
 mod redis_support;
 mod reload;
@@ -88,6 +83,7 @@ mod state;
 // `/readyz` reflects whether a complete serving snapshot is active.
 #[allow(dead_code)]
 mod status;
+mod store;
 mod streaming;
 mod telemetry;
 // One tenant cannot reach another (#225), asserted at the layers a black-box
@@ -130,10 +126,11 @@ impl SnapshotSink for ServingSnapshotSink {
         SnapshotSink::admit(&self.state, snapshot)
     }
 
-    fn publish(&self, snapshot: state::ConfigSnapshot) {
+    fn publish(&self, snapshot: state::ConfigSnapshot) -> Result<(), state::SnapshotError> {
         let authorization = snapshot.admin_authorization_handle();
-        SnapshotSink::publish(&self.state, snapshot);
+        SnapshotSink::publish(&self.state, snapshot)?;
         self.authorization.update(authorization);
+        Ok(())
     }
 
     fn generation(&self) -> u64 {
@@ -825,6 +822,16 @@ async fn serve() -> anyhow::Result<()> {
 
     let bind = config.server.bind;
     let watching = config.reload.watch;
+    let storage = config
+        .storage
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("`[storage]` is required (ADR 0063)"))?;
+    let store = crate::store::open(storage, &env)
+        .await
+        .map_err(|e| anyhow::anyhow!("store: {e}"))?;
+    crate::store::seed_config_namespaces(store.as_ref(), &config.namespace)
+        .await
+        .map_err(|e| anyhow::anyhow!("store seed: {e}"))?;
     let state = AppState::new_with_policy(
         config.clone(),
         &env,
@@ -834,6 +841,7 @@ async fn serve() -> anyhow::Result<()> {
         revocation,
         policy,
         observability,
+        Some(store),
     )
     .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
 
@@ -904,7 +912,7 @@ async fn serve() -> anyhow::Result<()> {
         reconciler
             .restore_cached(revision, snapshot)
             .map_err(|error| {
-                anyhow::anyhow!("compiled serving cache could not be admitted: {error}")
+                anyhow::anyhow!("compiled serving cache could not be restored: {error}")
             })?;
         tracing::info!(%revision, "restored compiled serving snapshot from last-known-good cache");
     }

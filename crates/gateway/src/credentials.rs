@@ -503,10 +503,7 @@ impl Credentials {
                 Some((pool, source))
             }
             None => {
-                let allow_fallback = config
-                    .namespace(namespace)
-                    .is_some_and(|n| n.allow_platform_fallback);
-                if !allow_fallback || namespace == self.platform_ns {
+                if !self.allow_platform_fallback(config, namespace) {
                     return None;
                 }
                 let pool = self
@@ -548,13 +545,20 @@ impl Credentials {
         {
             return true;
         }
-        namespace != self.platform_ns
-            && config
-                .namespace(namespace)
-                .is_some_and(|n| n.allow_platform_fallback)
+        self.allow_platform_fallback(config, namespace)
             && self
                 .pools
                 .contains_key(&(self.platform_ns.clone(), provider.to_string()))
+    }
+
+    /// API-created namespaces are absent from TOML; they inherit the platform
+    /// pool until BYOK lands. A TOML namespace still honours its own flag.
+    fn allow_platform_fallback(&self, config: &Config, namespace: &str) -> bool {
+        namespace != self.platform_ns
+            && config
+                .namespace(namespace)
+                .map(|n| n.allow_platform_fallback)
+                .unwrap_or(true)
     }
 
     /// Return configured credentials visible to a namespace or to an operator.
@@ -606,10 +610,7 @@ impl Credentials {
                 }
             }
             CredentialStatusView::Namespace(namespace) => {
-                let allow_platform_fallback = namespace != self.platform_ns
-                    && config
-                        .namespace(namespace)
-                        .is_some_and(|n| n.allow_platform_fallback);
+                let allow_platform_fallback = self.allow_platform_fallback(config, namespace);
                 for ((owner, provider), pool) in &self.pools {
                     if owner == namespace {
                         add_pool(
@@ -776,6 +777,18 @@ id = "public-platform"
             })
             .collect();
         assert_eq!(first, ["openai-a", "openai-b", "openai-a", "openai-b"]);
+    }
+
+    #[test]
+    fn api_created_namespace_inherits_platform_credentials() {
+        let cfg = config(TWO_PLATFORM_KEYS);
+        let creds = two_key_credentials(&cfg);
+        assert!(creds.is_present(&cfg, "wsp_x", "openai"));
+        assert!(creds.plan(&cfg, "wsp_x", "openai").is_some());
+        assert!(
+            !creds.is_present(&cfg, "acme", "openai"),
+            "TOML namespaces still default to no platform fallback"
+        );
     }
 
     #[test]

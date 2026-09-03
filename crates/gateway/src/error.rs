@@ -125,6 +125,12 @@ pub enum GatewayError {
     ScopeInsufficient(Capability),
     #[error("namespace identifier is invalid")]
     InvalidNamespace,
+    #[error("unknown namespace")]
+    UnknownNamespace,
+    #[error("namespace already exists")]
+    NamespaceConflict,
+    #[error("store is unavailable")]
+    StoreUnavailable,
     #[error("the authenticated grant does not authorize the selected namespace")]
     NamespaceNotAuthorized,
     #[error(transparent)]
@@ -202,6 +208,9 @@ impl GatewayError {
             Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
             Self::ScopeInsufficient(_) => StatusCode::FORBIDDEN,
             Self::InvalidNamespace => StatusCode::BAD_REQUEST,
+            Self::UnknownNamespace => StatusCode::NOT_FOUND,
+            Self::NamespaceConflict => StatusCode::CONFLICT,
+            Self::StoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::NamespaceNotAuthorized => StatusCode::FORBIDDEN,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::MintingDisabled => StatusCode::NOT_FOUND,
@@ -257,6 +266,9 @@ impl GatewayError {
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
             Self::InvalidNamespace => "invalid_namespace",
+            Self::UnknownNamespace => "unknown_namespace",
+            Self::NamespaceConflict => "namespace_conflict",
+            Self::StoreUnavailable => "store_unavailable",
             Self::NamespaceNotAuthorized => "namespace_not_authorized",
             Self::BadRequest(_) => "bad_request",
             Self::MintingDisabled => "minting_disabled",

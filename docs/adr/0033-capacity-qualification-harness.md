@@ -6,6 +6,9 @@ Date: 2026-08-12
 
 Accepted
 
+Amended by [ADR 0063](./0063-stateful-only-namespaced-gateway.md): the subject
+is a SQLite replica serving `/ns/{ns}/v1`, not a Tier 0 config-only process.
+
 Extends the black-box harness of
 [ADR 0014](./0014-compatibility-and-soak-harness.md) from *does it stay correct
 under load* to *what does it cost to serve*, and gives the bounds of
@@ -105,13 +108,11 @@ contention while still producing an artifact that reads as an envelope. The
 driver holds a process-wide lock across a run, and the heavy invocations pass
 `--test-threads=1`, so the subject under measurement is one replica.
 
-### State tier
+### Store
 
-Tier 0. The harness boots a config-only process — no Redis, no Postgres, no
-control plane — and needs no service container, which is why it can precede
-stateful serving. It qualifies the stateless request path *only*, and it is not
-evidence about stateful serving, revision convergence, or any store-backed
-control. Those need their own profiles once the surfaces exist.
+SQLite WAL. The harness boots a required temp SQLite file and offers load on
+`/ns/{ns}/v1`. It needs no Redis and no service container. It is request-path
+evidence, not HA/Postgres evidence and not the retired tier matrix.
 
 ## Consequences
 

@@ -107,6 +107,9 @@ pub struct UsageRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
     pub namespace: String,
+    /// Opaque namespace attrs copied at admission (ADR 0063).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attrs: Option<serde_json::Value>,
     /// Authenticated caller / gateway-key id.
     pub subject: String,
     /// Configured JWS signer that vouched for the caller; absent for static
@@ -847,6 +850,7 @@ mod tests {
             request_id: identity::next_request_id().to_string(),
             trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
             namespace: "acme".to_string(),
+            attrs: Some(serde_json::json!({"org": "acme", "env": "prod"})),
             subject: "GW_INBOUND_ACME_KEY".to_string(),
             signer_kid: Some("verifier-1".to_string()),
             model: "gpt-4o".to_string(),

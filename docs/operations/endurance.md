@@ -12,11 +12,9 @@ only a long run makes visible:
 - an accounting row that goes missing or arrives twice, which is invisible until
   it is a bill.
 
-This page qualifies the **stateless request path only** — a Tier 0 process with
-no Redis, no Postgres, and no control plane. The same workload offered to a
-fleet with a durable usage sink, while its catalogue, credentials, policy,
-provider, database, and processes change underneath it, is
-[stateful endurance qualification](./stateful-endurance.md).
+This page qualifies the **SQLite request path** on `/ns/{ns}/v1`. The
+stateful-endurance / tier-matrix harness is retired
+([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).
 
 Where it sits in what production qualification has and has not measured — the
 soak tier has not been dispatched — is the
@@ -35,7 +33,7 @@ Every request is a point in four dimensions:
 | Dimension | Values |
 | --- | --- |
 | Tenant | `platform` (operator credentials), `endurance-byok` (its own credentials), `endurance-fallback` (no credentials, `allow_platform_fallback`). |
-| Provider and route | `fake-openai` over `/v1/chat/completions`, `/v1/embeddings`, `/v1/responses`; `fake-anthropic` over `/v1/messages`. |
+| Provider and route | `fake-openai` over `/ns/{ns}/v1/chat/completions`, `/ns/{ns}/v1/embeddings`, `/ns/{ns}/v1/responses`; `fake-anthropic` over `/ns/{ns}/v1/messages`. |
 | Wire | Buffered and streamed, interleaved. |
 | Ending | `complete`, `cancelled` (the caller hangs up mid-answer), `dropped` (the upstream dies mid-stream), `faulted` (the upstream refuses before a byte). |
 

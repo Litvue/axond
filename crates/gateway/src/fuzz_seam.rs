@@ -27,6 +27,7 @@
 mod admin;
 mod admission;
 mod aliases;
+mod api;
 mod availability;
 mod backends;
 mod budget;
@@ -52,6 +53,7 @@ mod routes;
 mod shutdown;
 mod state;
 mod status;
+mod store;
 mod streaming;
 // The layer re-export this module makes for `main.rs` has no consumer here.
 #[allow(unused_imports)]
@@ -828,7 +830,7 @@ pub fn publication_moves_runtime_routes() -> bool {
     });
     let snapshot = ConfigSnapshot::build(config, &seam_env(), 1)
         .expect("the seam's config resolves with one more alias");
-    state.publish(snapshot);
+    state.publish(snapshot).expect("publish");
     routes_of(&state.config()) != before
 }
 

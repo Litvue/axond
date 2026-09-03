@@ -45,7 +45,7 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _config(bind: str, upstream: str) -> str:
+def _config(bind: str, upstream: str, sqlite: str) -> str:
     models = "".join(
         f'[[model]]\nname = "{alias}"\n'
         f'targets = [ {{ provider = "{provider}", model = "{target}", price = {PRICE} }} ]\n\n'
@@ -60,13 +60,16 @@ def _config(bind: str, upstream: str) -> str:
 [server]
 bind = "{bind}"
 
+[storage]
+backend = "sqlite"
+path = "{sqlite}"
+
 [[namespace]]
 id = "{NAMESPACE}"
 default = true
 
-# This namespace exists but the SDK caller's key does not grant it. Keeping it
-# in the black-box fixture lets the SDK lanes prove that an existing namespace
-# and an absent namespace have the same refusal envelope.
+# A second store-backed namespace. ADR 0063 uses one deployment-wide static key;
+# this id is addressable, and a missing id is `unknown_namespace`.
 [[namespace]]
 id = "{UNGRANTED_NAMESPACE}"
 
@@ -106,8 +109,10 @@ def upstream():
 @pytest.fixture(scope="session")
 def gateway(upstream, tmp_path_factory):
     bind = f"127.0.0.1:{_free_port()}"
-    config = tmp_path_factory.mktemp("axond") / "axond.toml"
-    config.write_text(_config(bind, upstream.base_url))
+    workspace = tmp_path_factory.mktemp("axond")
+    config = workspace / "axond.toml"
+    sqlite = str(workspace / "axond.sqlite").replace("\\", "/")
+    config.write_text(_config(bind, upstream.base_url, sqlite))
 
     env = {
         **os.environ,

@@ -47,51 +47,27 @@ ANCHORED_IDENTITY = re.compile(r"^\s*SIGNER_IDENTITY:\s*\^.+\$\s*$")
 # of this list, which is the point.
 KEY_VERIFY_FILES = frozenset({"ops/check-cosign-format.sh"})
 
-# ADR 0062 supersedes these PostgreSQL stateful-v1 qualification lanes. Keeping
-# the list here makes their paused status fail closed: adding an automatic event
-# or dropping one job's dispatch guard is a policy failure, not a review-time
-# convention. The aggregate needs `always()` so it can inspect both source jobs.
+# Kubernetes stateful overlay drills remain behind an explicit opt-in. Request-
+# path qualification (capacity, endurance, provider/transport faults) is SQLite
+# + `/ns/{ns}/v1` and does not use this input. Recovery, rollout, and
+# stateful-endurance qualification jobs were retired with the tier matrix
+# (ADR 0063 / #427).
 LEGACY_POSTGRES_INPUT = "run_legacy_postgres_qualification"
 LEGACY_POSTGRES_GUARD = (
     "${{ github.event_name == 'workflow_dispatch' && "
     "inputs.run_legacy_postgres_qualification == true }}"
 )
-LEGACY_POSTGRES_ALWAYS_GUARD = (
-    "${{ always() && github.event_name == 'workflow_dispatch' && "
-    "inputs.run_legacy_postgres_qualification == true }}"
-)
 LEGACY_POSTGRES_JOBS = {
     ".github/workflows/ci.yml": {
-        "recovery-binary": LEGACY_POSTGRES_GUARD,
-        "stateful-tests": LEGACY_POSTGRES_GUARD,
-        "stateful-endurance-smoke": LEGACY_POSTGRES_GUARD,
-        "restore-drill": LEGACY_POSTGRES_GUARD,
-        "recovery-record": LEGACY_POSTGRES_ALWAYS_GUARD,
         "stateful-deploy-drill": LEGACY_POSTGRES_GUARD,
         "stateful-persistent-drill": LEGACY_POSTGRES_GUARD,
     },
-    ".github/workflows/endurance.yml": {
-        "stateful-endurance": LEGACY_POSTGRES_GUARD,
-    },
-    ".github/workflows/rollout.yml": {
-        "candidate": LEGACY_POSTGRES_GUARD,
-        "rollout": (
-            "${{ github.event_name == 'workflow_dispatch' && "
-            "inputs.run_legacy_postgres_qualification == true && "
-            "needs.candidate.outputs.ready == 'true' }}"
-        ),
-    },
 }
-UNSCHEDULED_LEGACY_WORKFLOWS = frozenset(
-    {".github/workflows/endurance.yml", ".github/workflows/rollout.yml"}
-)
+UNSCHEDULED_LEGACY_WORKFLOWS = frozenset()
 ACTIONS_ENDURANCE_WORKFLOW = ".github/workflows/endurance.yml"
 ACTIONS_ENDURANCE_MAX_JOB_MINUTES = 15
 ACTIONS_ENDURANCE_SMOKE_JOBS = {
     "endurance": "the_endurance_smoke_tier_qualifies_and_publishes_its_evidence",
-    "stateful-endurance": (
-        "the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence"
-    ),
 }
 
 
@@ -374,7 +350,7 @@ def dispatch_block(text: str) -> list[str]:
 
 
 def check_legacy_postgres_qualification(root: Path) -> list[str]:
-    """Keep superseded PostgreSQL qualification manual, explicit, and visible."""
+    """Keep remaining PostgreSQL overlay drills manual, explicit, and visible."""
     failures: list[str] = []
     for relative, expected_jobs in LEGACY_POSTGRES_JOBS.items():
         path = root / relative
@@ -729,52 +705,22 @@ def self_test() -> list[str]:
                 "self-test: a default-on legacy PostgreSQL dispatch was accepted"
             )
 
-        write_legacy_fixtures()
-        endurance = root / ".github/workflows/endurance.yml"
-        endurance.write_text(
-            fixtures[".github/workflows/endurance.yml"].replace(
-                "permissions:\n", "  schedule:\n    - cron: '0 0 * * *'\npermissions:\n"
-            ),
-            encoding="utf-8",
-        )
-        failures = check_legacy_postgres_qualification(root)
-        if not any("must not have a schedule" in failure for failure in failures):
-            problems.append(
-                "self-test: an automatically scheduled legacy PostgreSQL workflow was accepted"
-            )
-
-        write_legacy_fixtures()
-        rollout = root / ".github/workflows/rollout.yml"
-        rollout.write_text(
-            fixtures[".github/workflows/rollout.yml"].replace(
-                LEGACY_POSTGRES_GUARD,
-                "${{ inputs.run_legacy_postgres_qualification == true }}",
-                1,
-            ),
-            encoding="utf-8",
-        )
-        failures = check_legacy_postgres_qualification(root)
-        if not any("explicit-dispatch guard" in failure for failure in failures):
-            problems.append(
-                "self-test: a legacy job without a workflow_dispatch event guard was accepted"
-            )
-
         actions_smoke = (
             "name: Endurance smoke\n"
             "on:\n"
-            + opt_in
-            + "permissions:\n  contents: read\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      note:\n"
+            "        type: string\n"
+            "permissions:\n  contents: read\n"
             "jobs:\n"
             "  endurance:\n"
             "    timeout-minutes: 15\n"
             "    steps:\n"
             "      - run: cargo test the_endurance_smoke_tier_qualifies_and_publishes_its_evidence\n"
-            "  stateful-endurance:\n"
-            f"    if: {LEGACY_POSTGRES_GUARD}\n"
-            "    timeout-minutes: 15\n"
-            "    steps:\n"
-            "      - run: cargo test the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence\n"
         )
+        endurance = root / ".github/workflows/endurance.yml"
+        endurance.parent.mkdir(parents=True, exist_ok=True)
         endurance.write_text(actions_smoke, encoding="utf-8")
         failures = check_actions_endurance_budget(root)
         if failures:

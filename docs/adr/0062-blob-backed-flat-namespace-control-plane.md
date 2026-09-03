@@ -4,16 +4,16 @@ Date: 2026-08-20
 
 ## Status
 
-Accepted; implementation in progress. Typed namespace identity, canonical
-namespace-prefixed inference routes, complete flat namespace desired-state
-resources, deployment-scoped single/set/all workload grants, the
-provider-neutral object-store contract, and authenticated blob publication
-contracts now compile into recoverable serving snapshots. Deployment resources
-carry a signed secret index, static policy compiles without a coordination
-backend, and exact shared caps remain explicit. Runtime convergence, blob-backed
-secret resolution, administrative trust activation, migration, and topology
-qualification remain open; blob-backed serving remains fail-closed until those
-slices land.
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+The blob-backed control plane, grant model, `/namespaces/` spelling, and
+namespace-owned model/alias graph are withdrawn. Namespace as the tenant
+unit and “the path selects the namespace” are absorbed by 0063
+(`/ns/{ns}/v1/...`, SQLite or Postgres `Store`, one static API key).
+This record is retained for history. Do not implement from it.
+
+Previously accepted; implementation in progress.
 
 Supersedes the PostgreSQL-only stateful control plane and the durable
 tenant/project/workload-principal hierarchy selected by

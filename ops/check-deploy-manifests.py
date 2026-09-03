@@ -63,7 +63,6 @@ RECOVERY_DOC = ROOT / "docs/operations/backup-and-recovery.md"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 SCHEMA_SOURCE = ROOT / "crates/gateway/src/backends/control_plane/schema.rs"
 REVOCATION_SOURCE = ROOT / "crates/gateway/src/revocation/redis.rs"
-DRILL = ROOT / "ops/restore-drill.sh"
 ROLLOUT_DRILL = ROOT / "ops/rollout-drill.sh"
 STATEFUL_DRILL = ROOT / "ops/stateful-deploy-drill.sh"
 STATEFUL_PERSISTENT_DRILL = ROOT / "ops/stateful-persistent-drill.sh"
@@ -617,20 +616,38 @@ def check_example_secret(
 
 
 def ci_service_images(workflow: dict[str, Any]) -> dict[str, str]:
-    """The backend images the stateful lane actually runs, keyed by service name."""
-    services = workflow["jobs"]["stateful-tests"]["services"]
-    return {name: service["image"] for name, service in services.items()}
+    """Backend images required CI actually runs, keyed by service name.
+
+    Request-path qualification boots SQLite and does not attach Redis or
+    Postgres. Overlay drills are opt-in and are not this map.
+    """
+    images: dict[str, str] = {}
+    for job in workflow.get("jobs", {}).values():
+        for name, service in (job.get("services") or {}).items():
+            image = service.get("image")
+            if image:
+                images[name] = image
+    return images
+
+
+REQUIRED_CI_IMAGE = re.compile(r"^`([^`]+)`$")
 
 
 def documented_backends(page: str) -> dict[str, tuple[str, str]]:
-    """The supported-version table, as `{backend: (supported column, CI image)}`."""
+    """The supported-version table, as `{backend: (supported column, exercised)}`."""
     rows: dict[str, tuple[str, str]] = {}
     for line in page.splitlines():
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         if len(cells) < 3 or cells[0] not in {"PostgreSQL", "Redis"}:
             continue
-        rows[cells[0]] = (cells[1], cells[2].strip("`"))
+        rows[cells[0]] = (cells[1], cells[2])
     return rows
+
+
+def claimed_required_ci_image(exercised: str) -> str | None:
+    """A backtick-only cell is a required-CI image claim; anything else is not."""
+    match = REQUIRED_CI_IMAGE.fullmatch(exercised.strip())
+    return match.group(1) if match else None
 
 
 def enforced_postgres_floor(source: str) -> int:
@@ -662,9 +679,28 @@ def check_supported_backends(
                 f"docs/deployment/stateful-backends.md: no supported-version row for {backend}"
             )
             continue
-        supported, documented_image = rows[backend]
+        supported, exercised = rows[backend]
         running = images.get(service)
-        if documented_image != running:
+        documented_image = claimed_required_ci_image(exercised)
+        if documented_image is None:
+            marker = exercised.lower()
+            if "not exercised" not in marker and "opt-in" not in marker:
+                failures.append(
+                    f"docs/deployment/stateful-backends.md: {backend} exercised-in-CI cell "
+                    f"{exercised!r} is neither a required-CI image nor an explicit "
+                    "opt-in / not-exercised marker"
+                )
+            elif "not exercised" in marker and running is not None:
+                failures.append(
+                    f"docs/deployment/stateful-backends.md: {backend} is documented as not "
+                    f"exercised, but required CI runs `{running}`"
+                )
+        elif running is None:
+            failures.append(
+                f"docs/deployment/stateful-backends.md: {backend} is documented as exercised on "
+                f"`{documented_image}`, but required CI runs no `{service}` service"
+            )
+        elif documented_image != running:
             failures.append(
                 f"docs/deployment/stateful-backends.md: {backend} is documented as exercised on "
                 f"`{documented_image}`, but CI runs `{running}`"
@@ -719,37 +755,14 @@ def unblocked_lane(jobs: dict[str, Any], lane: str) -> str | None:
     return None
 
 
-def check_recovery_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
-    """The recovery objectives have an executable form, and CI runs it.
-
-    A recovery page is only as good as the last time somebody restored from it, so
-    the drill is required to exist, to be named by the page, to be a required lane
-    rather than an optional one, and to keep asserting the half that a broken
-    point-in-time recovery still passes: that the write after the target is *gone*.
-    """
+def check_recovery_objectives(page: str) -> list[str]:
+    """Operator recovery objectives stay documented after the qualification drill retired."""
     failures: list[str] = []
-    jobs = workflow["jobs"]
-    lane = jobs.get("restore-drill")
-    if lane is None:
-        failures.append(".github/workflows/ci.yml: the restore-drill lane is missing")
-    elif not any("ops/restore-drill.sh" in str(step.get("run", "")) for step in lane["steps"]):
-        failures.append(".github/workflows/ci.yml: the restore-drill lane does not run the drill")
-    elif (reason := unblocked_lane(jobs, "restore-drill")) is not None:
-        failures.append(
-            f".github/workflows/ci.yml: {reason}, so a failed recovery would not block a merge"
-        )
-    for wanted in ("ops/restore-drill.sh", "RPO", "RTO"):
+    for wanted in ("RPO", "RTO"):
         if wanted not in page:
             failures.append(
                 f"docs/operations/backup-and-recovery.md: {wanted} is not documented"
             )
-    # The drill names its checks as evidence identifiers, so the assertion is
-    # `the_write_after_the_target_is_not_replayed` rather than a sentence.
-    if "the_write_after_the_target_is_not_replayed" not in drill:
-        failures.append(
-            "ops/restore-drill.sh: the assertion that the post-target write is absent is gone; "
-            "without it a recovery that replayed the whole WAL passes the drill"
-        )
     return failures
 
 
@@ -1835,13 +1848,28 @@ def self_test() -> int:
     floor = enforced_postgres_floor(SCHEMA_SOURCE.read_text(encoding="utf-8"))
     revocation = REVOCATION_SOURCE.read_text(encoding="utf-8")
     recovery = RECOVERY_DOC.read_text(encoding="utf-8")
-    drill = DRILL.read_text(encoding="utf-8")
 
     if check_supported_backends(backends, images, floor, revocation):
         failures.append("self-test: the committed support window must pass the gate")
+    required_redis = backends.replace(
+        "| Redis | 6.2, 7.x, 8.x | not exercised (ADR 0063) |",
+        "| Redis | 6.2, 7.x, 8.x | `redis:7.4.2-alpine` |",
+    )
+    expect_failure(
+        "required-CI image with no CI service",
+        check_supported_backends(required_redis, images, floor, revocation),
+    )
     expect_failure(
         "backend image drift",
-        check_supported_backends(backends, {**images, "postgres": "postgres:13-alpine"}, floor, revocation),
+        check_supported_backends(
+            required_redis, {**images, "redis": "redis:6.0-alpine"}, floor, revocation
+        ),
+    )
+    expect_failure(
+        "not-exercised backend that CI still runs",
+        check_supported_backends(
+            backends, {**images, "redis": "redis:7.4.2-alpine"}, floor, revocation
+        ),
     )
     expect_failure(
         "documented floor below what the gateway accepts",
@@ -1868,28 +1896,11 @@ def self_test() -> int:
         ),
     )
 
-    if check_recovery_drill(workflow, recovery, drill):
-        failures.append("self-test: the committed drill wiring must pass the gate")
-    unrequired = copy.deepcopy(workflow)
-    unrequired["jobs"]["CI-Success"]["needs"].remove("restore-drill")
-    expect_failure("optional drill lane", check_recovery_drill(unrequired, recovery, drill))
-    unasserted = copy.deepcopy(workflow)
-    for step in unasserted["jobs"]["CI-Success"]["steps"]:
-        if "run" in step:
-            step["run"] = re.sub(
-                r"^.*needs\.restore-drill\.result.*$", "", step["run"], flags=re.MULTILINE
-            )
+    if check_recovery_objectives(recovery):
+        failures.append("self-test: the committed recovery objectives must pass the gate")
     expect_failure(
-        "a needed lane CI-Success never asserts",
-        check_recovery_drill(unasserted, recovery, drill),
-    )
-    expect_failure(
-        "drill without its asymmetric assertion",
-        check_recovery_drill(
-            workflow,
-            recovery,
-            drill.replace("the_write_after_the_target_is_not_replayed", "a_write"),
-        ),
+        "recovery page without RPO",
+        check_recovery_objectives(recovery.replace("RPO", "recovery-point")),
     )
 
     kubernetes_page = KUBERNETES_DOC.read_text(encoding="utf-8")
@@ -2026,11 +2037,7 @@ def main(argv: list[str]) -> int:
             enforced_postgres_floor(SCHEMA_SOURCE.read_text(encoding="utf-8")),
             REVOCATION_SOURCE.read_text(encoding="utf-8"),
         ),
-        *check_recovery_drill(
-            yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
-            RECOVERY_DOC.read_text(encoding="utf-8"),
-            DRILL.read_text(encoding="utf-8"),
-        ),
+        *check_recovery_objectives(RECOVERY_DOC.read_text(encoding="utf-8")),
         *check_rollout_drill(
             yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
             KUBERNETES_DOC.read_text(encoding="utf-8"),

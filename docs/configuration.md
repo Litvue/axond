@@ -297,6 +297,22 @@ recovery path.
 | --- | --- | --- | --- |
 | `bind` | socket address | `0.0.0.0:8080` | Listening address. Changing it needs a restart; a reload warns and ignores it. |
 
+## `[storage]` — required (ADR 0063)
+
+The durable namespace store. Boot refuses a config without this section. A
+reload that changes `backend`, `path`, or `dsn_env` is reported and ignored
+until restart — the live `Store` is opened once.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `backend` | `sqlite` \| `postgres` | `sqlite` | SQLite WAL for a single replica; Postgres for HA. |
+| `path` | string | — | SQLite file path. Required for `sqlite`. `:memory:` is refused by `Config::load`. |
+| `dsn_env` | env-var name | — | Postgres DSN environment variable. Required for `postgres`. The DSN's `sslmode` selects TLS. |
+| `create_table` | bool | `true` | Apply namespace DDL at connect. Postgres deployments that migrate out of band set `false`. |
+| `on_unavailable` | `deny` \| `allow` | `deny` | Budget/store outage stance used by later slices. |
+
+SQLite rejects a set `dsn_env`; Postgres rejects a set `path`.
+
 ## `[shutdown]` — Tier 0
 
 Bounds on the `SIGTERM`/`SIGINT` sequence

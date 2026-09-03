@@ -35,6 +35,16 @@ resources:
 images:
   - name: ghcr.io/litvue/axond
     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+# Replace the base's single-replica SQLite store with the shared Postgres DSN
+# this three-replica fleet needs (ADR 0063).
+configMapGenerator:
+  - name: axond-config
+    namespace: axond
+    behavior: replace
+    files:
+      - axond.toml
+generatorOptions:
+  disableNameSuffixHash: true
 patches:
   - path: deployment.yaml
   # The base's published placeholder Secret is not part of the production

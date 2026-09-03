@@ -4,7 +4,14 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+Runtime policy activation, generations, and hold protection of
+`axond.policy.v1` documents are withdrawn. This record is retained for
+history. Do not implement from it.
+
+Accepted historically.
 
 Activates the documents typed by
 [ADR 0036](./0036-typed-policy-documents-generations-and-transitions.md), on the

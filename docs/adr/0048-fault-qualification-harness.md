@@ -6,6 +6,11 @@ Date: 2026-08-13
 
 Accepted
 
+Amended by [ADR 0063](./0063-stateful-only-namespaced-gateway.md): provider and
+transport rows run on SQLite + `/ns/{ns}/v1`. Redis budget and rate-limit rows
+skip because those backends are withdrawn, not because of a missing
+tier-matrix service.
+
 Third harness in the qualification programme of axond #156, after the capacity
 harness of [ADR 0033](./0033-capacity-qualification-harness.md) (*what does it
 cost to serve*) and the recovery contract of
@@ -103,19 +108,12 @@ suite skips it with a message saying why. `--test-threads=1` alone would not do:
 the workspace suite runs other binaries concurrently, which is exactly the
 contention these rows cannot tolerate.
 
-### State tier
+### Store
 
-Tier 0 for the harness, Tier 1 and Tier 2 for the rows that need them. The 14
-provider and transport rows are config-only and run with no datastore. The four
-Redis rows need Tier 1 and the four Postgres rows need Tier 2; without
-`AXOND_TEST_REDIS_URL` or `AXOND_TEST_POSTGRES_DSN` those rows are reported as
-skipped, and `AXOND_TEST_REQUIRE_SERVICES=1` — which the stateful CI lane sets —
-turns a skip into a failure so the lane cannot go green on eight rows it never
-ran. Each Postgres row keeps its spend in a run-scoped table it drops afterwards,
-and each Redis row under a run-scoped key prefix, so two harnesses against one
-datastore do not read each other's state. This raises no deployment's tier: the
-harness ships no gateway code, and the fail-open and fail-closed behaviour it
-qualifies is the configured behaviour ADR 0027 already defines.
+Provider and transport rows boot SQLite and hit `/ns/{ns}/v1`. Redis budget and
+rate-limit rows always skip: those backends are withdrawn (ADR 0063), and the
+skip reason is that withdrawal. Postgres HA rows skip unless
+`AXOND_TEST_POSTGRES_DSN` is set. Required CI does not need Redis.
 
 ## Consequences
 

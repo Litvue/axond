@@ -124,6 +124,8 @@ pub struct InboundKey {
     pub can_mint: bool,
     pub jti: Option<String>,
     pub namespace_grant: Option<NamespaceGrant>,
+    /// Opaque namespace attrs copied at namespaced admission (ADR 0063).
+    pub attrs: Option<serde_json::Value>,
 }
 
 impl InboundKey {
@@ -737,6 +739,7 @@ impl PrincipalStore for TokenVerifier {
             // the namespaced route parses and intersects this label, while
             // legacy v1 routes continue to accept the token exactly as minted.
             namespace_grant: None,
+            attrs: None,
         }))
     }
 }
@@ -795,6 +798,7 @@ impl ProjectedPrincipals {
                         can_mint: false,
                         jti: None,
                         namespace_grant: principal.grant,
+                        attrs: None,
                     },
                 )
             })
@@ -1066,6 +1070,7 @@ mod tests {
                 can_mint: false,
                 jti: None,
                 namespace_grant: None,
+                attrs: None,
             },
         }]))
     }
@@ -1414,10 +1419,17 @@ max_ttl = "15m"
                 .expect("principal");
             assert_eq!(principal.namespace, namespace);
             assert!(principal.namespace_grant.is_none());
-            assert!(
-                principal.namespace_grant().is_err(),
-                "only the canonical namespaced route rejects the legacy label"
-            );
+            if namespace.contains('/') {
+                assert!(
+                    principal.namespace_grant().is_err(),
+                    "slash labels are not a NamespaceId; namespaced routes refuse them"
+                );
+            } else {
+                assert!(
+                    principal.namespace_grant().is_ok(),
+                    "a one-segment namespace id is a NamespaceGrant"
+                );
+            }
         }
     }
 

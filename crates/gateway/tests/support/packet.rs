@@ -8,8 +8,8 @@
 //! and the retained records the slice actually names, so a slice cannot say
 //! `evidenced` while retaining nothing.
 //!
-//! Modelled on [`super::recovery`], for the same reason: a claim about
-//! qualification is only worth as much as the file that can contradict it.
+//! A claim about qualification is only worth as much as the file that can
+//! contradict it.
 
 use std::path::PathBuf;
 
@@ -24,14 +24,14 @@ pub const MANIFEST_RELATIVE: &str = "qualification/packet.toml";
 pub const CONTRACT_RELATIVE: &str = "docs/operations/qualification.md";
 
 /// The schema this loader understands. Schema 2 adds the release-candidate
-/// cohort that all six heavy records must share before closure.
+/// cohort that the remaining request-path heavy records must share before
+/// closure. Recovery, rollout, and stateful-endurance slices were retired with
+/// the tier matrix (ADR 0063 / #427).
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const GENERIC_RECORD_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_RECORD_SCHEMA_VERSION: u32 = 2;
-pub const ROLLOUT_RECORD_SCHEMA_VERSION: u32 = 4;
 
 pub const QUALIFICATION_CANDIDATE_VERSION: &str = "0.4.0";
-pub const ROLLOUT_PREVIOUS_VERSION: &str = "0.3.40";
 pub const PENDING_SOURCE_COMMIT: &str = "pending";
 
 /// The epic the packet reports on.
@@ -56,7 +56,7 @@ impl Packet {
     }
 }
 
-/// The immutable candidate identity shared by the six release-qualification
+/// The immutable candidate identity shared by the remaining request-path
 /// slices. While no candidate is frozen, `source_commit` is explicitly
 /// `pending`; a closed packet requires an exact hexadecimal Git object id.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -98,10 +98,10 @@ pub struct Slice {
     #[serde(default)]
     pub heavy_lane: Option<String>,
     /// What the slice's own manifest calls its evidencing tier — `heavy` for
-    /// capacity/rollout, `smoke` for endurance/stateful endurance, and
-    /// `serving` for recovery. The 12-hour soak is a scheduled observational
-    /// lane, not this field. A record from any other tier is not the ship
-    /// gate, so the rung above `harnessed` is defined against this name.
+    /// capacity, `smoke` for endurance, and `full` for fault. The 12-hour soak
+    /// is a scheduled observational lane, not this field. A record from any
+    /// other tier is not the ship gate, so the rung above `harnessed` is
+    /// defined against this name.
     #[serde(default)]
     pub heavy_tier: Option<String>,
     /// Retained runs, as committed evidence records.
@@ -167,38 +167,25 @@ impl Status {
     }
 }
 
-/// The slices #156 decomposes into. One variant each, so a slice cannot be
-/// dropped from the packet without the contract test noticing.
+/// The request-path slices that remain after ADR 0063 retired the tier matrix.
+/// One variant each, so a slice cannot be dropped from the packet without the
+/// contract test noticing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SliceId {
     Capacity,
     Endurance,
-    #[serde(rename = "stateful-endurance")]
-    StatefulEndurance,
-    Recovery,
     Fault,
-    Rollout,
 }
 
 impl SliceId {
-    pub const ALL: [Self; 6] = [
-        Self::Capacity,
-        Self::Endurance,
-        Self::StatefulEndurance,
-        Self::Recovery,
-        Self::Fault,
-        Self::Rollout,
-    ];
+    pub const ALL: [Self; 3] = [Self::Capacity, Self::Endurance, Self::Fault];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Capacity => "capacity",
             Self::Endurance => "endurance",
-            Self::StatefulEndurance => "stateful-endurance",
-            Self::Recovery => "recovery",
             Self::Fault => "fault",
-            Self::Rollout => "rollout",
         }
     }
 }
@@ -216,28 +203,21 @@ pub enum Scenario {
     ResponseSizes,
     /// Provider 429 and 5xx, DNS/TLS/connect stalls, truncation, idle streams.
     ProviderFaults,
-    /// Redis and Postgres latency, outage, recovery, and fail-open/fail-closed.
+    /// Store latency, outage, recovery, and fail-open/fail-closed. Redis budget
+    /// and rate-limit rows are skipped (ADR 0063); Postgres HA rows skip unless
+    /// a DSN is supplied.
     BackendOutage,
-    /// Control-plane outage and revision convergence.
-    ControlPlaneOutage,
-    /// SIGTERM during buffered and streaming traffic.
-    SigtermDrain,
-    /// Rolling patch upgrades and rollback.
-    RollingUpgrade,
     /// The 12–24 hour sustained mixed-workload soak.
     LongSoak,
 }
 
 impl Scenario {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 6] = [
         Self::ThroughputAndLatency,
         Self::MixedWorkload,
         Self::ResponseSizes,
         Self::ProviderFaults,
         Self::BackendOutage,
-        Self::ControlPlaneOutage,
-        Self::SigtermDrain,
-        Self::RollingUpgrade,
         Self::LongSoak,
     ];
 
@@ -248,9 +228,6 @@ impl Scenario {
             Self::ResponseSizes => "response_sizes",
             Self::ProviderFaults => "provider_faults",
             Self::BackendOutage => "backend_outage",
-            Self::ControlPlaneOutage => "control_plane_outage",
-            Self::SigtermDrain => "sigterm_drain",
-            Self::RollingUpgrade => "rolling_upgrade",
             Self::LongSoak => "long_soak",
         }
     }
@@ -658,7 +635,6 @@ pub fn load_record(relative: &str) -> Record {
         .unwrap_or_else(|e| panic!("{} is not a valid evidence record: {e}", path.display()));
     let expected = match record.slice_id {
         SliceId::Capacity => CAPACITY_RECORD_SCHEMA_VERSION,
-        SliceId::Rollout => ROLLOUT_RECORD_SCHEMA_VERSION,
         _ => GENERIC_RECORD_SCHEMA_VERSION,
     };
     assert_eq!(

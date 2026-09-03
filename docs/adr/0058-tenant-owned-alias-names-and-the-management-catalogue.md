@@ -4,7 +4,14 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted, partially superseded by
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+Tenant-owned alias names and `GET /admin/v1/catalogue` are withdrawn.
+Namespaces are API resources; inference is `/ns/{ns}/v1/...`. This
+record is retained for history. Do not implement from it.
+
+Previously accepted, and previously partially superseded by
 [ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
 
 Alias-name isolation and the distinction between serving and management views

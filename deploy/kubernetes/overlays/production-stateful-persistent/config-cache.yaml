@@ -13,6 +13,10 @@ data:
     [server]
     bind = "0.0.0.0:8080"
 
+    [storage]
+    backend = "postgres"
+    dsn_env = "GW_CONTROL_PLANE_DSN"
+
     [convergence]
     cache_path = "/var/lib/axond/last-known-good.snapshot"
     cache_key_env = "GW_LAST_KNOWN_GOOD_KEY"

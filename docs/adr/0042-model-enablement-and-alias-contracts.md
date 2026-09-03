@@ -4,7 +4,14 @@ Date: 2026-08-13
 
 ## Status
 
-Accepted, partially superseded by
+Superseded by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
+Model enablements, ordered aliases, and catalogue pins are withdrawn.
+Routing is `provider-id/model-id`; models are not configured. This
+record is retained for history. Do not implement from it.
+
+Previously accepted, and previously partially superseded by
 [ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md).
 
 Pinned offering identity, ordered aliases, wire-family validation, and atomic

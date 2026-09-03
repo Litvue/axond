@@ -236,7 +236,7 @@ Useful focused checks:
 ```bash
 just quickstart-smoke  # build current source and exercise the Compose path
 just compat            # OpenAI and Anthropic SDKs against a real local axond
-just tier0              # prove config-only boot in a network-denied namespace
+just tier0              # prove a temp SQLite file boots and serves /ns/{ns}/v1
 just soak               # long streaming soak, also available on demand in CI
 ```
 
