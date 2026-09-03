@@ -31,6 +31,10 @@ const EMPTY_BACKOFF_CAP: Duration = Duration::from_secs(30);
 pub async fn run(state: AppState, mut stop: oneshot::Receiver<()>) {
     let mut empty_backoff = EMPTY_BACKOFF_START;
     let mut waiting_for_providers = true;
+    // First completed round may stale+replace a foreign cache row so a
+    // `base_url` change lands. Later rounds skip a fresh foreign row so a
+    // lagged replica cannot mark it stale and CAS-put the old listing.
+    let mut first_round = true;
     loop {
         let providers = state.config().config.provider.len();
         if waiting_for_providers && providers == 0 {
@@ -46,13 +50,13 @@ pub async fn run(state: AppState, mut stop: oneshot::Receiver<()>) {
             continue;
         }
         waiting_for_providers = false;
-        match refresh_all(&state, &mut stop).await {
+        match refresh_all(&state, &mut stop, first_round).await {
             Round::Stopped => {
                 tracing::debug!("provider model discovery stopped");
                 return;
             }
             Round::Restart => continue,
-            Round::Done => {}
+            Round::Done => first_round = false,
         }
         let interval = state.config().config.discovery.interval();
         tokio::select! {
@@ -79,7 +83,11 @@ enum RefreshError {
     SnapshotChanged,
 }
 
-async fn refresh_all(state: &AppState, stop: &mut oneshot::Receiver<()>) -> Round {
+async fn refresh_all(
+    state: &AppState,
+    stop: &mut oneshot::Receiver<()>,
+    allow_replace: bool,
+) -> Round {
     let snapshot = state.config();
     let providers: Vec<(String, ProviderKind, String)> = snapshot
         .config
@@ -97,7 +105,9 @@ async fn refresh_all(state: &AppState, stop: &mut oneshot::Receiver<()>) -> Roun
         if stopped(stop) {
             return Round::Stopped;
         }
-        if let Err(error) = refresh_one(state, &snapshot, id, *kind, base_url, stop).await {
+        if let Err(error) =
+            refresh_one(state, &snapshot, id, *kind, base_url, allow_replace, stop).await
+        {
             match error {
                 RefreshError::Stopped => return Round::Stopped,
                 RefreshError::SnapshotChanged => return Round::Restart,
@@ -121,12 +131,17 @@ async fn refresh_one(
     provider_id: &str,
     kind: ProviderKind,
     base_url: &str,
+    allow_replace: bool,
     stop: &mut oneshot::Receiver<()>,
 ) -> Result<(), RefreshError> {
     if stopped(stop) {
         return Err(RefreshError::Stopped);
     }
-    stale_if_source_changed(state, provider_id, base_url).await;
+    if allow_replace {
+        stale_if_source_changed(state, provider_id, base_url).await;
+    } else if skip_fresh_foreign(state, provider_id, base_url).await {
+        return Ok(());
+    }
 
     let leases = snapshot
         .credentials
@@ -249,6 +264,36 @@ async fn stale_if_source_changed(state: &AppState, provider: &str, base_url: &st
             "could not persist stale provider model cache"
         );
     }
+}
+
+/// Later rounds: a fresh row for another URL is someone else's successful
+/// listing. Do not mark it stale (that would open the put CAS) and do not
+/// fetch. A GET error falls through so put's source CAS still decides.
+async fn skip_fresh_foreign(state: &AppState, provider: &str, base_url: &str) -> bool {
+    let Some(store) = state.store() else {
+        return false;
+    };
+    match store.get_provider_models(provider).await {
+        Ok(existing) => is_fresh_foreign(existing.as_ref(), base_url),
+        Err(error) => {
+            tracing::warn!(
+                provider,
+                error = %error,
+                "could not read provider model cache before refresh"
+            );
+            false
+        }
+    }
+}
+
+fn is_fresh_foreign(existing: Option<&ProviderModels>, my_source: &str) -> bool {
+    existing.is_some_and(|row| {
+        !row.stale
+            && row
+                .source
+                .as_deref()
+                .is_some_and(|source| source != my_source)
+    })
 }
 
 async fn mark_stale(state: &AppState, provider: &str, source: &str) {
@@ -430,6 +475,35 @@ mod tests {
             models_path(Some("claude-3 opus")),
             "/models?after_id=claude-3%20opus"
         );
+    }
+
+    #[test]
+    fn later_round_skips_a_fresh_foreign_source() {
+        let fresh = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("t".into()),
+            stale: false,
+            data: vec![json!({"id": "gpt-4o"})],
+            source: Some("https://new.example/v1".into()),
+        };
+        assert!(is_fresh_foreign(Some(&fresh), "https://old.example/v1"));
+        assert!(
+            !is_fresh_foreign(Some(&fresh), "https://new.example/v1"),
+            "same source still refreshes"
+        );
+        let mut stale = fresh.clone();
+        stale.stale = true;
+        assert!(
+            !is_fresh_foreign(Some(&stale), "https://old.example/v1"),
+            "stale foreign may be replaced after a URL change"
+        );
+        assert!(!is_fresh_foreign(None, "https://old.example/v1"));
+        let mut missing_source = fresh.clone();
+        missing_source.source = None;
+        assert!(!is_fresh_foreign(
+            Some(&missing_source),
+            "https://old.example/v1"
+        ));
     }
 
     #[test]

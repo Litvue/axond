@@ -1707,4 +1707,40 @@ mod tests {
             .expect("row");
         assert_eq!(got, neu);
     }
+
+    #[tokio::test]
+    async fn provider_models_mark_unless_then_put_replaces_fresh_foreign() {
+        // Store hole discovery must not hit on later rounds: marking a
+        // foreign row stale opens the put CAS for an old URL.
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let neu = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(neu.clone()).await.expect("new");
+        store
+            .mark_provider_models_stale_unless_source("openai", "https://api.openai.com/v1")
+            .await
+            .expect("mark");
+        let old = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:02:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "old", "object": "model"})],
+            source: Some("https://api.openai.com/v1".into()),
+        };
+        store
+            .put_provider_models(old.clone())
+            .await
+            .expect("old put");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, old);
+    }
 }
