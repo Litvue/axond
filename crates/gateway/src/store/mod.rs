@@ -278,8 +278,9 @@ pub trait Store: Send + Sync {
     /// Insert or replace one provider's cached listing.
     ///
     /// A write for a different `source` applies only when the existing row is
-    /// missing or `stale`. A lagged replica still on the old URL cannot replace
-    /// a fresh listing published for a new URL.
+    /// missing or `stale`. Discovery may mark a foreign row stale only on the
+    /// first round (URL change / cold start). Later rounds skip a fresh
+    /// foreign row so a lagged replica cannot open this CAS.
     async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
         let _ = row;
         Ok(())
