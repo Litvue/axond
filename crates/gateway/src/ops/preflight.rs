@@ -782,10 +782,10 @@ env = "GW_BREAKGLASS"
         );
     }
 
-    /// A selected store's reference is checked wherever the boot resolves it: a
-    /// Redis limiter and denylist may omit their own and read the Redis budget's,
-    /// and one that names nothing at all is a failure rather than a check that
-    /// silently does not happen.
+    /// A selected store's reference is checked wherever the boot resolves it.
+    /// Redis limiter and denylist name their own `dsn_env` (`[budget] backend`
+    /// is withdrawn, ADR 0063); one that names nothing at all is a failure
+    /// rather than a check that silently does not happen.
     #[tokio::test]
     async fn a_selected_store_is_checked_by_the_name_its_boot_resolves() {
         let toml = "[[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n\
@@ -793,19 +793,17 @@ env = "GW_BREAKGLASS"
              [[namespace]]\nid = \"platform\"\ndefault = true\n\
              [[provider]]\nid = \"openai\"\nkind = \"openai\"\n\
              base_url = \"https://api.openai.com/v1\"\n\
-             [budget]\nbackend = \"redis\"\nlimit_microdollars = 1\ndsn_env = \"GW_REDIS\"\n\
-             [rate_limit]\nbackend = \"redis\"\n\
-             [revocation]\nbackend = \"redis\"\n";
+             [rate_limit]\nbackend = \"redis\"\ndsn_env = \"GW_REDIS\"\n\
+             [revocation]\nbackend = \"redis\"\ndsn_env = \"GW_REDIS\"\n";
         let path = write("axond.toml", toml);
         let mut config = Config::from_toml_str(toml).expect("valid config");
         let env = HashMap::from([("GW_KEY".to_owned(), "secret".to_owned())]);
 
-        // The limiter and the denylist name nothing of their own, so the budget's
-        // reference is the one whose absence fails their boot.
+        // Each selected store is checked by the name it reads, not silently skipped.
         let rendered = run(&config, &path, &env).await.to_string();
         assert!(
-            rendered.matches("GW_REDIS").count() >= 3,
-            "each inheriting store is checked by the name it reads: {rendered}"
+            rendered.matches("GW_REDIS").count() >= 2,
+            "each selected store is checked by the name it reads: {rendered}"
         );
 
         // And a selected backend with no reference anywhere is named as such
