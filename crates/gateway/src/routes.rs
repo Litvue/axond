@@ -115,11 +115,19 @@ pub fn router(state: AppState) -> Router {
 /// with the inference surface it happens to be declared next to.
 #[allow(dead_code)]
 pub fn diagnostic_router(state: AppState) -> Router {
-    let specs = route_specs(state.config().gateway_minting.is_some())
-        .into_iter()
-        .filter(|spec| spec.auth == AuthPosture::Diagnostic)
-        .collect();
-    mount(specs, state, RouteAuthority::Global)
+    // Not in production `route_specs` (ADR 0063). Tests of the withdrawn
+    // diagnostic still compose this helper.
+    mount(
+        vec![RouteSpec {
+            path: "/admin/v1/status",
+            namespace_scoped: false,
+            auth: AuthPosture::Diagnostic,
+            capability: Some(Capability::Status),
+            router: || get(replica_status),
+        }],
+        state,
+        RouteAuthority::Global,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -313,13 +321,6 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Credentials),
             router: || get(list_credentials),
-        },
-        RouteSpec {
-            path: "/admin/v1/status",
-            namespace_scoped: false,
-            auth: AuthPosture::Diagnostic,
-            capability: Some(Capability::Status),
-            router: || get(replica_status),
         },
         RouteSpec {
             path: "/v1/chat/completions",
@@ -741,6 +742,7 @@ async fn convergence_middleware(
 /// authenticated: an orchestrator polling `/readyz` must never learn that the
 /// budget store is down, because removing healthy replicas from service is how a
 /// dependency outage becomes a fleet outage.
+///
 async fn replica_status(
     State(state): State<AppState>,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
@@ -3863,7 +3865,7 @@ output_microdollars_per_million = 10000000
         // This test changes only the process authority after parsing so it can
         // exercise the route graph of a compiled stateful serving snapshot;
         // convergence tests own the separate bootstrap/projection validation.
-        config.mode = crate::config::Mode::Stateful;
+        config.mode = Some(crate::config::Mode::Stateful);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
         AppState::new_with_observability(
             config,
@@ -11890,6 +11892,36 @@ output_microdollars_per_million = 1000000
         assert_eq!(records[1].attempts, 1);
     }
 
+    #[tokio::test]
+    async fn admin_v1_is_unmounted() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+            catalogue: None,
+        });
+        let app = router(state);
+        for path in ["/admin/v1/status", "/admin/v1/tenants"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header(
+                            axum::http::header::AUTHORIZATION,
+                            format!("Bearer {OPERATOR_KEY}"),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be served (ADR 0063)"
+            );
+        }
+    }
+
     // ----------------------------------------------------------------
     // `/admin/v1/status`: authorization, redaction, and revision visibility.
     //
@@ -11900,9 +11932,8 @@ output_microdollars_per_million = 1000000
     // sees its own request path with coarsened reasons, and no scope sees a
     // secret, a DSN, a raw backend error, or a revision id.
 
-    /// The status deployment: an operator's scope-less key in the default
-    /// namespace, a tenant's key in another namespace, and a verifier for minted
-    /// tokens.
+    /// The status deployment: one deployment-wide static key (ADR 0063), plus a
+    /// leftover verifier fixture for ignored minted-token tests.
     const STATUS_CONFIG: &str = r#"
 [[namespace]]
 id = "platform"
@@ -11914,10 +11945,6 @@ id = "tenant"
 [[gateway_key]]
 env = "AXOND_OPERATOR_KEY"
 namespace = "platform"
-
-[[gateway_key]]
-env = "AXOND_TENANT_KEY"
-namespace = "tenant"
 
 [gateway_token]
 audience = "test-audience"
@@ -12036,7 +12063,7 @@ max_ttl = "15m"
                 format!("Bearer {credential}"),
             );
         }
-        let response = router(state)
+        let response = diagnostic_router(state)
             .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -12061,6 +12088,7 @@ max_ttl = "15m"
     /// unauthenticated poller gets `401` and no component list, because "which of
     /// the operator's backends is down" is reconnaissance.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn status_refuses_an_unauthenticated_caller() {
         let (status, body) = status_response(
             status_state(ReplicaObservability {
@@ -12096,6 +12124,7 @@ max_ttl = "15m"
     /// namespace — is what deployment scope is derived from, never a request
     /// parameter.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn status_gives_the_operator_the_deployment_view() {
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
@@ -12127,6 +12156,7 @@ max_ttl = "15m"
     /// upstream is contacted for it, and a tenant-scoped caller learns nothing
     /// about the deployment's metadata source (#146).
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn status_reports_catalogue_freshness_to_the_operator_only() {
         let handle = crate::backends::catalog_runtime::start(
             &crate::config::CatalogConfig {
@@ -12190,6 +12220,7 @@ max_ttl = "15m"
     /// and the reasons behind them coarsened: it learns *that* a dependency is
     /// impaired, not that the operator's control-plane credential was rejected.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn status_gives_a_tenant_only_its_own_request_path() {
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
@@ -12271,6 +12302,7 @@ max_ttl = "15m"
     /// against fields: a probe published a DSN, a password, and a backend error,
     /// and none of it appears in either scope's response.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn status_never_serializes_a_secret_a_dsn_or_a_backend_error() {
         for credential in [OPERATOR_KEY, TENANT_KEY] {
             let state = status_state(ReplicaObservability {
@@ -12306,6 +12338,7 @@ max_ttl = "15m"
     /// property the metric labels depend on: every component name, state, and
     /// reason in it comes from a closed vocabulary the catalogue also names.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn status_reports_only_bounded_vocabulary_values() {
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
@@ -12444,6 +12477,7 @@ max_ttl = "15m"
     /// outside admission, and takes no in-flight slot the shutdown deadline
     /// would then wait on.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn status_still_answers_once_admission_has_closed() {
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
@@ -12753,6 +12787,7 @@ max_ttl = "15m"
     /// state, so it must survive the merge in either mode while every
     /// administrative path keeps answering `stateful_mode_required`.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn the_status_diagnostic_survives_the_administrative_merge() {
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
@@ -12801,6 +12836,7 @@ max_ttl = "15m"
     /// Both deployment postures, because both nest the prefix and both would
     /// otherwise answer this one path differently from every other one under it.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn a_wrong_method_on_the_status_path_is_still_a_declared_refusal() {
         for (posture, surface) in [
             ("stateless", crate::admin::router::refusing_router()),
@@ -12864,6 +12900,7 @@ max_ttl = "15m"
     /// once it has been published, an inference request must not consult the
     /// durable control plane that administration continues to read.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn inference_reads_zero_control_plane_state_on_the_main_route_graph() {
         const ADMIN_TOKEN: &str = "stateful-admin-token";
 
@@ -12952,6 +12989,7 @@ max_ttl = "15m"
     /// so the diagnostic is mounted beside the refusal — without the refusal's
     /// fallback swallowing it, and while every other path still refuses.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn the_status_diagnostic_answers_on_a_replica_that_refuses_inference() {
         let state = status_state(ReplicaObservability {
             status: observed_registry(),
@@ -13042,6 +13080,7 @@ max_ttl = "15m"
     /// and never probes, so a dependency outage cannot be turned into a status
     /// outage — or into load on a struggling backend — by polling this route.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn status_reads_the_cache_without_probing() {
         let registry = observed_registry();
         let probe = Arc::new(CountingProbe {
@@ -13143,6 +13182,7 @@ max_ttl = "15m"
     /// an operator (or the shipped `AxondFleetRevisionSplit` rule) makes across
     /// replicas, not a claim any one replica makes.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn two_replicas_report_their_own_revision_lag() {
         let converged = status_state(ReplicaObservability {
             status: observed_registry(),
@@ -13181,6 +13221,7 @@ max_ttl = "15m"
     /// convergence is the operator's business, and `lag_ms` plus a generation is
     /// enough to fingerprint a rollout.
     #[tokio::test]
+    #[ignore = "ADR 0063: /admin/v1 unmounted"]
     async fn a_tenant_sees_no_revision_summary_however_far_behind_the_replica_is() {
         let (_clock, lagging_status) = lagging_replica();
         let state = status_state(ReplicaObservability {

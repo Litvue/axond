@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use crate::config::{Config, Mode};
+use crate::config::Config;
 use crate::desired_state::policy::{PolicyBody, PolicyGeneration, PolicyScope};
 
 /// What a scope may spend, and how long an unsettled hold survives.
@@ -167,7 +167,7 @@ impl PolicyView {
     /// describe before any document exists, not something a publication
     /// introduces.
     pub fn of(config: &Config) -> Self {
-        let stateful = config.mode == Mode::Stateful;
+        let stateful = config.is_stateful();
         let bootstrap = ActivePolicy::bootstrap(config);
         let mut by_namespace = BTreeMap::new();
         let projected_namespaces = config

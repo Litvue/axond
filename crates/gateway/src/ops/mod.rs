@@ -52,7 +52,7 @@ use std::collections::HashMap;
 
 use crate::backends::control_plane::ControlPlaneError;
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
-use crate::config::{Config, Mode};
+use crate::config::Config;
 
 /// Why an operator command could not do what was asked.
 ///
@@ -114,9 +114,10 @@ pub(crate) const CONTROL_PLANE: &str = "control plane";
 /// section in that mode; this is the second half of the same rule, stated where
 /// the connection would otherwise be made.
 pub(crate) fn control_plane(config: &Config) -> Option<&crate::config::ControlPlane> {
-    match config.mode {
-        Mode::Stateless => None,
-        Mode::Stateful => config.control_plane.as_ref(),
+    if config.is_stateful() {
+        config.control_plane.as_ref()
+    } else {
+        None
     }
 }
 

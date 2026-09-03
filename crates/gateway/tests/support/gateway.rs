@@ -22,10 +22,7 @@ use super::upstream::target;
 /// The inbound gateway key every test authenticates with. A fixture value, not
 /// a secret: the fake upstream is the only thing it can reach.
 pub const GATEWAY_KEY: &str = "test-inbound-key";
-/// The environment variable carrying a boot's private inbound key. Its value is
-/// unique per boot, which is what lets a readiness probe tell this child apart
-/// from a sibling test process serving the same loopback port.
-pub const BOOT_KEY_ENV: &str = "GW_BOOT_KEY";
+
 /// Upstream credentials the gateway is expected to inject, asserted on the
 /// fake upstream's recorded requests.
 pub const OPENAI_KEY: &str = "test-upstream-openai-key";
@@ -306,9 +303,9 @@ impl<'a> Options<'a> {
 
 pub struct Axond {
     pub base_url: String,
-    /// This boot's private inbound key: no other process has it, so a route that
-    /// fails closed accepts it only from this child.
-    boot_key: String,
+    /// Unique namespace id appended to this child's config so a readiness probe
+    /// can tell this process apart from a sibling that won the loopback port.
+    boot_ns: String,
     /// The config the process was booted with, kept so a harness can record
     /// exactly what it qualified.
     pub config: String,
@@ -392,9 +389,9 @@ impl Axond {
     /// config would not express it. `render` is called per attempt because a
     /// retried boot binds a different port, and the config carries the bind.
     ///
-    /// The rendered config must declare a `[[gateway_key]]` reading
-    /// `GW_BOOT_KEY`: that key is how readiness tells this child apart from a
-    /// sibling that won the port (see [`Self::answers_for_this_boot`]).
+    /// Readiness identifies this child by a unique `[[namespace]]` the harness
+    /// appends (see [`Self::answers_for_this_boot`]). The rendered config must
+    /// declare exactly one `[[gateway_key]]` reading `GW_INBOUND_KEY`.
     pub async fn start_custom(
         render: &dyn Fn(SocketAddr) -> String,
         env: &[(String, String)],
@@ -453,23 +450,23 @@ impl Axond {
         extra_env: &[(String, String)],
         binary: &Path,
     ) -> Result<Self, String> {
-        // One reservation, used for both the config directory and the boot key:
-        // re-reading the counter could hand two concurrent boots the same value,
-        // and the key has to be unique by construction, not by timing.
+        // One reservation, used for both the config directory and the boot
+        // namespace: re-reading the counter could hand two concurrent boots the
+        // same value, and the namespace has to be unique by construction.
         let boot = CONFIGS.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("axond-compat-{}-{boot}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("test config directory");
         let addr = free_addr();
         let path = dir.join(format!("axond-{}.toml", addr.port()));
-        let boot_key = format!("test-boot-key-{}-{boot}", std::process::id());
-        let config = render(addr);
+        let boot_ns = format!("boot_{}_{boot}", std::process::id());
+        let mut config = render(addr);
+        config.push_str(&format!("\n[[namespace]]\nid = \"{boot_ns}\"\n"));
         std::fs::write(&path, &config).expect("test config is written");
 
         let mut command = Command::new(binary);
         command
             .env("AXOND_CONFIG", &path)
             .env("GW_INBOUND_KEY", GATEWAY_KEY)
-            .env(BOOT_KEY_ENV, &boot_key)
             .env("GW_FAKE_OPENAI_KEY", OPENAI_KEY)
             .env("GW_FAKE_ANTHROPIC_KEY", ANTHROPIC_KEY)
             .env(OPENAI_SECONDARY_ENV, OPENAI_KEY_SECONDARY)
@@ -512,7 +509,7 @@ impl Axond {
 
         let mut gateway = Self {
             base_url: format!("http://{addr}"),
-            boot_key,
+            boot_ns,
             config,
             child,
             config_path: path,
@@ -552,8 +549,8 @@ impl Axond {
                 && response.status().is_success()
             {
                 // Health only proves *something* serves the port. Readiness is
-                // this child's only if the server also accepts this boot's
-                // private key, which no sibling was given.
+                // this child's only if the server also has this boot's unique
+                // namespace, which no sibling was given.
                 let base_url = self.base_url.clone();
                 return self.answers_for_this_boot(&client, &base_url).await;
             }
@@ -572,16 +569,13 @@ impl Axond {
         false
     }
 
-    /// Whether the process serving this port is this child. `/v1/models` fails
-    /// closed on an unknown gateway key, and this boot's key exists only in this
-    /// child's environment, so a sibling that won the port answers 401 — the
-    /// window between `spawn` and the child's own bind failure, where nothing has
-    /// been logged yet, is covered by asking the server who it is rather than by
-    /// waiting for this child to complain.
+    /// Whether the process serving this port is this child. A sibling that won
+    /// the port does not have this boot's unique namespace, so the GET is 404
+    /// rather than 200 — even when it accepts the shared suite key.
     async fn answers_for_this_boot(&mut self, client: &reqwest::Client, base_url: &str) -> bool {
         let identified = client
-            .get(format!("{base_url}/api/v1/namespaces"))
-            .bearer_auth(&self.boot_key)
+            .get(format!("{base_url}/api/v1/namespaces/{}", self.boot_ns))
+            .bearer_auth(GATEWAY_KEY)
             .send()
             .await
             .is_ok_and(|response| response.status().is_success());
@@ -874,12 +868,6 @@ id = "fake-anthropic-primary"
 
 [[gateway_key]]
 env = "GW_INBOUND_KEY"
-namespace = "platform"
-
-# Unique to this boot, so a request carrying it can only be answered by the
-# process the harness started; the suites authenticate with GW_INBOUND_KEY.
-[[gateway_key]]
-env = "GW_BOOT_KEY"
 namespace = "platform"
 
 [[price]]
