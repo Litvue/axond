@@ -10,7 +10,7 @@
 //! distinguishes local vs imported by tenant-scoped `CatalogModel`, not by
 //! sniffing the URL.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use gateway_core::ModelPrice;
@@ -167,21 +167,71 @@ impl LocalCatalogBuilder {
     }
 }
 
-/// Compile a local snapshot's stated `cost` into a file price, when exact.
+/// Compile a models.dev `cost` into billable micro-dollar rates, when exact.
+///
+/// Nano-dollars that are not a whole micro-dollar are unpublished: charging a
+/// truncated rate would disagree with the observation, and rounding up would
+/// overcharge. Optional cache/reasoning rates convert the same way; a stated
+/// optional that is not exact makes the whole offering unusable rather than
+/// silently falling back to input/output.
 pub fn model_price_from_cost(price: &ObservedPrice) -> Option<ModelPrice> {
-    const PER_MICRO: u64 = 1_000;
-    let input = price.base.input.nanos();
-    let output = price.base.output.nanos();
-    if !input.is_multiple_of(PER_MICRO) || !output.is_multiple_of(PER_MICRO) {
-        return None;
-    }
     Some(ModelPrice {
-        input_microdollars_per_million: input / PER_MICRO,
-        output_microdollars_per_million: output / PER_MICRO,
-        reasoning_microdollars_per_million: None,
-        cache_read_microdollars_per_million: None,
-        cache_write_microdollars_per_million: None,
+        input_microdollars_per_million: exact_micros(price.base.input.nanos())?,
+        output_microdollars_per_million: exact_micros(price.base.output.nanos())?,
+        reasoning_microdollars_per_million: optional_micros(price.base.reasoning)?,
+        cache_read_microdollars_per_million: optional_micros(price.base.cache_read)?,
+        cache_write_microdollars_per_million: optional_micros(price.base.cache_write)?,
     })
+}
+
+const NANOS_PER_MICRO: u64 = 1_000;
+
+fn exact_micros(nanos: u64) -> Option<u64> {
+    nanos
+        .is_multiple_of(NANOS_PER_MICRO)
+        .then_some(nanos / NANOS_PER_MICRO)
+}
+
+fn optional_micros(rate: Option<super::catalog::ObservedRate>) -> Option<Option<u64>> {
+    match rate {
+        None => Some(None),
+        Some(rate) => exact_micros(rate.nanos()).map(Some),
+    }
+}
+
+/// Billable rates compiled from one imported snapshot.
+///
+/// Keyed by (`[[provider]]` id, the id that provider publishes — the bare
+/// model id after the request's first `/`). Offerings with no usable `cost`
+/// are omitted; `unpriced_models` decides those at admission.
+#[derive(Debug, Clone, Default)]
+pub struct CatalogPriceIndex {
+    rates: HashMap<String, HashMap<String, ModelPrice>>,
+}
+
+impl CatalogPriceIndex {
+    pub fn from_snapshot(snapshot: &CatalogSnapshot) -> Self {
+        let mut rates: HashMap<String, HashMap<String, ModelPrice>> = HashMap::new();
+        for model in snapshot.content.models() {
+            for offering in &model.offerings {
+                let Some(observed) = offering.price.as_ref() else {
+                    continue;
+                };
+                let Some(price) = model_price_from_cost(observed) else {
+                    continue;
+                };
+                rates
+                    .entry(offering.provider.as_str().to_owned())
+                    .or_default()
+                    .insert(offering.published_model_id.clone(), price);
+            }
+        }
+        Self { rates }
+    }
+
+    pub fn price_for(&self, provider: &str, published_model_id: &str) -> Option<ModelPrice> {
+        self.rates.get(provider)?.get(published_model_id).copied()
+    }
 }
 
 /// The file price a tenant-scoped pin would compile, when the snapshot still
@@ -474,5 +524,112 @@ mod tests {
             "the golden offering must pin"
         );
         assert!(store.load().await.expect("load").active.is_none());
+    }
+
+    fn usage(input_tokens: u64, output_tokens: u64) -> gateway_core::Usage {
+        gateway_core::Usage {
+            input_tokens,
+            output_tokens,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        }
+    }
+
+    /// models.dev `cost.input`/`cost.output` of 5/30 USD per million tokens
+    /// become 5_000_000/30_000_000 µUSD per million; 1M+1M tokens charge
+    /// 35_000_000 µUSD with no `[[price]]` row.
+    #[test]
+    fn seed_charges_from_models_dev_cost_without_a_price_book() {
+        let index = CatalogPriceIndex::from_snapshot(&crate::backends::models_dev::seed_snapshot());
+        let rates = index
+            .price_for("openai", "gpt-5.5")
+            .expect("openai publishes gpt-5.5 with a usable cost");
+        assert_eq!(rates.input_microdollars_per_million, 5_000_000);
+        assert_eq!(rates.output_microdollars_per_million, 30_000_000);
+        assert_eq!(rates.cache_read_microdollars_per_million, Some(500_000));
+        assert_eq!(
+            rates.cost_microdollars(usage(1_000_000, 1_000_000)),
+            35_000_000
+        );
+        assert!(
+            index.price_for("openai", "does-not-exist").is_none(),
+            "an offering the snapshot does not price is omitted, not free"
+        );
+        let gpt_4o = index
+            .price_for("openai", "gpt-4o")
+            .expect("the seed also prices gpt-4o");
+        assert_eq!(gpt_4o.input_microdollars_per_million, 2_500_000);
+        assert_eq!(gpt_4o.output_microdollars_per_million, 10_000_000);
+    }
+
+    #[test]
+    fn empty_cost_is_unpublished_not_indexed() {
+        let payload = r#"{
+            "models": {
+                "openai/unpriced": {
+                    "id": "openai/unpriced",
+                    "name": "Unpriced",
+                    "modalities": {"input": ["text"], "output": ["text"]}
+                }
+            },
+            "providers": {
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "env": ["OPENAI_API_KEY"],
+                    "models": {
+                        "unpriced": {
+                            "id": "unpriced",
+                            "name": "Unpriced",
+                            "modalities": {"input": ["text"], "output": ["text"]},
+                            "cost": {}
+                        }
+                    }
+                }
+            }
+        }"#;
+        let snapshot = ModelsDevAdapter::default()
+            .parse(
+                payload.as_bytes(),
+                SourceValidators::etag("\"empty-cost\""),
+                UNIX_EPOCH,
+            )
+            .expect("empty cost is unpublished, not a parse error");
+        let index = CatalogPriceIndex::from_snapshot(&snapshot);
+        assert!(
+            index.price_for("openai", "unpriced").is_none(),
+            "empty cost must not become a zero charge"
+        );
+    }
+
+    /// A request copies rates at bind time; a later snapshot cannot reprice it.
+    #[test]
+    fn a_later_snapshot_does_not_reprice_an_already_bound_request() {
+        let opened = CatalogPriceIndex::from_snapshot(
+            &LocalCatalogBuilder::new("openai", "gpt-5.5")
+                .price(5_000_000, 30_000_000)
+                .snapshot(tenant(), UNIX_EPOCH)
+                .expect("snapshot A"),
+        )
+        .price_for("openai", "gpt-5.5")
+        .expect("priced");
+        let bound = crate::pricing::RequestPrice::configured(opened);
+
+        let after = CatalogPriceIndex::from_snapshot(
+            &LocalCatalogBuilder::new("openai", "gpt-5.5")
+                .price(4_000_000, 30_000_000)
+                .snapshot(tenant(), UNIX_EPOCH)
+                .expect("snapshot B"),
+        )
+        .price_for("openai", "gpt-5.5")
+        .expect("still priced");
+
+        assert_eq!(
+            bound.cost_microdollars(usage(1_000_000, 0)),
+            Some(5_000_000)
+        );
+        assert_eq!(after.cost_microdollars(usage(1_000_000, 0)), 4_000_000);
+        assert_ne!(opened, after);
     }
 }

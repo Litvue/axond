@@ -1591,8 +1591,10 @@ async fn serve(
             provider: provider.id.clone(),
         });
     }
+    let catalog_price = state.catalog_price_for(&provider.id, model_id);
     let book_price = cfg.price_for(&provider.id, model_id);
-    let request_price = match book_price {
+    let rates = catalog_price.or(book_price);
+    let request_price = match rates {
         Some(rates) => RequestPrice::configured(rates),
         None => match provider.unpriced_models {
             UnpricedModels::Deny => return Err(GatewayError::UnpricedModel(alias)),
@@ -1602,7 +1604,7 @@ async fn serve(
     let routed = Model::single(
         provider.id.clone(),
         model_id.to_owned(),
-        book_price.unwrap_or(UNPRICED_TARGET),
+        rates.unwrap_or(UNPRICED_TARGET),
     );
     let model = &routed;
 
@@ -7023,6 +7025,279 @@ env = "AXOND_PLATFORM_OPENAI"
         assert_eq!(records[0].cost_microdollars, None);
         assert_eq!(records[0].target_model, "gpt-4o");
         assert_eq!(records[0].target_provider, "openai");
+    }
+
+    fn seed_catalog() -> crate::backends::catalog::CatalogSnapshot {
+        crate::backends::models_dev::seed_snapshot()
+    }
+
+    fn state_with_catalog(
+        cfg: Config,
+        env: HashMap<String, String>,
+        usage: UsageFanout,
+        budget: Box<dyn crate::budget::BudgetStore>,
+        snapshot: &crate::backends::catalog::CatalogSnapshot,
+    ) -> AppState {
+        let status = crate::backends::catalog_runtime::CatalogStatus::new();
+        status.install_snapshot(snapshot);
+        AppState::new_with_observability(
+            cfg,
+            &env,
+            usage,
+            budget,
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            ReplicaObservability::stateless().with_catalogue(std::sync::Arc::new(status)),
+        )
+        .expect("credentials resolve")
+    }
+
+    #[tokio::test]
+    async fn catalog_rates_charge_without_a_price_book() {
+        let base_url = rate_limiting_upstream("never-matches").await;
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+{GATEWAY_KEY}
+"#
+        ))
+        .unwrap();
+        let captured = CapturingSink::default();
+        let state = state_with_catalog(
+            cfg,
+            env_with([("AXOND_PLATFORM_OPENAI", "sk-good")]),
+            UsageFanout::new(vec![Box::new(captured.clone())]),
+            Box::new(NoBudget),
+            &seed_catalog(),
+        );
+        let body = serde_json::to_vec(&json!({"model": "openai/gpt-5.5", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        // seed cost: $5 / $30 per million; fake upstream reports 10+5 tokens.
+        assert_eq!(records[0].cost_microdollars, Some(200));
+        assert_eq!(records[0].target_model, "gpt-5.5");
+        assert_eq!(records[0].input_tokens, 10);
+        assert_eq!(records[0].output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn catalog_miss_with_deny_is_typed_400() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+{GATEWAY_KEY}
+"#
+        ))
+        .unwrap();
+        let state = state_with_catalog(
+            cfg,
+            env_with([]),
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+            &seed_catalog(),
+        );
+        let body =
+            serde_json::to_vec(&json!({"model": "openai/not-in-catalog", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unpriced_model");
+    }
+
+    #[tokio::test]
+    async fn catalog_miss_with_allow_dispatches_with_null_cost() {
+        let base_url = rate_limiting_upstream("never-matches").await;
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+unpriced_models = "allow"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+{GATEWAY_KEY}
+"#
+        ))
+        .unwrap();
+        let captured = CapturingSink::default();
+        let state = state_with_catalog(
+            cfg,
+            env_with([("AXOND_PLATFORM_OPENAI", "sk-good")]),
+            UsageFanout::new(vec![Box::new(captured.clone())]),
+            Box::new(NoBudget),
+            &seed_catalog(),
+        );
+        let body =
+            serde_json::to_vec(&json!({"model": "openai/not-in-catalog", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cost_microdollars, None);
+    }
+
+    #[tokio::test]
+    async fn catalog_rates_win_over_a_price_book_row() {
+        let base_url = rate_limiting_upstream("never-matches").await;
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+{GATEWAY_KEY}
+
+[[price]]
+provider = "openai"
+model = "gpt-5.5"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
+"#
+        ))
+        .unwrap();
+        let captured = CapturingSink::default();
+        let state = state_with_catalog(
+            cfg,
+            env_with([("AXOND_PLATFORM_OPENAI", "sk-good")]),
+            UsageFanout::new(vec![Box::new(captured.clone())]),
+            Box::new(NoBudget),
+            &seed_catalog(),
+        );
+        let body = serde_json::to_vec(&json!({"model": "openai/gpt-5.5", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].cost_microdollars,
+            Some(200),
+            "models.dev rates, not the [[price]] override"
+        );
+    }
+
+    #[tokio::test]
+    async fn price_book_covers_offerings_the_catalogue_does_not_price() {
+        let base_url = rate_limiting_upstream("never-matches").await;
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+{GATEWAY_KEY}
+
+[[price]]
+provider = "openai"
+model = "custom-deploy"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+"#
+        ))
+        .unwrap();
+        let captured = CapturingSink::default();
+        let state = state_with_catalog(
+            cfg,
+            env_with([("AXOND_PLATFORM_OPENAI", "sk-good")]),
+            UsageFanout::new(vec![Box::new(captured.clone())]),
+            Box::new(NoBudget),
+            &seed_catalog(),
+        );
+        let body =
+            serde_json::to_vec(&json!({"model": "openai/custom-deploy", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        // 10 * 2_500_000 / 1e6 + 5 * 10_000_000 / 1e6 = 25 + 50
+        assert_eq!(records[0].cost_microdollars, Some(75));
     }
 
     #[tokio::test]

@@ -28,12 +28,12 @@ separator (`AXOND_SERVER__BIND=0.0.0.0:9090`). The override layer is for scalars
 in containerized deploys; structure belongs in the file.
 
 TOML plus env holds bind, providers, credentials, **exactly one**
-`[[gateway_key]]`, `[storage]`, the deployment price-book and blocklist, and
-process bounds (`[admission]`, `[transport]`, `[shutdown]`, telemetry).
-Namespaces, period budgets, and usage also live in the Store: file
-`[[namespace]]` rows are seeded at boot; further namespaces are created through
-`/api/v1`. Changing process config is a restart or a reload of the keys that
-reload supports.
+`[[gateway_key]]`, `[storage]`, optional `[catalog]` import, optional `[[price]]`
+fallback, the blocklist, and process bounds (`[admission]`, `[transport]`,
+`[shutdown]`, telemetry). Namespaces, period budgets, and usage also live in the
+Store: file `[[namespace]]` rows are seeded at boot; further namespaces are
+created through `/api/v1`. Changing process config is a restart or a reload of
+the keys that reload supports.
 
 ## State tiers
 
@@ -44,7 +44,7 @@ missing or unreachable store is a boot failure.
 | Config section | Persistence |
 | --- | --- |
 | `[storage]` | **Required.** SQLite WAL or Postgres. Namespaces, period budgets, usage index, discovery cache. |
-| `[server]`, `[[provider]]`, `[[price]]`, `[blocklist]`, `[[credential]]` | Process config. |
+| `[server]`, `[[provider]]`, `[catalog]`, optional `[[price]]`, `[blocklist]`, `[[credential]]` | Process config. Charging uses imported models.dev rates; `[[price]]` is fallback for unlisted ids. |
 | `[[namespace]]` | Seeded into the Store at boot; runtime create/update/delete is `/api/v1`. |
 | `[credential_pool]`, `[failover]` | In-memory, per replica. Alias-level failover is gone; credential-pool rotation inside one provider remains. |
 | `[transport]`, `[admission]`, `[shutdown]` | Process-level bounds. |
@@ -268,7 +268,7 @@ unknown_namespace` (same body for never-existed and deleted).
 | `id` | string | — | Provider name, referenced by credentials and the `provider-id/` prefix of a request model. |
 | `kind` | `openai` \| `anthropic` \| `openai-compatible` | — | Which wire the endpoint speaks. Decides which routes can serve it — see the [compatibility contract](./compatibility.md). |
 | `base_url` | string | — | Endpoint root, e.g. `https://api.openai.com/v1`. **Path only**: the route's path is appended by string concatenation, so a query string or fragment here would swallow it. Never put a secret in it either — see the [security review](./security-review-2026-08-05.md#4-finding-transport-errors-echoed-the-upstream-url--fixed-here). |
-| `unpriced_models` | `allow` \| `deny` | `deny` | What to do when no `[[price]]` rule matches. `deny` is `400 unpriced_model` before dispatch. `allow` dispatches and records `cost_microdollars` NULL. |
+| `unpriced_models` | `allow` \| `deny` | `deny` | What to do when neither the imported models.dev snapshot nor a `[[price]]` rule covers the id. `deny` is `400 unpriced_model` before dispatch. `allow` dispatches and records `cost_microdollars` NULL. |
 
 ## `[blocklist]`
 
@@ -280,12 +280,34 @@ Effective denials are the union of this list and the namespace's optional
 `blocklist`. A hit is `400 model_blocked` and is not sent upstream. Globs match
 the full `provider-id/model-id` or the bare model id.
 
-## `[[price]]` — deployment price-book
+## Charging — models.dev rates, optional `[[price]]` fallback
 
-Not a routing table. First matching `(provider, model-id glob)` in file order
-wins; put exact ids before globs. Callers send `provider-id/model-id`; Axond
-forwards the bare id. A leftover `[[model]]` table is a boot error that names
-the old alias and the prefix form.
+Callers send `provider-id/model-id`; Axond forwards the bare id. A leftover
+`[[model]]` table is a boot error that names the old alias and the prefix form.
+
+Namespace spend is **actual tokens × rates from the imported models.dev
+snapshot** the request started under. Operator setup is `[[provider]]` plus
+`[catalog]` import. The `[[provider]] id` must match the models.dev provider key
+(`openai`, `anthropic`, …). A custom id or an `openai-compatible` deployment
+models.dev does not list stays unpriced unless a `[[price]]` row covers it.
+
+Resolution at admission, first hit wins:
+
+1. Imported snapshot `cost` for `(provider id, published model id)`, converted
+   to integer micro-dollars per million tokens (input, output, and optional
+   cache/reasoning when those convert exactly).
+2. Optional `[[price]]` — first matching `(provider, model-id glob)` in file
+   order. Put exact ids before globs.
+3. Per-provider `unpriced_models`.
+
+The inference path does not fetch models.dev. A later catalogue admit cannot
+reprice an in-flight request.
+
+## `[[price]]` — optional fallback for unlisted offerings
+
+Not a routing table, not required for models.dev-covered ids. Use it for custom
+vLLM / Azure deployment ids the catalogue does not publish. When both a snapshot
+`cost` and a `[[price]]` row exist, the snapshot wins.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -950,7 +972,7 @@ also applies the policy store-wide.
 The separate request-wait and liveness budgets keep ordinary slowness from
 triggering that generation-wide recovery path.
 
-## `[catalog]` — imported model metadata (opt-in, Tier 2 when retained)
+## `[catalog]` — imported model metadata and charging rates (opt-in)
 
 Omit this section for the default: nothing is imported, no HTTP client is built,
 and no connection is opened. Enabled, a background task imports the
@@ -958,11 +980,13 @@ and no connection is opened. Enabled, a background task imports the
 its provenance, and keeps a last-known-good active
 ([ADR 0043](./adr/0043-catalogue-source-imports.md),
 [ADR 0051](./adr/0051-durable-catalogue-snapshots-and-refresh-orchestration.md)).
+Admitted snapshots are the default charging source for configured providers
+whose ids match models.dev keys.
 
-Imports are observational metadata only: they never activate a model, change a
-tenant's enablements, or settle a price. Nothing on the inference path reads the
-source or the store — a request cannot cause a fetch, and a fetch cannot delay a
-request.
+An import never enables a model or changes routing. It does compile that
+snapshot's `cost` into rates the request path may copy at admission. Nothing on
+the inference path reads the source or the store — a request cannot cause a
+fetch, and a fetch cannot delay a request.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -985,11 +1009,9 @@ An HTTPS mirror is a supported `source_url`; a plaintext, hostless, or credentia
 carrying one is refused at boot. Hosts are deliberately not allowlisted: an
 operator-controlled HTTPS mirror may be deployment-local or air-gapped. The URL
 must still name the exact supported `/catalog.json` document.
-Imported metadata is what an operator browses (`axond admin catalog browse`)
-before `axond admin model apply`. An import still never enables, aliases, or
-prices anything, so a document anyone on the path could substitute is not a
-source this gateway will trust. Redirects are not followed either: the configured URL is the
-provenance every snapshot records, so a `3xx` is a bounded refusal naming its
+The configured URL is the provenance every snapshot records. A document anyone
+on the path could substitute would become the rates a request is charged at, so
+this gateway will not follow redirects: a `3xx` is a bounded refusal naming its
 status rather than an import of whatever the answer pointed at.
 
 Refreshes are conditional: the stored ETag and `Last-Modified` are sent back, and

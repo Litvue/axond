@@ -2001,6 +2001,20 @@ impl AppState {
             .and_then(|catalogue| catalogue.report())
     }
 
+    /// Compiled models.dev rates for this offering from the snapshot the
+    /// importer last admitted, if any. Copied at admission so a later import
+    /// cannot reprice an in-flight request.
+    pub fn catalog_price_for(
+        &self,
+        provider: &str,
+        published_model_id: &str,
+    ) -> Option<gateway_core::ModelPrice> {
+        self.0
+            .catalogue
+            .as_ref()
+            .and_then(|catalogue| catalogue.price_for(provider, published_model_id))
+    }
+
     /// The config snapshot a request runs against. Taken once per request and
     /// held for its duration, so a concurrent reload cannot half-apply.
     pub fn config(&self) -> Arc<ConfigSnapshot> {
