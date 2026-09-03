@@ -791,7 +791,9 @@ impl Store for SqliteStore {
                     fetched_at = excluded.fetched_at,
                     stale = excluded.stale,
                     models = excluded.models,
-                    source = excluded.source",
+                    source = excluded.source
+                 WHERE axond_store_provider_models.source IS NOT DISTINCT FROM excluded.source
+                    OR axond_store_provider_models.stale = 1",
                 params![
                     row.provider,
                     row.fetched_at,
@@ -1679,4 +1681,30 @@ mod tests {
         assert_eq!(stale.source, fresh.source);
     }
 
+    #[tokio::test]
+    async fn provider_models_put_does_not_replace_a_newer_source() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let neu = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(neu.clone()).await.expect("new");
+        let old = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:02:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "old", "object": "model"})],
+            source: Some("https://api.openai.com/v1".into()),
+        };
+        store.put_provider_models(old).await.expect("old put");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, neu);
+    }
 }
