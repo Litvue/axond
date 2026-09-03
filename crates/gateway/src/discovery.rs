@@ -5,6 +5,7 @@
 //! upstream models. Azure Foundry's data-plane listing omits deployments;
 //! this still stores whatever `GET /models` returned.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gateway_core::AnthropicAdapter;
@@ -31,6 +32,7 @@ const EMPTY_BACKOFF_CAP: Duration = Duration::from_secs(30);
 pub async fn run(state: AppState, mut stop: oneshot::Receiver<()>) {
     let mut empty_backoff = EMPTY_BACKOFF_START;
     let mut waiting_for_providers = true;
+    let mut asserted_sources = HashMap::new();
     loop {
         let providers = state.config().config.provider.len();
         if waiting_for_providers && providers == 0 {
@@ -46,7 +48,7 @@ pub async fn run(state: AppState, mut stop: oneshot::Receiver<()>) {
             continue;
         }
         waiting_for_providers = false;
-        match refresh_all(&state, &mut stop).await {
+        match refresh_all(&state, &mut stop, &mut asserted_sources).await {
             Round::Stopped => {
                 tracing::debug!("provider model discovery stopped");
                 return;
@@ -79,7 +81,11 @@ enum RefreshError {
     SnapshotChanged,
 }
 
-async fn refresh_all(state: &AppState, stop: &mut oneshot::Receiver<()>) -> Round {
+async fn refresh_all(
+    state: &AppState,
+    stop: &mut oneshot::Receiver<()>,
+    asserted_sources: &mut HashMap<String, String>,
+) -> Round {
     let snapshot = state.config();
     let providers: Vec<(String, ProviderKind, String)> = snapshot
         .config
@@ -97,7 +103,17 @@ async fn refresh_all(state: &AppState, stop: &mut oneshot::Receiver<()>) -> Roun
         if stopped(stop) {
             return Round::Stopped;
         }
-        if let Err(error) = refresh_one(state, &snapshot, id, *kind, base_url, stop).await {
+        if let Err(error) = refresh_one(
+            state,
+            &snapshot,
+            id,
+            *kind,
+            base_url,
+            stop,
+            asserted_sources,
+        )
+        .await
+        {
             match error {
                 RefreshError::Stopped => return Round::Stopped,
                 RefreshError::SnapshotChanged => return Round::Restart,
@@ -122,11 +138,20 @@ async fn refresh_one(
     kind: ProviderKind,
     base_url: &str,
     stop: &mut oneshot::Receiver<()>,
+    asserted_sources: &mut HashMap<String, String>,
 ) -> Result<(), RefreshError> {
     if stopped(stop) {
         return Err(RefreshError::Stopped);
     }
-    stale_if_source_changed(state, provider_id, base_url).await;
+    // Stale a differing-source row only when this replica's URL for the
+    // provider changes (boot or reload). Doing it on every refresh would let a
+    // lagged replica still on the old URL stale a fresh new-URL row and then
+    // pass `put_provider_models`' `OR stale` escape, clobbering the listing.
+    if asserted_sources.get(provider_id).map(String::as_str) != Some(base_url)
+        && stale_if_source_changed(state, provider_id, base_url).await
+    {
+        asserted_sources.insert(provider_id.to_owned(), base_url.to_owned());
+    }
 
     let leases = snapshot
         .credentials
@@ -235,19 +260,25 @@ async fn fetch_listing(
     Ok(data)
 }
 
-async fn stale_if_source_changed(state: &AppState, provider: &str, base_url: &str) {
+/// Returns `true` once the mark is durably applied, so a failed mark is retried
+/// on the next refresh instead of being recorded as asserted.
+async fn stale_if_source_changed(state: &AppState, provider: &str, base_url: &str) -> bool {
     let Some(store) = state.store() else {
-        return;
+        return false;
     };
-    if let Err(error) = store
+    match store
         .mark_provider_models_stale_unless_source(provider, base_url)
         .await
     {
-        tracing::warn!(
-            provider,
-            error = %error,
-            "could not persist stale provider model cache"
-        );
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                provider,
+                error = %error,
+                "could not persist stale provider model cache"
+            );
+            false
+        }
     }
 }
 
