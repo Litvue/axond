@@ -360,10 +360,12 @@ change that broadens a match is a privilege change. Projection:
 `models_requires_a_gateway_key`, `models_lists_the_callers_aliases`, and the
 namespace intersection tests in trigger 2. An alias a namespace owns is that
 namespace's alone, in the catalogue and in resolution:
-`an_owned_alias_is_listed_and_routable_only_by_its_namespace` — a name
-one tenant publishes may not be enumerated or invoked by another. Configured
-`[[model]]` aliases (and the file-level owner checks that went with them) were
-withdrawn in ADR 0063; routing is `provider-id/model-id`. The
+`namespaced_completion_and_namespace_api` and
+`models_lists_the_callers_aliases` — inference is `/ns/{ns}/v1`, the
+namespace must exist in the store, and the models list is that path's
+catalogue. Configured `[[model]]` aliases (and the file-level owner checks
+that went with them) were withdrawn in ADR 0063; routing is
+`provider-id/model-id`. The
 administrative catalogue answers within one scope and says what it could not
 consult: `a_tenant_read_is_isolated_and_explains_each_entry`,
 `a_tenant_read_does_not_enumerate_a_projects_overrides`,

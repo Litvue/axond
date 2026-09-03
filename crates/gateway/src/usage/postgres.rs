@@ -200,7 +200,7 @@ impl PostgresSink {
 
     /// `cost_microdollars` must be nullable so unpriced+allow rows can bind NULL.
     ///
-    /// Absent tables and missing columns are not this gap: [`missing_columns`]
+    /// Absent tables and missing columns are not this gap: [`Self::missing_columns`]
     /// already names the recreate/migrate path for those. `to_regclass($1)`
     /// follows the same search_path the INSERT uses, including a qualified name.
     async fn not_null_cost_gap(
