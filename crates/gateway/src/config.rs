@@ -4893,6 +4893,7 @@ namespace = "platform"
         for relative in [
             "axond.example.toml",
             "ops/compose/axond.quickstart.toml",
+            "ops/compose/axond.stateful.toml",
             "tests/tier0/axond.tier0.toml",
             "deploy/kubernetes/base/axond.toml",
             "deploy/azure-container-apps/axond.toml",
