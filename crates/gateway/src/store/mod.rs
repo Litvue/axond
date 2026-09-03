@@ -1529,6 +1529,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_append_usage_saturates_oversized_cost() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store
+            .append_usage(UsageAppend {
+                request_id: format!("req_over_{ns}"),
+                namespace: ns.clone(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(i64::MAX as u64 + 1),
+            })
+            .await
+            .expect("append");
+        let rows = store.summarize_usage(&ns, "p").await.expect("summarize");
+        assert_eq!(
+            rows,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 1,
+                cost_microdollars: i64::MAX as u64,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_usage_summary_groups_by_model_and_status() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
@@ -1616,6 +1645,36 @@ mod tests {
                 model: "openai/gpt-4o".into(),
                 status: "ok".into(),
                 count: 2,
+                cost_microdollars: i64::MAX as u64,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_append_usage_saturates_oversized_cost() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store
+            .append_usage(UsageAppend {
+                request_id: "req_over".into(),
+                namespace: "wsp_x".into(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(i64::MAX as u64 + 1),
+            })
+            .await
+            .expect("append");
+        let rows = store
+            .summarize_usage("wsp_x", "p")
+            .await
+            .expect("summarize");
+        assert_eq!(
+            rows,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 1,
                 cost_microdollars: i64::MAX as u64,
             }]
         );

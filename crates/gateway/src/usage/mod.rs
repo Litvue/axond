@@ -1141,6 +1141,12 @@ mod tests {
         async fn delete_namespace(&self, _: &str) -> Result<bool, crate::store::StoreError> {
             Ok(false)
         }
+        fn seed_namespaces_blocking(
+            &self,
+            _: &[crate::config::Namespace],
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
         async fn put_budget(
             &self,
             _: &str,
@@ -1228,6 +1234,12 @@ mod tests {
         }
         async fn delete_namespace(&self, _: &str) -> Result<bool, crate::store::StoreError> {
             Ok(false)
+        }
+        fn seed_namespaces_blocking(
+            &self,
+            _: &[crate::config::Namespace],
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
         }
         async fn put_budget(
             &self,
