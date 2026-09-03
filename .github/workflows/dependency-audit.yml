@@ -25,7 +25,7 @@ jobs:
         with:
           toolchain: 1.97.1
       - name: Install pinned policy tools
-        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
         with:
           tool: cargo-deny@0.20.2
       - name: Check advisories, licenses, bans, and sources
