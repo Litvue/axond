@@ -32,21 +32,19 @@ Logs are always JSON on stdout, filtered by `RUST_LOG` (default
 
 ## Health surfaces
 
-Three surfaces answer three different questions, and none of them substitutes for
-another ([ADR 0031](./adr/0031-bounded-status-contract.md)):
+Two production surfaces answer two different questions
+([ADR 0031](./adr/0031-bounded-status-contract.md)). `GET /admin/v1/status` is
+unmounted ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)).
 
 | Surface | Authentication | Question it answers |
 | --- | --- | --- |
 | `GET /healthz` | none | *Is the process alive?* Answers `ok` throughout, including the shutdown drain. Restart it if this fails. |
 | `GET /readyz` | none | *Should traffic be sent here?* `ready`, or `503 draining` once termination begins. Point the load balancer here. |
-| `GET /admin/v1/status` | any gateway credential; a scoped token also needs the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. Answers throughout the shutdown, including `closing`, and on a replica that refuses inference. Bounded by its own diagnostic ceilings — eight concurrent answers, seventy-two concurrent authentications — rather than by `admission.max_in_flight`. |
+| `GET /admin/v1/status` | unmounted | Withdrawn replica diagnostic. Not composed into production `serve()`. |
 
-Neither `/healthz` nor `/readyz` observes a dependency. A store outage must not
-remove healthy replicas from service, so dependency state lives only on the
-authenticated surface — and that surface answers from a **cache**: a background
-refresher observes each enabled component on its own cadence, and a read takes an
-in-memory snapshot. A status request never probes a backend, never takes a budget
-or rate-limit permit, and cannot slow inference down.
+Neither `/healthz` nor `/readyz` observes a dependency. A Store outage on the
+budget path is `503 budget_unavailable` (default `[storage].on_unavailable =
+deny`). Dependency health is in logs and metrics.
 
 Read the age, not just the state. Each component reports `ok`, `degraded`,
 `unavailable`, or `disabled` (nothing is configured for it) with the age of the
@@ -73,16 +71,8 @@ is the correct answer, not a degraded one — so a replica that configured nothi
 durable reports `disabled` everywhere, observes nothing, and produces no
 `axond.status.*` series at all.
 
-The components a replica does observe are the ones its own configuration opened:
-**the control plane** in `mode = "stateful"`, and the **budget**, **rate-limit**,
-and **revocation** stores wherever those are backed by Redis or PostgreSQL rather
-than by `none`/`in-memory`. Each is observed on the connection the administrative
-or request path already uses, rather than a second pool of its own: a diagnostic
-that probed a path no real request takes is how status reports `ok` throughout an
-outage of the thing being asked about. The exception is PostgreSQL, whose
-request-path client is serialised behind a mutex — a probe queued there would
-delay inference to answer a status page, so it opens its own short-lived session
-and runs `SELECT 1`.
+`GET /admin/v1/status` is unmounted. Store health is typed errors and metrics.
+Optional `[rate_limit]` Redis still participates in admission when configured.
 
 A probe asks only for reachability: a `PING` or a `SELECT 1`, with no tenant, key,
 or `jti` in it, never a `reserve`, an `acquire`, or a revocation lookup. A store
@@ -341,7 +331,8 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | Status | `type` | What happened | What to do |
 | --- | --- | --- | --- |
 | `401` | `unauthorized` | No `Authorization: Bearer` / `x-api-key`, or the token is not in the key table. | Check the caller's key and that its `[[gateway_key]]` is declared and its env var set. There is no keyless mode. |
-| `404` | `unknown_model` | The alias is not configured. | Add a `[[model]]`, or fix the caller. `/v1/models` lists the aliases the caller can invoke. |
+| `404` | `unknown_namespace` | Path namespace is missing or deleted. | `POST /api/v1/namespaces` or fix the URL. |
+| `400` | `unknown_provider` / `model_unprefixed` | Request `model` is not `provider-id/model-id`. | Prefix with a configured `[[provider]] id`. `GET /ns/{ns}/v1/models` lists cached ids. |
 | `400` | `unsupported_wire` | The alias's target (or one of its failover targets) does not speak this route's wire — e.g. an OpenAI-only alias on `/v1/messages`. Raised **before** anything is reserved or dispatched. | Fix the alias's targets; no route translates between wires. See the [compatibility contract](./compatibility.md). |
 | `400` | `invalid_request`, `context_window_exceeded`, `bad_request` | The provider (or the gateway) rejected the request shape. | Caller-side fix; retrying will not help. |
 | `400` | `middleware_refused` | Request middleware rejected the request as invalid before provider dispatch. The bounded message never echoes request content or middleware diagnostics. | Correct the request; retrying the same body will not help. |

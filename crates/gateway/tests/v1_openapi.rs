@@ -55,7 +55,7 @@ async fn openapi_json_is_31_covers_mounted_routes_and_requires_the_key() {
     assert!(paths["/api/v1/namespaces"].get("get").is_some());
     assert!(paths["/api/v1/namespaces/{ns}"].get("get").is_some());
     assert!(paths["/api/v1/namespaces/{ns}"].get("put").is_some());
-    assert!(paths["/api/v1/namespaces/{ns}"].get("delete").is_none());
+    assert!(paths["/api/v1/namespaces/{ns}"].get("delete").is_some());
     assert!(
         paths["/api/v1/namespaces/{ns}/budgets/{period}"]
             .get("put")
@@ -67,9 +67,16 @@ async fn openapi_json_is_31_covers_mounted_routes_and_requires_the_key() {
             .is_some()
     );
     assert!(paths["/api/v1/namespaces/{ns}/usage"].get("get").is_some());
+    assert!(paths["/api/v1/providers/{id}/models"].get("get").is_some());
+    assert!(paths["/api/v1/providers/models"].get("get").is_some());
     assert!(
-        paths.keys().all(|path| !path.contains("/providers")),
-        "discovery is unmounted: {paths:?}"
+        paths
+            .keys()
+            .filter(|path| path.contains("/providers"))
+            .all(|path| {
+                *path == "/api/v1/providers/{id}/models" || *path == "/api/v1/providers/models"
+            }),
+        "only the two discovery routes are mounted: {paths:?}"
     );
     let scheme = &spec["components"]["securitySchemes"]["gateway_key"];
     assert_eq!(scheme["type"], "http");

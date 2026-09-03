@@ -1,5 +1,7 @@
 # Namespace and blob control-plane migration plan
 
+> **Superseded ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** Blob-backed `/namespaces/` control plane did not ship. Canonical inference is `/ns/{ns}/v1`. Historical record.
+
 Status: accepted architecture; Stages 1 and 2 are in progress. Typed namespace
 identity, canonical routes, complete flat namespace resources, namespace-native
 policy/middleware values, deployment-scoped single/set/all workload grants, and

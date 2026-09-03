@@ -1,5 +1,7 @@
 # Control-plane revision journal
 
+> **Withdrawn ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** `[control_plane]` is a boot error. Historical record; do not follow as a runbook.
+
 The durable desired state of a stateful deployment is a chain of immutable
 revisions in PostgreSQL. This page is the operator's view of that journal: what
 the schema is, how migrations are applied and checked, and what happens to a

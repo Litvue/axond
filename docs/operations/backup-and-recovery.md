@@ -27,10 +27,10 @@ therefore optional; if you do, restore the layout markers with it rather than th
 counters alone, because a marker-less database reads as a different layout to the
 next boot. See [Stateful backends](../deployment/stateful-backends.md#redis).
 
-The gateway itself holds nothing durable. Replicas are interchangeable and a lost
-replica is replaced, not recovered; a stateless deployment (`mode = "stateless"`)
-has no durable state at all and nothing on this page applies to it beyond the
-usage, budget, and revocation stores it opted into.
+The HTTP process holds nothing durable besides its Store connection. Replicas
+are interchangeable. SQLite is a single-replica file: back up that file.
+Postgres HA is what this page's PITR drill is for. `mode = "stateless"` is a
+boot error; there is no config-only deployment.
 
 ## Objectives
 

@@ -34,16 +34,15 @@ GW_PLATFORM_OPENAI_API_KEY=replace-me
 GW_PLATFORM_ANTHROPIC_API_KEY=replace-me
 GW_ACME_OPENAI_API_KEY=replace-me
 GW_INBOUND_PLATFORM_KEY=replace-me
-GW_INBOUND_ACME_KEY=replace-me
 ```
 
 ```bash
 sudo install -o root -g axond -m 0640 axond.env /etc/axond/axond.env
 ```
 
-Do not place secret values directly in the TOML or unit. For static gateway
-keys and verifier public material, file-backed configuration is also available;
-write exact bytes with no accidental newline for static/HS256 secrets.
+Do not place secret values directly in the TOML or unit. For the static
+gateway key, file-backed configuration is also available; write exact bytes
+with no accidental newline. Minted-token verifier material is withdrawn.
 
 ## Install and start the service
 

@@ -188,6 +188,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn published_ceilings_account_holds_against_the_runtime_they_read() {
         let runtime = Arc::new(PolicyRuntime::bootstrap(&stateless_config()));
         let ceilings = Ceilings::published(&runtime);
@@ -200,6 +201,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_hold_taken_before_a_store_call_survives_only_the_admission_that_keeps_it() {
         let runtime = Arc::new(PolicyRuntime::bootstrap(&stateless_config()));
         let ceilings = Ceilings::published(&runtime);

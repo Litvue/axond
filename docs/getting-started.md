@@ -1,8 +1,9 @@
 # Getting started
 
-This walkthrough boots Axond with no datastore, proves its public and
-authenticated surfaces, and optionally sends a real provider request. No real
-provider credential is needed until the final step.
+This walkthrough boots Axond with a local SQLite Store, publishes a period
+budget, proves its public and authenticated surfaces, and optionally sends a
+real provider request. No real provider credential is needed until the final
+step.
 
 ## Prerequisites
 
@@ -20,41 +21,52 @@ docker compose up -d
 ```
 
 The base Compose file pulls the current public image and mounts
-`ops/compose/axond.quickstart.toml`. It is Tier 0: Redis and Postgres are not
-started and Axond writes one JSON usage record per completed request to its
-container log.
+`ops/compose/axond.quickstart.toml`. It requires `[storage]` (a temp SQLite
+file inside the container). Redis is not started. Axond writes one JSON usage
+record per completed request to its container log.
 
 The values in `.env` are intentionally public placeholders. They are safe only
 for local evaluation.
 
 ## 2. Prove boot and authentication
 
+Inference is fail-closed until a period budget exists. Publish one, then list
+models:
+
 ```bash
 curl --fail http://127.0.0.1:8080/healthz
 curl --fail http://127.0.0.1:8080/readyz
 curl --fail \
   -H 'Authorization: Bearer quickstart-platform-key' \
-  http://127.0.0.1:8080/v1/models
+  -H 'content-type: application/json' \
+  -d '{"limit_microdollars":1000000000000}' \
+  -X PUT http://127.0.0.1:8080/api/v1/namespaces/platform/budgets/quickstart
+curl --fail \
+  -H 'Authorization: Bearer quickstart-platform-key' \
+  http://127.0.0.1:8080/ns/platform/v1/models
 curl --silent --output /dev/null --write-out '%{http_code}\n' \
-  http://127.0.0.1:8080/v1/models
+  http://127.0.0.1:8080/ns/platform/v1/models
 ```
 
-Expected results are `ok`, `ready`, an alias catalogue, and `401` for the
-unauthenticated catalogue request. Only `/healthz` and `/readyz` are public.
+Expected results are `ok`, `ready`, a budget document, a
+`provider-id/model-id` catalogue, and `401` for the unauthenticated catalogue
+request. Only `/healthz` and `/readyz` are public. Unprefixed `/v1/...` is not
+served. `/admin/v1` is unmounted (`404`).
 
 ## 3. Exercise the dispatch path
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
+curl http://127.0.0.1:8080/ns/platform/v1/chat/completions \
   -H 'Authorization: Bearer quickstart-platform-key' \
   -H 'content-type: application/json' \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
+  -d '{"model":"openai/gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
 ```
 
 With the committed placeholder key, this returns either a typed provider error
 or `upstream_transport` in an air-gapped environment. That is expected: Axond
-has authenticated the caller, resolved the alias and credential, attempted the
-provider, and rendered the failure through its typed error envelope.
+has authenticated the caller, resolved the provider prefix and credential,
+attempted the provider, and rendered the failure through its typed error
+envelope.
 
 For a successful completion, edit `.env`:
 
@@ -62,7 +74,7 @@ For a successful completion, edit `.env`:
 GW_PLATFORM_OPENAI_API_KEY=sk-your-real-key
 ```
 
-Then recreate the container and repeat the request:
+Then recreate the container, republish the budget, and repeat the request:
 
 ```bash
 docker compose up -d --force-recreate
@@ -73,7 +85,7 @@ docker compose up -d --force-recreate
 ```bash
 curl --fail \
   -H 'Authorization: Bearer quickstart-platform-key' \
-  http://127.0.0.1:8080/v1/credentials
+  http://127.0.0.1:8080/ns/platform/v1/credentials
 docker compose logs axond
 ```
 
@@ -81,7 +93,21 @@ Credential status exposes labels and replica-local `healthy`, `parked`, or
 `probe` state, never secret values. Logs are structured JSON and include the
 canonical usage record.
 
-## 5. Stop the stack
+## 5. Create another namespace
+
+File TOML seeds `platform` and `acme`. Further namespaces are API-created:
+
+```bash
+curl --fail \
+  -H 'Authorization: Bearer quickstart-platform-key' \
+  -H 'content-type: application/json' \
+  -d '{"id":"wsp_demo","attrs":{"label":"demo"}}' \
+  http://127.0.0.1:8080/api/v1/namespaces
+```
+
+OpenAPI is at `GET /api/v1/openapi.json`.
+
+## 6. Stop the stack
 
 ```bash
 docker compose down -v
@@ -90,11 +116,11 @@ docker compose down -v
 Keep `.env` until after teardown; required-variable interpolation happens
 before every Compose command.
 
-## Try the stateful stack
+## Try the Postgres overlay
 
-The stateful Compose example adds Redis-backed budgets/rate limits and a
-Postgres usage sink. It is still file-owned models (`gpt-4o` in the TOML),
-not the control-plane mode below.
+The stateful Compose example adds a Postgres Store (and leftover Redis from
+the old overlay — budgets no longer use it). File-owned providers and prices
+stay in TOML; namespaces and period caps live in the Store.
 
 ```bash
 export AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml
@@ -104,47 +130,10 @@ docker compose \
 ```
 
 Use those same `-f` and `--profile` flags on every follow-up command. See the
-[Compose guide](./deployment/docker-compose.md) for the durable-row probe and
-failure tests.
+[Compose guide](./deployment/docker-compose.md).
 
-## Make a model available (`mode = "stateful"`)
-
-A control-plane replica does not take `[[model]]` in the file. After a tenant,
-project, provider connection, and credential exist, one apply makes a published
-id callable:
-
-```bash
-export AXOND_ADMIN_TOKEN=...
-axond admin catalog browse --tenant ten_01J... --provider openai --q gpt-4o
-axond admin model apply --tenant ten_01J... --project prj_01J... \
-  --target openai:gpt-4o \
-  --price-input 2500000 --price-output 10000000
-```
-
-Omit `--name`. The alias is `gpt-4o` — the id callers send and what
-`GET /v1/models` lists. The CLI fills `idempotency-key` and
-`x-axond-expected-revision`.
-
-```bash
-curl --fail \
-  -H 'Authorization: Bearer <workload-key>' \
-  http://127.0.0.1:8080/v1/models
-```
-
-Expected: `{"data":[{"id":"gpt-4o",...}],"object":"list"}`. Then one completion:
-
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Authorization: Bearer <workload-key>' \
-  -H 'content-type: application/json' \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
-```
-
-The workload key is an inference credential, not `AXOND_ADMIN_TOKEN`. Browse,
-apply, disable, and the binding document are in
-[administering a stateful deployment](./operations/admin-api.md). The
-[stateful Kubernetes runbook](./operations/stateful-deployment-runbook.md)
-covers first install.
+`mode = "stateful"`, `[control_plane]`, and `axond admin model apply` are
+withdrawn. Do not follow the old `/admin/v1` runbooks.
 
 ## Run current source instead
 
@@ -165,7 +154,6 @@ GW_PLATFORM_OPENAI_API_KEY=placeholder-openai-key \
 GW_PLATFORM_ANTHROPIC_API_KEY=placeholder-anthropic-key \
 GW_ACME_OPENAI_API_KEY=placeholder-acme-openai-key \
 GW_INBOUND_PLATFORM_KEY=quickstart-platform-key \
-GW_INBOUND_ACME_KEY=quickstart-acme-key \
   target/debug/axond
 ```
 

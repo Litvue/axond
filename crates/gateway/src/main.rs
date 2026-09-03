@@ -1,4 +1,4 @@
-//! Axond — a stateless, single-binary, self-hosted AI gateway.
+//! Axond — a store-backed, single-binary, self-hosted AI gateway.
 //!
 //! Boot sequence: install telemetry (logs always, OTLP only when configured),
 //! load + validate config (fail fast, delta B2), snapshot the environment for
@@ -14,10 +14,8 @@
 //! `[reload] watch` is on, a change to the config file) re-runs this same load +
 //! validate path and swaps the result in atomically (ADR 0011).
 
-// The `/admin/v1` surface: the only way durable desired state changes (#143).
-// Mounted by `serve` beside the inference router, with its own authentication
-// and its own error envelope; the inference request path is unchanged and still
-// never reads the control plane.
+// Withdrawn `/admin/v1` control-plane surface (ADR 0063). Kept compiled for
+// tests of that tree; `serve` does not mount it. Management is `/api/v1`.
 #[allow(dead_code)]
 mod admin;
 mod admission;
@@ -43,6 +41,7 @@ mod config;
 #[allow(dead_code)]
 mod convergence;
 mod credentials;
+mod discovery;
 // The desired-state domain the durable contracts are expressed in. Contract
 // only, for the same reason `backends` is: no revision is loaded or published on
 // the request path yet.
@@ -102,7 +101,7 @@ use std::time::{Duration, Instant};
 
 use budget::{BudgetStore, StoreBudget};
 use clap::{Arg, ArgAction, Command};
-use config::{Config, Mode};
+use config::Config;
 use convergence::{
     ConvergenceSettings, LastKnownGood, MaterialLedger, Reconciler, RevisionCompiler,
     RevisionStatus, SnapshotSink, SystemClock,
@@ -563,7 +562,7 @@ async fn serve() -> anyhow::Result<()> {
     // different serving snapshot. If the signed sibling is absent or cannot be
     // read, the data plane may still recover, but non-breakglass admin requests
     // remain fail-closed until durable convergence returns.
-    let cached_authorization = if config.mode == Mode::Stateful {
+    let cached_authorization = if config.is_stateful() {
         match cache.as_ref() {
             Some(cache) if cache.compiled_exists() => match cache.load() {
                 Ok(Some(revision)) => {
@@ -592,7 +591,7 @@ async fn serve() -> anyhow::Result<()> {
     } else {
         None
     };
-    let cached_serving = if config.mode == Mode::Stateful {
+    let cached_serving = if config.is_stateful() {
         match cache.as_ref() {
             Some(cache) if cache.compiled_exists() => match cache.load_compiled() {
                 Ok(Some(record)) => match state::ConfigSnapshot::from_cached_serving(
@@ -651,7 +650,7 @@ async fn serve() -> anyhow::Result<()> {
     // compiled cache is available. This is the fail-closed boundary: the
     // deferred store and convergence loop keep retrying, but no empty snapshot
     // reaches inference.
-    let allow_recovery = config.mode == Mode::Stateful;
+    let allow_recovery = config.is_stateful();
 
     // No-datastore defaults: usage to stdout, budget always-allow. Durable
     // usage sinks and shared (Redis / Postgres) budget backends are opt-in via
@@ -716,8 +715,9 @@ async fn serve() -> anyhow::Result<()> {
     // the listener exists: stateful boot may defer an unavailable control plane so
     // the listener can expose authenticated administration and fail-closed
     // readiness while convergence retries. In stateless mode this opens nothing.
-    let change_signal =
-        (config.mode == Mode::Stateful).then(|| Arc::new(convergence::ChangeSignal::new()));
+    let change_signal = config
+        .is_stateful()
+        .then(|| Arc::new(convergence::ChangeSignal::new()));
     let admin = admin::runtime::surface_with_change_signal_and_recovery(
         &config,
         &env,
@@ -728,11 +728,7 @@ async fn serve() -> anyhow::Result<()> {
     .map_err(|e| {
         anyhow::anyhow!("a stateful deployment could not bring up its administrative surface: {e}")
     })?;
-    tracing::info!(
-        mode = admin.mode,
-        prefix = admin::ADMIN_PREFIX,
-        "administrative surface"
-    );
+    let _ = admin.mode;
 
     // Metadata ingestion, brought up before the listener and owned by a task of
     // its own: every import runs off the request path, and a request cannot reach
@@ -812,7 +808,8 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
     let (observability, status_refresher) = ReplicaObservability::observing(plan);
-    let revision_status = (config.mode == Mode::Stateful)
+    let revision_status = config
+        .is_stateful()
         .then(|| Arc::new(RevisionStatus::new(Box::new(SystemClock))));
     let observability = match revision_status.as_ref() {
         Some(status) => observability.with_revision(Arc::clone(status)),
@@ -861,7 +858,7 @@ async fn serve() -> anyhow::Result<()> {
     // Assemble the stateful convergence loop only after its immutable serving
     // state exists. The first bootstrap attempt is started after the listener
     // binds, so a slow control plane cannot delay liveness registration.
-    let reconciler = if config.mode == Mode::Stateful {
+    let reconciler = if config.is_stateful() {
         let store = admin
             .control_plane
             .as_ref()
@@ -914,16 +911,11 @@ async fn serve() -> anyhow::Result<()> {
         tracing::info!(%revision, "restored compiled serving snapshot from last-known-good cache");
     }
 
-    // Routed after the inference state exists, because an availability read is
-    // answered from the snapshot this replica is serving (#148), while the store
-    // behind administration was opened before it so the diagnostic paces against
-    // the connection administrative requests take.
-    let administration =
-        admin.router_with_convergence(Some(Arc::new(state.clone())), revision_status.clone());
+    // ADR 0063: `/admin/v1` is unmounted. Management is `/api/v1`. The
+    // control-plane surface stays compiled (`mod admin`) for tests of the
+    // withdrawn tree, but `serve` does not merge it.
     let inference = routes::router(state.clone());
-    let app = inference
-        .merge(administration)
-        .layer(telemetry::TelemetryLayer);
+    let app = inference.layer(telemetry::TelemetryLayer);
 
     tracing::info!(
         %bind,
@@ -962,6 +954,13 @@ async fn serve() -> anyhow::Result<()> {
                 .await;
         })
     });
+    let (stop_discovery, stop_discovery_rx) = tokio::sync::oneshot::channel::<()>();
+    let discovering = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            discovery::run(state, stop_discovery_rx).await;
+        })
+    };
     let (stop_converging, stop_converging_rx) = tokio::sync::oneshot::channel::<()>();
     let converging = reconciler.map(|reconciler| {
         let shutdown = Arc::clone(&lifecycle);
@@ -998,6 +997,17 @@ async fn serve() -> anyhow::Result<()> {
     drop(stop_refreshing);
     if let Some(refreshing) = refreshing {
         let _ = refreshing.await;
+    }
+    let _ = stop_discovery.send(());
+    // Best-effort cache: do not spend the settle/flush budget on a stuck
+    // store write. Abort if cooperative stop does not finish immediately.
+    let mut discovering = discovering;
+    if tokio::time::timeout(Duration::from_millis(50), &mut discovering)
+        .await
+        .is_err()
+    {
+        discovering.abort();
+        tracing::debug!("discovery task aborted at shutdown");
     }
     let _ = stop_converging.send(());
     if let Some(converging) = converging {

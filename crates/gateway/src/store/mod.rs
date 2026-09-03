@@ -109,6 +109,54 @@ pub struct UsageSummary {
     pub data: Vec<UsageSummaryRow>,
 }
 
+/// Cached upstream `GET /models` listing for one configured provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ProviderModels {
+    pub provider: String,
+    /// RFC3339 of the last successful fetch. Absent if none has succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+    /// True when the last upstream fetch failed. Last-good `data` is still
+    /// returned; empty + stale if never fetched.
+    pub stale: bool,
+    pub data: Vec<Value>,
+    /// Provider `base_url` this row was fetched from. Internal cache key;
+    /// omitted from the management JSON.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub source: Option<String>,
+}
+
+impl ProviderModels {
+    pub fn empty_stale(provider: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            fetched_at: None,
+            stale: true,
+            data: Vec::new(),
+            source: None,
+        }
+    }
+
+    /// Last-good rows fetched from a different upstream are stale.
+    pub fn against_source(mut self, source: &str) -> Self {
+        if self.source.as_deref() != Some(source) {
+            self.stale = true;
+        }
+        self
+    }
+
+    /// Inference `/v1/models` lists last-good ids only when this row was
+    /// fetched from `source`. A foreign URL's catalog is omitted.
+    pub fn data_if_source(&self, source: &str) -> &[Value] {
+        if self.source.as_deref() == Some(source) {
+            &self.data
+        } else {
+            &[]
+        }
+    }
+}
+
 /// Outcome of a pre-dispatch hold against the namespace's active period.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetReserve {
@@ -143,7 +191,10 @@ pub trait Store: Send + Sync {
         attrs: Value,
         blocklist: Option<Vec<String>>,
     ) -> Result<Option<NamespaceRecord>, StoreError>;
-    #[allow(dead_code)]
+    /// Remove the namespace and its live budget ledger in one transaction.
+    /// Usage rows are retained. Reservation rows are kept so an in-flight
+    /// settle can see the incarnation it reserved under. Missing id is
+    /// `Ok(false)`.
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError>;
     /// Seed addressable namespace ids without `spawn_blocking`.
     fn seed_namespaces_blocking(
@@ -176,8 +227,10 @@ pub trait Store: Send + Sync {
         reservation_id: &str,
     ) -> Result<BudgetReserve, StoreError>;
 
-    /// Charge `actual` and release the hold in one operation. A missing hold
-    /// (expired) still records spend against `period`.
+    /// Charge `actual` and release the hold in one operation. Charge only when
+    /// a reservation or expire-tombstone records an incarnation that matches
+    /// the live namespace. A prior-incarnation hold (row or tombstone) is
+    /// dropped without charging. An unknown reservation id is a no-op.
     async fn settle_budget(
         &self,
         namespace: &str,
@@ -217,6 +270,54 @@ pub trait Store: Send + Sync {
         namespace: &str,
         period: &str,
     ) -> Result<Vec<UsageSummaryRow>, StoreError>;
+
+    /// Cached upstream listing for one provider, or `None` if never written.
+    async fn get_provider_models(
+        &self,
+        provider: &str,
+    ) -> Result<Option<ProviderModels>, StoreError> {
+        let _ = provider;
+        Ok(None)
+    }
+
+    /// Every cached provider listing. Missing configured providers are absent.
+    async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Insert or replace one provider's cached listing.
+    ///
+    /// A write for a different `source` applies only when the existing row is
+    /// missing or `stale`. Discovery may mark a foreign row stale only on the
+    /// first round (URL change / cold start). Later rounds skip a fresh
+    /// foreign row so a lagged replica cannot open this CAS.
+    async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
+        let _ = row;
+        Ok(())
+    }
+
+    /// Set `stale = true` only when the cached `source` differs from `source`.
+    /// One UPDATE, so a concurrent listing with the new source is not replaced.
+    /// Matching source or missing row is a no-op.
+    async fn mark_provider_models_stale_unless_source(
+        &self,
+        provider: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let _ = (provider, source);
+        Ok(())
+    }
+
+    /// Set `stale = true` only when the cached `source` still equals `source`.
+    /// A concurrent listing with a different URL is left untouched.
+    async fn mark_provider_models_stale_if_source(
+        &self,
+        provider: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let _ = (provider, source);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +375,29 @@ impl Store for UnavailableStore {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn summarize_usage(&self, _: &str, _: &str) -> Result<Vec<UsageSummaryRow>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn get_provider_models(&self, _: &str) -> Result<Option<ProviderModels>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn put_provider_models(&self, _: ProviderModels) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn mark_provider_models_stale_unless_source(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn mark_provider_models_stale_if_source(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<(), StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
 }
@@ -623,6 +747,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_delete_namespace_drops_budget_and_keeps_usage() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        store
+            .append_usage(UsageAppend {
+                request_id: "req_1".into(),
+                namespace: "wsp_x".into(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(5),
+            })
+            .await
+            .expect("usage");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        assert!(!store.delete_namespace("wsp_x").await.expect("repeat"));
+        assert!(store.get_namespace("wsp_x").await.expect("get").is_none());
+        assert!(
+            store
+                .get_budget("wsp_x", "p")
+                .await
+                .expect("budget")
+                .is_none()
+        );
+        let usage = store
+            .summarize_usage("wsp_x", "p")
+            .await
+            .expect("summarize");
+        assert_eq!(
+            usage,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 1,
+                cost_microdollars: 5,
+            }]
+        );
+        seeded(&store).await;
+        assert!(
+            store
+                .get_budget("wsp_x", "p")
+                .await
+                .expect("recreate budget")
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
+                .await
+                .expect("closed"),
+            BudgetReserve::Exceeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_settle_after_recreate_does_not_charge_new_budget() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 77, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        seeded(&store).await;
+        let rec = store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("recreate");
+        assert_eq!(rec.spent_microdollars, 0);
+        assert_eq!(rec.reserved_microdollars, 0);
+        store
+            .settle_budget("wsp_x", "p", "r1", 77)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_delete_recreate_expires_any_incarnation_hold() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "old")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        seeded(&store).await;
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("recreate");
+        match store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "new")
+            .await
+            .expect("expire path")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget("wsp_x", "p", "old", 10)
+            .await
+            .expect("late settle after TTL");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        // Expire-delete wrote a tombstone for incarnation 1; current is 2.
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_late_settle_after_two_reserves_still_charges_this_incarnation() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
+        store
+            .reserve_budget("wsp_x", 40, Duration::from_millis(1), "r1")
+            .await
+            .expect("hold");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        match store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
+            .await
+            .expect("second")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        match store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r3")
+            .await
+            .expect("third")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget("wsp_x", "p", "r1", 40)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 40);
+        assert_eq!(got.reserved_microdollars, 2);
+    }
+
+    #[tokio::test]
     async fn sqlite_in_flight_hold_counts_and_settle_is_one_operation() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
@@ -822,6 +1113,338 @@ mod tests {
             .await
             .expect("ns");
         (store, ns)
+    }
+
+    #[tokio::test]
+    async fn postgres_delete_namespace_drops_budget_and_keeps_usage() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("put");
+        store
+            .reserve_budget(&ns, 10, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        store
+            .append_usage(UsageAppend {
+                request_id: format!("req_{ns}"),
+                namespace: ns.clone(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(5),
+            })
+            .await
+            .expect("usage");
+        assert!(store.delete_namespace(&ns).await.expect("delete"));
+        assert!(!store.delete_namespace(&ns).await.expect("repeat"));
+        assert!(store.get_namespace(&ns).await.expect("get").is_none());
+        assert!(store.get_budget(&ns, "p").await.expect("budget").is_none());
+        assert_eq!(store.reservation_count(&ns).await.expect("holds"), 1);
+        let usage = store.summarize_usage(&ns, "p").await.expect("summarize");
+        assert_eq!(
+            usage,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 1,
+                cost_microdollars: 5,
+            }]
+        );
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        assert!(
+            store
+                .get_budget(&ns, "p")
+                .await
+                .expect("recreate budget")
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .reserve_budget(&ns, 1, Duration::from_secs(30), "r2")
+                .await
+                .expect("closed"),
+            BudgetReserve::Exceeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn postgres_settle_after_recreate_does_not_charge_new_budget() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("put");
+        store
+            .reserve_budget(&ns, 77, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace(&ns).await.expect("delete"));
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        let rec = store
+            .put_budget(&ns, "p", 10_000)
+            .await
+            .expect("new ledger");
+        assert_eq!(rec.spent_microdollars, 0);
+        assert_eq!(rec.reserved_microdollars, 0);
+        store
+            .settle_budget(&ns, "p", "r1", 77)
+            .await
+            .expect("late settle");
+        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 0);
+        assert_eq!(store.reservation_count(&ns).await.expect("holds"), 0);
+    }
+
+    #[tokio::test]
+    async fn postgres_put_namespace_inserts_incarnation_one() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        let store = PostgresStore::connect(&scoped, true)
+            .await
+            .expect("connect");
+        let ns = unique_ns("wsp_inc");
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("put");
+        let n: i64 = setup
+            .query_one(
+                "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
+                &[&ns],
+            )
+            .await
+            .expect("row")
+            .get(0);
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_delete_missing_incarnation_row_isolates_late_settle() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        let store = PostgresStore::connect(&scoped, true)
+            .await
+            .expect("connect");
+        let ns = unique_ns("wsp_legacy_inc");
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("put");
+        store.put_budget(&ns, "p", 10_000).await.expect("budget");
+        setup
+            .execute(
+                "DELETE FROM axond_namespace_incarnation WHERE id = $1",
+                &[&ns],
+            )
+            .await
+            .expect("drop companion");
+        store
+            .reserve_budget(&ns, 77, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace(&ns).await.expect("delete"));
+        let n: i64 = setup
+            .query_one(
+                "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
+                &[&ns],
+            )
+            .await
+            .expect("bumped")
+            .get(0);
+        assert_eq!(
+            n, 2,
+            "delete must create n=2 when the companion was missing"
+        );
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        let n: i64 = setup
+            .query_one(
+                "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
+                &[&ns],
+            )
+            .await
+            .expect("kept")
+            .get(0);
+        assert_eq!(n, 2, "recreate must not reset incarnation");
+        let rec = store
+            .put_budget(&ns, "p", 10_000)
+            .await
+            .expect("new ledger");
+        assert_eq!(rec.spent_microdollars, 0);
+        store
+            .settle_budget(&ns, "p", "r1", 77)
+            .await
+            .expect("late settle");
+        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 0);
+    }
+
+    #[tokio::test]
+    async fn postgres_delete_recreate_expires_any_incarnation_hold() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("put");
+        store
+            .reserve_budget(&ns, 10, Duration::from_millis(1), "old")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace(&ns).await.expect("delete"));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        store
+            .put_budget(&ns, "p", 10_000)
+            .await
+            .expect("new ledger");
+        match store
+            .reserve_budget(&ns, 1, Duration::from_secs(30), "new")
+            .await
+            .expect("expire path")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget(&ns, "p", "old", 10)
+            .await
+            .expect("late settle after TTL");
+        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_expired_tombstone_is_vacuumed_on_reserve_and_late_settle_is_noop() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 10_000).await.expect("put");
+        let stale = format!("vac_{ns}");
+        store
+            .insert_expired_reservation_tombstone(&stale, 1)
+            .await
+            .expect("past tombstone");
+        match store
+            .reserve_budget(&ns, 1, Duration::from_secs(30), &format!("live_{ns}"))
+            .await
+            .expect("reserve vacuums")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        store
+            .settle_budget(&ns, "p", &stale, 99)
+            .await
+            .expect("late settle");
+        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_settle_charges_once() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (a, ns) = postgres_seeded(&dsn).await;
+        let b = PostgresStore::connect(&dsn, true)
+            .await
+            .expect("second client");
+        a.put_budget(&ns, "p", 10_000).await.expect("put");
+        let rid = format!("once_{ns}");
+        match a
+            .reserve_budget(&ns, 50, Duration::from_secs(30), &rid)
+            .await
+            .expect("hold")
+        {
+            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+            other => panic!("{other:?}"),
+        }
+        let (left, right) = tokio::join!(
+            a.settle_budget(&ns, "p", &rid, 50),
+            b.settle_budget(&ns, "p", &rid, 50),
+        );
+        left.expect("settle a");
+        right.expect("settle b");
+        let got = a.get_budget(&ns, "p").await.expect("get").expect("row");
+        assert_eq!(got.spent_microdollars, 50);
+        assert_eq!(got.reserved_microdollars, 0);
+    }
+
+    #[tokio::test]
+    async fn postgres_delete_and_create_cannot_orphan_a_budget() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let a = PostgresStore::connect(&dsn, true).await.expect("a");
+        let b = PostgresStore::connect(&dsn, true).await.expect("b");
+        for _ in 0..8 {
+            let ns = unique_ns("race");
+            let rec = NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            };
+            let (deleted, created) = tokio::join!(a.delete_namespace(&ns), async {
+                b.put_namespace(rec.clone()).await?;
+                b.put_budget(&ns, "p", 10_000).await
+            });
+            deleted.expect("delete");
+            match created {
+                Ok(_) | Err(StoreError::NotFound(_)) => {}
+                Err(error) => panic!("{error}"),
+            }
+            let ns_row = a.get_namespace(&ns).await.expect("get ns");
+            let budget = a.get_budget(&ns, "p").await.expect("get budget");
+            if ns_row.is_none() {
+                assert!(budget.is_none(), "orphaned budget for {ns}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1151,10 +1774,20 @@ mod tests {
                      namespace           text        NOT NULL,
                      period              text        NOT NULL,
                      amount_microdollars bigint      NOT NULL,
-                     expires_at          timestamptz NOT NULL
+                     expires_at          timestamptz NOT NULL,
+                     incarnation         bigint      NOT NULL DEFAULT 1
                  );
                  CREATE INDEX axond_budget_reservation_scope_idx
                      ON axond_budget_reservation (namespace, period, expires_at);
+                 CREATE TABLE axond_namespace_incarnation (
+                     id text PRIMARY KEY NOT NULL,
+                     n  bigint NOT NULL
+                 );
+                 CREATE TABLE axond_store_budget_reservation_tombstone (
+                     id          text PRIMARY KEY NOT NULL,
+                     incarnation bigint NOT NULL,
+                     expires_at  timestamptz NOT NULL
+                 );
                  INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
                  INSERT INTO axond_budget
                      (namespace, period, limit_microdollars, spent_microdollars)
@@ -1173,6 +1806,10 @@ mod tests {
             )
             .await
             .expect("draft store tables");
+        setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
         let store = PostgresStore::connect(&scoped, false)
             .await
             .expect("rename draft tables");
@@ -1229,10 +1866,20 @@ mod tests {
                      namespace           text        NOT NULL,
                      period              text        NOT NULL,
                      amount_microdollars bigint      NOT NULL,
-                     expires_at          timestamptz NOT NULL
+                     expires_at          timestamptz NOT NULL,
+                     incarnation         bigint      NOT NULL DEFAULT 1
                  );
                  CREATE INDEX axond_budget_reservation_scope_idx
                      ON axond_budget_reservation (namespace, period, expires_at);
+                 CREATE TABLE axond_namespace_incarnation (
+                     id text PRIMARY KEY NOT NULL,
+                     n  bigint NOT NULL
+                 );
+                 CREATE TABLE axond_store_budget_reservation_tombstone (
+                     id          text PRIMARY KEY NOT NULL,
+                     incarnation bigint NOT NULL,
+                     expires_at  timestamptz NOT NULL
+                 );
                  INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
                  INSERT INTO axond_budget
                      (namespace, period, limit_microdollars, spent_microdollars)
@@ -1251,6 +1898,10 @@ mod tests {
             )
             .await
             .expect("draft store tables");
+        setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
         setup
             .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
             .await
@@ -1274,6 +1925,98 @@ mod tests {
         assert!(
             old_gone,
             "draft axond_budget must be renamed, not left beside empty new tables"
+        );
+    }
+
+    /// Draft period tables with spend, then both shipped Store SQLs, then
+    /// `connect(false)`: rename drops the incarnation-bearing reservation
+    /// table, so connect must ADD COLUMN. Skipped without
+    /// `AXOND_TEST_POSTGRES_DSN`.
+    #[tokio::test]
+    async fn postgres_connect_false_recovers_incarnation_after_draft_rename() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        setup
+            .batch_execute(
+                "CREATE TABLE axond_namespace (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+                     blocklist JSONB
+                 );
+                 CREATE TABLE axond_budget (
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     limit_microdollars  bigint      NOT NULL,
+                     spent_microdollars  bigint      NOT NULL DEFAULT 0,
+                     PRIMARY KEY (namespace, period)
+                 );
+                 CREATE TABLE axond_budget_active (
+                     namespace text PRIMARY KEY NOT NULL,
+                     period    text NOT NULL
+                 );
+                 CREATE TABLE axond_budget_reservation (
+                     id                  text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     amount_microdollars bigint      NOT NULL,
+                     expires_at          timestamptz NOT NULL
+                 );
+                 CREATE INDEX axond_budget_reservation_scope_idx
+                     ON axond_budget_reservation (namespace, period, expires_at);
+                 INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
+                 INSERT INTO axond_budget
+                     (namespace, period, limit_microdollars, spent_microdollars)
+                     VALUES ('wsp_x', '2026-09', 1000, 40);
+                 INSERT INTO axond_budget_active (namespace, period)
+                     VALUES ('wsp_x', '2026-09');
+                 CREATE TABLE axond_store_usage (
+                     request_id          text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text,
+                     model               text        NOT NULL,
+                     status              text        NOT NULL,
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
+                 );",
+            )
+            .await
+            .expect("draft period tables");
+        setup
+            .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
+            .await
+            .expect("budget v1");
+        setup
+            .batch_execute(include_str!("../../sql/store_namespace_incarnation_v1.sql"))
+            .await
+            .expect("incarnation v1");
+        let store = PostgresStore::connect(&scoped, false)
+            .await
+            .expect("connect false after draft rename");
+        let rec = store
+            .get_budget("wsp_x", "2026-09")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(rec.spent_microdollars, 40);
+        let has_incarnation: bool = setup
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_attribute
+                     WHERE attrelid = to_regclass('axond_store_budget_reservation')
+                       AND attname = 'incarnation'
+                       AND attnum > 0
+                       AND NOT attisdropped
+                 )",
+                &[],
+            )
+            .await
+            .expect("col")
+            .get(0);
+        assert!(
+            has_incarnation,
+            "reservation must have incarnation after draft rename"
         );
     }
 
@@ -1321,9 +2064,17 @@ mod tests {
             .await
             .expect("draft");
         setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
+        setup
             .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
             .await
             .expect("new ddl");
+        setup
+            .batch_execute(include_str!("../../sql/store_namespace_incarnation_v1.sql"))
+            .await
+            .expect("incarnation ddl");
         setup
             .batch_execute(
                 "INSERT INTO axond_store_budget
@@ -1491,6 +2242,90 @@ mod tests {
         assert_partial_dest_boot_error(err, "axond_store_budget_reservation");
     }
 
+    /// `create_table = false` probes incarnation objects; it must not CREATE
+    /// them or ALTER the reservation table. Additive `incarnation` is only
+    /// recovered after a draft rename (or `create_table = true`).
+    #[tokio::test]
+    async fn postgres_create_table_false_does_not_apply_incarnation_ddl() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (scoped, setup) = postgres_isolated(&dsn).await;
+        setup
+            .batch_execute(
+                "CREATE TABLE axond_namespace (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+                     blocklist JSONB
+                 );
+                 CREATE TABLE axond_store_usage (
+                     request_id          text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text,
+                     model               text        NOT NULL,
+                     status              text        NOT NULL,
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
+                 );",
+            )
+            .await
+            .expect("ns and usage");
+        setup
+            .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
+            .await
+            .expect("budget v1");
+        let err = match PostgresStore::connect(&scoped, false).await {
+            Err(error) => error,
+            Ok(_) => panic!("missing incarnation must fail closed"),
+        };
+        assert!(
+            matches!(err, StoreError::Unavailable(ref message) if message.contains("schema missing")),
+            "{err:?}"
+        );
+        let table: bool = setup
+            .query_one(
+                "SELECT to_regclass('axond_namespace_incarnation') IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("regclass")
+            .get(0);
+        assert!(
+            !table,
+            "create_table=false must not CREATE axond_namespace_incarnation"
+        );
+        let column: bool = setup
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_attribute
+                     WHERE attrelid = to_regclass('axond_store_budget_reservation')
+                       AND attname = 'incarnation'
+                       AND attnum > 0
+                       AND NOT attisdropped
+                 )",
+                &[],
+            )
+            .await
+            .expect("col")
+            .get(0);
+        assert!(
+            !column,
+            "create_table=false must not ADD COLUMN incarnation without a draft rename"
+        );
+        let tombstone: bool = setup
+            .query_one(
+                "SELECT to_regclass('axond_store_budget_reservation_tombstone') IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("tombstone")
+            .get(0);
+        assert!(
+            !tombstone,
+            "create_table=false must not CREATE reservation tombstone"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_settle_saturates_oversized_actual_and_releases_the_hold() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
@@ -1555,6 +2390,39 @@ mod tests {
                 cost_microdollars: i64::MAX as u64,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_put_provider_models_does_not_replace_a_newer_source() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let store = PostgresStore::connect(&dsn, true).await.expect("connect");
+        let provider = unique_ns("prov");
+        let neu = ProviderModels {
+            provider: provider.clone(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(neu.clone()).await.expect("new");
+        store
+            .put_provider_models(ProviderModels {
+                provider: provider.clone(),
+                fetched_at: Some("2026-09-02T12:02:00Z".into()),
+                stale: false,
+                data: vec![serde_json::json!({"id": "old", "object": "model"})],
+                source: Some("https://api.openai.com/v1".into()),
+            })
+            .await
+            .expect("old");
+        let got = store
+            .get_provider_models(&provider)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, neu);
     }
 
     #[tokio::test]

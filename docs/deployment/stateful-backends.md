@@ -1,5 +1,7 @@
 # Stateful backends
 
+> **Superseded ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** The live Store is SQLite WAL or Postgres (`[storage]`). Redis/in-memory budget backends, blob control plane, and `mode = "stateful"` are withdrawn. Keep this page for recovery/version notes that still apply to Postgres.
+
 Axond is config-only by default. Add object storage, Redis, or Postgres only
 when a feature must coordinate replicas or survive process replacement.
 

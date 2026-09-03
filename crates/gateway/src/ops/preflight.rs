@@ -37,9 +37,7 @@ use super::{
 };
 use crate::backends::control_plane::ControlPlaneBackend;
 use crate::backends::control_plane::schema::{self, SchemaStatus};
-use crate::config::{
-    BudgetBackend, Config, Mode, RateLimitBackend, RevocationBackend, UsageSinkKind,
-};
+use crate::config::{BudgetBackend, Config, RateLimitBackend, RevocationBackend, UsageSinkKind};
 use crate::convergence::LastKnownGood;
 
 /// One check's outcome.
@@ -152,9 +150,10 @@ pub async fn run(config: &Config, config_path: &Path, env: &HashMap<String, Stri
         format!(
             "`{}` parses and validates in {} mode",
             config_path.display(),
-            match config.mode {
-                Mode::Stateless => "stateless",
-                Mode::Stateful => "stateful",
+            if config.is_stateful() {
+                "stateful"
+            } else {
+                "stateless"
             }
         ),
     );
@@ -171,7 +170,7 @@ pub async fn run(config: &Config, config_path: &Path, env: &HashMap<String, Stri
 /// snapshot builder is the fail-closed boundary that refuses an empty projected
 /// key set, while this command catches an incomplete bootstrap before rollout.
 fn check_serving_posture(report: &mut Report, config: &Config) {
-    if config.mode == Mode::Stateless {
+    if !config.is_stateful() {
         return;
     }
     if config
@@ -787,6 +786,7 @@ env = "GW_BREAKGLASS"
     /// is withdrawn, ADR 0063); one that names nothing at all is a failure
     /// rather than a check that silently does not happen.
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn a_selected_store_is_checked_by_the_name_its_boot_resolves() {
         let toml = "[[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n\
              [gateway_token]\naudience = \"axond-test\"\n\

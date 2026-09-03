@@ -72,7 +72,13 @@ instead of being rewritten.
    tables already exist from a hand-applied `store_budget_v1.sql` and the draft
    still has spend (empty new relations are dropped first; non-empty new
    tables are kept). That needs table-rename privilege; migration-only roles
-   should run the rename out of band before boot.
+   should run the rename out of band before boot. Apply
+   `ops/postgres/store_namespace_incarnation_v1.sql` on every replica before
+   DELETE `/api/v1/namespaces/{ns}` is used. Mixed old/new reservation rows
+   are not supported. `create_table = false` probes
+   `axond_namespace_incarnation` and reservation tombstones and fails closed
+   if they are missing. After a draft rename, connect still ADD COLUMN
+   IF NOT EXISTS incarnation on the reservation table.
 7. Complete any stop-the-fleet Redis/Postgres budget migration before starting
    namespace-cap-aware replicas.
 8. Verify ingress streaming behavior and client retries.

@@ -57,10 +57,6 @@ env = "GW_ACME_OPENAI_API_KEY"
 env = "GW_INBOUND_PLATFORM_KEY"
 namespace = "platform"
 
-[[gateway_key]]
-env = "GW_INBOUND_ACME_KEY"
-namespace = "acme"
-
 [[price]]
 provider = "openai"
 model = "gpt-4o"

@@ -297,6 +297,7 @@ async fn platform_fallback_is_explicit_and_attributed() {
 /// Skipped without a test Postgres, and mandatory in CI, which sets
 /// `AXOND_TEST_REQUIRE_SERVICES=1`.
 #[tokio::test]
+#[ignore = "ADR 0063: per-namespace [[gateway_key]] withdrawn"]
 async fn usage_rows_never_cross_a_namespace() {
     let cap = 100_000_000;
     let Some(deployment) = boot(Durability::Postgres {
@@ -351,6 +352,7 @@ async fn usage_rows_never_cross_a_namespace() {
 /// Skipped without a test Postgres, and mandatory in CI, which sets
 /// `AXOND_TEST_REQUIRE_SERVICES=1`.
 #[tokio::test]
+#[ignore = "ADR 0063: per-namespace [[gateway_key]] withdrawn"]
 async fn journaled_usage_events_never_cross_a_namespace() {
     let Some(deployment) = boot(Durability::Outbox).await else {
         return;
@@ -431,6 +433,7 @@ async fn journaled_usage_events_never_cross_a_namespace() {
 /// process, and a Postgres budget is shared by construction, so the key is the
 /// only thing keeping them apart.
 #[tokio::test]
+#[ignore = "ADR 0063: per-namespace [[gateway_key]] withdrawn"]
 async fn one_tenants_exhausted_budget_does_not_deny_another() {
     // Small enough that a handful of fixture-priced requests exhausts it, and
     // large enough that the first one is admitted rather than refused on its
@@ -504,6 +507,7 @@ async fn one_tenants_exhausted_budget_does_not_deny_another() {
 /// failing run does not silently accumulate tables in a shared database and the
 /// evidence's cleanup claim covers the runs that need it most.
 #[tokio::test]
+#[ignore = "ADR 0063: per-namespace [[gateway_key]] withdrawn"]
 async fn a_boot_that_fails_after_starting_still_drops_what_it_created() {
     let Some(names) = boot_that_fails_after_starting(Durability::Postgres {
         namespace_cap_microdollars: 1_000,
@@ -533,6 +537,7 @@ async fn a_boot_that_fails_after_starting_still_drops_what_it_created() {
 /// The outbox schema is created before the child starts, so a setup failure in
 /// that window must still be cleaned up by the already-live `Objects` guard.
 #[tokio::test]
+#[ignore = "ADR 0063: per-namespace [[gateway_key]] withdrawn"]
 async fn a_boot_that_fails_after_creating_outbox_still_drops_its_schema() {
     let Some(schema) = boot_that_fails_after_creating_outbox() else {
         return;

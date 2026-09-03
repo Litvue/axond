@@ -1,5 +1,7 @@
 # Secret material in the stateful control plane
 
+> **Withdrawn control plane ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** `[secret_store]` is a boot error. Historical record of the pre-0063 envelope-encrypted store.
+
 The stateless deployment keeps provider credentials in environment variables:
 TOML carries a reference, the process reads the value at boot, and nothing
 durable ever holds it. The stateful control plane adds a second path — an

@@ -5304,7 +5304,7 @@ fn serve_snapshot(snapshot: crate::state::ConfigSnapshot) -> AppState {
     // are not request-path NamespaceIds. Rebuild the compiled aliases onto the
     // bootstrap `platform` key so the probe is a real GET /ns/platform/v1/models.
     let mut config = crate::convergence::compile::testing::bootstrap();
-    config.mode = crate::config::Mode::Stateless;
+    config.mode = Some(crate::config::Mode::Stateless);
     config.model = snapshot.config.model;
     for model in &mut config.model {
         model.namespace = None;
@@ -5487,7 +5487,7 @@ async fn hydrate_binding_still_boots_axond_example_toml_unchanged() {
     let toml = std::fs::read_to_string(&path).expect("axond.example.toml is shipped");
     let config = crate::config::Config::from_toml_str(&toml)
         .expect("axond.example.toml must still boot unchanged");
-    assert_eq!(config.mode, crate::config::Mode::Stateless);
+    assert!(!config.is_stateful());
     let gpt4o: Vec<_> = config
         .model
         .iter()

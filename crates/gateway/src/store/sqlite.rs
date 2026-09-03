@@ -7,8 +7,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, UsageAppend, UsageSummaryRow,
-    from_sql_amount, sql_amount, sql_amount_saturating,
+    BudgetRecord, BudgetReserve, NamespaceRecord, ProviderModels, Store, StoreError, UsageAppend,
+    UsageSummaryRow, from_sql_amount, sql_amount, sql_amount_saturating,
 };
 
 pub struct SqliteStore {
@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS axond_namespace (
     id TEXT PRIMARY KEY NOT NULL,
     attrs TEXT NOT NULL DEFAULT '{}',
     blocklist TEXT
+);
+CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (
+    id TEXT PRIMARY KEY NOT NULL,
+    n INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS axond_store_budget (
     namespace TEXT NOT NULL,
@@ -37,10 +41,18 @@ CREATE TABLE IF NOT EXISTS axond_store_budget_reservation (
     namespace TEXT NOT NULL,
     period TEXT NOT NULL,
     amount_microdollars INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL
+    expires_at INTEGER NOT NULL,
+    incarnation INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx
     ON axond_store_budget_reservation (namespace, period, expires_at);
+CREATE TABLE IF NOT EXISTS axond_store_budget_reservation_tombstone (
+    id TEXT PRIMARY KEY NOT NULL,
+    incarnation INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_tombstone_expires_idx
+    ON axond_store_budget_reservation_tombstone (expires_at);
 CREATE TABLE IF NOT EXISTS axond_store_usage (
     request_id TEXT PRIMARY KEY NOT NULL,
     namespace TEXT NOT NULL,
@@ -52,6 +64,13 @@ CREATE TABLE IF NOT EXISTS axond_store_usage (
 );
 CREATE INDEX IF NOT EXISTS axond_store_usage_ns_period
     ON axond_store_usage (namespace, period);
+CREATE TABLE IF NOT EXISTS axond_store_provider_models (
+    provider TEXT PRIMARY KEY NOT NULL,
+    fetched_at TEXT,
+    stale INTEGER NOT NULL,
+    models TEXT NOT NULL,
+    source TEXT
+);
 ";
 
 impl SqliteStore {
@@ -62,6 +81,9 @@ impl SqliteStore {
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(unavailable)?;
         conn.execute_batch(SCHEMA).map_err(unavailable)?;
+        migrate_reservation_incarnation(&conn)?;
+        migrate_tombstone_expires_at(&conn)?;
+        migrate_provider_models_source(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -125,6 +147,84 @@ fn unavailable(err: rusqlite::Error) -> StoreError {
     StoreError::Unavailable(err.to_string())
 }
 
+/// `CREATE TABLE IF NOT EXISTS` does not add columns to an existing file.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(unavailable)?;
+    let mut rows = stmt.query([]).map_err(unavailable)?;
+    while let Some(row) = rows.next().map_err(unavailable)? {
+        let name: String = row.get(1).map_err(unavailable)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_reservation_incarnation(conn: &Connection) -> Result<(), StoreError> {
+    if !table_has_column(conn, "axond_store_budget_reservation", "incarnation")? {
+        conn.execute(
+            "ALTER TABLE axond_store_budget_reservation
+             ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
+
+fn migrate_tombstone_expires_at(conn: &Connection) -> Result<(), StoreError> {
+    if !table_has_column(
+        conn,
+        "axond_store_budget_reservation_tombstone",
+        "expires_at",
+    )? {
+        conn.execute(
+            "ALTER TABLE axond_store_budget_reservation_tombstone
+             ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
+
+fn migrate_provider_models_source(conn: &Connection) -> Result<(), StoreError> {
+    if !table_has_column(conn, "axond_store_provider_models", "source")? {
+        conn.execute(
+            "ALTER TABLE axond_store_provider_models ADD COLUMN source TEXT",
+            [],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
+
+fn current_incarnation(conn: &Connection, id: &str) -> Result<i64, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT n FROM axond_namespace_incarnation WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(unavailable)?
+        .unwrap_or(1))
+}
+
+fn namespace_exists(conn: &Connection, id: &str) -> Result<bool, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM axond_namespace WHERE id = ?1",
+            params![id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(unavailable)?
+        .is_some())
+}
+
 fn insert_usage(conn: &Connection, event: &UsageAppend) -> Result<(), StoreError> {
     let cost = event.cost_microdollars.map(sql_amount_saturating);
     conn.execute(
@@ -175,11 +275,23 @@ impl Store for SqliteStore {
                 .blocklist
                 .as_ref()
                 .map(|list| serde_json::to_string(list).unwrap_or_else(|_| "[]".into()));
-            match conn.execute(
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(unavailable)?;
+            match tx.execute(
                 "INSERT INTO axond_namespace (id, attrs, blocklist) VALUES (?1, ?2, ?3)",
                 params![ns.id, attrs, blocklist],
             ) {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    tx.execute(
+                        "INSERT INTO axond_namespace_incarnation (id, n) VALUES (?1, 1)
+                         ON CONFLICT(id) DO NOTHING",
+                        params![ns.id],
+                    )
+                    .map_err(unavailable)?;
+                    tx.commit().map_err(unavailable)?;
+                    Ok(())
+                }
                 Err(rusqlite::Error::SqliteFailure(err, _))
                     if err.code == rusqlite::ErrorCode::ConstraintViolation =>
                 {
@@ -294,9 +406,34 @@ impl Store for SqliteStore {
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError> {
         let id = id.to_string();
         self.with_conn(move |conn| {
-            let n = conn
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(unavailable)?;
+            let existed = namespace_exists(&tx, &id)?;
+            if existed {
+                // Keep reservation rows. Implicit n=1 when the companion row
+                // is missing (legacy id).
+                tx.execute(
+                    "INSERT INTO axond_namespace_incarnation (id, n) VALUES (?1, 2)
+                     ON CONFLICT(id) DO UPDATE SET n = n + 1",
+                    params![id],
+                )
+                .map_err(unavailable)?;
+            }
+            tx.execute(
+                "DELETE FROM axond_store_budget WHERE namespace = ?1",
+                params![id],
+            )
+            .map_err(unavailable)?;
+            tx.execute(
+                "DELETE FROM axond_store_budget_active WHERE namespace = ?1",
+                params![id],
+            )
+            .map_err(unavailable)?;
+            let n = tx
                 .execute("DELETE FROM axond_namespace WHERE id = ?1", params![id])
                 .map_err(unavailable)?;
+            tx.commit().map_err(unavailable)?;
             Ok(n > 0)
         })
         .await
@@ -322,16 +459,7 @@ impl Store for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(unavailable)?;
-            let exists: bool = tx
-                .query_row(
-                    "SELECT 1 FROM axond_namespace WHERE id = ?1",
-                    params![namespace],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(unavailable)?
-                .is_some();
-            if !exists {
+            if !namespace_exists(&tx, &namespace)? {
                 return Err(StoreError::NotFound(namespace));
             }
             tx.execute(
@@ -393,6 +521,25 @@ impl Store for SqliteStore {
                 return Ok(BudgetReserve::Exceeded);
             };
             let now = now_ms();
+            let incarnation = current_incarnation(&tx, &namespace)?;
+            // Vacuum tombstones whose retention has elapsed. Copy newly
+            // expired holds with now()+ttl so a late settle after later
+            // admissions can still charge this incarnation.
+            tx.execute(
+                "DELETE FROM axond_store_budget_reservation_tombstone
+                 WHERE expires_at < ?1",
+                params![now],
+            )
+            .map_err(unavailable)?;
+            let retained_until = now.saturating_add(ttl_ms);
+            tx.execute(
+                "INSERT OR REPLACE INTO axond_store_budget_reservation_tombstone
+                    (id, incarnation, expires_at)
+                 SELECT id, incarnation, ?3 FROM axond_store_budget_reservation
+                 WHERE namespace = ?1 AND expires_at <= ?2",
+                params![namespace, now, retained_until],
+            )
+            .map_err(unavailable)?;
             tx.execute(
                 "DELETE FROM axond_store_budget_reservation
                  WHERE namespace = ?1 AND expires_at <= ?2",
@@ -418,8 +565,9 @@ impl Store for SqliteStore {
             let reserved: i64 = tx
                 .query_row(
                     "SELECT COALESCE(SUM(amount_microdollars), 0) FROM axond_store_budget_reservation
-                     WHERE namespace = ?1 AND period = ?2 AND expires_at > ?3",
-                    params![namespace, period, now],
+                     WHERE namespace = ?1 AND period = ?2 AND expires_at > ?3
+                       AND incarnation = ?4",
+                    params![namespace, period, now, incarnation],
                     |row| row.get(0),
                 )
                 .map_err(unavailable)?;
@@ -430,9 +578,16 @@ impl Store for SqliteStore {
             let expires_at = now.saturating_add(ttl_ms);
             tx.execute(
                 "INSERT INTO axond_store_budget_reservation
-                    (id, namespace, period, amount_microdollars, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![reservation_id, namespace, period, estimate, expires_at],
+                    (id, namespace, period, amount_microdollars, expires_at, incarnation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    reservation_id,
+                    namespace,
+                    period,
+                    estimate,
+                    expires_at,
+                    incarnation
+                ],
             )
             .map_err(unavailable)?;
             tx.commit().map_err(unavailable)?;
@@ -456,21 +611,46 @@ impl Store for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(unavailable)?;
-            tx.execute(
-                "DELETE FROM axond_store_budget_reservation WHERE id = ?1",
-                params![reservation_id],
-            )
-            .map_err(unavailable)?;
-            tx.execute(
-                "UPDATE axond_store_budget
-                 SET spent_microdollars = CASE
-                     WHEN spent_microdollars >= 9223372036854775807 - ?1 THEN 9223372036854775807
-                     ELSE spent_microdollars + ?1
-                 END
-                 WHERE namespace = ?2 AND period = ?3",
-                params![actual, namespace, period],
-            )
-            .map_err(unavailable)?;
+            let held_incarnation: Option<i64> = tx
+                .query_row(
+                    "DELETE FROM axond_store_budget_reservation WHERE id = ?1
+                     RETURNING incarnation",
+                    params![reservation_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(unavailable)?;
+            let held_incarnation = match held_incarnation {
+                Some(n) => Some(n),
+                None => tx
+                    .query_row(
+                        "DELETE FROM axond_store_budget_reservation_tombstone WHERE id = ?1
+                         RETURNING incarnation",
+                        params![reservation_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(unavailable)?,
+            };
+            let ns_exists = namespace_exists(&tx, &namespace)?;
+            let current = current_incarnation(&tx, &namespace)?;
+            // Unknown reservation id (no row, no tombstone) is a no-op.
+            let charge = match held_incarnation {
+                Some(incarnation) => ns_exists && incarnation == current,
+                None => false,
+            };
+            if charge {
+                tx.execute(
+                    "UPDATE axond_store_budget
+                     SET spent_microdollars = CASE
+                         WHEN spent_microdollars >= 9223372036854775807 - ?1 THEN 9223372036854775807
+                         ELSE spent_microdollars + ?1
+                     END
+                     WHERE namespace = ?2 AND period = ?3",
+                    params![actual, namespace, period],
+                )
+                .map_err(unavailable)?;
+            }
             tx.commit().map_err(unavailable)?;
             Ok(())
         })
@@ -537,6 +717,153 @@ impl Store for SqliteStore {
         })
         .await
     }
+
+    async fn get_provider_models(
+        &self,
+        provider: &str,
+    ) -> Result<Option<ProviderModels>, StoreError> {
+        let provider = provider.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT provider, fetched_at, stale, models, source
+                 FROM axond_store_provider_models WHERE provider = ?1",
+                params![provider],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(unavailable)?
+            .map(|(provider, fetched_at, stale, models, source)| {
+                sqlite_provider_models(provider, fetched_at, stale, models, source)
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT provider, fetched_at, stale, models, source
+                     FROM axond_store_provider_models ORDER BY provider",
+                )
+                .map_err(unavailable)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .map_err(unavailable)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (provider, fetched_at, stale, models, source) = row.map_err(unavailable)?;
+                out.push(sqlite_provider_models(
+                    provider, fetched_at, stale, models, source,
+                )?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
+        self.with_conn(move |conn| {
+            let models = serde_json::to_string(&row.data).map_err(|error| {
+                StoreError::Unavailable(format!("provider `{}` models: {error}", row.provider))
+            })?;
+            conn.execute(
+                "INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (provider) DO UPDATE SET
+                    fetched_at = excluded.fetched_at,
+                    stale = excluded.stale,
+                    models = excluded.models,
+                    source = excluded.source
+                 WHERE axond_store_provider_models.source IS NOT DISTINCT FROM excluded.source
+                    OR axond_store_provider_models.stale = 1",
+                params![
+                    row.provider,
+                    row.fetched_at,
+                    if row.stale { 1 } else { 0 },
+                    models,
+                    row.source,
+                ],
+            )
+            .map_err(unavailable)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn mark_provider_models_stale_unless_source(
+        &self,
+        provider: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let provider = provider.to_string();
+        let source = source.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE axond_store_provider_models SET stale = 1
+                 WHERE provider = ?1 AND (source IS NULL OR source != ?2)",
+                params![provider, source],
+            )
+            .map_err(unavailable)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn mark_provider_models_stale_if_source(
+        &self,
+        provider: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let provider = provider.to_string();
+        let source = source.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE axond_store_provider_models SET stale = 1
+                 WHERE provider = ?1 AND source IS NOT NULL AND source = ?2",
+                params![provider, source],
+            )
+            .map_err(unavailable)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn sqlite_provider_models(
+    provider: String,
+    fetched_at: Option<String>,
+    stale: i64,
+    models: String,
+    source: Option<String>,
+) -> Result<ProviderModels, StoreError> {
+    let data: Vec<Value> = serde_json::from_str(&models).map_err(|error| {
+        StoreError::Unavailable(format!("provider `{provider}` models: {error}"))
+    })?;
+    Ok(ProviderModels {
+        provider,
+        fetched_at,
+        stale: stale != 0,
+        data,
+        source,
+    })
 }
 
 fn now_ms() -> i64 {
@@ -562,6 +889,9 @@ fn read_budget(
                  WHERE r.namespace = b.namespace
                    AND r.period = b.period
                    AND r.expires_at > ?3
+                   AND r.incarnation = COALESCE((
+                       SELECT n FROM axond_namespace_incarnation i WHERE i.id = b.namespace
+                   ), 1)
              ), 0),
              EXISTS (
                  SELECT 1 FROM axond_store_budget_active a
@@ -755,6 +1085,371 @@ mod tests {
         assert_eq!(n, 0, "denied admission must keep the expiry delete");
     }
 
+    #[tokio::test]
+    async fn delete_drops_budget_tables_and_keeps_usage_rows() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        store
+            .append_usage(UsageAppend {
+                request_id: "req_1".into(),
+                namespace: "wsp_x".into(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(5),
+            })
+            .await
+            .expect("usage");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        let (budget, active, reservations, usage): (i64, i64, i64, i64) = {
+            let conn = store.conn.lock().expect("lock");
+            let count = |sql: &str| conn.query_row(sql, [], |row| row.get(0)).expect("count");
+            (
+                count("SELECT count(*) FROM axond_store_budget WHERE namespace = 'wsp_x'"),
+                count("SELECT count(*) FROM axond_store_budget_active WHERE namespace = 'wsp_x'"),
+                count(
+                    "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
+                ),
+                count("SELECT count(*) FROM axond_store_usage WHERE namespace = 'wsp_x'"),
+            )
+        };
+        assert_eq!((budget, active, reservations, usage), (0, 0, 1, 1));
+        assert!(store.get_namespace("wsp_x").await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn seed_restores_a_toml_listed_id_after_store_delete() {
+        let path = std::env::temp_dir().join(format!(
+            "axond-seed-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let path_str = path.to_str().expect("utf8 path");
+        let store = SqliteStore::open(path_str).expect("open");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_seed".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("put");
+        assert!(store.delete_namespace("wsp_seed").await.expect("delete"));
+        drop(store);
+        let store = SqliteStore::open(path_str).expect("reopen");
+        let toml_ns = crate::config::Namespace {
+            id: "wsp_seed".into(),
+            default: false,
+            allow_platform_fallback: false,
+            project: None,
+            policy: None,
+            static_policy: None,
+        };
+        super::super::seed_config_namespaces(&store, &[toml_ns])
+            .await
+            .expect("seed");
+        assert!(
+            store
+                .get_namespace("wsp_seed")
+                .await
+                .expect("get")
+                .is_some(),
+            "a TOML-listed id is restored on seed; HTTP DELETE of those ids is 409"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn settle_after_recreate_does_not_charge_new_budget() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        store
+            .reserve_budget("wsp_x", 77, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        let rec = store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("new ledger");
+        assert_eq!(rec.spent_microdollars, 0);
+        assert_eq!(rec.reserved_microdollars, 0);
+        store
+            .settle_budget("wsp_x", "p", "r1", 77)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 0);
+        let holds: i64 = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation WHERE id = 'r1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(holds, 0, "old hold is dropped even when spend is skipped");
+    }
+
+    #[tokio::test]
+    async fn reserve_reclaims_expired_holds_of_any_incarnation() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "old")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("new ledger");
+        store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "new")
+            .await
+            .expect("expire path");
+        let (old, n): (i64, i64) = {
+            let conn = store.conn.lock().expect("lock");
+            let count = |sql: &str| conn.query_row(sql, [], |row| row.get(0)).expect("count");
+            (
+                count("SELECT count(*) FROM axond_store_budget_reservation WHERE id = 'old'"),
+                count(
+                    "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
+                ),
+            )
+        };
+        assert_eq!(old, 0, "expired prior-incarnation hold must be reclaimed");
+        assert_eq!(n, 1);
+        store
+            .settle_budget("wsp_x", "p", "old", 10)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
+    }
+
+    #[tokio::test]
+    async fn unexpired_prior_incarnation_hold_survives_reserve() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_secs(30), "old")
+            .await
+            .expect("hold");
+        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("new ledger");
+        store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "new")
+            .await
+            .expect("live hold");
+        let n: i64 = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(
+            n, 2,
+            "unexpired prior-incarnation hold stays until settle or TTL"
+        );
+        store
+            .settle_budget("wsp_x", "p", "old", 10)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_reservation_settle_is_a_noop() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        store
+            .reserve_budget("wsp_x", 80, Duration::from_secs(30), "r1")
+            .await
+            .expect("hold");
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "DELETE FROM axond_store_budget_reservation WHERE id = 'r1'",
+                [],
+            )
+            .expect("drop hold");
+        }
+        store
+            .settle_budget("wsp_x", "p", "r1", 11)
+            .await
+            .expect("unknown id");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_tombstone_is_vacuumed_on_reserve_and_late_settle_is_noop() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store
+            .put_budget("wsp_x", "p", 10_000)
+            .await
+            .expect("budget");
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO axond_store_budget_reservation_tombstone
+                    (id, incarnation, expires_at) VALUES ('stale', 1, 1)",
+                [],
+            )
+            .expect("past tombstone");
+        }
+        store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "live")
+            .await
+            .expect("reserve vacuums");
+        let leftover: i64 = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation_tombstone
+                 WHERE id = 'stale'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(leftover, 0, "past-expiry tombstone must be vacuumed");
+        store
+            .settle_budget("wsp_x", "p", "stale", 99)
+            .await
+            .expect("late settle");
+        let got = store
+            .get_budget("wsp_x", "p")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.spent_microdollars, 0);
+        assert_eq!(got.reserved_microdollars, 1);
+    }
+
     #[test]
     fn budget_tables_use_store_prefix() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
@@ -778,9 +1473,254 @@ mod tests {
         assert!(
             names
                 .iter()
+                .any(|n| n == "axond_store_budget_reservation_tombstone")
+        );
+        assert!(
+            names
+                .iter()
                 .any(|n| n == "axond_store_budget_reservation_scope_idx")
         );
+        assert!(names.iter().any(|n| n == "axond_store_provider_models"));
         assert!(!names.iter().any(|n| n == "axond_budget"));
         assert!(!names.iter().any(|n| n == "axond_budget_reservation"));
+    }
+
+    #[test]
+    fn migrate_reservation_incarnation_adds_column_when_pragma_shows_it_absent() {
+        let conn = Connection::open_in_memory().expect("memory");
+        conn.execute_batch(
+            "CREATE TABLE axond_store_budget_reservation (
+                id TEXT PRIMARY KEY NOT NULL,
+                namespace TEXT NOT NULL,
+                period TEXT NOT NULL,
+                amount_microdollars INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )",
+        )
+        .expect("legacy table");
+        migrate_reservation_incarnation(&conn).expect("add");
+        migrate_reservation_incarnation(&conn).expect("idempotent");
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(axond_store_budget_reservation)")
+                .expect("pragma");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query")
+                .map(|row| row.expect("name"))
+                .collect()
+        };
+        assert!(names.iter().any(|n| n == "incarnation"));
+    }
+
+    #[test]
+    fn migrate_tombstone_expires_at_adds_column_when_pragma_shows_it_absent() {
+        let conn = Connection::open_in_memory().expect("memory");
+        conn.execute_batch(
+            "CREATE TABLE axond_store_budget_reservation_tombstone (
+                id TEXT PRIMARY KEY NOT NULL,
+                incarnation INTEGER NOT NULL
+            )",
+        )
+        .expect("legacy table");
+        migrate_tombstone_expires_at(&conn).expect("add");
+        migrate_tombstone_expires_at(&conn).expect("idempotent");
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(axond_store_budget_reservation_tombstone)")
+                .expect("pragma");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query")
+                .map(|row| row.expect("name"))
+                .collect()
+        };
+        assert!(names.iter().any(|n| n == "expires_at"));
+    }
+
+    #[tokio::test]
+    async fn provider_models_cache_keeps_last_good_when_marked_stale() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let good = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:00:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "gpt-4o", "object": "model"})],
+            source: Some("https://api.openai.com/v1".into()),
+        };
+        store.put_provider_models(good.clone()).await.expect("put");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, good);
+        store
+            .mark_provider_models_stale_if_source("openai", "https://api.openai.com/v1")
+            .await
+            .expect("stale");
+        let stale = store
+            .get_provider_models("openai")
+            .await
+            .expect("get stale")
+            .expect("row");
+        assert!(stale.stale);
+        assert_eq!(stale.data, good.data);
+        assert_eq!(stale.fetched_at, good.fetched_at);
+        assert_eq!(stale.source, good.source);
+        store
+            .mark_provider_models_stale_if_source("missing", "https://api.openai.com/v1")
+            .await
+            .expect("missing mark");
+        assert!(
+            store
+                .get_provider_models("missing")
+                .await
+                .expect("missing")
+                .is_none()
+        );
+        let listed = store.list_provider_models().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn provider_models_source_stale_does_not_replace_matching_source() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let old = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:00:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "old", "object": "model"})],
+            source: Some("https://api.openai.com/v1".into()),
+        };
+        store.put_provider_models(old.clone()).await.expect("put");
+        store
+            .mark_provider_models_stale_unless_source("openai", "https://example.invalid/v1")
+            .await
+            .expect("mismatch");
+        let stale = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(stale.stale);
+        assert_eq!(stale.data, old.data);
+        assert_eq!(stale.source, old.source);
+
+        let fresh = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(fresh.clone()).await.expect("put");
+        store
+            .mark_provider_models_stale_unless_source("openai", "https://example.invalid/v1")
+            .await
+            .expect("match is no-op");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, fresh);
+    }
+
+    #[tokio::test]
+    async fn provider_models_failed_refresh_does_not_stale_a_newer_source() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let fresh = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(fresh.clone()).await.expect("put");
+        store
+            .mark_provider_models_stale_if_source("openai", "https://api.openai.com/v1")
+            .await
+            .expect("old source");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, fresh);
+        store
+            .mark_provider_models_stale_if_source("openai", "https://example.invalid/v1")
+            .await
+            .expect("matching source");
+        let stale = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(stale.stale);
+        assert_eq!(stale.data, fresh.data);
+        assert_eq!(stale.source, fresh.source);
+    }
+
+    #[tokio::test]
+    async fn provider_models_put_does_not_replace_a_newer_source() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let neu = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(neu.clone()).await.expect("new");
+        let old = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:02:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "old", "object": "model"})],
+            source: Some("https://api.openai.com/v1".into()),
+        };
+        store.put_provider_models(old).await.expect("old put");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, neu);
+    }
+
+    #[tokio::test]
+    async fn provider_models_mark_unless_then_put_replaces_fresh_foreign() {
+        // Store hole discovery must not hit on later rounds: marking a
+        // foreign row stale opens the put CAS for an old URL.
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let neu = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(neu.clone()).await.expect("new");
+        store
+            .mark_provider_models_stale_unless_source("openai", "https://api.openai.com/v1")
+            .await
+            .expect("mark");
+        let old = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:02:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "old", "object": "model"})],
+            source: Some("https://api.openai.com/v1".into()),
+        };
+        store
+            .put_provider_models(old.clone())
+            .await
+            .expect("old put");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, old);
     }
 }

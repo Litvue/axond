@@ -19,7 +19,7 @@ use utoipa::{Modify, OpenApi, ToSchema};
 use crate::error::GatewayError;
 use crate::state::AppState;
 use crate::store::{
-    BudgetRecord, NamespaceRecord, Store, StoreError, UsageSummary, validate_attrs,
+    BudgetRecord, NamespaceRecord, ProviderModels, Store, StoreError, UsageSummary, validate_attrs,
     validate_namespace_id, validate_period,
 };
 
@@ -38,13 +38,17 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/namespaces/{ns}",
-            get(get_namespace).put(put_namespace),
+            get(get_namespace)
+                .put(put_namespace)
+                .delete(delete_namespace),
         )
         .route(
             "/api/v1/namespaces/{ns}/budgets/{period}",
             get(get_budget).put(put_budget),
         )
         .route("/api/v1/namespaces/{ns}/usage", get(get_usage))
+        .route("/api/v1/providers/models", get(list_provider_models))
+        .route("/api/v1/providers/{id}/models", get(get_provider_models))
         .layer(DefaultBodyLimit::max(MANAGEMENT_MAX_REQUEST_BYTES))
         .with_state(state)
 }
@@ -83,9 +87,10 @@ impl Modify for GatewayKeySecurity {
     servers((url = "/", description = "This gateway")),
     tags(
         (name = "spec", description = "Generated OpenAPI document"),
-        (name = "namespaces", description = "Namespace CRUD minus delete"),
+        (name = "namespaces", description = "Namespace CRUD"),
         (name = "budgets", description = "Per-namespace per-period ledger"),
-        (name = "usage", description = "Usage summary by model and status")
+        (name = "usage", description = "Usage summary by model and status"),
+        (name = "providers", description = "Cached upstream model listings")
     ),
     paths(
         openapi_spec,
@@ -93,9 +98,12 @@ impl Modify for GatewayKeySecurity {
         list_namespaces,
         get_namespace,
         put_namespace,
+        delete_namespace,
         put_budget,
         get_budget,
-        get_usage
+        get_usage,
+        list_provider_models,
+        get_provider_models
     ),
     modifiers(&GatewayKeySecurity),
     security(("gateway_key" = []))
@@ -110,9 +118,9 @@ struct ErrorEnvelope {
 
 #[derive(Debug, Serialize, ToSchema)]
 struct TypedError {
-    /// Stable code: `unknown_namespace`, `unknown_budget`, `namespace_conflict`,
-    /// `store_unavailable`, `bad_request`, `unauthorized`, `request_too_large`,
-    /// or `unsupported_media_type`.
+    /// Stable code: `unknown_namespace`, `unknown_budget`, `unknown_provider`,
+    /// `namespace_conflict`, `store_unavailable`, `bad_request`, `unauthorized`,
+    /// `request_too_large`, or `unsupported_media_type`.
     #[serde(rename = "type")]
     r#type: String,
     message: String,
@@ -159,6 +167,11 @@ struct ListBody {
     data: Vec<NamespaceRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct ProviderModelsList {
+    data: Vec<ProviderModels>,
 }
 
 fn store(state: &AppState) -> Result<&Arc<dyn Store>, GatewayError> {
@@ -336,6 +349,39 @@ async fn put_namespace(
     }
 }
 
+/// Idempotent remove. Missing id is 204; live budget rows go with it.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/namespaces/{ns}",
+    tag = "namespaces",
+    params(("ns" = String, Path, description = "Namespace id")),
+    responses(
+        (status = 204, description = "Deleted, or already absent"),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 409, description = "`namespace_conflict` when `{ns}` is still in the deployment file", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
+async fn delete_namespace(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<StatusCode, GatewayError> {
+    if state
+        .config()
+        .config
+        .namespace
+        .iter()
+        .any(|namespace| namespace.id == ns)
+    {
+        return Err(GatewayError::NamespaceConflict);
+    }
+    match store(&state)?.delete_namespace(&ns).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
+        Err(err) => Err(GatewayError::BadRequest(err.to_string())),
+    }
+}
+
 /// Set the period limit and mark it as the namespace's active period.
 #[utoipa::path(
     put,
@@ -488,6 +534,76 @@ async fn get_usage(
     }
 }
 
+/// Cached upstream listing for one configured provider.
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/{id}/models",
+    tag = "providers",
+    params(("id" = String, Path, description = "Configured provider id")),
+    responses(
+        (status = 200, description = "Cached listing, possibly stale", body = ProviderModels),
+        (status = 400, description = "`unknown_provider`", body = ErrorEnvelope),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
+async fn get_provider_models(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ProviderModels>, GatewayError> {
+    let snapshot = state.config();
+    let Some(provider) = snapshot
+        .config
+        .provider
+        .iter()
+        .find(|provider| provider.id == id)
+    else {
+        return Err(GatewayError::UnknownProvider(id));
+    };
+    match store(&state)?.get_provider_models(&id).await {
+        Ok(Some(row)) => Ok(Json(row.against_source(&provider.base_url))),
+        Ok(None) => Ok(Json(ProviderModels::empty_stale(id))),
+        Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
+        Err(err) => Err(GatewayError::BadRequest(err.to_string())),
+    }
+}
+
+/// Fan-out of the cached listing across every configured provider.
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/models",
+    tag = "providers",
+    responses(
+        (status = 200, description = "Per-provider cached listings", body = ProviderModelsList),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
+async fn list_provider_models(
+    State(state): State<AppState>,
+) -> Result<Json<ProviderModelsList>, GatewayError> {
+    let snapshot = state.config();
+    let cached = match store(&state)?.list_provider_models().await {
+        Ok(rows) => rows,
+        Err(StoreError::Unavailable(_)) => return Err(GatewayError::StoreUnavailable),
+        Err(err) => return Err(GatewayError::BadRequest(err.to_string())),
+    };
+    let data = snapshot
+        .config
+        .provider
+        .iter()
+        .map(|provider| {
+            cached
+                .iter()
+                .find(|row| row.provider == provider.id)
+                .cloned()
+                .map(|row| row.against_source(&provider.base_url))
+                .unwrap_or_else(|| ProviderModels::empty_stale(provider.id.clone()))
+        })
+        .collect();
+    Ok(Json(ProviderModelsList { data }))
+}
+
 impl IntoResponse for StoreError {
     fn into_response(self) -> axum::response::Response {
         GatewayError::from(self).into_response()
@@ -525,6 +641,8 @@ mod tests {
             "/api/v1/namespaces/{ns}",
             "/api/v1/namespaces/{ns}/budgets/{period}",
             "/api/v1/namespaces/{ns}/usage",
+            "/api/v1/providers/{id}/models",
+            "/api/v1/providers/models",
         ] {
             assert!(paths.contains_key(path), "missing {path}");
         }
@@ -532,19 +650,23 @@ mod tests {
         assert!(paths["/api/v1/namespaces"].get("get").is_some());
         assert!(paths["/api/v1/namespaces/{ns}"].get("get").is_some());
         assert!(paths["/api/v1/namespaces/{ns}"].get("put").is_some());
-        assert!(
-            paths["/api/v1/namespaces/{ns}"].get("delete").is_none(),
-            "DELETE is a later slice"
-        );
+        assert!(paths["/api/v1/namespaces/{ns}"].get("delete").is_some());
         assert!(
             paths["/api/v1/namespaces/{ns}/budgets/{period}"]["get"]["responses"]
                 .get("400")
                 .is_some(),
             "invalid period is a typed 400"
         );
+        assert!(paths["/api/v1/providers/{id}/models"].get("get").is_some());
+        assert!(paths["/api/v1/providers/models"].get("get").is_some());
         assert!(
-            paths.keys().all(|path| !path.contains("/providers")),
-            "discovery is a later slice: {paths:?}"
+            paths
+                .keys()
+                .filter(|path| path.contains("/providers"))
+                .all(|path| {
+                    *path == "/api/v1/providers/{id}/models" || *path == "/api/v1/providers/models"
+                }),
+            "only the two discovery routes are mounted: {paths:?}"
         );
 
         let usage = &paths["/api/v1/namespaces/{ns}/usage"]["get"];
@@ -559,6 +681,9 @@ mod tests {
         let scheme = &spec["components"]["securitySchemes"]["gateway_key"];
         assert_eq!(scheme["type"], "http");
         assert_eq!(scheme["scheme"], "bearer");
+
+        let models = &spec["components"]["schemas"]["ProviderModels"]["properties"];
+        assert!(models.get("source").is_none(), "cache source is internal");
 
         if let Ok(path) = std::env::var("AXOND_OPENAPI_OUT") {
             let pretty = serde_json::to_vec_pretty(&spec).expect("pretty spec");

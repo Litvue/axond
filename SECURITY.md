@@ -21,7 +21,7 @@ into a public issue.
 A useful report contains:
 
 - the axond version (`axond --version`) or commit, and the deployment shape
-  (single binary, container, Compose, Kubernetes) and [state tier](./docs/configuration.md#state-tiers);
+  (single binary, container, Compose, Kubernetes) and [Store backend](./docs/configuration.md#state-tiers);
 - the configuration that reproduces it, with credentials removed — config is a
   public interface here, and most reachability questions are answered by it;
 - what an attacker gains, and which trust boundary from the
@@ -34,8 +34,8 @@ Please do not run tests against infrastructure you do not operate.
 ### In scope
 
 The gateway and its libraries as configured by a documented deployment:
-authentication and minted tokens (issuance, scope, revocation, epochs),
-namespace and tenant isolation, credential handling and redaction, budget and
+authentication (the deployment-wide static gateway key),
+namespace isolation, credential handling and redaction, budget and
 usage integrity, the HTTP surface and its typed errors, the published crates,
 the release artifacts (binaries, images, checksums, SBOMs, attestations), and
 the installers.
@@ -109,8 +109,8 @@ to be.
    not finished; the
    [threat-model review triggers](./docs/security/threat-model-review.md) name the
    existing tests for each area, so a fix extends one of them rather than
-   inventing coverage. When the finding is a parser — configuration, a minted
-   token, a query string — that coverage is a seed in the
+   inventing coverage. When the finding is a parser — configuration, a token
+   shape, a query string — that coverage is a seed in the
    [fuzz corpora](./docs/security/fuzzing.md), so the required smoke replays the
    exact input from then on.
 3. A release from `main` through the ordinary
@@ -137,8 +137,7 @@ Prevention is documented separately, and is the more useful read if you are
 deploying rather than reporting: the
 [deployment security model](./docs/security/deployment-model.md) for trust
 boundaries, the [production checklist](./docs/deployment/production-checklist.md)
-before going live, the [minted-token guide](./docs/minted-token-guide.md) for
-scoped credentials and revocation, [fuzzing](./docs/security/fuzzing.md) for what
+before going live, the [fuzzing](./docs/security/fuzzing.md) for what
 the config, token, and query parsers are continuously tested against, and the
 [security review](./docs/security-review-2026-08-05.md) for the reviewed
 baseline.

@@ -37,11 +37,9 @@ use crate::usage::{BatchSettings, validate_table_name};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Which authority owns durable resources (ADR 0027). Omitting the key
-    /// selects `stateless`, so every configuration written before the key
-    /// existed keeps the meaning it had.
+    /// Withdrawn (ADR 0063). Presence of this key is a boot error.
     #[serde(default)]
-    pub mode: Mode,
+    pub mode: Option<Mode>,
     #[serde(default)]
     pub server: Server,
     /// Required durable store (ADR 0063). SQLite WAL or Postgres.
@@ -166,6 +164,11 @@ pub struct Config {
     /// (ADR 0043, ADR 0051).
     #[serde(default)]
     pub catalog: CatalogConfig,
+    /// Background refresh of each provider's upstream `GET /models` listing.
+    /// Default interval is five minutes; first round runs at boot. Not on the
+    /// inference path.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 /// Which authority owns durable resources for the whole process (ADR 0027).
@@ -194,6 +197,12 @@ impl Mode {
     }
 }
 
+impl Config {
+    pub fn is_stateful(&self) -> bool {
+        matches!(self.mode, Some(Mode::Stateful))
+    }
+}
+
 /// The top-level keys the `AXOND_` environment layer can address, since
 /// [`Config::load`] merges `Env::prefixed("AXOND_")` over the file.
 ///
@@ -202,7 +211,7 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 32] = [
+const OVERRIDE_KEYS: [&str; 33] = [
     "mode",
     "server",
     "storage",
@@ -235,6 +244,7 @@ const OVERRIDE_KEYS: [&str; 32] = [
     "admission",
     "revocation",
     "catalog",
+    "discovery",
 ];
 
 /// Whether one segment of a namespace id is a slug: ASCII alphanumerics, `-`,
@@ -747,6 +757,31 @@ impl AdminBreakglass {
             .filter(|id| !id.trim().is_empty())
             .or_else(|| self.source().map(|(_, reference)| reference))
             .unwrap_or("<unnamed>")
+    }
+}
+
+/// Background provider-model listing. Off the inference path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoveryConfig {
+    #[serde(default = "default_discovery_refresh_interval_seconds")]
+    pub refresh_interval_seconds: u64,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_seconds: default_discovery_refresh_interval_seconds(),
+        }
+    }
+}
+
+fn default_discovery_refresh_interval_seconds() -> u64 {
+    300
+}
+
+impl DiscoveryConfig {
+    pub fn interval(&self) -> Duration {
+        Duration::from_secs(self.refresh_interval_seconds)
     }
 }
 
@@ -2878,9 +2913,20 @@ impl Config {
         // Both modes. Before the mode match so a stateful file without
         // control_plane still fails on a withdrawn backend.
         self.validate_budget()?;
+        if self.discovery.refresh_interval_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "discovery.refresh_interval_seconds must be at least 1".into(),
+            ));
+        }
+        if self.mode.is_some() {
+            return Err(ConfigError::Invalid(
+                "`mode` is withdrawn (ADR 0063): Axond is a store-backed gateway. Remove the `mode` key."
+                    .into(),
+            ));
+        }
         match self.mode {
-            Mode::Stateless => self.validate_stateless(),
-            Mode::Stateful => self.validate_stateful(),
+            Some(Mode::Stateful) => self.validate_stateful(),
+            None | Some(Mode::Stateless) => self.validate_stateless(),
         }
     }
 
@@ -3134,7 +3180,7 @@ impl Config {
         // The empty-key refusal still applies to every candidate: this branch
         // is reachable only when at least one projected principal has already
         // passed the namespace and subject checks above.
-        if self.mode != Mode::Stateful || self.projected_principals.is_empty() {
+        if !self.is_stateful() || self.projected_principals.is_empty() {
             self.validate_gateway_keys(&namespaces)?;
         }
         self.validate_gateway_verifiers(&namespaces)?;
@@ -3149,7 +3195,7 @@ impl Config {
         // published values. The bootstrap path already validates backend
         // connectivity and layout; stateless candidates still validate their
         // complete file-owned budget.
-        if self.mode != Mode::Stateful {
+        if !self.is_stateful() {
             self.validate_budget()?;
         }
         self.validate_rate_limit()?;
@@ -3296,8 +3342,7 @@ impl Config {
             return Ok(());
         }
         Err(ConfigError::Invalid(format!(
-            "{} {} stateful bootstrap, which stateless mode never reads: add `mode = \"stateful\"` \
-             to select the control plane, or remove the section",
+            "{} {} withdrawn (ADR 0063): remove the section. Axond has no control-plane mode.",
             sections.join(", "),
             if sections.len() == 1 { "is" } else { "are" },
         )))
@@ -3765,7 +3810,13 @@ impl Config {
     ) -> Result<(), ConfigError> {
         if self.gateway_key.is_empty() {
             return Err(ConfigError::Invalid(
-                "at least one `[[gateway_key]]` is required: inbound authentication fails closed and there is no keyless mode"
+                "exactly one `[[gateway_key]]` is required: inbound authentication fails closed and there is no keyless mode"
+                    .into(),
+            ));
+        }
+        if self.gateway_key.len() > 1 {
+            return Err(ConfigError::Invalid(
+                "`[[gateway_key]]` as a per-namespace list is withdrawn (ADR 0063): declare exactly one deployment-wide static key"
                     .into(),
             ));
         }
@@ -3988,7 +4039,7 @@ impl Config {
                  published rather than declared"
             )));
         }
-        if self.mode != Mode::Stateful {
+        if !self.is_stateful() {
             return Err(ConfigError::Invalid(format!(
                 "budget `{backend}`: namespace_scope declares a layout whose cap the control \
                  plane publishes, so it is only meaningful under `mode = \"stateful\"`. Set \
@@ -4260,7 +4311,7 @@ impl Config {
             if let Some(schema) = catalog.schema.as_deref() {
                 validate_schema_name("catalog.schema", schema)?;
             }
-        } else if self.mode == Mode::Stateful {
+        } else if self.is_stateful() {
             return Err(ConfigError::Invalid(
                 "catalog `in-memory`: a stateful deployment must retain imported catalogues in \
                  `postgres`, since an in-memory store loses every snapshot and its provenance on \
@@ -4841,14 +4892,10 @@ namespace = "platform"
     fn shipped_runnable_configs_load_without_test_storage_injection() {
         for relative in [
             "axond.example.toml",
-            "axond.stateful.example.toml",
             "ops/compose/axond.quickstart.toml",
             "ops/compose/axond.stateful.toml",
-            "ops/compose/axond.blob-contract.toml",
             "tests/tier0/axond.tier0.toml",
-            "tests/tier0/axond.stateful-bootstrap.toml",
             "deploy/kubernetes/base/axond.toml",
-            "deploy/kubernetes/components/stateful/axond.toml",
             "deploy/azure-container-apps/axond.toml",
         ] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4859,8 +4906,36 @@ namespace = "platform"
         }
     }
 
+    #[test]
+    fn compose_env_example_declares_one_inbound_key() {
+        let text = repository_file("ops/compose/env.example");
+        let inbound: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && line.starts_with("GW_INBOUND_"))
+            .collect();
+        assert_eq!(
+            inbound,
+            ["GW_INBOUND_PLATFORM_KEY=quickstart-platform-key"],
+            "env.example must declare exactly one inbound key (ADR 0063):\n{text}"
+        );
+    }
+
     /// Inbound auth fails closed (ADR 0013), so a config that would leave the
     /// gateway callable without a credential is refused at boot.
+    #[test]
+    fn rejects_plural_gateway_keys() {
+        let error = Config::from_toml_str(&format!(
+            "{VALID}\n[[gateway_key]]\nenv = \"AXOND_KEY_2\"\nnamespace = \"platform\"\n"
+        ))
+        .expect_err("one deployment-wide key");
+        let message = error.to_string();
+        assert!(
+            message.contains("[[gateway_key]]") && message.contains("ADR 0063"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn rejects_a_config_with_no_gateway_keys() {
         let toml = r#"
@@ -4901,7 +4976,12 @@ base_url = "https://api.openai.com/v1"
             "env = \"\"\nfile = \"\"",
         ] {
             let result = Config::from_toml_str(&format!(
-                "{VALID}\n[[gateway_key]]\n{source}\nnamespace = \"platform\"\n"
+                "[storage]\nbackend = \"sqlite\"\npath = \":memory:\"\n\
+                 [[namespace]]\nid = \"platform\"\ndefault = true\n\
+                 [[provider]]\nid = \"openai\"\nkind = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n\
+                 [[gateway_key]]\n{source}\nnamespace = \"platform\"\n\
+                 [[price]]\nprovider = \"openai\"\nmodel = \"*\"\n\
+                 input_microdollars_per_million = 1\noutput_microdollars_per_million = 1\n"
             ));
             let err = result.expect_err("source shape must be rejected");
             assert!(err.to_string().contains("exactly one"), "{err}");
@@ -4924,20 +5004,22 @@ base_url = "https://api.openai.com/v1"
 
     #[test]
     fn blank_file_is_absent_when_gateway_key_uses_env() {
-        let config = Config::from_toml_str(&format!(
-            "{VALID}\n[[gateway_key]]\nenv = \"K\"\nfile = \"\"\nnamespace = \"platform\"\n"
-        ))
+        let config = Config::from_toml_str(
+            "[storage]\nbackend = \"sqlite\"\npath = \":memory:\"\n\
+             [[namespace]]\nid = \"platform\"\ndefault = true\n\
+             [[provider]]\nid = \"openai\"\nkind = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n\
+             [[gateway_key]]\nenv = \"K\"\nfile = \"\"\nnamespace = \"platform\"\n\
+             [[price]]\nprovider = \"openai\"\nmodel = \"*\"\n\
+             input_microdollars_per_million = 1\noutput_microdollars_per_million = 1\n",
+        )
         .expect("blank file must not count as a declared source");
         let snapshot = crate::state::ConfigSnapshot::build(
             config,
-            &std::collections::HashMap::from([
-                ("AXOND_KEY".to_owned(), "primary-secret".to_owned()),
-                ("K".to_owned(), "secondary-secret".to_owned()),
-            ]),
+            &std::collections::HashMap::from([("K".to_owned(), "secondary-secret".to_owned())]),
             0,
         )
         .expect("the non-empty env source resolves");
-        assert_eq!(snapshot.inbound_key_count(), 2);
+        assert_eq!(snapshot.inbound_key_count(), 1);
     }
 
     #[test]
@@ -6045,14 +6127,21 @@ env = "GW_ADMIN_BREAKGLASS"
     #[test]
     fn omitting_mode_means_stateless() {
         let config = Config::from_toml_str(VALID).expect("today's config still boots");
-        assert_eq!(config.mode, Mode::Stateless);
+        assert!(!config.is_stateful());
+        assert!(config.mode.is_none());
     }
 
     #[test]
-    fn declaring_stateless_explicitly_changes_nothing() {
-        let explicit = Config::from_toml_str(&format!("mode = \"stateless\"\n{VALID}"))
-            .expect("an explicit stateless mode is the same configuration");
-        assert_eq!(explicit.mode, Mode::Stateless);
+    fn mode_key_is_a_boot_error() {
+        for mode in ["stateless", "stateful"] {
+            let error = Config::from_toml_str(&format!("mode = \"{mode}\"\n{VALID}"))
+                .expect_err("mode is withdrawn");
+            let message = error.to_string();
+            assert!(
+                message.contains("`mode`") && message.contains("ADR 0063"),
+                "{mode}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -6062,8 +6151,8 @@ env = "GW_ADMIN_BREAKGLASS"
         assert!(matches!(error, ConfigError::Load(_)), "{error:?}");
     }
 
-    /// Stateful bootstrap in a stateless configuration is a forgotten `mode`
-    /// key, not an inert extra, so it is refused rather than ignored.
+    /// Withdrawn control-plane bootstrap is a boot error naming the section
+    /// (ADR 0063). Presence is never an inert extra.
     #[test]
     fn stateless_mode_rejects_stateful_bootstrap_sections() {
         for (section, snippet) in [
@@ -6081,10 +6170,11 @@ env = "GW_ADMIN_BREAKGLASS"
             ),
         ] {
             let error = Config::from_toml_str(&format!("{VALID}\n{snippet}"))
-                .expect_err("stateless mode has no control plane to bootstrap");
+                .expect_err("withdrawn control-plane bootstrap is a boot error");
+            let message = error.to_string();
             assert!(
-                matches!(error, ConfigError::Invalid(ref message) if message.contains(section)),
-                "{section}: {error:?}"
+                message.contains(section) && message.contains("ADR 0063"),
+                "{section}: {message}"
             );
         }
     }
@@ -6093,7 +6183,7 @@ env = "GW_ADMIN_BREAKGLASS"
     #[ignore = "ADR 0063: stateful/blob control plane withdrawn"]
     fn accepts_a_minimal_stateful_bootstrap() {
         let config = Config::from_toml_str(STATEFUL).expect("the approved bootstrap set validates");
-        assert_eq!(config.mode, Mode::Stateful);
+        assert_eq!(config.mode, Some(Mode::Stateful));
         assert_eq!(
             config
                 .control_plane
@@ -7064,7 +7154,7 @@ dsn_env = "AXOND_REDIS_URL"
     fn the_shipped_stateful_example_validates() {
         let config = Config::from_toml_str(&repository_file("axond.stateful.example.toml"))
             .expect("axond.stateful.example.toml must validate");
-        assert_eq!(config.mode, Mode::Stateful);
+        assert_eq!(config.mode, Some(Mode::Stateful));
         assert!(
             config.namespace.is_empty(),
             "the control plane owns tenants"
@@ -7139,7 +7229,7 @@ unpriced_models = "allow""#,
     #[test]
     fn tenancy_schemas_do_not_change_what_a_file_can_declare() {
         let config = Config::from_toml_str(VALID).expect("the stateless example still parses");
-        assert_eq!(config.mode, Mode::Stateless);
+        assert!(!config.is_stateful());
         assert_eq!(
             config
                 .namespace

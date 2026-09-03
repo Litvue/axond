@@ -67,7 +67,7 @@ shared controls, backend availability is part of admission.
 - A rejected reload leaves the prior snapshot serving; a rejected new revision
   never binds its listener.
 - Do not resolve the secret store on the request path. Axond reads material at
-  boot or reload (stateless) or while compiling a snapshot (stateful).
+  boot or reload.
 
 A worked Azure Container Apps deployment — image pin, Key Vault, probes,
 telemetry, usage, and rotation — is in

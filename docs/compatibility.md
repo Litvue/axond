@@ -9,67 +9,48 @@ breaking them is a deliberate, documented act — not that they are frozen.
 
 ## Routes
 
+Inference is namespace-prefixed. An SDK `baseURL` is `/ns/{ns}/v1` (OpenAI) or
+`/ns/{ns}` (Anthropic, which appends `/v1/messages`). Unprefixed `/v1/...` is
+not served. Management is `/api/v1`. `/admin/v1` is unmounted.
+
 | Route | Status | Wire | Streaming |
 | --- | --- | --- | --- |
-| `POST /v1/chat/completions` | **supported** | OpenAI chat completions | yes (`stream: true`) |
-| `POST /v1/messages` | **supported** | Anthropic Messages, native | yes |
-| `POST /v1/embeddings` | **supported** | OpenAI embeddings | n/a |
-| `GET /v1/models` | **supported** | the alias catalogue, gated + namespace-scoped | n/a |
-| `GET /v1/credentials` | **supported** | replica-local credential labels and circuit state, scoped | n/a |
-| `GET /admin/v1/status` | **supported** | this replica's cached dependency status, scoped and redacted | n/a |
-| `GET /admin/v1/catalogue` | **supported** (stateful only) | one tenant's management catalogue, including imported offerings that are not enabled (`unavailable` may contain `not-enabled`) | n/a |
-| `POST /admin/v1/bindings` | **supported** (stateful only) | one imported model expanded into one revision | n/a |
+| `POST /ns/{ns}/v1/chat/completions` | **supported** | OpenAI chat completions | yes (`stream: true`) |
+| `POST /ns/{ns}/v1/messages` | **supported** | Anthropic Messages, native | yes |
+| `POST /ns/{ns}/v1/embeddings` | **supported** | OpenAI embeddings | n/a |
+| `GET /ns/{ns}/v1/models` | **supported** | cached `provider-id/model-id` listings, minus the namespace blocklist | n/a |
+| `GET /ns/{ns}/v1/credentials` | **supported** | replica-local credential labels and circuit state, scoped | n/a |
+| `POST /ns/{ns}/v1/responses` | **supported** | OpenAI Responses, native passthrough | yes |
 | `GET /healthz`, `GET /readyz` | **supported** | liveness / readiness text | n/a |
-| `POST /v1/responses` | **supported** | OpenAI Responses, native passthrough | yes |
+| `GET /api/v1/openapi.json` | **supported** | OpenAPI 3.1 of the management API | n/a |
+| `POST /api/v1/namespaces` | **supported** | create `{id, attrs, blocklist?}` | n/a |
+| `GET /api/v1/namespaces` | **supported** | list, cursor-paginated | n/a |
+| `GET`/`PUT`/`DELETE /api/v1/namespaces/{ns}` | **supported** | read / replace attrs / idempotent delete | n/a |
+| `PUT`/`GET /api/v1/namespaces/{ns}/budgets/{period}` | **supported** | period cap; active period for admission | n/a |
+| `GET /api/v1/namespaces/{ns}/usage` | **supported** | summary by model and status (`period` required) | n/a |
+| `GET /api/v1/providers/{id}/models` | **supported** | cached upstream discovery | n/a |
+| `GET /api/v1/providers/models` | **supported** | fan-out of the same | n/a |
+| `POST /v1/chat/completions` | unmounted | same wire as `/ns/{ns}/v1/chat/completions` | — |
+| `POST /v1/messages` | unmounted | same wire as `/ns/{ns}/v1/messages` | — |
+| `POST /v1/embeddings` | unmounted | same wire as `/ns/{ns}/v1/embeddings` | — |
+| `GET /v1/models` | unmounted | same wire as `/ns/{ns}/v1/models` | — |
+| `GET /v1/credentials` | unmounted | same wire as `/ns/{ns}/v1/credentials` | — |
+| `POST /v1/responses` | unmounted | same wire as `/ns/{ns}/v1/responses` | — |
+| `POST /v1/tokens` | unmounted | minted-token issuance withdrawn (ADR 0063) | — |
+| `GET /admin/v1/status` | unmounted | replica diagnostic withdrawn from production `serve()` | — |
+| `GET /admin/v1/catalogue` | unmounted | control-plane catalogue withdrawn | — |
+| `POST /admin/v1/bindings` | unmounted | `axond admin model apply` withdrawn | — |
 
-Scoped minted callers receive a typed `403 token_scope_insufficient` when their
-scope does not include a route capability or the namespace cannot serve it.
-Static gateway keys and scope-less tokens retain their existing route behavior,
-including the own-namespace `/v1/credentials` view. The all-namespaces
-credential view (`?namespaces=all`) follows direct operator authority: a
-scope-less static `[[gateway_key]]` in the configured default namespace is
-admitted, while a static key in a tenant namespace and every minted token —
-including one carrying a `credentials:all` claim — receive
-`403 token_scope_insufficient`. A scoped token also needs `credentials` for the
-route. `credentials:all` remains unmintable through `POST /v1/tokens`.
+The one static `[[gateway_key]]` authenticates every `/api/v1` and `/ns/...`
+route. Minted `axt1.` tokens are `401`. The all-namespaces credential view
+(`?namespaces=all`) is admitted only for that key when its configured
+`namespace` is the file default namespace.
 
-`GET /admin/v1/status` is authenticated, and a *scoped* caller needs the `status`
-capability — which a scope-less `POST /v1/tokens` mint does **not** confer unless
-a `[gateway_minting] scope` ceiling names it ([ADR 0031]). A static
-`[[gateway_key]]` carries no scope claim and so is admitted on its namespace
-authority alone, as it is on every other capability-gated route: a tenant key
-therefore reads its own namespace's projection, which is the tenant view
-described next rather than the operator's. Its scope follows the same
-direct-operator-authority
-rule as the all-namespaces credential view: a scope-less static
-`[[gateway_key]]` in the default namespace sees every component, the deployment's
-reason codes, exact observation ages, and the revision summary, while every other
-caller sees only the components its own requests depend on, with reasons coarsened
-to `unavailable`, ages floored to whole seconds, and no revision summary. The
-summary is `null` only when the replica has no convergence reconciler. Stateful
-mode constructs one and reports desired, loaded, and active revisions plus its
-source and lag; stateless mode has no control-plane revision lifecycle and keeps
-the field `null`. Which
-components are enabled is a deployment property, so a replica with no durable
-dependency answers `200` with every component `disabled` rather than `404`. A
-replica observes the dependencies it opened — the control plane on the connection
-its administrative surface holds, and the budget, rate-limit, and revocation
-stores wherever those are backed by Redis or PostgreSQL; the secret store, the
-usage sink, the catalogue, and provider credentials stay `disabled` until the
-slice owning each one exposes a reachability seam, and a component moving from
-`disabled` to a real state is additive rather than a contract change. The route is bounded by
-its own fixed eight-deep diagnostic ceiling on answering — `503
-diagnostic_concurrency_exceeded` beyond it — rather than by
-`admission.max_in_flight`, so it stays answerable on a saturated or draining
-replica while still refusing an unbounded poller. A wider seventy-two-deep
-ceiling outside authentication refuses the same way, so a flood of credentials
-that turn out to be worthless cannot spend unbounded verification and
-revocation-store work on a route admission does not cover. That wider ceiling is
-split by what checking the credential costs — forty-eight permits for minted
-tokens, sixteen for credentials that resolve in memory, eight for callers
-presenting none — so neither a slow revocation store nor a flood that needs no
-credential can refuse the static operator key that reads status through an
-outage.
+`GET /admin/v1/status` is unmounted in production `serve()` ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md),
+[#438](https://github.com/Litvue/axond/pull/438)). A `diagnostic_router` helper
+still exists for withdrawn-tree tests; it is not composed into the listening
+app. Ask `/readyz` for load-balancer readiness and logs/metrics for Store
+health.
 
 Responses is forwarded natively with only `model` rewritten and streaming is
 byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones
@@ -81,8 +62,9 @@ failover, so a first-target outage or an exhausted first key is returned to the
 caller. Only a request with a non-empty `previous_response_id` reports
 `continuation_affinity_unavailable`; a pinned initial request that cannot use
 its target or key reports the ordinary routing, credential, or upstream error.
-`/v1/chat/completions`, `/v1/messages`, and `/v1/embeddings` keep full failover
-and credential rotation over the same aliases.
+`/ns/{ns}/v1/chat/completions`, `/ns/{ns}/v1/messages`, and
+`/ns/{ns}/v1/embeddings` keep credential-pool rotation inside one provider.
+Alias-level failover is gone ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)).
 
 ## Providers
 
@@ -98,11 +80,10 @@ field rewritten, so the caller and the target must already speak the same wire.
 
 **Cross-provider translation is explicitly deferred.** There is no path that
 converts an OpenAI chat request into an Anthropic Messages request, and none is
-planned for beta. An alias whose target — *including any failover target* —
-cannot speak the route's wire is rejected up front with
-`400 unsupported_wire`, before a budget hold or a dispatch
-([ADR 0012](./adr/0012-native-provider-routes.md), and the same guard on
-`/v1/chat/completions`).
+planned for beta. A `provider-id/model-id` whose provider `kind` cannot speak
+the route's wire is rejected up front with `400 unsupported_wire`, before a
+budget hold or a dispatch
+([ADR 0012](./adr/0012-native-provider-routes.md)).
 
 What passthrough buys: Anthropic signed thinking blocks and tool-use blocks
 survive intact — verbatim bytes on a stream, re-serialized values with the same
@@ -110,9 +91,11 @@ signatures when buffered — because nothing rewrites them.
 
 ## Clients
 
-Point any OpenAI-compatible or Anthropic SDK at the gateway's base URL with a
-gateway key as its API key. Both `Authorization: Bearer <token>` and
-`x-api-key: <token>` are accepted, so an Anthropic SDK's default works unchanged.
+Point any OpenAI-compatible SDK at `/ns/{namespace}/v1` and any Anthropic SDK
+at `/ns/{namespace}` with the deployment gateway key as its API key. Both
+`Authorization: Bearer <token>` and `x-api-key: <token>` are accepted, so an
+Anthropic SDK's default works unchanged. The request `model` is
+`provider-id/model-id`.
 
 Compatibility is enforced by CI, not asserted: two required lanes drive a real
 `axond` process with the vendors' own SDKs against committed wire fixtures, with
@@ -136,14 +119,14 @@ reject — and [`tests/compat-ts/README.md`](../tests/compat-ts/README.md) says
 what each calls for.
 
 Both lanes cover buffered and streamed chat, Responses, embeddings, native
-Anthropic Messages with thinking and tool-use blocks, the `/v1/models` catalogue,
-rejection of an unknown gateway key, and — the property no unit test can see —
-that the credential reaching the upstream is the *provider's*, never the caller's
-gateway key.
+Anthropic Messages with thinking and tool-use blocks, the `/ns/{ns}/v1/models`
+catalogue, rejection of an unknown gateway key, and — the property no unit test
+can see — that the credential reaching the upstream is the *provider's*, never
+the caller's gateway key.
 
 **Go is deliberately not covered.** A third runtime would re-assert the same
-wire; the case for one is the stateful/admin API, which is not stable yet, so
-it is revisited when that surface is.
+wire; the case for one is a generated management client, which is not an Axond
+crate.
 
 ## Supported platforms
 
@@ -398,32 +381,17 @@ version 2 transition.
 - **Deferred features arriving on a date.** Cross-provider translation and
   further usage sinks (Tinybird, ClickHouse) remain post-beta with no committed
   schedule.
-- **The stateful control plane.** `mode = "stateful"` bootstrap configuration
-  parses and validates ([ADR 0027]), and a stateful process boots and serves
-  authenticated `/admin/v1`. A complete durable revision now projects inbound
-  workload principals and can publish a serving snapshot; before one is active,
-  anonymous inference is `401 unauthorized` and an authenticated bootstrap
-  caller reaches `503 inference_unavailable`. The persistent StatefulSet/PVC
-  option can retain signed recovery caches, but neither that path nor stateful
-  fleet serving is a production-readiness promise until the current rollout and
-  endurance qualifications are retained. Neither `/admin/v1` nor the stateful
-  bootstrap surface is under the `0.x` config or HTTP promise; a stateless deployment
-  answers every `/admin/v1` resource path with `501 stateful_mode_required`, with
-  `GET /admin/v1/status` the one exception — it is a replica diagnostic rather
-  than a control-plane resource, so it answers in either mode. `POST
-  /admin/v1/bindings` is an additive route on that surface (older binaries
-  answer `404 admin_route_not_found`). Catalogue `unavailable` gained
-  `not-enabled` for imported-but-not-enabled offerings; existing reasons are
-  unchanged. See
-  [administering a stateful deployment](./operations/admin-api.md).
+- **The withdrawn control plane.** `mode`, `[control_plane]`, `[secret_store]`,
+  `[[admin_breakglass]]`, and `/admin/v1` are boot errors or unmounted
+  ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)). They are not
+  under the `0.x` HTTP promise. Historical pages remain under
+  [operations](./operations/admin-api.md).
 
-### Stateful-v2 namespace route transition (first runtime slice implemented)
+### Namespaced inference (ADR 0063)
 
-[ADR 0062](./adr/0062-blob-backed-flat-namespace-control-plane.md) accepts a
-breaking stateful redesign before the stateful surface above enters the `0.x`
-promise. The target uses blob-backed flat namespaces rather than durable
-tenants/projects/principals and mounts every provider-compatible route beneath
-`/namespaces/{namespace}` without changing its native suffix:
+Canonical inference is `/ns/{namespace}/v1/...`. [ADR 0062](./adr/0062-blob-backed-flat-namespace-control-plane.md)
+proposed `/namespaces/{namespace}` and is superseded. That longer prefix is not
+served. Historical spelling for the blob-control-plane draft:
 
 ```text
 /namespaces/{namespace}/v1/chat/completions
@@ -435,30 +403,10 @@ tenants/projects/principals and mounts every provider-compatible route beneath
 /namespaces/{namespace}/v1/tokens
 ```
 
-An SDK changes only its base URL. OpenAI-compatible clients use a base ending
-in `/namespaces/{namespace}/v1`; Anthropic clients that append `/v1/messages`
-use one ending in `/namespaces/{namespace}`. Redirects are not a migration
-mechanism for authenticated or streaming `POST` requests.
-
-The runtime implements the canonical routes and checks each path namespace
-against its authenticated grant. Existing static keys and `axt1` tokens retain
-one-namespace grants; v2 desired state can project digest-backed workload grants
-over one namespace, a bounded set, or all namespaces.
-Stateless mode also retains the legacy direct `/v1/*` mount by default for
-compatibility; it dispatches directly and never redirects. Stateful serving
-does not mount that alias and therefore never infers an inference namespace.
-Making the stateless alias explicitly configurable/opt-in, extending signed
-token claims beyond one namespace, and scheduling the alias's removal remain
-follow-up work. PostgreSQL configuration remains readable until the offline
-PostgreSQL-to-blob export and verification path has shipped for one release;
-there is no dual-write mode.
-
-Typed namespace identity, path selection, complete flat namespace projection,
-and single/set/all digest-backed workload grants are now runtime contracts. Blob
-publication/runtime wiring, configurable legacy aliases, signed-token grant
-expansion, migration tooling, and topology qualification remain migration
-commitments. The complete sequence and qualification reset are in the
-[namespace control-plane migration plan](./maintainers/namespace-control-plane-migration.md).
+Live clients use `/ns/{namespace}/v1` (OpenAI) or `/ns/{namespace}` (Anthropic).
+Redirects are not a migration mechanism for authenticated or streaming `POST`
+requests. Unprefixed `/v1/*` and `/namespaces/{namespace}` are unmounted. One
+static key authenticates every namespace path; minted `axt1` tokens are `401`.
 
 ## Supported releases and who owns each matrix
 
@@ -489,9 +437,10 @@ holds the restatement to its owner. `ops/check-docs.py` is that gate:
 Every released target is booted and served, not merely compiled. On each change
 and again at the tag, for the exact binary that is archived,
 [`ops/binary-smoke.py`](../ops/binary-smoke.py) asserts that `/healthz` and
-`/readyz` answer unauthenticated, that `/v1/models` requires a gateway key and
-lists the configured alias, that an unknown model is refused as `unknown_model`,
-and that one chat completion completes against a local fixture upstream. Each
+`/readyz` answer unauthenticated, that `/ns/{ns}/v1/models` requires a gateway
+key and lists cached `provider-id/model-id` ids, that an unprefixed model is
+refused as `model_unprefixed`, and that one chat completion completes against a
+local fixture upstream. Each
 Linux archive runs it on a runner of its own architecture, so an ARM64 archive is
 booted on ARM64 rather than emulated. Linux musl is held to more:
 [`ops/tier0-gate.sh`](../ops/tier0-gate.sh) boots it inside a network namespace
