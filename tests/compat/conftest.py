@@ -122,10 +122,36 @@ def gateway(upstream, tmp_path_factory):
     base_url = f"http://{bind}"
     try:
         _await_ready(process, base_url)
+        _put_budget(base_url, NAMESPACE)
+        _put_budget(base_url, UNGRANTED_NAMESPACE)
         yield base_url
     finally:
         process.terminate()
         process.wait(timeout=10)
+
+
+def _put_budget(base_url: str, namespace: str) -> None:
+    """ADR 0063: inference without a budget row is 429 budget_exceeded."""
+    request = urllib.request.Request(
+        f"{base_url}/api/v1/namespaces/{namespace}/budgets/compat",
+        data=b'{"limit_microdollars": 1000000000000}',
+        headers={
+            "Authorization": f"Bearer {GATEWAY_KEY}",
+            "content-type": "application/json",
+        },
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.status not in (200, 201):
+                raise RuntimeError(
+                    f"PUT budget {namespace} returned {response.status}"
+                )
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", "replace")
+        raise RuntimeError(
+            f"PUT budget {namespace} returned {error.code}: {body}"
+        ) from error
 
 
 def _await_ready(process: subprocess.Popen, base_url: str) -> None:

@@ -95,14 +95,20 @@ class Response:
 
 
 def request(
-    url: str, *, key: str | None = None, payload: dict | None = None
+    url: str,
+    *,
+    key: str | None = None,
+    payload: dict | None = None,
+    method: str | None = None,
 ) -> Response:
     """One HTTP exchange, treating an error status as a value, not an exception."""
     data = None if payload is None else json.dumps(payload).encode()
     headers = {} if key is None else {"Authorization": f"Bearer {key}"}
     if data is not None:
         headers["content-type"] = "application/json"
-    http_request = urllib.request.Request(url, data=data, headers=headers)
+    if method is None:
+        method = "POST" if data is not None else "GET"
+    http_request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(
             http_request, timeout=REQUEST_TIMEOUT_SECONDS
@@ -169,6 +175,18 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
     ready = request(f"{base_url}/readyz")
     if ready.status != 200 or ready.body.strip() != "ready":
         raise SmokeFailure(f"/readyz answered {ready.status} {ready.body.strip()!r}")
+
+    # ADR 0063: no budget row is 429 budget_exceeded. Litvue PUTs on create.
+    budget = request(
+        f"{base_url}/api/v1/namespaces/platform/budgets/smoke",
+        key=GATEWAY_KEY,
+        payload={"limit_microdollars": 1_000_000_000_000},
+        method="PUT",
+    )
+    if budget.status not in (200, 201):
+        raise SmokeFailure(
+            f"PUT platform budget answered {budget.status}: {budget.body}"
+        )
 
     anonymous = request(f"{base_url}/ns/platform/v1/models")
     if anonymous.status != 401:

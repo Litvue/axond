@@ -287,6 +287,18 @@ ready_body="$(cat "$ready_probe_body")"
 rm -f "$ready_probe_body"
 ready_probe_body=""
 
+# ADR 0063: no budget row is 429 budget_exceeded. Litvue PUTs on create.
+budget_body="$(mktemp "$tmpdir/axond-tier0-budget.XXXXXX")"
+budget_status="$(curl --silent --show-error --max-time 5 --output "$budget_body" \
+  --write-out '%{http_code}' \
+  -X PUT -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
+  -d '{"limit_microdollars":1000000000000}' \
+  "$base_url/api/v1/namespaces/platform/budgets/tier0" || true)"
+[[ "$budget_status" == 200 || "$budget_status" == 201 ]] ||
+  failure "PUT platform budget returned HTTP $budget_status: $(cat "$budget_body")"
+rm -f "$budget_body"
+budget_body=""
+
 models_probe_body="$(mktemp "$tmpdir/axond-tier0-models.XXXXXX")"
 models_status="$(curl --silent --show-error --max-time 5 --output "$models_probe_body" \
   --write-out '%{http_code}' -H 'Authorization: Bearer tier0-gateway-key' \
