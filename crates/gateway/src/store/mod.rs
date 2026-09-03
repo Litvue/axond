@@ -299,15 +299,19 @@ pub trait Store: Send + Sync {
         Ok(())
     }
 
-    /// Set `stale = true` only when the cached `source` differs from `source`.
-    /// One UPDATE, so a concurrent listing with the new source is not replaced.
-    /// Matching source or missing row is a no-op.
+    /// Set `stale = true` only when the cached `source` differs from `source`
+    /// and the row was last fetched before `fetched_before` (RFC3339), i.e. no
+    /// replica still refreshes that URL. One UPDATE, so a concurrent listing
+    /// with the new source is not replaced, and a row another replica keeps
+    /// fresh is not freed for this replica's [`Store::put_provider_models`].
+    /// Matching source, recent row, or missing row is a no-op.
     async fn mark_provider_models_stale_unless_source(
         &self,
         provider: &str,
         source: &str,
+        fetched_before: &str,
     ) -> Result<(), StoreError> {
-        let _ = (provider, source);
+        let _ = (provider, source, fetched_before);
         Ok(())
     }
 
@@ -394,6 +398,7 @@ impl Store for UnavailableStore {
     }
     async fn mark_provider_models_stale_unless_source(
         &self,
+        _: &str,
         _: &str,
         _: &str,
     ) -> Result<(), StoreError> {

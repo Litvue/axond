@@ -992,15 +992,20 @@ impl Store for PostgresStore {
         &self,
         provider: &str,
         source: &str,
+        fetched_before: &str,
     ) -> Result<(), StoreError> {
         let provider = provider.to_owned();
         let source = source.to_owned();
+        let fetched_before = fetched_before.to_owned();
         self.with_client(async move |client| {
+            // `fetched_at` is fixed-width RFC3339 UTC, so a byte-wise compare
+            // is chronological; `COLLATE "C"` keeps the DB locale out of it.
             client
                 .execute(
                     "UPDATE axond_store_provider_models SET stale = TRUE
-                     WHERE provider = $1 AND source IS DISTINCT FROM $2",
-                    &[&provider, &source],
+                     WHERE provider = $1 AND source IS DISTINCT FROM $2
+                       AND (fetched_at IS NULL OR fetched_at COLLATE \"C\" < $3)",
+                    &[&provider, &source, &fetched_before],
                 )
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;

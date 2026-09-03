@@ -21,6 +21,12 @@ use crate::store::ProviderModels;
 const MAX_PAGES: usize = 20;
 const EMPTY_BACKOFF_START: Duration = Duration::from_secs(1);
 const EMPTY_BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// A cached row for another URL counts as abandoned once nothing has refreshed
+/// it for this many discovery intervals. A live replica refreshes its row every
+/// interval, so a lagged replica still on the old URL never frees a fresh row
+/// written for the new URL; the old row is taken over once that replica is
+/// gone.
+const ABANDONED_SOURCE_INTERVALS: u32 = 2;
 
 /// Refresh every configured provider, then sleep the live discovery interval,
 /// until `stop`.
@@ -126,7 +132,16 @@ async fn refresh_one(
     if stopped(stop) {
         return Err(RefreshError::Stopped);
     }
-    stale_if_source_changed(state, provider_id, base_url).await;
+    let abandoned_before = SystemTime::now()
+        .checked_sub(
+            snapshot
+                .config
+                .discovery
+                .interval()
+                .saturating_mul(ABANDONED_SOURCE_INTERVALS),
+        )
+        .unwrap_or(UNIX_EPOCH);
+    stale_if_source_changed(state, provider_id, base_url, &rfc3339_utc(abandoned_before)).await;
 
     let leases = snapshot
         .credentials
@@ -235,12 +250,20 @@ async fn fetch_listing(
     Ok(data)
 }
 
-async fn stale_if_source_changed(state: &AppState, provider: &str, base_url: &str) {
+/// Stale a cached row fetched from another URL, but only once no replica has
+/// refreshed it since `fetched_before`: that is the row of a URL nobody serves
+/// any more, which this replica's listing may then replace.
+async fn stale_if_source_changed(
+    state: &AppState,
+    provider: &str,
+    base_url: &str,
+    fetched_before: &str,
+) {
     let Some(store) = state.store() else {
         return;
     };
     if let Err(error) = store
-        .mark_provider_models_stale_unless_source(provider, base_url)
+        .mark_provider_models_stale_unless_source(provider, base_url, fetched_before)
         .await
     {
         tracing::warn!(
