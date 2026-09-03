@@ -16,6 +16,7 @@ const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
 const POOL_SIZE: usize = 32;
+const IDLE_CAP: usize = 8;
 /// Same order as `lock_timeout` / `statement_timeout`: fail 503 rather than hang.
 #[cfg(not(test))]
 const POOL_WAIT: Duration = Duration::from_secs(2);
@@ -116,7 +117,10 @@ impl PostgresStore {
         if client.is_closed() {
             return;
         }
-        self.idle.lock().await.push(client);
+        let mut idle = self.idle.lock().await;
+        if idle.len() < IDLE_CAP {
+            idle.push(client);
+        }
     }
 
     fn keep_session(error: &StoreError) -> bool {
@@ -181,9 +185,11 @@ const DRAFT_STORE_BUDGET_RESERVATION_IDX: &str = "axond_budget_reservation_scope
 
 /// Create or rename Store budget tables so [`probe_schema`] can succeed.
 ///
-/// 1. New `axond_store_budget*` with spend rows — use them (already migrated).
-/// 2. Draft `axond_budget*` with a `period` column, and new tables missing or
-///    empty while the draft has rows — drop empty new relations, then rename.
+/// 1. New `axond_store_budget*` complete with spend rows — use them (already
+///    migrated). Complete and empty with draft rows — drop empty dest, rename.
+/// 2. Draft `axond_budget*` with a `period` column and dest missing or empty —
+///    drop empty dest relations, then rename. Incomplete dest with any rows is
+///    a boot error (do not mix dest spend with renamed draft tables).
 ///    Needs table-rename privilege; migration-only roles should run this out
 ///    of band before boot.
 /// 3. Else `create_table` applies [`BUDGET_DDL`].
@@ -203,7 +209,18 @@ async fn ensure_budget_schema(client: &mut Client, create_table: bool) -> Result
 }
 
 async fn should_rename_draft(client: &impl GenericClient) -> Result<bool, StoreError> {
-    if !store_budget_ready(client).await? {
+    let dest_complete = store_budget_ready(client).await?;
+    let dest_has_rows = ledger_has_rows(
+        client,
+        STORE_BUDGET,
+        STORE_BUDGET_ACTIVE,
+        STORE_BUDGET_RESERVATION,
+    )
+    .await?;
+    if !dest_complete {
+        if dest_has_rows {
+            return Err(partial_dest_store_budget_error(client).await?);
+        }
         return Ok(true);
     }
     Ok(ledger_has_rows(
@@ -213,13 +230,22 @@ async fn should_rename_draft(client: &impl GenericClient) -> Result<bool, StoreE
         DRAFT_STORE_BUDGET_RESERVATION,
     )
     .await?
-        && !ledger_has_rows(
-            client,
-            STORE_BUDGET,
-            STORE_BUDGET_ACTIVE,
-            STORE_BUDGET_RESERVATION,
-        )
-        .await?)
+        && !dest_has_rows)
+}
+
+async fn partial_dest_store_budget_error(
+    client: &impl GenericClient,
+) -> Result<StoreError, StoreError> {
+    let mut present = Vec::new();
+    for name in [STORE_BUDGET, STORE_BUDGET_ACTIVE, STORE_BUDGET_RESERVATION] {
+        if relation_exists(client, name).await? {
+            present.push(name);
+        }
+    }
+    Ok(StoreError::Unavailable(format!(
+        "partial {} schema has rows; finish creating the missing axond_store_budget* tables or drop them before renaming draft axond_budget* spend",
+        present.join(", ")
+    )))
 }
 
 async fn store_budget_ready(client: &impl GenericClient) -> Result<bool, StoreError> {
