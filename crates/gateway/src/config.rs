@@ -2875,6 +2875,9 @@ impl Config {
                 "`[budget]` reservation_ttl_seconds must be at least 1".into(),
             ));
         }
+        // Both modes. Before the mode match so a stateful file without
+        // control_plane still fails on a withdrawn backend.
+        self.validate_budget()?;
         match self.mode {
             Mode::Stateless => self.validate_stateless(),
             Mode::Stateful => self.validate_stateful(),
@@ -5444,6 +5447,21 @@ env = "SIGN"
                 "{VALID}\n[budget]\nbackend = \"{backend}\"\nlimit_microdollars = 1\ndsn_env = \"D\"\n"
             ))
             .expect_err("legacy budget backends must not silently no-op");
+            let message = error.to_string();
+            assert!(
+                message.contains("withdrawn") && message.contains("ADR 0063"),
+                "{backend}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn withdrawn_budget_backends_are_a_boot_error_in_stateful_mode() {
+        for backend in ["redis", "postgres", "in-memory"] {
+            let error = Config::from_toml_str(&format!(
+                "{VALID}\nmode = \"stateful\"\n[budget]\nbackend = \"{backend}\"\nlimit_microdollars = 1\ndsn_env = \"D\"\n"
+            ))
+            .expect_err("legacy budget backends must not silently no-op in stateful mode");
             let message = error.to_string();
             assert!(
                 message.contains("withdrawn") && message.contains("ADR 0063"),

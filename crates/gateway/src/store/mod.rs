@@ -1246,6 +1246,143 @@ mod tests {
         );
     }
 
+    async fn postgres_connect_with_draft_and_dest(
+        dsn: &str,
+        dest_sql: &str,
+    ) -> Result<PostgresStore, StoreError> {
+        let (scoped, setup) = postgres_isolated(dsn).await;
+        setup
+            .batch_execute(
+                "CREATE TABLE axond_namespace (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+                     blocklist JSONB
+                 );
+                 CREATE TABLE axond_budget (
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     limit_microdollars  bigint      NOT NULL,
+                     spent_microdollars  bigint      NOT NULL DEFAULT 0,
+                     PRIMARY KEY (namespace, period)
+                 );
+                 CREATE TABLE axond_budget_active (
+                     namespace text PRIMARY KEY NOT NULL,
+                     period    text NOT NULL
+                 );
+                 CREATE TABLE axond_budget_reservation (
+                     id                  text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text        NOT NULL,
+                     amount_microdollars bigint      NOT NULL,
+                     expires_at          timestamptz NOT NULL
+                 );
+                 INSERT INTO axond_namespace (id, attrs) VALUES ('wsp_x', '{}'::jsonb);
+                 INSERT INTO axond_budget
+                     (namespace, period, limit_microdollars, spent_microdollars)
+                     VALUES ('wsp_x', '2026-09', 1000, 40);
+                 INSERT INTO axond_budget_active (namespace, period)
+                     VALUES ('wsp_x', '2026-09');",
+            )
+            .await
+            .expect("draft");
+        setup.batch_execute(dest_sql).await.expect("dest");
+        PostgresStore::connect(&scoped, false).await
+    }
+
+    fn assert_partial_dest_boot_error(err: StoreError, table: &str) {
+        let named = format!("{table} ");
+        assert!(
+            matches!(
+                err,
+                StoreError::Unavailable(ref message)
+                    if message.contains("partial")
+                        && message.contains(&named)
+                        && message.contains("drop")
+            ),
+            "{table}: {err:?}"
+        );
+    }
+
+    /// Dest budget with rows but missing active/reservation must not mix with
+    /// a draft rename.
+    #[tokio::test]
+    async fn postgres_partial_dest_budget_with_rows_refuses_draft_rename() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let err = match postgres_connect_with_draft_and_dest(
+            &dsn,
+            "CREATE TABLE axond_store_budget (
+                 namespace           text        NOT NULL,
+                 period              text        NOT NULL,
+                 limit_microdollars  bigint      NOT NULL,
+                 spent_microdollars  bigint      NOT NULL DEFAULT 0,
+                 PRIMARY KEY (namespace, period)
+             );
+             INSERT INTO axond_store_budget
+                 (namespace, period, limit_microdollars, spent_microdollars)
+                 VALUES ('wsp_x', '2026-09', 1000, 7);",
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("partial dest budget with rows must fail boot"),
+        };
+        assert_partial_dest_boot_error(err, "axond_store_budget");
+    }
+
+    /// Dest active with rows but missing budget/reservation must not mix with
+    /// a draft rename.
+    #[tokio::test]
+    async fn postgres_partial_dest_active_with_rows_refuses_draft_rename() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let err = match postgres_connect_with_draft_and_dest(
+            &dsn,
+            "CREATE TABLE axond_store_budget_active (
+                 namespace text PRIMARY KEY NOT NULL,
+                 period    text NOT NULL
+             );
+             INSERT INTO axond_store_budget_active (namespace, period)
+                 VALUES ('wsp_x', '2026-09');",
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("partial dest active with rows must fail boot"),
+        };
+        assert_partial_dest_boot_error(err, "axond_store_budget_active");
+    }
+
+    /// Dest reservation with rows but missing budget/active must not mix with
+    /// a draft rename.
+    #[tokio::test]
+    async fn postgres_partial_dest_reservation_with_rows_refuses_draft_rename() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let err = match postgres_connect_with_draft_and_dest(
+            &dsn,
+            "CREATE TABLE axond_store_budget_reservation (
+                 id                  text        PRIMARY KEY,
+                 namespace           text        NOT NULL,
+                 period              text        NOT NULL,
+                 amount_microdollars bigint      NOT NULL,
+                 expires_at          timestamptz NOT NULL
+             );
+             INSERT INTO axond_store_budget_reservation
+                 (id, namespace, period, amount_microdollars, expires_at)
+                 VALUES ('r1', 'wsp_x', '2026-09', 10, now() + interval '1 hour');",
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("partial dest reservation with rows must fail boot"),
+        };
+        assert_partial_dest_boot_error(err, "axond_store_budget_reservation");
+    }
+
     #[tokio::test]
     async fn postgres_settle_saturates_oversized_actual_and_releases_the_hold() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
