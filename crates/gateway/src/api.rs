@@ -13,7 +13,10 @@ use serde_json::Value;
 
 use crate::error::GatewayError;
 use crate::state::AppState;
-use crate::store::{NamespaceRecord, Store, StoreError, validate_attrs, validate_namespace_id};
+use crate::store::{
+    BudgetRecord, NamespaceRecord, Store, StoreError, validate_attrs, validate_namespace_id,
+    validate_period,
+};
 
 /// Bound for the whole management request body. Attrs alone are capped at
 /// 4 KiB ([`crate::store::MAX_ATTRS_BYTES`]); this leaves room for id and
@@ -30,6 +33,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/namespaces/{ns}",
             get(get_namespace).put(put_namespace),
+        )
+        .route(
+            "/api/v1/namespaces/{ns}/budgets/{period}",
+            get(get_budget).put(put_budget),
         )
         .layer(DefaultBodyLimit::max(MANAGEMENT_MAX_REQUEST_BYTES))
         .with_state(state)
@@ -58,6 +65,12 @@ struct ReplaceBody {
 struct ListQuery {
     cursor: Option<String>,
     limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutBudgetBody {
+    limit_microdollars: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +145,7 @@ async fn create_namespace(
         Err(StoreError::Duplicate(_)) => Err(GatewayError::NamespaceConflict),
         Err(StoreError::Invalid(msg)) => Err(GatewayError::BadRequest(msg)),
         Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
+        Err(StoreError::NotFound(_)) => Err(GatewayError::UnknownNamespace),
     }
 }
 
@@ -166,6 +180,45 @@ async fn put_namespace(
     }
 }
 
+async fn put_budget(
+    State(state): State<AppState>,
+    Path((ns, period)): Path<(String, String)>,
+    body: Result<Json<PutBudgetBody>, JsonRejection>,
+) -> Result<Json<BudgetRecord>, GatewayError> {
+    let body = json_body(body)?;
+    validate_period(&period).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
+    match store(&state)?
+        .put_budget(&ns, &period, body.limit_microdollars)
+        .await
+    {
+        Ok(rec) => Ok(Json(rec)),
+        Err(StoreError::NotFound(_)) => Err(GatewayError::UnknownNamespace),
+        Err(StoreError::Invalid(msg)) => Err(GatewayError::BadRequest(msg)),
+        Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
+        Err(StoreError::Duplicate(_)) => Err(GatewayError::NamespaceConflict),
+    }
+}
+
+async fn get_budget(
+    State(state): State<AppState>,
+    Path((ns, period)): Path<(String, String)>,
+) -> Result<Json<BudgetRecord>, GatewayError> {
+    validate_period(&period).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
+    let store = store(&state)?;
+    match store.get_namespace(&ns).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(GatewayError::UnknownNamespace),
+        Err(StoreError::Unavailable(_)) => return Err(GatewayError::StoreUnavailable),
+        Err(err) => return Err(GatewayError::BadRequest(err.to_string())),
+    }
+    match store.get_budget(&ns, &period).await {
+        Ok(Some(rec)) => Ok(Json(rec)),
+        Ok(None) => Err(GatewayError::UnknownBudget),
+        Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
+        Err(err) => Err(GatewayError::BadRequest(err.to_string())),
+    }
+}
+
 async fn list_namespaces(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
@@ -193,6 +246,7 @@ impl From<StoreError> for GatewayError {
     fn from(err: StoreError) -> Self {
         match err {
             StoreError::Duplicate(_) => Self::NamespaceConflict,
+            StoreError::NotFound(_) => Self::UnknownNamespace,
             StoreError::Unavailable(_) => Self::StoreUnavailable,
             StoreError::Invalid(msg) => Self::BadRequest(msg),
         }

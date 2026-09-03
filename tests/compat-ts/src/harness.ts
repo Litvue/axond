@@ -177,6 +177,8 @@ async function boot(
   };
   try {
     await awaitReady(child, baseUrl, readyTimeoutMs, () => launch);
+    await putBudget(baseUrl, NAMESPACE);
+    await putBudget(baseUrl, UNGRANTED_NAMESPACE);
   } catch (error) {
     // The upstream is the caller's to close, which is what keeps this path from
     // stopping it twice.
@@ -184,6 +186,25 @@ async function boot(
     throw error;
   }
   return harness;
+}
+
+/** ADR 0063: inference without a budget row is 429 budget_exceeded. */
+async function putBudget(baseUrl: string, namespace: string): Promise<void> {
+  const response = await fetch(
+    `${baseUrl}/api/v1/namespaces/${namespace}/budgets/compat`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ limit_microdollars: 1_000_000_000_000 }),
+    },
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`PUT budget ${namespace} returned ${response.status}: ${body}`);
+  }
 }
 
 /** Whether the process is gone, however it went: a status or a signal. */

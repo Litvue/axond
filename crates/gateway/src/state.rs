@@ -2190,6 +2190,33 @@ namespace = "platform"
         ) -> Result<(), StoreError> {
             (self.seed)()
         }
+        async fn put_budget(
+            &self,
+            _: &str,
+            _: &str,
+            _: u64,
+        ) -> Result<crate::store::BudgetRecord, StoreError> {
+            Err(StoreError::Unavailable("unused".into()))
+        }
+        async fn get_budget(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<crate::store::BudgetRecord>, StoreError> {
+            Ok(None)
+        }
+        async fn reserve_budget(
+            &self,
+            _: &str,
+            _: u64,
+            _: Duration,
+            _: &str,
+        ) -> Result<crate::store::BudgetReserve, StoreError> {
+            Err(StoreError::Unavailable("unused".into()))
+        }
+        async fn settle_budget(&self, _: &str, _: &str, _: &str, _: u64) -> Result<(), StoreError> {
+            Ok(())
+        }
     }
 
     fn publish_test_state(

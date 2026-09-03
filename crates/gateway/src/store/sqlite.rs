@@ -1,14 +1,46 @@
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
-use super::{NamespaceRecord, Store, StoreError};
+use super::{
+    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, from_sql_amount, sql_amount,
+    sql_amount_saturating,
+};
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
 }
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS axond_namespace (
+    id TEXT PRIMARY KEY NOT NULL,
+    attrs TEXT NOT NULL DEFAULT '{}',
+    blocklist TEXT
+);
+CREATE TABLE IF NOT EXISTS axond_store_budget (
+    namespace TEXT NOT NULL,
+    period TEXT NOT NULL,
+    limit_microdollars INTEGER NOT NULL,
+    spent_microdollars INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (namespace, period)
+);
+CREATE TABLE IF NOT EXISTS axond_store_budget_active (
+    namespace TEXT PRIMARY KEY NOT NULL,
+    period TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS axond_store_budget_reservation (
+    id TEXT PRIMARY KEY NOT NULL,
+    namespace TEXT NOT NULL,
+    period TEXT NOT NULL,
+    amount_microdollars INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS axond_store_budget_reservation_scope_idx
+    ON axond_store_budget_reservation (namespace, period, expires_at);
+";
 
 impl SqliteStore {
     pub fn open(path: &str) -> Result<Self, StoreError> {
@@ -17,14 +49,7 @@ impl SqliteStore {
             .map_err(unavailable)?;
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(unavailable)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS axond_namespace (
-                id TEXT PRIMARY KEY NOT NULL,
-                attrs TEXT NOT NULL DEFAULT '{}',
-                blocklist TEXT
-            );",
-        )
-        .map_err(unavailable)?;
+        conn.execute_batch(SCHEMA).map_err(unavailable)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -65,14 +90,14 @@ impl SqliteStore {
     async fn with_conn<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
         let conn = Arc::clone(&self.conn);
         let run = move || {
-            let guard = conn
+            let mut guard = conn
                 .lock()
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            f(&guard)
+            f(&mut guard)
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::spawn_blocking(run)
@@ -252,6 +277,220 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         self.seed_config_namespaces_sync(namespaces)
     }
+
+    async fn put_budget(
+        &self,
+        namespace: &str,
+        period: &str,
+        limit_microdollars: u64,
+    ) -> Result<BudgetRecord, StoreError> {
+        let namespace = namespace.to_string();
+        let period = period.to_string();
+        let limit = sql_amount(limit_microdollars)?;
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(unavailable)?;
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM axond_namespace WHERE id = ?1",
+                    params![namespace],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(unavailable)?
+                .is_some();
+            if !exists {
+                return Err(StoreError::NotFound(namespace));
+            }
+            tx.execute(
+                "INSERT INTO axond_store_budget_active (namespace, period) VALUES (?1, ?2)
+                 ON CONFLICT (namespace) DO UPDATE SET period = excluded.period",
+                params![namespace, period],
+            )
+            .map_err(unavailable)?;
+            tx.execute(
+                "INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
+                 VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT (namespace, period) DO UPDATE SET
+                    limit_microdollars = excluded.limit_microdollars",
+                params![namespace, period, limit],
+            )
+            .map_err(unavailable)?;
+            let rec = read_budget(&tx, &namespace, &period, now_ms())?;
+            tx.commit().map_err(unavailable)?;
+            rec.ok_or_else(|| StoreError::Unavailable("budget row missing after put".into()))
+        })
+        .await
+    }
+
+    async fn get_budget(
+        &self,
+        namespace: &str,
+        period: &str,
+    ) -> Result<Option<BudgetRecord>, StoreError> {
+        let namespace = namespace.to_string();
+        let period = period.to_string();
+        self.with_conn(move |conn| read_budget(conn, &namespace, &period, now_ms()))
+            .await
+    }
+
+    async fn reserve_budget(
+        &self,
+        namespace: &str,
+        estimate_microdollars: u64,
+        reservation_ttl: Duration,
+        reservation_id: &str,
+    ) -> Result<BudgetReserve, StoreError> {
+        let namespace = namespace.to_string();
+        let reservation_id = reservation_id.to_string();
+        let estimate = sql_amount(estimate_microdollars)?;
+        let ttl_ms = sql_amount(reservation_ttl.as_millis().min(i64::MAX as u128) as u64)?;
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(unavailable)?;
+            let Some(period) = tx
+                .query_row(
+                    "SELECT period FROM axond_store_budget_active WHERE namespace = ?1",
+                    params![namespace],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(unavailable)?
+            else {
+                return Ok(BudgetReserve::Exceeded);
+            };
+            let now = now_ms();
+            tx.execute(
+                "DELETE FROM axond_store_budget_reservation
+                 WHERE namespace = ?1 AND expires_at <= ?2",
+                params![namespace, now],
+            )
+            .map_err(unavailable)?;
+            let (limit, spent) = match tx
+                .query_row(
+                    "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget
+                     WHERE namespace = ?1 AND period = ?2",
+                    params![namespace, period],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(unavailable)?
+            {
+                Some(row) => row,
+                None => {
+                    tx.commit().map_err(unavailable)?;
+                    return Ok(BudgetReserve::Exceeded);
+                }
+            };
+            let reserved: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(SUM(amount_microdollars), 0) FROM axond_store_budget_reservation
+                     WHERE namespace = ?1 AND period = ?2 AND expires_at > ?3",
+                    params![namespace, period, now],
+                    |row| row.get(0),
+                )
+                .map_err(unavailable)?;
+            if super::budget_would_exceed(spent, reserved, estimate, limit) {
+                tx.commit().map_err(unavailable)?;
+                return Ok(BudgetReserve::Exceeded);
+            }
+            let expires_at = now.saturating_add(ttl_ms);
+            tx.execute(
+                "INSERT INTO axond_store_budget_reservation
+                    (id, namespace, period, amount_microdollars, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![reservation_id, namespace, period, estimate, expires_at],
+            )
+            .map_err(unavailable)?;
+            tx.commit().map_err(unavailable)?;
+            Ok(BudgetReserve::Allowed { period })
+        })
+        .await
+    }
+
+    async fn settle_budget(
+        &self,
+        namespace: &str,
+        period: &str,
+        reservation_id: &str,
+        actual_microdollars: u64,
+    ) -> Result<(), StoreError> {
+        let namespace = namespace.to_string();
+        let period = period.to_string();
+        let reservation_id = reservation_id.to_string();
+        let actual = sql_amount_saturating(actual_microdollars);
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(unavailable)?;
+            tx.execute(
+                "DELETE FROM axond_store_budget_reservation WHERE id = ?1",
+                params![reservation_id],
+            )
+            .map_err(unavailable)?;
+            tx.execute(
+                "UPDATE axond_store_budget
+                 SET spent_microdollars = CASE
+                     WHEN spent_microdollars >= 9223372036854775807 - ?1 THEN 9223372036854775807
+                     ELSE spent_microdollars + ?1
+                 END
+                 WHERE namespace = ?2 AND period = ?3",
+                params![actual, namespace, period],
+            )
+            .map_err(unavailable)?;
+            tx.commit().map_err(unavailable)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn read_budget(
+    conn: &Connection,
+    namespace: &str,
+    period: &str,
+    now: i64,
+) -> Result<Option<BudgetRecord>, StoreError> {
+    conn.query_row(
+        "SELECT
+             b.limit_microdollars,
+             b.spent_microdollars,
+             COALESCE((
+                 SELECT SUM(r.amount_microdollars)
+                 FROM axond_store_budget_reservation r
+                 WHERE r.namespace = b.namespace
+                   AND r.period = b.period
+                   AND r.expires_at > ?3
+             ), 0),
+             EXISTS (
+                 SELECT 1 FROM axond_store_budget_active a
+                 WHERE a.namespace = b.namespace AND a.period = b.period
+             )
+         FROM axond_store_budget b
+         WHERE b.namespace = ?1 AND b.period = ?2",
+        params![namespace, period, now],
+        |row| {
+            Ok(BudgetRecord::new(
+                namespace,
+                period,
+                from_sql_amount(row.get(0)?),
+                from_sql_amount(row.get(1)?),
+                from_sql_amount(row.get(2)?),
+                row.get(3)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(unavailable)
 }
 
 #[cfg(test)]
@@ -317,6 +556,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_config_namespaces_skips_slash_ids() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        super::super::seed_config_namespaces(
+            &store,
+            &[namespace("wsp_ok"), namespace("acme/core")],
+        )
+        .await
+        .expect("seed");
+        assert!(store.get_namespace("wsp_ok").await.expect("get").is_some());
+        assert!(
+            store
+                .get_namespace("acme/core")
+                .await
+                .expect("slash")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn update_returns_the_written_row() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         store
@@ -333,5 +591,104 @@ mod tests {
             .expect("update")
             .expect("row");
         assert_eq!(got.attrs["org"], "acme");
+    }
+
+    #[tokio::test]
+    async fn reserve_expires_old_period_holds_for_the_namespace() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store.put_budget("wsp_x", "old", 10_000).await.expect("old");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "stale")
+            .await
+            .expect("stale hold");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store.put_budget("wsp_x", "new", 10_000).await.expect("new");
+        store
+            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "live")
+            .await
+            .expect("live");
+        let n: i64 = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(n, 1, "expired holds from the old period must be reclaimed");
+    }
+
+    #[tokio::test]
+    async fn denied_reserve_still_drops_expired_holds() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store.put_budget("wsp_x", "p", 100).await.expect("budget");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "stale")
+            .await
+            .expect("stale hold");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(matches!(
+            store
+                .reserve_budget("wsp_x", 200, Duration::from_secs(30), "over")
+                .await
+                .expect("denied"),
+            BudgetReserve::Exceeded
+        ));
+        let n: i64 = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(n, 0, "denied admission must keep the expiry delete");
+    }
+
+    #[test]
+    fn budget_tables_use_store_prefix() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let conn = store.conn.lock().expect("lock");
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type IN ('table', 'index')
+                     ORDER BY name",
+                )
+                .expect("prep");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query")
+                .map(|row| row.expect("name"))
+                .collect()
+        };
+        assert!(names.iter().any(|n| n == "axond_store_budget"));
+        assert!(names.iter().any(|n| n == "axond_store_budget_active"));
+        assert!(names.iter().any(|n| n == "axond_store_budget_reservation"));
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "axond_store_budget_reservation_scope_idx")
+        );
+        assert!(!names.iter().any(|n| n == "axond_budget"));
+        assert!(!names.iter().any(|n| n == "axond_budget_reservation"));
     }
 }

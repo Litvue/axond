@@ -28,6 +28,7 @@ bind = "0.0.0.0:8080"
 [storage]
 backend = "sqlite"
 path = "axond.sqlite"
+# on_unavailable = "deny" # deny (default) | allow — store-down budget stance
 
 # ── Termination (optional) ────────────────────────────────────────────────────
 # What SIGTERM does. `/readyz` starts failing at once so a load balancer can

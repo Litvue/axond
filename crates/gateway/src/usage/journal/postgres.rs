@@ -1279,6 +1279,8 @@ struct StoredRecord {
     // of older events still decodes.
     #[serde(default)]
     attrs: Option<serde_json::Value>,
+    #[serde(default)]
+    period: Option<String>,
     subject: String,
     #[serde(default)]
     signer_kid: Option<String>,
@@ -1321,6 +1323,7 @@ impl StoredRecord {
             trace_id: self.trace_id,
             namespace: self.namespace,
             attrs: self.attrs,
+            period: self.period,
             subject: self.subject,
             signer_kid: self.signer_kid,
             model: self.model,

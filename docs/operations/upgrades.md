@@ -63,10 +63,20 @@ instead of being rewritten.
    idempotent, and applying it early costs two empty tables
    ([ADR 0051](../adr/0051-durable-catalogue-snapshots-and-refresh-orchestration.md),
    [ADR 0055](../adr/0055-catalogue-imports-in-a-running-deployment.md)).
-6. Complete any stop-the-fleet Redis/Postgres budget migration before starting
+6. Apply `ops/postgres/store_budget_v1.sql` (or `create_table = true`) before
+   any replica that sets `[storage] backend = "postgres"`. The Store ledger is
+   `axond_store_budget*`. A leftover withdrawn-backend `axond_budget` (PK
+   `(namespace, subject)`) is left in place; spend is not migrated (subject vs
+   period). Connect may RENAME leftover draft Store tables (`axond_budget*`
+   with a `period` column) to `axond_store_budget*`, including when empty new
+   tables already exist from a hand-applied `store_budget_v1.sql` and the draft
+   still has spend (empty new relations are dropped first; non-empty new
+   tables are kept). That needs table-rename privilege; migration-only roles
+   should run the rename out of band before boot.
+7. Complete any stop-the-fleet Redis/Postgres budget migration before starting
    namespace-cap-aware replicas.
-7. Verify ingress streaming behavior and client retries.
-8. Retain the old artifact and old configuration for rollback where compatible.
+8. Verify ingress streaming behavior and client retries.
+9. Retain the old artifact and old configuration for rollback where compatible.
 
 In stateful mode the new binary owns the control-plane half of that list. Run
 these from the new artifact, with the fleet still on the old one:

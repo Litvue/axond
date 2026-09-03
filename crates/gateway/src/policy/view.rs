@@ -318,7 +318,6 @@ env = "STATIC_KEY"
 namespace = "platform"
 
 [budget]
-backend = "in-memory"
 limit_microdollars = 5_000
 reservation_ttl_seconds = 120
 
@@ -342,10 +341,6 @@ kek_env = "GW_SECRET_STORE_KEK"
 
 [[admin_breakglass]]
 env = "GW_ADMIN_BREAKGLASS"
-
-[budget]
-backend = "redis"
-dsn_env = "GW_BUDGET_REDIS"
 "#,
         )
         .expect("a valid stateful bootstrap")

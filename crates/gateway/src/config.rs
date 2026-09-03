@@ -2868,6 +2868,16 @@ impl Config {
     fn validate_inner(&self, allow_memory_sqlite: bool) -> Result<(), ConfigError> {
         self.validate_storage(allow_memory_sqlite)?;
         self.reject_legacy_models()?;
+        // Hold TTL is process config in every mode (StoreBudget). Check it
+        // here so stateful bootstrap cannot skip the nonzero gate.
+        if self.budget.reservation_ttl_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "`[budget]` reservation_ttl_seconds must be at least 1".into(),
+            ));
+        }
+        // Both modes. Before the mode match so a stateful file without
+        // control_plane still fails on a withdrawn backend.
+        self.validate_budget()?;
         match self.mode {
             Mode::Stateless => self.validate_stateless(),
             Mode::Stateful => self.validate_stateful(),
@@ -4010,42 +4020,16 @@ impl Config {
             _ => {}
         }
         self.validate_budget_layout()?;
-        if budget.backend == BudgetBackend::None {
-            return Ok(());
-        }
-        if budget.limit_microdollars == 0 {
+        if budget.backend != BudgetBackend::None {
             return Err(ConfigError::Invalid(format!(
-                "budget `{backend}`: limit_microdollars must be at least 1"
+                "`[budget]` backend `{backend}` is withdrawn (ADR 0063): spend caps live on the Store. \
+                 Remove `[budget]` or leave `backend` unset. `[budget] reservation_ttl_seconds` still sets the hold TTL."
             )));
         }
         if budget.reservation_ttl_seconds == 0 {
-            return Err(ConfigError::Invalid(format!(
-                "budget `{backend}`: reservation_ttl_seconds must be at least 1"
-            )));
-        }
-        if budget.idle_ttl_seconds == 0 {
-            return Err(ConfigError::Invalid(format!(
-                "budget `{backend}`: idle_ttl_seconds must be at least 1"
-            )));
-        }
-        if budget.max_subjects == 0 {
-            return Err(ConfigError::Invalid(format!(
-                "budget `{backend}`: max_subjects must be at least 1"
-            )));
-        }
-        if budget.backend.is_shared()
-            && !budget
-                .dsn_env
-                .as_deref()
-                .is_some_and(|dsn_env| !dsn_env.trim().is_empty())
-        {
-            return Err(ConfigError::Invalid(format!(
-                "budget `{backend}`: `dsn_env` must name the env var holding the connection string"
-            )));
-        }
-        if budget.backend == BudgetBackend::Postgres {
-            validate_table_name(&budget.table())
-                .map_err(|message| ConfigError::Invalid(format!("budget `postgres`: {message}")))?;
+            return Err(ConfigError::Invalid(
+                "`[budget]` reservation_ttl_seconds must be at least 1".into(),
+            ));
         }
         Ok(())
     }
@@ -4547,6 +4531,7 @@ impl Config {
         self.namespace.iter().find(|n| n.id == id)
     }
 
+    #[allow(dead_code)]
     pub fn distinct_namespace_count(&self) -> usize {
         self.namespace
             .iter()
@@ -5044,10 +5029,9 @@ audience = "test"
 
     #[test]
     fn revocation_reuses_redis_budget_dsn_and_rejects_zero_timeouts() {
-        let config = format!(
-            "{VALID}\n[budget]\nbackend = \"redis\"\ndsn_env = \"REDIS_URL\"\nlimit_microdollars = 1\n[revocation]\nbackend = \"redis\"\n"
-        );
-        let cfg = Config::from_toml_str(&config).expect("budget DSN fallback");
+        let config =
+            format!("{VALID}\n[revocation]\nbackend = \"redis\"\ndsn_env = \"REDIS_URL\"\n");
+        let cfg = Config::from_toml_str(&config).expect("revocation redis");
         assert_eq!(cfg.revocation.backend, RevocationBackend::Redis);
 
         for section in [
@@ -5400,7 +5384,7 @@ env = "SIGN"
     #[test]
     fn redis_rate_limit_reads_defaults_and_budget_dsn_fallback() {
         let cfg = Config::from_toml_str(&format!(
-            "{VALID}\n[budget]\nbackend = \"redis\"\nlimit_microdollars = 1\ndsn_env = \"REDIS_URL\"\n[rate_limit]\nbackend = \"redis\"\n"
+            "{VALID}\n[rate_limit]\nbackend = \"redis\"\ndsn_env = \"REDIS_URL\"\n"
         ))
         .expect("valid config");
         assert_eq!(cfg.rate_limit.lease_ttl_seconds, 300);
@@ -5427,24 +5411,68 @@ env = "SIGN"
 
     #[test]
     fn a_budget_reads_its_backend_and_stance() {
-        let cfg = Config::from_toml_str(&format!(
-            r#"{VALID}
-[budget]
-backend = "redis"
-limit_microdollars = 10000
-dsn_env = "AXOND_BUDGET_REDIS_URL"
-on_unavailable = "allow"
-"#
+        let cfg = Config::from_toml_str(VALID).expect("valid config");
+        assert_eq!(cfg.budget.backend, BudgetBackend::None);
+        assert_eq!(cfg.budget.on_unavailable, StoreUnavailable::Deny);
+        assert_eq!(cfg.budget.reservation_ttl_seconds, 300);
+    }
+
+    #[test]
+    fn reservation_ttl_zero_is_rejected_without_a_backend() {
+        let error =
+            Config::from_toml_str(&format!("{VALID}\n[budget]\nreservation_ttl_seconds = 0\n"))
+                .expect_err("zero TTL must fail at load");
+        assert!(
+            error.to_string().contains("reservation_ttl_seconds"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn reservation_ttl_zero_is_rejected_in_stateful_mode() {
+        let error = Config::from_toml_str(&format!(
+            "{VALID}\nmode = \"stateful\"\n[budget]\nreservation_ttl_seconds = 0\n"
         ))
-        .expect("valid config");
-        assert_eq!(cfg.budget.backend, BudgetBackend::Redis);
-        assert_eq!(cfg.budget.on_unavailable, StoreUnavailable::Allow);
-        assert_eq!(cfg.budget.key_prefix(), "axond:budget");
+        .expect_err("stateful zero TTL must fail at load");
+        assert!(
+            error.to_string().contains("reservation_ttl_seconds"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn withdrawn_budget_backends_are_a_boot_error() {
+        for backend in ["redis", "postgres", "in-memory"] {
+            let error = Config::from_toml_str(&format!(
+                "{VALID}\n[budget]\nbackend = \"{backend}\"\nlimit_microdollars = 1\ndsn_env = \"D\"\n"
+            ))
+            .expect_err("legacy budget backends must not silently no-op");
+            let message = error.to_string();
+            assert!(
+                message.contains("withdrawn") && message.contains("ADR 0063"),
+                "{backend}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn withdrawn_budget_backends_are_a_boot_error_in_stateful_mode() {
+        for backend in ["redis", "postgres", "in-memory"] {
+            let error = Config::from_toml_str(&format!(
+                "{VALID}\nmode = \"stateful\"\n[budget]\nbackend = \"{backend}\"\nlimit_microdollars = 1\ndsn_env = \"D\"\n"
+            ))
+            .expect_err("legacy budget backends must not silently no-op in stateful mode");
+            let message = error.to_string();
+            assert!(
+                message.contains("withdrawn") && message.contains("ADR 0063"),
+                "{backend}: {message}"
+            );
+        }
     }
 
     #[test]
     fn a_shared_backend_reads_the_optional_namespace_cap() {
-        let cfg = Config::from_toml_str(&format!(
+        let error = Config::from_toml_str(&format!(
             r#"{VALID}
 [budget]
 backend = "redis"
@@ -5453,17 +5481,14 @@ namespace_limit_microdollars = 100000
 dsn_env = "AXOND_BUDGET_REDIS_URL"
 "#
         ))
-        .expect("valid config");
-        assert_eq!(cfg.budget.namespace_limit_microdollars, Some(100_000));
+        .expect_err("redis budget is withdrawn");
+        assert!(error.to_string().contains("withdrawn"), "{error}");
     }
 
     /// Omitting it must keep the previous per-subject-only behavior exactly.
     #[test]
     fn omitting_the_namespace_cap_leaves_subject_only_enforcement() {
-        let cfg = Config::from_toml_str(&format!(
-            "{VALID}\n[budget]\nbackend = \"redis\"\nlimit_microdollars = 1\ndsn_env = \"R\"\n"
-        ))
-        .expect("valid config");
+        let cfg = Config::from_toml_str(VALID).expect("valid config");
         assert_eq!(cfg.budget.namespace_limit_microdollars, None);
     }
 

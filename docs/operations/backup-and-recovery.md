@@ -13,6 +13,7 @@ that used to execute them in CI was retired with the tier matrix
 | Schema version and migration ledger | PostgreSQL (`axond_cp_schema_migration`) | The record of what was applied; without it a database is [`Unrecorded`](./control-plane-journal.md#schema-status-and-what-each-state-means) and a replica refuses it. |
 | Usage rows | PostgreSQL (`axond_usage`) | Billing and analytics history. |
 | Namespace and subject spend, reservations | PostgreSQL (`axond_budget*`) when a Postgres budget backend is configured | Accumulated spend against caps. |
+| Namespace period spend, reservations | PostgreSQL (`axond_store_budget*`) when `[storage] backend = "postgres"` | Accumulated spend against namespace period caps. Leftover `axond_budget*` from the withdrawn budget backend is not this ledger and is not migrated. |
 | Revocation entries | PostgreSQL (`axond_revocation`) | Denylisted token identifiers, which is a security regression, not just a data one. |
 | Rate-limit windows, budget reservations, revocation cache | Redis | Accuracy and availability of enforcement in flight — **not history**. |
 

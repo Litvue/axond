@@ -18,6 +18,7 @@ meaning, and how they are allowed to change. The design rationale is
 | `request_id` | `text` | Identifies one request, and therefore one usage event. Globally unique: `req_` followed by a lowercase canonical UUIDv7 (`req_0192f5e1-2b3c-7def-8123-456789abcdef`). Opaque — treat it as a string, not as a parsed timestamp. |
 | `trace_id` | `text` | Validated W3C trace id of the caller's trace; NULL when the request carried no valid trace context. It is retained even when OTLP export is disabled, and one trace usually spans many requests. |
 | `namespace` | `text` | Tenant/namespace the request was served under. |
+| `period` | `text` | Active budget period at admission. NULL when the request was admitted without a Store hold. |
 | `subject` | `text` | Authenticated caller — the gateway key's env-var label or file path for static authentication, or the token's `sub` claim for token authentication. Switching a static key from `env` to `file` changes this value and therefore the corresponding budget subject; file paths are emitted as written. |
 | `signer_kid` | `text` | Configured JWS signer that vouched for a token caller; NULL for static gateway-key authentication. |
 | `model` | `text` | Prefixed id the caller asked for (`openai/gpt-4o`). |
@@ -68,7 +69,8 @@ exported as zero; `Some(0)` is still emitted.
   additive file in filename order — currently
   `usage_v1_001_add_signer_kid.sql` then
   `usage_v2_001_add_price_identity.sql` then
-  `usage_v2_002_nullable_cost.sql`; existing installations apply only the
+  `usage_v2_002_nullable_cost.sql` then
+  `usage_v2_003_add_period.sql`; existing installations apply only the
   new additive file **before** deploying a writer that emits its column.
   Ordering is enforced rather than trusted: the Postgres sink checks every
   column the writer binds while it connects and refuses to boot naming the

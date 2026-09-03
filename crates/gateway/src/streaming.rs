@@ -1504,6 +1504,7 @@ impl Accounting {
             trace_id: self.ctx.identity.trace_id.clone(),
             namespace: self.ctx.namespace.clone(),
             attrs: self.ctx.attrs.clone(),
+            period: self.ctx.reservation.period.clone(),
             subject: self.ctx.subject.clone(),
             signer_kid: self.ctx.signer_kid.clone(),
             model: self.ctx.alias.clone(),
@@ -1804,6 +1805,7 @@ mod tests {
                 id: "ledger".to_owned(),
                 estimate_microdollars: estimated_microdollars,
                 generation: None,
+                period: None,
             })
         }
         async fn settle(
@@ -2089,6 +2091,7 @@ cache_read_microdollars_per_million = 1000000
                 id: "test".to_owned(),
                 estimate_microdollars: 1_000,
                 generation: None,
+                period: None,
             },
             rate_limit_permit: None,
             admission_permit: None,

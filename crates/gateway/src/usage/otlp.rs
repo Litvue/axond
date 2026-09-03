@@ -166,6 +166,9 @@ fn attributes(record: &UsageRecord) -> Vec<(&'static str, AnyValue)> {
             AnyValue::String(catalog.clone().into()),
         ));
     }
+    if let Some(period) = &record.period {
+        attributes.push(("axond.period", AnyValue::String(period.clone().into())));
+    }
     attributes
 }
 
