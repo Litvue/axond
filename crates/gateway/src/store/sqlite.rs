@@ -839,14 +839,17 @@ impl Store for SqliteStore {
         &self,
         provider: &str,
         source: &str,
+        fetched_before: &str,
     ) -> Result<(), StoreError> {
         let provider = provider.to_string();
         let source = source.to_string();
+        let fetched_before = fetched_before.to_string();
         self.with_conn(move |conn| {
             conn.execute(
                 "UPDATE axond_store_provider_models SET stale = 1
-                 WHERE provider = ?1 AND (source IS NULL OR source != ?2)",
-                params![provider, source],
+                 WHERE provider = ?1 AND (source IS NULL OR source != ?2)
+                   AND (fetched_at IS NULL OR fetched_at < ?3)",
+                params![provider, source, fetched_before],
             )
             .map_err(unavailable)?;
             Ok(())
@@ -1628,7 +1631,11 @@ mod tests {
         };
         store.put_provider_models(old.clone()).await.expect("put");
         store
-            .mark_provider_models_stale_unless_source("openai", "https://example.invalid/v1")
+            .mark_provider_models_stale_unless_source(
+                "openai",
+                "https://example.invalid/v1",
+                "2026-09-02T12:10:00Z",
+            )
             .await
             .expect("mismatch");
         let stale = store
@@ -1649,7 +1656,11 @@ mod tests {
         };
         store.put_provider_models(fresh.clone()).await.expect("put");
         store
-            .mark_provider_models_stale_unless_source("openai", "https://example.invalid/v1")
+            .mark_provider_models_stale_unless_source(
+                "openai",
+                "https://example.invalid/v1",
+                "2026-09-02T12:10:00Z",
+            )
             .await
             .expect("match is no-op");
         let got = store
@@ -1658,6 +1669,63 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got, fresh);
+    }
+
+    #[tokio::test]
+    async fn provider_models_lagged_source_cannot_stale_then_replace_a_fresh_listing() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let neu = ProviderModels {
+            provider: "openai".into(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(neu.clone()).await.expect("new");
+        // A replica still on the old URL runs its pre-fetch stale mark, then
+        // publishes. The new listing was refreshed inside the window, so
+        // neither step touches it.
+        store
+            .mark_provider_models_stale_unless_source(
+                "openai",
+                "https://api.openai.com/v1",
+                "2026-09-02T12:00:00Z",
+            )
+            .await
+            .expect("recent row is left alone");
+        store
+            .put_provider_models(ProviderModels {
+                provider: "openai".into(),
+                fetched_at: Some("2026-09-02T12:02:00Z".into()),
+                stale: false,
+                data: vec![serde_json::json!({"id": "old", "object": "model"})],
+                source: Some("https://api.openai.com/v1".into()),
+            })
+            .await
+            .expect("old put");
+        let got = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, neu);
+
+        // Once nobody has refreshed that URL for the window, it is superseded.
+        store
+            .mark_provider_models_stale_unless_source(
+                "openai",
+                "https://api.openai.com/v1",
+                "2026-09-02T12:11:00Z",
+            )
+            .await
+            .expect("abandoned row is staled");
+        let stale = store
+            .get_provider_models("openai")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(stale.stale);
+        assert_eq!(stale.data, neu.data);
     }
 
     #[tokio::test]

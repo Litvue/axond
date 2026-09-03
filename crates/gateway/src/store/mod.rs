@@ -299,15 +299,20 @@ pub trait Store: Send + Sync {
         Ok(())
     }
 
-    /// Set `stale = true` only when the cached `source` differs from `source`.
-    /// One UPDATE, so a concurrent listing with the new source is not replaced.
-    /// Matching source or missing row is a no-op.
+    /// Set `stale = true` only when the cached `source` differs from `source`
+    /// and its `fetched_at` is absent or earlier than `fetched_before`
+    /// (RFC3339, same `YYYY-MM-DDTHH:MM:SSZ` shape discovery writes). One
+    /// UPDATE, so a concurrent listing with the new source is not replaced. A
+    /// row another replica still refreshes stays fresh, so a lagged replica
+    /// cannot stale — and then replace — it. Matching source, recent fetch, or
+    /// missing row is a no-op.
     async fn mark_provider_models_stale_unless_source(
         &self,
         provider: &str,
         source: &str,
+        fetched_before: &str,
     ) -> Result<(), StoreError> {
-        let _ = (provider, source);
+        let _ = (provider, source, fetched_before);
         Ok(())
     }
 
@@ -394,6 +399,7 @@ impl Store for UnavailableStore {
     }
     async fn mark_provider_models_stale_unless_source(
         &self,
+        _: &str,
         _: &str,
         _: &str,
     ) -> Result<(), StoreError> {
@@ -2410,6 +2416,63 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got, neu);
+    }
+
+    #[tokio::test]
+    async fn postgres_lagged_source_cannot_stale_then_replace_a_fresh_listing() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let store = PostgresStore::connect(&dsn, true).await.expect("connect");
+        let provider = unique_ns("prov");
+        let neu = ProviderModels {
+            provider: provider.clone(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(neu.clone()).await.expect("new");
+        store
+            .mark_provider_models_stale_unless_source(
+                &provider,
+                "https://api.openai.com/v1",
+                "2026-09-02T12:00:00Z",
+            )
+            .await
+            .expect("recent row is left alone");
+        store
+            .put_provider_models(ProviderModels {
+                provider: provider.clone(),
+                fetched_at: Some("2026-09-02T12:02:00Z".into()),
+                stale: false,
+                data: vec![serde_json::json!({"id": "old", "object": "model"})],
+                source: Some("https://api.openai.com/v1".into()),
+            })
+            .await
+            .expect("old");
+        let got = store
+            .get_provider_models(&provider)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, neu);
+
+        store
+            .mark_provider_models_stale_unless_source(
+                &provider,
+                "https://api.openai.com/v1",
+                "2026-09-02T12:11:00Z",
+            )
+            .await
+            .expect("abandoned row is staled");
+        let stale = store
+            .get_provider_models(&provider)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(stale.stale);
+        assert_eq!(stale.data, neu.data);
     }
 
     #[tokio::test]

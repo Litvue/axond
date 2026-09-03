@@ -21,6 +21,9 @@ use crate::store::ProviderModels;
 const MAX_PAGES: usize = 20;
 const EMPTY_BACKOFF_START: Duration = Duration::from_secs(1);
 const EMPTY_BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// A cache row from a different provider URL is superseded only after this
+/// many discovery intervals without a successful refresh.
+const SUPERSEDE_AFTER_INTERVALS: u32 = 2;
 
 /// Refresh every configured provider, then sleep the live discovery interval,
 /// until `stop`.
@@ -126,7 +129,13 @@ async fn refresh_one(
     if stopped(stop) {
         return Err(RefreshError::Stopped);
     }
-    stale_if_source_changed(state, provider_id, base_url).await;
+    stale_if_source_changed(
+        state,
+        provider_id,
+        base_url,
+        snapshot.config.discovery.interval(),
+    )
+    .await;
 
     let leases = snapshot
         .credentials
@@ -235,12 +244,27 @@ async fn fetch_listing(
     Ok(data)
 }
 
-async fn stale_if_source_changed(state: &AppState, provider: &str, base_url: &str) {
+/// Stale a cache row fetched from another URL so [`Store::put_provider_models`]
+/// may replace it — but only once that URL has gone unrefreshed for
+/// [`SUPERSEDE_AFTER_INTERVALS`] rounds. A row a live replica still refreshes
+/// is left alone: a lagged replica on the old URL must not stale, then
+/// overwrite, a fresh listing for the new URL.
+async fn stale_if_source_changed(
+    state: &AppState,
+    provider: &str,
+    base_url: &str,
+    interval: Duration,
+) {
     let Some(store) = state.store() else {
         return;
     };
+    let fetched_before = rfc3339_utc(
+        SystemTime::now()
+            .checked_sub(interval.saturating_mul(SUPERSEDE_AFTER_INTERVALS))
+            .unwrap_or(UNIX_EPOCH),
+    );
     if let Err(error) = store
-        .mark_provider_models_stale_unless_source(provider, base_url)
+        .mark_provider_models_stale_unless_source(provider, base_url, &fetched_before)
         .await
     {
         tracing::warn!(
