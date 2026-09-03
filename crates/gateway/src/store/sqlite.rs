@@ -392,7 +392,7 @@ impl Store for SqliteStore {
                     |row| row.get(0),
                 )
                 .map_err(unavailable)?;
-            if spent.saturating_add(reserved).saturating_add(estimate) > limit {
+            if super::budget_would_exceed(spent, reserved, estimate, limit) {
                 tx.commit().map_err(unavailable)?;
                 return Ok(BudgetReserve::Exceeded);
             }
