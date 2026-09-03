@@ -36,7 +36,7 @@ use crate::backends::catalog_store::CatalogStore;
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::secrets::{SecretError, SecretResolver};
-use crate::config::{AdminBreakglass, Config, KeyMaterialSource, Mode};
+use crate::config::{AdminBreakglass, Config, KeyMaterialSource};
 use crate::desired_state::{Action, AuthorizationSnapshot, Caller, DenialReason, ResourceScope};
 use crate::key_material::{self, KeyMaterialError};
 use crate::status::probes::ControlPlaneProbe;
@@ -147,7 +147,7 @@ pub async fn surface_with_change_signal_and_recovery(
     change_signal: Option<Arc<crate::convergence::ChangeSignal>>,
     allow_recovery: bool,
 ) -> Result<Surface, BootError> {
-    if config.mode == Mode::Stateless {
+    if !config.is_stateful() {
         return Ok(Surface {
             api: None,
             mode: "stateless",

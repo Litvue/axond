@@ -139,8 +139,8 @@ const PLATFORM: Tenant = Tenant {
 
 const ACME: Tenant = Tenant {
     namespace: "capacity-acme",
-    inbound_key: "test-capacity-acme-key",
-    inbound_env: "GW_CAPACITY_ACME_KEY",
+    inbound_key: GATEWAY_KEY,
+    inbound_env: "GW_INBOUND_KEY",
     upstream_key: "test-upstream-capacity-acme",
     upstream_env: "GW_CAPACITY_ACME_UPSTREAM",
     chat_alias: "fake-openai/fixture-chat#capacity-acme",
@@ -149,8 +149,8 @@ const ACME: Tenant = Tenant {
 
 const GLOBEX: Tenant = Tenant {
     namespace: "capacity-globex",
-    inbound_key: "test-capacity-globex-key",
-    inbound_env: "GW_CAPACITY_GLOBEX_KEY",
+    inbound_key: GATEWAY_KEY,
+    inbound_env: "GW_INBOUND_KEY",
     upstream_key: "test-upstream-capacity-globex",
     upstream_env: "GW_CAPACITY_GLOBEX_UPSTREAM",
     chat_alias: "fake-openai/fixture-chat#capacity-globex",
@@ -254,14 +254,9 @@ namespace = "{namespace}"
 provider = "fake-openai"
 env = "{upstream_env}"
 id = "{namespace}-openai"
-
-[[gateway_key]]
-env = "{inbound_env}"
-namespace = "{namespace}"
 "#,
             namespace = tenant.namespace,
             upstream_env = tenant.upstream_env,
-            inbound_env = tenant.inbound_env,
         );
         config
     })

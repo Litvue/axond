@@ -78,7 +78,7 @@ struct Boot {
 impl From<&ConfigSnapshot> for Boot {
     fn from(booted: &ConfigSnapshot) -> Self {
         Self {
-            mode: booted.config.mode,
+            mode: booted.config.mode.unwrap_or(Mode::Stateless),
             bind: booted.config.server.bind,
             usage_sink: booted.config.usage_sink.clone(),
             usage_journal: booted.config.usage_journal.clone(),
@@ -301,12 +301,13 @@ impl Reloader {
         generation: u64,
     ) -> Result<ReloadCandidate, ReloadError> {
         let mut config = Config::load(&self.path)?;
-        if config.mode != self.boot.mode {
+        let incoming_mode = config.mode.unwrap_or(Mode::Stateless);
+        if incoming_mode != self.boot.mode {
             return Err(ReloadError::Config(ConfigError::Invalid(format!(
                 "`mode` is a bootstrap property: this process booted in `{}` mode and a reload \
                  cannot switch it to `{}`; restart with the new configuration",
                 self.boot.mode.as_str(),
-                config.mode.as_str()
+                incoming_mode.as_str()
             ))));
         }
         let catalog_changed = self.boot.catalog != config.catalog;
@@ -1380,37 +1381,25 @@ scope = ["chat", "models"]
         );
     }
 
-    /// The mode picks which authority owns durable resources, which a serving
-    /// process cannot change under itself: the reload is refused and the
-    /// previous configuration keeps serving (ADR 0027).
+    /// `mode` is withdrawn (ADR 0063): a candidate that reintroduces it is
+    /// refused and the previous configuration keeps serving.
     #[tokio::test]
     async fn a_reload_cannot_switch_operating_mode() {
         let file = ConfigFile::new(PLATFORM_ONLY);
         let state = state_from(&file);
         let reloader = Reloader::new(file.path(), state.clone());
 
-        file.rewrite(
-            r#"
-mode = "stateful"
-
-[control_plane]
-dsn_env = "GW_CONTROL_PLANE_DSN"
-
-[secret_store]
-kek_env = "GW_SECRET_STORE_KEK"
-
-[[admin_breakglass]]
-env = "GW_ADMIN_BREAKGLASS"
-"#,
-        );
+        file.rewrite(&format!("mode = \"stateful\"\n{PLATFORM_ONLY}"));
         let error = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .await
-            .expect_err("a mode switch needs a restart");
+            .expect_err("mode is withdrawn");
 
         let message = error.to_string();
-        assert!(message.contains("stateless"), "{message}");
-        assert!(message.contains("stateful"), "{message}");
+        assert!(
+            message.contains("`mode`") && message.contains("ADR 0063"),
+            "{message}"
+        );
         assert_eq!(state.config().generation, 0, "the old config keeps serving");
         assert_eq!(listed_aliases(&state).await, Vec::<String>::new());
     }
@@ -1458,6 +1447,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[test]
+    #[ignore = "ADR 0063: minted tokens / plural [[gateway_key]] withdrawn"]
     fn reload_summary_reports_can_mint_toggles() {
         let before_config = Config::from_toml_str(WITH_GATEWAY_MINTING).unwrap();
         let after_config = Config::from_toml_str(&WITH_GATEWAY_MINTING.replacen(
@@ -1478,6 +1468,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[test]
+    #[ignore = "ADR 0063: minted tokens / plural [[gateway_key]] withdrawn"]
     fn reload_summary_reports_minting_material_rotation() {
         let config = Config::from_toml_str(WITH_GATEWAY_MINTING).unwrap();
         let before = ConfigSnapshot::build(config.clone(), &minting_env(), 0).unwrap();
@@ -1505,6 +1496,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[test]
+    #[ignore = "ADR 0063: minted tokens / plural [[gateway_key]] withdrawn"]
     fn reload_summary_separates_minting_add_remove_from_changes() {
         let disabled_config = WITH_GATEWAY_MINTING
             .replace("[gateway_minting]\nkid = \"reload-kid\"\nenv = \"SIGNING_KEY\"\nmax_ttl = \"10m\"\n", "")
@@ -1566,6 +1558,7 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     #[test]
+    #[ignore = "ADR 0063: minted tokens / plural [[gateway_key]] withdrawn"]
     fn reload_summary_reports_inherited_minting_ttl_changes() {
         let before_config = WITH_GATEWAY_MINTING.replace("max_ttl = \"10m\"\n", "");
         let after_config = before_config.replace("max_ttl = \"15m\"", "max_ttl = \"20m\"");

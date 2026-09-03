@@ -34,7 +34,6 @@ GW_PLATFORM_OPENAI_API_KEY=replace-me
 GW_PLATFORM_ANTHROPIC_API_KEY=replace-me
 GW_ACME_OPENAI_API_KEY=replace-me
 GW_INBOUND_PLATFORM_KEY=replace-me
-GW_INBOUND_ACME_KEY=replace-me
 ```
 
 ```bash

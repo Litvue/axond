@@ -306,7 +306,7 @@ pub const PUBLICATION_MANIFEST_MAX_BYTES: usize =
 pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection> {
     match Config::from_toml_str(input) {
         Ok(config) => Ok(ConfigShape {
-            stateful: config.mode == config::Mode::Stateful,
+            stateful: config.is_stateful(),
             namespaces: config.namespace.len(),
             providers: config.provider.len(),
             models: config.model.len(),

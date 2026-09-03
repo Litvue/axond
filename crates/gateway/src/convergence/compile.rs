@@ -623,9 +623,7 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
         secrets: &SecretMaterialization,
     ) -> Result<ConfigSnapshot, CompileError> {
         let id = revision.id();
-        if self.bootstrap.mode == crate::config::Mode::Stateful
-            && !self.projection.projects_inbound_principals()
-        {
+        if self.bootstrap.is_stateful() && !self.projection.projects_inbound_principals() {
             return Err(CompileError::Unsupported {
                 revision: id,
                 detail: "the active projection does not provide inbound caller principals",
@@ -648,7 +646,7 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
         } else {
             self.pricing(revision)?
         };
-        let config = if self.bootstrap.mode == crate::config::Mode::Stateful && !flat_v2 {
+        let config = if self.bootstrap.is_stateful() && !flat_v2 {
             super::serving::project(
                 config,
                 revision.state(),
@@ -695,7 +693,7 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
             None => snapshot,
             Some(pricing) => snapshot.with_pricing(pricing),
         };
-        let snapshot = if self.bootstrap.mode == crate::config::Mode::Stateful && !flat_v2 {
+        let snapshot = if self.bootstrap.is_stateful() && !flat_v2 {
             let authorization = crate::desired_state::AuthorizationSnapshot::of(revision.state())
                 .map_err(|error| CompileError::Projection {
                 revision: id,

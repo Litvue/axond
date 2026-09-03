@@ -17,7 +17,6 @@ services:
       GW_PLATFORM_ANTHROPIC_API_KEY: ${GW_PLATFORM_ANTHROPIC_API_KEY:?set it in .env}
       GW_ACME_OPENAI_API_KEY: ${GW_ACME_OPENAI_API_KEY:?set it in .env}
       GW_INBOUND_PLATFORM_KEY: ${GW_INBOUND_PLATFORM_KEY:?set it in .env}
-      GW_INBOUND_ACME_KEY: ${GW_INBOUND_ACME_KEY:?set it in .env}
       AXOND_BUDGET_REDIS_URL: ${AXOND_BUDGET_REDIS_URL:-redis://redis:6379}
       AXOND_RATE_LIMIT_REDIS_URL: ${AXOND_RATE_LIMIT_REDIS_URL:-redis://redis:6379}
       AXOND_USAGE_POSTGRES_DSN: ${AXOND_USAGE_POSTGRES_DSN:-postgres://postgres:axond-quickstart@postgres:5432/axond}

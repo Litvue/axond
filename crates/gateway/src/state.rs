@@ -1529,7 +1529,7 @@ impl ConfigSnapshot {
         let projected_principals = ProjectedPrincipals::new(config.projected_principals.clone());
         if inbound_keys.is_empty()
             && projected_principals.count() == 0
-            && !(allow_keyless_bootstrap && config.mode == crate::config::Mode::Stateful)
+            && !(allow_keyless_bootstrap && config.is_stateful())
         {
             return Err(SnapshotError::NoInboundKeys);
         }
@@ -1925,7 +1925,7 @@ impl AppState {
         let stream_terminal_grace =
             Duration::from_millis(config.transport.stream_terminal_grace_ms);
         let admission = AdmissionControl::from_config(&config.admission);
-        let snapshot = if config.mode == crate::config::Mode::Stateful {
+        let snapshot = if config.is_stateful() {
             ConfigSnapshot::build_bootstrap(config, env, 0)?
         } else {
             ConfigSnapshot::build(config, env, 0)?
@@ -3156,11 +3156,25 @@ scope = ["chat", "models"]
     }
 
     /// Two keys holding one secret cannot both be honoured: the table is keyed
-    /// by the secret, so one namespace would silently win.
+    /// by the secret, so one namespace would silently win. ADR 0063 refuses the
+    /// second `[[gateway_key]]` at boot rather than at snapshot build.
     #[test]
     fn two_gateway_keys_sharing_one_secret_refuse_to_resolve() {
-        let config = config_with(
+        let error = Config::from_toml_str(
             r#"
+[storage]
+backend = "sqlite"
+path = ":memory:"
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
 [[gateway_key]]
 env = "AXOND_KEY"
 namespace = "platform"
@@ -3168,43 +3182,25 @@ namespace = "platform"
 [[gateway_key]]
 env = "AXOND_OTHER_KEY"
 namespace = "platform"
+
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#,
-        );
-        let env = HashMap::from([
-            ("AXOND_KEY".to_owned(), "shared".to_owned()),
-            ("AXOND_OTHER_KEY".to_owned(), "shared".to_owned()),
-        ]);
-        let Err(err) = ConfigSnapshot::build(config, &env, 0) else {
-            panic!("an ambiguous key table must not resolve");
-        };
+        )
+        .expect_err("plural [[gateway_key]] is withdrawn");
+        let message = error.to_string();
         assert!(
-            matches!(err, SnapshotError::DuplicateGatewayKey { .. }),
-            "{err}"
+            message.contains("[[gateway_key]]") && message.contains("ADR 0063"),
+            "{message}"
         );
-        let message = err.to_string();
-        assert!(message.contains("AXOND_KEY") && message.contains("AXOND_OTHER_KEY"));
         assert!(!message.contains("shared"), "{message}");
     }
 
     #[test]
     fn file_backed_gateway_key_errors_redact_material() {
-        let first = temp_file(b"file-shared-secret");
-        let second = temp_file(b"file-shared-secret");
-        let config = config_with(&format!(
-            "[[gateway_key]]\nfile = \"{first}\"\nnamespace = \"platform\"\n\n[[gateway_key]]\nfile = \"{second}\"\nnamespace = \"platform\"\n"
-        ));
-        let Err(error) = ConfigSnapshot::build(config, &HashMap::new(), 0) else {
-            panic!("duplicate file-backed keys must be rejected");
-        };
-        let message = format!("{error:?} {error}");
-        assert!(
-            message.contains(&first) && message.contains(&second),
-            "{message}"
-        );
-        assert!(!message.contains("file-shared-secret"), "{message}");
-        std::fs::remove_file(first).unwrap();
-        std::fs::remove_file(second).unwrap();
-
         let failed = temp_file(b"");
         let config = config_with(&format!(
             "[[gateway_key]]\nfile = \"{failed}\"\nnamespace = \"platform\"\n"

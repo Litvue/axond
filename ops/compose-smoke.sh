@@ -85,7 +85,7 @@ cat "$platform_models_file"
 echo
 printf 'acme models: '
 curl --fail --silent \
-  -H "Authorization: Bearer ${GW_INBOUND_ACME_KEY}" \
+  -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
   "${base_url}/ns/acme/v1/models" >"$acme_models_file"
 cat "$acme_models_file"
 echo

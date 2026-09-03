@@ -165,7 +165,6 @@ GW_PLATFORM_OPENAI_API_KEY=placeholder-openai-key \
 GW_PLATFORM_ANTHROPIC_API_KEY=placeholder-anthropic-key \
 GW_ACME_OPENAI_API_KEY=placeholder-acme-openai-key \
 GW_INBOUND_PLATFORM_KEY=quickstart-platform-key \
-GW_INBOUND_ACME_KEY=quickstart-acme-key \
   target/debug/axond
 ```
 

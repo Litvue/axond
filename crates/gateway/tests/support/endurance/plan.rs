@@ -43,26 +43,10 @@ pub const FALLBACK: &str = "endurance-fallback";
 /// having offered all of them rather than for having offered *some*.
 pub const TENANTS: usize = 3;
 
-/// Inbound keys for the two extra namespaces. They are fixtures, not secrets —
-/// the only thing they can reach is a fake upstream on loopback — and they are
-/// delivered as files because the boot's environment is fixed by the shared
-/// harness while `[[gateway_key]] file` is config the profile owns.
-const BYOK_KEY: &str = "endurance-byok-inbound-key";
-const FALLBACK_KEY: &str = "endurance-fallback-inbound-key";
-
-/// Write the tenant key files under `dir` and return the tenants together with
-/// the config that declares them. The returned TOML is appended to the harness
-/// config, so the namespaces, their credential pools, and their inbound keys
-/// are all recorded in the artifact's config hash.
-pub fn tenants(dir: &Path) -> (Vec<Tenant>, String) {
-    let byok_key_path = dir.join("byok.key");
-    let fallback_key_path = dir.join("fallback.key");
-    // No trailing newline: a static key is exact bytes, and a newline makes the
-    // file unusable as a bearer token.
-    std::fs::write(&byok_key_path, BYOK_KEY).expect("the byok tenant key file is written");
-    std::fs::write(&fallback_key_path, FALLBACK_KEY)
-        .expect("the fallback tenant key file is written");
-
+/// Return the tenants together with the extra config that declares their
+/// namespaces and credential pools. One deployment-wide static key authenticates
+/// every tenant (ADR 0063); isolation is the `/ns/{ns}` path.
+pub fn tenants(_dir: &Path) -> (Vec<Tenant>, String) {
     let tenants = vec![
         Tenant {
             namespace: PLATFORM,
@@ -71,12 +55,12 @@ pub fn tenants(dir: &Path) -> (Vec<Tenant>, String) {
         },
         Tenant {
             namespace: BYOK,
-            key: BYOK_KEY.to_owned(),
+            key: GATEWAY_KEY.to_owned(),
             credential_source: "byok",
         },
         Tenant {
             namespace: FALLBACK,
-            key: FALLBACK_KEY.to_owned(),
+            key: GATEWAY_KEY.to_owned(),
             credential_source: "platform",
         },
     ];
@@ -117,17 +101,7 @@ namespace = "{BYOK}"
 provider = "fake-anthropic"
 env = "{ANTHROPIC_SECONDARY_ENV}"
 id = "endurance-byok-anthropic"
-
-[[gateway_key]]
-file = "{byok}"
-namespace = "{BYOK}"
-
-[[gateway_key]]
-file = "{fallback}"
-namespace = "{FALLBACK}"
 "#,
-        byok = byok_key_path.display(),
-        fallback = fallback_key_path.display(),
     );
     (tenants, config)
 }
