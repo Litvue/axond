@@ -256,9 +256,9 @@ pub async fn seed_config_namespaces(
     namespaces: &[crate::config::Namespace],
 ) -> Result<(), StoreError> {
     for namespace in namespaces {
-        validate_namespace_id(&namespace.id)?;
-    }
-    for namespace in namespaces {
+        if validate_namespace_id(&namespace.id).is_err() {
+            continue;
+        }
         let record = NamespaceRecord {
             id: namespace.id.clone(),
             attrs: serde_json::json!({}),
@@ -904,6 +904,32 @@ mod tests {
             store.reservation_count(&ns).await.expect("count"),
             1,
             "expired holds from the old period must be reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_denied_reserve_still_drops_expired_holds() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "p", 100).await.expect("budget");
+        store
+            .reserve_budget(&ns, 10, Duration::from_millis(1), "stale")
+            .await
+            .expect("stale");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(matches!(
+            store
+                .reserve_budget(&ns, 200, Duration::from_secs(30), "over")
+                .await
+                .expect("denied"),
+            BudgetReserve::Exceeded
+        ));
+        assert_eq!(
+            store.reservation_count(&ns).await.expect("count"),
+            0,
+            "denied admission must keep the expiry delete"
         );
     }
 

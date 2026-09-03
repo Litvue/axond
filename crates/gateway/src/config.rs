@@ -2868,6 +2868,13 @@ impl Config {
     fn validate_inner(&self, allow_memory_sqlite: bool) -> Result<(), ConfigError> {
         self.validate_storage(allow_memory_sqlite)?;
         self.reject_legacy_models()?;
+        // Hold TTL is process config in every mode (StoreBudget). Check it
+        // here so stateful bootstrap cannot skip the nonzero gate.
+        if self.budget.reservation_ttl_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "`[budget]` reservation_ttl_seconds must be at least 1".into(),
+            ));
+        }
         match self.mode {
             Mode::Stateless => self.validate_stateless(),
             Mode::Stateful => self.validate_stateful(),
@@ -5412,6 +5419,18 @@ env = "SIGN"
         let error =
             Config::from_toml_str(&format!("{VALID}\n[budget]\nreservation_ttl_seconds = 0\n"))
                 .expect_err("zero TTL must fail at load");
+        assert!(
+            error.to_string().contains("reservation_ttl_seconds"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn reservation_ttl_zero_is_rejected_in_stateful_mode() {
+        let error = Config::from_toml_str(&format!(
+            "{VALID}\nmode = \"stateful\"\n[budget]\nreservation_ttl_seconds = 0\n"
+        ))
+        .expect_err("stateful zero TTL must fail at load");
         assert!(
             error.to_string().contains("reservation_ttl_seconds"),
             "{error}"
