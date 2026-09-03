@@ -2471,6 +2471,7 @@ output_microdollars_per_million = 9
         );
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("price change is valid and boot-owned");
         assert!(summary.price_changed);
         assert!(summary.restart_required());
@@ -2498,6 +2499,7 @@ output_microdollars_per_million = 9
         ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("blocklist change is valid and boot-owned");
         assert!(summary.blocklist_changed);
         assert!(summary.restart_required());
@@ -2547,6 +2549,7 @@ output_microdollars_per_million = 10000000
         );
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("unpriced_models change is valid and boot-owned");
         assert!(summary.unpriced_models_changed);
         assert!(summary.restart_required());
@@ -2598,6 +2601,7 @@ output_microdollars_per_million = 10000000
         );
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .await
             .expect("new provider is valid; unpriced_models stays boot-owned");
         assert!(summary.unpriced_models_changed);
         assert!(summary.restart_required());
