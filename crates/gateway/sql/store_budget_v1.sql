@@ -17,7 +17,8 @@
 -- column. Connect may RENAME those leftover relations to `axond_store_budget*`
 -- before probing, including when this file has already created empty new
 -- tables and the draft still has spend (empty new relations are dropped
--- first). That needs table-rename privilege; migration-only roles should run
+-- first). Incomplete dest tables with rows are a boot error, not a partial
+-- rename. That needs table-rename privilege; migration-only roles should run
 -- the rename out of band before boot.
 --
 -- Spend is cumulative per `(namespace, period)`. Reservations are short-lived
