@@ -69,6 +69,14 @@ printf 'readyz: '
 curl --fail --silent "${base_url}/readyz" >"$readyz_file"
 cat "$readyz_file"
 echo
+printf 'platform budget: '
+curl --fail --silent \
+  -X PUT \
+  -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
+  -H 'content-type: application/json' \
+  -d '{"limit_microdollars":1000000000000}' \
+  "${base_url}/api/v1/namespaces/platform/budgets/smoke" >/dev/null
+echo 200
 printf 'platform models: '
 curl --fail --silent \
   -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
