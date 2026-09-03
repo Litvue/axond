@@ -663,16 +663,10 @@ impl Store for PostgresStore {
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
             let outcome = hold(&tx, &namespace, estimate, ttl_ms, &reservation_id).await?;
-            match &outcome {
-                BudgetReserve::Allowed { .. } => tx
-                    .commit()
-                    .await
-                    .map_err(|e| StoreError::Unavailable(e.to_string()))?,
-                BudgetReserve::Exceeded => tx
-                    .rollback()
-                    .await
-                    .map_err(|e| StoreError::Unavailable(e.to_string()))?,
-            }
+            // Commit Exceeded too: hold() may have deleted expired rows.
+            tx.commit()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
             Ok(outcome)
         })
         .await

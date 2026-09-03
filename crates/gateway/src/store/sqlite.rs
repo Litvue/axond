@@ -379,7 +379,10 @@ impl Store for SqliteStore {
                 .map_err(unavailable)?
             {
                 Some(row) => row,
-                None => return Ok(BudgetReserve::Exceeded),
+                None => {
+                    tx.commit().map_err(unavailable)?;
+                    return Ok(BudgetReserve::Exceeded);
+                }
             };
             let reserved: i64 = tx
                 .query_row(
@@ -390,6 +393,7 @@ impl Store for SqliteStore {
                 )
                 .map_err(unavailable)?;
             if spent.saturating_add(reserved).saturating_add(estimate) > limit {
+                tx.commit().map_err(unavailable)?;
                 return Ok(BudgetReserve::Exceeded);
             }
             let expires_at = now.saturating_add(ttl_ms);
@@ -552,6 +556,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_config_namespaces_skips_slash_ids() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        super::super::seed_config_namespaces(
+            &store,
+            &[namespace("wsp_ok"), namespace("acme/core")],
+        )
+        .await
+        .expect("seed");
+        assert!(store.get_namespace("wsp_ok").await.expect("get").is_some());
+        assert!(
+            store
+                .get_namespace("acme/core")
+                .await
+                .expect("slash")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn update_returns_the_written_row() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         store
@@ -602,6 +625,42 @@ mod tests {
             .expect("count")
         };
         assert_eq!(n, 1, "expired holds from the old period must be reclaimed");
+    }
+
+    #[tokio::test]
+    async fn denied_reserve_still_drops_expired_holds() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_x".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("ns");
+        store.put_budget("wsp_x", "p", 100).await.expect("budget");
+        store
+            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "stale")
+            .await
+            .expect("stale hold");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(matches!(
+            store
+                .reserve_budget("wsp_x", 200, Duration::from_secs(30), "over")
+                .await
+                .expect("denied"),
+            BudgetReserve::Exceeded
+        ));
+        let n: i64 = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(n, 0, "denied admission must keep the expiry delete");
     }
 
     #[test]
