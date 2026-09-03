@@ -616,7 +616,7 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # Production: `source = "models-dev"` with `bootstrap = "seed"` so the first
 # boot has rates before the first successful fetch.
 # `store = "in-memory"` is a development store: it loses every snapshot on
-# restart. Postgres retention needs `dsn_env` (or inherit `[control_plane]`).
+# restart. Postgres retention needs `store = "postgres"` and `dsn_env`.
 [catalog]
 source = "seed" # none (default) | models-dev | seed
 # source_url = "https://models.dev/catalog.json"

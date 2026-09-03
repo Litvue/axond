@@ -7083,7 +7083,7 @@ env = "AXOND_PLATFORM_OPENAI"
             Box::new(NoBudget),
             &seed_catalog(),
         );
-        let body = serde_json::to_vec(&json!({"model": "openai/gpt-5.5", "messages": []})).unwrap();
+        let body = serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []})).unwrap();
         let resp = router(state)
             .oneshot(
                 authorized("/v1/chat/completions")
@@ -7095,9 +7095,9 @@ env = "AXOND_PLATFORM_OPENAI"
         assert_eq!(resp.status(), StatusCode::OK);
         let records = captured.0.lock().unwrap();
         assert_eq!(records.len(), 1);
-        // seed cost: $5 / $30 per million; fake upstream reports 10+5 tokens.
-        assert_eq!(records[0].cost_microdollars, Some(200));
-        assert_eq!(records[0].target_model, "gpt-5.5");
+        // seed cost: $2.5 / $10 per million; fake upstream reports 10+5 tokens.
+        assert_eq!(records[0].cost_microdollars, Some(75));
+        assert_eq!(records[0].target_model, "gpt-4o");
         assert_eq!(records[0].input_tokens, 10);
         assert_eq!(records[0].output_tokens, 5);
     }
@@ -7213,9 +7213,68 @@ env = "AXOND_PLATFORM_OPENAI"
 
 [[price]]
 provider = "openai"
-model = "gpt-5.5"
+model = "gpt-4o"
 input_microdollars_per_million = 1
 output_microdollars_per_million = 1
+"#
+        ))
+        .unwrap();
+        let captured = CapturingSink::default();
+        let state = state_with_catalog(
+            cfg,
+            env_with([("AXOND_PLATFORM_OPENAI", "sk-good")]),
+            UsageFanout::new(vec![Box::new(captured.clone())]),
+            Box::new(NoBudget),
+            &seed_catalog(),
+        );
+        let body = serde_json::to_vec(&json!({"model": "openai/gpt-4o", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].cost_microdollars,
+            Some(75),
+            "models.dev rates, not the [[price]] override"
+        );
+    }
+
+    /// The seed publishes `gpt-5.5` with a `context_over_200k` tier. A flat
+    /// rate cannot hold that schedule, so the catalogue does not price it and
+    /// the `[[price]]` row is what the request is charged at.
+    #[tokio::test]
+    async fn tiered_catalog_cost_falls_back_to_the_price_book() {
+        let base_url = rate_limiting_upstream("never-matches").await;
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+{GATEWAY_KEY}
+
+[[price]]
+provider = "openai"
+model = "gpt-5.5"
+input_microdollars_per_million = 10000000
+output_microdollars_per_million = 45000000
 "#
         ))
         .unwrap();
@@ -7239,11 +7298,9 @@ output_microdollars_per_million = 1
         assert_eq!(resp.status(), StatusCode::OK);
         let records = captured.0.lock().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].cost_microdollars,
-            Some(200),
-            "models.dev rates, not the [[price]] override"
-        );
+        // 10 * 10_000_000 / 1e6 + 5 * 45_000_000 / 1e6 = 100 + 225, not the
+        // seed's $5 / $30 base rate (200).
+        assert_eq!(records[0].cost_microdollars, Some(325));
     }
 
     #[tokio::test]

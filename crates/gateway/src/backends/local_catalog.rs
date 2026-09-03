@@ -174,7 +174,15 @@ impl LocalCatalogBuilder {
 /// overcharge. Optional cache/reasoning rates convert the same way; a stated
 /// optional that is not exact makes the whole offering unusable rather than
 /// silently falling back to input/output.
+///
+/// A published schedule with context tiers is unpublished for the same reason:
+/// [`ModelPrice`] has no threshold, so compiling only the base rates would bill
+/// long-context requests below what the source states. Such offerings fall to
+/// the `[[price]]` fallback, where an operator can state the rate they accept.
 pub fn model_price_from_cost(price: &ObservedPrice) -> Option<ModelPrice> {
+    if !price.tiers.is_empty() {
+        return None;
+    }
     Some(ModelPrice {
         input_microdollars_per_million: exact_micros(price.base.input.nanos())?,
         output_microdollars_per_million: exact_micros(price.base.output.nanos())?,
@@ -536,31 +544,57 @@ mod tests {
         }
     }
 
-    /// models.dev `cost.input`/`cost.output` of 5/30 USD per million tokens
-    /// become 5_000_000/30_000_000 µUSD per million; 1M+1M tokens charge
-    /// 35_000_000 µUSD with no `[[price]]` row.
+    /// models.dev `cost.input`/`cost.output` of 2.5/10 USD per million tokens
+    /// become 2_500_000/10_000_000 µUSD per million; 1M+1M tokens charge
+    /// 12_500_000 µUSD with no `[[price]]` row.
     #[test]
     fn seed_charges_from_models_dev_cost_without_a_price_book() {
         let index = CatalogPriceIndex::from_snapshot(&crate::backends::models_dev::seed_snapshot());
         let rates = index
-            .price_for("openai", "gpt-5.5")
-            .expect("openai publishes gpt-5.5 with a usable cost");
-        assert_eq!(rates.input_microdollars_per_million, 5_000_000);
-        assert_eq!(rates.output_microdollars_per_million, 30_000_000);
-        assert_eq!(rates.cache_read_microdollars_per_million, Some(500_000));
+            .price_for("openai", "gpt-4o")
+            .expect("openai publishes gpt-4o with a usable cost");
+        assert_eq!(rates.input_microdollars_per_million, 2_500_000);
+        assert_eq!(rates.output_microdollars_per_million, 10_000_000);
+        assert_eq!(rates.cache_read_microdollars_per_million, Some(1_250_000));
         assert_eq!(
             rates.cost_microdollars(usage(1_000_000, 1_000_000)),
-            35_000_000
+            12_500_000
         );
         assert!(
             index.price_for("openai", "does-not-exist").is_none(),
             "an offering the snapshot does not price is omitted, not free"
         );
-        let gpt_4o = index
-            .price_for("openai", "gpt-4o")
-            .expect("the seed also prices gpt-4o");
-        assert_eq!(gpt_4o.input_microdollars_per_million, 2_500_000);
-        assert_eq!(gpt_4o.output_microdollars_per_million, 10_000_000);
+        let azure = index
+            .price_for("azure", "gpt-4o")
+            .expect("the seed also prices azure/gpt-4o");
+        assert_eq!(azure.input_microdollars_per_million, 2_500_000);
+        assert_eq!(azure.output_microdollars_per_million, 10_000_000);
+    }
+
+    /// The seed publishes `gpt-5.5` with a `context_over_200k` tier at twice
+    /// the base rate. A flat [`ModelPrice`] cannot hold that schedule, so the
+    /// offering is omitted rather than billed at the base rate for every
+    /// context size; a `[[price]]` row is then the operator's rate.
+    #[test]
+    fn tiered_cost_is_not_flattened_to_its_base_rate() {
+        let snapshot = crate::backends::models_dev::seed_snapshot();
+        let observed = snapshot
+            .content
+            .models()
+            .iter()
+            .flat_map(|model| &model.offerings)
+            .find(|offering| {
+                offering.provider.as_str() == "openai" && offering.published_model_id == "gpt-5.5"
+            })
+            .and_then(|offering| offering.price.as_ref())
+            .expect("the seed states a cost for openai/gpt-5.5");
+        assert!(!observed.tiers.is_empty(), "the fixture must stay tiered");
+        assert_eq!(model_price_from_cost(observed), None);
+        let index = CatalogPriceIndex::from_snapshot(&snapshot);
+        assert!(
+            index.price_for("openai", "gpt-5.5").is_none(),
+            "a tiered offering must not charge its base rate for long context"
+        );
     }
 
     #[test]
