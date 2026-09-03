@@ -1,15 +1,16 @@
-# Axond example STATEFUL bootstrap configuration.
+# WITHDRAWN bootstrap file (ADR 0063).
 #
-# This is the whole file a stateful replica reads. Tenants, projects,
-# identities, providers, provider credentials, model catalogues, prices,
-# aliases, and policy are owned by the Postgres control plane and administered
-# through `/admin/v1`; declaring any of them here is a boot error before the
-# listener binds, because two authorities for one resource would need a merge
-# policy (docs/adr/0027-stateless-and-stateful-operating-modes.md).
+# `mode = "stateful"`, `[control_plane]`, `[secret_store]`, and
+# `[[admin_breakglass]]` are boot errors. This file is kept so the docs gate
+# still names every parser-accepted withdrawn key. Do not deploy it.
+# Live configuration is `axond.example.toml` plus `[storage]`.
 #
-# Stateless mode remains the default and is what `axond.example.toml`
-# describes. Omitting `mode` selects it, so nothing written before this file
-# existed changes meaning.
+# Historical context: this was the whole file a control-plane replica read.
+# Tenants, projects, identities, providers, credentials, catalogues, prices,
+# aliases, and policy were owned by Postgres and administered through
+# `/admin/v1` (docs/adr/0027-stateless-and-stateful-operating-modes.md).
+#
+# The live product omits `mode`. `axond.example.toml` is the operator file.
 #
 # Every secret here is a *reference*: the name of an environment variable, or a
 # path to a file. No DSN, key-encryption key, or credential is ever inlined,

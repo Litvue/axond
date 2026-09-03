@@ -10,28 +10,26 @@ dashboards and alert rules under [`ops/observability/`](../../ops/observability/
 are the same signals as assets you can import, and every rule's `runbook_url`
 points at a section of this page.
 
-**What is live today.** The dependency-status family is live for the dependencies
-a deployment actually opens. Stateful replicas also emit convergence and
-candidate-publication signals; stateless replicas do not open the control plane
-and therefore do not emit that family.
+**What is live today.** `/admin/v1/status` is unmounted
+([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)). Store and
+optional Redis limiter health is typed errors and metrics. Control-plane
+convergence series are withdrawn.
 
-* **Status.** A replica runs a refresher over the dependencies **it actually
-  opened**, so which components report a state is a property of your
-  configuration rather than of the mode:
+* **Status.** Historical component table (the diagnostic route is unmounted):
 
   | Component | Observed when | Not observed when |
   | --- | --- | --- |
-  | `control_plane` | `mode = "stateful"` | `mode = "stateless"` |
-  | `budget_store` | `[budget] backend` is `redis` or `postgres` | `none`, `in-memory` |
+  | `control_plane` | withdrawn (`mode = "stateful"`) | live product (`mode` omitted) |
+  | `budget_store` | withdrawn `[budget] backend` | Store period budgets |
   | `rate_limit_store` | `[rate_limit] backend = "redis"` | `none`, `in-memory` |
-  | `revocation_store` | `[revocation] backend` is `redis` or `postgres` | `none` |
-  | `secret_store`, `usage_sink`, `catalogue`, `provider_credentials` | never yet | always |
+  | `revocation_store` | withdrawn minted denylist | always |
+  | `secret_store`, `usage_sink`, `catalogue`, `provider_credentials` | never | always |
 
   A component in the right column reports `disabled` and emits no series — that
   is the correct answer for a dependency the deployment does not have, not a gap.
-  A replica with none of them (a stateless install with in-memory stores) runs no
-  refresher at all and produces none of `axond_status_component_state`,
-  `axond_status_observation_age`, or `axond_status_refreshes`.
+  A replica with none of them runs no refresher and produces none of
+  `axond_status_component_state`, `axond_status_observation_age`, or
+  `axond_status_refreshes`. `/admin/v1/status` is unmounted.
 
   Each component is observed through the connection the *request or admin path*
   already uses, so the diagnostic and the real work fail together instead of

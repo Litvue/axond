@@ -13,8 +13,8 @@ connects configured backends before binding the socket.
 | `failed to load config` | Missing file, invalid TOML, invalid graph, or unsupported combination. | Check `AXOND_CONFIG`, then compare against the configuration reference. |
 | `references env var ... unset or empty` | A credential, gateway key, verifier, or DSN reference is absent from the process environment. | Set it on the actual service/container and restart. |
 | `cached guardrail key reference ... resolves to different material` | A cold-recovery cache was compiled with a different value behind the same `key_env` name. | Restore the original value, or recover control-plane access and publish a new policy naming a new versioned environment variable before rotating. |
-| `at least one gateway key` | No static `[[gateway_key]]` exists. | Add a breakglass key; minted verifiers are additive. |
-| `hold the same secret` | Two gateway-key entries resolve to one value. | Give each principal a distinct value. |
+| `exactly one \`[[gateway_key]]\`` | Zero or more than one static key. | Declare exactly one deployment-wide key. |
+| `mode is withdrawn` | `mode` is set. | Remove the `mode` key. |
 | `usage sink configuration failed` | Postgres or OTLP configuration/connectivity failed, or the usage outbox could not connect to or read its tables. | Verify DSN/endpoint, DNS, TLS, schema, and credentials; for `[usage_journal]`, that `ops/postgres/usage_outbox_v1.sql` is applied in the named schema and the role can read it. |
 | `budget configuration failed` | Budget backend unavailable or layout migration incomplete. | Restore the backend or complete the named migration. |
 | `rate-limit configuration failed` | Redis is unavailable or invalid. | Verify URL, TLS, DNS, and connectivity. |
@@ -26,10 +26,9 @@ Boot errors name references and identifiers, not secret values.
 
 | Status / type | Meaning | First check |
 | --- | --- | --- |
-| `401 unauthorized` | No presented credential matched a static key or valid minted token. | Header value, key namespace, token audience/signature/expiry. |
-| `403 token_scope_insufficient` | Auth succeeded but route/operator authority did not. | Token scope and whether the action requires the default-namespace static operator key. |
-| `403 token_signer_not_permitted` | Verifier does not permit the token namespace. | Verifier `namespaces` and token `ns`. |
-| `404 unknown_model` | Alias is absent or unavailable to the caller namespace. | `/v1/models`, credential coverage, alias spelling. |
+| `401 unauthorized` | No presented credential matched the static gateway key, or the caller sent `axt1.`. | Header value; minted tokens are not inbound identity. |
+| `404 unknown_namespace` | Path namespace missing or deleted. | `GET /api/v1/namespaces/{ns}`; same body for never-existed and deleted. |
+| `400 model_unprefixed` / `unknown_provider` | Request `model` is not `provider-id/model-id`. | Prefix with a configured provider id. |
 | `400 unsupported_wire` | Route and alias provider family differ. | Keep every alias target in one wire family and use the matching route. |
 | `400 bad_request` | Invalid request or query shape. | Error message; repeated/invalid `namespaces` values are rejected deliberately. |
 | `400 middleware_refused` | Request middleware classified the request as invalid before provider dispatch. | Request shape and the namespace's selected content policy. |

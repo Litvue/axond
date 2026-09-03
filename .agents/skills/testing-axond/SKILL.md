@@ -36,11 +36,10 @@ GW_INBOUND_PLATFORM_KEY=dummy-inbound \
 ```bash
 curl -s http://127.0.0.1:8080/healthz     # -> ok      (unauthenticated)
 curl -s http://127.0.0.1:8080/readyz      # -> ready   (unauthenticated)
-# /v1/models is authenticated and namespace-scoped: pass a gateway key, and it
-# lists only aliases whose targets that key's namespace holds a credential for.
+# /ns/{ns}/v1/models is authenticated: pass the deployment gateway key.
 curl -s -H "Authorization: Bearer <gateway key value>" \
-  http://127.0.0.1:8080/v1/models         # -> {"object":"list","data":[{"id":"<alias>",...}]}
-curl -s http://127.0.0.1:8080/v1/models   # -> 401 unauthorized (no key)
+  http://127.0.0.1:8080/ns/platform/v1/models
+curl -s http://127.0.0.1:8080/ns/platform/v1/models   # -> 401 unauthorized (no key)
 ```
 
 Every route except the `/healthz` and `/readyz` liveness probes needs
@@ -124,7 +123,12 @@ concatenation** of `base_url`
 + route path, so a `base_url` with a query string or trailing junk will produce a mangled
 URL — keep test `base_url`s path-only unless that is what you are testing.
 
-## Minted tokens and file-backed key material
+## Minted tokens (withdrawn) and file-backed key material
+
+Minted `axt1.` tokens are not inbound identity ([ADR 0063](../../../docs/adr/0063-stateful-only-namespaced-gateway.md)):
+production `authenticate` returns `401` for that prefix and `POST /v1/tokens`
+is unmounted. The `keygen`/`mint` recipes below remain useful for parser and
+fuzz tests only.
 
 `[[gateway_verifier]]` and `[[gateway_key]]` take **exactly one** of `env = "NAME"` or
 `file = "/path"`. File material is re-read whenever a reload candidate is built, so

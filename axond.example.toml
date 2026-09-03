@@ -12,15 +12,10 @@
 # OTEL_EXPORTER_OTLP_ENDPOINT (OTLP/HTTP, e.g. http://collector:4318) to turn on
 # traces and metrics. See docs/adr/0007-telemetry-model.md.
 #
-# Operating mode: this file is stateless mode, where TOML owns every resource.
-# It is the default, so the key is omitted here and nothing below needs it. The
-# opt-in `mode = "stateful"` hands tenants, providers, credentials, catalogues,
-# prices, aliases, and policy to a Postgres control plane and shrinks this file
-# to bootstrap references — see `axond.stateful.example.toml` and
-# docs/adr/0027-stateless-and-stateful-operating-modes.md. Declaring a
-# stateful-owned section in a stateful file is a boot error, and vice versa.
-
-# mode = "stateless"
+# Product shape: store-backed, namespace-scoped (ADR 0063). `[storage]` is
+# required. `mode`, `[control_plane]`, `[secret_store]`, `[[admin_breakglass]]`,
+# and `[[model]]` are boot errors. See docs/configuration.md.
+# Historical withdrawn bootstrap: `axond.stateful.example.toml`.
 
 [server]
 bind = "0.0.0.0:8080"
@@ -100,17 +95,11 @@ strategy = "weighted"
 failure_threshold = 2
 cooldown_seconds = 30
 
-# ── Failover across targets ───────────────────────────────────────────────────
-# The OUTER loop around credential-pool dispatch. An alias's `targets` are tried
-# in configured order; a RETRYABLE upstream failure (5xx, transport, a fully
-# rate-limited pool, an unavailable model) advances to the next target, while a
-# 4xx-class error that would just fail again is returned as-is. Each target has
-# its own in-memory, per-replica circuit breaker: `failure_threshold` consecutive
-# target-scoped failures trip it, the target is skipped for `cooldown_seconds`,
-# then re-offered as a single half-open probe that closes on success. A pool-wide
-# `429` is credential-scoped (see `[credential_pool]`) and never trips the
-# target's breaker. `max_attempts` and `overall_timeout_ms` bound the walk so
-# failover cannot amplify latency without limit.
+# ── Circuits (credential-pool, not alias failover) ────────────────────────────
+# Alias-level failover is withdrawn (ADR 0063). This section still bounds
+# credential-pool circuits inside one provider. A pool-wide `429` is
+# credential-scoped (see `[credential_pool]`) and never trips the provider
+# breaker. `max_attempts` and `overall_timeout_ms` bound the walk.
 
 [failover]
 max_attempts = 3
@@ -279,7 +268,9 @@ namespace = "platform"
 # file = "/run/secrets/axond-inbound-platform"
 # namespace = "platform"
 
-# ── Minted token verification (optional) ─────────────────────────────────────
+# ── Minted token verification (WITHDRAWN, ADR 0063) ──────────────────────────
+# `axt1.` presentations are 401. `POST /v1/tokens` is unmounted. Leave the
+# following commented. Historical field names only.
 # Verifiers are additive to the required static gateway keys. The Ed25519
 # public key is a single-line base64 encoding of the raw 32-byte public key;
 # the referenced env var is validated at boot and reload. `kid` is carried in

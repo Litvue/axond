@@ -5,14 +5,21 @@ Every section, key, and default the gateway reads today, cross-checked against
 [`axond.example.toml`](../axond.example.toml) is the same surface with prose;
 this is the lookup table.
 
+Axond is a **store-backed inference gateway**
+([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)). There is no
+stateless/config-only product, no in-memory or Redis budget tier, and no
+`/admin/v1` control plane. Historical ADRs that described those shapes remain
+on disk as records; this page is the live contract.
+
 Two rules hold everywhere:
 
-- **TOML owns structure, and secrets are referenced rather than inlined.** A
-  key, DSN, or token is referenced by an environment-variable name or, for
-  gateway key material, a file path. No config key takes material inline.
+- **TOML owns process structure, and secrets are referenced rather than
+  inlined.** A key, DSN, or token is referenced by an environment-variable name
+  or, for gateway key material, a file path. No config key takes material
+  inline.
 - **Fail at boot, not at request time.** The whole graph is validated before the
   socket is bound, and again on every reload. Anything listed as "rejected"
-  below refuses to start (or, on reload, is rejected while the previous config
+  below is a boot error (or, on reload, is rejected while the previous config
   keeps serving).
 
 Loading order: the TOML file (`AXOND_CONFIG`, default `axond.toml`), then
@@ -20,137 +27,91 @@ Loading order: the TOML file (`AXOND_CONFIG`, default `axond.toml`), then
 separator (`AXOND_SERVER__BIND=0.0.0.0:9090`). The override layer is for scalars
 in containerized deploys; structure belongs in the file.
 
+TOML plus env holds bind, providers, credentials, **exactly one**
+`[[gateway_key]]`, `[storage]`, the deployment price-book and blocklist, and
+process bounds (`[admission]`, `[transport]`, `[shutdown]`, telemetry).
+Namespaces, period budgets, and usage also live in the Store: file
+`[[namespace]]` rows are seeded at boot; further namespaces are created through
+`/api/v1`. Changing process config is a restart or a reload of the keys that
+reload supports.
+
 ## State tiers
 
-State tiers describe the state backends axond itself depends on, not provider
-egress: upstream provider calls still use the network at Tier 0.
+The live product is one Store. SQLite WAL is the single-replica
+implementation; Postgres is the HA implementation. Boot requires `[storage]`; a
+missing or unreachable store is a boot failure.
 
-| Config section | State tier |
+| Config section | Persistence |
 | --- | --- |
-| `[server]`, `[[namespace]]`, `[[provider]]`, `[[price]]`, `[blocklist]`, `[[credential]]` | Tier 0: config-only. |
-| `[credential_pool]`, `[failover]` | Tier 0: in-memory, per replica. |
-| `[transport]` | Tier 0: process-level bounds on provider egress. |
-| `[admission]` | Tier 0: in-memory per-replica request bounds and load shedding. |
-| `[[gateway_key]]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]`, offline `keygen`/`mint` | Tier 0: config, referenced files, and environment only. |
-| `[reload]` | Tier 0: reload reads the config file, referenced key-material files, and process environment. |
-| `[[usage_sink]]` omitted or `kind = "stdout"` | Tier 0: one JSON line on stdout. |
-| `[[usage_sink]] kind = "otlp"` | Tier 0 state, but not hermetic: a collector is a boot-time dependency, so this is outside the hermetic Tier 0 CI lane. |
-| `[[usage_sink]] kind = "postgres"` | Tier 2: durable usage rows. |
-| `[usage_journal]` omitted or `backend = "none"` | Tier 0: telemetry-grade usage delivery, exactly as before. |
-| `[usage_journal] backend = "postgres"` | Tier 2: a durable usage outbox on the request path. |
-| `[budget]` omitted or only `reservation_ttl_seconds` | Hold TTL for Store-backed namespace period caps (ADR 0063). `backend = redis\|postgres\|in-memory` is a boot error. |
-| `[rate_limit] backend = "redis"` or `[revocation] backend = "redis"` | Tier 1: exact shared inbound concurrency and precise token revocation through Redis. |
-| `[rate_limit] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
-| `[revocation] backend = "postgres"` | Tier 2: durable precise token revocation. |
-| `[shutdown]` | Tier 0: process-level bounds on termination. |
-| `/healthz`, `/readyz` | Tier 0. |
+| `[storage]` | **Required.** SQLite WAL or Postgres. Namespaces, period budgets, usage index, discovery cache. |
+| `[server]`, `[[provider]]`, `[[price]]`, `[blocklist]`, `[[credential]]` | Process config. |
+| `[[namespace]]` | Seeded into the Store at boot; runtime create/update/delete is `/api/v1`. |
+| `[credential_pool]`, `[failover]` | In-memory, per replica. Alias-level failover is gone; credential-pool rotation inside one provider remains. |
+| `[transport]`, `[admission]`, `[shutdown]` | Process-level bounds. |
+| `[[gateway_key]]` | **Exactly one** deployment-wide static key. |
+| `[reload]` | Re-reads the config file, referenced key-material files, and process environment. Not a live channel for `[storage]`. |
+| `[[usage_sink]]` omitted or `kind = "stdout"` | One JSON line on stdout. |
+| `[[usage_sink]] kind = "otlp"` | Process-local export; a collector is a boot-time dependency. |
+| `[[usage_sink]] kind = "postgres"` | Durable usage rows (optional sink; the Store already has a usage index). |
+| `[usage_journal]` omitted or `backend = "none"` | Telemetry-grade usage delivery. |
+| `[usage_journal] backend = "postgres"` | Durable usage outbox on the request path. |
+| `[budget]` | Hold TTL only. `backend = "redis"\|"postgres"\|"in-memory"` is a boot error. Caps are `PUT /api/v1/namespaces/{ns}/budgets/{period}`. |
+| `[rate_limit]` | Optional per-replica or Redis in-flight limiter. Not a budget backend. |
+| `/healthz`, `/readyz` | Unauthenticated liveness / readiness. |
 
-Namespaces, providers, aliases, prices, and provider credentials are
-config-owned and reload through ADR 0011. Only callers and keys may ever become
-store-owned at Tier 2; nothing is defined in both. A database may not override
-namespace provider access, an alias's target, a price, or the credential pool.
-Even at Tier 2, a token verifier intersects token claims with config-owned
-namespace authority (ADR 0016). See
-[ADR 0017](./adr/0017-state-tiers-and-optional-backends.md) and the hermetic
-[Tier 0 gate](./adr/0018-tier-0-hermetic-boot-gate.md).
+`[[model]]` is a boot error. Callers send `provider-id/model-id`. There is no
+config hot-reload of a model table.
 
 ## Operating mode
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `mode` | `stateless` \| `stateful` | `stateless` | Which authority owns durable resources. Any other value is rejected. |
+| `mode` | withdrawn | omitted | Any presence is a boot error, including `mode = "stateless"` and `mode = "stateful"`. Axond is store-backed; there is no mode matrix. Remove the key. |
 
-Everything else in this reference describes the **stateless** mode: TOML plus
-the environment and files it references own every resource. It is the default,
-so no existing configuration needs the key and none of its behaviour is
-tightened by having one — omitting `mode` and writing `mode = "stateless"` are
-the same configuration.
-
-[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) adds an opt-in
-`mode = "stateful"`, in which tenants, projects, identities, providers, provider
-credentials, catalogues, prices, aliases, and policy are owned by a durable
-Postgres control plane and administered through `/admin/v1`, while inference
-still serves one immutable in-memory snapshot. The mode is process-wide and
-exclusive: there is no per-resource migration state, and therefore no merge
-policy between a file and a database. It is a bootstrap property, so a reload
-cannot switch a serving process between modes — that needs a restart.
-
-**A stateful replica administers and serves only projected state.** It opens the
-control plane and serves `/admin/v1`. Making a model callable is
-`axond admin model apply` — see [administering a stateful deployment]
-(./operations/admin-api.md) — while inference remains fail-closed until a
-projected snapshot or valid signed last-known-good cache is active. Once active,
-the immutable snapshot keeps serving through a control-plane outage. See
-[revision convergence](./operations/revision-convergence.md) for recovery.
+Omitting `mode` is the only valid configuration. The two-mode product in
+[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) is superseded
+by [ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md).
 
 ### Stateful bootstrap
 
-The whole file a stateful replica reads is `mode`, `[server]`, `[transport]`,
-`[admission]`, telemetry (`[[usage_sink]]`, plus the environment-only OTLP
-settings), the three sections below, and *backend selection with DSN references*
-for the opt-in `[budget]`, `[rate_limit]`, and `[revocation]` backends.
-[`axond.stateful.example.toml`](../axond.stateful.example.toml) is that file with
-prose.
+These sections still parse far enough for diagnostics to name them, then fail
+validation. They are not a supported deployment. The parser-accepted field
+names are listed so an old file's error is readable; do not copy them into a
+new config. [`axond.stateful.example.toml`](../axond.stateful.example.toml) is
+the withdrawn file with prose — it is not a runnable bootstrap.
 
-`[reload]` remains a recognized bootstrap section for schema compatibility, but
-it is not a live configuration channel in stateful mode: SIGHUP and file-watch
-reloads are refused because they cannot compile a control-plane revision. The
-stateful example omits it deliberately. Change process-local settings such as
-the listener or admission bounds with a restart, and change durable resources
-through `/admin/v1`.
+A referenced env var must also stay clear of the `AXOND_<section>` shape,
+because `AXOND_`-prefixed variables are the override layer: `AXOND_ADMIN_BREAKGLASS`
+would be merged as the `admin_breakglass` *key* rather than resolved as a
+reference. Such a name is rejected at validation, naming the variable and the
+key it collides with. Live examples use the `GW_` prefix for secret-bearing
+variables.
 
-Two symmetrical rejections happen before the socket is bound, and again on every
-reload:
-
-- Any stateful-owned section in a stateful file — `[[namespace]]`,
-  `[[provider]]`, `[[model]]`, `[[credential]]`, `[credential_pool]`,
-  `[failover]`, `[[gateway_key]]`, `[[gateway_verifier]]`, `[gateway_minting]`,
-  `[gateway_token]`, `[[gateway_token_epoch]]` — is rejected, and so is any
-  *policy value* under `[budget]` or `[rate_limit]` (`limit_microdollars`,
-  `namespace_limit_microdollars`, `max_in_flight_per_subject`, the TTLs, and
-  `max_subjects`). Bootstrap owns connectivity to those backends; the control
-  plane owns their limits. Every offending section is named in one error.
-- Any stateful bootstrap section in a stateless file — `[control_plane]`,
-  `[secret_store]`, `[[admin_breakglass]]` — is rejected, since stateless mode
-  never reads it. That is almost always a missing `mode = "stateful"`.
-
-Secret-bearing values below are *references*: environment-variable names or
-file paths. Object-storage URLs are credential-free settings, never SAS URLs,
-account keys, or bearer tokens. Loading configuration connects to no backend,
-reads no key, and resolves no DSN; diagnostics name references and fields rather
-than secret material.
-
-A referenced env var must also stay clear of the `AXOND_<section>` shape, because
-`AXOND_`-prefixed variables are the override layer described at the top of this
-reference: `AXOND_ADMIN_BREAKGLASS` would be merged as the `admin_breakglass`
-*key* rather than resolved as a reference, so exporting it would fail config load
-and put the credential in the error. Such a name is rejected at validation,
-naming the variable and the key it collides with. The examples use the `GW_`
-prefix for secret-bearing variables.
+Presence of `[control_plane]`, `[secret_store]`, `[[admin_breakglass]]`,
+`[admin_oidc]`, or `[convergence]` is a boot error: Axond has no control-plane
+mode and does not serve `/admin/v1`.
 
 #### `[control_plane]`
 
-Required in stateful mode. Initial cold boot may expose liveness and authenticated
-administration while it waits for the control plane, but a replica with no valid
-snapshot fails readiness rather than serving partial state.
+Withdrawn. Presence is a boot error.
 
-| Key | Type | Default | Meaning |
+| Key | Type | Default | Meaning (historical) |
 | --- | --- | --- | --- |
-| `backend` | `object-storage` \| `postgres` | `postgres` | Durable Tier 2 implementation. The omitted default preserves existing PostgreSQL files; `object-storage` is the ADR 0062 target. Redis and memory are refused. |
-| `dsn_env` | string | — | **Postgres only.** Name of the env var holding the control-plane connection string. Required and non-empty for `postgres`; rejected for `object-storage`. |
-| `schema` | string | connection default | **Postgres only.** PostgreSQL journal schema. A single unqualified identifier; rejected for `object-storage`. |
-| `migrate` | boolean | `false` | **Postgres only.** Whether a booting replica may apply pending migrations. Even an explicit `false` is rejected for `object-storage`, preventing an ambiguous mixed contract. |
-| `environment_id` | string | — | **Object storage only; required.** Stable environment object-key segment: at most 128 bytes, lowercase ASCII letters/digits with internal `-`, `_`, or `.`, and alphanumeric boundaries. |
-| `container_url` | absolute URL | — | **Object storage only; required.** Credential-free container URL with exactly one unescaped container path segment. A loopback Azurite endpoint also accepts its native `account/container` pair over HTTPS or explicitly enabled HTTP. Production requires HTTPS. User info, query strings (including SAS), and fragments are rejected. |
-| `authentication` | `workload-identity` | — | **Object storage only; required.** The adapter obtains short-lived credentials from its workload identity chain. Tokens, account keys, client secrets, and SAS values cannot be represented in this section. |
-| `max_object_bytes` | integer | `16777216` | **Object storage only.** Absolute object ceiling; 1 byte through 64 MiB. |
-| `max_read_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Streaming read ceiling; 1 byte through 64 MiB and no greater than `max_object_bytes`. An explicit incoherent value is rejected rather than lowered. |
-| `max_write_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Conditional-write ceiling; 1 byte through 64 MiB and no greater than `max_read_bytes`, so this deployment can read every object it acknowledges writing. An explicit incoherent value is rejected rather than lowered. |
-| `allow_loopback_http` | boolean | `false` | **Object storage only.** Insecure development/Azurite escape hatch. It is accepted only for an `http://localhost` or loopback-IP endpoint and cannot weaken remote TLS. Native HTTPS Azurite needs no exception. |
-| `connect_timeout_ms` | integer | `5000` | Bound on establishing a backend connection. `0` is rejected. |
-| `operation_timeout_ms` | integer | `30000` | Bound on one control-plane operation. `0` is rejected. |
+| `backend` | `object-storage` \| `postgres` | `postgres` | Durable control-plane implementation. Redis and memory were refused. |
+| `dsn_env` | string | — | **Postgres only.** Name of the env var holding the control-plane connection string. |
+| `schema` | string | connection default | **Postgres only.** PostgreSQL journal schema. A single unqualified identifier. |
+| `migrate` | boolean | `false` | **Postgres only.** Whether a booting process may apply pending migrations. |
+| `environment_id` | string | — | **Object storage only.** Stable environment object-key segment. |
+| `container_url` | absolute URL | — | **Object storage only.** Credential-free container URL. |
+| `authentication` | `workload-identity` | — | **Object storage only.** Adapter workload-identity chain. |
+| `max_object_bytes` | integer | `16777216` | **Object storage only.** Absolute object ceiling. |
+| `max_read_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Streaming read ceiling. |
+| `max_write_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Conditional-write ceiling. |
+| `allow_loopback_http` | boolean | `false` | **Object storage only.** Insecure development/Azurite escape hatch. |
+| `connect_timeout_ms` | integer | `5000` | Bound on establishing a backend connection. `0` was rejected. |
+| `operation_timeout_ms` | integer | `30000` | Bound on one control-plane operation. `0` was rejected. |
 
-The minimal object-storage configuration contract is:
+Historical object-storage shape (does not boot):
 
 ```toml
 mode = "stateful"
@@ -165,130 +126,52 @@ authentication = "workload-identity"
 env = "GW_ADMIN_BREAKGLASS"
 ```
 
-This slice validates and retains that contract but does **not** wire it into
-`axond serve`, migration commands, or secret hydration yet. It is reviewable
-configuration for the target topology, not a claim that blob-backed stateful
-serving is deployable. The checked repository example is
-[`ops/compose/axond.blob-contract.toml`](../ops/compose/axond.blob-contract.toml).
-`axond check preflight` therefore validates its references and syntax but fails
-the serving-posture check explicitly; it never asks this backend for a PostgreSQL
-DSN or reports the configuration contract as deployment readiness.
-
-PostgreSQL compatibility is unchanged: omit `backend`, keep `dsn_env`, and keep
-the existing `[secret_store]` section. Object storage rejects that legacy
-`[secret_store]` bootstrap because encrypted blob-secret runtime wiring is a
-separate implementation slice.
-
-`migrate` governs boot only. `axond migrate apply` is an operator asking for a
-migration explicitly, so it applies pending migrations whatever this key says;
-`axond check preflight` and `axond migrate status` never write regardless of it.
-See [the control-plane journal](operations/control-plane-journal.md#operator-commands).
-
 #### `[secret_store]` (legacy PostgreSQL control plane)
 
-Required when the stateful control plane uses `postgres`, and rejected by the
-new `object-storage` configuration contract. Tenant provider credentials are
-stored wrapped and unwrapped only while a snapshot is compiled; a request never
-unwraps a secret.
+Withdrawn. Presence is a boot error.
 
-| Key | Type | Default | Meaning |
+| Key | Type | Default | Meaning (historical) |
 | --- | --- | --- | --- |
-| `backend` | `postgres` | `postgres` | Which store holds wrapped material. Encrypted Postgres is the first implementation ADR 0027 approves. |
-| `dsn_env` | string | `[control_plane] dsn_env` | Name of the env var holding the store's connection string. Omit to reuse the control plane's own reference, which is the common single-database deployment. |
+| `backend` | `postgres` | `postgres` | Which store held wrapped material. |
+| `dsn_env` | string | `[control_plane] dsn_env` | Name of the env var holding the store's connection string. |
 | `kek_env` | string | — | Name of the env var holding the key-encryption key. |
 | `kek_file` | string | — | Path to a file holding the key-encryption key. |
-| `schema` | string | connection default | PostgreSQL schema `axond_secret` lives in. A single unqualified identifier, on the same rules as `[control_plane] schema`, because it becomes `SET search_path`. |
-| `create_table` | boolean | `true` | Whether a booting replica may apply the shipped `secret_store_v1.sql`. On by default, unlike `[control_plane] migrate`: the DDL is one `CREATE TABLE IF NOT EXISTS`, not a migration ledger a rollout can race on. An operator who applies it out of band turns this off and gets a refusal at boot instead of a schema change. |
+| `schema` | string | connection default | PostgreSQL schema `axond_secret` lived in. |
+| `create_table` | boolean | `true` | Whether boot applied `secret_store_v1.sql`. |
 
-Exactly one of `kek_env` and `kek_file` must be non-empty; zero or both is
-rejected.
-
-The key is 32 bytes, base64-encoded (padded or not; surrounding whitespace and a
-trailing newline are tolerated, so a file written by `openssl rand -base64 32 >
-kek` works as-is). Anything else is refused at boot, naming the reference and the
-reason and never the material:
-
-```bash
-openssl rand -base64 32 > /etc/axond/secret-store.kek   # chmod 0400, root-owned
-```
-
-Material is sealed under a fresh per-version data key, that key is sealed under
-this KEK, and only the sealed bytes reach the database — so a dump, a backup, or
-a stolen replica of the store discloses nothing without the KEK, which is not in
-the database. Rotating the KEK is therefore not a config edit on its own: rows
-sealed under the previous key stop unwrapping, and the material has to be
-restaged under the new one. Timeouts are inherited from `[control_plane]`, since
-encrypted Postgres is normally the same database and two independent sets of
-bounds for one server is a knob with no decision behind it. See
-[ADR 0039](./adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md).
+Exactly one of `kek_env` and `kek_file` had to be non-empty.
 
 #### `[convergence]`
 
-Optional in stateful mode. It controls the authenticated local
-last-known-good snapshot used only when a replica cold-boots while the control
-plane is unreachable. The signed desired-state file contains projected state and
-references; the sibling encrypted serving file contains the material needed to
-rebuild an already-admitted snapshot without the SecretStore. Neither file is
-usable without the deployment cache key. Set both fields or neither.
+Withdrawn with the control plane. Presence of a non-default section is a boot
+error.
 
-| Key | Type | Default | Meaning |
+| Key | Type | Default | Meaning (historical) |
 | --- | --- | --- | --- |
-| `cache_path` | path | unset | Per-replica signed desired-state cache; an encrypted `.serving` sibling stores the compiled serving snapshot. |
-| `cache_key_env` | string | unset | Environment-variable name containing canonical padded base64 for exactly 32 CSPRNG bytes. Leading/trailing whitespace and raw passphrases are refused; the value is never logged. |
-
-A valid cache permits cold boot during a control-plane outage. Missing, invalid,
-or tampered projected state leaves the process alive but unready while
-convergence retries; keyless projected state remains fail-closed. The cache is
-not a fallback for a candidate that fails validation or secret resolution.
-Credential-bearing flat-v2 snapshots are a deliberate exception: this build
-does not persist or cold-restore their compiled-serving sibling until an
-authenticated monotonic revision/tombstone floor is integrated. Credential-free
-flat-v2 state remains eligible for cache recovery.
-
-The stateful projection supplies recoverable project-scoped inbound principals,
-so a revision with complete provider, retained catalogue, credential, and
-approved pricing evidence can compile into a serving snapshot. A missing
-principal or any other required evidence remains a typed refusal; configuring
-the cache does not weaken that gate or create a keyless serving path.
-
-Generate `GW_LAST_KNOWN_GOOD_KEY` as one canonical padded base64 value from 32
-random bytes (for example, `openssl rand -base64 32` with its trailing newline
-removed). Do not use a human passphrase, add whitespace, or trim a value
-differently between replicas: the exact Secret bytes are the HMAC contract.
+| `cache_path` | path | unset | Per-replica signed desired-state cache. |
+| `cache_key_env` | string | unset | Environment-variable name containing the cache HMAC key. |
 
 #### `[[admin_breakglass]]`
 
-Exactly one is required in stateful mode. Human `/admin/v1` identity is OIDC;
-this static credential is what remains when the identity provider is down or the
-control plane rejected the last change. A second one would make an audited
-operator action ambiguous, so two are rejected.
+Withdrawn. Presence is a boot error. `/admin/v1` is unmounted.
 
-| Key | Type | Default | Meaning |
+| Key | Type | Default | Meaning (historical) |
 | --- | --- | --- | --- |
 | `env` | string | — | Name of the env var holding the credential. |
 | `file` | string | — | Path to a file holding the credential. |
 | `id` | string | the source reference | Non-secret attribution label for audit events. |
 
-Exactly one of `env` and `file` must be non-empty; zero or both is rejected.
+Exactly one of `env` and `file` had to be non-empty.
 
 #### `[admin_oidc]`
 
-Optional human administration through one configured OIDC issuer. The gateway
-verifies the bearer token's signature against the explicit JWKS endpoint and
-then resolves its `(issuer, subject)` against the active desired-state
-directory; a valid token without a published principal remains forbidden.
+Withdrawn. Presence is a boot error.
 
-| Key | Type | Default | Meaning |
+| Key | Type | Default | Meaning (historical) |
 | --- | --- | --- | --- |
 | `issuer` | string | — | Exact `iss` claim accepted. |
 | `audience` | string | — | Required `aud` value. |
-| `jwks_url` | string | — | JWKS endpoint. HTTPS is required in deployed environments; HTTP is reserved for loopback qualification. |
-
-The endpoint is operator-configured rather than discovered from token data,
-redirects are refused, keys are cached for five minutes, and only asymmetric
-signature algorithms are accepted. `[[admin_breakglass]]` remains mandatory
-and is checked before OIDC so an identity-provider outage cannot remove the
-recovery path.
+| `jwks_url` | string | — | JWKS endpoint. |
 
 ## `[server]`
 
@@ -365,12 +248,18 @@ process mid-flush, discarding the usage records the sequence exists to write.
 ## `[[namespace]]`
 
 The tenancy boundary: which credential pool a caller's requests draw from.
+File rows are seeded into the Store at boot. Runtime create, replace, list, and
+delete is `/api/v1/namespaces` (same static key). `id` is 1–128 characters,
+`[A-Za-z0-9._-]+`, case-sensitive, immutable.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `id` | string | — | Namespace name, referenced by credentials, gateway keys, and usage records. |
-| `default` | bool | `false` | The fallback namespace. **Exactly one** namespace must set it; zero or two is rejected. |
+| `default` | bool | `false` | The fallback namespace. **Exactly one** file namespace must set it; zero or two is rejected. |
 | `allow_platform_fallback` | bool | `false` | When this namespace has no credential for a provider, may it use the `platform` namespace's pool? Off means BYOK means BYOK. |
+
+Unknown namespace on an inference or management path: typed `404
+unknown_namespace` (same body for never-existed and deleted).
 
 ## `[[provider]]`
 
@@ -483,8 +372,10 @@ The outer loop around pool dispatch: an alias's targets, in order
 one target. Its circuit is still recorded and observed: a tripped first target
 makes Responses requests fail rather than move on.
 
-Circuits are in-memory and per replica, consistent with running stateless
-([ADR 0002](./adr/0002-stateless-by-default-stateful-by-opt-in.md)).
+Circuits are in-memory and per replica
+([ADR 0008](./adr/0008-target-failover-and-circuit-scope.md)). Alias-level
+failover is gone ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md));
+this section still bounds credential-pool circuits inside one provider.
 
 `overall_timeout_ms` is authoritative for everything that happens *before* a
 response is being served: connecting, waiting for response headers, reading a
@@ -647,30 +538,33 @@ bound is a queue that hides an outage.
 
 ### Sizing across replicas
 
-Every ceiling here is per replica and in process memory. The gateway is stateless
-(Tier 0), so a fleet of *N* replicas admits *N* × `max_in_flight` requests, and a
-tenant behind a round-robin load balancer gets *N* × `max_in_flight_per_tenant`.
-Size these from what one process can hold — sockets, relay tasks, buffered bodies
-— and use the shared-store `[rate_limit]` for the fleet-wide bound on a subject's
-request *rate*, which is a different question from concurrency. Fleet-wide
-admission policy is left to the stateful-policy work in #150; this section is the
-per-replica floor it will build on.
+Every ceiling here is per replica and in process memory. A fleet of *N*
+replicas admits *N* × `max_in_flight` requests, and a tenant behind a
+round-robin load balancer gets *N* × `max_in_flight_per_tenant`. Size these
+from what one process can hold — sockets, relay tasks, buffered bodies — and
+use `[rate_limit]` for a per-subject in-flight bound. Period spend caps live
+on the Store, not in this section.
 
 The ceilings own semaphores built at boot, so a reload validates a changed
 `[admission]` and warns that a restart is needed to apply it, exactly as
 `[transport]` behaves
 ([ADR 0030](./adr/0030-request-bounds-and-load-shedding.md)).
 
-## `[[gateway_key]]` — inbound authentication (required, Tier 0)
+## `[[gateway_key]]` — inbound authentication (required)
+
+Exactly one deployment-wide static key authenticates **both** `/api/v1` and
+`/ns/...` inference ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)).
+Zero entries or two-or-more entries are boot errors. A second key as a
+per-namespace list is withdrawn.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `env` | string | — | *Name* of the environment variable holding the inbound token. Exactly one of `env` and `file` must be non-empty. |
 | `file` | string | — | Path to a UTF-8 file holding the inbound token. Exactly one of `file` and `env` must be non-empty; the file is re-read on every reload. |
-| `namespace` | string | — | Namespace the bearer is served under. Undefined is rejected. |
-| `can_mint` | boolean | `false` | Authorizes this static key to use the opt-in in-gateway minting endpoint. |
+| `namespace` | string | — | Must name a defined `[[namespace]]`. The key itself is deployment-wide; this field is the seed namespace used for credential-status authority. |
+| `can_mint` | boolean | `false` | Withdrawn with in-gateway minting. Leave `false`. |
 
-Exactly one source (`env` or `file`) is permitted per entry; both declared or
+Exactly one source (`env` or `file`) is permitted; both declared or
 neither declared is a config error. File contents are read without trimming:
 static gateway-key secrets are exact bytes, so do not leave a trailing newline
 (`printf %s 'secret' > /run/secrets/axond-gateway-key`). On Unix, a
@@ -686,30 +580,18 @@ Reload fingerprints are salted per process: they are comparable only within
 one process lifetime and show that material changed at this reload; they are
 not a stable identifier for a key.
 
-At least one entry is required: a config with none describes a gateway nobody
-could call, so it refuses to boot. Two keys may not resolve to the **same**
-secret — the caller's namespace would be ambiguous. Callers present the token as
-`Authorization: Bearer <token>` or `x-api-key: <token>`; both read the same
-table. The usage record's `subject` is the env var's *name*
+Callers present the token as `Authorization: Bearer <token>` or
+`x-api-key: <token>`. Minted `axt1.` tokens are `401` and are not issued.
+The usage record's `subject` is the env var's *name*
 ([ADR 0013](./adr/0013-inbound-auth-fails-closed.md)).
 
-A key's `namespace` also decides its authority over the operator credential
-view: an entry in the default namespace may use
-`GET /v1/credentials?namespaces=all` and see every namespace, because an
-operator placed that secret in the config. An entry in a tenant namespace keeps
-its own-namespace view only, and no minted token can reach the operator view
-even with a `credentials:all` claim
-([ADR 0021](./adr/0021-credential-status-endpoint.md)). Keeping one
-default-namespace key is therefore what makes the fleet-wide credential view
-reachable at all.
+A key whose `namespace` is the file default namespace may use
+`GET /ns/{ns}/v1/credentials?namespaces=all` and see every namespace.
 
-Treat the default namespace as the operator's own namespace and its keys as
-breakglass: a static key placed there is an operator credential, so anyone
-holding it can enumerate every namespace's credential labels and circuit state.
-Serve applications from their own `[[namespace]]` with their own key, or from
-minted tokens, rather than handing out the default-namespace key.
+## `[gateway_minting]` — withdrawn (ADR 0063)
 
-## `[gateway_minting]` — in-gateway token issuance (optional, Tier 0)
+`POST /v1/tokens` is unmounted. Do not enable this section. Field names below
+are the parser surface only.
 
 This section is absent by default; its presence registers `POST /v1/tokens`.
 It may be paired with a static `[[gateway_key]]` with `can_mint = true`; if no
@@ -734,7 +616,10 @@ every verifier already holds the forging secret. Keep offline `axond mint` as
 the default, prefer EdDSA when verification-only replicas matter, and consider
 a separately deployed minting replica set with short `max_ttl`.
 
-## `[gateway_token]` — minted-token deployment policy (Tier 0)
+## `[gateway_token]` — withdrawn minted-token policy (ADR 0063)
+
+Minted inbound identity is withdrawn. `axt1.` presentations are `401`. This
+section is documented so an old file's keys are still named.
 
 This section is optional when the gateway uses only static gateway keys. It is
 required when any `[[gateway_verifier]]` is declared: the verifier needs one
@@ -748,12 +633,14 @@ The audience is config-owned and is applied to every verifier. A token with a
 different audience is rejected. The value is not a secret and is written
 directly in TOML.
 
-## `[[gateway_verifier]]` — minted-token verification (optional, Tier 0)
+## `[[gateway_verifier]]` — withdrawn minted-token verification (ADR 0063)
 
-Verifiers are additive to the required static gateway keys. They resolve
+Do not configure verifiers. Production authentication does not verify `axt1.`
+tokens. Historical field names:
+
+Verifiers were additive to the required static gateway keys. They resolved
 `axt1.` compact JWS credentials without a per-caller registry or a runtime
-datastore. For the operator setup, rotation, claims, and revocation runbook,
-see the [minted identity guide](./minted-token-guide.md).
+datastore. See the withdrawn [minted identity guide](./minted-token-guide.md).
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -793,11 +680,10 @@ The check runs before the alias is looked up, so a disallowed alias returns `403
 whether or not it is configured and regardless of whether the endpoint supports
 the target's wire protocol.
 
-## `[[gateway_token_epoch]]` — minted-token issuance revocation (optional)
+## `[[gateway_token_epoch]]` — withdrawn minted-token epochs (ADR 0063)
 
-An issuance epoch invalidates minted tokens whose `iat` is earlier than the
-configured instant. It is applied when the config is reloaded, so changing an
-epoch and sending `SIGHUP` revokes matching tokens without a restart.
+An issuance epoch invalidated minted tokens whose `iat` is earlier than the
+configured instant. Minted tokens are no longer a supported inbound identity.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -823,8 +709,8 @@ process environment, and referenced key-material files; a bad candidate is
 rejected and the running config keeps serving. Replacing file contents in place
 or via an atomic rename is therefore reload-reachable without a process
 restart. `[[namespace]]` changes are reloadable and appear in the reported
-namespace delta, but the namespace count used for in-memory budget retention
-floors is captured at boot and does not resize until restart. `[server] bind`,
+namespace delta. Period budget ledgers live in the Store, not in an in-memory
+retention floor. `[server] bind`,
 `[transport]`, `[admission]`, `[[usage_sink]]`, `[usage_journal]`, `[budget]`,
 `[rate_limit]`, `[revocation]`, and `[catalog]` changes warn and are ignored
 until restart;
@@ -838,11 +724,10 @@ The same log entry sets `restart_required = true` for catalogue and other
 boot-owned changes; `changed` only reports live serving state applied by the
 reload.
 
-Stateful mode is the exception to this file-reload contract. Because a file
-reload has no control-plane projection compiler, SIGHUP and file-watch reloads
-are refused rather than replacing the active or pending revision with the
-keyless bootstrap configuration. Restart for process-local bootstrap changes;
-publish durable resource changes through `/admin/v1`.
+`[storage]` is boot-owned: a reload that changes `backend`, `path`, or
+`dsn_env` warns and is ignored until restart. Namespaces, period budgets, and
+usage after boot are `/api/v1`, not `/admin/v1`. `mode` and control-plane
+bootstrap sections are boot errors; there is no stateful file-reload exception.
 
 ## `[[usage_sink]]` — Tier 0 by default; Tier 2 for `postgres`
 
@@ -1040,11 +925,10 @@ failure, and cancellation expectations. Operators should return to
 `middleware` after diagnosing a rollback because subsequent fixed-core stages
 build on that ownership model.
 
-## `[revocation]` — opt-in precise minted-token revocation
+## `[revocation]` — withdrawn minted-token denylist (ADR 0063)
 
-Omit this section for Tier 0: no denylist is consulted. Redis is Tier 1 and
-Postgres is the durable alternative. Expired rows and keys are harmless
-leftovers and are not removed on the request path.
+Minted tokens are not verified, so a revocation denylist is unused. Omit this
+section. Historical keys:
 
 | Key | Type | Default | Applies to | Meaning |
 | --- | --- | --- | --- | --- |

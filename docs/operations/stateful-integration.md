@@ -1,5 +1,7 @@
 # Stateful integration: the release gates and what proves them
 
+> **Withdrawn ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** The #160 control-plane gates are superseded. Historical record; do not follow as a runbook.
+
 Stateful mode
 ([#160](https://github.com/Litvue/axond/issues/160)) is being built as a set of
 *contract* slices — durable schemas, typed documents, protocol boundaries — each

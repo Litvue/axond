@@ -39,18 +39,18 @@ read the maintainer-facing
 - [ ] Provider keys live in the platform secret store (for example Azure Key Vault) and are injected as the env-var names the TOML references.
 - [ ] Key rotation of env-injected secrets is rehearsed as a new revision/task, not as a live env mutation.
 - [ ] Platform authentication in front of Axond is off: Axond owns `Authorization` / `x-api-key`.
-- [ ] At least one static breakglass gateway key is configured.
-- [ ] Gateway keys are unique and mapped to the intended namespaces.
+- [ ] Exactly one static `[[gateway_key]]` is configured.
+- [ ] `[storage]` is set (SQLite path or Postgres `dsn_env`) and reachable at boot.
 - [ ] Provider `base_url` values contain a path only, with no query, fragment, credentials, or secret.
-- [ ] Alias targets stay within one provider wire family.
+- [ ] Callers send `provider-id/model-id`; there is no `[[model]]` table.
 - [ ] Provider pricing is reviewed; budgets depend on it.
 - [ ] Secret and signer rotation has been rehearsed.
 - [ ] Config reload rejection is monitored.
 
 ## State and scaling
 
-- [ ] Tier 0 per-replica behavior is acceptable, or a shared backend is selected.
-- [ ] Redis/Postgres outage policy is an explicit `deny` or `allow` decision.
+- [ ] SQLite single-replica vs Postgres HA is an explicit choice.
+- [ ] Store outage policy (`[storage].on_unavailable`) is an explicit `deny` or `allow` decision.
 - [ ] Namespace budget-cap migrations were completed with the fleet stopped.
 - [ ] Postgres DDL is applied before writers using the new schema.
 - [ ] Redis key prefixes and Postgres tables are isolated between environments.
@@ -86,8 +86,10 @@ read the maintainer-facing
 
 - [ ] `/healthz` returns `ok` without authentication.
 - [ ] `/readyz` returns `ready` without authentication, and `503 draining` after `SIGTERM` while `/healthz` still returns `ok`.
-- [ ] `/v1/models` returns `401` without a key.
-- [ ] `/v1/models` returns the expected namespace-scoped aliases with a key.
+- [ ] `/ns/{ns}/v1/models` returns `401` without a key.
+- [ ] `/ns/{ns}/v1/models` returns cached `provider-id/model-id` ids with a key.
+- [ ] `/admin/v1/status` is `404`.
+- [ ] A namespace with no budget row is `429 budget_exceeded`.
 - [ ] A real buffered request succeeds through the production ingress.
 - [ ] A real streamed request succeeds through the production ingress.
 - [ ] A deliberately unknown alias returns typed `404 unknown_model`.

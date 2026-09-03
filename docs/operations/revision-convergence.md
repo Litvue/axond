@@ -1,5 +1,7 @@
 # Revision convergence
 
+> **Withdrawn ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** Control-plane revision convergence is gone. Historical record; do not follow as a runbook.
+
 In stateful mode, a change is *published* to the control plane and then
 *converges* onto every replica. This page is the operator's view of that second
 half: how fast it is, what a replica reports about itself, what happens when it

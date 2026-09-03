@@ -1,5 +1,7 @@
 # Administering a stateful deployment
 
+> **Withdrawn ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** `/admin/v1` is unmounted. `axond admin model apply` is gone. Management is `/api/v1`. Historical record; do not follow as a runbook.
+
 In `mode = "stateful"` ([ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md))
 a deployment's tenants, projects, providers, credentials, catalogues, model
 enablements, aliases, and policy are owned by the Postgres control plane and

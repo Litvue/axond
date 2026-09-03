@@ -1,5 +1,7 @@
 # Stateful Kubernetes deployment runbook
 
+> **Withdrawn ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** `mode = "stateful"` and `/admin/v1` are not served. Historical record; do not follow as a runbook.
+
 This is the operator procedure for
 [deploy/kubernetes/overlays/production-stateful](../../deploy/kubernetes/overlays/production-stateful).
 The stateful process serves authenticated /admin/v1 and can compile a published

@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Axond — a stateless, single-binary, self-hosted AI gateway: one place for provider keys, model routing, usage, and telemetry."
+description = "Axond — a store-backed, single-binary, self-hosted AI gateway: one place for provider keys, namespaced inference, usage, and telemetry."
 keywords = ["llm", "gateway", "openai", "anthropic", "proxy"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 # The binary sources plus the data they `include_str!`: the JSON fixtures the

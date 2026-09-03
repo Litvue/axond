@@ -1,8 +1,8 @@
 # Deployment overview
 
-Axond is one stateless process. It reads TOML for structure, environment or
-supported mounted files for secret material, and touches no datastore unless a
-configured feature requires one.
+Axond is one store-backed process. It reads TOML for structure, environment or
+supported mounted files for secret material, and requires `[storage]` (SQLite
+WAL or Postgres).
 
 ## 5-minute quickstart
 
@@ -16,12 +16,17 @@ docker compose up -d
 curl --fail http://127.0.0.1:8080/healthz
 curl --fail \
   -H 'Authorization: Bearer quickstart-platform-key' \
-  http://127.0.0.1:8080/v1/models
+  -H 'content-type: application/json' \
+  -d '{"limit_microdollars":1000000000000}' \
+  -X PUT http://127.0.0.1:8080/api/v1/namespaces/platform/budgets/quickstart
+curl --fail \
+  -H 'Authorization: Bearer quickstart-platform-key' \
+  http://127.0.0.1:8080/ns/platform/v1/models
 docker compose down -v
 ```
 
-For expected responses, a real provider call, the source-build overlay, and the
-Redis/Postgres profile, follow [Getting started](./getting-started.md) and the
+For expected responses, source builds, and the Postgres overlay, follow
+[Getting started](./getting-started.md) and the
 [Compose guide](./deployment/docker-compose.md).
 
 ## Choose an environment
@@ -35,8 +40,8 @@ Redis/Postgres profile, follow [Getting started](./getting-started.md) and the
 | Azure Container Apps | [ACA production](./deployment/azure-container-apps.md) | Worked production path: GHCR digest, Key Vault keys, TOML mount. |
 | Managed containers | [Managed-container contract](./deployment/managed-containers.md) | ECS/Fargate, Cloud Run, Nomad, and other OCI hosts. |
 
-Review [Stateful backends](./deployment/stateful-backends.md) before enabling
-Redis/Postgres and use the
+Review [Store backends](./deployment/stateful-backends.md) before choosing
+Postgres HA and use the
 [Production checklist](./deployment/production-checklist.md) before exposing a
 deployment.
 
@@ -44,15 +49,16 @@ deployment.
 
 - A readable TOML configuration selected by `AXOND_CONFIG` (default
   `axond.toml`).
+- A required `[storage]` section (SQLite path or Postgres `dsn_env`).
 - Every environment or file reference declared by the config.
-- At least one static `[[gateway_key]]`; there is no keyless mode.
+- Exactly one static `[[gateway_key]]`; there is no keyless mode.
 - Provider network egress.
 - Port 8080 or a scalar `AXOND_SERVER__BIND` override.
 - JSON stdout/stderr collection.
 - TLS termination and streaming-compatible proxy behavior when exposed over a
   network.
 
-Configuration, credential resolution, and initial backend connections complete
+Configuration, credential resolution, and the Store connection complete
 before the listener binds.
 
 ## Minimal working config
@@ -60,6 +66,10 @@ before the listener binds.
 ```toml
 [server]
 bind = "0.0.0.0:8080"
+
+[storage]
+backend = "sqlite"
+path = "axond.sqlite"
 
 [[namespace]]
 id = "platform"
@@ -79,16 +89,18 @@ env = "GW_PLATFORM_OPENAI_API_KEY"
 env = "GW_INBOUND_PLATFORM_KEY"
 namespace = "platform"
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
-]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2_500_000
+output_microdollars_per_million = 10_000_000
 ```
 
-That is the serving floor. Credential pools, failover tuning, minted identity,
-budgets, rate limits, revocation, usage sinks, telemetry, and reload watching
-are optional.
+That is the serving floor. Callers send `openai/gpt-4o` to
+`/ns/platform/v1/...`. Publish a period budget before inference:
+`PUT /api/v1/namespaces/platform/budgets/{period}`. Credential pools, admission
+tuning, usage sinks, telemetry, and reload watching are optional. `[[model]]`,
+`mode`, and a second `[[gateway_key]]` are boot errors.
 
 ## Running the static binary
 
@@ -138,14 +150,11 @@ today. Do not look up Key Vault on the request path.
 | --- | --- | --- |
 | `GET /healthz` | none | Process is alive. Keeps returning `ok` through the shutdown drain. |
 | `GET /readyz` | none | Process is serving a boot-validated snapshot; `503 draining` once termination begins. |
-| `GET /v1/models` | gateway credential | Namespace-scoped alias catalogue. |
-| `GET /v1/credentials` | gateway credential | Replica-local credential labels and circuit state. |
+| `GET /ns/{ns}/v1/models` | gateway credential | Cached `provider-id/model-id` catalogue, minus blocklist. |
+| `GET /ns/{ns}/v1/credentials` | gateway credential | Replica-local credential labels and circuit state. |
 
-`/readyz` does not continuously probe providers or stateful backends, and never
-will: dependency state belongs to the authenticated status surface whose contract
-is fixed by [ADR 0031](./adr/0031-bounded-status-contract.md) and whose route
-ships with the stateful slices. Until then, runtime dependency health is exposed
-by typed errors and metrics.
+`/readyz` does not probe providers or the Store. Dependency health is typed
+errors (`503 budget_unavailable`) and metrics. `/admin/v1/status` is unmounted.
 
 Point the load balancer at `/readyz` and liveness at `/healthz`: on `SIGTERM`
 the replica fails readiness first, keeps serving for `shutdown.drain_grace_ms`,

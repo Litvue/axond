@@ -34,8 +34,9 @@ docker run --rm --read-only \
   ghcr.io/litvue/axond@sha256:<verified-digest>
 ```
 
-An unset or empty referenced value is a fatal boot error. At least one
-`[[gateway_key]]` is required.
+An unset or empty referenced value is a fatal boot error. Exactly one
+`[[gateway_key]]` is required. Mount a writable path for SQLite `[storage]`
+or point `dsn_env` at Postgres.
 
 ## Verify before deployment
 
