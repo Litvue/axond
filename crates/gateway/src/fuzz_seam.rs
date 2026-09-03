@@ -829,8 +829,12 @@ pub fn publication_moves_runtime_routes() -> bool {
     };
     config.provider.push(Provider {
         id: format!("{}-published", extra.id),
+        base_url: format!("{}/published", extra.base_url),
         ..extra
     });
+    if let Some(first) = config.provider.first_mut() {
+        first.base_url.push_str("/edited");
+    }
     let snapshot = ConfigSnapshot::build(config, &seam_env(), 1)
         .expect("the seam's config resolves with one more provider");
     state.publish(snapshot).expect("publish");
@@ -878,14 +882,19 @@ pub fn override_oracle_notices_a_missing_override() -> bool {
 }
 
 fn routes_of(snapshot: &ConfigSnapshot) -> Vec<String> {
-    let mut ids: Vec<String> = snapshot
+    let mut rows: Vec<String> = snapshot
         .config
         .provider
         .iter()
-        .map(|provider| provider.id.clone())
+        .map(|provider| {
+            format!(
+                "{}:{:?}:{}:{:?}",
+                provider.id, provider.kind, provider.base_url, provider.unpriced_models
+            )
+        })
         .collect();
-    ids.sort();
-    ids
+    rows.sort();
+    rows
 }
 
 /// The default fetch time an import is stamped with, as unix seconds. Fixed, so
