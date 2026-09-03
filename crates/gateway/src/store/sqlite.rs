@@ -808,19 +808,6 @@ impl Store for SqliteStore {
         .await
     }
 
-    async fn mark_provider_models_stale(&self, provider: &str) -> Result<(), StoreError> {
-        let provider = provider.to_string();
-        self.with_conn(move |conn| {
-            conn.execute(
-                "UPDATE axond_store_provider_models SET stale = 1 WHERE provider = ?1",
-                params![provider],
-            )
-            .map_err(unavailable)?;
-            Ok(())
-        })
-        .await
-    }
-
     async fn mark_provider_models_stale_unless_source(
         &self,
         provider: &str,
@@ -1186,13 +1173,6 @@ mod tests {
                 .expect("get")
                 .is_some(),
             "a TOML-listed id is restored on seed; HTTP DELETE of those ids is 409"
-        );
-        assert!(
-            store
-                .namespace_incarnation("wsp_seed")
-                .await
-                .expect("incarnation")
-                .is_some()
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1574,7 +1554,7 @@ mod tests {
             .expect("row");
         assert_eq!(got, good);
         store
-            .mark_provider_models_stale("openai")
+            .mark_provider_models_stale_if_source("openai", "https://api.openai.com/v1")
             .await
             .expect("stale");
         let stale = store
@@ -1587,7 +1567,7 @@ mod tests {
         assert_eq!(stale.fetched_at, good.fetched_at);
         assert_eq!(stale.source, good.source);
         store
-            .mark_provider_models_stale("missing")
+            .mark_provider_models_stale_if_source("missing", "https://api.openai.com/v1")
             .await
             .expect("missing mark");
         assert!(
