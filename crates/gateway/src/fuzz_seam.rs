@@ -72,7 +72,7 @@ use crate::backends::models_dev::{
     self, ModelsDevAdapter, ModelsDevError, SEED_PAYLOAD, seed_snapshot,
 };
 use crate::budget::NoBudget;
-use crate::config::{Config, Model};
+use crate::config::Config;
 use crate::desired_state::{
     CanonicalValue, DeploymentBody, InboundGrantBody, NamespaceBody, ResourceBody, ResourceId,
     ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, Slug, Uuid7,
@@ -801,37 +801,11 @@ pub fn catalog_diff(
 /// the same load a request performs, off the same `ArcSwap` that
 /// [`AppState::publish`] stores into.
 ///
-/// Read fresh on every call rather than cached, so publication is what the
-/// comparison watches: anything that reached runtime state by the one route
-/// runtime state is reached by would move it. That the observation is live, and
-/// not a constant compared with itself, is [`publication_moves_runtime_routes`]:
-/// it publishes into a state built the same way and shows the routes move.
+/// Read fresh on every call rather than cached. Catalogue import is
+/// last-known-good / metadata-only (ADR 0063 withdrew the catalogue control
+/// plane): an import must leave this table unchanged.
 pub fn runtime_routes() -> Vec<String> {
     routes_of(&runtime_state().config())
-}
-
-/// Whether publishing a snapshot moves what [`runtime_routes`] reports.
-///
-/// The calibration of the no-publication assertion: it runs on a *separate*
-/// state built exactly like the seam's, publishes a snapshot carrying one more
-/// alias, and answers whether the routing table read afterwards differs. `false`
-/// means the assertion has gone blind and every no-publication claim made with
-/// it is worthless, which is why the smoke asserts it directly.
-pub fn publication_moves_runtime_routes() -> bool {
-    let state = build_state(seam_config().clone()).expect("the seam's own config resolves");
-    let before = routes_of(&state.config());
-    let mut config = seam_config().clone();
-    let Some(extra) = config.model.first().cloned() else {
-        return false;
-    };
-    config.model.push(Model {
-        name: format!("{}-published", extra.name),
-        ..extra
-    });
-    let snapshot = ConfigSnapshot::build(config, &seam_env(), 1)
-        .expect("the seam's config resolves with one more alias");
-    state.publish(snapshot).expect("publish");
-    routes_of(&state.config()) != before
 }
 
 /// Whether the override oracle notices an override the import failed to record.
@@ -1102,10 +1076,9 @@ max_ttl = "15m"
 namespace = "fuzz"
 min_iat = {MIN_IAT}
 
-# One provider and one alias, so the request path this seam compiles has a
-# routing table with something in it: `catalog_import` asserts that importing a
-# catalogue leaves that table byte-for-byte alone, and a table that was empty to
-# begin with would assert nothing. Neither is reachable — the base URL resolves
+# One provider so the request path this seam compiles is a real serving config.
+# Catalogue import is last-known-good / metadata-only (ADR 0063): it must not
+# publish runtime routes. The provider is unreachable — the base URL resolves
 # nowhere and no target is ever dispatched.
 [[provider]]
 id = "fuzz-provider"

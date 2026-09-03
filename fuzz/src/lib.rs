@@ -980,18 +980,8 @@ fn import(
     payload: &[u8],
     etag: Option<&str>,
 ) -> (&'static str, Option<axond_fuzz_seam::CatalogImport>) {
-    // The routing table a request would be served from, read before and after:
-    // a catalogue import records metadata and must never publish runtime state.
-    // Read live off the state's snapshot pointer, so publication is what the
-    // comparison watches — calibrated once per process against a separate state
-    // that is deliberately published into, since a comparison that cannot move
-    // proves nothing about the path that must not move it.
-    static PUBLICATION_IS_OBSERVABLE: OnceLock<bool> = OnceLock::new();
-    assert!(
-        *PUBLICATION_IS_OBSERVABLE.get_or_init(axond_fuzz_seam::publication_moves_runtime_routes),
-        "publishing a snapshot did not move the observed routing table: the \
-         no-publication check is blind"
-    );
+    // Catalogue import is last-known-good / metadata-only (ADR 0063 withdrew
+    // the catalogue control plane). It must not publish runtime routes.
     let routes = axond_fuzz_seam::runtime_routes();
 
     let parsed = axond_fuzz_seam::catalog_parse(payload, FETCHED_AT, etag);

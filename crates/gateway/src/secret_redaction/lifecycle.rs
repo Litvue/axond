@@ -389,22 +389,6 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
         id: Some("stateless".to_owned()),
         weight: 1,
     });
-    config.model.push(crate::config::Model {
-        name: "fast".to_owned(),
-        namespace: None,
-        targets: vec![crate::config::Target {
-            provider: "openai".to_owned(),
-            model: "gpt-4o".to_owned(),
-            price: gateway_core::catalog::ModelPrice {
-                input_microdollars_per_million: 1_000_000,
-                output_microdollars_per_million: 2_000_000,
-                reasoning_microdollars_per_million: None,
-                cache_read_microdollars_per_million: None,
-                cache_write_microdollars_per_million: None,
-            },
-            catalog: None,
-        }],
-    });
     let mut env = bootstrap_env();
     env.insert(
         "AXOND_STATELESS_OPENAI".to_owned(),
@@ -422,7 +406,9 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
                     axum::http::header::AUTHORIZATION,
                     format!("Bearer {INBOUND_MATERIAL}"),
                 )
-                .body(axum::body::Body::from(r#"{"model":"fast","messages":[]}"#))
+                .body(axum::body::Body::from(
+                    r#"{"model":"openai/gpt-4o","messages":[]}"#,
+                ))
                 .expect("a valid request"),
         )
         .await
