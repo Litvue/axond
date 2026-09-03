@@ -8,9 +8,8 @@
 # Boot refuses a credential or gateway key whose env var is unset, so every env
 # var the example config references is supplied with a placeholder. Nothing here
 # is dispatched upstream: /healthz is unauthenticated, and /ns/platform/v1/models
-# is probed with the platform gateway key (it now fails closed like every request
-# path), so the placeholders are never used as provider keys. Two gateway keys
-# may not share a secret, so the inbound placeholders differ.
+# is probed with the one deployment-wide inbound key (ADR 0063), so the
+# placeholders are never used as provider keys.
 #
 # Usage: ops/docker-smoke.sh <image-ref>
 set -euo pipefail

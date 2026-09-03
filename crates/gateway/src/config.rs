@@ -4909,13 +4909,15 @@ namespace = "platform"
     #[test]
     fn compose_env_example_declares_one_inbound_key() {
         let text = repository_file("ops/compose/env.example");
-        assert!(
-            text.contains("GW_INBOUND_PLATFORM_KEY="),
-            "quickstart still names the deployment-wide inbound key"
-        );
-        assert!(
-            !text.contains("GW_INBOUND_ACME_KEY"),
-            "a second inbound key in env.example is withdrawn (ADR 0063):\n{text}"
+        let inbound: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && line.starts_with("GW_INBOUND_"))
+            .collect();
+        assert_eq!(
+            inbound,
+            ["GW_INBOUND_PLATFORM_KEY=quickstart-platform-key"],
+            "env.example must declare exactly one inbound key (ADR 0063):\n{text}"
         );
     }
 
