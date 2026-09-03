@@ -327,6 +327,16 @@ pub(crate) fn from_sql_amount(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
+/// Fail-closed admit: overflow of `spent + reserved + estimate` is exceeded,
+/// matching GET remaining at `i64::MAX`.
+pub(crate) fn budget_would_exceed(spent: i64, reserved: i64, estimate: i64, limit: i64) -> bool {
+    spent
+        .checked_add(reserved)
+        .and_then(|total| total.checked_add(estimate))
+        .map(|total| total > limit)
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +355,15 @@ mod tests {
         assert_eq!(sql_amount_saturating(i64::MAX as u64 + 1), i64::MAX);
         assert_eq!(sql_amount_saturating(i64::MAX as u64), i64::MAX);
         assert_eq!(sql_amount_saturating(640), 640);
+    }
+
+    #[test]
+    fn budget_would_exceed_fail_closes_on_i64_max_limit() {
+        assert!(budget_would_exceed(i64::MAX, 0, 1, i64::MAX));
+        assert!(budget_would_exceed(i64::MAX - 1, 1, 1, i64::MAX));
+        assert!(!budget_would_exceed(i64::MAX - 1, 0, 1, i64::MAX));
+        assert!(!budget_would_exceed(0, 0, 1, 10));
+        assert!(budget_would_exceed(5, 5, 1, 10));
     }
 
     #[tokio::test]

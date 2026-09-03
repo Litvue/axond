@@ -7,8 +7,8 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, from_sql_amount, sql_amount,
-    sql_amount_saturating,
+    BudgetRecord, BudgetReserve, NamespaceRecord, Store, StoreError, budget_would_exceed,
+    from_sql_amount, sql_amount, sql_amount_saturating,
 };
 use crate::backends::health::{BackendHealth, PostgresHealth};
 
@@ -849,7 +849,7 @@ async fn hold(
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .get(0);
-    if spent.saturating_add(reserved).saturating_add(estimate) > limit {
+    if budget_would_exceed(spent, reserved, estimate, limit) {
         return Ok(BudgetReserve::Exceeded);
     }
     tx.execute(
