@@ -43,6 +43,7 @@ struct Instruments {
     usage_dropped: Counter<u64>,
     usage_flushes: Counter<u64>,
     journal_appends: Counter<u64>,
+    usage_index_appends: Counter<u64>,
     journal_deliveries: Counter<u64>,
     journal_quarantined: Counter<u64>,
     journal_undeliverable: Counter<u64>,
@@ -196,6 +197,13 @@ impl Instruments {
                 .with_description(
                     "Billing-grade usage appends, by journal and outcome. Anything other than \
                      `accepted` or `already_present` means the request was not journaled.",
+                )
+                .build(),
+            usage_index_appends: meter
+                .u64_counter("axond.usage.index.appends")
+                .with_description(
+                    "Management usage-index appends, by outcome. `accepted` landed; `failed` and \
+                     `timeout` are best-effort losses of the summary index, not of billing.",
                 )
                 .build(),
             journal_deliveries: meter
@@ -651,6 +659,18 @@ pub fn record_usage_journal_append(journal: &'static str, outcome: &'static str)
             KeyValue::new("axond.journal.outcome", outcome),
         ],
     );
+}
+
+/// One management usage-index append's outcome. `outcome` is `accepted`,
+/// `failed`, or `timeout`. Failures are best-effort: they do not refuse the
+/// request and they do not unwind a durable journal append.
+pub fn record_usage_index_append(outcome: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .usage_index_appends
+        .add(1, &[KeyValue::new("axond.index.outcome", outcome)]);
 }
 
 /// Deliveries of journaled events. `redelivered` counts attempts after the

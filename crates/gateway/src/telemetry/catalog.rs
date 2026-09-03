@@ -493,6 +493,15 @@ pub const CATALOG: &[MetricSpec] = &[
         ],
     },
     MetricSpec {
+        name: "axond.usage.index.appends",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[Label::closed(
+            "axond.index.outcome",
+            &["accepted", "failed", "timeout"],
+        )],
+    },
+    MetricSpec {
         name: "axond.usage.journal.deliveries",
         kind: InstrumentKind::Counter,
         unit: None,

@@ -1,21 +1,26 @@
-//! `/api/v1` management surface (ADR 0063). OpenAPI generation is a later slice.
+//! `/api/v1` management surface (ADR 0063).
+//!
+//! OpenAPI 3.1 is generated from these handlers and served at
+//! `GET /api/v1/openapi.json` behind the same static key.
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi, ToSchema};
 
 use crate::error::GatewayError;
 use crate::state::AppState;
 use crate::store::{
-    BudgetRecord, NamespaceRecord, Store, StoreError, validate_attrs, validate_namespace_id,
-    validate_period,
+    BudgetRecord, NamespaceRecord, Store, StoreError, UsageSummary, validate_attrs,
+    validate_namespace_id, validate_period,
 };
 
 /// Bound for the whole management request body. Attrs alone are capped at
@@ -26,6 +31,7 @@ const MANAGEMENT_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/api/v1/openapi.json", get(openapi_spec))
         .route(
             "/api/v1/namespaces",
             post(create_namespace).get(list_namespaces),
@@ -38,11 +44,81 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/namespaces/{ns}/budgets/{period}",
             get(get_budget).put(put_budget),
         )
+        .route("/api/v1/namespaces/{ns}/usage", get(get_usage))
         .layer(DefaultBodyLimit::max(MANAGEMENT_MAX_REQUEST_BYTES))
         .with_state(state)
 }
 
-#[derive(Debug, Deserialize)]
+/// Compile-time OpenAPI 3.1 document for the mounted `/api/v1` routes.
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
+    ApiDoc::openapi()
+}
+
+struct GatewayKeySecurity;
+
+impl Modify for GatewayKeySecurity {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "gateway_key",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "Deployment-wide static API key (`Authorization: Bearer`).",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Axond management API",
+        description = "Namespaced gateway management surface (ADR 0063). Inference errors such as `budget_exceeded` and `unpriced_model` are not returned here.",
+        version = "1"
+    ),
+    servers((url = "/", description = "This gateway")),
+    tags(
+        (name = "spec", description = "Generated OpenAPI document"),
+        (name = "namespaces", description = "Namespace CRUD minus delete"),
+        (name = "budgets", description = "Per-namespace per-period ledger"),
+        (name = "usage", description = "Usage summary by model and status")
+    ),
+    paths(
+        openapi_spec,
+        create_namespace,
+        list_namespaces,
+        get_namespace,
+        put_namespace,
+        put_budget,
+        get_budget,
+        get_usage
+    ),
+    modifiers(&GatewayKeySecurity),
+    security(("gateway_key" = []))
+)]
+struct ApiDoc;
+
+/// Typed error envelope used on the management surface.
+#[derive(Debug, Serialize, ToSchema)]
+struct ErrorEnvelope {
+    error: TypedError,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct TypedError {
+    /// Stable code: `unknown_namespace`, `unknown_budget`, `namespace_conflict`,
+    /// `store_unavailable`, `bad_request`, `unauthorized`, `request_too_large`,
+    /// or `unsupported_media_type`.
+    #[serde(rename = "type")]
+    r#type: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct CreateBody {
     id: String,
@@ -52,7 +128,7 @@ struct CreateBody {
     blocklist: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct ReplaceBody {
     #[serde(default)]
@@ -61,19 +137,24 @@ struct ReplaceBody {
     blocklist: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct ListQuery {
     cursor: Option<String>,
     limit: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
+struct UsageQuery {
+    period: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct PutBudgetBody {
     limit_microdollars: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ListBody {
     data: Vec<NamespaceRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,6 +209,51 @@ fn json_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, GatewayError>
     }
 }
 
+fn query_value<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, GatewayError> {
+    match query {
+        Ok(Query(value)) => Ok(value),
+        Err(rejection) => Err(GatewayError::BadRequest(rejection.body_text())),
+    }
+}
+
+fn required_period(period: Option<String>) -> Result<String, GatewayError> {
+    let Some(period) = period.filter(|value| !value.is_empty()) else {
+        return Err(GatewayError::BadRequest("`period` is required".into()));
+    };
+    validate_period(&period).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
+    Ok(period)
+}
+
+/// OpenAPI 3.1 document for the mounted `/api/v1` routes.
+#[utoipa::path(
+    get,
+    path = "/api/v1/openapi.json",
+    tag = "spec",
+    responses(
+        (status = 200, description = "OpenAPI 3.1 document", content_type = "application/json"),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope)
+    )
+)]
+async fn openapi_spec() -> Json<utoipa::openapi::OpenApi> {
+    Json(openapi_document())
+}
+
+/// Create a namespace.
+#[utoipa::path(
+    post,
+    path = "/api/v1/namespaces",
+    tag = "namespaces",
+    request_body = CreateBody,
+    responses(
+        (status = 201, description = "Created", body = NamespaceRecord),
+        (status = 400, description = "Malformed body or invalid id", body = ErrorEnvelope),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 409, description = "`namespace_conflict`", body = ErrorEnvelope),
+        (status = 413, description = "`request_too_large`", body = ErrorEnvelope),
+        (status = 415, description = "`unsupported_media_type`", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
 async fn create_namespace(
     State(state): State<AppState>,
     body: Result<Json<CreateBody>, JsonRejection>,
@@ -149,6 +275,19 @@ async fn create_namespace(
     }
 }
 
+/// Read a namespace.
+#[utoipa::path(
+    get,
+    path = "/api/v1/namespaces/{ns}",
+    tag = "namespaces",
+    params(("ns" = String, Path, description = "Namespace id")),
+    responses(
+        (status = 200, description = "Namespace", body = NamespaceRecord),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 404, description = "`unknown_namespace`", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
 async fn get_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
@@ -161,6 +300,23 @@ async fn get_namespace(
     }
 }
 
+/// Replace namespace attrs and blocklist. The id is immutable.
+#[utoipa::path(
+    put,
+    path = "/api/v1/namespaces/{ns}",
+    tag = "namespaces",
+    params(("ns" = String, Path, description = "Namespace id")),
+    request_body = ReplaceBody,
+    responses(
+        (status = 200, description = "Replaced attrs/blocklist", body = NamespaceRecord),
+        (status = 400, description = "Malformed body", body = ErrorEnvelope),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 404, description = "`unknown_namespace`", body = ErrorEnvelope),
+        (status = 413, description = "`request_too_large`", body = ErrorEnvelope),
+        (status = 415, description = "`unsupported_media_type`", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
 async fn put_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
@@ -180,6 +336,26 @@ async fn put_namespace(
     }
 }
 
+/// Set the period limit and mark it as the namespace's active period.
+#[utoipa::path(
+    put,
+    path = "/api/v1/namespaces/{ns}/budgets/{period}",
+    tag = "budgets",
+    params(
+        ("ns" = String, Path, description = "Namespace id"),
+        ("period" = String, Path, description = "Opaque billing period")
+    ),
+    request_body = PutBudgetBody,
+    responses(
+        (status = 200, description = "Ledger after the PUT", body = BudgetRecord),
+        (status = 400, description = "Malformed body or period", body = ErrorEnvelope),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 404, description = "`unknown_namespace`", body = ErrorEnvelope),
+        (status = 413, description = "`request_too_large`", body = ErrorEnvelope),
+        (status = 415, description = "`unsupported_media_type`", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
 async fn put_budget(
     State(state): State<AppState>,
     Path((ns, period)): Path<(String, String)>,
@@ -199,6 +375,23 @@ async fn put_budget(
     }
 }
 
+/// Read the ledger for a namespace and period.
+#[utoipa::path(
+    get,
+    path = "/api/v1/namespaces/{ns}/budgets/{period}",
+    tag = "budgets",
+    params(
+        ("ns" = String, Path, description = "Namespace id"),
+        ("period" = String, Path, description = "Opaque billing period")
+    ),
+    responses(
+        (status = 200, description = "Ledger", body = BudgetRecord),
+        (status = 400, description = "Invalid period", body = ErrorEnvelope),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 404, description = "`unknown_namespace` or `unknown_budget`", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
 async fn get_budget(
     State(state): State<AppState>,
     Path((ns, period)): Path<(String, String)>,
@@ -219,10 +412,27 @@ async fn get_budget(
     }
 }
 
+/// List namespaces, cursor-paginated.
+#[utoipa::path(
+    get,
+    path = "/api/v1/namespaces",
+    tag = "namespaces",
+    params(
+        ("cursor" = Option<String>, Query, description = "List cursor from a previous page"),
+        ("limit" = Option<u32>, Query, description = "Page size, default 100, max 1000")
+    ),
+    responses(
+        (status = 200, description = "Cursor-paginated namespaces", body = ListBody),
+        (status = 400, description = "Invalid `limit`", body = ErrorEnvelope),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
 async fn list_namespaces(
     State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
+    query: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<ListBody>, GatewayError> {
+    let query = query_value(query)?;
     let limit = query.limit.unwrap_or(100);
     if !(1..=1000).contains(&limit) {
         return Err(GatewayError::BadRequest(
@@ -231,6 +441,48 @@ async fn list_namespaces(
     }
     match store(&state)?.list_namespaces(query.cursor, limit).await {
         Ok((data, next_cursor)) => Ok(Json(ListBody { data, next_cursor })),
+        Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
+        Err(err) => Err(GatewayError::BadRequest(err.to_string())),
+    }
+}
+
+/// Summary by model and status for one period. `period` is required.
+#[utoipa::path(
+    get,
+    path = "/api/v1/namespaces/{ns}/usage",
+    tag = "usage",
+    params(
+        ("ns" = String, Path, description = "Namespace id"),
+        ("period" = String, Query, description = "Budget period; required")
+    ),
+    responses(
+        (status = 200, description = "Per-model per-status counts and cost totals", body = UsageSummary),
+        (status = 400, description = "Missing or invalid `period`", body = ErrorEnvelope),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 404, description = "`unknown_namespace`", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
+async fn get_usage(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+    query: Result<Query<UsageQuery>, QueryRejection>,
+) -> Result<Json<UsageSummary>, GatewayError> {
+    let query = query_value(query)?;
+    let period = required_period(query.period)?;
+    let store = store(&state)?;
+    match store.get_namespace(&ns).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(GatewayError::UnknownNamespace),
+        Err(StoreError::Unavailable(_)) => return Err(GatewayError::StoreUnavailable),
+        Err(err) => return Err(GatewayError::BadRequest(err.to_string())),
+    }
+    match store.summarize_usage(&ns, &period).await {
+        Ok(data) => Ok(Json(UsageSummary {
+            namespace: ns,
+            period,
+            data,
+        })),
         Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
         Err(err) => Err(GatewayError::BadRequest(err.to_string())),
     }
@@ -249,6 +501,70 @@ impl From<StoreError> for GatewayError {
             StoreError::NotFound(_) => Self::UnknownNamespace,
             StoreError::Unavailable(_) => Self::StoreUnavailable,
             StoreError::Invalid(msg) => Self::BadRequest(msg),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::openapi_document;
+
+    #[test]
+    fn openapi_spec_is_31_and_covers_mounted_routes() {
+        let spec = serde_json::to_value(openapi_document()).expect("serialize");
+        let version = spec["openapi"].as_str().expect("openapi");
+        assert!(
+            version.starts_with("3.1"),
+            "expected OpenAPI 3.1, got {version}"
+        );
+
+        let paths = spec["paths"].as_object().expect("paths");
+        for path in [
+            "/api/v1/openapi.json",
+            "/api/v1/namespaces",
+            "/api/v1/namespaces/{ns}",
+            "/api/v1/namespaces/{ns}/budgets/{period}",
+            "/api/v1/namespaces/{ns}/usage",
+        ] {
+            assert!(paths.contains_key(path), "missing {path}");
+        }
+        assert!(paths["/api/v1/namespaces"].get("post").is_some());
+        assert!(paths["/api/v1/namespaces"].get("get").is_some());
+        assert!(paths["/api/v1/namespaces/{ns}"].get("get").is_some());
+        assert!(paths["/api/v1/namespaces/{ns}"].get("put").is_some());
+        assert!(
+            paths["/api/v1/namespaces/{ns}"].get("delete").is_none(),
+            "DELETE is a later slice"
+        );
+        assert!(
+            paths["/api/v1/namespaces/{ns}/budgets/{period}"]["get"]["responses"]
+                .get("400")
+                .is_some(),
+            "invalid period is a typed 400"
+        );
+        assert!(
+            paths.keys().all(|path| !path.contains("/providers")),
+            "discovery is a later slice: {paths:?}"
+        );
+
+        let usage = &paths["/api/v1/namespaces/{ns}/usage"]["get"];
+        let params = usage["parameters"].as_array().expect("usage params");
+        let period = params
+            .iter()
+            .find(|param| param["name"] == "period")
+            .expect("period param");
+        assert_eq!(period["in"], "query");
+        assert_eq!(period["required"], true);
+
+        let scheme = &spec["components"]["securitySchemes"]["gateway_key"];
+        assert_eq!(scheme["type"], "http");
+        assert_eq!(scheme["scheme"], "bearer");
+
+        if let Ok(path) = std::env::var("AXOND_OPENAPI_OUT") {
+            let pretty = serde_json::to_vec_pretty(&spec).expect("pretty spec");
+            std::fs::write(&path, pretty).unwrap_or_else(|error| {
+                panic!("write OpenAPI spec to {path}: {error}");
+            });
         }
     }
 }

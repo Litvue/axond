@@ -5445,6 +5445,239 @@ max_ttl = "15m"
             }
             assert!(rejected, "{0} must handle GET or POST", spec.path);
         }
+
+        for (method, path) in [
+            ("GET", "/api/v1/openapi.json"),
+            ("GET", "/api/v1/namespaces"),
+            ("POST", "/api/v1/namespaces"),
+            ("GET", "/api/v1/namespaces/platform"),
+            ("PUT", "/api/v1/namespaces/platform"),
+            ("GET", "/api/v1/namespaces/platform/budgets/harness"),
+            ("PUT", "/api/v1/namespaces/platform/budgets/harness"),
+            ("GET", "/api/v1/namespaces/platform/usage?period=harness"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = router(test_state()).oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} must authenticate before handling the request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_json_requires_the_gateway_key() {
+        let unauthorized = router(test_state())
+            .oneshot(
+                Request::get("/api/v1/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = router(test_state())
+            .oneshot(
+                Request::get("/api/v1/openapi.json")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer not-the-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let ok = router(test_state())
+            .oneshot(
+                Request::get("/api/v1/openapi.json")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = ok.into_body().collect().await.unwrap().to_bytes();
+        let spec: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            spec["openapi"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("3.1"),
+            "{spec}"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_summary_matches_rows_for_namespace_and_period() {
+        let state = test_state();
+        let store = state.store().expect("store");
+        for (id, ns, period, model, status, cost) in [
+            (
+                "req_a",
+                "platform",
+                "p",
+                "openai/gpt-4o",
+                "ok",
+                Some(10_u64),
+            ),
+            ("req_b", "platform", "p", "openai/gpt-4o", "ok", Some(15)),
+            (
+                "req_c",
+                "platform",
+                "p",
+                "openai/gpt-4o",
+                "upstream_error",
+                Some(1),
+            ),
+            (
+                "req_d",
+                "platform",
+                "other",
+                "openai/gpt-4o",
+                "ok",
+                Some(99),
+            ),
+        ] {
+            store
+                .append_usage(crate::store::UsageAppend {
+                    request_id: id.into(),
+                    namespace: ns.into(),
+                    period: Some(period.into()),
+                    model: model.into(),
+                    status: status.into(),
+                    cost_microdollars: cost,
+                })
+                .await
+                .expect("append");
+        }
+
+        let missing_period = router(state.clone())
+            .oneshot(
+                Request::get("/api/v1/namespaces/platform/usage")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_period.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(
+            &missing_period
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["type"], "bad_request");
+
+        let unknown = router(state.clone())
+            .oneshot(
+                Request::get("/api/v1/namespaces/ghost/usage?period=p")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/api/v1/namespaces/platform/usage?period=p")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["namespace"], "platform");
+        assert_eq!(body["period"], "p");
+        let data = body["data"].as_array().expect("data");
+        assert_eq!(data.len(), 2, "{body}");
+        assert_eq!(data[0]["model"], "openai/gpt-4o");
+        assert_eq!(data[0]["status"], "ok");
+        assert_eq!(data[0]["count"], 2);
+        assert_eq!(data[0]["cost_microdollars"], 25);
+        assert_eq!(data[1]["status"], "upstream_error");
+        assert_eq!(data[1]["count"], 1);
+        assert_eq!(data[1]["cost_microdollars"], 1);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_requires_period_query() {
+        let response = router(test_state())
+            .oneshot(
+                Request::get("/api/v1/namespaces/platform/usage?period=")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn malformed_management_queries_are_typed_bad_request() {
+        let state = test_state();
+        for path in [
+            "/api/v1/namespaces?limit=abc",
+            "/api/v1/namespaces/platform/usage?period=bad/period",
+            "/api/v1/namespaces/platform/usage?period=a&period=b",
+            "/api/v1/namespaces/platform/usage",
+        ] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::get(path)
+                        .header(
+                            axum::http::header::AUTHORIZATION,
+                            format!("Bearer {CALLER_SECRET}"),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or_else(|_| json!({"raw": "not json"}));
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}");
+            assert_eq!(body["error"]["type"], "bad_request", "{path} {body}");
+        }
     }
 
     #[test]

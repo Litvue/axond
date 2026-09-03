@@ -13,6 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use utoipa::ToSchema;
 
 use crate::backends::health::BackendHealth;
 use crate::config::{StorageBackend, StorageConfig};
@@ -30,7 +31,7 @@ pub const MAX_ATTRS_BYTES: usize = 4 * 1024;
 /// Opaque billing-period keys share the namespace id charset and bound.
 pub const MAX_PERIOD_LEN: usize = 128;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct NamespaceRecord {
     pub id: String,
     #[serde(default)]
@@ -40,7 +41,7 @@ pub struct NamespaceRecord {
 }
 
 /// One `(namespace, period)` ledger, as GET returns it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct BudgetRecord {
     pub namespace: String,
     pub period: String,
@@ -78,6 +79,34 @@ impl BudgetRecord {
 
 pub fn remaining(limit: u64, spent: u64, reserved: u64) -> u64 {
     limit.saturating_sub(spent).saturating_sub(reserved)
+}
+
+/// One usage event as the Store indexes it for `GET .../usage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageAppend {
+    pub request_id: String,
+    pub namespace: String,
+    pub period: Option<String>,
+    pub model: String,
+    pub status: String,
+    pub cost_microdollars: Option<u64>,
+}
+
+/// Per-model per-status totals for one namespace and period.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UsageSummaryRow {
+    pub model: String,
+    pub status: String,
+    pub count: u64,
+    pub cost_microdollars: u64,
+}
+
+/// `GET /api/v1/namespaces/{ns}/usage?period=` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UsageSummary {
+    pub namespace: String,
+    pub period: String,
+    pub data: Vec<UsageSummaryRow>,
 }
 
 /// Outcome of a pre-dispatch hold against the namespace's active period.
@@ -161,6 +190,33 @@ pub trait Store: Send + Sync {
     fn health(&self) -> Option<Arc<dyn BackendHealth>> {
         None
     }
+
+    /// Index one usage event for the management summary. Duplicate
+    /// `request_id` is ignored (at-least-once).
+    async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError>;
+
+    /// When true, [`Self::append_usage`] runs blocking I/O inside `spawn_blocking`
+    /// and dropping its future cannot cancel the work. The usage-index worker
+    /// then calls [`Self::append_usage_sync`] on one OS thread instead.
+    fn blocking_usage_index(&self) -> bool {
+        false
+    }
+
+    /// Insert one usage-index row on the caller's thread. SQLite only; must
+    /// not schedule `spawn_blocking`.
+    fn append_usage_sync(&self, event: UsageAppend) -> Result<(), StoreError> {
+        let _ = event;
+        Err(StoreError::Unavailable(
+            "this store has no synchronous usage-index path".into(),
+        ))
+    }
+
+    /// Per-model per-status counts and cost totals for `namespace`+`period`.
+    async fn summarize_usage(
+        &self,
+        namespace: &str,
+        period: &str,
+    ) -> Result<Vec<UsageSummaryRow>, StoreError>;
 }
 
 #[cfg(test)]
@@ -212,6 +268,12 @@ impl Store for UnavailableStore {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn settle_budget(&self, _: &str, _: &str, _: &str, _: u64) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn append_usage(&self, _: UsageAppend) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn summarize_usage(&self, _: &str, _: &str) -> Result<Vec<UsageSummaryRow>, StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
 }
@@ -1098,7 +1160,16 @@ mod tests {
                      (namespace, period, limit_microdollars, spent_microdollars)
                      VALUES ('wsp_x', '2026-09', 1000, 40);
                  INSERT INTO axond_budget_active (namespace, period)
-                     VALUES ('wsp_x', '2026-09');",
+                     VALUES ('wsp_x', '2026-09');
+                 CREATE TABLE axond_store_usage (
+                     request_id          text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text,
+                     model               text        NOT NULL,
+                     status              text        NOT NULL,
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
+                 );",
             )
             .await
             .expect("draft store tables");
@@ -1167,7 +1238,16 @@ mod tests {
                      (namespace, period, limit_microdollars, spent_microdollars)
                      VALUES ('wsp_x', '2026-09', 1000, 40);
                  INSERT INTO axond_budget_active (namespace, period)
-                     VALUES ('wsp_x', '2026-09');",
+                     VALUES ('wsp_x', '2026-09');
+                 CREATE TABLE axond_store_usage (
+                     request_id          text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text,
+                     model               text        NOT NULL,
+                     status              text        NOT NULL,
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
+                 );",
             )
             .await
             .expect("draft store tables");
@@ -1227,7 +1307,16 @@ mod tests {
                      (namespace, period, limit_microdollars, spent_microdollars)
                      VALUES ('wsp_x', '2026-09', 1000, 40);
                  INSERT INTO axond_budget_active (namespace, period)
-                     VALUES ('wsp_x', '2026-09');",
+                     VALUES ('wsp_x', '2026-09');
+                 CREATE TABLE axond_store_usage (
+                     request_id          text        PRIMARY KEY,
+                     namespace           text        NOT NULL,
+                     period              text,
+                     model               text        NOT NULL,
+                     status              text        NOT NULL,
+                     cost_microdollars   bigint,
+                     recorded_at         timestamptz NOT NULL DEFAULT now()
+                 );",
             )
             .await
             .expect("draft");
@@ -1437,5 +1526,157 @@ mod tests {
         assert_eq!(got.spent_microdollars, i64::MAX as u64);
         assert_eq!(got.reserved_microdollars, 0);
         assert_eq!(store.reservation_count(&ns).await.expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn postgres_append_usage_saturates_oversized_cost() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store
+            .append_usage(UsageAppend {
+                request_id: format!("req_over_{ns}"),
+                namespace: ns.clone(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(i64::MAX as u64 + 1),
+            })
+            .await
+            .expect("append");
+        let rows = store.summarize_usage(&ns, "p").await.expect("summarize");
+        assert_eq!(
+            rows,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 1,
+                cost_microdollars: i64::MAX as u64,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_summary_groups_by_model_and_status() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        for (id, period, model, status, cost) in [
+            ("req_a", "p", "openai/gpt-4o", "ok", Some(10)),
+            ("req_b", "p", "openai/gpt-4o", "ok", Some(15)),
+            ("req_c", "p", "openai/gpt-4o", "upstream_error", Some(1)),
+            ("req_d", "p", "anthropic/claude", "ok", None),
+            ("req_e", "other", "openai/gpt-4o", "ok", Some(99)),
+            ("req_a", "p", "openai/gpt-4o", "ok", Some(10)),
+        ] {
+            store
+                .append_usage(UsageAppend {
+                    request_id: id.into(),
+                    namespace: "wsp_x".into(),
+                    period: Some(period.into()),
+                    model: model.into(),
+                    status: status.into(),
+                    cost_microdollars: cost,
+                })
+                .await
+                .expect("append");
+        }
+        let rows = store
+            .summarize_usage("wsp_x", "p")
+            .await
+            .expect("summarize");
+        assert_eq!(
+            rows,
+            vec![
+                UsageSummaryRow {
+                    model: "anthropic/claude".into(),
+                    status: "ok".into(),
+                    count: 1,
+                    cost_microdollars: 0,
+                },
+                UsageSummaryRow {
+                    model: "openai/gpt-4o".into(),
+                    status: "ok".into(),
+                    count: 2,
+                    cost_microdollars: 25,
+                },
+                UsageSummaryRow {
+                    model: "openai/gpt-4o".into(),
+                    status: "upstream_error".into(),
+                    count: 1,
+                    cost_microdollars: 1,
+                },
+            ]
+        );
+        assert!(
+            store
+                .summarize_usage("wsp_x", "empty")
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_summary_saturates_cost_at_i64_max() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        let half_plus_one = (i64::MAX / 2) as u64 + 1;
+        for id in ["req_a", "req_b"] {
+            store
+                .append_usage(UsageAppend {
+                    request_id: id.into(),
+                    namespace: "wsp_x".into(),
+                    period: Some("p".into()),
+                    model: "openai/gpt-4o".into(),
+                    status: "ok".into(),
+                    cost_microdollars: Some(half_plus_one),
+                })
+                .await
+                .expect("append");
+        }
+        let rows = store
+            .summarize_usage("wsp_x", "p")
+            .await
+            .expect("summarize");
+        assert_eq!(
+            rows,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 2,
+                cost_microdollars: i64::MAX as u64,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_append_usage_saturates_oversized_cost() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        store
+            .append_usage(UsageAppend {
+                request_id: "req_over".into(),
+                namespace: "wsp_x".into(),
+                period: Some("p".into()),
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                cost_microdollars: Some(i64::MAX as u64 + 1),
+            })
+            .await
+            .expect("append");
+        let rows = store
+            .summarize_usage("wsp_x", "p")
+            .await
+            .expect("summarize");
+        assert_eq!(
+            rows,
+            vec![UsageSummaryRow {
+                model: "openai/gpt-4o".into(),
+                status: "ok".into(),
+                count: 1,
+                cost_microdollars: i64::MAX as u64,
+            }]
+        );
     }
 }
