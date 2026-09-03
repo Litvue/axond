@@ -2219,6 +2219,16 @@ namespace = "platform"
         async fn settle_budget(&self, _: &str, _: &str, _: &str, _: u64) -> Result<(), StoreError> {
             Ok(())
         }
+        async fn append_usage(&self, _: crate::store::UsageAppend) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn summarize_usage(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<crate::store::UsageSummaryRow>, StoreError> {
+            Ok(Vec::new())
+        }
     }
 
     fn publish_test_state(

@@ -126,7 +126,7 @@ fn unavailable(err: rusqlite::Error) -> StoreError {
 }
 
 fn insert_usage(conn: &Connection, event: &UsageAppend) -> Result<(), StoreError> {
-    let cost = event.cost_microdollars.map(sql_amount).transpose()?;
+    let cost = event.cost_microdollars.map(sql_amount_saturating);
     conn.execute(
         "INSERT OR IGNORE INTO axond_store_usage
             (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
