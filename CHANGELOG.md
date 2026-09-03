@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.5.0](https://github.com/Litvue/axond/compare/v0.4.2...v0.5.0) (2026-09-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* Boot requires `[storage]`. Inference is `/ns/{ns}/v1` with `provider-id/model-id`. `[[model]]`, `mode`, `[control_plane]`, minted `axt1.` tokens, and `/admin/v1` are withdrawn. Exactly one `[[gateway_key]]`.
+
+### Features
+
+* **admin:** authorize bindings per touched surface and scope ([#413](https://github.com/Litvue/axond/issues/413)) ([2551a3e](https://github.com/Litvue/axond/commit/2551a3ef38d8b58ca00a5539723e13e9e0bb409c))
+* **admin:** binding price changes close half-open book intervals ([#417](https://github.com/Litvue/axond/issues/417)) ([1d53771](https://github.com/Litvue/axond/commit/1d5377139c10c2a57877021dbc9360c8d582541e))
+* **admin:** catalogue imported browse, NotEnabled, and catalogue refresh ([#411](https://github.com/Litvue/axond/issues/411)) ([04b383f](https://github.com/Litvue/axond/commit/04b383f76c0e45c3120e4d5f498dcdb11eda60bc))
+* **admin:** POST /admin/v1/bindings expands one imported model into one revision ([#412](https://github.com/Litvue/axond/issues/412)) ([507901a](https://github.com/Litvue/axond/commit/507901ad0d3e8881707a36004cdff7f46fd12943))
+* **api:** cached provider model discovery ([#437](https://github.com/Litvue/axond/issues/437)) ([b988561](https://github.com/Litvue/axond/commit/b988561a61147bfaec7e58e57a4aeff98395cabc))
+* **api:** DELETE /api/v1/namespaces/{ns} ([#436](https://github.com/Litvue/axond/issues/436)) ([6250f96](https://github.com/Litvue/axond/commit/6250f962c74d6c72337efa642b65d1a3820a27fe))
+* **api:** OpenAPI 3.1 and usage summary ([#435](https://github.com/Litvue/axond/issues/435)) ([afd3df5](https://github.com/Litvue/axond/commit/afd3df5a4bebe8476bc5606034f103d0f9ac37c5))
+* **budget:** per-namespace per-period reserve/settle ([#434](https://github.com/Litvue/axond/issues/434)) ([ae91a11](https://github.com/Litvue/axond/commit/ae91a1106976f6c77f478d965e6252d8d5cadb1d))
+* **cli:** axond admin model apply fills expected-revision and idempotency-key ([#415](https://github.com/Litvue/axond/issues/415)) ([9c18d5f](https://github.com/Litvue/axond/commit/9c18d5f4e341e970e3472a73c44e35c82fe11cd2))
+* **models:** tenant-scoped local catalogue snapshots for custom deployment ids ([#416](https://github.com/Litvue/axond/issues/416)) ([49a04f2](https://github.com/Litvue/axond/commit/49a04f24cc81260e16d86c1bf53a87e78761bc75))
+* **routing:** providers-only prefixed model ids, drop [[model]] ([#433](https://github.com/Litvue/axond/issues/433)) ([45e06f0](https://github.com/Litvue/axond/commit/45e06f0015c65c3b09cb7149e676c69854892c7e))
+* store-backed namespaced gateway (ADR 0063) ([1db2832](https://github.com/Litvue/axond/commit/1db28323dd5929b513cc7c8cc79d4625eda6b48e))
+* **store:** required SQLite/Postgres store, namespaces, /ns/{ns}/v1, static API key ([#431](https://github.com/Litvue/axond/issues/431)) ([5ea10f5](https://github.com/Litvue/axond/commit/5ea10f5e596291e6979c889d721a13d6e16fd099))
+
+
+### Bug Fixes
+
+* **admin:** derive catalogue billable from compiled pricing, not enablement pointers ([#410](https://github.com/Litvue/axond/issues/410)) ([e48d89f](https://github.com/Litvue/axond/commit/e48d89fa2452eae66810dd6bca0cf520163cc91c))
+* **gateway:** unmount /admin/v1 and reject withdrawn bootstrap config ([#438](https://github.com/Litvue/axond/issues/438)) ([bdb0907](https://github.com/Litvue/axond/commit/bdb0907650bb727f0a1aca150e4d72c80798d284))
+
+
+### Documentation
+
+* align operator docs with ADR 0063 ([#439](https://github.com/Litvue/axond/issues/439)) ([1dfbe44](https://github.com/Litvue/axond/commit/1dfbe44fd54c7c788b44c110c0d6216421edc159))
+* teach axond admin model apply as the only happy path ([#418](https://github.com/Litvue/axond/issues/418)) ([ad3c9ba](https://github.com/Litvue/axond/commit/ad3c9ba68961df2c153aff5101072175782304df))
+
+
+### Tests
+
+* **admin:** binding revision compiles to a chargeable alias ([#414](https://github.com/Litvue/axond/issues/414)) ([a85fe39](https://github.com/Litvue/axond/commit/a85fe39a78e4532749d37b11aae6f17a4ef10561))
+* hydrate a four-step revision and a binding-adopted one on the new binary ([#419](https://github.com/Litvue/axond/issues/419)) ([7f6e787](https://github.com/Litvue/axond/commit/7f6e78706d5f9f352aae45a2774eb392234aedb9))
+
+
+### Continuous Integration
+
+* bump the github-actions group across 1 directory with 2 updates ([#422](https://github.com/Litvue/axond/issues/422)) ([ecc37e4](https://github.com/Litvue/axond/commit/ecc37e462ca627ed1a228bac48b042e3c3693922))
+
 ## [0.4.2](https://github.com/Litvue/axond/compare/v0.4.1...v0.4.2) (2026-08-24)
 
 
