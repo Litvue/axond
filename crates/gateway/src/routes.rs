@@ -5452,6 +5452,7 @@ max_ttl = "15m"
             ("POST", "/api/v1/namespaces"),
             ("GET", "/api/v1/namespaces/platform"),
             ("PUT", "/api/v1/namespaces/platform"),
+            ("DELETE", "/api/v1/namespaces/platform"),
             ("GET", "/api/v1/namespaces/platform/budgets/harness"),
             ("PUT", "/api/v1/namespaces/platform/budgets/harness"),
             ("GET", "/api/v1/namespaces/platform/usage?period=harness"),

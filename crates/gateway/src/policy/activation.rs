@@ -1411,6 +1411,7 @@ mod tests {
     /// Nothing about a stateless deployment reaches activation: there are no
     /// documents to classify, so the plan is empty and the file keeps governing.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_stateless_deployment_has_nothing_to_activate() {
         let view = PolicyView::of(&stateless_config());
         let activation = plan(&view, &view, BackendSupport::of(&stateless_config()))

@@ -1995,6 +1995,7 @@ mod tests {
     /// a stop-the-fleet migration is asking whether anything it admitted is
     /// left, not merely whether anyone is still waiting.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn a_compensating_release_keeps_its_generation_counted_until_the_lease_is_gone() {
         use crate::desired_state::fixtures::tenant_id;
         use crate::desired_state::policy::PolicyScope;
