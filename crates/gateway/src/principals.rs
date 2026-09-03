@@ -1379,6 +1379,7 @@ max_ttl = "15m"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn legacy_minted_namespace_labels_are_parsed_only_by_namespaced_routes() {
         for namespace in ["acme/core", "team.a"] {
             let config = Config::from_toml_str(&format!(

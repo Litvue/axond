@@ -403,6 +403,7 @@ dsn_env = "GW_BUDGET_REDIS"
     /// The refusal that keeps a stateful replica from admitting against a cap
     /// nobody published: no document, no enforcement values, no admission.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_stateful_namespace_with_no_document_has_no_policy_at_all() {
         let mut config = stateful_config();
         config.namespace.push(projected("acme/core", None));
@@ -412,6 +413,7 @@ dsn_env = "GW_BUDGET_REDIS"
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_flat_v2_static_only_namespace_is_not_an_ungoverned_gap() {
         let mut config = stateful_config();
         config.namespace.push(crate::config::Namespace {
@@ -433,6 +435,7 @@ dsn_env = "GW_BUDGET_REDIS"
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_published_document_governs_its_namespace_and_carries_its_generation() {
         let scope = PolicyScope::Tenant(tenant_id(1));
         let document = body(scope, 3, 9_000);

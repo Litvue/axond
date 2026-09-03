@@ -25,18 +25,10 @@ export const UNGRANTED_NAMESPACE = "tenant";
 export const UPSTREAM_OPENAI_KEY = "test-upstream-openai-key";
 export const UPSTREAM_ANTHROPIC_KEY = "test-upstream-anthropic-key";
 
-const PRICE =
-  "{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }";
-
-const ALIASES: ReadonlyArray<readonly [alias: string, provider: string, target: string]> = [
-  ["chat-golden", "fake-openai", CHAT],
-  ["messages-golden", "fake-anthropic", MESSAGES],
-  ["embeddings-golden", "fake-openai", EMBEDDINGS],
-  ["responses-golden", "fake-openai", RESPONSES],
-];
-
-/** The alias catalogue `GET /ns/{ns}/v1/models` must report. */
-export const ALIAS_NAMES: readonly string[] = ALIASES.map(([alias]) => alias);
+export const CHAT_MODEL = `fake-openai/${CHAT}`;
+export const MESSAGES_MODEL = `fake-anthropic/${MESSAGES}`;
+export const EMBEDDINGS_MODEL = `fake-openai/${EMBEDDINGS}`;
+export const RESPONSES_MODEL = `fake-openai/${RESPONSES}`;
 
 /** How long a gateway has to answer `/healthz`, and each probe of it. */
 const READY_TIMEOUT_MS = 30_000;
@@ -72,11 +64,6 @@ async function freePort(): Promise<number> {
 }
 
 function config(bind: string, upstream: string, sqlite: string): string {
-  const models = ALIASES.map(
-    ([alias, provider, target]) =>
-      `[[model]]\nname = "${alias}"\n` +
-      `targets = [ { provider = "${provider}", model = "${target}", price = ${PRICE} } ]\n`,
-  ).join("\n");
   return `
 [server]
 bind = "${bind}"
@@ -117,7 +104,18 @@ env = "GW_FAKE_ANTHROPIC_KEY"
 env = "GW_INBOUND_KEY"
 namespace = "${NAMESPACE}"
 
-${models}`;
+[[price]]
+provider = "fake-openai"
+model = "*"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+
+[[price]]
+provider = "fake-anthropic"
+model = "*"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+`;
 }
 
 /** Boot the fake upstream and a real gateway pointed at it. */

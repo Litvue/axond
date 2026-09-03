@@ -913,6 +913,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn stateful_projection_without_inbound_principals_is_typed_unsupported() {
         let compiler = RevisionCompiler::new(
             stateful_bootstrap(),
@@ -932,6 +933,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn production_stateful_projection_compiles_a_projected_workload_principal() {
         let projection = crate::convergence::StateModelProjection;
         assert!(
@@ -986,6 +988,7 @@ mod tests {
     /// the same error a file would produce, and nothing is returned that a caller
     /// could publish.
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn a_revision_whose_alias_targets_an_undefined_provider_is_refused_by_the_boot_gate() {
         let compiler = RevisionCompiler::with_secrets(
             bootstrap(),

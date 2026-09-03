@@ -111,6 +111,12 @@ base_url = "{base_url}"
 [[gateway_key]]
 env = "AXOND_SENTINEL_INBOUND"
 namespace = "platform"
+
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#
     ))
     .expect("a valid bootstrap config")
@@ -665,7 +671,7 @@ pub(crate) fn chat_request() -> Request<Body> {
             axum::http::header::AUTHORIZATION,
             format!("Bearer {INBOUND_MATERIAL}"),
         )
-        .body(Body::from(r#"{"model":"fast","messages":[]}"#))
+        .body(Body::from(r#"{"model":"openai/gpt-4o","messages":[]}"#))
         .expect("a valid request")
 }
 

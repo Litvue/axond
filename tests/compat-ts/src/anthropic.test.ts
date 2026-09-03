@@ -15,6 +15,7 @@ import Anthropic, { AuthenticationError } from "@anthropic-ai/sdk";
 import { MESSAGES, fixtureJson } from "./fakeUpstream.js";
 import {
   GATEWAY_KEY,
+  MESSAGES_MODEL,
   NAMESPACE,
   UPSTREAM_ANTHROPIC_KEY,
   start,
@@ -64,7 +65,7 @@ after(async () => {
 sdkTest("a buffered message preserves thinking and tool-use blocks", async (mount) => {
   const client = sdkClient(mount);
   const message = await client.messages.create({
-    model: "messages-golden",
+    model: MESSAGES_MODEL,
     max_tokens: 1024,
     thinking: { type: "enabled", budget_tokens: 1024 },
     messages: [{ role: "user", content: "Weather in Paris?" }],
@@ -101,7 +102,7 @@ sdkTest("a streamed message reassembles thinking and tool use", async (mount) =>
   const client = sdkClient(mount);
   const final = await client.messages
     .stream({
-      model: "messages-golden",
+      model: MESSAGES_MODEL,
       max_tokens: 1024,
       thinking: { type: "enabled", budget_tokens: 1024 },
       messages: [{ role: "user", content: "Weather in Paris?" }],
@@ -148,7 +149,7 @@ sdkTest("a declared tool round-trips to the upstream unchanged", async (mount) =
     },
   ];
   await client.messages.create({
-    model: "messages-golden",
+    model: MESSAGES_MODEL,
     max_tokens: 1024,
     tools,
     messages: [{ role: "user", content: "Weather in Paris?" }],
@@ -164,7 +165,7 @@ sdkTest("an unknown gateway key is rejected", async (mount) => {
   });
   await assert.rejects(
     stranger.messages.create({
-      model: "messages-golden",
+      model: MESSAGES_MODEL,
       max_tokens: 16,
       messages: [{ role: "user", content: "hi" }],
     }),

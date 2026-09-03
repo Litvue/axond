@@ -24,11 +24,12 @@ id = "openai-primary"
 env = "GW_INBOUND_PLATFORM_KEY"
 namespace = "platform"
 
-[[model]]
-name = "gpt-4o"
-targets = [
-  { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
-]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2_500_000
+output_microdollars_per_million = 10_000_000
+
 
 # Sized for this manifest's single SQLite replica (ADR 0063): the ceilings are
 # per process and in process memory. They are set deliberately below axond's

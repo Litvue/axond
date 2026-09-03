@@ -68,14 +68,19 @@ impl SqliteStore {
         F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
     {
         let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || {
+        let run = move || {
             let guard = conn
                 .lock()
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
             f(&guard)
-        })
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::spawn_blocking(run)
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        } else {
+            run()
+        }
     }
 }
 

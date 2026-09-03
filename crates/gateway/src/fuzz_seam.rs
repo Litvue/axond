@@ -72,7 +72,7 @@ use crate::backends::models_dev::{
     self, ModelsDevAdapter, ModelsDevError, SEED_PAYLOAD, seed_snapshot,
 };
 use crate::budget::NoBudget;
-use crate::config::{Config, Model};
+use crate::config::{Config, Provider};
 use crate::desired_state::{
     CanonicalValue, DeploymentBody, InboundGrantBody, NamespaceBody, ResourceBody, ResourceId,
     ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, Slug, Uuid7,
@@ -796,16 +796,19 @@ pub fn catalog_diff(
     }
 }
 
-/// The routing table the request path would serve, as `alias => provider/model`
-/// entries, read from the seam's [`AppState`] through [`AppState::config`] —
-/// the same load a request performs, off the same `ArcSwap` that
-/// [`AppState::publish`] stores into.
+/// The provider ids the request path would look up, read from the seam's
+/// [`AppState`] through [`AppState::config`] — the same load a request
+/// performs, off the same `ArcSwap` that [`AppState::publish`] stores into.
 ///
-/// Read fresh on every call rather than cached, so publication is what the
-/// comparison watches: anything that reached runtime state by the one route
-/// runtime state is reached by would move it. That the observation is live, and
-/// not a constant compared with itself, is [`publication_moves_runtime_routes`]:
-/// it publishes into a state built the same way and shows the routes move.
+/// Sorted, and read fresh on every call rather than cached, so publication is
+/// what the comparison watches: anything that reached runtime state by the one
+/// route runtime state is reached by would move it. Catalogue import is
+/// last-known-good / metadata-only (ADR 0063 withdrew the catalogue control
+/// plane): an import must not publish this table.
+///
+/// That the observation is live, and not a constant compared with itself, is
+/// [`publication_moves_runtime_routes`]: it publishes into a state built the
+/// same way and shows the ids move.
 pub fn runtime_routes() -> Vec<String> {
     routes_of(&runtime_state().config())
 }
@@ -814,22 +817,26 @@ pub fn runtime_routes() -> Vec<String> {
 ///
 /// The calibration of the no-publication assertion: it runs on a *separate*
 /// state built exactly like the seam's, publishes a snapshot carrying one more
-/// alias, and answers whether the routing table read afterwards differs. `false`
+/// provider id, and answers whether the table read afterwards differs. `false`
 /// means the assertion has gone blind and every no-publication claim made with
 /// it is worthless, which is why the smoke asserts it directly.
 pub fn publication_moves_runtime_routes() -> bool {
     let state = build_state(seam_config().clone()).expect("the seam's own config resolves");
     let before = routes_of(&state.config());
     let mut config = seam_config().clone();
-    let Some(extra) = config.model.first().cloned() else {
+    let Some(extra) = config.provider.first().cloned() else {
         return false;
     };
-    config.model.push(Model {
-        name: format!("{}-published", extra.name),
+    config.provider.push(Provider {
+        id: format!("{}-published", extra.id),
+        base_url: format!("{}/published", extra.base_url),
         ..extra
     });
+    if let Some(first) = config.provider.first_mut() {
+        first.base_url.push_str("/edited");
+    }
     let snapshot = ConfigSnapshot::build(config, &seam_env(), 1)
-        .expect("the seam's config resolves with one more alias");
+        .expect("the seam's config resolves with one more provider");
     state.publish(snapshot).expect("publish");
     routes_of(&state.config()) != before
 }
@@ -875,16 +882,19 @@ pub fn override_oracle_notices_a_missing_override() -> bool {
 }
 
 fn routes_of(snapshot: &ConfigSnapshot) -> Vec<String> {
-    snapshot
+    let mut rows: Vec<String> = snapshot
         .config
-        .model
+        .provider
         .iter()
-        .flat_map(|model| {
-            model.targets.iter().map(move |target| {
-                format!("{} => {}/{}", model.name, target.provider, target.model)
-            })
+        .map(|provider| {
+            format!(
+                "{}:{:?}:{}:{:?}",
+                provider.id, provider.kind, provider.base_url, provider.unpriced_models
+            )
         })
-        .collect()
+        .collect();
+    rows.sort();
+    rows
 }
 
 /// The default fetch time an import is stamped with, as unix seconds. Fixed, so
@@ -1102,11 +1112,12 @@ max_ttl = "15m"
 namespace = "fuzz"
 min_iat = {MIN_IAT}
 
-# One provider and one alias, so the request path this seam compiles has a
-# routing table with something in it: `catalog_import` asserts that importing a
-# catalogue leaves that table byte-for-byte alone, and a table that was empty to
-# begin with would assert nothing. Neither is reachable — the base URL resolves
-# nowhere and no target is ever dispatched.
+# One provider so the request path this seam compiles has a routing table
+# with something in it: `catalog_import` asserts that importing a catalogue
+# leaves those provider ids byte-for-byte alone, and a table that was empty
+# to begin with would assert nothing. Catalogue import is last-known-good /
+# metadata-only (ADR 0063): it must not publish this table. The provider is
+# unreachable — the base URL resolves nowhere and no target is ever dispatched.
 [[provider]]
 id = "fuzz-provider"
 kind = "openai-compatible"
@@ -1117,11 +1128,11 @@ namespace = "fuzz"
 provider = "fuzz-provider"
 env = "AXOND_FUZZ_PROVIDER_KEY"
 
-[[model]]
-name = "fuzz-alias"
-targets = [
-  { provider = "fuzz-provider", model = "fuzz-upstream-model", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
-]
+[[price]]
+provider = "fuzz-provider"
+model = "fuzz-upstream-model"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#;
 
 /// The configuration this seam compiles: the one an assertion about the request

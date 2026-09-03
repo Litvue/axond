@@ -40,30 +40,30 @@ pub const ANTHROPIC_KEY_SECONDARY: &str = "test-upstream-anthropic-key-secondary
 pub const OPENAI_SECONDARY_ENV: &str = "GW_FAKE_OPENAI_KEY_SECONDARY";
 pub const ANTHROPIC_SECONDARY_ENV: &str = "GW_FAKE_ANTHROPIC_KEY_SECONDARY";
 
-/// Caller-facing aliases the test config exposes.
+/// Caller-facing prefixed model ids the test config exposes.
 pub mod alias {
     /// The rollout evidence contract requires this shared durable alias verbatim.
-    pub const CHAT: &str = "chat";
-    pub const CHAT_NO_HEADERS: &str = "chat-no-headers";
-    pub const CHAT_LATE_HEADERS: &str = "chat-late-headers";
-    pub const CHAT_SLOW_BODY: &str = "chat-slow-body";
-    pub const CHAT_HUGE_BODY: &str = "chat-huge-body";
-    pub const CHAT_HUGE_ERROR: &str = "chat-huge-error";
-    pub const CHAT_STALL: &str = "chat-stall";
-    pub const CHAT_STALL_AFTER_BYTES: &str = "chat-stall-after-bytes";
-    pub const CHAT_LONG: &str = "chat-long";
-    pub const CHAT_SLOW: &str = "chat-slow";
-    pub const CHAT_DROP: &str = "chat-drop";
-    pub const CHAT_FAIL: &str = "chat-fail";
-    pub const MESSAGES: &str = "messages-golden";
-    pub const MESSAGES_SLOW: &str = "messages-slow";
-    pub const MESSAGES_DROP: &str = "messages-drop";
-    pub const EMBEDDINGS: &str = "embeddings-golden";
-    pub const RESPONSES: &str = "responses-golden";
+    pub const CHAT: &str = "fake-openai/fixture-chat";
+    pub const CHAT_NO_HEADERS: &str = "fake-openai/no-headers";
+    pub const CHAT_LATE_HEADERS: &str = "fake-openai/late-headers";
+    pub const CHAT_SLOW_BODY: &str = "fake-openai/slow-body";
+    pub const CHAT_HUGE_BODY: &str = "fake-openai/huge-body";
+    pub const CHAT_HUGE_ERROR: &str = "fake-openai/huge-error";
+    pub const CHAT_STALL: &str = "fake-openai/stall-stream";
+    pub const CHAT_STALL_AFTER_BYTES: &str = "fake-openai/stall-after-bytes";
+    pub const CHAT_LONG: &str = "fake-openai/long-stream";
+    pub const CHAT_SLOW: &str = "fake-openai/slow-stream";
+    pub const CHAT_DROP: &str = "fake-openai/drop-stream";
+    pub const CHAT_FAIL: &str = "fake-openai/fail-500";
+    pub const MESSAGES: &str = "fake-anthropic/fixture-messages";
+    pub const MESSAGES_SLOW: &str = "fake-anthropic/slow-stream";
+    pub const MESSAGES_DROP: &str = "fake-anthropic/drop-stream";
+    pub const EMBEDDINGS: &str = "fake-openai/fixture-embeddings";
+    pub const RESPONSES: &str = "fake-openai/fixture-responses";
     /// Buffered answers of a fixed size, for a response-size sweep.
-    pub const CHAT_SIZED_SMALL: &str = "chat-sized-small";
-    pub const CHAT_SIZED_MEDIUM: &str = "chat-sized-medium";
-    pub const CHAT_SIZED_LARGE: &str = "chat-sized-large";
+    pub const CHAT_SIZED_SMALL: &str = "fake-openai/sized-body-1k";
+    pub const CHAT_SIZED_MEDIUM: &str = "fake-openai/sized-body-32k";
+    pub const CHAT_SIZED_LARGE: &str = "fake-openai/sized-body-256k";
 }
 
 /// The `[failover]` and `[transport]` sections every suite gets unless it asks
@@ -774,18 +774,12 @@ pub fn price() -> String {
 /// preflight the exact bytes a replica will be started from *before* starting
 /// it, which is the order a deployment gate runs in.
 pub fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str, extra: &str) -> String {
-    let price = price();
     let sqlite = std::env::temp_dir().join(format!(
         "axond-store-{}-{}.sqlite",
         std::process::id(),
         bind.port()
     ));
     let sqlite = sqlite.display();
-    let model = |name: &str, provider: &str, target: &str| {
-        format!(
-            "[[model]]\nname = \"{name}\"\ntargets = [ {{ provider = \"{provider}\", model = \"{target}\", price = {price} }} ]\n\n"
-        )
-    };
     format!(
         r#"
 [server]
@@ -831,50 +825,21 @@ namespace = "platform"
 env = "GW_BOOT_KEY"
 namespace = "platform"
 
+[[price]]
+provider = "fake-openai"
+model = "*"
+input_microdollars_per_million = {INPUT_PRICE}
+output_microdollars_per_million = {OUTPUT_PRICE}
+
+[[price]]
+provider = "fake-anthropic"
+model = "*"
+input_microdollars_per_million = {INPUT_PRICE}
+output_microdollars_per_million = {OUTPUT_PRICE}
+
 {tuning}
 
 {extra}
-
-{chat}{chat_sized_small}{chat_sized_medium}{chat_sized_large}{chat_no_headers}{chat_late_headers}{chat_slow_body}{chat_huge_body}{chat_huge_error}{chat_stall}{chat_stall_after_bytes}{chat_long}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}{responses}"#,
-        chat = model(alias::CHAT, "fake-openai", target::CHAT),
-        chat_sized_small = model(
-            alias::CHAT_SIZED_SMALL,
-            "fake-openai",
-            target::SIZED_BODY_SMALL
-        ),
-        chat_sized_medium = model(
-            alias::CHAT_SIZED_MEDIUM,
-            "fake-openai",
-            target::SIZED_BODY_MEDIUM
-        ),
-        chat_sized_large = model(
-            alias::CHAT_SIZED_LARGE,
-            "fake-openai",
-            target::SIZED_BODY_LARGE
-        ),
-        chat_no_headers = model(alias::CHAT_NO_HEADERS, "fake-openai", target::NO_HEADERS),
-        chat_late_headers = model(
-            alias::CHAT_LATE_HEADERS,
-            "fake-openai",
-            target::LATE_HEADERS
-        ),
-        chat_slow_body = model(alias::CHAT_SLOW_BODY, "fake-openai", target::SLOW_BODY),
-        chat_huge_body = model(alias::CHAT_HUGE_BODY, "fake-openai", target::HUGE_BODY),
-        chat_huge_error = model(alias::CHAT_HUGE_ERROR, "fake-openai", target::HUGE_ERROR),
-        chat_stall = model(alias::CHAT_STALL, "fake-openai", target::STALL_STREAM),
-        chat_stall_after_bytes = model(
-            alias::CHAT_STALL_AFTER_BYTES,
-            "fake-openai",
-            target::STALL_AFTER_BYTES
-        ),
-        chat_long = model(alias::CHAT_LONG, "fake-openai", target::LONG_STREAM),
-        chat_slow = model(alias::CHAT_SLOW, "fake-openai", target::SLOW_STREAM),
-        chat_drop = model(alias::CHAT_DROP, "fake-openai", target::DROP_STREAM),
-        chat_fail = model(alias::CHAT_FAIL, "fake-openai", target::FAIL),
-        messages = model(alias::MESSAGES, "fake-anthropic", target::MESSAGES),
-        messages_slow = model(alias::MESSAGES_SLOW, "fake-anthropic", target::SLOW_STREAM),
-        messages_drop = model(alias::MESSAGES_DROP, "fake-anthropic", target::DROP_STREAM),
-        embeddings = model(alias::EMBEDDINGS, "fake-openai", target::EMBEDDINGS),
-        responses = model(alias::RESPONSES, "fake-openai", target::RESPONSES),
+"#
     )
 }

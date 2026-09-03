@@ -1026,6 +1026,7 @@ async fn force_refresh_signals_coalesce_and_refresh_the_run_loop() {
 /// servable graph — is refused with *nothing* published: same generation, same
 /// aliases, and a report that says which stage refused it.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_revision_that_fails_the_boot_gate_publishes_nothing() {
     let store = control_plane();
     let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
@@ -1381,6 +1382,7 @@ async fn an_outage_keeps_the_previous_revision_serving_and_reports_the_lag() {
 /// Lag is what an operator alerts on, so it has to grow while a replica is stuck
 /// and be measured from the moment it fell behind.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn lag_grows_while_a_replica_cannot_reach_the_desired_revision() {
     let store = control_plane();
     let first = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
@@ -1482,6 +1484,7 @@ async fn a_replica_whose_control_plane_is_down_does_not_hot_loop() {
 /// compiled into serving state while the control plane is unavailable because
 /// there is no monotonic revocation/tombstone floor to compare it against.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_credential_bearing_flat_v2_signed_cache_is_not_a_cross_restart_lkg() {
     let store = control_plane();
     let first = publish(
@@ -1534,6 +1537,7 @@ async fn a_credential_bearing_flat_v2_signed_cache_is_not_a_cross_restart_lkg() 
 /// tombstones its credential but replacing the compiled file fails, a restart
 /// must refuse A even though its envelope still authenticates.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_stale_flat_v2_credential_cache_cannot_restore_after_a_tombstone_write_failure() {
     let store = control_plane();
     let first = publish(
@@ -1625,6 +1629,7 @@ async fn a_stale_flat_v2_credential_cache_cannot_restore_after_a_tombstone_write
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_credential_free_flat_v2_cache_remains_eligible_for_cold_restoration() {
     let store = control_plane();
     let published = publish(
@@ -1895,6 +1900,7 @@ async fn a_cold_boot_against_an_empty_control_plane_refuses_to_start() {
 /// would silently serve state an operator already replaced. The post-listener
 /// caller may retry, but this candidate never publishes.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_boot_revision_that_does_not_compile_is_rejected_even_with_a_cache() {
     let store = control_plane();
     publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;

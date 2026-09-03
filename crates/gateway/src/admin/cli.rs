@@ -2286,7 +2286,7 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
                 "aliases": named,
                 "metadata": {
                     "provider": "openai",
-                    "model": "gpt-4o",
+                    "model": "openai/gpt-4o",
                     "published_model": "gpt-4o"
                 }
             }]
@@ -2352,6 +2352,7 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn json_file_flattens_a_single_models_array() {
         let args = apply_argv(&["--target", "openai:unused"]);
         let (_, model) = nested(&args);
@@ -2365,7 +2366,7 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
                     "models": [{
                         "targets": [{
                             "provider": "openai",
-                            "model": "gpt-4o",
+                            "model": "openai/gpt-4o",
                             "price": "observed"
                         }]
                     }]
@@ -2384,7 +2385,7 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
         .expect_err("zero models");
         spec_from_json(
             r#"{ "resource": { "tenant": "ten_1", "models": [
-                { "targets": [{ "provider": "openai", "model": "gpt-4o" }] },
+                { "targets": [{ "provider": "openai", "model": "openai/gpt-4o" }] },
                 { "targets": [{ "provider": "openai", "model": "gpt-4o-mini" }] }
             ] } }"#,
             apply,

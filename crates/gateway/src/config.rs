@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use gateway_core::ModelPrice;
 use gateway_transport::TransportLimits;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
@@ -74,8 +74,18 @@ pub struct Config {
     pub namespace: Vec<Namespace>,
     #[serde(default)]
     pub provider: Vec<Provider>,
+    /// Rejected at boot (ADR 0063). Kept deserializable so the error can name
+    /// each alias and the `provider-id/model-id` form that replaces it.
     #[serde(default)]
     pub model: Vec<Model>,
+    /// Deployment price-book. First matching `(provider, model-id glob)` in
+    /// file order wins; this is not a routing table.
+    #[serde(default)]
+    pub price: Vec<PriceRule>,
+    /// Deployment-wide model-id glob denials. Unioned with the namespace list
+    /// at request time.
+    #[serde(default)]
+    pub blocklist: BlocklistConfig,
     #[serde(default)]
     pub credential: Vec<Credential>,
     /// Pool-wide policy for `(namespace, provider)` pairs that bind more than
@@ -192,9 +202,10 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 29] = [
+const OVERRIDE_KEYS: [&str; 32] = [
     "mode",
     "server",
+    "storage",
     "control_plane",
     "convergence",
     "secret_store",
@@ -203,6 +214,8 @@ const OVERRIDE_KEYS: [&str; 29] = [
     "namespace",
     "provider",
     "model",
+    "price",
+    "blocklist",
     "credential",
     "credential_pool",
     "failover",
@@ -230,6 +243,22 @@ const OVERRIDE_KEYS: [&str; 29] = [
 /// The rule the durable [`Slug`](crate::desired_state::Slug) already enforces,
 /// restated over a `String` because a compiled config carries the rendered id and
 /// not the typed one.
+fn parse_glob(pattern: &str) -> Result<AliasScope, String> {
+    AliasScope::parse(std::iter::once(pattern)).map_err(|_| pattern.to_owned())
+}
+
+pub(crate) fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
+    parse_glob(pattern).map(|_| ()).map_err(|pattern| {
+        format!(
+            "blocklist glob `{pattern}` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`"
+        )
+    })
+}
+
+fn glob_permits(pattern: &str, value: &str) -> bool {
+    parse_glob(pattern).is_ok_and(|scope| scope.permits(value))
+}
+
 fn is_namespace_segment(segment: &str) -> bool {
     let alphanumeric = |character: char| character.is_ascii_alphanumeric();
     segment.starts_with(alphanumeric)
@@ -878,6 +907,18 @@ pub struct Provider {
     pub id: String,
     pub kind: ProviderKind,
     pub base_url: String,
+    /// Unpriced model ids: `deny` refuses before dispatch; `allow` dispatches
+    /// and records `cost_microdollars` as NULL.
+    #[serde(default)]
+    pub unpriced_models: UnpricedModels,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnpricedModels {
+    #[default]
+    Deny,
+    Allow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -938,11 +979,43 @@ pub struct Model {
 
 impl Model {
     /// Whether `namespace` may see and invoke this alias.
+    #[allow(dead_code)]
     pub fn reachable_from(&self, namespace: &str) -> bool {
         self.namespace
             .as_deref()
             .is_none_or(|owner| owner == namespace)
     }
+
+    /// One observed `(provider, model)` for the request path. Alias failover
+    /// is gone; credential-pool rotation still walks this single target.
+    pub(crate) fn single(provider: String, model: String, price: ModelPrice) -> Self {
+        Self {
+            name: format!("{provider}/{model}"),
+            namespace: None,
+            targets: vec![Target {
+                provider,
+                model,
+                price,
+                catalog: None,
+            }],
+        }
+    }
+}
+
+/// Deployment default blocklist. Namespaced extras are store-backed.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct BlocklistConfig {
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+/// One price-book row: exact provider id, glob against the bare upstream id.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PriceRule {
+    pub provider: String,
+    pub model: String,
+    #[serde(flatten)]
+    pub price: ModelPrice,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2794,10 +2867,40 @@ impl Config {
 
     fn validate_inner(&self, allow_memory_sqlite: bool) -> Result<(), ConfigError> {
         self.validate_storage(allow_memory_sqlite)?;
+        self.reject_legacy_models()?;
         match self.mode {
             Mode::Stateless => self.validate_stateless(),
             Mode::Stateful => self.validate_stateful(),
         }
+    }
+
+    /// `[[model]]` is gone: callers send `provider-id/model-id`. Name each
+    /// leftover alias and the prefix form that replaces it.
+    fn reject_legacy_models(&self) -> Result<(), ConfigError> {
+        if self.model.is_empty() {
+            return Ok(());
+        }
+        let replacements = self
+            .model
+            .iter()
+            .map(|model| {
+                let forms: Vec<String> = model
+                    .targets
+                    .iter()
+                    .map(|target| format!("`{}/{}`", target.provider, target.model))
+                    .collect();
+                let forms = if forms.is_empty() {
+                    format!("`provider-id/{}`", model.name)
+                } else {
+                    forms.join(", ")
+                };
+                format!("alias `{}` is now requested as {forms}", model.name)
+            })
+            .collect::<Vec<_>>();
+        Err(ConfigError::Invalid(format!(
+            "`[[model]]` is no longer accepted (ADR 0063). Callers send `provider-id/model-id`. {}",
+            replacements.join("; ")
+        )))
     }
 
     fn validate_storage(&self, allow_memory_sqlite: bool) -> Result<(), ConfigError> {
@@ -2895,13 +2998,6 @@ impl Config {
         let namespaces: HashMap<&str, &Namespace> =
             self.namespace.iter().map(|n| (n.id.as_str(), n)).collect();
 
-        // An alias name is unique within the namespace that owns it, not across
-        // the deployment: two tenants naming their own `fast` is the point of
-        // ownership. What must stay unique is the pair, because resolution takes
-        // the first row that matches and a second row for the same pair would be
-        // unreachable configuration.
-        let mut owned: HashSet<(Option<&str>, &str)> = HashSet::new();
-
         let mut projected_digests = HashSet::new();
         for principal in &self.projected_principals {
             if !projected_digests.insert(principal.digest) {
@@ -2936,53 +3032,8 @@ impl Config {
                 }
             }
         }
-        for model in &self.model {
-            if model.targets.is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "model `{}` has no targets",
-                    model.name
-                )));
-            }
-            if let Some(namespace) = model.namespace.as_deref()
-                && !namespaces.contains_key(namespace)
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "model `{}` is owned by undefined namespace `{namespace}`",
-                    model.name
-                )));
-            }
-            if !owned.insert((model.namespace.as_deref(), model.name.as_str())) {
-                return Err(ConfigError::Invalid(match model.namespace.as_deref() {
-                    Some(namespace) => format!(
-                        "namespace `{namespace}` defines model `{}` twice",
-                        model.name
-                    ),
-                    None => format!("model `{}` is defined twice", model.name),
-                }));
-            }
-            for t in &model.targets {
-                if !providers.contains_key(t.provider.as_str()) {
-                    return Err(ConfigError::Invalid(format!(
-                        "model `{}` targets undefined provider `{}`",
-                        model.name, t.provider
-                    )));
-                }
-            }
-            let first = &model.targets[0];
-            let first_provider = providers[first.provider.as_str()];
-            let first_wire = first_provider.kind.wire();
-            for target in model.targets.iter().skip(1) {
-                let provider = providers[target.provider.as_str()];
-                let wire = provider.kind.wire();
-                if wire != first_wire {
-                    return Err(ConfigError::Invalid(format!(
-                        "model `{}` has incompatible failover targets: provider `{}` uses {} wire, \
-                         but provider `{}` uses {} wire; no route can serve such an alias",
-                        model.name, first.provider, first_wire, provider.id, wire
-                    )));
-                }
-            }
-        }
+        self.validate_price_book(&providers)?;
+        self.validate_blocklist()?;
         if self.credential_pool.failure_threshold == 0 {
             return Err(ConfigError::Invalid(
                 "credential_pool.failure_threshold must be at least 1".into(),
@@ -4440,6 +4491,58 @@ impl Config {
         self.provider.iter().find(|p| p.id == id)
     }
 
+    /// First matching price-book rule in file order, or `None` if unpriced.
+    pub fn price_for(&self, provider: &str, model: &str) -> Option<ModelPrice> {
+        self.price.iter().find_map(|rule| {
+            if rule.provider != provider {
+                return None;
+            }
+            glob_permits(&rule.model, model).then_some(rule.price)
+        })
+    }
+
+    /// Union of the deployment default and a namespace's extra globs.
+    pub fn is_blocked(&self, prefixed: &str, bare: &str, extra: &[String]) -> bool {
+        self.blocklist
+            .models
+            .iter()
+            .chain(extra)
+            .any(|pattern| glob_permits(pattern, prefixed) || glob_permits(pattern, bare))
+    }
+
+    fn validate_price_book(&self, providers: &HashMap<&str, &Provider>) -> Result<(), ConfigError> {
+        for rule in &self.price {
+            if rule.provider.trim().is_empty() || rule.model.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "`[[price]]` requires a non-empty `provider` and `model` glob".into(),
+                ));
+            }
+            if !providers.contains_key(rule.provider.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "`[[price]]` references undefined provider `{}`",
+                    rule.provider
+                )));
+            }
+            parse_glob(&rule.model).map_err(|pattern| {
+                ConfigError::Invalid(format!(
+                    "`[[price]]` model glob `{pattern}` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn validate_blocklist(&self) -> Result<(), ConfigError> {
+        for pattern in &self.blocklist.models {
+            parse_glob(pattern).map_err(|pattern| {
+                ConfigError::Invalid(format!(
+                    "blocklist glob `{pattern}` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn namespace(&self, id: &str) -> Option<&Namespace> {
         self.namespace.iter().find(|n| n.id == id)
     }
@@ -4470,6 +4573,7 @@ impl Config {
     /// a tenant default (ADR 0042): a namespace that names an alias replaces the
     /// deployment-wide one for itself alone, and nothing here can reach a row
     /// another namespace owns.
+    #[allow(dead_code)]
     pub fn model_for(&self, namespace: &str, name: &str) -> Option<&Model> {
         self.model
             .iter()
@@ -4594,35 +4698,114 @@ base_url = "https://api.openai.com/v1"
 env = "AXOND_KEY"
 namespace = "platform"
 
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
 "#;
 
-    /// A catalogue binding is optional, and when written it is parsed into the
-    /// pricing domain's own vocabulary at boot, so a binding no catalogue could
-    /// hold is a startup refusal rather than a request that prices nothing.
     #[test]
-    fn a_targets_catalogue_binding_is_optional_and_parsed_at_boot() {
-        let unbound = Config::from_toml_str(VALID).expect("a target need not be bound");
-        assert_eq!(unbound.model[0].targets[0].catalog, None);
+    fn a_legacy_model_table_is_a_boot_error_naming_the_prefix_form() {
+        let err = Config::from_toml_str(&format!(
+            r#"
+{VALID}
 
-        let bound = Config::from_toml_str(&VALID.replace(
-            r#"model = "gpt-4o", price"#,
-            r#"model = "gpt-4o", catalog = { provider = "openai", model = "gpt-4o-2024-08-06" }, price"#,
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#
         ))
-        .expect("a bound target parses");
+        .expect_err("[[model]] must not boot");
+        let message = err.to_string();
+        assert!(message.contains("[[model]]"), "{message}");
+        assert!(message.contains("gpt-4o"), "{message}");
+        assert!(message.contains("openai/gpt-4o"), "{message}");
+    }
+
+    #[test]
+    fn price_book_first_match_in_file_order() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+{VALID}
+
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 2
+"#
+        ))
+        .expect("exact before glob");
+        // VALID already has `model = "*"` first, so the catch-all wins.
         assert_eq!(
-            bound.model[0].targets[0].catalog,
-            Some(CatalogBinding::new("openai", "gpt-4o-2024-08-06").expect("a valid binding"))
+            cfg.price_for("openai", "gpt-4o")
+                .expect("priced")
+                .input_microdollars_per_million,
+            2_500_000
         );
 
-        let err = Config::from_toml_str(&VALID.replace(
-            r#"model = "gpt-4o", price"#,
-            r#"model = "gpt-4o", catalog = { provider = "Open AI", model = "gpt-4o" }, price"#,
+        let cfg = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 2
+
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 9
+output_microdollars_per_million = 9
+"#,
+        )
+        .expect("exact first");
+        assert_eq!(
+            cfg.price_for("openai", "gpt-4o")
+                .expect("exact")
+                .input_microdollars_per_million,
+            1
+        );
+        assert_eq!(
+            cfg.price_for("openai", "o3")
+                .expect("glob")
+                .input_microdollars_per_million,
+            9
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_blocklist_or_price_glob() {
+        let err = Config::from_toml_str(&format!("{VALID}\n[blocklist]\nmodels = [\"foo*bar\"]\n"))
+            .expect_err("middle star");
+        assert!(err.to_string().contains("blocklist glob"), "{err}");
+
+        let err = Config::from_toml_str(&format!(
+            r#"
+{VALID}
+[[price]]
+provider = "openai"
+model = "foo*bar"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
+"#
         ))
-        .expect_err("a provider id the catalogue cannot hold must not boot");
-        assert!(matches!(err, ConfigError::Load(_)), "{err:?}");
+        .expect_err("price glob");
+        assert!(err.to_string().contains("model glob"), "{err}");
     }
 
     #[test]
@@ -4644,10 +4827,6 @@ base_url = "https://api.openai.com/v1"
 [[gateway_key]]
 env = "AXOND_KEY"
 namespace = "platform"
-
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
 "#;
         let cfg: Config = Figment::new()
             .merge(Toml::string(toml))
@@ -4708,10 +4887,6 @@ default = true
 id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
-
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
 "#;
         let err = Config::from_toml_str(toml).expect_err("a keyless gateway must not boot");
         assert!(
@@ -4860,7 +5035,7 @@ audience = "test"
     fn accepts_a_well_formed_config() {
         let cfg = Config::from_toml_str(VALID).expect("valid config");
         assert_eq!(cfg.default_namespace(), "platform");
-        assert!(cfg.model("gpt-4o").is_some());
+        assert!(cfg.price_for("openai", "gpt-4o").is_some());
         assert_eq!(cfg.revocation.backend, RevocationBackend::None);
         assert_eq!(cfg.revocation.key_prefix(), "axond:revocation");
         assert_eq!(cfg.revocation.timeout_ms, 250);
@@ -5498,87 +5673,28 @@ dsn_env = "AXOND_BUDGET_REDIS_URL"
     }
 
     #[test]
-    fn rejects_alias_pointing_at_undefined_provider() {
+    fn rejects_price_pointing_at_undefined_provider() {
         let toml = r#"
 [[namespace]]
 id = "platform"
 default = true
 
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "ghost", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[[price]]
+provider = "ghost"
+model = "gpt-4o"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
 "#;
         let err = Config::from_toml_str(toml).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("undefined provider"), "{err:?}");
     }
 
     #[test]
-    fn rejects_alias_with_targets_from_incompatible_wires() {
-        let toml = r#"
-[[namespace]]
-id = "platform"
-default = true
-
-[[provider]]
-id = "openai"
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-
-[[provider]]
-id = "anthropic"
-kind = "anthropic"
-base_url = "https://api.anthropic.com/v1"
-
-[[model]]
-name = "mixed"
-targets = [
-    { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
-    { provider = "anthropic", model = "claude", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
-]
-"#;
-        let err = Config::from_toml_str(toml).expect_err("cross-wire failover must fail");
-        let message = err.to_string();
-        assert!(message.contains("mixed"), "{message}");
-        assert!(message.contains("openai"), "{message}");
-        assert!(message.contains("anthropic"), "{message}");
-        assert!(message.contains("OpenAI"), "{message}");
-        assert!(message.contains("Anthropic"), "{message}");
-        assert!(message.contains("no route can serve"), "{message}");
-    }
-
-    #[test]
-    fn accepts_openai_family_failover_targets() {
-        let toml = r#"
-[[namespace]]
-id = "platform"
-default = true
-
-[[provider]]
-id = "openai"
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-
-[[provider]]
-id = "compatible"
-kind = "openai-compatible"
-base_url = "https://example.test/v1"
-
-[[gateway_key]]
-env = "AXOND_KEY"
-namespace = "platform"
-
-[[model]]
-name = "mixed-openai"
-targets = [
-    { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
-    { provider = "compatible", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
-]
-"#;
-        Config::from_toml_str(toml).expect("OpenAI-family targets are compatible");
-    }
-
-    #[test]
-    fn accepts_aliases_each_confined_to_one_wire_family() {
+    fn accepts_two_providers_without_alias_failover() {
         let toml = r#"
 [[namespace]]
 id = "platform"
@@ -5597,16 +5713,8 @@ base_url = "https://api.anthropic.com/v1"
 [[gateway_key]]
 env = "AXOND_KEY"
 namespace = "platform"
-
-[[model]]
-name = "openai-alias"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
-
-[[model]]
-name = "anthropic-alias"
-targets = [{ provider = "anthropic", model = "claude", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
 "#;
-        Config::from_toml_str(toml).expect("single-wire aliases are compatible");
+        Config::from_toml_str(toml).expect("providers only");
     }
 
     #[test]
@@ -5624,113 +5732,14 @@ id = "b"
     }
 
     #[test]
-    fn rejects_model_with_no_targets() {
-        let toml = r#"
-[[namespace]]
-id = "platform"
-default = true
-
-[[model]]
-name = "gpt-4o"
-targets = []
-"#;
-        assert!(matches!(
-            Config::from_toml_str(toml),
-            Err(ConfigError::Invalid(_))
-        ));
-    }
-
-    /// Two namespaces may publish the same alias name, and each resolves to its
-    /// own: the pair `(namespace, name)` is what has to be unique, not the name.
-    #[test]
-    fn an_owned_alias_is_its_namespaces_own_and_shadows_the_deployments() {
-        let cfg = Config::from_toml_str(&format!(
-            r#"
-{VALID}
-
-[[namespace]]
-id = "acme"
-
-[[namespace]]
-id = "globex"
-
-[[model]]
-name = "shared"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
-
-[[model]]
-name = "shared"
-namespace = "acme"
-targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
-
-[[model]]
-name = "private"
-namespace = "globex"
-targets = [{{ provider = "openai", model = "o3", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
-"#
-        ))
-        .expect("an owned alias beside an unowned one");
-
-        // The owner gets its own row; everyone else gets the unowned one.
-        assert_eq!(
-            cfg.model_for("acme", "shared").expect("acme's own").targets[0].model,
-            "gpt-4o-mini"
-        );
-        assert_eq!(
-            cfg.model_for("globex", "shared")
-                .expect("the deployment's")
-                .targets[0]
-                .model,
-            "gpt-4o"
-        );
-        // An owned alias is not reachable from anywhere else, with no unowned row
-        // to fall back to.
-        assert!(cfg.model_for("acme", "private").is_none());
-        assert!(cfg.model_for("globex", "private").is_some());
-    }
-
-    #[test]
-    fn rejects_an_alias_owned_by_a_namespace_the_deployment_does_not_define() {
-        let toml = format!(
-            r#"
-{VALID}
-
-[[model]]
-name = "shared"
-namespace = "nowhere"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
-"#
-        );
-        assert!(matches!(
-            Config::from_toml_str(&toml),
-            Err(ConfigError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn rejects_one_namespace_defining_the_same_alias_twice() {
-        let toml = format!(
-            r#"
-{VALID}
-
-[[namespace]]
-id = "acme"
-
-[[model]]
-name = "shared"
-namespace = "acme"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
-
-[[model]]
-name = "shared"
-namespace = "acme"
-targets = [{{ provider = "openai", model = "o3", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
-"#
-        );
-        assert!(matches!(
-            Config::from_toml_str(&toml),
-            Err(ConfigError::Invalid(_))
-        ));
+    fn deployment_and_namespace_blocklists_union() {
+        let cfg =
+            Config::from_toml_str(&format!("{VALID}\n[blocklist]\nmodels = [\"*-preview\"]\n"))
+                .expect("valid blocklist");
+        assert!(cfg.is_blocked("openai/gpt-4o-preview", "gpt-4o-preview", &[]));
+        assert!(!cfg.is_blocked("openai/gpt-4o", "gpt-4o", &[]));
+        assert!(cfg.is_blocked("openai/gpt-4o", "gpt-4o", &["gpt-4o".to_owned()]));
+        assert!(cfg.is_blocked("openai/secret-x", "secret-x", &["secret-*".to_owned()]));
     }
 
     #[test]
@@ -7087,26 +7096,16 @@ dsn_env = "AXOND_REDIS_URL"
     }
 
     #[test]
-    fn rejects_unpriced_target_at_parse() {
-        let toml = r#"
-[[namespace]]
-id = "platform"
-default = true
-
-[[provider]]
-id = "openai"
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o" }]
-"#;
-        // Missing `price` → deserialization fails before validation runs.
-        assert!(matches!(
-            Config::from_toml_str(toml),
-            Err(ConfigError::Load(_))
-        ));
+    fn unpriced_models_defaults_to_deny() {
+        let cfg = Config::from_toml_str(VALID).expect("valid");
+        assert_eq!(cfg.provider[0].unpriced_models, UnpricedModels::Deny);
+        let cfg = Config::from_toml_str(&VALID.replace(
+            r#"base_url = "https://api.openai.com/v1""#,
+            r#"base_url = "https://api.openai.com/v1"
+unpriced_models = "allow""#,
+        ))
+        .expect("allow");
+        assert_eq!(cfg.provider[0].unpriced_models, UnpricedModels::Allow);
     }
 
     /// Landing the durable tenancy schemas (#191) does not give a *file* tenants

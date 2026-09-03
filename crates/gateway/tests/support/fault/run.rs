@@ -69,12 +69,12 @@ const STATE_DSN_ENV: &str = "AXOND_FAULT_STATE_DSN";
 
 /// Aliases the driver adds on top of the shared harness config.
 mod fault_alias {
-    pub const RATE_LIMITED: &str = "fault-rate-limited";
-    pub const RATE_LIMITED_FAILOVER: &str = "fault-rate-limited-failover";
-    pub const SERVER_ERROR_FAILOVER: &str = "fault-server-error-failover";
-    pub const DNS: &str = "fault-dns";
-    pub const CONNECT: &str = "fault-connect";
-    pub const TLS: &str = "fault-tls";
+    pub const RATE_LIMITED: &str = "fake-openai/rate-limited-429";
+    pub const RATE_LIMITED_FAILOVER: &str = "fake-openai/rate-limited-429";
+    pub const SERVER_ERROR_FAILOVER: &str = "fake-openai/fail-500";
+    pub const DNS: &str = "fault-dns/fixture-chat";
+    pub const CONNECT: &str = "fault-connect/fixture-chat";
+    pub const TLS: &str = "fault-tls/fixture-chat";
 }
 
 /// How long a row waits for the accounting to settle behind the last client
@@ -562,26 +562,23 @@ fn wiring_for(
     tls: &GarbageTls,
     backend: Option<&Backend>,
 ) -> Wiring {
-    let price = format!(
-        "{{ input_microdollars_per_million = {}, output_microdollars_per_million = {} }}",
-        gateway::INPUT_PRICE,
-        gateway::OUTPUT_PRICE
-    );
     let provider = |id: &str, base_url: &str, env: &str| {
         format!(
             "[[provider]]\nid = \"{id}\"\nkind = \"openai\"\nbase_url = \"{base_url}\"\n\n\
              [[credential]]\nnamespace = \"platform\"\nprovider = \"{id}\"\nenv = \"{env}\"\nid = \"{id}-key\"\n\n"
         )
     };
-    let model = |name: &str, targets: &[(&str, &str)]| {
-        let targets = targets
+    let model = |_name: &str, targets: &[(&str, &str)]| {
+        targets
             .iter()
-            .map(|(provider, target)| {
-                format!("{{ provider = \"{provider}\", model = \"{target}\", price = {price} }}")
+            .map(|(provider, _target)| {
+                format!(
+                    "[[price]]\nprovider = \"{provider}\"\nmodel = \"*\"\ninput_microdollars_per_million = {}\noutput_microdollars_per_million = {}\n\n",
+                    gateway::INPUT_PRICE,
+                    gateway::OUTPUT_PRICE,
+                )
             })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("[[model]]\nname = \"{name}\"\ntargets = [ {targets} ]\n\n")
+            .collect::<String>()
     };
 
     // A second provider on the same fake upstream, with its own credential, so

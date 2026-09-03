@@ -27,7 +27,7 @@ egress: upstream provider calls still use the network at Tier 0.
 
 | Config section | State tier |
 | --- | --- |
-| `[server]`, `[[namespace]]`, `[[provider]]`, `[[model]]`, `[[credential]]` | Tier 0: config-only. |
+| `[server]`, `[[namespace]]`, `[[provider]]`, `[[price]]`, `[blocklist]`, `[[credential]]` | Tier 0: config-only. |
 | `[credential_pool]`, `[failover]` | Tier 0: in-memory, per replica. |
 | `[transport]` | Tier 0: process-level bounds on provider egress. |
 | `[admission]` | Tier 0: in-memory per-replica request bounds and load shedding. |
@@ -353,64 +353,39 @@ The tenancy boundary: which credential pool a caller's requests draw from.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `id` | string | — | Provider name, referenced by targets and credentials. |
+| `id` | string | — | Provider name, referenced by credentials and the `provider-id/` prefix of a request model. |
 | `kind` | `openai` \| `anthropic` \| `openai-compatible` | — | Which wire the endpoint speaks. Decides which routes can serve it — see the [compatibility contract](./compatibility.md). |
 | `base_url` | string | — | Endpoint root, e.g. `https://api.openai.com/v1`. **Path only**: the route's path is appended by string concatenation, so a query string or fragment here would swallow it. Never put a secret in it either — see the [security review](./security-review-2026-08-05.md#4-finding-transport-errors-echoed-the-upstream-url--fixed-here). |
+| `unpriced_models` | `allow` \| `deny` | `deny` | What to do when no `[[price]]` rule matches. `deny` is `400 unpriced_model` before dispatch. `allow` dispatches and records `cost_microdollars` NULL. |
 
-## `[[model]]` — aliases and pricing
-
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `name` | string | — | The published model id callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. Required in this file; a stateful apply omits it and defaults to the first target's published id. Credential labels are separately exposed by the scoped, replica-local `/v1/credentials` status view. |
-| `namespace` | string | — | The namespace that owns the alias. Omitted, the alias is deployment-wide: every namespace may name it. Named, only that namespace lists or invokes it, and it shadows a deployment-wide alias of the same name for that namespace alone. An undefined namespace is rejected, and one namespace may not define the same `name` twice ([ADR 0058](./adr/0058-tenant-owned-alias-names-and-the-management-catalogue.md)). |
-| `targets` | array of target | — | Concrete destinations, tried **in order** on a retryable failure. All targets must use one provider wire family: OpenAI (`openai` or `openai-compatible`) or Anthropic. An empty list is rejected. |
-
-Each target:
+## `[blocklist]`
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `provider` | string | — | A defined `[[provider]] id`. An undefined reference is rejected. |
-| `model` | string | — | The upstream model / deployment id sent to the provider. |
-| `price.input_microdollars_per_million` | integer | — | Prompt-token price. Required. |
-| `price.output_microdollars_per_million` | integer | — | Completion-token price. Required; unused by `/v1/embeddings`, which bills input only. |
-| `catalog.provider` | string | — | The **catalogue's** provider id (the upstream's own, not the `[[provider]] id` above), when this target is bound to a catalogue offering. |
-| `catalog.model` | string | — | The model id that provider publishes, which is what an approved price rule is keyed by. |
+| `models` | array of glob | `[]` | Deployment-wide denials (exact, `prefix*`, `*suffix`, or `*`). |
 
-Pricing is mandatory because budgets are denominated in currency: an unpriced
-target could not be charged, so it fails to parse.
+Effective denials are the union of this list and the namespace's optional
+`blocklist`. A hit is `400 model_blocked` and is not sent upstream. Globs match
+the full `provider-id/model-id` or the bare model id.
 
-Stateful mode rejects `[[model]]` in this file. The same fields are a binding
-applied with `axond admin model apply`: connection slug, published id, and
-price. The public example is one imported target whose slug is the catalogue
-provider (`openai` / `gpt-4o`). Operator-authored vLLM or Azure deployment ids
-are not that imported path.
+## `[[price]]` — deployment price-book
 
-`catalog` is optional and opts the target into **approved price books**: where the
-serving snapshot carries an approved book covering the bound offering, that book's
-rates are charged and the usage row names the book, its checksum, and the
-catalogue it was approved against. The `price` above stays authoritative for an
-unbound target and for a deployment with no approved book, so an existing
-configuration is unaffected. Two consequences are worth knowing before binding
-one: the binding is never inferred from `provider`/`model` (they are
-operator-chosen routing names, and guessing would bill one provider's rates for
-another's traffic), and a bound target the approved book does *not* price is
-**ineligible** rather than free — the alias stays listed by `/v1/models`, but a
-request that can only route to unpriced targets is refused
-`503 model_not_priced` ([ADR 0056](./adr/0056-request-path-pricing.md)).
-On a stateful *imported* apply, `catalog.provider` if set must equal the
-connection slug.
+Not a routing table. First matching `(provider, model-id glob)` in file order
+wins; put exact ids before globs. Callers send `provider-id/model-id`; Axond
+forwards the bare id. A leftover `[[model]]` table is a boot error that names
+the old alias and the prefix form.
 
-`/v1/responses` does not use the target order at all: every Responses request,
-initial or continuation, is served only by the **first** target so a
-provider-stored response id stays reachable without gateway state. An alias
-whose first target is low-availability is a poor Responses alias, and reordering
-`targets` strands response ids created under the previous order
-([ADR 0023](./adr/0023-openai-responses-passthrough.md)).
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `provider` | string | — | A defined `[[provider]] id`. |
+| `model` | string | — | Glob against the bare upstream model id. |
+| `input_microdollars_per_million` | integer | — | Prompt-token price. |
+| `output_microdollars_per_million` | integer | — | Completion-token price. Unused by `/v1/embeddings`. |
 
-An alias cannot fail over between OpenAI-shaped and Anthropic targets because no
-single route can serve both wires. Such a cross-family alias is rejected at boot
-and on reload; a request that uses an alias from one family on the wrong route
-still receives the typed `400 unsupported_wire` error.
+Wire compatibility is the provider `kind`: `/v1/messages` to an `openai`
+provider is `400 unsupported_wire`. There is no alias-level failover; credential
+pool rotation inside one provider remains. `GET /ns/{ns}/v1/models` may return
+an empty list until discovery.
 
 ## `[[credential]]` — outbound provider keys
 

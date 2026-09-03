@@ -1513,6 +1513,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn candidate_scoped_resolution_uses_the_real_snapshot_compiler() {
         let store = resolver_object_store();
         let environment = environment_id("blob-secret-test");
@@ -1579,6 +1580,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn reconciler_publishes_through_the_blob_candidate_compiler() {
         let store = resolver_object_store();
         let environment = environment_id("blob-secret-test");
@@ -1664,6 +1666,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn a_blob_candidate_for_a_different_state_refuses_compilation() {
         let store = resolver_object_store();
         let environment = environment_id("blob-secret-test");

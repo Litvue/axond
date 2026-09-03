@@ -133,7 +133,8 @@ pub struct UsageRecord {
     /// Prompt tokens written to the provider's cache.
     pub cache_write_tokens: u64,
     pub output_tokens: u64,
-    pub cost_microdollars: u64,
+    /// Book rate × tokens, or `None` when the request was admitted unpriced.
+    pub cost_microdollars: Option<u64>,
     /// Version of the approved price book the cost was computed against, or `0`
     /// when the file configuration priced the request. Populating it is what
     /// makes a historical row auditable: the book version, its checksum, and the
@@ -166,6 +167,11 @@ impl UsageRecord {
             CredentialSource::Platform => "platform",
             CredentialSource::Byok => "byok",
         }
+    }
+
+    /// Spend settled against a budget hold. Unpriced requests settle nothing.
+    pub fn settle_cost(&self) -> u64 {
+        self.cost_microdollars.unwrap_or(0)
     }
 }
 
@@ -863,7 +869,7 @@ mod tests {
             cache_read_tokens: 12,
             cache_write_tokens: 0,
             output_tokens: 34,
-            cost_microdollars: 640,
+            cost_microdollars: Some(640),
             catalog_version: 7,
             price_book: Some("price/res_0190f2c1-6f6a-7c2e-9d3a-6f1c2b4d5e60@v7".to_string()),
             price_book_checksum: Some(

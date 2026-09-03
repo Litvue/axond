@@ -294,7 +294,8 @@ models_status="$(curl --silent --show-error --max-time 5 --output "$models_probe
 [[ "$models_status" == 200 ]] ||
   failure "authenticated /ns/platform/v1/models returned HTTP $models_status instead of 200"
 models="$(cat "$models_probe_body")"
-grep -q '"id":"fixture-chat"' <<<"$models" || failure "authenticated /ns/platform/v1/models omitted configured alias fixture-chat"
+grep -Eq '"object"[[:space:]]*:[[:space:]]*"list"' <<<"$models" ||
+  failure "authenticated /ns/platform/v1/models was not a JSON object list"
 rm -f "$models_probe_body"
 models_probe_body=""
 
@@ -308,8 +309,8 @@ unknown_status="$(curl --silent --max-time 5 --output "$unknown_body" \
   -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
   -d '{"model":"does-not-exist","messages":[{"role":"user","content":"hello"}]}' \
   "$base_url/ns/platform/v1/chat/completions" || true)"
-[[ "$unknown_status" == 404 ]] || failure "unknown model returned $unknown_status instead of 404"
-grep -q '"type":"unknown_model"' "$unknown_body" || failure "unknown model response lacked typed unknown_model error"
+[[ "$unknown_status" == 400 ]] || failure "unprefixed model returned $unknown_status instead of 400"
+grep -q '"type":"model_unprefixed"' "$unknown_body" || failure "unprefixed model response lacked typed model_unprefixed error"
 rm -f "$unknown_body"
 
 if [[ "$check_serving" == 1 ]]; then
@@ -317,7 +318,7 @@ if [[ "$check_serving" == 1 ]]; then
   fixture_status="$(curl --silent --max-time 5 --output "$fixture_body" \
     --write-out '%{http_code}' \
     -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
-    -d '{"model":"fixture-chat","messages":[{"role":"user","content":"What is the capital of France?"}]}' \
+    -d '{"model":"fake-openai/fixture-chat","messages":[{"role":"user","content":"What is the capital of France?"}]}' \
     "$base_url/ns/platform/v1/chat/completions" || true)"
   [[ "$fixture_status" == 200 ]] || failure "local fake-upstream request returned $fixture_status instead of 200"
   grep -Eq '"object"[[:space:]]*:[[:space:]]*"chat.completion"' "$fixture_body" ||
@@ -328,9 +329,9 @@ fi
 
 echo "healthz: $health"
 echo "readyz: $ready_body"
-echo "models: fixture-chat"
+echo "models: JSON object list"
 echo "auth: unauthenticated /ns/platform/v1/models -> 401"
-echo "errors: unknown model -> 404 unknown_model"
+echo "errors: unprefixed model -> 400 model_unprefixed"
 echo "store: temp SQLite file $sqlite_path"
 if [[ "$check_serving" == 1 ]]; then
   echo "serving: local fixture upstream -> 200 chat.completion on /ns/platform/v1"

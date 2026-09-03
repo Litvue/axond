@@ -97,6 +97,9 @@ fn validate_payload(attrs: &Value, blocklist: &Option<Vec<String>>) -> Result<()
                 "namespace blocklist exceeds 4 KiB".into(),
             ));
         }
+        for pattern in list {
+            crate::config::validate_glob_pattern(pattern).map_err(GatewayError::BadRequest)?;
+        }
     }
     Ok(())
 }

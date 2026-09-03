@@ -92,6 +92,7 @@ async fn material_is_disclosed_to_the_runtime_and_never_read_back_by_an_administ
 /// provider call was already authenticated with the previous key, and would do
 /// so only under load, only during a rotation.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_rotation_publishes_new_material_without_cutting_an_in_flight_request() {
     let provider = FakeProvider::gated().await;
     let replica = Replica::new(&provider);
@@ -196,6 +197,7 @@ async fn two_credentials_sharing_a_version_take_material_out_of_the_store_once()
 /// that resolved credentials into a partially-mutated snapshot would take the
 /// deployment down with the store.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_failed_resolution_keeps_the_last_known_good_snapshot_serving() {
     let provider = FakeProvider::serving().await;
     let replica = Replica::new(&provider);
@@ -271,6 +273,7 @@ async fn a_failed_resolution_keeps_the_last_known_good_snapshot_serving() {
 /// *retirement* of unreferenced material rather than the destruction of
 /// material a live request still needs.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn retired_material_is_destroyed_once_no_snapshot_references_it() {
     let provider = FakeProvider::serving().await;
     let replica = Replica::new(&provider);
@@ -386,22 +389,6 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
         id: Some("stateless".to_owned()),
         weight: 1,
     });
-    config.model.push(crate::config::Model {
-        name: "fast".to_owned(),
-        namespace: None,
-        targets: vec![crate::config::Target {
-            provider: "openai".to_owned(),
-            model: "gpt-4o".to_owned(),
-            price: gateway_core::catalog::ModelPrice {
-                input_microdollars_per_million: 1_000_000,
-                output_microdollars_per_million: 2_000_000,
-                reasoning_microdollars_per_million: None,
-                cache_read_microdollars_per_million: None,
-                cache_write_microdollars_per_million: None,
-            },
-            catalog: None,
-        }],
-    });
     let mut env = bootstrap_env();
     env.insert(
         "AXOND_STATELESS_OPENAI".to_owned(),
@@ -419,7 +406,9 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
                     axum::http::header::AUTHORIZATION,
                     format!("Bearer {INBOUND_MATERIAL}"),
                 )
-                .body(axum::body::Body::from(r#"{"model":"fast","messages":[]}"#))
+                .body(axum::body::Body::from(
+                    r#"{"model":"openai/gpt-4o","messages":[]}"#,
+                ))
                 .expect("a valid request"),
         )
         .await
@@ -457,6 +446,7 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
 /// often material crosses the store boundary is how often it can be observed
 /// crossing it, and "once per publication" is a small, auditable number.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn material_crosses_the_store_boundary_once_per_compilation() {
     let provider = FakeProvider::serving().await;
     let replica = Replica::new(&provider);

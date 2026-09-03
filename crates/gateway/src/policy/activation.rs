@@ -627,6 +627,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_first_document_binds_live() {
         let document = body(scope(), 1, 1_000);
         let activation = plan(&empty(), &view(&document, 1), shared()).expect("enforceable");
@@ -635,6 +636,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn namespace_scoped_documents_use_backend_layout_and_drain_checks() {
         let namespace_scope = PolicyScope::Namespace(resource_id(91));
         let first = detailed(namespace_scope, 1, 1_000, None, 300, 8, 60, 0);
@@ -659,6 +661,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn raising_a_cap_is_live_and_lowering_one_drains() {
         let first = body(scope(), 1, 1_000);
         let raised = body(scope(), 2, 5_000);
@@ -680,6 +683,7 @@ mod tests {
     /// The rollback rule: republishing the old values forward is an ordinary
     /// drain, and walking the epoch backwards is refused with the procedure named.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_rollback_is_published_forward_and_a_reversed_epoch_is_refused() {
         let old = body(scope(), 4, 1_000);
         let new = body(scope(), 5, 9_000);
@@ -702,6 +706,7 @@ mod tests {
     /// control plane. Refused before either can be enforced, because a fence
     /// could no longer tell them apart.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_forked_epoch_is_refused_and_named() {
         let mine = body(scope(), 7, 1_000);
         let theirs = body(scope(), 7, 2_000);
@@ -728,6 +733,7 @@ mod tests {
     /// would replace it — still hydrates, and the refusal happens here, where
     /// the replica keeps the policy it was already enforcing.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_stored_cap_of_zero_is_refused_at_activation_and_leaves_the_last_good_policy() {
         let good = body(scope(), 1, 1_000);
         let active = view(&good, 1);
@@ -759,6 +765,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn turning_a_scope_wide_cap_on_needs_a_migration_not_a_publication() {
         let flat = body(scope(), 1, 1_000);
         let scoped = detailed(scope(), 2, 1_000, Some(10_000), 300, 8, 60, 0);
@@ -771,6 +778,7 @@ mod tests {
     /// The rule that keeps control-plane Postgres, or a per-replica map, from
     /// being quietly promoted into a fleet-wide cap.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_per_replica_or_absent_backend_cannot_enforce_a_published_document() {
         let document = body(scope(), 1, 1_000);
         let mut config = stateful_config();
@@ -791,6 +799,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn flat_static_policy_needs_no_shared_backend_but_exact_caps_still_do() {
         let mut blob_only = stateful_config();
         blob_only.budget.backend = BudgetBackend::None;
@@ -831,6 +840,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn mixed_flat_static_only_and_exact_namespaces_use_shared_backends_selectively() {
         let mut mixed = stateful_config();
         mixed.rate_limit.backend = RateLimitBackend::Redis;
@@ -862,6 +872,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_document_withdrawn_from_a_namespace_that_is_still_served_is_refused() {
         let document = body(scope(), 1, 1_000);
         let mut without = stateful_config();
@@ -886,6 +897,7 @@ mod tests {
     /// A tenant document governs every namespace its projects have, so one of
     /// them being deleted does not make the rest withdrawable.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_tenant_document_is_only_withdrawable_when_every_namespace_it_governs_is_gone() {
         let document = body(scope(), 1, 1_000);
         let policy = NamespacePolicy {
@@ -922,6 +934,7 @@ mod tests {
     /// Which document governs a namespace is allowed to change in both
     /// directions. Only the namespace being left with nothing is a withdrawal.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_scope_handover_is_not_a_withdrawal_in_either_direction() {
         let project = PolicyScope::Project {
             tenant: tenant_id(1),
@@ -946,6 +959,7 @@ mod tests {
     /// what the namespace was actually enforcing. A tightening handover drains,
     /// and says so, rather than being reported as a fresh binding.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_first_project_document_is_classified_against_what_it_displaces() {
         let project = PolicyScope::Project {
             tenant: tenant_id(1),
@@ -989,6 +1003,7 @@ mod tests {
     /// cap are stranded — and an operator gating a migration on `draining()`
     /// reads it, rather than the scope being skipped as unchanged.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn an_unchanged_document_taking_a_namespace_over_still_drains() {
         let tenant = body(scope(), 1, 1_000);
         let projects = body(project(), 1, 500);
@@ -1032,6 +1047,7 @@ mod tests {
     /// wider cap moves onto it. The move strands what the wider cap admitted,
     /// so the scope drains rather than reporting the raise as live.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_document_that_is_edited_while_taking_a_namespace_over_drains_for_both() {
         let tenant = body(scope(), 1, 10_000);
         let before = body(project(), 1, 500);
@@ -1090,6 +1106,7 @@ mod tests {
     /// projected before any document governs it, so every request to it would be
     /// denied. The candidate is refused, and what was already published stays.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_candidate_serving_an_ungoverned_namespace_is_refused_before_it_is_published() {
         let document = body(scope(), 1, 1_000);
         let mut candidate = governed(
@@ -1138,6 +1155,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn an_empty_bootstrap_platform_namespace_does_not_block_project_convergence() {
         let document = body(scope(), 1, 1_000);
         let mut candidate = governed(
@@ -1164,6 +1182,7 @@ mod tests {
     /// *which* document states it. Both directions of a handover are compared by
     /// value, and a falling floor is refused in either.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_handover_cannot_lower_the_token_floor() {
         let floor = |scope, epoch, token_epoch| {
             detailed(scope, epoch, 1_000, None, 300, 8, 60, token_epoch)
@@ -1205,6 +1224,7 @@ mod tests {
     /// keep their generation's terms — but an operator draining before a
     /// migration has to see it, so it is reported as the drain it is.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn dropping_a_project_document_for_a_tighter_tenant_one_drains() {
         let tenants = body(scope(), 1, 1_000);
         let mut both = governed(
@@ -1257,6 +1277,7 @@ mod tests {
     /// taking them over need not strand the same thing. An operator gating a
     /// migration on the drain reads all of it, in one order.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_scope_handing_over_several_namespaces_reports_every_reason_once() {
         let held = detailed(project(), 1, 5_000, None, 300, 8, 60, 0);
         let mut governs_both = governed(
@@ -1321,6 +1342,7 @@ mod tests {
     /// A revision that moved an unrelated resource restates every document under
     /// its own id. Nothing about enforcement changed, so nothing activates.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_document_restated_by_a_later_revision_is_not_a_transition() {
         let document = body(scope(), 1, 1_000);
         let activation = plan(&view(&document, 1), &view(&document, 2), shared())

@@ -989,8 +989,7 @@ fn import(
     static PUBLICATION_IS_OBSERVABLE: OnceLock<bool> = OnceLock::new();
     assert!(
         *PUBLICATION_IS_OBSERVABLE.get_or_init(axond_fuzz_seam::publication_moves_runtime_routes),
-        "publishing a snapshot did not move the observed routing table: the \
-         no-publication check is blind"
+        "publishing a snapshot did not move the observed routing table"
     );
     let routes = axond_fuzz_seam::runtime_routes();
 

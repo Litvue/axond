@@ -30,7 +30,7 @@ def client(sdk_base_url) -> Anthropic:
 
 def test_buffered_message_preserves_thinking_and_tool_use(client, upstream):
     message = client.messages.create(
-        model="messages-golden",
+        model=f"fake-anthropic/{MESSAGES}",
         max_tokens=1024,
         thinking={"type": "enabled", "budget_tokens": 1024},
         messages=[{"role": "user", "content": "Weather in Paris?"}],
@@ -62,7 +62,7 @@ def test_buffered_message_preserves_thinking_and_tool_use(client, upstream):
 
 def test_streamed_message_reassembles_thinking_and_tool_use(client, upstream):
     with client.messages.stream(
-        model="messages-golden",
+        model=f"fake-anthropic/{MESSAGES}",
         max_tokens=1024,
         thinking={"type": "enabled", "budget_tokens": 1024},
         messages=[{"role": "user", "content": "Weather in Paris?"}],
@@ -101,7 +101,7 @@ def test_an_unknown_gateway_key_is_rejected(sdk_base_url):
     )
     with pytest.raises(anthropic.AuthenticationError):
         stranger.messages.create(
-            model="messages-golden",
+            model=f"fake-anthropic/{MESSAGES}",
             max_tokens=16,
             messages=[{"role": "user", "content": "hi"}],
         )

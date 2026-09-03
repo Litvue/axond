@@ -37,19 +37,16 @@ metrics = ["axond.request.count", "axond.upstream.errors"]
 id = "provider-rate-limited-failover"
 family = "provider"
 fault = "provider_rate_limited_failover"
-description = "A 429 on the first target is failed over to a standby, and costs exactly one retry."
+description = "A 429 on the first target is not failed over (ADR 0063: alias failover is withdrawn). The caller sees the typed verdict."
 deadline_ms = 10000
 
-# A failed-over request settles as a success, and `axond.upstream.errors` is
-# counted from the settled record rather than per attempt, so the retry shows up
-# in the record's attempt count, not in an error counter.
 [row.expect]
-status = 200
-attempts = 2
-upstream_requests = 2
-usage_status = "ok"
-relayed_output = true
-metrics = ["axond.request.count"]
+status = 502
+error_type = "provider_dependency_failed"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.errors"]
 
 [[row]]
 id = "provider-server-error"
@@ -70,16 +67,16 @@ metrics = ["axond.request.count", "axond.upstream.errors"]
 id = "provider-server-error-failover"
 family = "provider"
 fault = "provider_server_error_failover"
-description = "A 500 on the first target is failed over to a standby rather than surfaced."
+description = "A 500 on the first target is not failed over (ADR 0063: alias failover is withdrawn). The caller sees the typed verdict."
 deadline_ms = 10000
 
 [row.expect]
-status = 200
-attempts = 2
-upstream_requests = 2
-usage_status = "ok"
-relayed_output = true
-metrics = ["axond.request.count"]
+status = 502
+error_type = "provider_dependency_failed"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.errors"]
 
 # --- the path to the provider ------------------------------------------------
 

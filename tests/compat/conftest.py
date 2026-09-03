@@ -17,7 +17,7 @@ import pytest
 import urllib.error
 import urllib.request
 
-from fake_upstream import CHAT, EMBEDDINGS, FakeUpstream, MESSAGES, RESPONSES
+from fake_upstream import FakeUpstream
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GATEWAY_KEY = "test-inbound-key"
@@ -25,12 +25,6 @@ NAMESPACE = "platform"
 UNGRANTED_NAMESPACE = "tenant"
 UPSTREAM_OPENAI_KEY = "test-upstream-openai-key"
 UPSTREAM_ANTHROPIC_KEY = "test-upstream-anthropic-key"
-
-PRICE = (
-    "{ input_microdollars_per_million = 2500000, "
-    "output_microdollars_per_million = 10000000 }"
-)
-
 
 def _binary() -> Path:
     path = Path(os.environ.get("AXOND_BIN", REPO_ROOT / "target/debug/axond"))
@@ -46,16 +40,6 @@ def _free_port() -> int:
 
 
 def _config(bind: str, upstream: str, sqlite: str) -> str:
-    models = "".join(
-        f'[[model]]\nname = "{alias}"\n'
-        f'targets = [ {{ provider = "{provider}", model = "{target}", price = {PRICE} }} ]\n\n'
-        for alias, provider, target in [
-            ("chat-golden", "fake-openai", CHAT),
-            ("messages-golden", "fake-anthropic", MESSAGES),
-            ("embeddings-golden", "fake-openai", EMBEDDINGS),
-            ("responses-golden", "fake-openai", RESPONSES),
-        ]
-    )
     return f"""
 [server]
 bind = "{bind}"
@@ -97,7 +81,18 @@ env = "GW_FAKE_ANTHROPIC_KEY"
 env = "GW_INBOUND_KEY"
 namespace = "{NAMESPACE}"
 
-{models}"""
+[[price]]
+provider = "fake-openai"
+model = "*"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+
+[[price]]
+provider = "fake-anthropic"
+model = "*"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
+"""
 
 
 @pytest.fixture(scope="session")

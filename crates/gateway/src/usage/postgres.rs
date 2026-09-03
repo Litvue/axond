@@ -35,9 +35,10 @@ const SCHEMA_DDL: &str = include_str!("../../sql/usage_v2.sql");
 /// installations apply them before deploying a writer that emits the new
 /// columns. Nullable columns only, so a writer deployed ahead of one of them
 /// still writes rows the earlier shape can read.
-const ADDITIVE_DDL: [&str; 2] = [
+const ADDITIVE_DDL: [&str; 3] = [
     include_str!("../../sql/usage_v1_001_add_signer_kid.sql"),
     include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
+    include_str!("../../sql/usage_v2_002_nullable_cost.sql"),
 ];
 
 /// Which migration adds each column the base DDL of the current schema version
@@ -154,6 +155,12 @@ impl PostgresSink {
         if let Some(gap) = migration_gap(&sink.missing_columns(&client).await?) {
             return Err(UsageSinkError::invalid("postgres", gap));
         }
+        // Nullability is not a missing column: `usage_v2_002_nullable_cost.sql`
+        // keeps the same name and only drops NOT NULL. An unmigrated table would
+        // otherwise boot and then fail every unpriced insert.
+        if let Some(gap) = sink.not_null_cost_gap(&client).await? {
+            return Err(UsageSinkError::invalid("postgres", gap));
+        }
         *sink.client.lock().await = Some(client);
         Ok(sink)
     }
@@ -189,6 +196,40 @@ impl PostgresSink {
             .filter(|column| !present.iter().any(|present| present == *column))
             .map(|column| (*column).to_owned())
             .collect())
+    }
+
+    /// `cost_microdollars` must be nullable so unpriced+allow rows can bind NULL.
+    ///
+    /// Absent tables and missing columns are not this gap: [`Self::missing_columns`]
+    /// already names the recreate/migrate path for those. `to_regclass($1)`
+    /// follows the same search_path the INSERT uses, including a qualified name.
+    async fn not_null_cost_gap(
+        &self,
+        client: &Client,
+    ) -> Result<Option<String>, tokio_postgres::Error> {
+        let row = client
+            .query_opt(
+                "SELECT a.attnotnull \
+                 FROM pg_attribute AS a \
+                 WHERE a.attrelid = to_regclass($1) \
+                   AND a.attname = 'cost_microdollars' \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped",
+                &[&self.table],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let not_null: bool = row.get(0);
+        if !not_null {
+            return Ok(None);
+        }
+        Ok(Some(
+            "usage table column cost_microdollars is still NOT NULL: apply \
+             ops/postgres/usage_v2_002_nullable_cost.sql before deploying this writer"
+                .into(),
+        ))
     }
 
     /// The shipped DDL, retargeted at the configured table.
@@ -404,7 +445,7 @@ fn row(observed: &ObservedRecord) -> Vec<Box<dyn ToSql + Sync + Send>> {
         Box::new(bigint(record.cache_read_tokens)),
         Box::new(bigint(record.cache_write_tokens)),
         Box::new(bigint(record.output_tokens)),
-        Box::new(bigint(record.cost_microdollars)),
+        Box::new(record.cost_microdollars.map(bigint)),
         Box::new(bigint(record.catalog_version)),
         Box::new(record.price_book.clone()),
         Box::new(record.price_book_checksum.clone()),
@@ -482,6 +523,10 @@ mod tests {
             (
                 "usage_v2_001_add_price_identity.sql",
                 include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
+            ),
+            (
+                "usage_v2_002_nullable_cost.sql",
+                include_str!("../../sql/usage_v2_002_nullable_cost.sql"),
             ),
         ];
         for (column, file) in ADDITIVE_COLUMNS {
@@ -739,6 +784,187 @@ mod tests {
             .batch_execute(&format!("DROP TABLE {schema}.{table}"))
             .await
             .expect("drop the test table");
+    }
+
+    #[tokio::test]
+    async fn a_not_null_cost_column_refuses_boot_naming_the_nullable_cost_migration() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = format!("axond_usage_notnull_{}", std::process::id());
+        let created = PostgresSink::connect(
+            &dsn,
+            PostgresSinkSettings {
+                table: table.clone(),
+                create_table: true,
+            },
+        )
+        .await
+        .expect("create");
+        {
+            let guard = created.client.lock().await;
+            guard
+                .as_ref()
+                .expect("connected")
+                .execute(
+                    &format!("ALTER TABLE {table} ALTER COLUMN cost_microdollars SET NOT NULL"),
+                    &[],
+                )
+                .await
+                .expect("restore NOT NULL");
+        }
+        drop(created);
+
+        let error = PostgresSink::connect(
+            &dsn,
+            PostgresSinkSettings {
+                table: table.clone(),
+                create_table: false,
+            },
+        )
+        .await
+        .err()
+        .expect("NOT NULL cost is a boot gap");
+        let message = error.to_string();
+        assert!(
+            message.contains("usage_v2_002_nullable_cost.sql"),
+            "{message}"
+        );
+        assert!(message.contains("cost_microdollars"), "{message}");
+        assert!(message.contains("NOT NULL"), "{message}");
+
+        let cleanup = PostgresSink {
+            table: table.clone(),
+            config: dsn.parse().expect("dsn"),
+            client: tokio::sync::Mutex::new(None),
+        };
+        cleanup
+            .connect_client()
+            .await
+            .expect("cleanup connect")
+            .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+    }
+
+    #[tokio::test]
+    async fn the_nullable_cost_gate_follows_a_qualified_table_name() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let suffix = std::process::id();
+        let schema = format!("axond_usage_nn_schema_{suffix}");
+        let table = format!("axond_usage_nn_{suffix}");
+        let qualified = format!("{schema}.{table}");
+        let setup = PostgresSink {
+            table: qualified.clone(),
+            config: dsn.parse().expect("dsn"),
+            client: tokio::sync::Mutex::new(None),
+        };
+        setup
+            .connect_client()
+            .await
+            .expect("setup connect")
+            .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+            .await
+            .expect("create schema");
+        let created = PostgresSink::connect(
+            &dsn,
+            PostgresSinkSettings {
+                table: qualified.clone(),
+                create_table: true,
+            },
+        )
+        .await
+        .expect("create qualified");
+        {
+            let guard = created.client.lock().await;
+            guard
+                .as_ref()
+                .expect("connected")
+                .batch_execute(&format!(
+                    "ALTER TABLE {qualified} ALTER COLUMN cost_microdollars SET NOT NULL"
+                ))
+                .await
+                .expect("restore NOT NULL");
+        }
+        drop(created);
+
+        let error = PostgresSink::connect(
+            &dsn,
+            PostgresSinkSettings {
+                table: qualified.clone(),
+                create_table: false,
+            },
+        )
+        .await
+        .err()
+        .expect("qualified NOT NULL cost is a boot gap");
+        let message = error.to_string();
+        assert!(
+            message.contains("usage_v2_002_nullable_cost.sql"),
+            "{message}"
+        );
+
+        let cleanup = PostgresSink {
+            table: qualified.clone(),
+            config: dsn.parse().expect("dsn"),
+            client: tokio::sync::Mutex::new(None),
+        };
+        cleanup
+            .connect_client()
+            .await
+            .expect("cleanup connect")
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {qualified}; DROP SCHEMA IF EXISTS {schema}"
+            ))
+            .await
+            .expect("drop");
+    }
+
+    #[tokio::test]
+    async fn a_migrated_table_accepts_a_null_cost() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = format!("axond_usage_nullcost_{}", std::process::id());
+        let sink = PostgresSink::connect(
+            &dsn,
+            PostgresSinkSettings {
+                table: table.clone(),
+                create_table: true,
+            },
+        )
+        .await
+        .expect("connect");
+        {
+            let guard = sink.client.lock().await;
+            guard
+                .as_ref()
+                .expect("connected")
+                .execute(&format!("TRUNCATE {table}"), &[])
+                .await
+                .expect("truncate");
+        }
+
+        let mut record = sample_record();
+        record.cost_microdollars = None;
+        sink.record_batch(&[ObservedRecord::now(record)])
+            .await
+            .expect("insert unpriced");
+
+        let guard = sink.client.lock().await;
+        let client = guard.as_ref().expect("connected");
+        let cost: Option<i64> = client
+            .query_one(&format!("SELECT cost_microdollars FROM {table}"), &[])
+            .await
+            .expect("select")
+            .get(0);
+        assert_eq!(cost, None);
+        client
+            .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
     }
 
     #[tokio::test]

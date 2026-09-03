@@ -687,6 +687,7 @@ env = "GW_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn an_unset_control_plane_reference_fails_without_connecting() {
         let path = write("axond.toml", stateful_toml());
         let config = Config::from_toml_str(stateful_toml()).expect("valid stateful config");
@@ -710,6 +711,7 @@ env = "GW_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn a_reference_that_resolves_is_reported_without_its_value() {
         let path = write("axond.toml", stateful_toml());
         let config = Config::from_toml_str(stateful_toml()).expect("valid stateful config");
@@ -824,6 +826,7 @@ env = "GW_BREAKGLASS"
     /// readiness before a projected snapshot is active; the running replica's
     /// readiness endpoint and snapshot builder enforce that boundary.
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn a_stateful_preflight_accepts_a_complete_serving_posture() {
         let path = write("axond.toml", stateful_toml());
         let config = Config::from_toml_str(stateful_toml()).expect("valid stateful config");
@@ -863,6 +866,7 @@ env = "GW_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn blob_preflight_never_requests_postgres_or_claims_runtime_readiness() {
         let path = write("axond-blob.toml", BLOB_STATEFUL);
         let config = Config::from_toml_str(BLOB_STATEFUL).expect("valid blob contract");
@@ -916,6 +920,7 @@ env = "GW_BREAKGLASS"
     }
 
     #[tokio::test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     async fn the_cache_key_is_preflighted_by_name_without_rendering_its_value() {
         let toml = format!(
             "{}\n[convergence]\ncache_path = \"/tmp/axond-lkg\"\ncache_key_env = \"GW_LAST_KNOWN_GOOD_KEY\"\n",

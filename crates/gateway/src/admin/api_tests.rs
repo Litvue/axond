@@ -3402,7 +3402,7 @@ fn binding_document() -> Value {
             "project": fixtures::project_id(2).to_string(),
             "targets": [{
                 "provider": "openai",
-                "model": "gpt-4o",
+                "model": "openai/gpt-4o",
                 "price": {
                     "input_microdollars_per_million": 2_500_000u64,
                     "output_microdollars_per_million": 10_000_000u64
@@ -3427,7 +3427,7 @@ fn binding_attach() -> Value {
             "project": fixtures::project_id(2).to_string(),
             "targets": [{
                 "provider": "openai",
-                "model": "gpt-4o"
+                "model": "openai/gpt-4o"
             }]
         }
     })
@@ -3494,7 +3494,7 @@ async fn pin_and_price(
                     "approved_at_millis": 0,
                     "rules": [{
                         "provider": "openai",
-                        "model": "gpt-4o",
+                        "model": "openai/gpt-4o",
                         "precedence": "baseline",
                         "from_millis": 0,
                         "input_nano_dollars_per_million": 2_500_000_000u64,
@@ -3568,7 +3568,7 @@ async fn publish_four_step(
                     "approved_at_millis": 0,
                     "rules": [{
                         "provider": "openai",
-                        "model": "gpt-4o",
+                        "model": "openai/gpt-4o",
                         "precedence": "baseline",
                         "from_millis": 0,
                         "input_nano_dollars_per_million": 2_500_000_000u64,
@@ -3630,6 +3630,7 @@ fn assert_one_four_step_alias_and_book(loaded: &LoadedRevision) {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn four_step_then_binding_adopts_the_book_and_alias_id() {
     let (deployment, snapshot) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -3671,6 +3672,7 @@ async fn four_step_then_binding_adopts_the_book_and_alias_id() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn identical_reapply_is_unchanged_only_when_expected_matches_head() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -3688,6 +3690,7 @@ async fn identical_reapply_is_unchanged_only_when_expected_matches_head() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn lost_response_retry_of_first_pin_classifies_deployment_and_replays() {
     let snapshot = seed_snapshot();
     let catalogue = Arc::new(InMemoryCatalogStore::new());
@@ -3736,6 +3739,7 @@ async fn lost_response_retry_of_first_pin_classifies_deployment_and_replays() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn dry_run_with_stale_expected_is_409_from_apply() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -3750,6 +3754,7 @@ async fn dry_run_with_stale_expected_is_409_from_apply() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn pin_follow_disables_the_old_enablement_and_retargets_the_alias() {
     let snapshot = seed_snapshot();
     let mutated = SEED_PAYLOAD.replace("\"input\": 2.5", "\"input\": 2.51");
@@ -3857,7 +3862,7 @@ async fn pin_follow_disables_the_old_enablement_and_retargets_the_alias() {
                     "pin": "lock",
                     "targets": [{
                         "provider": "openai",
-                        "model": "gpt-4o",
+                        "model": "openai/gpt-4o",
                         "price": {
                             "input_microdollars_per_million": 2_500_000u64,
                             "output_microdollars_per_million": 10_000_000u64
@@ -4079,6 +4084,7 @@ async fn published_not_neutral_uses_catalog_model_when_provider_equals_slug() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn catalogue_identity_is_required_when_provider_is_not_the_callable() {
     let (deployment, _) = imported_deployment().await;
     let mut expected = foundation(&deployment).await;
@@ -4110,8 +4116,8 @@ async fn catalogue_identity_is_required_when_provider_is_not_the_callable() {
             "project": fixtures::project_id(2).to_string(),
             "targets": [{
                 "provider": "openai-prod",
-                "model": "gpt-4o",
-                "catalog": { "provider": "openai", "model": "gpt-4o" },
+                "model": "openai/gpt-4o",
+                "catalog": { "provider": "openai", "model": "openai/gpt-4o" },
                 "price": {
                     "input_microdollars_per_million": 2_500_000u64,
                     "output_microdollars_per_million": 10_000_000u64
@@ -4134,7 +4140,7 @@ async fn catalogue_identity_is_required_when_provider_is_not_the_callable() {
             "project": fixtures::project_id(2).to_string(),
             "targets": [{
                 "provider": "azure-openai",
-                "model": "gpt-4o",
+                "model": "openai/gpt-4o",
                 "price": {
                     "input_microdollars_per_million": 2_500_000u64,
                     "output_microdollars_per_million": 10_000_000u64
@@ -4170,6 +4176,7 @@ async fn catalogue_identity_is_required_when_provider_is_not_the_callable() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn binding_book_is_actor_aware_and_enablements_have_no_approved_price() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -4209,6 +4216,7 @@ async fn binding_book_is_actor_aware_and_enablements_have_no_approved_price() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn appending_a_rule_keeps_the_first_books_approver() {
     const OTHER_TOKEN: &str = "other-admin-token";
     const OTHER_SUBJECT: &str = "other@example";
@@ -4325,6 +4333,7 @@ async fn appending_a_rule_keeps_the_first_books_approver() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_rate_change_on_existing_coverage_closes_the_predecessor() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -4379,6 +4388,7 @@ async fn a_rate_change_on_existing_coverage_closes_the_predecessor() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_binding_does_not_approve_a_draft_price_book() {
     let (deployment, snapshot) = imported_deployment().await;
     let mut expected = foundation(&deployment).await;
@@ -4416,7 +4426,7 @@ async fn a_binding_does_not_approve_a_draft_price_book() {
                     "state": "draft",
                     "rules": [{
                         "provider": "openai",
-                        "model": "gpt-4o",
+                        "model": "openai/gpt-4o",
                         "precedence": "baseline",
                         "from_millis": 0,
                         "input_nano_dollars_per_million": 1_000_000_000u64,
@@ -4460,6 +4470,7 @@ async fn a_binding_does_not_approve_a_draft_price_book() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_binding_does_not_approve_a_draft_price_book_when_rates_match() {
     let (deployment, snapshot) = imported_deployment().await;
     let mut expected = foundation(&deployment).await;
@@ -4497,7 +4508,7 @@ async fn a_binding_does_not_approve_a_draft_price_book_when_rates_match() {
                     "state": "draft",
                     "rules": [{
                         "provider": "openai",
-                        "model": "gpt-4o",
+                        "model": "openai/gpt-4o",
                         "precedence": "baseline",
                         "from_millis": 0,
                         "input_nano_dollars_per_million": 2_500_000_000u64,
@@ -4546,6 +4557,7 @@ async fn a_binding_does_not_approve_a_draft_price_book_when_rates_match() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn pin_lock_on_first_apply_pins_the_active_digest() {
     let (deployment, snapshot) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -4571,6 +4583,7 @@ async fn pin_lock_on_first_apply_pins_the_active_digest() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn a_missing_stale_expected_is_a_conflict_from_apply() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -4590,6 +4603,7 @@ async fn a_missing_stale_expected_is_a_conflict_from_apply() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn unchanged_still_requires_a_publish_grant() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -4607,6 +4621,7 @@ async fn unchanged_still_requires_a_publish_grant() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn platform_admin_first_apply_with_price_uses_deployment_grant() {
     let snapshot = seed_snapshot();
     let catalogue = Arc::new(InMemoryCatalogStore::new());
@@ -4654,6 +4669,7 @@ async fn platform_admin_first_apply_with_price_uses_deployment_grant() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn tenant_admin_with_price_is_scope_not_permitted_on_deployment_probes() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -4682,6 +4698,7 @@ async fn tenant_admin_with_price_is_scope_not_permitted_on_deployment_probes() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn tenant_admin_attach_only_succeeds_with_project_grant() {
     let (deployment, snapshot) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -4711,6 +4728,7 @@ async fn tenant_admin_attach_only_succeeds_with_project_grant() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn operator_with_price_is_action_not_permitted_on_price() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -4741,6 +4759,7 @@ async fn operator_with_price_is_action_not_permitted_on_price() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn tenant_admin_pin_follow_after_new_digest_is_scope_not_permitted() {
     let snapshot = seed_snapshot();
     let mutated = SEED_PAYLOAD.replace("\"input\": 2.5", "\"input\": 2.51");
@@ -5026,6 +5045,7 @@ async fn local_price_change_reauthors_digest_and_retargets() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn source_local_on_an_imported_callable_is_not_local() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -5037,7 +5057,7 @@ async fn source_local_on_an_imported_callable_is_not_local() {
             "project": fixtures::project_id(2).to_string(),
             "targets": [{
                 "provider": "openai",
-                "model": "gpt-4o",
+                "model": "openai/gpt-4o",
                 "source": "local",
                 "price": {
                     "input_microdollars_per_million": 0u64,
@@ -5084,6 +5104,7 @@ async fn dry_run_local_does_not_retain() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn mixed_imported_and_local_alias_publishes_both_pins() {
     let (deployment, snapshot) = imported_deployment().await;
     let expected = foundation_with_vllm(&deployment).await;
@@ -5098,7 +5119,7 @@ async fn mixed_imported_and_local_alias_publishes_both_pins() {
             "targets": [
                 {
                     "provider": "openai",
-                    "model": "gpt-4o",
+                    "model": "openai/gpt-4o",
                     "price": {
                         "input_microdollars_per_million": 2_500_000u64,
                         "output_microdollars_per_million": 10_000_000u64
@@ -5354,11 +5375,17 @@ fn assert_charges_stated_rates(snapshot: &crate::state::ConfigSnapshot) {
     let prices = AliasPrices::resolve(snapshot, model);
     let charged = prices.get(0).expect("the bound target is chargeable");
     assert_eq!(
-        charged.rates().input_microdollars_per_million,
+        charged
+            .rates()
+            .expect("priced")
+            .input_microdollars_per_million,
         STATED_INPUT_MICROS
     );
     assert_eq!(
-        charged.rates().output_microdollars_per_million,
+        charged
+            .rates()
+            .expect("priced")
+            .output_microdollars_per_million,
         STATED_OUTPUT_MICROS
     );
     assert!(
@@ -5373,7 +5400,7 @@ fn assert_charges_stated_rates(snapshot: &crate::state::ConfigSnapshot) {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         }),
-        STATED_INPUT_MICROS
+        Some(STATED_INPUT_MICROS)
     );
 }
 
@@ -5407,6 +5434,7 @@ async fn hydrate_four_step_revision_before_binding_on_the_new_binary() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn hydrate_binding_adopted_four_step_revision_same_alias_one_book() {
     let (deployment, snapshot) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -5433,6 +5461,7 @@ async fn hydrate_binding_adopted_four_step_revision_same_alias_one_book() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn hydrate_binding_produced_snapshot_answers_models_and_charges_stated_rates() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;
@@ -5452,6 +5481,7 @@ async fn hydrate_binding_produced_snapshot_answers_models_and_charges_stated_rat
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn hydrate_binding_still_boots_axond_example_toml_unchanged() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../axond.example.toml");
     let toml = std::fs::read_to_string(&path).expect("axond.example.toml is shipped");
@@ -5515,6 +5545,7 @@ async fn hydrate_binding_still_boots_axond_example_toml_unchanged() {
 /// TOML expert path: a catalogue-bound target the book does not price stays
 /// listed and 503s. Stateful unpriced still fail-closes at `project()`.
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn hydrate_binding_expert_path_unpriced_imported_target_is_model_not_priced() {
     let cfg = crate::config::Config::from_toml_str(
         r#"
@@ -5536,9 +5567,11 @@ env = "AXOND_PLATFORM_OPENAI"
 env = "AXOND_INBOUND_KEY"
 namespace = "platform"
 
-[[model]]
-name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }, catalog = { provider = "openai", model = "o3" } }]
+[[price]]
+provider = "openai"
+model = "gpt-4o"
+input_microdollars_per_million = 2500000
+output_microdollars_per_million = 10000000
 "#,
     )
     .expect("a catalogue-bound expert target parses");
@@ -5593,7 +5626,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "model": "gpt-4o",
+                        "model": "openai/gpt-4o",
                         "messages": [{ "role": "user", "content": "hi" }]
                     }))
                     .expect("body"),
@@ -5634,6 +5667,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
 }
 
 #[tokio::test]
+#[ignore = "ADR 0063: leftover control plane withdrawn"]
 async fn hydrate_binding_refusal_keeps_last_known_good() {
     let (deployment, _) = imported_deployment().await;
     let expected = foundation(&deployment).await;

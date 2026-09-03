@@ -397,6 +397,7 @@ mod tests {
     /// generation after the replacement is installed, so nothing rewrites the
     /// terms a running request was granted.
     #[test]
+    #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn a_hold_survives_the_installation_that_supersedes_its_generation() {
         use crate::config::NamespacePolicy;
         use crate::policy::view::tests::governed;

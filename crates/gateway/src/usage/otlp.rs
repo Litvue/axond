@@ -128,10 +128,6 @@ fn attributes(record: &UsageRecord) -> Vec<(&'static str, AnyValue)> {
             AnyValue::Int(clamped(record.output_tokens)),
         ),
         (
-            "axond.cost_microdollars",
-            AnyValue::Int(clamped(record.cost_microdollars)),
-        ),
-        (
             "axond.catalog_version",
             AnyValue::Int(clamped(record.catalog_version)),
         ),
@@ -140,6 +136,9 @@ fn attributes(record: &UsageRecord) -> Vec<(&'static str, AnyValue)> {
             AnyValue::Int(clamped(record.latency_ms)),
         ),
     ];
+    if let Some(cost) = record.cost_microdollars {
+        attributes.push(("axond.cost_microdollars", AnyValue::Int(clamped(cost))));
+    }
     if let Some(trace_id) = &record.trace_id {
         attributes.push(("axond.trace_id", AnyValue::String(trace_id.clone().into())));
     }
@@ -206,6 +205,27 @@ mod tests {
                 .find(|(key, _)| *key == "axond.cost_microdollars")
                 .map(|(_, value)| value.clone()),
             Some(AnyValue::Int(640))
+        );
+    }
+
+    #[test]
+    fn unpriced_records_omit_cost_microdollars() {
+        let mut record = sample_record();
+        record.cost_microdollars = None;
+        let keys: Vec<&str> = attributes(&record).iter().map(|(key, _)| *key).collect();
+        assert!(!keys.contains(&"axond.cost_microdollars"));
+    }
+
+    #[test]
+    fn a_zero_cost_is_still_exported() {
+        let mut record = sample_record();
+        record.cost_microdollars = Some(0);
+        assert_eq!(
+            attributes(&record)
+                .iter()
+                .find(|(key, _)| *key == "axond.cost_microdollars")
+                .map(|(_, value)| value.clone()),
+            Some(AnyValue::Int(0))
         );
     }
 
