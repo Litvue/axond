@@ -4906,6 +4906,19 @@ namespace = "platform"
         }
     }
 
+    #[test]
+    fn compose_env_example_declares_one_inbound_key() {
+        let text = repository_file("ops/compose/env.example");
+        assert!(
+            text.contains("GW_INBOUND_PLATFORM_KEY="),
+            "quickstart still names the deployment-wide inbound key"
+        );
+        assert!(
+            !text.contains("GW_INBOUND_ACME_KEY"),
+            "a second inbound key in env.example is withdrawn (ADR 0063):\n{text}"
+        );
+    }
+
     /// Inbound auth fails closed (ADR 0013), so a config that would leave the
     /// gateway callable without a credential is refused at boot.
     #[test]

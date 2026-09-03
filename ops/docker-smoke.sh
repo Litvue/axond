@@ -42,7 +42,6 @@ docker run -d --name "$container" \
   -e GW_PLATFORM_AZURE_OPENAI_API_KEY=smoke-placeholder \
   -e GW_ACME_OPENAI_API_KEY=smoke-placeholder \
   -e GW_INBOUND_PLATFORM_KEY=smoke-placeholder-platform \
-  -e GW_INBOUND_ACME_KEY=smoke-placeholder-acme \
   -v "${config}:/etc/axond/axond.toml:ro" \
   "$image" >/dev/null
 
