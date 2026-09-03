@@ -511,7 +511,7 @@ jobs:
         shell: bash
         run: python ops/binary-smoke.py release-bin/axond
       - name: Generate binary SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: release-bin
           format: spdx-json
@@ -618,7 +618,7 @@ jobs:
       - name: Smoke the published image before signing
         run: bash ops/docker-smoke.sh "${IMAGE_NAME}:${RELEASE_VERSION}-${IMAGE_ARCH}"
       - name: Generate image SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.IMAGE_NAME }}@${{ steps.image.outputs.digest }}
           format: spdx-json
