@@ -138,9 +138,14 @@ impl ProviderModels {
         }
     }
 
+    /// True when this row was fetched from `source`.
+    pub fn is_from(&self, source: &str) -> bool {
+        self.source.as_deref() == Some(source)
+    }
+
     /// Last-good rows fetched from a different upstream are stale.
     pub fn against_source(mut self, source: &str) -> Self {
-        if self.source.as_deref() != Some(source) {
+        if !self.is_from(source) {
             self.stale = true;
         }
         self
@@ -279,8 +284,9 @@ pub trait Store: Send + Sync {
     ///
     /// A write for a different `source` applies only when the existing row is
     /// missing or `stale`. Discovery may mark a foreign row stale only on the
-    /// first round (URL change / cold start). Later rounds skip a fresh
-    /// foreign row so a lagged replica cannot open this CAS.
+    /// first round after it adopts a `base_url` (cold start / URL change).
+    /// Later rounds skip a fresh foreign row so a lagged replica cannot open
+    /// this CAS.
     async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
         let _ = row;
         Ok(())

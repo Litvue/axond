@@ -5,6 +5,7 @@
 //! upstream models. Azure Foundry's data-plane listing omits deployments;
 //! this still stores whatever `GET /models` returned.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gateway_core::AnthropicAdapter;
@@ -31,10 +32,12 @@ const EMPTY_BACKOFF_CAP: Duration = Duration::from_secs(30);
 pub async fn run(state: AppState, mut stop: oneshot::Receiver<()>) {
     let mut empty_backoff = EMPTY_BACKOFF_START;
     let mut waiting_for_providers = true;
-    // First completed round may stale+replace a foreign cache row so a
-    // `base_url` change lands. Later rounds skip a fresh foreign row so a
-    // lagged replica cannot mark it stale and CAS-put the old listing.
-    let mut first_round = true;
+    // Provider `base_url` as of the last completed round. The first round
+    // after this replica adopts a URL (boot, SIGHUP, projected revision) may
+    // stale+replace a foreign cache row so the change lands. Later rounds on
+    // the same URL skip a fresh foreign row so a lagged replica cannot mark
+    // it stale and CAS-put the old listing.
+    let mut refreshed_urls: HashMap<String, String> = HashMap::new();
     loop {
         let providers = state.config().config.provider.len();
         if waiting_for_providers && providers == 0 {
@@ -50,13 +53,13 @@ pub async fn run(state: AppState, mut stop: oneshot::Receiver<()>) {
             continue;
         }
         waiting_for_providers = false;
-        match refresh_all(&state, &mut stop, first_round).await {
+        match refresh_all(&state, &mut stop, &mut refreshed_urls).await {
             Round::Stopped => {
                 tracing::debug!("provider model discovery stopped");
                 return;
             }
             Round::Restart => continue,
-            Round::Done => first_round = false,
+            Round::Done => {}
         }
         let interval = state.config().config.discovery.interval();
         tokio::select! {
@@ -86,7 +89,7 @@ enum RefreshError {
 async fn refresh_all(
     state: &AppState,
     stop: &mut oneshot::Receiver<()>,
-    allow_replace: bool,
+    refreshed_urls: &mut HashMap<String, String>,
 ) -> Round {
     let snapshot = state.config();
     let providers: Vec<(String, ProviderKind, String)> = snapshot
@@ -105,6 +108,7 @@ async fn refresh_all(
         if stopped(stop) {
             return Round::Stopped;
         }
+        let allow_replace = refreshed_urls.get(id) != Some(base_url);
         if let Err(error) =
             refresh_one(state, &snapshot, id, *kind, base_url, allow_replace, stop).await
         {
@@ -122,6 +126,10 @@ async fn refresh_all(
             }
         }
     }
+    *refreshed_urls = providers
+        .into_iter()
+        .map(|(id, _, base_url)| (id, base_url))
+        .collect();
     Round::Done
 }
 

@@ -883,8 +883,10 @@ fn hex_digit(byte: u8) -> Option<u8> {
 /// namespace.
 ///
 /// Listed from the Store's discovery cache as `provider-id/model-id`, minus the
-/// effective blocklist (deployment default ∪ namespace extras). Never calls
-/// upstream: a background timer in `serve` refreshes the cache.
+/// effective blocklist (deployment default ∪ namespace extras). A row fetched
+/// from a different `base_url` than this snapshot's is not this provider's
+/// listing and is omitted. Never calls upstream: a background timer in `serve`
+/// refreshes the cache.
 async fn list_models(
     State(state): State<AppState>,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
@@ -905,7 +907,7 @@ async fn list_models(
     for provider in &snapshot.config.provider {
         let models = cached
             .iter()
-            .find(|row| row.provider == provider.id)
+            .find(|row| row.provider == provider.id && row.is_from(&provider.base_url))
             .map(|row| row.data.as_slice())
             .unwrap_or(&[]);
         for model in models {
