@@ -407,8 +407,18 @@ the old alias and the prefix form.
 
 Wire compatibility is the provider `kind`: `/v1/messages` to an `openai`
 provider is `400 unsupported_wire`. There is no alias-level failover; credential
-pool rotation inside one provider remains. `GET /ns/{ns}/v1/models` may return
-an empty list until discovery.
+pool rotation inside one provider remains. `GET /ns/{ns}/v1/models` lists the
+cached `provider-id/model-id` ids, minus the effective blocklist.
+
+## `[discovery]` — cached upstream model listings
+
+Background refresh of each `[[provider]]`'s OpenAI-compatible `GET /models`.
+Not on the inference path. `GET /api/v1/providers/{id}/models` and
+`GET /api/v1/providers/models` read the cache (`fetched_at`, `stale`).
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `refresh_interval_seconds` | integer | `300` | Seconds between refresh rounds. Read after each round, so a reload takes effect without a restart. The first round runs at boot; an empty provider set retries with short backoff instead of waiting the full interval. `0` is rejected. |
 
 ## `[[credential]]` — outbound provider keys
 

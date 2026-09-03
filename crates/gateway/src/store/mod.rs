@@ -109,6 +109,54 @@ pub struct UsageSummary {
     pub data: Vec<UsageSummaryRow>,
 }
 
+/// Cached upstream `GET /models` listing for one configured provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ProviderModels {
+    pub provider: String,
+    /// RFC3339 of the last successful fetch. Absent if none has succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+    /// True when the last upstream fetch failed. Last-good `data` is still
+    /// returned; empty + stale if never fetched.
+    pub stale: bool,
+    pub data: Vec<Value>,
+    /// Provider `base_url` this row was fetched from. Internal cache key;
+    /// omitted from the management JSON.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub source: Option<String>,
+}
+
+impl ProviderModels {
+    pub fn empty_stale(provider: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            fetched_at: None,
+            stale: true,
+            data: Vec::new(),
+            source: None,
+        }
+    }
+
+    /// Last-good rows fetched from a different upstream are stale.
+    pub fn against_source(mut self, source: &str) -> Self {
+        if self.source.as_deref() != Some(source) {
+            self.stale = true;
+        }
+        self
+    }
+
+    /// Inference `/v1/models` lists last-good ids only when this row was
+    /// fetched from `source`. A foreign URL's catalog is omitted.
+    pub fn data_if_source(&self, source: &str) -> &[Value] {
+        if self.source.as_deref() == Some(source) {
+            &self.data
+        } else {
+            &[]
+        }
+    }
+}
+
 /// Outcome of a pre-dispatch hold against the namespace's active period.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetReserve {
@@ -222,6 +270,54 @@ pub trait Store: Send + Sync {
         namespace: &str,
         period: &str,
     ) -> Result<Vec<UsageSummaryRow>, StoreError>;
+
+    /// Cached upstream listing for one provider, or `None` if never written.
+    async fn get_provider_models(
+        &self,
+        provider: &str,
+    ) -> Result<Option<ProviderModels>, StoreError> {
+        let _ = provider;
+        Ok(None)
+    }
+
+    /// Every cached provider listing. Missing configured providers are absent.
+    async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Insert or replace one provider's cached listing.
+    ///
+    /// A write for a different `source` applies only when the existing row is
+    /// missing or `stale`. Discovery may mark a foreign row stale only on the
+    /// first round (URL change / cold start). Later rounds skip a fresh
+    /// foreign row so a lagged replica cannot open this CAS.
+    async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
+        let _ = row;
+        Ok(())
+    }
+
+    /// Set `stale = true` only when the cached `source` differs from `source`.
+    /// One UPDATE, so a concurrent listing with the new source is not replaced.
+    /// Matching source or missing row is a no-op.
+    async fn mark_provider_models_stale_unless_source(
+        &self,
+        provider: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let _ = (provider, source);
+        Ok(())
+    }
+
+    /// Set `stale = true` only when the cached `source` still equals `source`.
+    /// A concurrent listing with a different URL is left untouched.
+    async fn mark_provider_models_stale_if_source(
+        &self,
+        provider: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let _ = (provider, source);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -279,6 +375,29 @@ impl Store for UnavailableStore {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn summarize_usage(&self, _: &str, _: &str) -> Result<Vec<UsageSummaryRow>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn get_provider_models(&self, _: &str) -> Result<Option<ProviderModels>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn put_provider_models(&self, _: ProviderModels) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn mark_provider_models_stale_unless_source(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn mark_provider_models_stale_if_source(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<(), StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
 }
@@ -1687,6 +1806,10 @@ mod tests {
             )
             .await
             .expect("draft store tables");
+        setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
         let store = PostgresStore::connect(&scoped, false)
             .await
             .expect("rename draft tables");
@@ -1775,6 +1898,10 @@ mod tests {
             )
             .await
             .expect("draft store tables");
+        setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
         setup
             .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
             .await
@@ -1936,6 +2063,10 @@ mod tests {
             )
             .await
             .expect("draft");
+        setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
         setup
             .batch_execute(include_str!("../../sql/store_budget_v1.sql"))
             .await
@@ -2259,6 +2390,39 @@ mod tests {
                 cost_microdollars: i64::MAX as u64,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_put_provider_models_does_not_replace_a_newer_source() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let store = PostgresStore::connect(&dsn, true).await.expect("connect");
+        let provider = unique_ns("prov");
+        let neu = ProviderModels {
+            provider: provider.clone(),
+            fetched_at: Some("2026-09-02T12:01:00Z".into()),
+            stale: false,
+            data: vec![serde_json::json!({"id": "new", "object": "model"})],
+            source: Some("https://example.invalid/v1".into()),
+        };
+        store.put_provider_models(neu.clone()).await.expect("new");
+        store
+            .put_provider_models(ProviderModels {
+                provider: provider.clone(),
+                fetched_at: Some("2026-09-02T12:02:00Z".into()),
+                stale: false,
+                data: vec![serde_json::json!({"id": "old", "object": "model"})],
+                source: Some("https://api.openai.com/v1".into()),
+            })
+            .await
+            .expect("old");
+        let got = store
+            .get_provider_models(&provider)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got, neu);
     }
 
     #[tokio::test]

@@ -9,7 +9,8 @@ the release matrix ships binaries for both. This runner is the portable subset â
 the same serving assertions, expressed with nothing but the standard library:
 
 * `/healthz` and `/readyz` answer, unauthenticated;
-* `/ns/platform/v1/models` needs a gateway key and may return an empty list;
+* `/ns/platform/v1/models` needs a gateway key and lists cached `provider-id/model-id` ids
+  (empty when discovery has not succeeded);
 * an unprefixed model is refused with the typed `model_unprefixed` error;
 * one chat completion completes against a local fixture upstream.
 
@@ -200,8 +201,14 @@ def probe(base_url: str, upstream: FakeUpstream) -> None:
             f"authenticated /v1/models answered {models.status}: {models.body}"
         )
     served = json.loads(models.body).get("data", [])
-    if served != []:
-        raise SmokeFailure(f"/v1/models was not empty before discovery: {served}")
+    if not isinstance(served, list):
+        raise SmokeFailure(f"/v1/models data is not a list: {served!r}")
+    for item in served:
+        model_id = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(model_id, str) or "/" not in model_id:
+            raise SmokeFailure(
+                f"/v1/models id is not provider-id/model-id: {item!r}"
+            )
 
     unknown = request(
         f"{base_url}/ns/platform/v1/chat/completions",

@@ -15,11 +15,12 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use bytes::Bytes;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -126,6 +127,7 @@ struct Counters {
     open: AtomicI64,
     opened: AtomicU64,
     received: AtomicU64,
+    models: AtomicU64,
 }
 
 /// How many recorded requests the fake keeps. Assertions read the last request,
@@ -226,6 +228,34 @@ pub fn credential_digest(presented: &str) -> String {
         })
 }
 
+#[derive(Clone)]
+struct ModelsScript {
+    status: u16,
+    ids: Vec<String>,
+    page_size: Option<usize>,
+    fail_when_paged: bool,
+}
+
+impl Default for ModelsScript {
+    fn default() -> Self {
+        Self {
+            status: 200,
+            ids: vec![
+                "gpt-4o".into(),
+                "gpt-4o-preview".into(),
+                "fixture-chat".into(),
+            ],
+            page_size: None,
+            fail_when_paged: false,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelsQuery {
+    after_id: Option<String>,
+}
+
 pub struct UpstreamState {
     requests: Mutex<VecDeque<Recorded>>,
     /// How many requests arrived from each caller bearing each credential, kept
@@ -239,6 +269,7 @@ pub struct UpstreamState {
     dispatches: Mutex<BTreeMap<Dispatch, u64>>,
     counters: Counters,
     fixtures: Fixtures,
+    models: Mutex<ModelsScript>,
 }
 
 impl UpstreamState {
@@ -280,6 +311,32 @@ impl UpstreamState {
     pub fn opened_streams(&self) -> u64 {
         self.counters.opened.load(Ordering::SeqCst)
     }
+
+    /// How many `GET /models` listings have arrived. Kept apart from
+    /// [`Self::received`]: inference assertions must not see discovery traffic.
+    pub fn models_hits(&self) -> u64 {
+        self.counters.models.load(Ordering::SeqCst)
+    }
+
+    pub fn set_models_status(&self, status: u16) {
+        self.models.lock().expect("upstream lock").status = status;
+    }
+
+    pub fn set_models(&self, ids: &[&str]) {
+        self.models.lock().expect("upstream lock").ids =
+            ids.iter().map(|id| (*id).to_owned()).collect();
+    }
+
+    /// Serve the listing in Anthropic-sized pages (`has_more` / `last_id`).
+    pub fn set_models_page_size(&self, size: usize) {
+        self.models.lock().expect("upstream lock").page_size = Some(size);
+    }
+
+    /// Fail every paged request (`after_id` present) so a later page cannot
+    /// replace a previously cached listing.
+    pub fn set_models_fail_when_paged(&self, fail: bool) {
+        self.models.lock().expect("upstream lock").fail_when_paged = fail;
+    }
 }
 
 /// Decrements the open-response count whenever a response body — or a handler
@@ -305,12 +362,14 @@ impl FakeUpstream {
             dispatches: Mutex::new(BTreeMap::new()),
             counters: Counters::default(),
             fixtures: Fixtures::load(),
+            models: Mutex::new(ModelsScript::default()),
         });
         let app = Router::new()
             .route("/chat/completions", post(handle))
             .route("/messages", post(handle))
             .route("/embeddings", post(handle))
             .route("/responses", post(handle))
+            .route("/models", get(list_models))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -340,20 +399,57 @@ impl Drop for FakeUpstream {
     }
 }
 
-async fn handle(
+async fn list_models(
     State(state): State<Arc<UpstreamState>>,
-    headers: HeaderMap,
-    path: axum::extract::OriginalUri,
-    body: Bytes,
+    Query(query): Query<ModelsQuery>,
 ) -> Response {
-    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let streamed = body.get("stream").and_then(Value::as_bool) == Some(true);
-    let path = path.0.path().to_owned();
+    state.counters.models.fetch_add(1, Ordering::SeqCst);
+    let script = state.models.lock().expect("upstream lock").clone();
+    if script.status != 200 || (script.fail_when_paged && query.after_id.is_some()) {
+        let status = if script.status != 200 {
+            script.status
+        } else {
+            500
+        };
+        return (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            [("content-type", "application/json")],
+            json!({ "error": { "type": "server_error", "message": "models listing failed" } })
+                .to_string(),
+        )
+            .into_response();
+    }
+    let start = query
+        .after_id
+        .as_deref()
+        .and_then(|id| script.ids.iter().position(|item| item == id).map(|i| i + 1))
+        .unwrap_or(0);
+    let end = match script.page_size {
+        Some(size) => start.saturating_add(size).min(script.ids.len()),
+        None => script.ids.len(),
+    };
+    let page = &script.ids[start.min(script.ids.len())..end];
+    let data: Vec<Value> = page
+        .iter()
+        .map(|id| json!({ "id": id, "object": "model" }))
+        .collect();
+    let mut body = json!({ "object": "list", "data": data });
+    if script.page_size.is_some() {
+        let has_more = end < script.ids.len();
+        body["has_more"] = json!(has_more);
+        if let Some(last_id) = page.last() {
+            body["last_id"] = json!(last_id);
+        }
+    }
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+fn record(state: &UpstreamState, headers: HeaderMap, path: String, model: String, body: Value) {
     let header = |name: &str| {
         headers
             .get(name)
@@ -376,21 +472,40 @@ async fn handle(
                 .map_or_else(|| UNCREDENTIALED.to_owned(), |p| credential_digest(&p)),
         })
         .or_default() += 1;
-    {
-        let mut recorded = state.requests.lock().expect("upstream lock");
-        if recorded.len() == RECORDED_LIMIT {
-            recorded.pop_front();
-        }
-        recorded.push_back(Recorded {
-            path: path.clone(),
-            model: model.clone(),
-            authorization: header("authorization"),
-            api_key: header("x-api-key"),
-            anthropic_version: header("anthropic-version"),
-            anthropic_beta: header("anthropic-beta"),
-            body,
-        });
+    let mut recorded = state.requests.lock().expect("upstream lock");
+    if recorded.len() == RECORDED_LIMIT {
+        recorded.pop_front();
     }
+    recorded.push_back(Recorded {
+        path,
+        model,
+        authorization: header("authorization"),
+        api_key: header("x-api-key"),
+        anthropic_version: header("anthropic-version"),
+        anthropic_beta: header("anthropic-beta"),
+        body,
+    });
+}
+
+async fn handle(
+    State(state): State<Arc<UpstreamState>>,
+    headers: HeaderMap,
+    path: axum::extract::OriginalUri,
+    body: Bytes,
+) -> Response {
+    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let streamed = body.get("stream").and_then(Value::as_bool) == Some(true);
+    let path = path.0.path().to_owned();
+    record(&state, headers, path.clone(), model.clone(), body);
+    let model = match model.split_once(CALLER_TAG) {
+        Some((target, _)) => target.to_owned(),
+        None => model,
+    };
 
     let anthropic = path == "/messages";
     let responses = path == "/responses";

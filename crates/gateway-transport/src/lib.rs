@@ -117,6 +117,7 @@ impl Default for TransportLimits {
 pub fn build_client(limits: &TransportLimits) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(limits.connect_timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
@@ -469,6 +470,38 @@ impl HttpDispatcher {
         let json: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| TransportError::Http(format!("decode upstream body: {e}")))?;
         Ok(adapter.decode_response(surface, json)?)
+    }
+
+    /// `GET` a JSON body from a provider path (model listing). Auth is the
+    /// same as native POST; there is no request body.
+    pub async fn get_json(
+        &self,
+        provider: &str,
+        upstream: &Upstream,
+        path: &str,
+        headers: &[(&'static str, String)],
+        deadline: Deadline,
+    ) -> Result<serde_json::Value, TransportError> {
+        let url = format!("{}{}", upstream.base_url.trim_end_matches('/'), path);
+        let mut req = self.client.get(url);
+        req = match &upstream.auth {
+            AuthScheme::Bearer => req.bearer_auth(upstream.api_key.expose_secret()),
+            AuthScheme::Header(name) => req.header(*name, upstream.api_key.expose_secret()),
+        };
+        for (name, value) in headers {
+            req = req.header(*name, value);
+        }
+        let resp = self
+            .send_bounded(req.headers(trace_context_headers()), deadline)
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = self.error_body(resp, deadline).await;
+            return Err(ProviderError::from_upstream(provider, status.as_u16(), &text).into());
+        }
+        let text = self.buffered_body(resp, deadline).await?;
+        serde_json::from_str(&text)
+            .map_err(|e| TransportError::Http(format!("decode upstream body: {e}")))
     }
 
     /// Native dispatch: POST an already-shaped body to the provider's own path
