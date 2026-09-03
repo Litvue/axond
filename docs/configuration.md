@@ -709,8 +709,8 @@ process environment, and referenced key-material files; a bad candidate is
 rejected and the running config keeps serving. Replacing file contents in place
 or via an atomic rename is therefore reload-reachable without a process
 restart. `[[namespace]]` changes are reloadable and appear in the reported
-namespace delta, but the namespace count used for in-memory budget retention
-floors is captured at boot and does not resize until restart. `[server] bind`,
+namespace delta. Period budget ledgers live in the Store, not in an in-memory
+retention floor. `[server] bind`,
 `[transport]`, `[admission]`, `[[usage_sink]]`, `[usage_journal]`, `[budget]`,
 `[rate_limit]`, `[revocation]`, and `[catalog]` changes warn and are ignored
 until restart;
@@ -724,11 +724,10 @@ The same log entry sets `restart_required = true` for catalogue and other
 boot-owned changes; `changed` only reports live serving state applied by the
 reload.
 
-Stateful mode is the exception to this file-reload contract. Because a file
-reload has no control-plane projection compiler, SIGHUP and file-watch reloads
-are refused rather than replacing the active or pending revision with the
-keyless bootstrap configuration. Restart for process-local bootstrap changes;
-publish durable resource changes through `/admin/v1`.
+`[storage]` is boot-owned: a reload that changes `backend`, `path`, or
+`dsn_env` warns and is ignored until restart. Namespaces, period budgets, and
+usage after boot are `/api/v1`, not `/admin/v1`. `mode` and control-plane
+bootstrap sections are boot errors; there is no stateful file-reload exception.
 
 ## `[[usage_sink]]` — Tier 0 by default; Tier 2 for `postgres`
 

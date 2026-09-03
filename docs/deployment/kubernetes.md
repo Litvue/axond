@@ -462,17 +462,17 @@ Both probes stay unauthenticated.
 
 ## Scaling
 
-The HTTP process shares the Store, so replicas can scale horizontally. These parts
-remain replica-local unless a shared backend is selected:
+The HTTP process shares the Store, so replicas can scale horizontally. Period
+budgets are Store-backed (`PUT /api/v1/namespaces/{ns}/budgets/{period}`).
+`[budget] backend = "redis"|"postgres"|"in-memory"` is a boot error. These
+parts remain replica-local:
 
 - credential and target circuit state;
 - round-robin/weighted cursors;
-- in-memory budgets;
-- in-memory rate limits;
+- in-memory `[rate_limit]` (unless `backend = "redis"`);
 - `[admission]` request bounds and load shedding.
 
-Use Redis or Postgres when a control must be exact across replicas. See
-[Stateful backends](./stateful-backends.md).
+See [Store backends](./stateful-backends.md).
 
 Do not add an HPA blindly. Base it on measured concurrency or request metrics,
 then verify that scale-out does not change the semantics of any intentionally

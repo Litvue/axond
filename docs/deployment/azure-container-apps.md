@@ -38,16 +38,18 @@ ghcr.io/litvue/axond@sha256:<digest>
 
 Commit a copy next to this guide at
 [`deploy/azure-container-apps/axond.toml`](../../deploy/azure-container-apps/axond.toml).
-Edit aliases, prices, and the env-var *names* to match the keys you will store.
-Do not put key material in the file.
+Edit prices, provider ids, and the env-var *names* to match the keys you will
+store. Do not put key material in the file. Callers send `provider-id/model-id`;
+`[[model]]` is a boot error.
 
 Minimum surface:
 
+- `[storage]` (SQLite path or Postgres `dsn_env`)
 - one `[[namespace]]` with `default = true`
 - one `[[provider]]` per upstream (OpenAI, Anthropic, Azure OpenAI, …)
 - one `[[credential]]` per `(namespace, provider)` with `env = "GW_..."`
-- one `[[gateway_key]]` bound to that namespace
-- one `[[model]]` alias per caller-facing name
+- exactly one `[[gateway_key]]`
+- `[[price]]` rules for billed model globs
 
 Adding a provider later is a TOML edit plus a new Key Vault secret of the
 referenced name, then a new revision. Rotating a key whose env-var name is
@@ -117,6 +119,17 @@ curl -sS -o /dev/null -w '%{http_code}\n' "https://$FQDN/ns/platform/v1/models"
 ```
 
 Expect `ok`, `ready`, a catalogue, and `401` without a key.
+
+Publish a period budget before inference; a namespace with no budget row is
+`429 budget_exceeded`:
+
+```bash
+curl --fail \
+  -H "Authorization: Bearer $INBOUND" \
+  -H 'content-type: application/json' \
+  -d '{"limit_microdollars":1000000000000}' \
+  -X PUT "https://$FQDN/api/v1/namespaces/platform/budgets/aca"
+```
 
 Real inference:
 
