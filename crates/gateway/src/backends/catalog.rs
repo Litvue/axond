@@ -3,17 +3,20 @@
 //!
 //! models.dev is the first source ([`super::models_dev`]). The contract exists to
 //! keep one distinction sharp: **metadata may refresh automatically; enablement
-//! and pricing are explicit administrative acts.** A refresh stores new or
-//! changed catalogue metadata and nothing else — it never enables a model for a
-//! tenant, never changes which alias targets exist, and never activates a price.
-//! An upstream catalogue edit must not be able to become a production billing
-//! change.
+//! is an explicit administrative act; charging copies rates from an already
+//! admitted snapshot.** A refresh stores new or changed catalogue metadata and
+//! never enables a model for a tenant or changes which ids a request may name.
+//! Compiling [`ObservedPrice`] into a [`super::local_catalog::CatalogPriceIndex`]
+//! is the conversion that makes those rates billable — not a `From` impl on the
+//! parsed document, and not a fetch on the inference path. A request copies the
+//! rates the snapshot it started under published; a later admit cannot reprice
+//! it.
 //!
 //! So [`ObservedPrice`] is *observed* pricing, not applied pricing, and it is
 //! deliberately its own type rather than [`gateway_core::ModelPrice`]: a value
 //! that a request could be billed against must not be constructible by parsing
-//! an upstream document. Turning an observation into an effective price is a
-//! later, explicit mutation that has to convert deliberately.
+//! an upstream document. The conversion is integer nano-dollars to exact
+//! micro-dollars at snapshot admit.
 //!
 //! The source is [`BackendPath::Background`](super::BackendPath::Background):
 //! never on the request path, never a boot dependency. In stateful mode

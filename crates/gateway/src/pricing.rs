@@ -8,15 +8,20 @@
 //! carries the identity of the pricing a charge was computed against all the way
 //! to the usage record.
 //!
-//! Three rules make a publication safe for a request already in flight:
+//! Live charging after ADR 0063 is [`crate::routes`] `serve`: imported
+//! models.dev `cost` from [`crate::backends::catalog_runtime::CatalogStatus`],
+//! then optional `[[price]]`, then `unpriced_models`. [`price_of`] is the
+//! withdrawn approved-book walk and is not on that path.
 //!
-//! 1. Resolution reads the [`ConfigSnapshot`] the request is already holding, so
-//!    a book published mid-request cannot change what that request settles at.
-//! 2. A target is priced by exactly one authority — the deployment's approved
-//!    book when the target names a catalogue offering the book prices, and the
-//!    `[[model]]` rates otherwise — never by a merge of the two.
-//! 3. A target the approved book *should* price but does not is ineligible: it
-//!    stays discoverable and is not routable under a budget (ADR 0056).
+//! Three rules make a later snapshot safe for a request already in flight:
+//!
+//! 1. Resolution copies rates onto [`RequestPrice`] when the request starts, so
+//!    a catalogue admit or book published mid-request cannot change what that
+//!    request settles at.
+//! 2. A target is priced by one authority at a time — the admitted snapshot
+//!    first, then a `[[price]]` fallback — never a merge of the two.
+//! 3. A target neither source prices follows `unpriced_models` (`deny` refuses,
+//!    `allow` records NULL cost).
 
 use gateway_core::catalog::{ModelPrice, Usage};
 
@@ -101,8 +106,8 @@ pub struct RequestPrice {
 }
 
 impl RequestPrice {
-    /// Rates a deployment price-book rule matched, or a `[[model]]` target
-    /// declared in leftover catalogue-priced tests.
+    /// Rates copied at admission: imported models.dev `cost`, or a `[[price]]`
+    /// fallback when the snapshot does not cover the offering.
     pub const fn configured(rates: ModelPrice) -> Self {
         Self {
             rates: Some(rates),

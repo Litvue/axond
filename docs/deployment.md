@@ -89,18 +89,18 @@ env = "GW_PLATFORM_OPENAI_API_KEY"
 env = "GW_INBOUND_PLATFORM_KEY"
 namespace = "platform"
 
-[[price]]
-provider = "openai"
-model = "gpt-4o"
-input_microdollars_per_million = 2_500_000
-output_microdollars_per_million = 10_000_000
+[catalog]
+source = "seed"
+bootstrap = "seed"
 ```
 
 That is the serving floor. Callers send `openai/gpt-4o` to
-`/ns/platform/v1/...`. Publish a period budget before inference:
-`PUT /api/v1/namespaces/platform/budgets/{period}`. Credential pools, admission
-tuning, usage sinks, telemetry, and reload watching are optional. `[[model]]`,
-`mode`, and a second `[[gateway_key]]` are boot errors.
+`/ns/platform/v1/...`. Charging uses imported models.dev rates (`models-dev` in
+production; `bootstrap = "seed"` so the first boot has rates). `[[price]]` is
+optional for custom ids the catalogue does not list. Publish a period budget
+before inference: `PUT /api/v1/namespaces/{ns}/budgets/{period}`. Credential
+pools, admission, usage sinks, and telemetry are optional. `[[model]]`, `mode`,
+and a second `[[gateway_key]]` are boot errors.
 
 ## Running the static binary
 

@@ -24,6 +24,9 @@ id = "openai-primary"
 env = "GW_INBOUND_PLATFORM_KEY"
 namespace = "platform"
 
+# Optional fallback. Enable `[catalog]` to charge from imported models.dev
+# rates; then this row is only needed for unlisted ids.
+
 [[price]]
 provider = "openai"
 model = "gpt-4o"

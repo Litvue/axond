@@ -943,7 +943,8 @@ pub struct Provider {
     pub kind: ProviderKind,
     pub base_url: String,
     /// Unpriced model ids: `deny` refuses before dispatch; `allow` dispatches
-    /// and records `cost_microdollars` as NULL.
+    /// and records `cost_microdollars` as NULL. "Unpriced" means neither the
+    /// imported models.dev snapshot nor a `[[price]]` row covers the id.
     #[serde(default)]
     pub unpriced_models: UnpricedModels,
 }
@@ -2251,8 +2252,8 @@ impl Default for RevocationConfig {
 /// `store` is what decides whether they survive a restart.
 ///
 /// The default is inert. Nothing is fetched, nothing is stored, and no task is
-/// spawned, so a deployment that hand-authors its models keeps exactly the
-/// behaviour it has today and no third party is contacted on its behalf.
+/// spawned, so a deployment that has not enabled `[catalog]` does not contact
+/// models.dev. Enabled, admitted snapshots are the default charging source.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CatalogConfig {
     /// Which upstream is imported. `none` disables the whole pipeline.
@@ -4526,7 +4527,10 @@ impl Config {
         self.provider.iter().find(|p| p.id == id)
     }
 
-    /// First matching price-book rule in file order, or `None` if unpriced.
+    /// First matching optional `[[price]]` rule in file order, or `None`.
+    ///
+    /// Request-path charging prefers imported models.dev rates; this book is
+    /// the fallback for offerings the catalogue does not price.
     pub fn price_for(&self, provider: &str, model: &str) -> Option<ModelPrice> {
         self.price.iter().find_map(|rule| {
             if rule.provider != provider {

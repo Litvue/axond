@@ -87,7 +87,8 @@ TOML plus env holds only:
 | inbound auth | **one** static API key (env or file reference) |
 | `[storage]` | `sqlite` (path) or `postgres` (DSN reference) |
 | default blocklist | deployment-wide model-id glob patterns |
-| price-book | deployment-level rates keyed on `(provider, model-id glob)` |
+| `[catalog]` | imported models.dev metadata; admitted `cost` is the default charging source |
+| optional `[[price]]` | fallback rates for offerings the catalogue does not list |
 | `[admission]`, `[transport]`, `[shutdown]`, telemetry / usage-sink transport | unchanged process bounds and export |
 
 Changing any of that is a restart. Namespaces, budgets, and usage are not in
@@ -178,17 +179,28 @@ caller’s job. Credential-pool rotation inside one provider remains.
 
 ### Pricing
 
-A deployment-level price-book, keyed on `(provider, model-id glob)`,
-decoupled from routing. First matching rule in file order wins; put exact
-ids before globs.
+Charging uses **actual tokens × rates from the imported models.dev snapshot**
+the request started under. Operator setup is `[[provider]]` plus `[catalog]`
+import; a per-model TOML price book is not required for models.dev-covered
+ids. The `[[provider]] id` must match the models.dev provider key.
 
-Per-provider `unpriced_models = allow | deny`:
+Optional `[[price]]` is fallback for custom / unlisted offerings (vLLM, Azure
+deployment ids). When both a snapshot `cost` and a `[[price]]` row exist, the
+snapshot wins.
+
+Per-provider `unpriced_models = allow | deny` applies when neither source
+covers the id:
 
 - `deny` → `400 unpriced_model` before dispatch;
 - `allow` → dispatch; usage `cost_microdollars` is NULL.
 
-Usage records carry computed cost when a rule matches. Rates are
-micro-dollars per million tokens as today.
+The inference path does not fetch models.dev. A later catalogue admit cannot
+reprice an in-flight request. Rates are micro-dollars per million tokens.
+
+This supersedes the earlier “deployment `[[price]]` book is the rate source”
+wording in this ADR for models.dev-covered offerings. Historical ADRs
+0043–0056 remain records of approved price books; they are not the live
+operator contract.
 
 ### Budgets
 

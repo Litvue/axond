@@ -337,54 +337,29 @@ namespace = "platform"
 # (Tier 1) or Postgres (Tier 2), and `axond revoke` writes to that configured
 # store. See docs/minted-token-guide.md for the complete runbook.
 
-# ── Price book ────────────────────────────────────────────────────────────────
+# ── Charging ──────────────────────────────────────────────────────────────────
 # Callers send `provider-id/model-id` (split on the first `/`). Axond selects
 # the configured provider and forwards the bare id. There is no `[[model]]`
 # alias table: a leftover `[[model]]` is a boot error naming the prefix form.
 #
-# `[[price]]` is not a routing table. First matching `(provider, model-id glob)`
-# in file order wins; put exact ids before globs. Unmatched ids follow the
-# provider's `unpriced_models = allow | deny` (default deny → 400 unpriced_model;
-# allow → dispatch, usage `cost_microdollars` NULL).
+# Spend is actual tokens × rates from the imported models.dev snapshot (see
+# `[catalog]` below). The `[[provider]] id` must match a models.dev provider
+# key (`openai`, `anthropic`, …). `[[price]]` is optional fallback for custom
+# ids the catalogue does not list (vLLM / Azure deployment names). When both
+# exist, the snapshot wins. Unmatched ids follow the provider's
+# `unpriced_models = allow | deny` (default deny → 400 unpriced_model; allow →
+# dispatch, usage `cost_microdollars` NULL).
 #
 # Wire compatibility is the provider `kind`: `/v1/messages` to an `openai`
 # provider is 400 unsupported_wire. Optional `blocklist` globs (deployment
 # default, unioned with the namespace list) refuse with 400 model_blocked.
-
-[[price]]
-provider = "openai"
-model = "gpt-4o"
-input_microdollars_per_million = 2_500_000
-output_microdollars_per_million = 10_000_000
-
-[[price]]
-provider = "azure-openai"
-model = "gpt-4o"
-input_microdollars_per_million = 2_500_000
-output_microdollars_per_million = 10_000_000
-
-
-# Served on Anthropic's native /v1/messages (forwarded verbatim, streaming
-# included, with only `model` rewritten). No route translates between wires:
-# `anthropic` providers on /v1/messages, OpenAI-family providers on
-# /v1/chat/completions and /v1/embeddings. A mismatch is 400 unsupported_wire
-# before anything is dispatched. See docs/adr/0012-native-provider-routes.md.
-
-[[price]]
-provider = "anthropic"
-model = "claude-3-7-sonnet-latest"
-input_microdollars_per_million = 3_000_000
-output_microdollars_per_million = 15_000_000
-
-
-# Embeddings on /v1/embeddings against an OpenAI-family target. They produce
-# no completion, so only input tokens are billed and the output price is unused.
-
-[[price]]
-provider = "openai"
-model = "text-embedding-3-small"
-input_microdollars_per_million = 20_000
-output_microdollars_per_million = 0
+#
+# Optional fallback — not required for openai/anthropic ids models.dev prices:
+# [[price]]
+# provider = "azure-openai"
+# model = "my-gpt-4o-deployment"
+# input_microdollars_per_million = 2_500_000
+# output_microdollars_per_million = 10_000_000
 
 
 # ── Config hot-reload ─────────────────────────────────────────────────────────
@@ -634,23 +609,24 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # max_request_microdollars = 1000
 # Add can_mint = true to an explicitly authorized static key.
 
-# ── Imported model metadata (opt-in; disabled in this example) ───────────────
-# Enabled, a background task imports the models.dev catalogue, retains every
-# accepted snapshot with its provenance, and keeps a last-known-good active.
-# Nothing on the inference path reads the source or the store, and an import
-# activates no model, changes no enablement, and settles no price.
-# `store = "in-memory"` is a development store: it loses every snapshot and its
-# provenance on restart, and a stateful deployment must retain in Postgres.
-# [catalog]
-# source = "models-dev" # none (default) | models-dev | seed
+# ── Imported model metadata and charging rates ───────────────────────────────
+# Background import of the models.dev catalogue. Admitted snapshots are the
+# default charging source: a request copies those rates at admission and does
+# not fetch. `source = "seed"` is the bundled excerpt (offline, no HTTPS).
+# Production: `source = "models-dev"` with `bootstrap = "seed"` so the first
+# boot has rates before the first successful fetch.
+# `store = "in-memory"` is a development store: it loses every snapshot on
+# restart. Postgres retention needs `store = "postgres"` and `dsn_env`.
+[catalog]
+source = "seed" # none (default) | models-dev | seed
 # source_url = "https://models.dev/catalog.json"
-# store = "in-memory" # in-memory (default) | postgres
-# dsn_env = "AXOND_CATALOG_DSN" # postgres: otherwise inherit [control_plane]
+store = "in-memory" # in-memory (default) | postgres
+# dsn_env = "AXOND_CATALOG_DSN"
 # schema = "public"
 # create_table = true
 # refresh_interval_seconds = 21_600
 # refresh_timeout_seconds = 60
 # retry_initial_seconds = 60 # doubles per consecutive refusal, up to retry_max
 # retry_max_seconds = 3_600
-# bootstrap = "empty" # empty (default) | seed (offline, before a first fetch)
+bootstrap = "seed" # empty (default) | seed (offline, before a first fetch)
 # max_payload_bytes = 67_108_864

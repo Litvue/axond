@@ -32,7 +32,7 @@ meaning, and how they are allowed to change. The design rationale is
 | `reasoning_tokens` | `bigint` | Reserved; NULL today. |
 | `cache_read_tokens` | `bigint` | Prompt tokens read from the provider cache, disjoint from `input_tokens`. |
 | `cache_write_tokens` | `bigint` | Prompt tokens written to the provider cache. |
-| `cost_microdollars` | `bigint` | Cost in micro-dollars from the matching price-book rule × tokens. NULL when the request was admitted unpriced (`unpriced_models = allow`). |
+| `cost_microdollars` | `bigint` | Cost in micro-dollars from the imported models.dev rates (or a `[[price]]` fallback) × actual tokens. NULL when the request was admitted unpriced (`unpriced_models = allow`). |
 | `catalog_version` | `bigint` | Resource version of the catalogue the approved price book was computed against, or `0` for configuration-priced rows and retained legacy v1 price books without catalogue-version provenance. |
 | `price_book` | `text` | Exact price-book resource reference and version the rates came from, rendered `price/<resource id>@v<version>` (e.g. `price/res_0190f2c1-6f6a-7c2e-9d3a-6f1c2b4d5e60@v3`); NULL for a file-priced row. |
 | `price_book_checksum` | `text` | Canonical checksum of that book's body — the same rates always produce the same checksum, so a republished (rolled-back) book is recognisable as the one that was audited before. NULL for a file-priced row. |
@@ -109,7 +109,9 @@ exported as zero; `Some(0)` is still emitted.
   priced by configuration. New v2 price books populate it with the catalogue
   resource version; a retained v1 book has no such provenance and records `0`.
   A reader that groups by pricing treats `price_book IS NULL` as "configured
-  rates" ([ADR 0056](./adr/0056-request-path-pricing.md)).
+  rates": imported models.dev snapshot rates or a `[[price]]` fallback
+  ([ADR 0056](./adr/0056-request-path-pricing.md) for the withdrawn approved-book
+  path).
 - A price change is never retroactive. A new publication is a new price-book
   version written into new rows; settled rows are never rewritten, so what a
   request was charged stays answerable from the row that recorded it.

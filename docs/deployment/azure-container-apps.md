@@ -49,7 +49,8 @@ Minimum surface:
 - one `[[provider]]` per upstream (OpenAI, Anthropic, Azure OpenAI, …)
 - one `[[credential]]` per `(namespace, provider)` with `env = "GW_..."`
 - exactly one `[[gateway_key]]`
-- `[[price]]` rules for billed model globs
+- `[catalog]` import (`source = "models-dev"`, `bootstrap = "seed"`). Optional
+  `[[price]]` only for custom ids models.dev does not list.
 
 Adding a provider later is a TOML edit plus a new Key Vault secret of the
 referenced name, then a new revision. Rotating a key whose env-var name is

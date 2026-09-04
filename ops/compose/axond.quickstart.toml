@@ -48,6 +48,9 @@ env = "GW_ACME_OPENAI_API_KEY"
 env = "GW_INBOUND_PLATFORM_KEY"
 namespace = "platform"
 
+# Optional fallback. Enable `[catalog]` (seed or models-dev) to charge from
+# imported rates instead; then these rows are only needed for unlisted ids.
+
 [[price]]
 provider = "openai"
 model = "gpt-4o"

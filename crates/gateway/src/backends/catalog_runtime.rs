@@ -1,13 +1,15 @@
 //! The catalogue import as a running thing: what boot builds, what the
 //! background task drives, and what an operator can read about it.
 //!
-//! Everything here is off the request path, and structurally rather than by
-//! convention: the source, the store, and the [`CatalogRefresher`] that owns them
-//! are moved into one spawned task, and the only handle the rest of the process
-//! keeps is a [`CatalogStatus`] — a mutex over a bounded report and a channel
-//! that asks for a refresh. A request cannot reach models.dev through it because
-//! it holds nothing that can fetch, and it cannot reach the catalogue store
-//! because it holds nothing that can query.
+//! Everything here is off the request path except a compiled price index, and
+//! structurally rather than by convention: the source, the store, and the
+//! [`CatalogRefresher`] that owns them are moved into one spawned task, and the
+//! only handle the rest of the process keeps is a [`CatalogStatus`] — a mutex
+//! over a bounded report, a [`CatalogPriceIndex`] of already-imported rates, and
+//! a channel that asks for a refresh. A request cannot reach models.dev through
+//! it because it holds nothing that can fetch, and it cannot reach the catalogue
+//! store because it holds nothing that can query. Admission copies rates out of
+//! the index; a later admit cannot reprice an in-flight request.
 //!
 //! The pieces below are the ones an operator configures rather than a second
 //! architecture: [`RuntimeSource`] and [`RuntimeStore`] are closed enumerations of
@@ -17,15 +19,16 @@
 //! catalogue that disappears on restart is not a catalogue an operator can
 //! approve prices against).
 //!
-//! What the loop does *not* do is as deliberate as what it does. An import is an
-//! observation: it never enables a model, never moves a price, and never changes
-//! what a request routes to. It retains content, moves an active pointer, and
-//! reports what a human should look at.
+//! An import never enables a model and never changes what a request routes to.
+//! It retains content, moves an active pointer, compiles that snapshot's
+//! models.dev `cost` into the price index a request may copy, and reports what
+//! a human should look at. It does not fetch on the inference path.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use gateway_core::ModelPrice;
 use tokio::sync::{mpsc, oneshot};
 
 use super::Capabilities;
@@ -41,20 +44,27 @@ use super::catalog_store::{
     CatalogStore, CatalogStoreError, InMemoryCatalogStore, RetainedCatalog, Retention,
     StoredCatalogState,
 };
+use super::local_catalog::CatalogPriceIndex;
 use super::models_dev::{HttpCatalogFetch, ModelsDevAdapter, ModelsDevSource, SeedCatalogSource};
 use crate::config::{CatalogConfig, CatalogSourceBackend, CatalogStoreBackend};
 
 /// What is operationally true about the catalogue, readable without touching a
 /// backend.
 ///
-/// A mutex over a `Copy` report, written once per refresh by the task that owns
-/// the refresher and read by the authenticated status view. The lock is never
-/// held across an `await`, so a status read cannot be delayed by an import that
-/// is waiting on an upstream — the two never contend for anything but a memory
-/// write.
+/// A mutex over a `Copy` report and an [`Arc`] of compiled rates, written once
+/// per refresh by the task that owns the refresher. The request path copies a
+/// [`ModelPrice`] out of the index; it never holds the source or the store. The
+/// lock is never held across an `await`, so a status read cannot be delayed by
+/// an import that is waiting on an upstream.
 #[derive(Debug, Default)]
 pub struct CatalogStatus {
-    report: Mutex<Option<CatalogReport>>,
+    live: Mutex<CatalogLive>,
+}
+
+#[derive(Debug, Default)]
+struct CatalogLive {
+    report: Option<CatalogReport>,
+    prices: Arc<CatalogPriceIndex>,
 }
 
 impl CatalogStatus {
@@ -69,7 +79,7 @@ impl CatalogStatus {
     /// answered with the stored number would hide exactly the staleness it
     /// exists to show.
     pub fn report(&self) -> Option<CatalogReport> {
-        let mut report = (*self.report.lock().expect("catalogue status lock"))?;
+        let mut report = self.live.lock().expect("catalogue status lock").report?;
         let now = SystemTime::now();
         if let Some(active) = report.active.as_mut() {
             active.age = now
@@ -79,8 +89,26 @@ impl CatalogStatus {
         Some(report)
     }
 
-    fn publish(&self, report: CatalogReport) {
-        *self.report.lock().expect("catalogue status lock") = Some(report);
+    /// Rates the active imported snapshot publishes for this offering, if any.
+    ///
+    /// Copied: a later admit replaces the index for *later* requests.
+    pub fn price_for(&self, provider: &str, published_model_id: &str) -> Option<ModelPrice> {
+        let prices = Arc::clone(&self.live.lock().expect("catalogue status lock").prices);
+        prices.price_for(provider, published_model_id)
+    }
+
+    fn publish(&self, report: CatalogReport, prices: Arc<CatalogPriceIndex>) {
+        *self.live.lock().expect("catalogue status lock") = CatalogLive {
+            report: Some(report),
+            prices,
+        };
+    }
+
+    /// Test seam: install compiled rates without a refresher.
+    #[cfg(test)]
+    pub fn install_snapshot(&self, snapshot: &super::catalog::CatalogSnapshot) {
+        let mut live = self.live.lock().expect("catalogue status lock");
+        live.prices = Arc::new(CatalogPriceIndex::from_snapshot(snapshot));
     }
 }
 
@@ -439,7 +467,7 @@ async fn start_with_recovery(
              and keeps refreshing",
         ),
     }
-    status.publish(refresher.report(SystemTime::now()));
+    publish_status(&status, &refresher, SystemTime::now());
     let (sender, receiver) = mpsc::channel(1);
     tokio::spawn(run(refresher, Arc::clone(&status), receiver, shutdown));
     Ok(Some(CatalogHandle {
@@ -514,7 +542,7 @@ async fn refresh(
 ) -> RefreshOutcome {
     let now = SystemTime::now();
     let outcome = refresher.refresh(trigger, now).await;
-    status.publish(refresher.report(SystemTime::now()));
+    publish_status(status, refresher, SystemTime::now());
     match &outcome {
         RefreshOutcome::Admitted {
             admission,
@@ -538,6 +566,25 @@ async fn refresh(
         RefreshOutcome::NotDue { .. } => {}
     }
     outcome
+}
+
+/// Publish the report and the compiled rates of whatever is active.
+///
+/// A refusal leaves the previous snapshot active, so the index stays the
+/// rates the request path already had. An empty restore publishes an empty
+/// index: nothing is chargeable from the catalogue until an import admits.
+fn publish_status<S: CatalogSource, T: CatalogStore>(
+    status: &CatalogStatus,
+    refresher: &CatalogRefresher<S, T>,
+    now: SystemTime,
+) {
+    let prices = Arc::new(
+        refresher
+            .active()
+            .map(CatalogPriceIndex::from_snapshot)
+            .unwrap_or_default(),
+    );
+    status.publish(refresher.report(now), prices);
 }
 
 /// What an admission did to the catalogue, in one bounded word.
@@ -647,6 +694,30 @@ mod tests {
                 .report()
                 .is_some_and(|report| report.active.is_some()),
             "the refresh published what it left active"
+        );
+    }
+
+    /// Restoration compiles models.dev `cost` onto the status handle so the
+    /// request path can charge without a `[[price]]` row and without fetching.
+    #[tokio::test]
+    async fn boot_publishes_seed_rates_for_configured_provider_ids() {
+        let handle = start(&offline(), None, &no_env(), std::future::pending())
+            .await
+            .expect("an offline catalogue starts")
+            .expect("an enabled catalogue yields a handle");
+        let gpt_4o = handle
+            .status()
+            .price_for("openai", "gpt-4o")
+            .expect("the seed prices openai/gpt-4o");
+        assert_eq!(gpt_4o.input_microdollars_per_million, 2_500_000);
+        assert_eq!(gpt_4o.output_microdollars_per_million, 10_000_000);
+        assert_eq!(gpt_4o.cache_read_microdollars_per_million, Some(1_250_000));
+        assert!(
+            handle
+                .status()
+                .price_for("openai", "does-not-exist")
+                .is_none(),
+            "an unpublished offering is omitted from the index"
         );
     }
 
