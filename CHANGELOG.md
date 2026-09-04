@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0](https://github.com/Litvue/axond/compare/v0.5.0...v0.6.0) (2026-09-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* 429 budget_exceeded is spent >= limit (or no budget row). GET remaining is limit - spent; reserved_microdollars is always 0. Concurrent in-flight requests can overshoot the cap.
+* gateway-core and gateway-transport are unpublished workspace members. Historical versions stay on the registry; they are not yanked. cargo install axond remains the crates.io path. The published tarball flattens those internals so it compiles without resolving them from crates.io.
+
+### Features
+
+* charge actuals after response, no pre-dispatch budget hold ([#445](https://github.com/Litvue/axond/issues/445)) ([d8adb6b](https://github.com/Litvue/axond/commit/d8adb6b902aff9cf7bfaa10f8652ddf573f89f57))
+* **gateway:** charge spend from imported models.dev rates ([#442](https://github.com/Litvue/axond/issues/442)) ([6c67fa6](https://github.com/Litvue/axond/commit/6c67fa6bd5d0d2373592f19a07c60e74813128a0))
+* publish only the axond binary crate to crates.io ([#444](https://github.com/Litvue/axond/issues/444)) ([43b46f2](https://github.com/Litvue/axond/commit/43b46f2ff16b832974218a92873bd68056b21c53))
+
 ## [0.5.0](https://github.com/Litvue/axond/compare/v0.4.2...v0.5.0) (2026-09-03)
 
 
