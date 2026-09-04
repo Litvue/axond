@@ -8,10 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "HTTP transport for the Axond gateway: credential injection, timeouts, retries, and connection pooling around gateway-core adapters."
-keywords = ["llm", "gateway", "http", "streaming", "proxy"]
-categories = ["web-programming::http-client", "api-bindings"]
-# Only the library sources ship; the workspace README is added by Cargo because
-# `readme` is inherited from the workspace.
+publish = false
+# Only the library sources ship when this crate is packaged locally; it is not
+# published to crates.io. The workspace README is inherited for `cargo doc`.
 include = ["src/**/*.rs"]
 
 [dependencies]

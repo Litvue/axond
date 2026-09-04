@@ -693,8 +693,9 @@ at the job, and a `pull_request_target` or workflow-run trigger on untrusted
 input is an ADR-level decision, not a workflow tweak.
 
 **Regression tests.** The release path is exercised on every change rather than
-at the tag: `publish-dry-run` packages each crate from its own tarball in
-dependency order, `docker-smoke` and `quickstart-smoke` boot what is shipped,
+at the tag: `publish-dry-run` stages a self-contained `axond` tarball (internals
+are not crates.io packages) and verifies that package, `docker-smoke` and
+`quickstart-smoke` boot what is shipped,
 `static-binary` proves the musl build and runs `ops/tier0-gate.sh`, the
 `openapi-smoke` dumps the generated OpenAPI 3.1 spec and typechecks a client from
 it, the

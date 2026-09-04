@@ -59,6 +59,7 @@ docs-check: ops-venv
     python3 ops/check-release-config.py
     python3 ops/qualification-evidence.py --self-test
     python3 ops/promote-qualification.py --self-test
+    python3 ops/stage-axond-crate.py --self-test
     sh -n install.sh
     bash -n ops/publish-image-index.sh
     bash -n ops/verify-image-evidence.sh
@@ -127,9 +128,11 @@ deploy-lock:
 msrv:
     ops/msrv-gate.sh
 
-# Public Rust API compatibility for the published library crates, against the
-# versions on crates.io. Needs cargo-semver-checks and network. Runs on any
-# python3 from 3.10 up, the same floor as the provider-SDK lockfile.
+# Public Rust API compatibility for published library crates. Axond's crates.io
+# product is the binary, so an empty library set is success. Needs
+# cargo-semver-checks and network only when a workspace member publishes a
+# library. Runs on any python3 from 3.10 up, the same floor as the provider-SDK
+# lockfile.
 api-compat:
     ops/api-compat.py
 
@@ -157,8 +160,9 @@ actionlint:
 deny:
     cargo deny --locked --all-features check
 
-# Package and publish-dry-run the three crates in dependency order. No upload,
-# no token; the real publish only ever runs from the tagged release workflow.
+# Package and publish-dry-run the flattened axond crate. No upload, no token;
+# the real publish only ever runs from the tagged release workflow. Internals
+# stay unpublished workspace members.
 publish-dry-run:
     ops/publish-crates.sh --dry-run
 

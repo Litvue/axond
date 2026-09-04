@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
+publish = false
 description = "Axond — a store-backed, single-binary, self-hosted AI gateway: one place for provider keys, namespaced inference, usage, and telemetry."
 keywords = ["llm", "gateway", "openai", "anthropic", "proxy"]
 categories = ["command-line-utilities", "web-programming::http-server"]
@@ -17,8 +18,9 @@ categories = ["command-line-utilities", "web-programming::http-server"]
 # `ops/postgres/*.sql`, which sits outside this crate and so cannot be packaged;
 # `tests/shipped_ddl.rs` fails if a copy drifts by a byte. The integration suites
 # under `tests/` depend on workspace-root fixtures and are not part of the
-# published package. The workspace README is added by Cargo because `readme` is
-# inherited.
+# published package. crates.io does not publish this workspace member as-is:
+# `ops/stage-axond-crate.py` flattens unpublished internals into a standalone
+# tarball. The workspace README is added by Cargo because `readme` is inherited.
 include = ["src/**/*.rs", "src/**/*.json", "sql/*.sql"]
 
 [[bin]]
