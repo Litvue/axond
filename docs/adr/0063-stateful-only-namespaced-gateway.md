@@ -332,9 +332,9 @@ cache. Implementations:
 No Redis, no blob control plane, no in-memory store, no “none”. Forward-only
 migrations remain ([ADR 0032](./0032-operator-preflight-and-forward-only-migrations.md)).
 
-Request-path store access is: namespace lookup, a spent-vs-limit read,
-then after the response a spent increment. Usage append stays off the
-request path (ADR 0009). Discovery refresh is background.
+Request-path store access is one namespace+admit join, then after the
+response a spent increment. Usage append stays off the request path
+(ADR 0009). Discovery refresh is background.
 
 ## Consumer contract (Litvue)
 

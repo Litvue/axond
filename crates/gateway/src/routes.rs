@@ -56,7 +56,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::admission::{AdmissionPermit, DiagnosticCredential, RequestKind};
 use crate::aliases::AliasScope;
-use crate::budget::{Admission, BudgetKey, Denial, Reservation};
+use crate::budget::{Admission, BudgetKey, Denial, Reservation, admission_from_store};
 use crate::config::{
     Config, CoreAccountingMode, Model, Provider, ProviderKind, ProviderWire, Target, UnpricedModels,
 };
@@ -72,7 +72,7 @@ use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::status::{StatusResponse, StatusScope};
-use crate::store::{NamespaceRecord, StoreError};
+use crate::store::{BudgetAdmit, NamespaceRecord, StoreError};
 use crate::streaming::{self, Framing, StreamContext, StreamDelivery};
 use crate::telemetry;
 use crate::usage::identity::EventIdentity;
@@ -1032,12 +1032,41 @@ async fn authenticate_middleware(
             .namespace_grant()
             .map_err(|_| GatewayError::NamespaceNotAuthorized)?;
         let authorized = grant.permits(&namespace);
-        let record = match state.store() {
-            Some(store) => store
-                .get_namespace(namespace.as_str())
-                .await
-                .map_err(GatewayError::from)?,
-            None => None,
+        let reuse_admit = match (state.store(), state.0.budget.store_ledger()) {
+            (Some(namespaces), Some(ledger)) => Arc::ptr_eq(namespaces, ledger),
+            _ => false,
+        };
+        let record = if reuse_admit {
+            let resolved = match state.store() {
+                Some(store) => store
+                    .resolve_namespace(namespace.as_str())
+                    .await
+                    .map_err(GatewayError::from)?,
+                None => None,
+            };
+            let Some(resolved) = resolved else {
+                if !authorized {
+                    return Err(GatewayError::NamespaceNotAuthorized);
+                }
+                return Err(GatewayError::UnknownNamespace);
+            };
+            request.extensions_mut().insert(resolved.admit);
+            resolved.record
+        } else {
+            match state.store() {
+                Some(store) => store
+                    .get_namespace(namespace.as_str())
+                    .await
+                    .map_err(GatewayError::from)?,
+                None => None,
+            }
+            .ok_or_else(|| {
+                if !authorized {
+                    GatewayError::NamespaceNotAuthorized
+                } else {
+                    GatewayError::UnknownNamespace
+                }
+            })?
         };
         if !authorized {
             debug!(
@@ -1048,15 +1077,14 @@ async fn authenticate_middleware(
             );
             return Err(GatewayError::NamespaceNotAuthorized);
         }
-        let Some(record) = record else {
-            return Err(GatewayError::UnknownNamespace);
-        };
 
         // Downstream code reads one effective namespace from the caller
         // context. Replacing it here makes the path authoritative when a later
         // grant implementation permits a set or all namespaces. Attrs are
         // copied at admission so usage records carry the workspace metadata
-        // Litvue stored (ADR 0063).
+        // Litvue stored (ADR 0063). When the budget ledger is this Store,
+        // admit is loaded in the same round trip so inference does not hit
+        // Postgres again before dispatch.
         caller.namespace = namespace.to_string();
         caller.attrs = Some(record.attrs.clone());
         request.extensions_mut().insert(namespace);
@@ -1457,6 +1485,7 @@ async fn chat_completions(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1467,6 +1496,7 @@ async fn chat_completions(
         snapshot,
         caller,
         record.map(|Extension(record)| record),
+        admit.map(|Extension(admit)| admit),
     )
     .await
 }
@@ -1481,6 +1511,7 @@ async fn native_messages(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1491,6 +1522,7 @@ async fn native_messages(
         snapshot,
         caller,
         record.map(|Extension(record)| record),
+        admit.map(|Extension(admit)| admit),
     )
     .await
 }
@@ -1501,6 +1533,7 @@ async fn embeddings(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1511,6 +1544,7 @@ async fn embeddings(
         snapshot,
         caller,
         record.map(|Extension(record)| record),
+        admit.map(|Extension(admit)| admit),
     )
     .await
 }
@@ -1521,6 +1555,7 @@ async fn responses(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1531,6 +1566,7 @@ async fn responses(
         snapshot,
         caller,
         record.map(|Extension(record)| record),
+        admit.map(|Extension(admit)| admit),
     )
     .await
 }
@@ -1549,6 +1585,7 @@ async fn serve(
     snapshot: Arc<ConfigSnapshot>,
     caller: InboundKey,
     namespace: Option<NamespaceRecord>,
+    preloaded_admit: Option<BudgetAdmit>,
 ) -> Result<Response, GatewayError> {
     let cfg = &snapshot.config;
     let ns_blocklist = namespace
@@ -1814,6 +1851,7 @@ async fn serve(
                     estimated_cost,
                     estimate.input_tokens,
                     &alias,
+                    preloaded_admit,
                 )
                 .await?;
             middleware_execution
@@ -1823,7 +1861,11 @@ async fn serve(
                 .clone()
         }
         CoreAccountingMode::Legacy => {
-            match state.0.budget.reserve(&budget_key, estimated_cost).await {
+            let admission = match preloaded_admit {
+                Some(admit) => admission_from_store(admit),
+                None => state.0.budget.reserve(&budget_key, estimated_cost).await,
+            };
+            match admission {
                 Admission::Allowed(reservation) => reservation,
                 Admission::Denied(Denial::Exceeded) => {
                     return Err(GatewayError::BudgetExceeded(alias));
@@ -7399,6 +7441,7 @@ output_microdollars_per_million = 10000000
                     attrs: None,
                 },
                 None,
+                None,
             )
             .await
             .unwrap_err()
@@ -7442,6 +7485,7 @@ output_microdollars_per_million = 10000000
                         namespace_grant: None,
                         attrs: None,
                     },
+                    None,
                     None,
                 )
                 .await
@@ -10394,6 +10438,7 @@ output_microdollars_per_million = 1000000
             snapshot,
             caller,
             None,
+            None,
         )
         .await
         .expect_err("post-middleware estimate exceeds the caller ceiling");
@@ -10988,6 +11033,7 @@ output_microdollars_per_million = 1
             snapshot,
             caller,
             None,
+            None,
         )
         .await
         .expect_err("the estimate exceeds the caller ceiling");
@@ -11030,6 +11076,7 @@ output_microdollars_per_million = 1
             Route::ChatCompletions,
             snapshot,
             caller,
+            None,
             None,
         )
         .await

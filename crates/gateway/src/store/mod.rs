@@ -6,6 +6,9 @@
 //! `(namespace, period)`) lives here, not in Redis. Postgres tables are
 //! `axond_store_budget*` so they do not collide with leftover `axond_budget`
 //! from the withdrawn `[budget]` backend.
+//!
+//! Inference Store access is one namespace+admit join, then one spent
+//! increment after the response (ADR 0064).
 
 use std::sync::Arc;
 
@@ -162,6 +165,29 @@ pub enum BudgetAdmit {
     Exceeded,
 }
 
+/// Namespace row plus spent-vs-limit admit, loaded in one round trip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamespaceResolve {
+    pub record: NamespaceRecord,
+    pub admit: BudgetAdmit,
+}
+
+/// `spent < limit` on a live active period. Missing ledger is exceeded.
+pub(crate) fn admit_from_ledger(
+    period: Option<String>,
+    limit: Option<i64>,
+    spent: Option<i64>,
+    incarnation: i64,
+) -> BudgetAdmit {
+    match (period, limit, spent) {
+        (Some(period), Some(limit), Some(spent)) if spent < limit => BudgetAdmit::Allowed {
+            period,
+            incarnation,
+        },
+        _ => BudgetAdmit::Exceeded,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("namespace `{0}` already exists")]
@@ -178,6 +204,15 @@ pub enum StoreError {
 pub trait Store: Send + Sync {
     async fn put_namespace(&self, ns: NamespaceRecord) -> Result<(), StoreError>;
     async fn get_namespace(&self, id: &str) -> Result<Option<NamespaceRecord>, StoreError>;
+    /// Namespace row and spent-vs-limit admit in one round trip. Missing id is
+    /// `Ok(None)`. Default is two sequential calls; SQLite/Postgres override.
+    async fn resolve_namespace(&self, id: &str) -> Result<Option<NamespaceResolve>, StoreError> {
+        let Some(record) = self.get_namespace(id).await? else {
+            return Ok(None);
+        };
+        let admit = self.admit_budget(id).await?;
+        Ok(Some(NamespaceResolve { record, admit }))
+    }
     async fn list_namespaces(
         &self,
         cursor: Option<String>,
@@ -519,6 +554,28 @@ mod tests {
         assert_eq!(sql_amount_saturating(640), 640);
     }
 
+    #[test]
+    fn admit_from_ledger_requires_room_on_a_live_period() {
+        assert!(matches!(
+            admit_from_ledger(None, None, None, 1),
+            BudgetAdmit::Exceeded
+        ));
+        assert!(matches!(
+            admit_from_ledger(Some("p".into()), Some(10), Some(10), 1),
+            BudgetAdmit::Exceeded
+        ));
+        match admit_from_ledger(Some("p".into()), Some(10), Some(9), 2) {
+            BudgetAdmit::Allowed {
+                period,
+                incarnation,
+            } => {
+                assert_eq!(period, "p");
+                assert_eq!(incarnation, 2);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn sqlite_round_trip_and_duplicate() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
@@ -694,6 +751,52 @@ mod tests {
             store.admit_budget("wsp_x").await.expect("closed"),
             BudgetAdmit::Exceeded
         ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_resolve_namespace_joins_admit() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        assert!(
+            store
+                .resolve_namespace("ghost")
+                .await
+                .expect("missing")
+                .is_none()
+        );
+        let none = store
+            .resolve_namespace("wsp_x")
+            .await
+            .expect("resolve")
+            .expect("ns");
+        assert_eq!(none.record.id, "wsp_x");
+        assert_eq!(none.admit, BudgetAdmit::Exceeded);
+        store.put_budget("wsp_x", "p", 100).await.expect("put");
+        let ok = store
+            .resolve_namespace("wsp_x")
+            .await
+            .expect("resolve")
+            .expect("ns");
+        match ok.admit {
+            BudgetAdmit::Allowed {
+                period,
+                incarnation,
+            } => {
+                assert_eq!(period, "p");
+                assert_eq!(incarnation, 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        store
+            .charge_budget("wsp_x", "p", 1, 100)
+            .await
+            .expect("fill");
+        let full = store
+            .resolve_namespace("wsp_x")
+            .await
+            .expect("resolve")
+            .expect("ns");
+        assert_eq!(full.admit, BudgetAdmit::Exceeded);
     }
 
     #[tokio::test]

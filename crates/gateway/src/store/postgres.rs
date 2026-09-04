@@ -7,8 +7,9 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
-    BudgetAdmit, BudgetRecord, NamespaceRecord, ProviderModels, Store, StoreError, UsageAppend,
-    UsageSummaryRow, from_sql_amount, sql_amount, sql_amount_saturating,
+    BudgetAdmit, BudgetRecord, NamespaceRecord, NamespaceResolve, ProviderModels, Store,
+    StoreError, UsageAppend, UsageSummaryRow, admit_from_ledger, from_sql_amount, sql_amount,
+    sql_amount_saturating,
 };
 use crate::backends::health::{BackendHealth, PostgresHealth};
 
@@ -621,6 +622,12 @@ impl Store for PostgresStore {
         .await
     }
 
+    async fn resolve_namespace(&self, id: &str) -> Result<Option<NamespaceResolve>, StoreError> {
+        let id = id.to_owned();
+        self.with_client(async move |client| resolve_namespace_on(client, &id).await)
+            .await
+    }
+
     async fn list_namespaces(
         &self,
         cursor: Option<String>,
@@ -778,15 +785,7 @@ impl Store for PostgresStore {
         let period = period.to_owned();
         let actual = sql_amount_saturating(actual_microdollars);
         self.with_client(async move |client| {
-            let tx = client
-                .transaction()
-                .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            charge_budget_tx(&tx, &namespace, &period, incarnation, actual).await?;
-            tx.commit()
-                .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            Ok(())
+            charge_budget_on(client, &namespace, &period, incarnation, actual).await
         })
         .await
     }
@@ -994,8 +993,9 @@ fn postgres_provider_models(
 }
 
 /// Transaction-scoped advisory lock on the namespace id. Shared by CREATE,
-/// DELETE, PUT budget, and settle so those paths cannot deadlock or orphan
-/// ledgers. Does not insert an incarnation row for a missing id.
+/// DELETE, and PUT budget so those paths cannot deadlock or orphan ledgers.
+/// Charge is a single UPDATE and does not take this lock. Does not insert an
+/// incarnation row for a missing id.
 async fn lock_namespace_id(tx: &Transaction<'_>, id: &str) -> Result<(), StoreError> {
     tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", &[&id])
         .await
@@ -1091,44 +1091,33 @@ async fn put_budget_tx(
         .ok_or_else(|| StoreError::Unavailable("budget row missing after put".into()))
 }
 
-async fn charge_budget_tx(
-    tx: &Transaction<'_>,
+async fn charge_budget_on(
+    client: &impl GenericClient,
     namespace: &str,
     period: &str,
     incarnation: i64,
     actual: i64,
 ) -> Result<(), StoreError> {
-    lock_namespace_id(tx, namespace).await?;
-    let ns_exists = tx
-        .query_opt(
-            "SELECT id FROM axond_namespace WHERE id = $1 FOR UPDATE",
-            &[&namespace],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?
-        .is_some();
-    let current: i64 = tx
-        .query_opt(
-            "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
-            &[&namespace],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?
-        .map(|row| row.get(0))
-        .unwrap_or(1);
-    if ns_exists && incarnation == current {
-        tx.execute(
+    // One statement: READ COMMITTED re-evaluates `spent + actual` after waiting
+    // on the row, so concurrent charges both apply. Incarnation and namespace
+    // existence are the same snapshot as the increment (ADR 0064).
+    client
+        .execute(
             "UPDATE axond_store_budget
              SET spent_microdollars = CASE
                  WHEN spent_microdollars >= 9223372036854775807 - $1 THEN 9223372036854775807
                  ELSE spent_microdollars + $1
              END
-             WHERE namespace = $2 AND period = $3",
-            &[&actual, &namespace, &period],
+             WHERE namespace = $2 AND period = $3
+               AND EXISTS (SELECT 1 FROM axond_namespace WHERE id = $2)
+               AND COALESCE(
+                     (SELECT n FROM axond_namespace_incarnation WHERE id = $2),
+                     1
+                   ) = $4",
+            &[&actual, &namespace, &period, &incarnation],
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    }
     Ok(())
 }
 
@@ -1152,17 +1141,40 @@ async fn admit_budget_on(
     else {
         return Ok(BudgetAdmit::Exceeded);
     };
-    let period: String = row.get(0);
-    let limit: i64 = row.get(1);
-    let spent: i64 = row.get(2);
-    let incarnation: i64 = row.get(3);
-    if spent >= limit {
-        return Ok(BudgetAdmit::Exceeded);
-    }
-    Ok(BudgetAdmit::Allowed {
-        period,
-        incarnation,
-    })
+    Ok(admit_from_ledger(
+        Some(row.get(0)),
+        Some(row.get(1)),
+        Some(row.get(2)),
+        row.get(3),
+    ))
+}
+
+async fn resolve_namespace_on(
+    client: &impl GenericClient,
+    id: &str,
+) -> Result<Option<NamespaceResolve>, StoreError> {
+    let Some(row) = client
+        .query_opt(
+            "SELECT n.id, n.attrs, n.blocklist,
+                    a.period, b.limit_microdollars, b.spent_microdollars,
+                    COALESCE(i.n, 1)
+             FROM axond_namespace n
+             LEFT JOIN axond_store_budget_active a ON a.namespace = n.id
+             LEFT JOIN axond_store_budget b
+               ON b.namespace = a.namespace AND b.period = a.period
+             LEFT JOIN axond_namespace_incarnation i ON i.id = n.id
+             WHERE n.id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(NamespaceResolve {
+        record: record_from(row.get(0), row.get(1), row.get(2))?,
+        admit: admit_from_ledger(row.get(3), row.get(4), row.get(5), row.get(6)),
+    }))
 }
 
 #[cfg(test)]

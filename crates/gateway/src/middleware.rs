@@ -28,12 +28,13 @@ use secrecy::zeroize::Zeroize;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::budget::{Admission, BudgetKey, Denial, Reservation};
+use crate::budget::{Admission, BudgetKey, Denial, Reservation, admission_from_store};
 use crate::config::Config;
 use crate::desired_state::ContentMiddlewareRegistration;
 use crate::error::GatewayError;
 use crate::rate_limit::{RateLimitError, RateLimitKey, RateLimitPermit};
 use crate::state::AppState;
+use crate::store::BudgetAdmit;
 
 /// Keep abandoned synchronous invocations from consuming Tokio's entire
 /// process-wide blocking pool. A timed-out task retains its permit until the
@@ -1069,9 +1070,14 @@ impl MiddlewareExecution {
         estimated_microdollars: u64,
         estimated_input_tokens: u64,
         alias: &str,
+        preloaded: Option<BudgetAdmit>,
     ) -> Result<(), GatewayError> {
         debug_assert!(self.core_budget.is_none());
-        let reservation = match state.0.budget.reserve(&key, estimated_microdollars).await {
+        let admission = match preloaded {
+            Some(admit) => admission_from_store(admit),
+            None => state.0.budget.reserve(&key, estimated_microdollars).await,
+        };
+        let reservation = match admission {
             Admission::Allowed(reservation) => reservation,
             Admission::Denied(Denial::Exceeded) => {
                 return Err(GatewayError::BudgetExceeded(alias.to_owned()));

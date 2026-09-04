@@ -45,8 +45,8 @@ The Store ledger does not write a hold on the inference path.
 - `[budget] backend` remains withdrawn (ADR 0063).
   `reservation_ttl_seconds` is unused on the live Store path.
 
-Request-path Store access is: namespace lookup, a spent-vs-limit read, then
-after the response a spent increment. Usage append stays off the path.
+Request-path Store access is one namespace+admit join, then after the
+response a single spent increment. Usage append stays off the path.
 
 ## Consequences
 

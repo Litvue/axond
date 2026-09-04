@@ -44,6 +44,7 @@ use crate::backends::health::BackendHealth;
 use crate::config::{BudgetBackend, BudgetConfig, StoreUnavailable};
 use crate::desired_state::policy::PolicyGeneration;
 use crate::policy::{BudgetCaps, Ceilings, PolicyHold, Unenforceable, denied};
+use crate::store::BudgetAdmit;
 use crate::telemetry::metrics;
 
 pub use postgres::PostgresBudget;
@@ -140,6 +141,23 @@ impl Admission {
     }
 }
 
+/// Map a Store spent-vs-limit read onto the request-path admission type.
+pub(crate) fn admission_from_store(admit: BudgetAdmit) -> Admission {
+    match admit {
+        BudgetAdmit::Allowed {
+            period,
+            incarnation,
+        } => Admission::Allowed(Reservation {
+            id: Reservation::next_id(),
+            estimate_microdollars: 0,
+            generation: None,
+            period: Some(period),
+            incarnation: Some(incarnation),
+        }),
+        BudgetAdmit::Exceeded => Admission::Denied(Denial::Exceeded),
+    }
+}
+
 #[async_trait]
 pub trait BudgetStore: Send + Sync {
     fn name(&self) -> &'static str;
@@ -169,6 +187,12 @@ pub trait BudgetStore: Send + Sync {
     ///
     /// [`ComponentProbe`]: crate::status::registry::ComponentProbe
     fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        None
+    }
+
+    /// Same `Store` the namespace lookup uses, when this ledger is that Store.
+    /// The request path then reuses a preloaded admit instead of a second RTT.
+    fn store_ledger(&self) -> Option<&Arc<dyn crate::store::Store>> {
         None
     }
 }

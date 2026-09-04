@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use super::{Admission, BudgetKey, BudgetStore, Denial, Reservation, UnavailablePolicy};
 use crate::backends::health::BackendHealth;
 use crate::config::StoreUnavailable;
-use crate::store::{BudgetAdmit, Store, StoreError};
+use crate::store::{Store, StoreError};
 
 pub struct StoreBudget {
     store: Arc<dyn Store>,
@@ -41,19 +41,13 @@ impl BudgetStore for StoreBudget {
         self.store.health()
     }
 
+    fn store_ledger(&self) -> Option<&Arc<dyn Store>> {
+        Some(&self.store)
+    }
+
     async fn reserve(&self, key: &BudgetKey, _estimated_microdollars: u64) -> Admission {
         match self.store.admit_budget(&key.namespace).await {
-            Ok(BudgetAdmit::Allowed {
-                period,
-                incarnation,
-            }) => Admission::Allowed(Reservation {
-                id: Reservation::next_id(),
-                estimate_microdollars: 0,
-                generation: None,
-                period: Some(period),
-                incarnation: Some(incarnation),
-            }),
-            Ok(BudgetAdmit::Exceeded) => Admission::Denied(Denial::Exceeded),
+            Ok(admit) => super::admission_from_store(admit),
             Err(StoreError::Invalid(_)) => Admission::Denied(Denial::Exceeded),
             Err(error) => self.on_unavailable(&error),
         }

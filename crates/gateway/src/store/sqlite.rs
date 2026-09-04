@@ -6,8 +6,9 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use super::{
-    BudgetAdmit, BudgetRecord, NamespaceRecord, ProviderModels, Store, StoreError, UsageAppend,
-    UsageSummaryRow, from_sql_amount, sql_amount, sql_amount_saturating,
+    BudgetAdmit, BudgetRecord, NamespaceRecord, NamespaceResolve, ProviderModels, Store,
+    StoreError, UsageAppend, UsageSummaryRow, admit_from_ledger, from_sql_amount, sql_amount,
+    sql_amount_saturating,
 };
 
 pub struct SqliteStore {
@@ -200,18 +201,6 @@ fn migrate_provider_models_source(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn current_incarnation(conn: &Connection, id: &str) -> Result<i64, StoreError> {
-    Ok(conn
-        .query_row(
-            "SELECT n FROM axond_namespace_incarnation WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(unavailable)?
-        .unwrap_or(1))
-}
-
 fn namespace_exists(conn: &Connection, id: &str) -> Result<bool, StoreError> {
     Ok(conn
         .query_row(
@@ -322,6 +311,12 @@ impl Store for SqliteStore {
             .transpose()
         })
         .await
+    }
+
+    async fn resolve_namespace(&self, id: &str) -> Result<Option<NamespaceResolve>, StoreError> {
+        let id = id.to_string();
+        self.with_conn(move |conn| resolve_namespace_on(conn, &id))
+            .await
     }
 
     async fn list_namespaces(
@@ -730,36 +725,73 @@ fn sqlite_provider_models(
 }
 
 fn admit_budget_on(conn: &Connection, namespace: &str) -> Result<BudgetAdmit, StoreError> {
-    let Some(period) = conn
+    let row = conn
         .query_row(
-            "SELECT period FROM axond_store_budget_active WHERE namespace = ?1",
+            "SELECT a.period, b.limit_microdollars, b.spent_microdollars,
+                    COALESCE((SELECT n FROM axond_namespace_incarnation WHERE id = ?1), 1)
+             FROM axond_store_budget_active a
+             JOIN axond_store_budget b
+               ON b.namespace = a.namespace AND b.period = a.period
+             WHERE a.namespace = ?1",
             params![namespace],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
         )
         .optional()
-        .map_err(unavailable)?
-    else {
-        return Ok(BudgetAdmit::Exceeded);
-    };
-    let Some((limit, spent)) = conn
-        .query_row(
-            "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget
-             WHERE namespace = ?1 AND period = ?2",
-            params![namespace, period],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(unavailable)?
-    else {
-        return Ok(BudgetAdmit::Exceeded);
-    };
-    if spent >= limit {
-        return Ok(BudgetAdmit::Exceeded);
-    }
-    Ok(BudgetAdmit::Allowed {
-        period,
-        incarnation: current_incarnation(conn, namespace)?,
+        .map_err(unavailable)?;
+    Ok(match row {
+        Some((period, limit, spent, incarnation)) => {
+            admit_from_ledger(Some(period), Some(limit), Some(spent), incarnation)
+        }
+        None => BudgetAdmit::Exceeded,
     })
+}
+
+fn resolve_namespace_on(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<NamespaceResolve>, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT n.id, n.attrs, n.blocklist,
+                    a.period, b.limit_microdollars, b.spent_microdollars,
+                    COALESCE(i.n, 1)
+             FROM axond_namespace n
+             LEFT JOIN axond_store_budget_active a ON a.namespace = n.id
+             LEFT JOIN axond_store_budget b
+               ON b.namespace = a.namespace AND b.period = a.period
+             LEFT JOIN axond_namespace_incarnation i ON i.id = n.id
+             WHERE n.id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(unavailable)?;
+    row.map(
+        |(id, attrs, blocklist, period, limit, spent, incarnation)| {
+            Ok(NamespaceResolve {
+                record: row_to_record(id, attrs, blocklist)?,
+                admit: admit_from_ledger(period, limit, spent, incarnation),
+            })
+        },
+    )
+    .transpose()
 }
 
 fn charge_budget_on(
@@ -769,20 +801,19 @@ fn charge_budget_on(
     incarnation: i64,
     actual: i64,
 ) -> Result<(), StoreError> {
-    if !namespace_exists(conn, namespace)? {
-        return Ok(());
-    }
-    if current_incarnation(conn, namespace)? != incarnation {
-        return Ok(());
-    }
     conn.execute(
         "UPDATE axond_store_budget
          SET spent_microdollars = CASE
              WHEN spent_microdollars >= 9223372036854775807 - ?1 THEN 9223372036854775807
              ELSE spent_microdollars + ?1
          END
-         WHERE namespace = ?2 AND period = ?3",
-        params![actual, namespace, period],
+         WHERE namespace = ?2 AND period = ?3
+           AND EXISTS (SELECT 1 FROM axond_namespace WHERE id = ?2)
+           AND COALESCE(
+                 (SELECT n FROM axond_namespace_incarnation WHERE id = ?2),
+                 1
+               ) = ?4",
+        params![actual, namespace, period, incarnation],
     )
     .map_err(unavailable)?;
     Ok(())
