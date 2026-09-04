@@ -1032,6 +1032,11 @@ async fn authenticate_middleware(
             .namespace_grant()
             .map_err(|_| GatewayError::NamespaceNotAuthorized)?;
         let authorized = grant.permits(&namespace);
+        let missing = if !authorized {
+            GatewayError::NamespaceNotAuthorized
+        } else {
+            GatewayError::UnknownNamespace
+        };
         let reuse_admit = match (state.store(), state.0.budget.store_ledger()) {
             (Some(namespaces), Some(ledger)) => Arc::ptr_eq(namespaces, ledger),
             _ => false,
@@ -1043,13 +1048,8 @@ async fn authenticate_middleware(
                     .await
                     .map_err(GatewayError::from)?,
                 None => None,
-            };
-            let Some(resolved) = resolved else {
-                if !authorized {
-                    return Err(GatewayError::NamespaceNotAuthorized);
-                }
-                return Err(GatewayError::UnknownNamespace);
-            };
+            }
+            .ok_or(missing)?;
             request.extensions_mut().insert(resolved.admit);
             resolved.record
         } else {
@@ -1060,13 +1060,7 @@ async fn authenticate_middleware(
                     .map_err(GatewayError::from)?,
                 None => None,
             }
-            .ok_or_else(|| {
-                if !authorized {
-                    GatewayError::NamespaceNotAuthorized
-                } else {
-                    GatewayError::UnknownNamespace
-                }
-            })?
+            .ok_or(missing)?
         };
         if !authorized {
             debug!(
@@ -1460,6 +1454,21 @@ impl Wire {
     }
 }
 
+struct ServeNs {
+    record: NamespaceRecord,
+    admit: Option<BudgetAdmit>,
+}
+
+fn serve_ns(
+    record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
+) -> Option<ServeNs> {
+    record.map(|Extension(record)| ServeNs {
+        record,
+        admit: admit.map(|Extension(admit)| admit),
+    })
+}
+
 /// The inbound body, or a typed refusal. An oversized body is a bound the
 /// gateway imposed (`413`), a wrong media type is `415` as axum's extractor
 /// already answered it, and a malformed one is the caller's (`400`); no
@@ -1495,8 +1504,7 @@ async fn chat_completions(
         Route::ChatCompletions,
         snapshot,
         caller,
-        record.map(|Extension(record)| record),
-        admit.map(|Extension(admit)| admit),
+        serve_ns(record, admit),
     )
     .await
 }
@@ -1521,8 +1529,7 @@ async fn native_messages(
         Route::NativeMessages,
         snapshot,
         caller,
-        record.map(|Extension(record)| record),
-        admit.map(|Extension(admit)| admit),
+        serve_ns(record, admit),
     )
     .await
 }
@@ -1543,8 +1550,7 @@ async fn embeddings(
         Route::Embeddings,
         snapshot,
         caller,
-        record.map(|Extension(record)| record),
-        admit.map(|Extension(admit)| admit),
+        serve_ns(record, admit),
     )
     .await
 }
@@ -1565,8 +1571,7 @@ async fn responses(
         Route::Responses,
         snapshot,
         caller,
-        record.map(|Extension(record)| record),
-        admit.map(|Extension(admit)| admit),
+        serve_ns(record, admit),
     )
     .await
 }
@@ -1584,15 +1589,15 @@ async fn serve(
     route: Route,
     snapshot: Arc<ConfigSnapshot>,
     caller: InboundKey,
-    namespace: Option<NamespaceRecord>,
-    preloaded_admit: Option<BudgetAdmit>,
+    namespace: Option<ServeNs>,
 ) -> Result<Response, GatewayError> {
     let cfg = &snapshot.config;
     let ns_blocklist = namespace
         .as_ref()
-        .and_then(|record| record.blocklist.clone())
+        .and_then(|ns| ns.record.blocklist.clone())
         .unwrap_or_default();
-    let attrs = namespace.map(|record| record.attrs);
+    let preloaded_admit = namespace.as_ref().and_then(|ns| ns.admit.clone());
+    let attrs = namespace.map(|ns| ns.record.attrs);
 
     route.validate_routing_controls(&body)?;
 
@@ -7441,7 +7446,6 @@ output_microdollars_per_million = 10000000
                     attrs: None,
                 },
                 None,
-                None,
             )
             .await
             .unwrap_err()
@@ -7485,7 +7489,6 @@ output_microdollars_per_million = 10000000
                         namespace_grant: None,
                         attrs: None,
                     },
-                    None,
                     None,
                 )
                 .await
@@ -10438,7 +10441,6 @@ output_microdollars_per_million = 1000000
             snapshot,
             caller,
             None,
-            None,
         )
         .await
         .expect_err("post-middleware estimate exceeds the caller ceiling");
@@ -11033,7 +11035,6 @@ output_microdollars_per_million = 1
             snapshot,
             caller,
             None,
-            None,
         )
         .await
         .expect_err("the estimate exceeds the caller ceiling");
@@ -11076,7 +11077,6 @@ output_microdollars_per_million = 1
             Route::ChatCompletions,
             snapshot,
             caller,
-            None,
             None,
         )
         .await
