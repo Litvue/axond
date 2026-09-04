@@ -70,10 +70,9 @@ the fix for a supported version is always a patch upgrade — see the
 and unreleased `main` commits are not separately supported; report against them
 and the fix ships in the next release.
 
-Only crates published from this repository (`axond`, `gateway-core`,
-`gateway-transport`) and the release artifacts described in
-[installation and verification](./docs/installation.md) are supported. A fork,
-a patched build, or a vendored copy is yours to fix.
+Only the `axond` crate published from this repository and the release artifacts
+described in [installation and verification](./docs/installation.md) are
+supported. A fork, a patched build, or a vendored copy is yours to fix.
 
 ## What to expect
 
@@ -120,7 +119,7 @@ to be.
 4. A backport to the previous supported minor when that release is affected.
 5. Publication of the GitHub Security Advisory with a CVE requested through
    GitHub, the affected and fixed version ranges, and the workaround if one
-   exists. `RUSTSEC` coordination for the published library crates happens here
+   exists. `RUSTSEC` coordination for the published `axond` crate happens here
    too, so `cargo audit` and the repository's
    [dependency policy](./.github/workflows/dependency-audit.yml) lane see it.
 6. A `CHANGELOG.md` entry referencing the advisory, and any configuration

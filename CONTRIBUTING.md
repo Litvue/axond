@@ -28,7 +28,7 @@ just compat     # run the Python SDK compatibility lane
 just compat-ts  # run the TypeScript SDK compatibility lane
 just fuzz-smoke # replay the committed fuzz corpora (see fuzz/README.md)
 just msrv       # build on the declared minimum supported Rust version
-just api-compat # semver-check the published library crates against crates.io
+just api-compat # published-library API gate (empty set is success)
 just workflow-policy
                 # check the Action pins, workflow permissions, and the release
                 # signer restriction
@@ -78,13 +78,14 @@ path, adding or bumping a dependency of any `crates/` member leaves
 `fuzz/Cargo.lock` stale: run `just fuzz-lock` and commit it, which the `Fuzz
 smoke` lane asks for by name before it replays anything.
 
-Changing anything public in `gateway-core` or `gateway-transport`? Run the
-compatibility gate, which compares the crates against the versions on crates.io
-(needs [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
-and network access):
+`gateway-core` and `gateway-transport` are unpublished workspace members, not a
+crates.io library product. `just api-compat` still runs: an empty published
+library set is success, and a newly publishable library crate is compared
+against crates.io the day it is added (needs
+[`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
+and network access in that case):
 
 ```bash
-cargo install cargo-semver-checks --locked
 just api-compat
 ```
 
@@ -98,12 +99,14 @@ first time it builds its venv from
 [`ops/deploy-requirements.txt`](./ops/deploy-requirements.txt) (refreshed with
 `just deploy-lock`).
 
-A break fails CI. If it is intentional, add a reviewed entry to
-[`ops/api-compat-overrides.toml`](./ops/api-compat-overrides.toml) in the same PR
-and follow
-[the release runbook](./docs/maintainers/releasing.md#public-api-compatibility);
-raising the MSRV follows
-[the same runbook](./docs/maintainers/releasing.md#rust-version-floor).
+A documented HTTP, config, or MSRV break is a minor, via a breaking commit
+title; see
+[the release runbook](./docs/maintainers/releasing.md#version-classification).
+Raising the MSRV follows
+[the same runbook](./docs/maintainers/releasing.md#rust-version-floor). If a
+library crate is later published, a public Rust API break uses
+[`ops/api-compat-overrides.toml`](./ops/api-compat-overrides.toml) as described
+in [public API compatibility](./docs/maintainers/releasing.md#public-api-compatibility).
 
 ## Conventions
 

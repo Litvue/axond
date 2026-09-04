@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Publish the Axond workspace to crates.io in dependency order, idempotently.
+# Publish the axond binary crate to crates.io, idempotently.
 #
-# The three packages are a single release at one version: `gateway-core`, then
-# `gateway-transport`, then `axond`. Order matters because each package's
-# registry dependency on the previous one must already be resolvable — for
-# `cargo publish`'s own verification build and for any external consumer.
+# `gateway-core` and `gateway-transport` are unpublished workspace members.
+# The registry tarball is a self-contained flatten of those sources into
+# `axond` (`ops/stage-axond-crate.py`), so `cargo install axond` compiles
+# from that package alone and does not resolve the internals from crates.io.
 #
 # A crates.io version is immutable, so a re-run after a partial release must not
-# re-upload what is already there: each package is skipped when the exact
-# version is already on the registry. That makes this script the resume path for
-# a release that failed halfway (see RELEASE.md), and it is why the release
-# workflow can be re-dispatched for an existing tag.
+# re-upload what is already there: `axond` is skipped when the exact version is
+# already on the registry. That makes this script the resume path for a release
+# that failed after the other artifacts (see RELEASE.md), and it is why the
+# release workflow can be re-dispatched for an existing tag.
 #
 # Usage:
 #   ops/publish-crates.sh <version>              # real publish; needs CARGO_REGISTRY_TOKEN
@@ -22,18 +22,15 @@
 # is what CI checks on every pull request.
 #
 # `--dry-run` never uploads and never consults the registry for the skip check.
-# It packages and verifies the whole workspace in one cargo invocation, because
-# a per-package dry-run of `gateway-transport` or `axond` cannot resolve a
-# sibling that is not on crates.io yet; `--workspace` lets cargo satisfy the
-# registry requirements from the local packages, in dependency order.
+# It stages the flattened crate and packages that, not the workspace members:
+# `cargo publish -p axond` from this workspace cannot produce a registry
+# tarball that compiles without the unpublished internals.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-# Dependency order. Do not reorder: `gateway-transport` depends on
-# `gateway-core`, and `axond` depends on both.
-packages=(gateway-core gateway-transport axond)
+package=axond
 
 usage() {
   echo "Usage: ops/publish-crates.sh [<version>] [--dry-run]" >&2
@@ -88,47 +85,79 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
   fail "'$version' is not a semantic version"
 fi
 
-# Every package ships at the single workspace version. A mismatch means the
-# release is not coherent, so refuse before touching the registry rather than
-# publishing a half-aligned set that cannot be unpublished.
+# Every workspace member stays at the single workspace version so a release is
+# coherent even though only axond is uploaded. Internal path crates must not
+# carry a version requirement: that is what would let an accidental
+# `cargo publish -p axond` from this workspace resolve stale crates.io copies.
 require_aligned_versions() {
-  local manifest_versions
-  manifest_versions="$(
-    cargo metadata --no-deps --format-version 1 --locked |
-      python3 -c '
-import json, sys
-metadata = json.load(sys.stdin)
-for package in sorted(metadata["packages"], key=lambda p: p["name"]):
-    print(package["name"], package["version"])
-'
-  )"
-  local name found
-  while read -r name found; do
-    [[ -n "$name" ]] || continue
-    if [[ "$found" != "$version" ]]; then
-      fail "package $name is at $found but the release is $version; align every workspace version before publishing"
-    fi
-  done <<<"$manifest_versions"
+  python3 - "$version" <<'PY' || fail "workspace versions are not aligned (see above)"
+import json, subprocess, sys
 
-  local declared
-  for name in gateway-core gateway-transport; do
-    declared="$(
-      python3 - "$name" <<'PY'
-import re, sys
-name = sys.argv[1]
-manifest = open("Cargo.toml", encoding="utf-8").read()
-match = re.search(rf'^{re.escape(name)}\s*=\s*\{{(.*)\}}\s*$', manifest, re.MULTILINE)
-if not match:
-    raise SystemExit(f"no workspace dependency entry for {name}")
-version = re.search(r'version\s*=\s*"([^"]+)"', match.group(1))
-print(version.group(1) if version else "")
+release_version = sys.argv[1]
+metadata = json.loads(
+    subprocess.check_output(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
+        text=True,
+    )
+)
+problems = []
+publishable = []
+by_name = {}
+for package in sorted(metadata["packages"], key=lambda p: p["name"]):
+    by_name[package["name"]] = package
+    flag = package.get("publish")
+    print(f"{package['name']} version={package['version']} publish={flag!r}")
+    if package["version"] != release_version:
+        problems.append(
+            f"package {package['name']} is at {package['version']} but the release is {release_version}"
+        )
+    if flag != []:
+        publishable.append(package["name"])
+for name in ("gateway-core", "gateway-transport"):
+    package = by_name.get(name)
+    if package is None:
+        problems.append(f"workspace is missing internal member {name}")
+        continue
+    if package.get("publish") != []:
+        problems.append(f"{name} is publishable; it must stay an unpublished workspace member")
+unexpected = [name for name in publishable if name != "axond"]
+if unexpected:
+    problems.append(
+        "publishable workspace crates besides axond: "
+        + ", ".join(unexpected)
+        + "; crates.io ships only the axond binary"
+    )
+print("---")
+print("workspace publishable:", publishable if publishable else "(none)")
+print("registry package: axond")
+print("internals unpublished: gateway-core, gateway-transport")
+for problem in problems:
+    print(f"  {problem}", file=sys.stderr)
+raise SystemExit(1 if problems else 0)
 PY
-    )"
-    if [[ "$declared" != "$version" ]]; then
-      fail "[workspace.dependencies] $name declares version '$declared', not $version; external consumers would resolve the wrong release"
-    fi
-  done
-  echo "versions: all workspace packages and internal dependency requirements are at $version"
+  echo "versions: every workspace package is at $version; registry package is axond; internals are unpublished"
+
+  python3 - "$version" <<'PY' || fail "internal path crates must not carry a registry version"
+import sys
+import tomllib
+
+release_version = sys.argv[1]
+manifest = tomllib.loads(open("Cargo.toml", "rb").read().decode("utf-8"))
+problems = []
+for name in ("gateway-core", "gateway-transport"):
+    dep = manifest["workspace"]["dependencies"].get(name)
+    if not isinstance(dep, dict) or "path" not in dep:
+        problems.append(f"[workspace.dependencies] {name} is not a path crate")
+        continue
+    if "version" in dep:
+        problems.append(
+            f"[workspace.dependencies] {name} declares version {dep['version']!r}; "
+            "omit it so cargo cannot rewrite the dep to crates.io"
+        )
+for problem in problems:
+    print(f"  {problem}", file=sys.stderr)
+raise SystemExit(1 if problems else 0)
+PY
 }
 
 # The shipped DDL is an operator interface and lives in `ops/postgres/`, which is
@@ -162,8 +191,8 @@ require_ddl_copies_match() {
 # symptom would be an incoherent release at the tag. So assert here that every
 # version string this release depends on is both reachable by a configured path
 # and already at $version — and that no internal `path` + `version` dependency
-# is missing an entry, which is the way a fourth publishable crate would
-# reintroduce the silent no-op.
+# has crept back in, which is the way a second publishable crate would
+# reintroduce a silent no-op.
 require_release_config_bumps_every_version() {
   python3 - "$version" <<'PY' || fail "release-please-config.json does not cover every version string (see above)"
 import json
@@ -254,6 +283,21 @@ published() {
   esac
 }
 
+stage_axond_crate() {
+  local stage="$1"
+  python3 ops/stage-axond-crate.py --self-test
+  python3 ops/stage-axond-crate.py --out "$stage"
+  python3 - "$stage/Cargo.toml" <<'PY' || fail "staged axond Cargo.toml still depends on unpublished internals"
+import pathlib, sys, tomllib
+manifest = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+deps = set(manifest.get("dependencies", {}))
+internal = {"gateway-core", "gateway-transport"} & deps
+if internal:
+    raise SystemExit("staged Cargo.toml depends on " + ", ".join(sorted(internal)))
+print("staged manifest: no crates.io dependency on gateway-core or gateway-transport")
+PY
+}
+
 if [[ "$mode" == publish && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
   fail "CARGO_REGISTRY_TOKEN is not set; a real crates.io publish needs the release token (see RELEASE.md)"
 fi
@@ -262,50 +306,64 @@ require_aligned_versions
 require_release_config_bumps_every_version
 require_ddl_copies_match
 
+stage="$(mktemp -d "${TMPDIR:-/tmp}/axond-crate.XXXXXX")"
+cleanup() { rm -rf "$stage"; }
+trap cleanup EXIT
+stage_axond_crate "$stage"
+
 if [[ "$mode" == dry-run ]]; then
   echo
-  echo "=== packaging the workspace at $version"
-  cargo package --locked --workspace
+  echo "=== packaging flattened ${package} at $version"
+  cargo package --locked --manifest-path "$stage/Cargo.toml"
+  packaged="$stage/target/package/${package}-${version}/Cargo.toml"
+  [[ -f "$packaged" ]] || fail "cargo package did not unpack ${package}-${version}"
+  python3 - "$packaged" <<'PY' || fail "packaged axond still depends on unpublished internals"
+import pathlib, sys, tomllib
+path = pathlib.Path(sys.argv[1])
+manifest = tomllib.loads(path.read_text(encoding="utf-8"))
+deps = manifest.get("dependencies", {})
+internal = {"gateway-core", "gateway-transport"} & set(deps)
+print(f"packaged {path}:")
+for name in sorted(deps):
+    print(f"  {name} = {deps[name]!r}")
+if internal:
+    raise SystemExit("packaged Cargo.toml depends on " + ", ".join(sorted(internal)))
+PY
   echo
-  echo "=== publish dry-run in dependency order: ${packages[*]}"
-  cargo publish --dry-run --locked --workspace
+  echo "=== publish dry-run of ${package} (internals are not packages)"
+  cargo publish --dry-run --locked --manifest-path "$stage/Cargo.toml"
   echo
-  echo "publish dry-run passed in dependency order: ${packages[*]}"
+  echo "publish dry-run passed: ${package} only"
   exit 0
 fi
 
-published_now=()
-skipped=()
-
-for name in "${packages[@]}"; do
-  echo
-  echo "=== ${name}@${version}"
-
-  if published "$name"; then
-    echo "skip: ${name}@${version} is already on crates.io (immutable); nothing to re-upload"
-    skipped+=("$name")
-    continue
-  fi
-
-  # cargo blocks until the uploaded version is visible in the index, so the
-  # next package in the order can resolve it.
-  if cargo publish --locked --package "$name"; then
-    published_now+=("$name")
-    continue
-  fi
-
-  # A publish can fail after the upload is accepted (a dropped response, a
-  # concurrent run). Re-check the registry: if the version is there, the release
-  # step succeeded and the retry is a no-op rather than a failure.
-  if published "$name"; then
-    echo "recovered: ${name}@${version} is on crates.io despite the failed publish call; continuing"
-    skipped+=("$name")
-    continue
-  fi
-  fail "could not publish ${name}@${version}; re-run this script (or re-dispatch the release) to resume from here"
-done
-
 echo
-echo "published now: ${published_now[*]:-none}"
-echo "already present: ${skipped[*]:-none}"
-echo "crates.io release $version complete in dependency order: ${packages[*]}"
+echo "=== ${package}@${version}"
+
+if published "$package"; then
+  echo "skip: ${package}@${version} is already on crates.io (immutable); nothing to re-upload"
+  echo
+  echo "published now: none"
+  echo "already present: ${package}"
+  echo "crates.io release $version complete: ${package}"
+  exit 0
+fi
+
+if cargo publish --locked --manifest-path "$stage/Cargo.toml"; then
+  echo
+  echo "published now: ${package}"
+  echo "already present: none"
+  echo "crates.io release $version complete: ${package}"
+  exit 0
+fi
+
+if published "$package"; then
+  echo "recovered: ${package}@${version} is on crates.io despite the failed publish call"
+  echo
+  echo "published now: none"
+  echo "already present: ${package}"
+  echo "crates.io release $version complete: ${package}"
+  exit 0
+fi
+
+fail "could not publish ${package}@${version}; re-run this script (or re-dispatch the release) to resume from here"

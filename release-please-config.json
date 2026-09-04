@@ -18,16 +18,6 @@
           "jsonpath": "$.workspace.package.version"
         },
         {
-          "type": "toml",
-          "path": "Cargo.toml",
-          "jsonpath": "$.workspace.dependencies.gateway-core.version"
-        },
-        {
-          "type": "toml",
-          "path": "Cargo.toml",
-          "jsonpath": "$.workspace.dependencies.gateway-transport.version"
-        },
-        {
           "type": "generic",
           "path": "README.md"
         },

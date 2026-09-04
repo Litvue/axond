@@ -13,7 +13,7 @@ evidence and known limitations; the reusable process lives in the
 | Public source repository | Met | `https://github.com/Litvue/axond`. |
 | Cross-platform release archives | Met | The [latest GitHub release](https://github.com/Litvue/axond/releases/latest) contains Linux x86-64 and ARM64 GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, and provenance. |
 | Public OCI image | Met | The versioned `ghcr.io/litvue/axond` image for each release is public, published as a `linux/amd64` + `linux/arm64` index, smoke-tested per architecture, signed keylessly, and attested: provenance on every manifest including the index, SBOM on the per-architecture children. |
-| crates.io workspace | Met | [`gateway-core`](https://crates.io/crates/gateway-core), [`gateway-transport`](https://crates.io/crates/gateway-transport), and [`axond`](https://crates.io/crates/axond) are published in dependency order. |
+| crates.io package | Met | [`axond`](https://crates.io/crates/axond) is published as the gateway binary. `gateway-core` and `gateway-transport` stay unpublished workspace members. |
 | Deployment/configuration/operator documentation | Met | Task-oriented documentation index, executable examples, references, and runbooks under `docs/`. |
 
 Current artifacts and workflow evidence are available from the
@@ -24,7 +24,6 @@ Current artifacts and workflow evidence are available from the
 
 ```bash
 cargo install axond --locked
-cargo add gateway-core gateway-transport
 ```
 
 Verify binaries and the OCI image with the commands in

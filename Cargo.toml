@@ -15,14 +15,13 @@ repository = "https://github.com/Litvue/axond"
 homepage = "https://github.com/Litvue/axond"
 readme = "README.md"
 
-# Every workspace crate is published to crates.io, so the internal dependencies
-# carry both a `path` (used by this workspace) and a `version` (used by the
-# packaged `.crate` files and by external consumers). The version tracks the
-# single workspace version; release-please rewrites both here and in
-# `[workspace.package]` from `release-please-config.json`.
+# Internal workspace members, not crates.io packages. They have no `version`
+# so `cargo publish -p axond` from this workspace cannot rewrite them to
+# stale registry copies. The published `axond` tarball is assembled by
+# `ops/stage-axond-crate.py`, which bundles their sources instead.
 [workspace.dependencies]
-gateway-core = { path = "crates/gateway-core", version = "0.5.0" }
-gateway-transport = { path = "crates/gateway-transport", version = "0.5.0" }
+gateway-core = { path = "crates/gateway-core" }
+gateway-transport = { path = "crates/gateway-transport" }
 
 aes-kw = { version = "=0.3.1", default-features = false, features = ["zeroize"] }
 anyhow = "1"

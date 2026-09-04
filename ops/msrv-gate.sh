@@ -5,7 +5,7 @@
 #
 # `rust-version` in `[workspace.package]` is the single source of truth. The MSRV
 # is interpreted as the *first* patch of that minor (`1.97` means `1.97.0`),
-# because that is what Cargo enforces for a consumer: `cargo add axond` on
+# because that is what Cargo enforces for a consumer: `cargo install axond` on
 # 1.97.0 must work. The pinned developer/CI toolchain in `rust-toolchain.toml`
 # is deliberately newer — it fixes lint and format output — so this lane is the
 # only place the floor itself is exercised.

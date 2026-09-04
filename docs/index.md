@@ -122,8 +122,7 @@ They are not runbooks for a current deployment:
   changes require a security review, and the regression tests, threat-model or
   ADR updates, and release-impact statement each one owes.
 - [Compatibility gates](./compatibility.md#the-published-rust-api) — the MSRV
-  floor, the published-crate API check, and the reviewed override for an
-  intentional break.
+  floor, and the published-library API check (empty set is success).
 - [Backend responsibility boundaries](./maintainers/backend-contracts.md) — the
   eight responsibility-specific backend contracts, which paths they may be
   called from, and why there is no universal state backend.

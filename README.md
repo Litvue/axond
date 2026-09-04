@@ -236,9 +236,8 @@ guidance.
 Release-please maintains the changelog and workspace version. A release builds
 six binary targets, publishes the `linux/amd64` and `linux/arm64` images plus the
 multi-architecture index they form — booted on both architectures before it takes
-the `<version>` tag — signs and attests artifacts, and publishes
-`gateway-core`, `gateway-transport`, and `axond` to crates.io in dependency
-order. Maintainer procedures are in the
+the `<version>` tag — signs and attests artifacts, and publishes the `axond`
+binary crate to crates.io. Maintainer procedures are in the
 [release runbook](./docs/maintainers/releasing.md).
 
 ## License

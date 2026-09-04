@@ -14,6 +14,9 @@ deployment unit. Read the release's `CHANGELOG.md` entry before every rollout.
 
 ## v0.4.0 `gateway-core` API migration
 
+Historical: crates.io no longer publishes `gateway-core`. This section remains
+for consumers of the last library versions already on the registry.
+
 v0.4.0 intentionally removes the unused public `governance` module and its
 `Governance`, `GovernanceKey`, `GovernanceLimits`, and `Admission` exports.
 Admission, rate limiting, and usage accounting are runtime concerns; embedders

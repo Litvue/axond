@@ -70,16 +70,9 @@ AXOND_VERSION=0.5.0 # x-release-please-version
 cargo install axond --version "$AXOND_VERSION" --locked
 ```
 
-The published workspace libraries are also available to external Rust
-consumers:
-
-```bash
-cargo add gateway-core gateway-transport
-```
-
-`gateway-core` contains runtime-neutral provider adapters and routing
-primitives. `gateway-transport` adds HTTP dispatch, credential injection,
-timeouts, retries, streaming, and tracing integration.
+crates.io publishes the `axond` binary crate only. `gateway-core` and
+`gateway-transport` are unpublished git workspace members, not a library
+product; older versions already on the registry are not yanked.
 
 ## Prebuilt release binary
 

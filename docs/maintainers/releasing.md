@@ -33,11 +33,12 @@ pipeline.
    `axond-image-<version>.digest`. SBOM attestations and SPDX assets stay
    per-architecture, on the children.
 11. Require every artifact lane.
-12. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.
+12. Publish `axond` to crates.io.
 
 crates.io is last because a published version cannot be replaced. The publish
-script is idempotent: an existing aligned package is skipped, and a partial
-release resumes at the first missing crate.
+script is idempotent: an existing aligned `axond` version is skipped.
+`gateway-core` and `gateway-transport` are unpublished workspace members; the
+uploaded tarball is a flatten of those sources into `axond`.
 
 ## Required GitHub configuration
 
@@ -91,8 +92,8 @@ or policy; it will fail at the same PR-creation boundary.
 3. Merge the release PR.
 4. Observe the tag/release workflow.
 5. Verify artifacts externally with `docs/installation.md`.
-6. Confirm all three crates are visible and `cargo install axond --locked`
-   succeeds.
+6. Confirm [`axond`](https://crates.io/crates/axond) is visible and
+   `cargo install axond --locked` succeeds.
 
 ## Version classification
 
@@ -118,9 +119,9 @@ by editing the version in the release PR.
 
 So a release PR is correctly classified when, for the commits it rolls up:
 
-- the `api-compat` lane passed on it, naming the published baseline it compared
-  against — `gateway-core`/`gateway-transport` only; a change confined to the
-  binary `axond` crate has no Rust API surface to break;
+- the `api-compat` lane passed on it — today that is an empty published-library
+  set, because `axond` has no public Rust API; a newly publishable library crate
+  would be compared against crates.io here;
 - [`ops/api-compat-overrides.toml`](../../ops/api-compat-overrides.toml) has no
   entry for that baseline, since an entry means a reviewed break, which is a
   minor;
@@ -253,30 +254,29 @@ artifacts from a mutated checkout.
 
 ## Partial crates.io failure
 
-Identify which immutable versions are already present, fix the account/token or
-network issue, and re-dispatch the same tag. `ops/publish-crates.sh` checks in
-dependency order and resumes safely.
+Identify whether `axond@<version>` is already present, fix the account/token or
+network issue, and re-dispatch the same tag. `ops/publish-crates.sh` skips an
+immutable version that is already on the registry.
 
-Never modify a packaged tarball at an existing version. If a published version
-is broken, yank all affected crates in reverse dependency order and ship a new
-patch release.
+Never modify a packaged tarball at an existing version. If a published `axond`
+version is broken, yank it and ship a new patch release. Do not yank historical
+`gateway-core` / `gateway-transport` versions as part of this resume path.
 
 ## Public API compatibility
 
-The `api-compat` lane runs [`ops/api-compat.py`](../../ops/api-compat.py), which
-compares each published *library* crate — `gateway-core` and
-`gateway-transport`; the binary-only `axond` has no Rust API surface — against
-the version already on crates.io with `cargo-semver-checks` (pinned in
-`ci.yml`). It is blocking, and there are no allow rules or per-lint bypasses.
-The crate list comes from `cargo metadata`, so a newly added published library
-crate is covered without touching the script, and the script itself needs only
-`python3` 3.10 or newer — the same floor as the provider-SDK lockfile — which CI
-proves with `ops/api-compat.py --self-test` on 3.10.
+The `api-compat` lane runs [`ops/api-compat.py`](../../ops/api-compat.py).
+crates.io publishes the `axond` binary only, so the published-library set is
+empty and the lane succeeds without calling `cargo-semver-checks`. The crate
+list comes from `cargo metadata`: a newly added published library crate is
+compared against crates.io with `cargo-semver-checks` (pinned in `ci.yml`)
+without touching the script. The script itself needs only `python3` 3.10 or
+newer — the same floor as the provider-SDK lockfile — which CI proves with
+`ops/api-compat.py --self-test` on 3.10.
 
-Run it before pushing an API change:
+Run it before pushing a change that would publish a library crate:
 
 ```bash
-just api-compat            # or: ops/api-compat.py gateway-core
+just api-compat
 ```
 
 When the break is unintended, fix the API. When it is intended:
@@ -472,13 +472,6 @@ on its own so the advisory maps to one version.
 
 ```bash
 cargo install axond --version <version> --locked
-```
-
-In a scratch crate:
-
-```bash
-cargo add gateway-core@<version> gateway-transport@<version>
-cargo build
 ```
 
 Also verify release checksums, GitHub attestations, the public OCI pull, cosign
