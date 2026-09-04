@@ -4,7 +4,13 @@ Date: 2026-08-11
 
 ## Status
 
-Accepted
+Accepted historically.
+
+Superseded in part on 2026-09-04: crates.io ships **only** the `axond` binary
+crate. `gateway-core` and `gateway-transport` remain unpublished workspace
+members. Historical versions already on the registry are not yanked. The rest of
+this record — duplicated shipped DDL, an idempotent publish script, a packaging
+dry-run in CI, publish-last-because-immutable — still holds for that one crate.
 
 Supersedes the supply-chain wildcard rule and extends the release-artifact list
 of [ADR 0004](./0004-ci-and-release-pipeline.md).
@@ -38,21 +44,24 @@ below, and it also breaks two things ADR 0004 recorded as settled:
 
 ## Decision
 
-**Three packages, one version, one order:** `gateway-core`, then
-`gateway-transport`, then `axond`. Order is not a preference: each package's
-registry dependency on the previous one must already resolve, both for
-`cargo publish`'s own verification build and for any external consumer.
+**One package:** `axond`. Every git workspace member, including the `axond`
+crate directory, is `publish = false`. `cargo publish -p axond` from the
+workspace therefore refuses. The registry tarball is assembled by
+`ops/stage-axond-crate.py`, which flattens unpublished internals into a
+standalone crate, and `ops/publish-crates.sh` publishes that. Direct registry
+dependencies in that tarball are pinned to the versions this workspace already
+locked; transitives resolve at pack time. `cargo install axond --locked`
+therefore compiles from that package alone.
 
-**Internal dependencies carry a `path` *and* an exact `version`** in
-`[workspace.dependencies]` — the path for this workspace, the version for the
-packaged crates. Consequently **`wildcards = "deny"`** in `deny.toml`, replacing
-ADR 0004's `"allow"`: a reintroduced version-less path dependency now fails
-`dependency-policy` in CI instead of failing the publish after a tag exists.
-release-please bumps all three version strings from one release, and because its
-TOML updater only *warns* when a JSONPath matches nothing, an unregistered or
-mistyped path is a silent no-op; `ops/publish-crates.sh` therefore asserts that
-every pinned internal version is covered by an `extra-files` path and is at the
-release version.
+**Internal path dependencies omit a `version`.** A version here would let an
+accidental `cargo publish -p axond` from the workspace rewrite the dep to a
+stale crates.io copy. Consequently **`wildcards = "deny"`** remains in
+`deny.toml` for registry dependencies, with **`allow-wildcard-paths = true`**
+for those unpublished internals, replacing ADR 0004's `"allow"`. release-please
+bumps `[workspace.package].version` from one release, and because its TOML
+updater only *warns* when a JSONPath matches nothing, `ops/publish-crates.sh`
+asserts that path is covered and that no internal path crate has reacquired a
+version pin.
 
 **The shipped DDL is duplicated, not moved.** `ops/postgres/*.sql` remains the
 operator-facing contract and the target of every doc link;
@@ -65,14 +74,15 @@ added file, such as `budget_v2.sql`, without being extended. The rule for
 maintainers is one-directional: edit `ops/postgres/`, then copy.
 
 **Publication is one script, and it is idempotent.** `ops/publish-crates.sh`
-queries the registry per package and skips a version that is already present,
+queries the registry for `axond` and skips a version that is already present,
 re-checks after a failed upload (an accepted upload with a lost response is done,
 not failed), and refuses to proceed on a misaligned version, drifted DDL, an
 unknown registry status, or a missing token. That makes it the resume path for a
-release that failed halfway, rather than a command that must not be run twice.
+release that failed after the other artifacts, rather than a command that must
+not be run twice.
 
-**Release artifacts of a tagged commit therefore also include** the three
-crates.io versions, published by a `release-crates` job that runs *last*: after
+**Release artifacts of a tagged commit therefore also include** the `axond`
+crates.io version, published by a `release-crates` job that runs *last*: after
 `release-success` (all binaries, plus the signed and attested image) and after
 polling the tagged commit's own `CI Success` check. `CARGO_REGISTRY_TOKEN` lives
 in a protected `crates-io` GitHub environment and is passed only to the publish
@@ -99,8 +109,10 @@ unchanged and still applied from `ops/postgres/`.
 - Two copies of every shipped DDL file exist. Editing the packaged copy directly
   is a mistake the gates catch, but the duplication is real and permanent for as
   long as `axond` is published from a crate that cannot reach `ops/`.
-- Deleting or renaming a published crate name is no longer possible, so the three
-  names are now part of the public interface.
+- Deleting or renaming a published crate name is no longer possible, so `axond`
+  (and the historical `gateway-core` / `gateway-transport` names already on the
+  registry) stay part of the public interface even though only `axond` is still
+  published.
 - A partial release is recoverable by re-dispatching the release for the tag,
   which is only true for tags whose tree contains the lane.
 - Until the `crates-io` environment holds a token, `release-crates` fails loudly

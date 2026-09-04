@@ -40,12 +40,14 @@ confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
-# Every dependency, including the workspace's own published crates, carries a
-# version requirement: `gateway-core` and `gateway-transport` are `path` + exact
-# workspace `version` in `[workspace.dependencies]` so the packaged crates
-# resolve from crates.io. Nothing may reintroduce a wildcard — crates.io rejects
-# a wildcard dependency on publish, so this check fails the release early.
+# Registry dependencies must carry a version; crates.io rejects a wildcard on
+# publish, so this check fails the release early. Workspace members are all
+# `publish = false`: the registry tarball is assembled out of tree and has no
+# path deps. Internal path crates omit a version so cargo cannot rewrite them
+# to crates.io. `allow-wildcard-paths` is that omission for unpublished
+# workspace crates, not a licence to write `*` on registry dependencies.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

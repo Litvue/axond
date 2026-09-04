@@ -1,9 +1,11 @@
 # Reviewed overrides for the public-API compatibility gate (`ops/api-compat.py`).
 #
-# The gate is blocking: a public API break in `gateway-core` or
-# `gateway-transport`, measured against the version already on crates.io, fails
-# CI. An entry here is the *only* way past it, and it is a review artifact rather
-# than a switch — it names one crate, one published baseline, and the review that
+# Axond's crates.io product is the `axond` binary. `gateway-core` and
+# `gateway-transport` are unpublished workspace members, so this file has no
+# active `[[break]]` entries: there is no published library API to break. If a
+# workspace member is later published as a library, the gate is blocking and an
+# entry here is the *only* way past a break. It is a review artifact rather than
+# a switch — it names one crate, one published baseline, and the review that
 # accepted the break.
 #
 # An override applies only while `baseline` is still the published baseline. Once
@@ -18,7 +20,7 @@
 # pairs are accepted, and anything else is an error.
 #
 # [[break]]
-# crate = "gateway-core"
+# crate = "example-lib"
 # # The crates.io version the break is measured against, exactly as the gate
 # # reports it.
 # baseline = "0.3.12"
@@ -29,9 +31,3 @@
 #
 # Process, including the required changelog and minor-bump handling:
 # docs/maintainers/releasing.md#public-api-compatibility.
-
-[[break]]
-crate = "gateway-core"
-baseline = "0.3.40"
-justification = "Intentional removal of the legacy governance and guardrail exports; deterministic route-bound request/response middleware replaces them for v0.4.0."
-reviewed_in = "https://github.com/Litvue/axond/pull/370"

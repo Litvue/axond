@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Public Rust API compatibility gate for the published library crates.
+"""Public Rust API compatibility gate for published library crates.
 
-`cargo-semver-checks` compares each crate's public API against the version
-already on crates.io — the API real consumers hold — and reports whether the
-change requires a version bump larger than the one this branch declares. Under
-the `0.x` policy (ADR 0015) a break is a minor bump, so on a branch that has not
-bumped anything, any break fails.
+Axond ships as a binary: `gateway-core` and `gateway-transport` are unpublished
+workspace members, and `axond`'s library target is empty outside `--cfg fuzzing`.
+An empty published-library set is therefore success — there is no Rust API for
+`cargo-semver-checks` to compare. If a workspace member is later marked
+publishable and exports a library, this gate covers it the day it is added.
 
-The gate is blocking. The only way past it is an entry in
+When such a crate exists, `cargo-semver-checks` compares its public API against
+the version already on crates.io and reports whether the change requires a
+version bump larger than the one this branch declares. Under the `0.x` policy
+(ADR 0015) a break is a minor bump, so on a branch that has not bumped anything,
+any break fails.
+
+The gate is blocking. The only way past a break is an entry in
 `ops/api-compat-overrides.toml` naming the crate, the exact published baseline
 the break is measured against, and the review that accepted it. An override is
 honoured only for that one baseline: once a release moves the baseline forward,
@@ -20,7 +26,7 @@ not import `tomllib`, which only exists from 3.11 on: crate discovery comes from
 
 Usage:
     ops/api-compat.py                 # check every published library crate
-    ops/api-compat.py gateway-core    # check one crate
+    ops/api-compat.py some-lib        # check one crate
     ops/api-compat.py --self-test     # exercise the override parser only
 """
 
@@ -48,12 +54,12 @@ KEY_VALUE = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"\s*(?:#.*)?')
 def published_library_crates() -> list[str]:
     """Workspace members that publish a library API.
 
-    A binary-only member (`axond`) has no public Rust API to break: its
-    compatibility surface is HTTP, config, and telemetry, which
-    `docs/compatibility.md` governs and other CI lanes exercise. Asking Cargo
-    rather than keeping a hard-coded list means a new published library crate is
-    covered the day it is added, and Cargo — not this script — decides what
-    counts as a library target or an inherited `publish` setting.
+    An empty list is success, not an error: Axond's crates.io product is the
+    `axond` binary, whose compatibility surface is HTTP, config, and telemetry,
+    which `docs/compatibility.md` governs and other CI lanes exercise. Asking
+    Cargo rather than keeping a hard-coded list means a new published library
+    crate is covered the day it is added, and Cargo — not this script — decides
+    what counts as a library target or an inherited `publish` setting.
 
     A library target that is `cfg`-ed away for every build the workspace performs
     (`#![cfg(fuzzing)]`, which only the out-of-tree `fuzz/` project sets) exports
@@ -83,8 +89,6 @@ def published_library_crates() -> list[str]:
         if not libraries or all(exports_nothing(target) for target in libraries):
             continue
         crates.append(package["name"])
-    if not crates:
-        raise SystemExit("no published library crates found in the workspace")
     return sorted(crates)
 
 
@@ -275,11 +279,16 @@ def main(argv: list[str]) -> int:
     requested = argv or crates
     unknown = [crate for crate in requested if crate not in crates]
     if unknown:
+        known = ", ".join(crates) if crates else "none"
         raise SystemExit(
             f"not published library crates: {', '.join(unknown)} "
-            f"(known: {', '.join(crates)})"
+            f"(known: {known})"
         )
     overrides = load_overrides(crates)
+    if not requested:
+        print("api-compat: no published library crates; axond has no public Rust API")
+        print("api-compat passed (0 published library crates)")
+        return 0
 
     failures: list[str] = []
     notes: list[str] = []

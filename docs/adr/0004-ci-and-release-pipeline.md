@@ -64,17 +64,19 @@ archives, before that binary is attested and attached.
   image, plus a keyless **cosign** signature on the image digest. The release
   job verifies the signature and provenance before completing, and the image is
   smoke-tested before it is signed.
-- The `gateway-core`, `gateway-transport`, and `axond` crates.io versions, added
-  by [ADR 0025](./0025-crates-io-publication.md), published last because they are
-  the only irreversible artifact.
+- The `axond` crates.io version, added by
+  [ADR 0025](./0025-crates-io-publication.md) (library crates later withdrawn;
+  only the binary remains), published last because it is the only irreversible
+  artifact.
 
 **Supply-chain policy (`deny.toml`)** is enforced in CI and re-run daily against
 `main`. Advisories and unmaintained crates fail; the license allowlist is the
 permissive set plus `CDLA-Permissive-2.0` (Mozilla's CA bundle in
 `webpki-roots`). `wildcards` was originally `"allow"`, because the workspace's
 own path crates read as wildcards; **[ADR 0025](./0025-crates-io-publication.md)
-supersedes that** with `"deny"`, since the internal crates now carry exact
-version requirements and crates.io rejects a wildcard dependency on publish.
+supersedes that** with `"deny"` for registry dependencies (internal path crates
+omit a version and are allowed via `allow-wildcard-paths`). crates.io rejects a
+wildcard dependency on publish.
 
 **PR titles are gated to Conventional Commits** so release-please can classify
 every merge.

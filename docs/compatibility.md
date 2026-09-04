@@ -305,38 +305,32 @@ zero one — an unpriced model is not a free one.
 
 ### The published Rust API
 
-Three crates are published: `gateway-core` and `gateway-transport` are libraries
-with a public Rust API, and `axond` is the binary — its compatibility surface is
-the config, HTTP, and telemetry contracts above, not Rust items. `axond` does
-carry a library target, but it is empty outside `--cfg fuzzing`: it exists so the
-out-of-tree [fuzz project](./security/fuzzing.md) can link the parsers under
-test, exports nothing to any other consumer, and is therefore excluded from the
-compatibility gate rather than promised.
+crates.io publishes **`axond` only** — the gateway binary. Its compatibility
+surface is the config, HTTP, and telemetry contracts above, not Rust items.
+`gateway-core` and `gateway-transport` remain unpublished git workspace members
+so the in-repo test graph can still `cargo test -p gateway-core`; they are not a
+library product and must not be `cargo add`-ed. Versions already on the registry
+are not yanked.
 
-The library API follows Cargo's `0.x` rules, and mechanically: a required CI lane
-runs [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
-against the versions already on crates.io, so removing or renaming a public item,
-changing a signature, or adding a variant to an exhaustive public enum fails the
-build rather than a downstream `cargo update`. Additive change — a new item, a new
-method, a new `#[non_exhaustive]` variant — is a patch.
+`axond` does carry a library target, but it is empty outside `--cfg fuzzing`: it
+exists so the out-of-tree [fuzz project](./security/fuzzing.md) can link the
+parsers under test, exports nothing to any other consumer, and is therefore
+excluded from the compatibility gate rather than promised.
 
-An intentional break is a minor bump plus a reviewed entry in
-[`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml) naming the
-crate, the published baseline, and the review; the process is in the
-[release runbook](./maintainers/releasing.md#public-api-compatibility). There is
-no blanket allow list, and an override stops applying as soon as the next release
-moves the baseline.
-
-`gateway-core` and `gateway-transport` are published so the gateway can be
-assembled from its parts, but they are *the gateway's* internals: the promise
-above is about not breaking you silently, not a commitment to a stable embedding
-API before `1.0`.
+A required CI lane still runs [`ops/api-compat.py`](../ops/api-compat.py): an
+empty published-library set is success. If a workspace member is later marked
+publishable and exports a library, that lane compares it with
+[`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
+against the version already on crates.io. An intentional break of such an API is
+a minor bump plus a reviewed entry in
+[`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml); the process
+is in the [release runbook](./maintainers/releasing.md#public-api-compatibility).
 
 ### The Rust version floor (MSRV)
 
 The minimum supported Rust version is **1.97**, declared once as
-`rust-version` in `[workspace.package]` and inherited by every published crate,
-so `cargo add gateway-core` on 1.97.0 resolves and builds.
+`rust-version` in `[workspace.package]` and inherited by every workspace crate,
+so `cargo install axond` on 1.97.0 resolves and builds.
 
 The floor and the toolchain this repository builds with are deliberately
 different things:
@@ -418,7 +412,7 @@ claim here cannot drift from what CI and the release actually do:
 | Supported versions for fixes | [`SECURITY.md`](../SECURITY.md) — latest `0.x` release plus the immediately previous minor, security fixes only | the release/backport process |
 | Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml), listed under [supported platforms](#supported-platforms) above: six archive targets plus the `linux/amd64` + `linux/arm64` image index | the release workflow; on every change the `binary-smoke` matrix boots each target on a runner of its own platform, the musl `static-binary` lane adds the Tier 0 network-denial gate, and `docker-smoke` covers the image |
 | Provider-SDK compatibility | [`tests/compat/requirements.in`](../tests/compat/requirements.in) (exact pins, hash-locked in `requirements.txt`) and [`tests/compat-ts/package.json`](../tests/compat-ts/package.json) with [`.nvmrc`](../tests/compat-ts/.nvmrc) (exact pins, hash-locked in `package-lock.json`) | the required `sdk-compat` and `sdk-compat-ts` lanes against committed fixtures ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)) |
-| Rust floor and published API | `rust-version` in [`Cargo.toml`](../Cargo.toml); [`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml) for accepted breaks | the required `msrv` and `api-compat` lanes |
+| Rust floor and published API | `rust-version` in [`Cargo.toml`](../Cargo.toml); [`ops/api-compat.py`](../ops/api-compat.py) (empty published-library set is success) | the required `msrv` and `api-compat` lanes |
 
 Adding a target, an SDK, or a supported version means editing the owner file
 above; this document describes the policy and restates a value only where a gate
