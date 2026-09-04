@@ -1363,6 +1363,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_connect_sweeps_expired_legacy_holds() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        let expired = format!("expired_{ns}");
+        let live = format!("live_{ns}");
+        let stale_tombstone = format!("stale_{ns}");
+        store
+            .insert_reservation(&expired, &ns, -60_000)
+            .await
+            .expect("expired reservation");
+        store
+            .insert_reservation(&live, &ns, 600_000)
+            .await
+            .expect("live reservation");
+        store
+            .insert_expired_reservation_tombstone(&stale_tombstone, 1)
+            .await
+            .expect("expired tombstone");
+        drop(store);
+
+        let reopened = PostgresStore::connect(&dsn, true).await.expect("reopen");
+        assert_eq!(reopened.reservation_count(&ns).await.expect("count"), 1);
+        assert!(
+            !reopened
+                .tombstone_exists(&stale_tombstone)
+                .await
+                .expect("tombstone"),
+            "expired tombstone should be swept at connect"
+        );
+        reopened.delete_namespace(&ns).await.expect("cleanup");
+    }
+
+    #[tokio::test]
     async fn postgres_concurrent_charges_both_apply() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;

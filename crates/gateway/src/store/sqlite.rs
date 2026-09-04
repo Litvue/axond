@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -84,6 +85,7 @@ impl SqliteStore {
         migrate_reservation_incarnation(&conn)?;
         migrate_tombstone_expires_at(&conn)?;
         migrate_provider_models_source(&conn)?;
+        sweep_expired_holds(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -145,6 +147,27 @@ impl SqliteStore {
 
 fn unavailable(err: rusqlite::Error) -> StoreError {
     StoreError::Unavailable(err.to_string())
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn sweep_expired_holds(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM axond_store_budget_reservation WHERE expires_at <= ?1",
+        params![now_ms()],
+    )
+    .map_err(unavailable)?;
+    conn.execute(
+        "DELETE FROM axond_store_budget_reservation_tombstone WHERE expires_at < ?1",
+        params![now_ms()],
+    )
+    .map_err(unavailable)?;
+    Ok(())
 }
 
 /// `CREATE TABLE IF NOT EXISTS` does not add columns to an existing file.
@@ -1349,6 +1372,70 @@ mod tests {
             .expect("row");
         assert_eq!(got.spent_microdollars, 99);
         assert_eq!(got.reserved_microdollars, 0);
+    }
+
+    #[test]
+    fn reopen_sweeps_expired_legacy_holds() {
+        let path = std::env::temp_dir().join(format!(
+            "axond-store-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let path = path.to_str().expect("temp path");
+        let store = SqliteStore::open(path).expect("open");
+        let live_expires_at = now_ms() + 60_000;
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO axond_store_budget_reservation
+                    (id, namespace, period, amount_microdollars, expires_at, incarnation)
+                 VALUES ('expired', 'ns', 'p', 1, 1, 1)",
+                [],
+            )
+            .expect("expired reservation");
+            conn.execute(
+                "INSERT INTO axond_store_budget_reservation
+                    (id, namespace, period, amount_microdollars, expires_at, incarnation)
+                 VALUES ('live', 'ns', 'p', 1, ?1, 1)",
+                params![live_expires_at],
+            )
+            .expect("live reservation");
+            conn.execute(
+                "INSERT INTO axond_store_budget_reservation_tombstone
+                    (id, incarnation, expires_at) VALUES ('expired_tombstone', 1, 1)",
+                [],
+            )
+            .expect("expired tombstone");
+            conn.execute(
+                "INSERT INTO axond_store_budget_reservation_tombstone
+                    (id, incarnation, expires_at)
+                 VALUES ('live_tombstone', 1, ?1)",
+                params![live_expires_at],
+            )
+            .expect("live tombstone");
+        }
+        drop(store);
+
+        let reopened = SqliteStore::open(path).expect("reopen");
+        let conn = reopened.conn.lock().expect("lock");
+        let reservations: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reservation count");
+        let tombstones: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM axond_store_budget_reservation_tombstone",
+                [],
+                |row| row.get(0),
+            )
+            .expect("tombstone count");
+        assert_eq!(reservations, 1);
+        assert_eq!(tombstones, 1);
+        drop(conn);
+        std::fs::remove_file(path).expect("remove temp database");
     }
 
     #[test]

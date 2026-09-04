@@ -42,6 +42,8 @@ The Store ledger does not write a hold on the inference path.
   is not a hold.
 - Reservation tables stay in the schema (forward-only). Code does not write
   holds.
+- Expired legacy hold and tombstone rows are deleted once at boot; unexpired
+  rows are left for the older replicas that own them.
 - `[budget] backend` remains withdrawn (ADR 0063).
   `reservation_ttl_seconds` is unused on the live Store path.
 

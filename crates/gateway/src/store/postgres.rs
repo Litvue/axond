@@ -80,6 +80,7 @@ impl PostgresStore {
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         }
         probe_schema(&client).await?;
+        sweep_expired_holds(&client).await?;
         store.checkin(client).await;
         Ok(store)
     }
@@ -214,6 +215,25 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
                 "axond_store_provider_models schema missing or incompatible: {e}"
             ))
         })?;
+    Ok(())
+}
+
+/// Expired holds left by replicas that predate ADR 0064; nothing on the live path removes them.
+async fn sweep_expired_holds(client: &impl GenericClient) -> Result<(), StoreError> {
+    client
+        .execute(
+            "DELETE FROM axond_store_budget_reservation WHERE expires_at <= now()",
+            &[],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    client
+        .execute(
+            "DELETE FROM axond_store_budget_reservation_tombstone WHERE expires_at < now()",
+            &[],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     Ok(())
 }
 
@@ -1216,6 +1236,30 @@ impl PostgresStore {
         .await
     }
 
+    pub(super) async fn insert_reservation(
+        &self,
+        id: &str,
+        namespace: &str,
+        expires_in_ms: i64,
+    ) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        let namespace = namespace.to_owned();
+        self.with_client(async move |client| {
+            client
+                .execute(
+                    "INSERT INTO axond_store_budget_reservation
+                        (id, namespace, period, amount_microdollars, expires_at, incarnation)
+                     VALUES ($1, $2, 'p', 1,
+                             now() + ($3 * interval '1 millisecond'), 1)",
+                    &[&id, &namespace, &expires_in_ms],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
     pub(super) async fn insert_expired_reservation_tombstone(
         &self,
         id: &str,
@@ -1233,6 +1277,26 @@ impl PostgresStore {
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
             Ok(())
+        })
+        .await
+    }
+
+    pub(super) async fn tombstone_exists(&self, id: &str) -> Result<bool, StoreError> {
+        let id = id.to_owned();
+        self.with_client(async move |client| {
+            let exists: bool = client
+                .query_one(
+                    "SELECT EXISTS(
+                         SELECT 1
+                         FROM axond_store_budget_reservation_tombstone
+                         WHERE id = $1
+                     )",
+                    &[&id],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?
+                .get(0);
+            Ok(exists)
         })
         .await
     }
