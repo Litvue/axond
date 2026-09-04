@@ -1806,6 +1806,7 @@ mod tests {
                 estimate_microdollars: estimated_microdollars,
                 generation: None,
                 period: None,
+                incarnation: None,
             })
         }
         async fn settle(
@@ -2092,6 +2093,7 @@ cache_read_microdollars_per_million = 1000000
                 estimate_microdollars: 1_000,
                 generation: None,
                 period: None,
+                incarnation: None,
             },
             rate_limit_permit: None,
             admission_permit: None,

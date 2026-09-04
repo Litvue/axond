@@ -854,6 +854,7 @@ impl BudgetStore for RedisBudget {
             estimate_microdollars: estimated_microdollars,
             generation: governing.generation,
             period: None,
+            incarnation: None,
         };
         // Counted before the round-trip, so a publication landing mid-admission
         // cannot see an empty drain list while this request is being admitted

@@ -6,6 +6,11 @@ Date: 2026-09-02
 
 Accepted
 
+Budget reserve-before-dispatch is superseded by
+[ADR 0064](./0064-charge-actuals-after-response.md): the Store ledger charges
+actual spend after the response and does not hold an estimate on the inference
+path.
+
 Settled with the maintainer on 2026-09-02. The session brief named this
 record `0061`; [ADR 0061](./0061-authentication-remains-an-outer-boundary.md)
 and [ADR 0062](./0062-blob-backed-flat-namespace-control-plane.md) already
@@ -212,11 +217,10 @@ PUT /api/v1/namespaces/{ns}/budgets/{period}
 ```
 
 `period` is a caller-chosen opaque string (1–128, `[A-Za-z0-9._-]+`).
-Axond keeps `spent + reserved` per `(ns, period)` using
-[ADR 0010](./0010-shared-budget-backends-and-charging-policy.md)
-reserve-before-dispatch / settle-exactly-once. Setting a limit **never**
-resets spend. A PUT that lowers the limit below `spent + reserved` is
-accepted; later reserves fail until the ledger fits.
+Axond keeps `spent` per `(ns, period)`. Setting a limit **never**
+resets spend. A PUT that lowers the limit below `spent` is accepted;
+later admits fail once `spent >= limit`. Concurrent in-flight requests
+can overshoot; see [ADR 0064](./0064-charge-actuals-after-response.md).
 
 **Active period (chosen):** a successful PUT marks that period as the
 namespace’s active period for admission. Inference does not carry the
@@ -235,14 +239,14 @@ GET /api/v1/namespaces/{ns}/budgets/{period}
     remaining_microdollars, active }
 ```
 
-`remaining = max(0, limit - spent - reserved)`.
+`remaining = max(0, limit - spent)`. `reserved_microdollars` is always `0`
+(the field stays on the wire).
 
-Denial of a request that will not fit: `429 budget_exceeded`. Store
-unavailable: `503 budget_unavailable`. Deployment
+Denial when `spent >= limit` (or no budget row): `429 budget_exceeded`.
+Store unavailable: `503 budget_unavailable`. Deployment
 `[storage].on_unavailable = deny | allow` (default `deny`).
 
-Reservation TTL and expire-on-replica-death stay as ADR 0010. The ledger
-lives in the `Store`, not in Redis.
+The ledger lives in the `Store`, not in Redis.
 
 ### Management API
 
@@ -318,7 +322,7 @@ CI boots against a temp SQLite file. That is the single-replica gate, not
 Replaces the template’s “State tier” section: **there are no tiers**.
 
 The `Store` is required. It owns namespace rows, budget ledgers
-(`spent`, `reserved`, limit, active period), usage, and the discovery
+(`spent`, limit, active period), usage, and the discovery
 cache. Implementations:
 
 - **SQLite WAL** — one process, one file. Two processes on one file are
@@ -328,9 +332,9 @@ cache. Implementations:
 No Redis, no blob control plane, no in-memory store, no “none”. Forward-only
 migrations remain ([ADR 0032](./0032-operator-preflight-and-forward-only-migrations.md)).
 
-Request-path store access is exactly: cached namespace lookup, budget
-reserve/settle. Usage append stays off the request path (ADR 0009).
-Discovery refresh is background.
+Request-path store access is: namespace lookup, a spent-vs-limit read,
+then after the response a spent increment. Usage append stays off the
+request path (ADR 0009). Discovery refresh is background.
 
 ## Consumer contract (Litvue)
 
@@ -364,7 +368,7 @@ reopened:
 | No budget row | `429 budget_exceeded` (fail closed) |
 | Usage `period` / `attrs` | additive nullable columns |
 | `GET .../usage?period=` | `period` query required |
-| Lowered limit < spent+reserved | accepted; future reserves deny |
+| Lowered limit < spent | accepted; later admits deny once spent >= limit |
 | DELETE semantics | idempotent; in-flight finish; new inference `404 unknown_namespace`; usage rows retained; live budget row removed |
 | `/v1/models` | empty until discovery; then cached prefixed ids, blocklist applied |
 | TS client | Litvue generates it from the spec Axond serves |
@@ -393,8 +397,8 @@ Tracked as [epic #424](https://github.com/Litvue/axond/issues/424).
    price-book. `unpriced_models`. Remove alias failover. Discovery is
    **not** in this slice.
 3. **[#426](https://github.com/Litvue/axond/issues/426) Budgets.** `PUT`/`GET` per `(ns, period)`; active-period rule;
-   reserve/settle; `429 budget_exceeded` / `503 budget_unavailable`;
-   usage `period`.
+   admit (spent-vs-limit) / charge actuals ([ADR 0064](./0064-charge-actuals-after-response.md));
+   `429 budget_exceeded` / `503 budget_unavailable`; usage `period`.
 4. **[#428](https://github.com/Litvue/axond/issues/428) OpenAPI.** utoipa (or equivalent) 3.1 spec at
    `/api/v1/openapi.json` covering every `/api/v1` route then mounted,
    including usage summary.

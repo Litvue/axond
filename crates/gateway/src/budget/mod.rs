@@ -9,12 +9,10 @@
 //! budget checks are on the request path (fast, fresh), records are off it
 //! (slow, batched). A Tinybird sink is fine; a Tinybird budget store is not.
 //!
-//! Actual cost is unknown until a response completes, so enforcement is
-//! **reserve → compute-actual → settle**: [`BudgetStore::reserve`] holds a
-//! conservative estimate before dispatch, and [`BudgetStore::settle`] converts
-//! that hold into the measured spend afterwards — or releases it entirely when
-//! nothing was consumed. A reservation is *held*, so concurrent in-flight
-//! requests cannot collectively overshoot the cap (ADR 0010).
+//! Actual cost is unknown until a response completes. The Store ledger (ADR
+//! 0064) **does not hold an estimate** before dispatch: [`BudgetStore::reserve`]
+//! is a spent-vs-limit read, and [`BudgetStore::settle`] adds measured spend
+//! afterwards. Concurrent in-flight requests can overshoot the cap.
 //!
 //! Three backends ship. [`NoBudget`] is the default and touches no datastore
 //! (ADR 0002). [`InMemoryBudget`] holds reservations per replica. The shared
@@ -59,13 +57,13 @@ pub struct BudgetKey {
     pub subject: String,
 }
 
-/// A held estimate: the outcome of an admitted [`BudgetStore::reserve`], and the
-/// handle that [`BudgetStore::settle`] converts into measured spend. Cheap to
-/// clone so the streaming relay can carry it to a detached settlement.
+/// Admit outcome: the handle [`BudgetStore::settle`] uses to charge measured
+/// spend. Cheap to clone so the streaming relay can carry it to a detached
+/// settlement. The Store path does not write a hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
-    /// Unique per reservation, so a settlement releases exactly the hold it
-    /// belongs to even when a key has many in flight.
+    /// Unique per admit on backends that still hold an estimate. Unused on
+    /// the Store path (charge keys off period + incarnation).
     pub id: String,
     pub estimate_microdollars: u64,
     /// The published policy generation this hold was admitted under, or `None`
@@ -76,9 +74,12 @@ pub struct Reservation {
     /// the previous document settles against the generation that granted it, and
     /// a drain is finished when no hold names the superseded generation any more.
     pub generation: Option<PolicyGeneration>,
-    /// Active period this hold was taken against. Set by the Store ledger;
-    /// absent on unheld / legacy backends.
+    /// Active period captured at admit. Set by the Store ledger; absent on
+    /// unheld / legacy backends.
     pub period: Option<String>,
+    /// Namespace incarnation captured at admit. Charge is a no-op if it no
+    /// longer matches (delete + recreate).
+    pub incarnation: Option<i64>,
 }
 
 impl Reservation {
@@ -89,6 +90,7 @@ impl Reservation {
             estimate_microdollars: 0,
             generation: None,
             period: None,
+            incarnation: None,
         }
     }
 
@@ -141,21 +143,16 @@ impl Admission {
 #[async_trait]
 pub trait BudgetStore: Send + Sync {
     fn name(&self) -> &'static str;
-    /// Pre-dispatch check that *holds* the estimate, in micro-dollars, so the
-    /// requests already in flight count against the cap.
+    /// Pre-dispatch spent-vs-limit check. The Store path does not write a hold.
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission;
-    /// Release the reservation and record the measured spend, in micro-dollars.
+    /// Charge measured spend, in micro-dollars.
     ///
     /// **Exactly once per admitted request**, whatever its outcome — completion,
     /// upstream failure, client cancellation, or a dropped handler. The route
-    /// guarantees it: the guard holding the reservation is disarmed before the
-    /// call, so a settlement and its drop-path fallback cannot both run, and no
-    /// caller retries a settlement. So an implementation must charge and release
-    /// in one atomic step (neither alone is recoverable afterwards), and it must
-    /// not assume a second chance: a settlement that fails at the store leaves the
-    /// hold to expire with its TTL, which the reserve path reclaims. That is the
-    /// bound on how long a failed settlement can hold a budget, and it is why the
-    /// TTL should exceed the longest expected request rather than be generous.
+    /// guarantees it: the guard is disarmed before the call, so a settlement and
+    /// its drop-path fallback cannot both run, and no caller retries. The Store
+    /// path adds `actual` to `spent` when period and incarnation still match. A
+    /// charge the store rejects is not retried and under-records that request.
     async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual_microdollars: u64);
     /// Drop a reservation that consumed nothing. Settling zero is the same
     /// operation, and every backend implements it that way.
@@ -540,6 +537,7 @@ impl BudgetStore for InMemoryBudget {
             estimate_microdollars: estimated_microdollars,
             generation: None,
             period: None,
+            incarnation: None,
         };
         ledger.held.insert(
             reservation.id.clone(),

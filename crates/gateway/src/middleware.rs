@@ -1060,8 +1060,8 @@ impl MiddlewareExecution {
     }
 
     /// Fixed core budget middleware. This runs only after content mutation and
-    /// authoritative estimate recomputation. An armed hold releases on drop
-    /// unless an outcome transfers it into terminal accounting first.
+    /// authoritative estimate recomputation. Admit is a spent-vs-limit read;
+    /// an armed handle charges on drop unless an outcome settles it first.
     pub(crate) async fn reserve_budget(
         &mut self,
         state: &AppState,
@@ -1563,7 +1563,7 @@ impl MiddlewareExecution {
 
 /// Gateway-owned state for the fixed budget middleware. It is deliberately not
 /// a `gateway-core` middleware state: core remains I/O-free, while this owner
-/// performs the asynchronous reserve/settle contract at fixed source positions.
+/// performs the asynchronous admit/charge contract at fixed source positions.
 pub(crate) struct CoreBudgetHold {
     state: AppState,
     key: BudgetKey,

@@ -292,7 +292,8 @@ zero one — an unpriced model is not a free one.
   parse it.
 - Status codes for the documented failure modes (see the
   [runbook](./observability.md#failure-modes)) are part of the contract:
-  notably `429 budget_exceeded` (the tenant is over cap) versus
+  notably `429 budget_exceeded` (`spent >= limit`, or no budget row; in-flight
+  requests are not reserved) versus
   `503 budget_unavailable` (the gateway's own dependency is down),
   `429 tenant_concurrency_exceeded` (this tenant is at its own concurrency
   ceiling) versus `503 gateway_overloaded` (the replica itself is saturated), and

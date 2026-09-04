@@ -688,11 +688,8 @@ async fn serve() -> anyhow::Result<()> {
     crate::store::seed_config_namespaces(store.as_ref(), &config.namespace)
         .await
         .map_err(|e| anyhow::anyhow!("store seed: {e}"))?;
-    let budget: Box<dyn BudgetStore> = Box::new(StoreBudget::new(
-        Arc::clone(&store),
-        storage.on_unavailable,
-        Duration::from_secs(config.budget.reservation_ttl_seconds),
-    ));
+    let budget: Box<dyn BudgetStore> =
+        Box::new(StoreBudget::new(Arc::clone(&store), storage.on_unavailable));
     tracing::info!(backend = budget.name(), "budget enforcement");
     let rate_limiter: Box<dyn RateLimiter> = rate_limit::build(
         &config.rate_limit,

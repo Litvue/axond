@@ -2,13 +2,12 @@
 //!
 //! SQLite WAL is the single-replica implementation; Postgres is HA. Boot
 //! requires a reachable backend. Namespace rows are loaded on demand — never
-//! preloaded at process start. The budget ledger (`spent + reserved` per
+//! preloaded at process start. The budget ledger (`spent` per
 //! `(namespace, period)`) lives here, not in Redis. Postgres tables are
 //! `axond_store_budget*` so they do not collide with leftover `axond_budget`
 //! from the withdrawn `[budget]` backend.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -58,7 +57,6 @@ impl BudgetRecord {
         period: impl Into<String>,
         limit_microdollars: u64,
         spent_microdollars: u64,
-        reserved_microdollars: u64,
         active: bool,
     ) -> Self {
         Self {
@@ -66,12 +64,9 @@ impl BudgetRecord {
             period: period.into(),
             limit_microdollars,
             spent_microdollars,
-            reserved_microdollars,
-            remaining_microdollars: remaining(
-                limit_microdollars,
-                spent_microdollars,
-                reserved_microdollars,
-            ),
+            // Holds are gone (ADR 0064). Field stays on the wire as zero.
+            reserved_microdollars: 0,
+            remaining_microdollars: remaining(limit_microdollars, spent_microdollars, 0),
             active,
         }
     }
@@ -157,10 +152,13 @@ impl ProviderModels {
     }
 }
 
-/// Outcome of a pre-dispatch hold against the namespace's active period.
+/// Outcome of a pre-dispatch spent check against the namespace's active period.
+///
+/// No hold is taken. Concurrent in-flight requests can all pass while `spent`
+/// is still under the limit, then all charge after the response (ADR 0064).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BudgetReserve {
-    Allowed { period: String },
+pub enum BudgetAdmit {
+    Allowed { period: String, incarnation: i64 },
     Exceeded,
 }
 
@@ -192,9 +190,8 @@ pub trait Store: Send + Sync {
         blocklist: Option<Vec<String>>,
     ) -> Result<Option<NamespaceRecord>, StoreError>;
     /// Remove the namespace and its live budget ledger in one transaction.
-    /// Usage rows are retained. Reservation rows are kept so an in-flight
-    /// settle can see the incarnation it reserved under. Missing id is
-    /// `Ok(false)`.
+    /// Usage rows are retained. Incarnation is bumped so an in-flight charge
+    /// from the previous occupant is a no-op. Missing id is `Ok(false)`.
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError>;
     /// Seed addressable namespace ids without `spawn_blocking`.
     fn seed_namespaces_blocking(
@@ -217,25 +214,19 @@ pub trait Store: Send + Sync {
         period: &str,
     ) -> Result<Option<BudgetRecord>, StoreError>;
 
-    /// Hold `estimate` against the namespace's active period. No budget row
-    /// is [`BudgetReserve::Exceeded`] (fail closed).
-    async fn reserve_budget(
-        &self,
-        namespace: &str,
-        estimate_microdollars: u64,
-        reservation_ttl: Duration,
-        reservation_id: &str,
-    ) -> Result<BudgetReserve, StoreError>;
+    /// Read-only: does the active period have room (`spent < limit`)?
+    /// No budget row is [`BudgetAdmit::Exceeded`] (fail closed). Does not
+    /// write a hold.
+    async fn admit_budget(&self, namespace: &str) -> Result<BudgetAdmit, StoreError>;
 
-    /// Charge `actual` and release the hold in one operation. Charge only when
-    /// a reservation or expire-tombstone records an incarnation that matches
-    /// the live namespace. A prior-incarnation hold (row or tombstone) is
-    /// dropped without charging. An unknown reservation id is a no-op.
-    async fn settle_budget(
+    /// Add `actual` to spent for `period` when `incarnation` still matches the
+    /// live namespace. A prior-incarnation charge (delete + recreate) is a
+    /// no-op. Missing period is a no-op.
+    async fn charge_budget(
         &self,
         namespace: &str,
         period: &str,
-        reservation_id: &str,
+        incarnation: i64,
         actual_microdollars: u64,
     ) -> Result<(), StoreError>;
 
@@ -359,16 +350,10 @@ impl Store for UnavailableStore {
     async fn get_budget(&self, _: &str, _: &str) -> Result<Option<BudgetRecord>, StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
-    async fn reserve_budget(
-        &self,
-        _: &str,
-        _: u64,
-        _: Duration,
-        _: &str,
-    ) -> Result<BudgetReserve, StoreError> {
+    async fn admit_budget(&self, _: &str) -> Result<BudgetAdmit, StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
-    async fn settle_budget(&self, _: &str, _: &str, _: &str, _: u64) -> Result<(), StoreError> {
+    async fn charge_budget(&self, _: &str, _: &str, _: i64, _: u64) -> Result<(), StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn append_usage(&self, _: UsageAppend) -> Result<(), StoreError> {
@@ -495,15 +480,15 @@ pub fn validate_period(period: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Fail-closed conversion for reserve (and other pre-dispatch amounts).
-/// An estimate above `i64::MAX` is rejected before the provider runs.
+/// Fail-closed conversion for PUT limits. An amount above `i64::MAX` is
+/// rejected rather than wrapping.
 pub(crate) fn sql_amount(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| {
         StoreError::Invalid("microdollar amount exceeds the store integer range".into())
     })
 }
 
-/// Settlement actuals that exceed `i64::MAX` charge the representable cap
+/// Charge actuals that exceed `i64::MAX` saturate at the representable cap
 /// rather than dropping the write. PUT limits use [`sql_amount`] and reject.
 pub(crate) fn sql_amount_saturating(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
@@ -513,22 +498,13 @@ pub(crate) fn from_sql_amount(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
-/// Fail-closed admit: overflow of `spent + reserved + estimate` is exceeded,
-/// matching GET remaining at `i64::MAX`.
-pub(crate) fn budget_would_exceed(spent: i64, reserved: i64, estimate: i64, limit: i64) -> bool {
-    spent
-        .checked_add(reserved)
-        .and_then(|total| total.checked_add(estimate))
-        .map(|total| total > limit)
-        .unwrap_or(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
-    fn sql_amount_rejects_unrepresentable_reserve() {
+    fn sql_amount_rejects_unrepresentable_limit() {
         assert!(sql_amount(u64::MAX).is_err());
         assert!(sql_amount(i64::MAX as u64 + 1).is_err());
         assert_eq!(sql_amount(i64::MAX as u64).expect("max"), i64::MAX);
@@ -541,15 +517,6 @@ mod tests {
         assert_eq!(sql_amount_saturating(i64::MAX as u64 + 1), i64::MAX);
         assert_eq!(sql_amount_saturating(i64::MAX as u64), i64::MAX);
         assert_eq!(sql_amount_saturating(640), 640);
-    }
-
-    #[test]
-    fn budget_would_exceed_fail_closes_on_i64_max_limit() {
-        assert!(budget_would_exceed(i64::MAX, 0, 1, i64::MAX));
-        assert!(budget_would_exceed(i64::MAX - 1, 1, 1, i64::MAX));
-        assert!(!budget_would_exceed(i64::MAX - 1, 0, 1, i64::MAX));
-        assert!(!budget_would_exceed(0, 0, 1, 10));
-        assert!(budget_would_exceed(5, 5, 1, 10));
     }
 
     #[tokio::test]
@@ -675,16 +642,12 @@ mod tests {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p1", 10_000).await.expect("put");
-        match store
-            .reserve_budget("wsp_x", 100, Duration::from_secs(30), "r1")
-            .await
-            .expect("reserve")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p1"),
+        match store.admit_budget("wsp_x").await.expect("reserve") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p1"),
             other => panic!("expected hold, got {other:?}"),
         }
         store
-            .settle_budget("wsp_x", "p1", "r1", 40)
+            .charge_budget("wsp_x", "p1", 1, 40)
             .await
             .expect("settle");
         let lowered = store.put_budget("wsp_x", "p1", 10).await.expect("lower");
@@ -692,11 +655,8 @@ mod tests {
         assert_eq!(lowered.limit_microdollars, 10);
         assert_eq!(lowered.remaining_microdollars, 0);
         assert!(matches!(
-            store
-                .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
-                .await
-                .expect("over"),
-            BudgetReserve::Exceeded
+            store.admit_budget("wsp_x").await.expect("over"),
+            BudgetAdmit::Exceeded
         ));
     }
 
@@ -705,12 +665,9 @@ mod tests {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "old", 10_000).await.expect("old");
+        store.admit_budget("wsp_x").await.expect("hold");
         store
-            .reserve_budget("wsp_x", 50, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
-        store
-            .settle_budget("wsp_x", "old", "r1", 50)
+            .charge_budget("wsp_x", "old", 1, 50)
             .await
             .expect("settle");
         let neu = store.put_budget("wsp_x", "new", 10_000).await.expect("new");
@@ -723,12 +680,8 @@ mod tests {
             .expect("row");
         assert!(!old.active);
         assert_eq!(old.spent_microdollars, 50);
-        match store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
-            .await
-            .expect("new period")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "new"),
+        match store.admit_budget("wsp_x").await.expect("new period") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "new"),
             other => panic!("{other:?}"),
         }
     }
@@ -738,11 +691,8 @@ mod tests {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         assert!(matches!(
-            store
-                .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r")
-                .await
-                .expect("closed"),
-            BudgetReserve::Exceeded
+            store.admit_budget("wsp_x").await.expect("closed"),
+            BudgetAdmit::Exceeded
         ));
     }
 
@@ -751,10 +701,7 @@ mod tests {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 10_000).await.expect("put");
-        store
-            .reserve_budget("wsp_x", 10, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         store
             .append_usage(UsageAppend {
                 request_id: "req_1".into(),
@@ -798,11 +745,8 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            store
-                .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
-                .await
-                .expect("closed"),
-            BudgetReserve::Exceeded
+            store.admit_budget("wsp_x").await.expect("closed"),
+            BudgetAdmit::Exceeded
         ));
     }
 
@@ -811,10 +755,7 @@ mod tests {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 10_000).await.expect("put");
-        store
-            .reserve_budget("wsp_x", 77, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         assert!(store.delete_namespace("wsp_x").await.expect("delete"));
         seeded(&store).await;
         let rec = store
@@ -824,7 +765,7 @@ mod tests {
         assert_eq!(rec.spent_microdollars, 0);
         assert_eq!(rec.reserved_microdollars, 0);
         store
-            .settle_budget("wsp_x", "p", "r1", 77)
+            .charge_budget("wsp_x", "p", 1, 77)
             .await
             .expect("late settle");
         let got = store
@@ -841,10 +782,7 @@ mod tests {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 10_000).await.expect("put");
-        store
-            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "old")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         assert!(store.delete_namespace("wsp_x").await.expect("delete"));
         tokio::time::sleep(Duration::from_millis(5)).await;
         seeded(&store).await;
@@ -852,16 +790,12 @@ mod tests {
             .put_budget("wsp_x", "p", 10_000)
             .await
             .expect("recreate");
-        match store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "new")
-            .await
-            .expect("expire path")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget("wsp_x").await.expect("expire path") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
         store
-            .settle_budget("wsp_x", "p", "old", 10)
+            .charge_budget("wsp_x", "p", 1, 10)
             .await
             .expect("late settle after TTL");
         let got = store
@@ -869,9 +803,8 @@ mod tests {
             .await
             .expect("get")
             .expect("row");
-        // Expire-delete wrote a tombstone for incarnation 1; current is 2.
         assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 1);
+        assert_eq!(got.reserved_microdollars, 0);
     }
 
     #[tokio::test]
@@ -879,29 +812,18 @@ mod tests {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 10_000).await.expect("put");
-        store
-            .reserve_budget("wsp_x", 40, Duration::from_millis(1), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         tokio::time::sleep(Duration::from_millis(5)).await;
-        match store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r2")
-            .await
-            .expect("second")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget("wsp_x").await.expect("second") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
-        match store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r3")
-            .await
-            .expect("third")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget("wsp_x").await.expect("third") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
         store
-            .settle_budget("wsp_x", "p", "r1", 40)
+            .charge_budget("wsp_x", "p", 1, 40)
             .await
             .expect("late settle");
         let got = store
@@ -910,44 +832,48 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got.spent_microdollars, 40);
-        assert_eq!(got.reserved_microdollars, 2);
+        assert_eq!(got.reserved_microdollars, 0);
     }
 
     #[tokio::test]
-    async fn sqlite_in_flight_hold_counts_and_settle_is_one_operation() {
+    async fn sqlite_in_flight_admits_do_not_hold_and_charge_after() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 100).await.expect("put");
-        store
-            .reserve_budget("wsp_x", 60, Duration::from_secs(30), "r1")
-            .await
-            .expect("first");
-        let held = store
+        assert!(matches!(
+            store.admit_budget("wsp_x").await.expect("first"),
+            BudgetAdmit::Allowed { .. }
+        ));
+        let before = store
             .get_budget("wsp_x", "p")
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(held.reserved_microdollars, 60);
-        assert_eq!(held.remaining_microdollars, 40);
+        assert_eq!(before.reserved_microdollars, 0);
+        assert_eq!(before.remaining_microdollars, 100);
         assert!(matches!(
             store
-                .reserve_budget("wsp_x", 50, Duration::from_secs(30), "r2")
+                .admit_budget("wsp_x")
                 .await
-                .expect("second"),
-            BudgetReserve::Exceeded
+                .expect("second still open"),
+            BudgetAdmit::Allowed { .. }
         ));
         store
-            .settle_budget("wsp_x", "p", "r1", 25)
+            .charge_budget("wsp_x", "p", 1, 100)
             .await
-            .expect("settle");
+            .expect("charge");
         let after = store
             .get_budget("wsp_x", "p")
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(after.spent_microdollars, 25);
+        assert_eq!(after.spent_microdollars, 100);
         assert_eq!(after.reserved_microdollars, 0);
-        assert_eq!(after.remaining_microdollars, 75);
+        assert_eq!(after.remaining_microdollars, 0);
+        assert!(matches!(
+            store.admit_budget("wsp_x").await.expect("at cap"),
+            BudgetAdmit::Exceeded
+        ));
     }
 
     #[tokio::test]
@@ -967,28 +893,20 @@ mod tests {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 10_000).await.expect("put");
-        match store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r0")
-            .await
-            .expect("prior")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget("wsp_x").await.expect("prior") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
         store
-            .settle_budget("wsp_x", "p", "r0", 40)
+            .charge_budget("wsp_x", "p", 1, 40)
             .await
             .expect("prior spend");
-        match store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "r1")
-            .await
-            .expect("reserve")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget("wsp_x").await.expect("reserve") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
         store
-            .settle_budget("wsp_x", "p", "r1", i64::MAX as u64 + 1)
+            .charge_budget("wsp_x", "p", 1, i64::MAX as u64 + 1)
             .await
             .expect("settle");
         let got = store
@@ -1001,37 +919,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_reserve_rejects_unrepresentable_estimate() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        seeded(&store).await;
-        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
-        let err = store
-            .reserve_budget("wsp_x", i64::MAX as u64 + 1, Duration::from_secs(30), "r")
-            .await
-            .expect_err("fail closed");
-        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
-    }
-
-    #[tokio::test]
     async fn sqlite_expired_hold_does_not_block_and_later_settle_still_charges() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 100).await.expect("put");
-        store
-            .reserve_budget("wsp_x", 80, Duration::from_millis(1), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         tokio::time::sleep(Duration::from_millis(5)).await;
-        match store
-            .reserve_budget("wsp_x", 80, Duration::from_secs(30), "r2")
-            .await
-            .expect("after expiry")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget("wsp_x").await.expect("after expiry") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
         store
-            .settle_budget("wsp_x", "p", "r1", 11)
+            .charge_budget("wsp_x", "p", 1, 11)
             .await
             .expect("late settle");
         let got = store
@@ -1040,7 +939,7 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got.spent_microdollars, 11);
-        assert_eq!(got.reserved_microdollars, 80);
+        assert_eq!(got.reserved_microdollars, 0);
     }
 
     #[tokio::test]
@@ -1068,25 +967,25 @@ mod tests {
         a.put_budget(&ns, "p", 1).await.expect("budget");
         let first = tokio::spawn({
             let ns = ns.clone();
-            async move { a.reserve_budget(&ns, 1, Duration::from_secs(30), "a").await }
+            async move { a.admit_budget(&ns).await }
         });
         let second = tokio::spawn({
             let ns = ns.clone();
-            async move { b.reserve_budget(&ns, 1, Duration::from_secs(30), "b").await }
+            async move { b.admit_budget(&ns).await }
         });
         let results = [first.await.expect("join a"), second.await.expect("join b")];
         let allowed = results
             .iter()
-            .filter(|r| matches!(r, Ok(BudgetReserve::Allowed { .. })))
+            .filter(|r| matches!(r, Ok(BudgetAdmit::Allowed { .. })))
             .count();
         let exceeded = results
             .iter()
-            .filter(|r| matches!(r, Ok(BudgetReserve::Exceeded)))
+            .filter(|r| matches!(r, Ok(BudgetAdmit::Exceeded)))
             .count();
         assert_eq!(
             (allowed, exceeded),
-            (1, 1),
-            "exactly one replica may take the last dollar: {results:?}"
+            (2, 0),
+            "admit is a spent read; both replicas pass before anyone charges: {results:?}"
         );
     }
 
@@ -1122,10 +1021,7 @@ mod tests {
         };
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "p", 10_000).await.expect("put");
-        store
-            .reserve_budget(&ns, 10, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget(&ns).await.expect("hold");
         store
             .append_usage(UsageAppend {
                 request_id: format!("req_{ns}"),
@@ -1141,7 +1037,7 @@ mod tests {
         assert!(!store.delete_namespace(&ns).await.expect("repeat"));
         assert!(store.get_namespace(&ns).await.expect("get").is_none());
         assert!(store.get_budget(&ns, "p").await.expect("budget").is_none());
-        assert_eq!(store.reservation_count(&ns).await.expect("holds"), 1);
+        assert_eq!(store.reservation_count(&ns).await.expect("holds"), 0);
         let usage = store.summarize_usage(&ns, "p").await.expect("summarize");
         assert_eq!(
             usage,
@@ -1168,11 +1064,8 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            store
-                .reserve_budget(&ns, 1, Duration::from_secs(30), "r2")
-                .await
-                .expect("closed"),
-            BudgetReserve::Exceeded
+            store.admit_budget(&ns).await.expect("closed"),
+            BudgetAdmit::Exceeded
         ));
     }
 
@@ -1183,10 +1076,7 @@ mod tests {
         };
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "p", 10_000).await.expect("put");
-        store
-            .reserve_budget(&ns, 77, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget(&ns).await.expect("hold");
         assert!(store.delete_namespace(&ns).await.expect("delete"));
         store
             .put_namespace(NamespaceRecord {
@@ -1203,7 +1093,7 @@ mod tests {
         assert_eq!(rec.spent_microdollars, 0);
         assert_eq!(rec.reserved_microdollars, 0);
         store
-            .settle_budget(&ns, "p", "r1", 77)
+            .charge_budget(&ns, "p", 1, 77)
             .await
             .expect("late settle");
         let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
@@ -1267,10 +1157,7 @@ mod tests {
             )
             .await
             .expect("drop companion");
-        store
-            .reserve_budget(&ns, 77, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget(&ns).await.expect("hold");
         assert!(store.delete_namespace(&ns).await.expect("delete"));
         let n: i64 = setup
             .query_one(
@@ -1307,7 +1194,7 @@ mod tests {
             .expect("new ledger");
         assert_eq!(rec.spent_microdollars, 0);
         store
-            .settle_budget(&ns, "p", "r1", 77)
+            .charge_budget(&ns, "p", 1, 77)
             .await
             .expect("late settle");
         let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
@@ -1322,10 +1209,7 @@ mod tests {
         };
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "p", 10_000).await.expect("put");
-        store
-            .reserve_budget(&ns, 10, Duration::from_millis(1), "old")
-            .await
-            .expect("hold");
+        store.admit_budget(&ns).await.expect("hold");
         assert!(store.delete_namespace(&ns).await.expect("delete"));
         tokio::time::sleep(Duration::from_millis(5)).await;
         store
@@ -1340,25 +1224,21 @@ mod tests {
             .put_budget(&ns, "p", 10_000)
             .await
             .expect("new ledger");
-        match store
-            .reserve_budget(&ns, 1, Duration::from_secs(30), "new")
-            .await
-            .expect("expire path")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget(&ns).await.expect("expire path") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
         store
-            .settle_budget(&ns, "p", "old", 10)
+            .charge_budget(&ns, "p", 1, 10)
             .await
             .expect("late settle after TTL");
         let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
         assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 1);
+        assert_eq!(got.reserved_microdollars, 0);
     }
 
     #[tokio::test]
-    async fn postgres_expired_tombstone_is_vacuumed_on_reserve_and_late_settle_is_noop() {
+    async fn postgres_expired_tombstone_is_not_vacuumed_on_admit() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
@@ -1369,25 +1249,18 @@ mod tests {
             .insert_expired_reservation_tombstone(&stale, 1)
             .await
             .expect("past tombstone");
-        match store
-            .reserve_budget(&ns, 1, Duration::from_secs(30), &format!("live_{ns}"))
-            .await
-            .expect("reserve vacuums")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget(&ns).await.expect("admit") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
-        store
-            .settle_budget(&ns, "p", &stale, 99)
-            .await
-            .expect("late settle");
+        store.charge_budget(&ns, "p", 1, 99).await.expect("charge");
         let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
-        assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 1);
+        assert_eq!(got.spent_microdollars, 99);
+        assert_eq!(got.reserved_microdollars, 0);
     }
 
     #[tokio::test]
-    async fn postgres_concurrent_settle_charges_once() {
+    async fn postgres_concurrent_charges_both_apply() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
@@ -1396,23 +1269,19 @@ mod tests {
             .await
             .expect("second client");
         a.put_budget(&ns, "p", 10_000).await.expect("put");
-        let rid = format!("once_{ns}");
-        match a
-            .reserve_budget(&ns, 50, Duration::from_secs(30), &rid)
-            .await
-            .expect("hold")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        let _rid = format!("once_{ns}");
+        match a.admit_budget(&ns).await.expect("hold") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
         let (left, right) = tokio::join!(
-            a.settle_budget(&ns, "p", &rid, 50),
-            b.settle_budget(&ns, "p", &rid, 50),
+            a.charge_budget(&ns, "p", 1, 50),
+            b.charge_budget(&ns, "p", 1, 50),
         );
-        left.expect("settle a");
-        right.expect("settle b");
+        left.expect("charge a");
+        right.expect("charge b");
         let got = a.get_budget(&ns, "p").await.expect("get").expect("row");
-        assert_eq!(got.spent_microdollars, 50);
+        assert_eq!(got.spent_microdollars, 100);
         assert_eq!(got.reserved_microdollars, 0);
     }
 
@@ -1455,12 +1324,8 @@ mod tests {
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "p", 10_000).await.expect("budget");
         store.drop_idle_connection().await.expect("drop");
-        match store
-            .reserve_budget(&ns, 1, Duration::from_secs(30), "after-drop")
-            .await
-            .expect("reserve after drop")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget(&ns).await.expect("reserve after drop") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
     }
@@ -1486,20 +1351,16 @@ mod tests {
             });
             let holds = tokio::spawn(async move {
                 for i in 0..80 {
-                    let id = format!("r{i}");
-                    match reserver
-                        .reserve_budget(&ns_res, 1, Duration::from_secs(30), &id)
-                        .await
-                        .expect("reserve")
-                    {
-                        BudgetReserve::Allowed { period } => {
+                    let _id = format!("r{i}");
+                    match reserver.admit_budget(&ns_res).await.expect("reserve") {
+                        BudgetAdmit::Allowed { period, .. } => {
                             assert_eq!(period, "p");
                             reserver
-                                .settle_budget(&ns_res, "p", &id, 1)
+                                .charge_budget(&ns_res, "p", 1, 1)
                                 .await
                                 .expect("settle");
                         }
-                        BudgetReserve::Exceeded => {}
+                        BudgetAdmit::Exceeded => {}
                     }
                 }
             });
@@ -1517,10 +1378,7 @@ mod tests {
         };
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "p", 100).await.expect("budget");
-        store
-            .reserve_budget(&ns, 60, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget(&ns).await.expect("hold");
         let reader = PostgresStore::connect(&dsn, true).await.expect("reader");
         let ns_get = ns.clone();
         let getter = tokio::spawn(async move {
@@ -1536,10 +1394,7 @@ mod tests {
             }
             samples
         });
-        store
-            .settle_budget(&ns, "p", "r1", 60)
-            .await
-            .expect("settle");
+        store.charge_budget(&ns, "p", 1, 60).await.expect("settle");
         let samples = getter.await.expect("join");
         assert!(!samples.is_empty());
         for rec in samples {
@@ -1551,11 +1406,11 @@ mod tests {
                     rec.reserved_microdollars
                 )
             );
-            assert_eq!(
-                rec.spent_microdollars + rec.reserved_microdollars,
-                60,
-                "GET mixed pre- and post-settle snapshots: {rec:?}"
+            assert!(
+                rec.spent_microdollars == 0 || rec.spent_microdollars == 60,
+                "GET spent must be pre- or post-charge: {rec:?}"
             );
+            assert_eq!(rec.reserved_microdollars, 0);
         }
     }
 
@@ -1594,20 +1449,17 @@ mod tests {
         };
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "old", 10_000).await.expect("old");
-        store
-            .reserve_budget(&ns, 10, Duration::from_millis(1), "stale")
-            .await
-            .expect("stale");
+        store.admit_budget(&ns).await.expect("stale");
         tokio::time::sleep(Duration::from_millis(5)).await;
         store.put_budget(&ns, "new", 10_000).await.expect("new");
-        store
-            .reserve_budget(&ns, 1, Duration::from_secs(30), "live")
-            .await
-            .expect("live");
+        match store.admit_budget(&ns).await.expect("live") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "new"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             store.reservation_count(&ns).await.expect("count"),
-            1,
-            "expired holds from the old period must be reclaimed"
+            0,
+            "admit does not write reservation rows"
         );
     }
 
@@ -1618,22 +1470,15 @@ mod tests {
         };
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "p", 100).await.expect("budget");
-        store
-            .reserve_budget(&ns, 10, Duration::from_millis(1), "stale")
-            .await
-            .expect("stale");
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        store.charge_budget(&ns, "p", 1, 100).await.expect("fill");
         assert!(matches!(
-            store
-                .reserve_budget(&ns, 200, Duration::from_secs(30), "over")
-                .await
-                .expect("denied"),
-            BudgetReserve::Exceeded
+            store.admit_budget(&ns).await.expect("at cap"),
+            BudgetAdmit::Exceeded
         ));
         assert_eq!(
             store.reservation_count(&ns).await.expect("count"),
             0,
-            "denied admission must keep the expiry delete"
+            "admit does not write reservation rows"
         );
     }
 
@@ -2327,34 +2172,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_settle_saturates_oversized_actual_and_releases_the_hold() {
+    async fn postgres_charge_saturates_oversized_actual() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "p", 10_000).await.expect("put");
-        match store
-            .reserve_budget(&ns, 1, Duration::from_secs(30), "r0")
-            .await
-            .expect("prior")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget(&ns).await.expect("prior") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
         store
-            .settle_budget(&ns, "p", "r0", 40)
+            .charge_budget(&ns, "p", 1, 40)
             .await
             .expect("prior spend");
-        match store
-            .reserve_budget(&ns, 1, Duration::from_secs(30), "r1")
-            .await
-            .expect("reserve")
-        {
-            BudgetReserve::Allowed { period } => assert_eq!(period, "p"),
+        match store.admit_budget(&ns).await.expect("reserve") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
         }
         store
-            .settle_budget(&ns, "p", "r1", i64::MAX as u64 + 1)
+            .charge_budget(&ns, "p", 1, i64::MAX as u64 + 1)
             .await
             .expect("settle");
         let got = store.get_budget(&ns, "p").await.expect("get").expect("row");

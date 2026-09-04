@@ -1162,20 +1162,17 @@ mod tests {
         ) -> Result<Option<crate::store::BudgetRecord>, crate::store::StoreError> {
             Ok(None)
         }
-        async fn reserve_budget(
+        async fn admit_budget(
             &self,
             _: &str,
-            _: u64,
-            _: Duration,
-            _: &str,
-        ) -> Result<crate::store::BudgetReserve, crate::store::StoreError> {
+        ) -> Result<crate::store::BudgetAdmit, crate::store::StoreError> {
             Err(crate::store::StoreError::Unavailable("unused".into()))
         }
-        async fn settle_budget(
+        async fn charge_budget(
             &self,
             _: &str,
             _: &str,
-            _: &str,
+            _: i64,
             _: u64,
         ) -> Result<(), crate::store::StoreError> {
             Ok(())
@@ -1256,20 +1253,17 @@ mod tests {
         ) -> Result<Option<crate::store::BudgetRecord>, crate::store::StoreError> {
             Ok(None)
         }
-        async fn reserve_budget(
+        async fn admit_budget(
             &self,
             _: &str,
-            _: u64,
-            _: Duration,
-            _: &str,
-        ) -> Result<crate::store::BudgetReserve, crate::store::StoreError> {
+        ) -> Result<crate::store::BudgetAdmit, crate::store::StoreError> {
             Err(crate::store::StoreError::Unavailable("unused".into()))
         }
-        async fn settle_budget(
+        async fn charge_budget(
             &self,
             _: &str,
             _: &str,
-            _: &str,
+            _: i64,
             _: u64,
         ) -> Result<(), crate::store::StoreError> {
             Ok(())

@@ -1298,8 +1298,9 @@ impl Route {
         }
     }
 
-    /// Pre-dispatch estimate the budget hold is priced from. Embeddings produce
-    /// no completion, so nothing is held for output.
+    /// Pre-dispatch estimate for `max_request_microdollars` and usage fallback.
+    /// Embeddings produce no completion, so output is zero. Not held against
+    /// the namespace cap (ADR 0064).
     fn estimate(self, body: &Value) -> Usage {
         self.measure(body).0
     }
@@ -1535,8 +1536,9 @@ async fn responses(
 }
 
 /// The one request path every route shares: split `provider-id/model-id`,
-/// hold a budget estimate, dispatch (credential-pool rotation, no alias
-/// failover), then settle the hold and record exactly one usage record.
+/// admit if spent is under the active-period limit, dispatch (credential-pool
+/// rotation, no alias failover), then charge measured spend and record exactly
+/// one usage record.
 /// Routes differ only in the wire they speak — where the body goes upstream and
 /// how usage is read back out (see [`Route`]).
 async fn serve(
@@ -1783,10 +1785,9 @@ async fn serve(
         recomputed
     };
 
-    // Budget is denominated in micro-dollars. Hold a conservative cost estimate
-    // from the post-middleware body before dispatch; settle the hold against the
-    // real cost — priced at whichever target actually served — after. The first
-    // estimate above remains only a cheap pre-admission fail-fast.
+    // Budget is denominated in micro-dollars. Admit on spent-vs-limit (no hold);
+    // charge measured cost — priced at whichever target actually served — after.
+    // The estimate is only for `max_request_microdollars` and usage fallback.
     let budget_key = BudgetKey {
         namespace: caller.namespace.clone(),
         subject: caller.subject.clone(),
@@ -1817,7 +1818,7 @@ async fn serve(
                 .await?;
             middleware_execution
                 .core_budget_context()
-                .expect("fixed budget middleware reserved a hold")
+                .expect("fixed budget middleware admitted")
                 .1
                 .clone()
         }
@@ -3314,9 +3315,9 @@ fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
 }
 
 /// Conservative pre-dispatch usage estimate: input tokens from the request body
-/// (~4 chars/token) plus a reserved output allowance (`max_tokens` when present,
-/// else a default). Priced with a target's `ModelPrice` it becomes the held
-/// estimate, which settlement replaces with the real cost.
+/// (~4 chars/token) plus an output allowance (`max_tokens` when present, else a
+/// default). Used for `max_request_microdollars` and as a fallback when the
+/// provider reports no usage. Not held against the namespace cap (ADR 0064).
 fn estimate_usage(body: &Value) -> (Usage, usize) {
     const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1_024;
     let body_bytes = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
@@ -3726,7 +3727,7 @@ mod tests {
             .0
             .output_tokens,
             500_000,
-            "the hold prices the allowance the provider will honor"
+            "the estimate uses the allowance the provider will honor"
         );
     }
 
@@ -8076,6 +8077,7 @@ output_microdollars_per_million = 1000000
                 estimate_microdollars: estimated_microdollars,
                 generation: None,
                 period: None,
+                incarnation: None,
             })
         }
         async fn settle(
@@ -8109,6 +8111,7 @@ output_microdollars_per_million = 1000000
                 estimate_microdollars: estimated_microdollars,
                 generation: None,
                 period: None,
+                incarnation: None,
             })
         }
 
@@ -11246,7 +11249,6 @@ output_microdollars_per_million = 1
         let budget = crate::budget::StoreBudget::new(
             Arc::new(crate::store::UnavailableStore),
             crate::config::StoreUnavailable::Deny,
-            Duration::from_secs(30),
         );
         let resp = router(budgeted_state(&base_url, Box::new(budget)))
             .oneshot(chat_request())
@@ -11266,7 +11268,6 @@ output_microdollars_per_million = 1
         let budget = crate::budget::StoreBudget::new(
             Arc::new(crate::store::UnavailableStore),
             crate::config::StoreUnavailable::Allow,
-            Duration::from_secs(30),
         );
         let resp = router(budgeted_state(&base_url, Box::new(budget)))
             .oneshot(chat_request())

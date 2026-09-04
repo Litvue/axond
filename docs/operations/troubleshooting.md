@@ -33,7 +33,7 @@ Boot errors name references and identifiers, not secret values.
 | `400 bad_request` | Invalid request or query shape. | Error message; repeated/invalid `namespaces` values are rejected deliberately. |
 | `400 middleware_refused` | Request middleware classified the request as invalid before provider dispatch. | Request shape and the namespace's selected content policy. |
 | `403 middleware_refused` | A content-policy guardrail denied the authenticated request before provider dispatch, including an unrewritable match in a JSON key, continuation id, forwarded native wire header, or split text fragment. | The namespace's selected policy and request structure; this is not provider or credential health. |
-| `429 budget_exceeded` | Subject or namespace spend cap cannot admit the estimate. | Budget metrics and namespace-denial metric. |
+| `429 budget_exceeded` | Namespace spend cap: `spent >= limit`, or no budget row. | `GET /api/v1/namespaces/{ns}/budgets/{period}`. |
 | `429 rate_limit_exceeded` | In-flight concurrency cap reached. | Caller concurrency and limiter metrics. |
 | `429 tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. | `axond.admission.in_flight`; whether the tenant's own concurrency, not the replica, is the cause. |
 | `413 request_too_large` / `413 prompt_too_large` | Inbound or post-middleware body over `admission.max_request_bytes`, or estimated input over `admission.max_prompt_tokens`. | The caller's payload size and selected content policy; raise the bound only if the workload genuinely needs it. |

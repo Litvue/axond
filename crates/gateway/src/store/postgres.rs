@@ -7,8 +7,8 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, ProviderModels, Store, StoreError, UsageAppend,
-    UsageSummaryRow, budget_would_exceed, from_sql_amount, sql_amount, sql_amount_saturating,
+    BudgetAdmit, BudgetRecord, NamespaceRecord, ProviderModels, Store, StoreError, UsageAppend,
+    UsageSummaryRow, from_sql_amount, sql_amount, sql_amount_saturating,
 };
 use crate::backends::health::{BackendHealth, PostgresHealth};
 
@@ -535,16 +535,6 @@ async fn read_budget(
             "SELECT
                  b.limit_microdollars,
                  b.spent_microdollars,
-                 COALESCE((
-                     SELECT SUM(r.amount_microdollars)
-                     FROM axond_store_budget_reservation r
-                     WHERE r.namespace = b.namespace
-                       AND r.period = b.period
-                       AND r.expires_at > now()
-                       AND r.incarnation = COALESCE((
-                           SELECT n FROM axond_namespace_incarnation i WHERE i.id = b.namespace
-                       ), 1)
-                 ), 0)::bigint,
                  EXISTS (
                      SELECT 1 FROM axond_store_budget_active a
                      WHERE a.namespace = b.namespace AND a.period = b.period
@@ -563,8 +553,7 @@ async fn read_budget(
         period,
         from_sql_amount(row.get(0)),
         from_sql_amount(row.get(1)),
-        from_sql_amount(row.get(2)),
-        row.get(3),
+        row.get(2),
     )))
 }
 
@@ -772,49 +761,28 @@ impl Store for PostgresStore {
             .await
     }
 
-    async fn reserve_budget(
-        &self,
-        namespace: &str,
-        estimate_microdollars: u64,
-        reservation_ttl: Duration,
-        reservation_id: &str,
-    ) -> Result<BudgetReserve, StoreError> {
+    async fn admit_budget(&self, namespace: &str) -> Result<BudgetAdmit, StoreError> {
         let namespace = namespace.to_owned();
-        let reservation_id = reservation_id.to_owned();
-        let estimate = sql_amount(estimate_microdollars)?;
-        let ttl_ms = sql_amount(reservation_ttl.as_millis().min(i64::MAX as u128) as u64)?;
-        self.with_client(async move |client| {
-            let tx = client
-                .transaction()
-                .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            let outcome = hold(&tx, &namespace, estimate, ttl_ms, &reservation_id).await?;
-            // Commit Exceeded too: hold() may have deleted expired rows.
-            tx.commit()
-                .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            Ok(outcome)
-        })
-        .await
+        self.with_client(async move |client| admit_budget_on(client, &namespace).await)
+            .await
     }
 
-    async fn settle_budget(
+    async fn charge_budget(
         &self,
         namespace: &str,
         period: &str,
-        reservation_id: &str,
+        incarnation: i64,
         actual_microdollars: u64,
     ) -> Result<(), StoreError> {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
-        let reservation_id = reservation_id.to_owned();
         let actual = sql_amount_saturating(actual_microdollars);
         self.with_client(async move |client| {
             let tx = client
                 .transaction()
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            settle_tx(&tx, &namespace, &period, &reservation_id, actual).await?;
+            charge_budget_tx(&tx, &namespace, &period, incarnation, actual).await?;
             tx.commit()
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -1123,11 +1091,11 @@ async fn put_budget_tx(
         .ok_or_else(|| StoreError::Unavailable("budget row missing after put".into()))
 }
 
-async fn settle_tx(
+async fn charge_budget_tx(
     tx: &Transaction<'_>,
     namespace: &str,
     period: &str,
-    reservation_id: &str,
+    incarnation: i64,
     actual: i64,
 ) -> Result<(), StoreError> {
     lock_namespace_id(tx, namespace).await?;
@@ -1139,44 +1107,6 @@ async fn settle_tx(
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .is_some();
-    let _ = tx
-        .query_opt(
-            "SELECT period FROM axond_store_budget_active WHERE namespace = $1 FOR UPDATE",
-            &[&namespace],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    let _ = tx
-        .query_opt(
-            "SELECT limit_microdollars FROM axond_store_budget
-             WHERE namespace = $1 AND period = $2 FOR UPDATE",
-            &[&namespace, &period],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    // Claim the hold (or its tombstone) in the same statement that removes it
-    // so two settlements cannot both observe the incarnation.
-    let held_incarnation: Option<i64> = tx
-        .query_opt(
-            "DELETE FROM axond_store_budget_reservation WHERE id = $1
-             RETURNING incarnation",
-            &[&reservation_id],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?
-        .map(|row| row.get(0));
-    let held_incarnation = match held_incarnation {
-        Some(n) => Some(n),
-        None => tx
-            .query_opt(
-                "DELETE FROM axond_store_budget_reservation_tombstone WHERE id = $1
-                 RETURNING incarnation",
-                &[&reservation_id],
-            )
-            .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?
-            .map(|row| row.get(0)),
-    };
     let current: i64 = tx
         .query_opt(
             "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
@@ -1186,12 +1116,7 @@ async fn settle_tx(
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
         .map(|row| row.get(0))
         .unwrap_or(1);
-    // Unknown reservation id (no row, no tombstone) is a no-op.
-    let charge = match held_incarnation {
-        Some(incarnation) => ns_exists && incarnation == current,
-        None => false,
-    };
-    if charge {
+    if ns_exists && incarnation == current {
         tx.execute(
             "UPDATE axond_store_budget
              SET spent_microdollars = CASE
@@ -1207,105 +1132,37 @@ async fn settle_tx(
     Ok(())
 }
 
-async fn hold(
-    tx: &Transaction<'_>,
+async fn admit_budget_on(
+    client: &impl GenericClient,
     namespace: &str,
-    estimate: i64,
-    ttl_ms: i64,
-    reservation_id: &str,
-) -> Result<BudgetReserve, StoreError> {
-    let Some(active) = tx
+) -> Result<BudgetAdmit, StoreError> {
+    let Some(row) = client
         .query_opt(
-            "SELECT period FROM axond_store_budget_active WHERE namespace = $1 FOR UPDATE",
+            "SELECT a.period, b.limit_microdollars, b.spent_microdollars,
+                    COALESCE(i.n, 1)
+             FROM axond_store_budget_active a
+             JOIN axond_store_budget b
+               ON b.namespace = a.namespace AND b.period = a.period
+             LEFT JOIN axond_namespace_incarnation i ON i.id = a.namespace
+             WHERE a.namespace = $1",
             &[&namespace],
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?
     else {
-        return Ok(BudgetReserve::Exceeded);
+        return Ok(BudgetAdmit::Exceeded);
     };
-    let period: String = active.get(0);
-    let incarnation: i64 = tx
-        .query_opt(
-            "SELECT n FROM axond_namespace_incarnation WHERE id = $1",
-            &[&namespace],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?
-        .map(|row| row.get(0))
-        .unwrap_or(1);
-    // Vacuum tombstones whose *retention* has elapsed. Copy newly expired
-    // holds with a fresh deadline of now()+ttl so a request that outlived
-    // its hold can still settle after later admissions.
-    tx.execute(
-        "DELETE FROM axond_store_budget_reservation_tombstone
-         WHERE expires_at < now()",
-        &[],
-    )
-    .await
-    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    tx.execute(
-        "INSERT INTO axond_store_budget_reservation_tombstone
-            (id, incarnation, expires_at)
-         SELECT id, incarnation, now() + ($2::double precision / 1000.0) * interval '1 second'
-         FROM axond_store_budget_reservation
-         WHERE namespace = $1 AND expires_at <= now()
-         ON CONFLICT (id) DO UPDATE SET
-            incarnation = EXCLUDED.incarnation,
-            expires_at = EXCLUDED.expires_at",
-        &[&namespace, &ttl_ms],
-    )
-    .await
-    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    tx.execute(
-        "DELETE FROM axond_store_budget_reservation
-         WHERE namespace = $1 AND expires_at <= now()",
-        &[&namespace],
-    )
-    .await
-    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    let Some(row) = tx
-        .query_opt(
-            "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget
-             WHERE namespace = $1 AND period = $2 FOR UPDATE",
-            &[&namespace, &period],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?
-    else {
-        return Ok(BudgetReserve::Exceeded);
-    };
-    let limit: i64 = row.get(0);
-    let spent: i64 = row.get(1);
-    let reserved: i64 = tx
-        .query_one(
-            "SELECT COALESCE(SUM(amount_microdollars), 0)::bigint FROM axond_store_budget_reservation
-             WHERE namespace = $1 AND period = $2 AND expires_at > now()
-               AND incarnation = $3",
-            &[&namespace, &period, &incarnation],
-        )
-        .await
-        .map_err(|e| StoreError::Unavailable(e.to_string()))?
-        .get(0);
-    if budget_would_exceed(spent, reserved, estimate, limit) {
-        return Ok(BudgetReserve::Exceeded);
+    let period: String = row.get(0);
+    let limit: i64 = row.get(1);
+    let spent: i64 = row.get(2);
+    let incarnation: i64 = row.get(3);
+    if spent >= limit {
+        return Ok(BudgetAdmit::Exceeded);
     }
-    tx.execute(
-        "INSERT INTO axond_store_budget_reservation
-            (id, namespace, period, amount_microdollars, expires_at, incarnation)
-         VALUES ($1, $2, $3, $4, now() + ($5::bigint * interval '1 millisecond'), $6)",
-        &[
-            &reservation_id,
-            &namespace,
-            &period,
-            &estimate,
-            &ttl_ms,
-            &incarnation,
-        ],
-    )
-    .await
-    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    Ok(BudgetReserve::Allowed { period })
+    Ok(BudgetAdmit::Allowed {
+        period,
+        incarnation,
+    })
 }
 
 #[cfg(test)]

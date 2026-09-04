@@ -866,35 +866,29 @@ accounting for availability, and each is counted
 (`axond.usage.journal.lost`). A configuration that sets either one logs a warning
 at boot saying so.
 
-## `[budget]` — hold TTL (ADR 0063)
+## `[budget]` — leftover keys (ADR 0064)
 
 Spend caps live on the Store:
 `PUT /api/v1/namespaces/{ns}/budgets/{period}` sets `{limit_microdollars}` and
 marks that period active for admission. The ledger is `(namespace, period)`
-spent + reserved, not Redis, in-memory, or a `[budget] backend`.
-`backend = "redis"`, `"postgres"`, and `"in-memory"` are boot errors.
+spent, not Redis, in-memory, or a `[budget] backend`.
+`remaining = max(0, limit - spent)`. `reserved_microdollars` on GET is always
+`0`. `backend = "redis"`, `"postgres"`, and `"in-memory"` are boot errors.
+
+Admission is a spent-vs-limit read: `429 budget_exceeded` when there is no
+budget row or `spent >= limit`. No estimate is held before dispatch. Measured
+spend is added after the response. Concurrent in-flight requests can overshoot;
+the next admit then denies.
 
 Outage stance is `[storage].on_unavailable` (`deny` → `503 budget_unavailable`,
-`allow` → serve without a hold). A namespace with no budget row is
-`429 budget_exceeded`.
+`allow` → serve without charging). A cancelled or failed request is charged
+what it actually consumed — not the estimate, and not always zero. Charge
+happens **exactly once** per admitted request; a failed charge is not retried
+and under-records that request.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `reservation_ttl_seconds` | integer | `300` | How long a hold survives a replica that died mid-request. Should exceed the longest expected request. Zero is rejected. |
-
-Enforcement holds a priced estimate before dispatch and settles it against
-measured spend afterwards, so concurrent requests cannot collectively overshoot.
-A cancelled or failed request is charged what it actually consumed — not the
-estimate, and not always zero.
-
-Settlement happens **exactly once** per admitted request — on completion,
-upstream failure, client cancellation, or a dropped handler — and charges and
-releases in one atomic operation, so a request can never be charged without its
-hold being freed or vice versa. It is never retried: a settlement the store
-rejects leaves the hold to lapse at `reservation_ttl_seconds`, which the next
-reserve reclaims. That TTL is therefore the upper bound on how long a failed
-settlement can hold budget out of circulation, which is why it should exceed the
-longest expected request rather than be set generously.
+| `reservation_ttl_seconds` | integer | `300` | Unused. Holds are gone (ADR 0064). Zero is still rejected so existing files boot. |
 
 A successful PUT marks that period as the namespace's active period. Inference
 does not carry a period. Plan change is PUT the same period with a new limit;

@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use super::{
-    BudgetRecord, BudgetReserve, NamespaceRecord, ProviderModels, Store, StoreError, UsageAppend,
+    BudgetAdmit, BudgetRecord, NamespaceRecord, ProviderModels, Store, StoreError, UsageAppend,
     UsageSummaryRow, from_sql_amount, sql_amount, sql_amount_saturating,
 };
 
@@ -476,7 +475,7 @@ impl Store for SqliteStore {
                 params![namespace, period, limit],
             )
             .map_err(unavailable)?;
-            let rec = read_budget(&tx, &namespace, &period, now_ms())?;
+            let rec = read_budget(&tx, &namespace, &period)?;
             tx.commit().map_err(unavailable)?;
             rec.ok_or_else(|| StoreError::Unavailable("budget row missing after put".into()))
         })
@@ -490,167 +489,31 @@ impl Store for SqliteStore {
     ) -> Result<Option<BudgetRecord>, StoreError> {
         let namespace = namespace.to_string();
         let period = period.to_string();
-        self.with_conn(move |conn| read_budget(conn, &namespace, &period, now_ms()))
+        self.with_conn(move |conn| read_budget(conn, &namespace, &period))
             .await
     }
 
-    async fn reserve_budget(
-        &self,
-        namespace: &str,
-        estimate_microdollars: u64,
-        reservation_ttl: Duration,
-        reservation_id: &str,
-    ) -> Result<BudgetReserve, StoreError> {
+    async fn admit_budget(&self, namespace: &str) -> Result<BudgetAdmit, StoreError> {
         let namespace = namespace.to_string();
-        let reservation_id = reservation_id.to_string();
-        let estimate = sql_amount(estimate_microdollars)?;
-        let ttl_ms = sql_amount(reservation_ttl.as_millis().min(i64::MAX as u128) as u64)?;
-        self.with_conn(move |conn| {
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(unavailable)?;
-            let Some(period) = tx
-                .query_row(
-                    "SELECT period FROM axond_store_budget_active WHERE namespace = ?1",
-                    params![namespace],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(unavailable)?
-            else {
-                return Ok(BudgetReserve::Exceeded);
-            };
-            let now = now_ms();
-            let incarnation = current_incarnation(&tx, &namespace)?;
-            // Vacuum tombstones whose retention has elapsed. Copy newly
-            // expired holds with now()+ttl so a late settle after later
-            // admissions can still charge this incarnation.
-            tx.execute(
-                "DELETE FROM axond_store_budget_reservation_tombstone
-                 WHERE expires_at < ?1",
-                params![now],
-            )
-            .map_err(unavailable)?;
-            let retained_until = now.saturating_add(ttl_ms);
-            tx.execute(
-                "INSERT OR REPLACE INTO axond_store_budget_reservation_tombstone
-                    (id, incarnation, expires_at)
-                 SELECT id, incarnation, ?3 FROM axond_store_budget_reservation
-                 WHERE namespace = ?1 AND expires_at <= ?2",
-                params![namespace, now, retained_until],
-            )
-            .map_err(unavailable)?;
-            tx.execute(
-                "DELETE FROM axond_store_budget_reservation
-                 WHERE namespace = ?1 AND expires_at <= ?2",
-                params![namespace, now],
-            )
-            .map_err(unavailable)?;
-            let (limit, spent) = match tx
-                .query_row(
-                    "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget
-                     WHERE namespace = ?1 AND period = ?2",
-                    params![namespace, period],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()
-                .map_err(unavailable)?
-            {
-                Some(row) => row,
-                None => {
-                    tx.commit().map_err(unavailable)?;
-                    return Ok(BudgetReserve::Exceeded);
-                }
-            };
-            let reserved: i64 = tx
-                .query_row(
-                    "SELECT COALESCE(SUM(amount_microdollars), 0) FROM axond_store_budget_reservation
-                     WHERE namespace = ?1 AND period = ?2 AND expires_at > ?3
-                       AND incarnation = ?4",
-                    params![namespace, period, now, incarnation],
-                    |row| row.get(0),
-                )
-                .map_err(unavailable)?;
-            if super::budget_would_exceed(spent, reserved, estimate, limit) {
-                tx.commit().map_err(unavailable)?;
-                return Ok(BudgetReserve::Exceeded);
-            }
-            let expires_at = now.saturating_add(ttl_ms);
-            tx.execute(
-                "INSERT INTO axond_store_budget_reservation
-                    (id, namespace, period, amount_microdollars, expires_at, incarnation)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    reservation_id,
-                    namespace,
-                    period,
-                    estimate,
-                    expires_at,
-                    incarnation
-                ],
-            )
-            .map_err(unavailable)?;
-            tx.commit().map_err(unavailable)?;
-            Ok(BudgetReserve::Allowed { period })
-        })
-        .await
+        self.with_conn(move |conn| admit_budget_on(conn, &namespace))
+            .await
     }
 
-    async fn settle_budget(
+    async fn charge_budget(
         &self,
         namespace: &str,
         period: &str,
-        reservation_id: &str,
+        incarnation: i64,
         actual_microdollars: u64,
     ) -> Result<(), StoreError> {
         let namespace = namespace.to_string();
         let period = period.to_string();
-        let reservation_id = reservation_id.to_string();
         let actual = sql_amount_saturating(actual_microdollars);
         self.with_conn(move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(unavailable)?;
-            let held_incarnation: Option<i64> = tx
-                .query_row(
-                    "DELETE FROM axond_store_budget_reservation WHERE id = ?1
-                     RETURNING incarnation",
-                    params![reservation_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(unavailable)?;
-            let held_incarnation = match held_incarnation {
-                Some(n) => Some(n),
-                None => tx
-                    .query_row(
-                        "DELETE FROM axond_store_budget_reservation_tombstone WHERE id = ?1
-                         RETURNING incarnation",
-                        params![reservation_id],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(unavailable)?,
-            };
-            let ns_exists = namespace_exists(&tx, &namespace)?;
-            let current = current_incarnation(&tx, &namespace)?;
-            // Unknown reservation id (no row, no tombstone) is a no-op.
-            let charge = match held_incarnation {
-                Some(incarnation) => ns_exists && incarnation == current,
-                None => false,
-            };
-            if charge {
-                tx.execute(
-                    "UPDATE axond_store_budget
-                     SET spent_microdollars = CASE
-                         WHEN spent_microdollars >= 9223372036854775807 - ?1 THEN 9223372036854775807
-                         ELSE spent_microdollars + ?1
-                     END
-                     WHERE namespace = ?2 AND period = ?3",
-                    params![actual, namespace, period],
-                )
-                .map_err(unavailable)?;
-            }
+            charge_budget_on(&tx, &namespace, &period, incarnation, actual)?;
             tx.commit().map_err(unavailable)?;
             Ok(())
         })
@@ -866,48 +729,88 @@ fn sqlite_provider_models(
     })
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+fn admit_budget_on(conn: &Connection, namespace: &str) -> Result<BudgetAdmit, StoreError> {
+    let Some(period) = conn
+        .query_row(
+            "SELECT period FROM axond_store_budget_active WHERE namespace = ?1",
+            params![namespace],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(unavailable)?
+    else {
+        return Ok(BudgetAdmit::Exceeded);
+    };
+    let Some((limit, spent)) = conn
+        .query_row(
+            "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget
+             WHERE namespace = ?1 AND period = ?2",
+            params![namespace, period],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(unavailable)?
+    else {
+        return Ok(BudgetAdmit::Exceeded);
+    };
+    if spent >= limit {
+        return Ok(BudgetAdmit::Exceeded);
+    }
+    Ok(BudgetAdmit::Allowed {
+        period,
+        incarnation: current_incarnation(conn, namespace)?,
+    })
+}
+
+fn charge_budget_on(
+    conn: &Connection,
+    namespace: &str,
+    period: &str,
+    incarnation: i64,
+    actual: i64,
+) -> Result<(), StoreError> {
+    if !namespace_exists(conn, namespace)? {
+        return Ok(());
+    }
+    if current_incarnation(conn, namespace)? != incarnation {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE axond_store_budget
+         SET spent_microdollars = CASE
+             WHEN spent_microdollars >= 9223372036854775807 - ?1 THEN 9223372036854775807
+             ELSE spent_microdollars + ?1
+         END
+         WHERE namespace = ?2 AND period = ?3",
+        params![actual, namespace, period],
+    )
+    .map_err(unavailable)?;
+    Ok(())
 }
 
 fn read_budget(
     conn: &Connection,
     namespace: &str,
     period: &str,
-    now: i64,
 ) -> Result<Option<BudgetRecord>, StoreError> {
     conn.query_row(
         "SELECT
              b.limit_microdollars,
              b.spent_microdollars,
-             COALESCE((
-                 SELECT SUM(r.amount_microdollars)
-                 FROM axond_store_budget_reservation r
-                 WHERE r.namespace = b.namespace
-                   AND r.period = b.period
-                   AND r.expires_at > ?3
-                   AND r.incarnation = COALESCE((
-                       SELECT n FROM axond_namespace_incarnation i WHERE i.id = b.namespace
-                   ), 1)
-             ), 0),
              EXISTS (
                  SELECT 1 FROM axond_store_budget_active a
                  WHERE a.namespace = b.namespace AND a.period = b.period
              )
          FROM axond_store_budget b
          WHERE b.namespace = ?1 AND b.period = ?2",
-        params![namespace, period, now],
+        params![namespace, period],
         |row| {
             Ok(BudgetRecord::new(
                 namespace,
                 period,
                 from_sql_amount(row.get(0)?),
                 from_sql_amount(row.get(1)?),
-                from_sql_amount(row.get(2)?),
-                row.get(3)?,
+                row.get(2)?,
             ))
         },
     )
@@ -918,6 +821,7 @@ fn read_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn corrupt_attrs_are_unavailable() {
@@ -1027,16 +931,13 @@ mod tests {
             .await
             .expect("ns");
         store.put_budget("wsp_x", "old", 10_000).await.expect("old");
-        store
-            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "stale")
-            .await
-            .expect("stale hold");
+        store.admit_budget("wsp_x").await.expect("stale hold");
         tokio::time::sleep(Duration::from_millis(5)).await;
         store.put_budget("wsp_x", "new", 10_000).await.expect("new");
-        store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "live")
-            .await
-            .expect("live");
+        match store.admit_budget("wsp_x").await.expect("live") {
+            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "new"),
+            other => panic!("{other:?}"),
+        }
         let n: i64 = {
             let conn = store.conn.lock().expect("lock");
             conn.query_row(
@@ -1046,7 +947,7 @@ mod tests {
             )
             .expect("count")
         };
-        assert_eq!(n, 1, "expired holds from the old period must be reclaimed");
+        assert_eq!(n, 0, "admit does not write reservation rows");
     }
 
     #[tokio::test]
@@ -1062,16 +963,12 @@ mod tests {
             .expect("ns");
         store.put_budget("wsp_x", "p", 100).await.expect("budget");
         store
-            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "stale")
+            .charge_budget("wsp_x", "p", 1, 100)
             .await
-            .expect("stale hold");
-        tokio::time::sleep(Duration::from_millis(5)).await;
+            .expect("fill");
         assert!(matches!(
-            store
-                .reserve_budget("wsp_x", 200, Duration::from_secs(30), "over")
-                .await
-                .expect("denied"),
-            BudgetReserve::Exceeded
+            store.admit_budget("wsp_x").await.expect("at cap"),
+            BudgetAdmit::Exceeded
         ));
         let n: i64 = {
             let conn = store.conn.lock().expect("lock");
@@ -1082,7 +979,7 @@ mod tests {
             )
             .expect("count")
         };
-        assert_eq!(n, 0, "denied admission must keep the expiry delete");
+        assert_eq!(n, 0, "admit does not write reservation rows");
     }
 
     #[tokio::test]
@@ -1100,10 +997,7 @@ mod tests {
             .put_budget("wsp_x", "p", 10_000)
             .await
             .expect("budget");
-        store
-            .reserve_budget("wsp_x", 10, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         store
             .append_usage(UsageAppend {
                 request_id: "req_1".into(),
@@ -1128,7 +1022,7 @@ mod tests {
                 count("SELECT count(*) FROM axond_store_usage WHERE namespace = 'wsp_x'"),
             )
         };
-        assert_eq!((budget, active, reservations, usage), (0, 0, 1, 1));
+        assert_eq!((budget, active, reservations, usage), (0, 0, 0, 1));
         assert!(store.get_namespace("wsp_x").await.expect("get").is_none());
     }
 
@@ -1192,10 +1086,7 @@ mod tests {
             .put_budget("wsp_x", "p", 10_000)
             .await
             .expect("budget");
-        store
-            .reserve_budget("wsp_x", 77, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         assert!(store.delete_namespace("wsp_x").await.expect("delete"));
         store
             .put_namespace(NamespaceRecord {
@@ -1212,7 +1103,7 @@ mod tests {
         assert_eq!(rec.spent_microdollars, 0);
         assert_eq!(rec.reserved_microdollars, 0);
         store
-            .settle_budget("wsp_x", "p", "r1", 77)
+            .charge_budget("wsp_x", "p", 1, 77)
             .await
             .expect("late settle");
         let got = store
@@ -1249,10 +1140,7 @@ mod tests {
             .put_budget("wsp_x", "p", 10_000)
             .await
             .expect("budget");
-        store
-            .reserve_budget("wsp_x", 10, Duration::from_millis(1), "old")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         assert!(store.delete_namespace("wsp_x").await.expect("delete"));
         tokio::time::sleep(Duration::from_millis(5)).await;
         store
@@ -1267,10 +1155,7 @@ mod tests {
             .put_budget("wsp_x", "p", 10_000)
             .await
             .expect("new ledger");
-        store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "new")
-            .await
-            .expect("expire path");
+        store.admit_budget("wsp_x").await.expect("expire path");
         let (old, n): (i64, i64) = {
             let conn = store.conn.lock().expect("lock");
             let count = |sql: &str| conn.query_row(sql, [], |row| row.get(0)).expect("count");
@@ -1281,10 +1166,10 @@ mod tests {
                 ),
             )
         };
-        assert_eq!(old, 0, "expired prior-incarnation hold must be reclaimed");
-        assert_eq!(n, 1);
+        assert_eq!(old, 0);
+        assert_eq!(n, 0, "admit does not write reservation rows");
         store
-            .settle_budget("wsp_x", "p", "old", 10)
+            .charge_budget("wsp_x", "p", 1, 10)
             .await
             .expect("late settle");
         let got = store
@@ -1293,7 +1178,7 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 1);
+        assert_eq!(got.reserved_microdollars, 0);
     }
 
     #[tokio::test]
@@ -1311,10 +1196,7 @@ mod tests {
             .put_budget("wsp_x", "p", 10_000)
             .await
             .expect("budget");
-        store
-            .reserve_budget("wsp_x", 10, Duration::from_secs(30), "old")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         assert!(store.delete_namespace("wsp_x").await.expect("delete"));
         store
             .put_namespace(NamespaceRecord {
@@ -1328,10 +1210,7 @@ mod tests {
             .put_budget("wsp_x", "p", 10_000)
             .await
             .expect("new ledger");
-        store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "new")
-            .await
-            .expect("live hold");
+        store.admit_budget("wsp_x").await.expect("live hold");
         let n: i64 = {
             let conn = store.conn.lock().expect("lock");
             conn.query_row(
@@ -1341,12 +1220,9 @@ mod tests {
             )
             .expect("count")
         };
-        assert_eq!(
-            n, 2,
-            "unexpired prior-incarnation hold stays until settle or TTL"
-        );
+        assert_eq!(n, 0, "admit does not write reservation rows");
         store
-            .settle_budget("wsp_x", "p", "old", 10)
+            .charge_budget("wsp_x", "p", 1, 10)
             .await
             .expect("late settle");
         let got = store
@@ -1355,7 +1231,7 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 1);
+        assert_eq!(got.reserved_microdollars, 0);
     }
 
     #[tokio::test]
@@ -1373,10 +1249,7 @@ mod tests {
             .put_budget("wsp_x", "p", 10_000)
             .await
             .expect("budget");
-        store
-            .reserve_budget("wsp_x", 80, Duration::from_secs(30), "r1")
-            .await
-            .expect("hold");
+        store.admit_budget("wsp_x").await.expect("hold");
         {
             let conn = store.conn.lock().expect("lock");
             conn.execute(
@@ -1386,9 +1259,9 @@ mod tests {
             .expect("drop hold");
         }
         store
-            .settle_budget("wsp_x", "p", "r1", 11)
+            .charge_budget("wsp_x", "p", 99, 11)
             .await
-            .expect("unknown id");
+            .expect("wrong incarnation");
         let got = store
             .get_budget("wsp_x", "p")
             .await
@@ -1399,7 +1272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_tombstone_is_vacuumed_on_reserve_and_late_settle_is_noop() {
+    async fn expired_tombstone_is_not_vacuumed_on_admit() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         store
             .put_namespace(NamespaceRecord {
@@ -1422,10 +1295,7 @@ mod tests {
             )
             .expect("past tombstone");
         }
-        store
-            .reserve_budget("wsp_x", 1, Duration::from_secs(30), "live")
-            .await
-            .expect("reserve vacuums");
+        store.admit_budget("wsp_x").await.expect("reserve vacuums");
         let leftover: i64 = {
             let conn = store.conn.lock().expect("lock");
             conn.query_row(
@@ -1436,18 +1306,18 @@ mod tests {
             )
             .expect("count")
         };
-        assert_eq!(leftover, 0, "past-expiry tombstone must be vacuumed");
+        assert_eq!(leftover, 1, "admit does not vacuum tombstones");
         store
-            .settle_budget("wsp_x", "p", "stale", 99)
+            .charge_budget("wsp_x", "p", 1, 99)
             .await
-            .expect("late settle");
+            .expect("charge");
         let got = store
             .get_budget("wsp_x", "p")
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 1);
+        assert_eq!(got.spent_microdollars, 99);
+        assert_eq!(got.reserved_microdollars, 0);
     }
 
     #[test]
