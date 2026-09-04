@@ -6,6 +6,12 @@ Date: 2026-08-04
 
 Accepted
 
+The live Store path no longer holds an estimate before dispatch
+([ADR 0064](./0064-charge-actuals-after-response.md)). Charging measured
+consumption, including cancelled streams, still holds. The Redis/Postgres
+`[budget]` backends this record introduced are withdrawn by
+[ADR 0063](./0063-stateful-only-namespaced-gateway.md).
+
 ## Context
 
 ADR 0002 put spend caps behind a `BudgetStore` trait with `NoBudget` as the

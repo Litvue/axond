@@ -1,35 +1,28 @@
-//! Budget ledger on the required [`Store`] (ADR 0063).
+//! Budget ledger on the required [`Store`] (ADR 0063 / ADR 0064).
 //!
-//! Caps are per `(namespace, period)`. The active period is the last successful
-//! PUT; inference does not carry a period. Unavailability follows
+//! Caps are per `(namespace, period)`. Admission is a spent-vs-limit read;
+//! actuals are charged after the response. Unavailability follows
 //! `[storage].on_unavailable`.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 
 use super::{Admission, BudgetKey, BudgetStore, Denial, Reservation, UnavailablePolicy};
 use crate::backends::health::BackendHealth;
 use crate::config::StoreUnavailable;
-use crate::store::{BudgetReserve, Store, StoreError};
+use crate::store::{Store, StoreError};
 
 pub struct StoreBudget {
     store: Arc<dyn Store>,
     unavailable: UnavailablePolicy,
-    reservation_ttl: Duration,
 }
 
 impl StoreBudget {
-    pub fn new(
-        store: Arc<dyn Store>,
-        unavailable: StoreUnavailable,
-        reservation_ttl: Duration,
-    ) -> Self {
+    pub fn new(store: Arc<dyn Store>, unavailable: StoreUnavailable) -> Self {
         Self {
             store,
             unavailable: unavailable.into(),
-            reservation_ttl,
         }
     }
 
@@ -48,40 +41,27 @@ impl BudgetStore for StoreBudget {
         self.store.health()
     }
 
-    async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {
-        let id = Reservation::next_id();
-        match self
-            .store
-            .reserve_budget(
-                &key.namespace,
-                estimated_microdollars,
-                self.reservation_ttl,
-                &id,
-            )
-            .await
-        {
-            Ok(BudgetReserve::Allowed { period }) => Admission::Allowed(Reservation {
-                id,
-                estimate_microdollars: estimated_microdollars,
-                generation: None,
-                period: Some(period),
-            }),
-            Ok(BudgetReserve::Exceeded) => Admission::Denied(Denial::Exceeded),
+    fn store_ledger(&self) -> Option<&Arc<dyn Store>> {
+        Some(&self.store)
+    }
+
+    async fn reserve(&self, key: &BudgetKey, _estimated_microdollars: u64) -> Admission {
+        match self.store.admit_budget(&key.namespace).await {
+            Ok(admit) => super::admission_from_store(admit),
             Err(StoreError::Invalid(_)) => Admission::Denied(Denial::Exceeded),
             Err(error) => self.on_unavailable(&error),
         }
     }
 
     async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual_microdollars: u64) {
-        if reservation.id.is_empty() {
-            return;
-        }
-        let Some(period) = reservation.period.as_deref() else {
+        let (Some(period), Some(incarnation)) =
+            (reservation.period.as_deref(), reservation.incarnation)
+        else {
             return;
         };
         if let Err(error) = self
             .store
-            .settle_budget(&key.namespace, period, &reservation.id, actual_microdollars)
+            .charge_budget(&key.namespace, period, incarnation, actual_microdollars)
             .await
         {
             tracing::error!(
@@ -89,7 +69,7 @@ impl BudgetStore for StoreBudget {
                 namespace = %key.namespace,
                 period,
                 error = %error,
-                "budget settlement failed; leaving the hold to expire"
+                "budget charge failed; spend is not recorded for this request"
             );
         }
     }
@@ -109,11 +89,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_is_budget_unavailable() {
-        let budget = StoreBudget::new(
-            Arc::new(UnavailableStore),
-            StoreUnavailable::Deny,
-            Duration::from_secs(30),
-        );
+        let budget = StoreBudget::new(Arc::new(UnavailableStore), StoreUnavailable::Deny);
         assert!(matches!(
             budget.reserve(&key(), 1).await,
             Admission::Denied(Denial::StoreUnavailable)
@@ -121,7 +97,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_estimate_is_exceeded_even_when_unavailable_is_allow() {
+    async fn zero_limit_is_exceeded_even_when_unavailable_is_allow() {
         let sqlite = crate::store::SqliteStore::open(":memory:").expect("sqlite");
         sqlite
             .put_namespace(crate::store::NamespaceRecord {
@@ -131,13 +107,13 @@ mod tests {
             })
             .await
             .expect("ns");
-        sqlite.put_budget("wsp_x", "p", 100).await.expect("budget");
+        sqlite.put_budget("wsp_x", "p", 0).await.expect("budget");
         let store: Arc<dyn Store> = Arc::new(sqlite);
         for stance in [StoreUnavailable::Allow, StoreUnavailable::Deny] {
-            let budget = StoreBudget::new(Arc::clone(&store), stance, Duration::from_secs(30));
+            let budget = StoreBudget::new(Arc::clone(&store), stance);
             assert!(
                 matches!(
-                    budget.reserve(&key(), u64::MAX).await,
+                    budget.reserve(&key(), 1).await,
                     Admission::Denied(Denial::Exceeded)
                 ),
                 "{stance:?}"
@@ -147,11 +123,7 @@ mod tests {
 
     #[tokio::test]
     async fn allow_serves_without_a_hold() {
-        let budget = StoreBudget::new(
-            Arc::new(UnavailableStore),
-            StoreUnavailable::Allow,
-            Duration::from_secs(30),
-        );
+        let budget = StoreBudget::new(Arc::new(UnavailableStore), StoreUnavailable::Allow);
         let admission = budget.reserve(&key(), 1).await;
         match admission {
             Admission::Allowed(reservation) => {

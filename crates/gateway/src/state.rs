@@ -2221,16 +2221,10 @@ namespace = "platform"
         ) -> Result<Option<crate::store::BudgetRecord>, StoreError> {
             Ok(None)
         }
-        async fn reserve_budget(
-            &self,
-            _: &str,
-            _: u64,
-            _: Duration,
-            _: &str,
-        ) -> Result<crate::store::BudgetReserve, StoreError> {
+        async fn admit_budget(&self, _: &str) -> Result<crate::store::BudgetAdmit, StoreError> {
             Err(StoreError::Unavailable("unused".into()))
         }
-        async fn settle_budget(&self, _: &str, _: &str, _: &str, _: u64) -> Result<(), StoreError> {
+        async fn charge_budget(&self, _: &str, _: &str, _: i64, _: u64) -> Result<(), StoreError> {
             Ok(())
         }
         async fn append_usage(&self, _: crate::store::UsageAppend) -> Result<(), StoreError> {

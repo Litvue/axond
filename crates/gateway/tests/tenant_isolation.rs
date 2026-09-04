@@ -45,11 +45,9 @@ use support::tenancy::{
 /// A minimal chat request; the fake upstream answers every alias from the same
 /// committed fixture, so a tenant's request differs only in who sent it.
 ///
-/// `max_tokens` is declared because the budget hold is priced from it: left out,
-/// the pre-dispatch estimate reserves a default output allowance worth orders of
-/// magnitude more than the fixture actually costs, and a cap small enough to be
-/// reached in a test would refuse the first request on its estimate rather than
-/// on any spend.
+/// `max_tokens` is declared so the pre-dispatch estimate (used for
+/// `max_request_microdollars`) stays small. Namespace admission is spent-vs-limit
+/// and does not hold that estimate (ADR 0064).
 fn chat(alias: &str) -> Value {
     json!({
         "model": alias,

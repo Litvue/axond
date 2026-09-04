@@ -56,7 +56,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::admission::{AdmissionPermit, DiagnosticCredential, RequestKind};
 use crate::aliases::AliasScope;
-use crate::budget::{Admission, BudgetKey, Denial, Reservation};
+use crate::budget::{Admission, BudgetKey, Denial, Reservation, admission_from_store};
 use crate::config::{
     Config, CoreAccountingMode, Model, Provider, ProviderKind, ProviderWire, Target, UnpricedModels,
 };
@@ -72,7 +72,7 @@ use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::status::{StatusResponse, StatusScope};
-use crate::store::{NamespaceRecord, StoreError};
+use crate::store::{BudgetAdmit, NamespaceRecord, StoreError};
 use crate::streaming::{self, Framing, StreamContext, StreamDelivery};
 use crate::telemetry;
 use crate::usage::identity::EventIdentity;
@@ -1032,12 +1032,35 @@ async fn authenticate_middleware(
             .namespace_grant()
             .map_err(|_| GatewayError::NamespaceNotAuthorized)?;
         let authorized = grant.permits(&namespace);
-        let record = match state.store() {
-            Some(store) => store
-                .get_namespace(namespace.as_str())
-                .await
-                .map_err(GatewayError::from)?,
-            None => None,
+        let missing = if !authorized {
+            GatewayError::NamespaceNotAuthorized
+        } else {
+            GatewayError::UnknownNamespace
+        };
+        let reuse_admit = match (state.store(), state.0.budget.store_ledger()) {
+            (Some(namespaces), Some(ledger)) => Arc::ptr_eq(namespaces, ledger),
+            _ => false,
+        };
+        let record = if reuse_admit {
+            let resolved = match state.store() {
+                Some(store) => store
+                    .resolve_namespace(namespace.as_str())
+                    .await
+                    .map_err(GatewayError::from)?,
+                None => None,
+            }
+            .ok_or(missing)?;
+            request.extensions_mut().insert(resolved.admit);
+            resolved.record
+        } else {
+            match state.store() {
+                Some(store) => store
+                    .get_namespace(namespace.as_str())
+                    .await
+                    .map_err(GatewayError::from)?,
+                None => None,
+            }
+            .ok_or(missing)?
         };
         if !authorized {
             debug!(
@@ -1048,15 +1071,14 @@ async fn authenticate_middleware(
             );
             return Err(GatewayError::NamespaceNotAuthorized);
         }
-        let Some(record) = record else {
-            return Err(GatewayError::UnknownNamespace);
-        };
 
         // Downstream code reads one effective namespace from the caller
         // context. Replacing it here makes the path authoritative when a later
         // grant implementation permits a set or all namespaces. Attrs are
         // copied at admission so usage records carry the workspace metadata
-        // Litvue stored (ADR 0063).
+        // Litvue stored (ADR 0063). When the budget ledger is this Store,
+        // admit is loaded in the same round trip so inference does not hit
+        // Postgres again before dispatch.
         caller.namespace = namespace.to_string();
         caller.attrs = Some(record.attrs.clone());
         request.extensions_mut().insert(namespace);
@@ -1298,8 +1320,9 @@ impl Route {
         }
     }
 
-    /// Pre-dispatch estimate the budget hold is priced from. Embeddings produce
-    /// no completion, so nothing is held for output.
+    /// Pre-dispatch estimate for `max_request_microdollars` and usage fallback.
+    /// Embeddings produce no completion, so output is zero. Not held against
+    /// the namespace cap (ADR 0064).
     fn estimate(self, body: &Value) -> Usage {
         self.measure(body).0
     }
@@ -1431,6 +1454,21 @@ impl Wire {
     }
 }
 
+struct ServeNs {
+    record: NamespaceRecord,
+    admit: Option<BudgetAdmit>,
+}
+
+fn serve_ns(
+    record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
+) -> Option<ServeNs> {
+    record.map(|Extension(record)| ServeNs {
+        record,
+        admit: admit.map(|Extension(admit)| admit),
+    })
+}
+
 /// The inbound body, or a typed refusal. An oversized body is a bound the
 /// gateway imposed (`413`), a wrong media type is `415` as axum's extractor
 /// already answered it, and a malformed one is the caller's (`400`); no
@@ -1456,6 +1494,7 @@ async fn chat_completions(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1465,7 +1504,7 @@ async fn chat_completions(
         Route::ChatCompletions,
         snapshot,
         caller,
-        record.map(|Extension(record)| record),
+        serve_ns(record, admit),
     )
     .await
 }
@@ -1480,6 +1519,7 @@ async fn native_messages(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1489,7 +1529,7 @@ async fn native_messages(
         Route::NativeMessages,
         snapshot,
         caller,
-        record.map(|Extension(record)| record),
+        serve_ns(record, admit),
     )
     .await
 }
@@ -1500,6 +1540,7 @@ async fn embeddings(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1509,7 +1550,7 @@ async fn embeddings(
         Route::Embeddings,
         snapshot,
         caller,
-        record.map(|Extension(record)| record),
+        serve_ns(record, admit),
     )
     .await
 }
@@ -1520,6 +1561,7 @@ async fn responses(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     record: Option<Extension<NamespaceRecord>>,
+    admit: Option<Extension<BudgetAdmit>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
@@ -1529,14 +1571,15 @@ async fn responses(
         Route::Responses,
         snapshot,
         caller,
-        record.map(|Extension(record)| record),
+        serve_ns(record, admit),
     )
     .await
 }
 
 /// The one request path every route shares: split `provider-id/model-id`,
-/// hold a budget estimate, dispatch (credential-pool rotation, no alias
-/// failover), then settle the hold and record exactly one usage record.
+/// admit if spent is under the active-period limit, dispatch (credential-pool
+/// rotation, no alias failover), then charge measured spend and record exactly
+/// one usage record.
 /// Routes differ only in the wire they speak — where the body goes upstream and
 /// how usage is read back out (see [`Route`]).
 async fn serve(
@@ -1546,14 +1589,15 @@ async fn serve(
     route: Route,
     snapshot: Arc<ConfigSnapshot>,
     caller: InboundKey,
-    namespace: Option<NamespaceRecord>,
+    namespace: Option<ServeNs>,
 ) -> Result<Response, GatewayError> {
     let cfg = &snapshot.config;
     let ns_blocklist = namespace
         .as_ref()
-        .and_then(|record| record.blocklist.clone())
+        .and_then(|ns| ns.record.blocklist.clone())
         .unwrap_or_default();
-    let attrs = namespace.map(|record| record.attrs);
+    let preloaded_admit = namespace.as_ref().and_then(|ns| ns.admit.clone());
+    let attrs = namespace.map(|ns| ns.record.attrs);
 
     route.validate_routing_controls(&body)?;
 
@@ -1783,10 +1827,9 @@ async fn serve(
         recomputed
     };
 
-    // Budget is denominated in micro-dollars. Hold a conservative cost estimate
-    // from the post-middleware body before dispatch; settle the hold against the
-    // real cost — priced at whichever target actually served — after. The first
-    // estimate above remains only a cheap pre-admission fail-fast.
+    // Budget is denominated in micro-dollars. Admit on spent-vs-limit (no hold);
+    // charge measured cost — priced at whichever target actually served — after.
+    // The estimate is only for `max_request_microdollars` and usage fallback.
     let budget_key = BudgetKey {
         namespace: caller.namespace.clone(),
         subject: caller.subject.clone(),
@@ -1813,16 +1856,21 @@ async fn serve(
                     estimated_cost,
                     estimate.input_tokens,
                     &alias,
+                    preloaded_admit,
                 )
                 .await?;
             middleware_execution
                 .core_budget_context()
-                .expect("fixed budget middleware reserved a hold")
+                .expect("fixed budget middleware admitted")
                 .1
                 .clone()
         }
         CoreAccountingMode::Legacy => {
-            match state.0.budget.reserve(&budget_key, estimated_cost).await {
+            let admission = match preloaded_admit {
+                Some(admit) => admission_from_store(admit),
+                None => state.0.budget.reserve(&budget_key, estimated_cost).await,
+            };
+            match admission {
                 Admission::Allowed(reservation) => reservation,
                 Admission::Denied(Denial::Exceeded) => {
                     return Err(GatewayError::BudgetExceeded(alias));
@@ -3314,9 +3362,9 @@ fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
 }
 
 /// Conservative pre-dispatch usage estimate: input tokens from the request body
-/// (~4 chars/token) plus a reserved output allowance (`max_tokens` when present,
-/// else a default). Priced with a target's `ModelPrice` it becomes the held
-/// estimate, which settlement replaces with the real cost.
+/// (~4 chars/token) plus an output allowance (`max_tokens` when present, else a
+/// default). Used for `max_request_microdollars` and as a fallback when the
+/// provider reports no usage. Not held against the namespace cap (ADR 0064).
 fn estimate_usage(body: &Value) -> (Usage, usize) {
     const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1_024;
     let body_bytes = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
@@ -3726,7 +3774,7 @@ mod tests {
             .0
             .output_tokens,
             500_000,
-            "the hold prices the allowance the provider will honor"
+            "the estimate uses the allowance the provider will honor"
         );
     }
 
@@ -8076,6 +8124,7 @@ output_microdollars_per_million = 1000000
                 estimate_microdollars: estimated_microdollars,
                 generation: None,
                 period: None,
+                incarnation: None,
             })
         }
         async fn settle(
@@ -8109,6 +8158,7 @@ output_microdollars_per_million = 1000000
                 estimate_microdollars: estimated_microdollars,
                 generation: None,
                 period: None,
+                incarnation: None,
             })
         }
 
@@ -11246,7 +11296,6 @@ output_microdollars_per_million = 1
         let budget = crate::budget::StoreBudget::new(
             Arc::new(crate::store::UnavailableStore),
             crate::config::StoreUnavailable::Deny,
-            Duration::from_secs(30),
         );
         let resp = router(budgeted_state(&base_url, Box::new(budget)))
             .oneshot(chat_request())
@@ -11266,7 +11315,6 @@ output_microdollars_per_million = 1
         let budget = crate::budget::StoreBudget::new(
             Arc::new(crate::store::UnavailableStore),
             crate::config::StoreUnavailable::Allow,
-            Duration::from_secs(30),
         );
         let resp = router(budgeted_state(&base_url, Box::new(budget)))
             .oneshot(chat_request())

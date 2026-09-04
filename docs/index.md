@@ -135,5 +135,7 @@ They are not runbooks for a current deployment:
 - [Architecture decisions](./adr) — accepted design decisions and consequences.
 - [ADR 0063: stateful-only namespaced gateway](./adr/0063-stateful-only-namespaced-gateway.md)
   — current product shape.
+- [ADR 0064: charge actuals after the response](./adr/0064-charge-actuals-after-response.md)
+  — no pre-dispatch budget hold; `remaining = limit - spent`.
 - [ADR 0062](./adr/0062-blob-backed-flat-namespace-control-plane.md) and
   [ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) — superseded.

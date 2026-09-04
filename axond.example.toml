@@ -289,8 +289,8 @@ namespace = "platform"
 # be emitted with repeatable `axond mint --scope` flags.
 # The `aliases` claim is enforced at dispatch and in the `/v1/models` view, and
 # `axond mint --alias` emits it. `max_request_microdollars` is enforced at
-# admission time against the pre-dispatch estimate and can be emitted by
-# `axond mint`.
+# admission time against the pre-dispatch estimate (not a namespace hold) and
+# can be emitted by `axond mint`.
 #
 # [gateway_token]
 # audience = "acme-production"
@@ -493,17 +493,13 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # poll_interval_ms = 250
 
 # ---------------------------------------------------------------------------
-# Budget — spend caps on the request path
+# Budget — leftover keys; spend caps live on the Store
 # ---------------------------------------------------------------------------
-# Omit this section entirely and there is no cap and no datastore, which is the
-# default. A cap is per (namespace, subject) and denominated in micro-dollars,
-# priced from the model's `price` above.
-#
-# Enforcement holds an estimate before dispatch and settles it against the real
-# cost afterwards, so concurrent in-flight requests cannot collectively overshoot
-# the cap. A failed or cancelled request is charged the spend it actually
-# consumed — not zero, and not the reserved estimate. See
-# docs/adr/0010-shared-budget-backends-and-charging-policy.md.
+# Caps are per (namespace, period) via
+# PUT /api/v1/namespaces/{ns}/budgets/{period}. `[budget] backend` is a boot
+# error (ADR 0063). Admission is spent >= limit; actuals are charged after the
+# response. Concurrent in-flight requests can overshoot (ADR 0064). A failed or
+# cancelled request is charged what it consumed.
 
 # [budget]
 # # none (default) | in-memory | redis | postgres.
@@ -526,8 +522,7 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # # What to do when the store is unreachable. deny (default) rejects with 503
 # # rather than silently serving an unenforced cap; allow serves and warns.
 # on_unavailable = "deny"
-# # How long a hold survives a replica that died mid-request. Should exceed the
-# # longest expected request.
+# # Unused. Holds are gone (ADR 0064).
 # reservation_ttl_seconds = 300
 # # Redis only: key namespace for budget state. Defaults to `axond:budget`.
 # key_prefix = "axond:budget"

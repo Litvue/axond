@@ -28,12 +28,13 @@ use secrecy::zeroize::Zeroize;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::budget::{Admission, BudgetKey, Denial, Reservation};
+use crate::budget::{Admission, BudgetKey, Denial, Reservation, admission_from_store};
 use crate::config::Config;
 use crate::desired_state::ContentMiddlewareRegistration;
 use crate::error::GatewayError;
 use crate::rate_limit::{RateLimitError, RateLimitKey, RateLimitPermit};
 use crate::state::AppState;
+use crate::store::BudgetAdmit;
 
 /// Keep abandoned synchronous invocations from consuming Tokio's entire
 /// process-wide blocking pool. A timed-out task retains its permit until the
@@ -1060,8 +1061,8 @@ impl MiddlewareExecution {
     }
 
     /// Fixed core budget middleware. This runs only after content mutation and
-    /// authoritative estimate recomputation. An armed hold releases on drop
-    /// unless an outcome transfers it into terminal accounting first.
+    /// authoritative estimate recomputation. Admit is a spent-vs-limit read;
+    /// an armed handle charges on drop unless an outcome settles it first.
     pub(crate) async fn reserve_budget(
         &mut self,
         state: &AppState,
@@ -1069,9 +1070,14 @@ impl MiddlewareExecution {
         estimated_microdollars: u64,
         estimated_input_tokens: u64,
         alias: &str,
+        preloaded: Option<BudgetAdmit>,
     ) -> Result<(), GatewayError> {
         debug_assert!(self.core_budget.is_none());
-        let reservation = match state.0.budget.reserve(&key, estimated_microdollars).await {
+        let admission = match preloaded {
+            Some(admit) => admission_from_store(admit),
+            None => state.0.budget.reserve(&key, estimated_microdollars).await,
+        };
+        let reservation = match admission {
             Admission::Allowed(reservation) => reservation,
             Admission::Denied(Denial::Exceeded) => {
                 return Err(GatewayError::BudgetExceeded(alias.to_owned()));
@@ -1563,7 +1569,7 @@ impl MiddlewareExecution {
 
 /// Gateway-owned state for the fixed budget middleware. It is deliberately not
 /// a `gateway-core` middleware state: core remains I/O-free, while this owner
-/// performs the asynchronous reserve/settle contract at fixed source positions.
+/// performs the asynchronous admit/charge contract at fixed source positions.
 pub(crate) struct CoreBudgetHold {
     state: AppState,
     key: BudgetKey,

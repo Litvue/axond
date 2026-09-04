@@ -4075,7 +4075,7 @@ impl Config {
         if budget.backend != BudgetBackend::None {
             return Err(ConfigError::Invalid(format!(
                 "`[budget]` backend `{backend}` is withdrawn (ADR 0063): spend caps live on the Store. \
-                 Remove `[budget]` or leave `backend` unset. `[budget] reservation_ttl_seconds` still sets the hold TTL."
+                 Remove `[budget]` or leave `backend` unset. `[budget] reservation_ttl_seconds` is unused (ADR 0064)."
             )));
         }
         if budget.reservation_ttl_seconds == 0 {

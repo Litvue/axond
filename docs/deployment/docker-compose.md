@@ -128,7 +128,7 @@ docker compose \
 Period budgets live in the Store, not Redis. A missing budget is `429
 budget_exceeded`. A Store outage is `503 budget_unavailable` under the default
 `[storage].on_unavailable = deny`. Catalogue reads
-(`GET /ns/{ns}/v1/models`) do not take a budget hold.
+(`GET /ns/{ns}/v1/models`) do not admit against the budget.
 
 ## Teardown
 

@@ -1,4 +1,4 @@
-//! ADR 0063 slice 3: per-namespace per-period reserve/settle.
+//! ADR 0063 slice 3 / ADR 0064: per-namespace per-period admit/charge.
 
 use std::time::Duration;
 
@@ -81,7 +81,9 @@ async fn post_put_then_fitting_completion_is_admitted_over_cap_is_not() {
     assert_eq!(body["error"]["type"], "budget_exceeded");
     assert_eq!(upstream.state.received(), 0);
 
-    put_budget(&http, &gateway, "wsp_fit", "2026-09", 1_000_000_000).await;
+    let published = put_budget(&http, &gateway, "wsp_fit", "2026-09", 1_000_000_000).await;
+    assert_eq!(published["reserved_microdollars"], json!(0));
+    assert_eq!(published["remaining_microdollars"], json!(1_000_000_000));
     let ok = complete(&http, &gateway, "wsp_fit", &chat_body()).await;
     assert_eq!(ok.status(), 200, "{}", ok.text().await.unwrap());
     assert!(upstream.state.received() >= 1);
@@ -141,10 +143,12 @@ async fn put_same_period_new_limit_does_not_zero_spend() {
     let after = put_budget(&http, &gateway, "wsp_limit", "p", spent + 10).await;
     assert_eq!(after["spent_microdollars"].as_u64().unwrap(), spent);
     assert_eq!(after["limit_microdollars"].as_u64().unwrap(), spent + 10);
+    assert_eq!(after["reserved_microdollars"], json!(0));
+    assert_eq!(after["remaining_microdollars"].as_u64().unwrap(), 10);
 }
 
 #[tokio::test]
-async fn in_flight_hold_counts_settle_charges_actual_cancel_charges_consumed() {
+async fn in_flight_does_not_hold_cancel_charges_consumed() {
     let (_upstream, gateway) = boot().await;
     let http = client();
     create_namespace(&http, &gateway, "wsp_hold").await;
@@ -167,24 +171,16 @@ async fn in_flight_hold_counts_settle_charges_actual_cancel_charges_consumed() {
         .expect("stream headers");
     assert_eq!(stream.status(), 200, "{}", stream.status());
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let reserved = loop {
-        let got = get_budget(&http, &gateway, "wsp_hold", "p").await;
-        let reserved = got["reserved_microdollars"].as_u64().unwrap();
-        if reserved > 0 {
-            break reserved;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("hold never appeared: {got}");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let inflight = get_budget(&http, &gateway, "wsp_hold", "p").await;
+    assert_eq!(inflight["reserved_microdollars"], json!(0));
 
-    put_budget(&http, &gateway, "wsp_hold", "p", reserved).await;
-    let denied = complete(&http, &gateway, "wsp_hold", &chat_body()).await;
-    assert_eq!(denied.status(), 429);
-    let body: Value = denied.json().await.unwrap();
-    assert_eq!(body["error"]["type"], "budget_exceeded");
+    let concurrent = complete(&http, &gateway, "wsp_hold", &chat_body()).await;
+    assert_eq!(
+        concurrent.status(),
+        200,
+        "in-flight work does not occupy remaining: {}",
+        concurrent.text().await.unwrap()
+    );
 
     let mut stream = stream;
     let mut saw_body = false;
@@ -211,14 +207,17 @@ async fn in_flight_hold_counts_settle_charges_actual_cancel_charges_consumed() {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("settle never landed: {got}");
+            panic!("charge never landed: {got}");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let records = gateway.await_usage_records(1).await;
-    assert_eq!(records[0]["status"], json!("client_cancelled"));
-    assert!(records[0]["cost_microdollars"].as_u64().unwrap_or(0) > 0);
+    let records = gateway.await_usage_records(2).await;
+    let cancelled = records
+        .iter()
+        .find(|record| record["status"] == json!("client_cancelled"))
+        .expect("cancelled usage");
+    assert!(cancelled["cost_microdollars"].as_u64().unwrap_or(0) > 0);
 }
 
 #[tokio::test]
