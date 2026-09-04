@@ -1250,7 +1250,7 @@ impl PostgresStore {
                     "INSERT INTO axond_store_budget_reservation
                         (id, namespace, period, amount_microdollars, expires_at, incarnation)
                      VALUES ($1, $2, 'p', 1,
-                             now() + ($3 * interval '1 millisecond'), 1)",
+                             now() + ($3::bigint * interval '1 millisecond'), 1)",
                     &[&id, &namespace, &expires_in_ms],
                 )
                 .await
