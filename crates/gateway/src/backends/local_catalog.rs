@@ -177,10 +177,16 @@ impl LocalCatalogBuilder {
 ///
 /// A published schedule with context tiers is unpublished for the same reason:
 /// [`ModelPrice`] has no threshold, so compiling only the base rates would bill
-/// long-context requests below what the source states. Such offerings fall to
-/// the `[[price]]` fallback, where an operator can state the rate they accept.
+/// long-context requests below what the source states. Audio rates are
+/// unpublished because [`gateway_core::Usage`] has no audio token field, so
+/// compiling the rest would let audio usage escape the charge. Such offerings
+/// fall to the `[[price]]` fallback, where an operator can state the rate they
+/// accept.
 pub fn model_price_from_cost(price: &ObservedPrice) -> Option<ModelPrice> {
     if !price.tiers.is_empty() {
+        return None;
+    }
+    if price.base.input_audio.is_some() || price.base.output_audio.is_some() {
         return None;
     }
     Some(ModelPrice {
@@ -594,6 +600,55 @@ mod tests {
         assert!(
             index.price_for("openai", "gpt-5.5").is_none(),
             "a tiered offering must not charge its base rate for long context"
+        );
+    }
+
+    /// Same fail-closed rule as the approved book: an `input_audio` /
+    /// `output_audio` rate has no usage field to bill, so the offering is
+    /// omitted rather than charged as text-only.
+    #[test]
+    fn an_audio_rate_is_not_compiled_because_no_usage_field_would_bill_it() {
+        let payload = r#"{
+            "models": {
+                "openai/gpt-audio": {
+                    "id": "openai/gpt-audio",
+                    "name": "GPT Audio",
+                    "modalities": {"input": ["text", "audio"], "output": ["text"]}
+                }
+            },
+            "providers": {
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "env": ["OPENAI_API_KEY"],
+                    "models": {
+                        "gpt-audio": {
+                            "id": "gpt-audio",
+                            "name": "GPT Audio",
+                            "modalities": {"input": ["text", "audio"], "output": ["text"]},
+                            "cost": {"input": 5, "output": 20, "input_audio": 40}
+                        }
+                    }
+                }
+            }
+        }"#;
+        let snapshot = ModelsDevAdapter::default()
+            .parse(
+                payload.as_bytes(),
+                SourceValidators::etag("\"audio-cost\""),
+                UNIX_EPOCH,
+            )
+            .expect("audio cost parses");
+        let observed = snapshot.content.models()[0].offerings[0]
+            .price
+            .as_ref()
+            .expect("cost is stated");
+        assert!(observed.base.input_audio.is_some());
+        assert_eq!(model_price_from_cost(observed), None);
+        let index = CatalogPriceIndex::from_snapshot(&snapshot);
+        assert!(
+            index.price_for("openai", "gpt-audio").is_none(),
+            "an audio schedule must not charge as text-only"
         );
     }
 

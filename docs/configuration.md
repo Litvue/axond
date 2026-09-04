@@ -296,9 +296,9 @@ Resolution at admission, first hit wins:
 1. Imported snapshot `cost` for `(provider id, published model id)`, converted
    to integer micro-dollars per million tokens (input, output, and optional
    cache/reasoning when those convert exactly). A `cost` that publishes context
-   tiers (`context_over_200k`, `tiers`) is not compiled: a flat rate would bill
-   long-context requests below the published schedule, so such offerings fall
-   through to `[[price]]`.
+   tiers (`context_over_200k`, `tiers`) or audio rates (`input_audio`,
+   `output_audio`) is not compiled: a flat text rate would undercharge, so such
+   offerings fall through to `[[price]]`.
 2. Optional `[[price]]` — first matching `(provider, model-id glob)` in file
    order. Put exact ids before globs.
 3. Per-provider `unpriced_models`.
