@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.1](https://github.com/Litvue/axond/compare/v0.6.0...v0.6.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* correct upstream errors and streamline PR CI ([#448](https://github.com/Litvue/axond/issues/448)) ([4af0898](https://github.com/Litvue/axond/commit/4af0898788bb7c2b425e454067c7c8d668998157))
+
+
+### Refactors
+
+* **budget:** remove obsolete reservation bookkeeping ([#447](https://github.com/Litvue/axond/issues/447)) ([0c12d40](https://github.com/Litvue/axond/commit/0c12d4030215533a0255705a39fcd0ee1d5dd6bb))
+
 ## [0.6.0](https://github.com/Litvue/axond/compare/v0.5.0...v0.6.0) (2026-09-04)
 
 
