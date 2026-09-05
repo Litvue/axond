@@ -26,7 +26,8 @@ not served. Management is `/api/v1`. `/admin/v1` is unmounted.
 | `POST /api/v1/namespaces` | **supported** | create `{id, attrs, blocklist?}` | n/a |
 | `GET /api/v1/namespaces` | **supported** | list, cursor-paginated | n/a |
 | `GET`/`PUT`/`DELETE /api/v1/namespaces/{ns}` | **supported** | read / replace attrs / idempotent delete | n/a |
-| `PUT`/`GET /api/v1/namespaces/{ns}/budgets/{period}` | **supported** | period cap; active period for admission | n/a |
+| `PUT`/`GET /api/v1/namespaces/{ns}/budgets/{period}` | **supported** | period cap; active period for admission (fixed cadence) | n/a |
+| `PUT`/`GET /api/v1/namespaces/{ns}/budget` | **supported** | cadence budget: `monthly` derives `YYYY-MM` in the budget's timezone and wins over the active-period marker; `fixed` keeps the chosen-period rule ([ADR 0065](./adr/0065-cadence-budgets.md)) | n/a |
 | `GET /api/v1/namespaces/{ns}/usage` | **supported** | summary by model and status (`period` required) | n/a |
 | `GET /api/v1/providers/{id}/models` | **supported** | cached upstream discovery | n/a |
 | `GET /api/v1/providers/models` | **supported** | fan-out of the same | n/a |

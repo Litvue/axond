@@ -1,6 +1,15 @@
 # Administering a stateful deployment
 
 > **Withdrawn ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).** `/admin/v1` is unmounted. `axond admin model apply` is gone. Management is `/api/v1`. Historical record; do not follow as a runbook.
+>
+> Current budget management lives on `/api/v1` and is described in
+> [`docs/configuration.md` § `[budget]`](../configuration.md#budget--leftover-keys-adr-0064):
+> `PUT`/`GET /api/v1/namespaces/{ns}/budget` sets a cadence budget
+> (`monthly` — the gateway derives `YYYY-MM` in the budget's timezone and
+> rolls periods itself; or `fixed`), and `PUT`/`GET
+> /api/v1/namespaces/{ns}/budgets/{period}` remains the fixed-period route
+> ([ADR 0065](../adr/0065-cadence-budgets.md)). A cadence budget wins when both
+> exist.
 
 In `mode = "stateful"` ([ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md))
 a deployment's tenants, projects, providers, credentials, catalogues, model
