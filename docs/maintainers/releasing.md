@@ -1,8 +1,15 @@
 # Maintainer release runbook
 
-Axond uses release-please with Conventional Commit PR titles. Merges to `main`
-update a release PR; merging that PR tags the release and runs the artifact
-pipeline.
+Axond uses release-please with Conventional Commit PR titles. Changes to Axond's
+source/build inputs on `main` update a release PR; merging that PR tags the release
+and runs the artifact pipeline. The automatic trigger covers `crates/`, the root
+Cargo manifest and lockfile, `.cargo/`, `rust-toolchain.toml`, and `Dockerfile`.
+Website, documentation, and CI-only pushes do not start release maintenance.
+
+Release Please also excludes commits confined to `website/` and `.github/` from
+version calculation and release notes, so a website `feat` cannot cause a bump
+on the next Axond code change. Mixed commits that also touch Axond code remain
+eligible. Existing-tag repair dispatches remain available.
 
 ## Release order
 

@@ -20,6 +20,7 @@ silently shrinking the release.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -190,6 +191,24 @@ def check_ci_success_poll(block: str, commit_expression: str, label: str) -> lis
             f"release-please.yml: {label} masks a check-runs API failure"
         )
     return failures
+
+
+def check_release_scope(text: str, config: dict) -> list[str]:
+    """Website-only pushes must neither run releases nor enter later release notes."""
+    errors = []
+    push = text.split("  push:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
+    paths = set(re.findall(r"^      - '([^']+)'$", push, re.M))
+    required = {"crates/**", "Cargo.toml", "Cargo.lock", ".cargo/**", "rust-toolchain.toml", "Dockerfile"}
+    if paths != required:
+        errors.append("release workflow push paths must be limited to Axond source/build inputs")
+    # Release Please uses directory prefixes, not glob patterns here. A commit
+    # touching both an excluded directory and Axond code remains included.
+    excluded = config.get("packages", {}).get(".", {}).get("exclude-paths", [])
+    if not {"website", ".github"}.issubset(excluded) or any("*" in path for path in excluded):
+        errors.append("release-please must exclude website and .github directory prefixes")
+    if "crates" in excluded or "." in excluded:
+        errors.append("release-please must retain Axond source commits")
+    return errors
 
 
 def check_release_ordering(text: str) -> list[str]:
@@ -1188,7 +1207,14 @@ def self_test() -> int:
     # and a tree where it disagrees with the pinned tag is already reported by
     # check_compose_platform as a readable failure rather than a traceback.
 
-    print("check-release-config: decision and release-order self-tests passed")
+    scope_config = json.loads((ROOT / "release-please-config.json").read_text())
+    scoped = workflow_text()
+    assert not check_release_scope(scoped, scope_config)
+    assert check_release_scope(scoped.replace("      - 'crates/**'", "      - 'website/**'"), scope_config)
+    assert check_release_scope(scoped.replace("      - 'Cargo.lock'\n", ""), scope_config)
+    assert check_release_scope(scoped, {"packages": {".": {"exclude-paths": ["website/**", ".github/**"]}}})
+    assert check_release_scope(scoped, {"packages": {".": {"exclude-paths": ["website", ".github", "crates"]}}})
+    print("check-release-config: decision, release-order, and release-scope self-tests passed")
     return 0
 
 
@@ -1205,6 +1231,7 @@ def main(argv: list[str]) -> int:
     text = workflow_text()
     notes: list[str] = []
     failures: list[str] = []
+    failures.extend(check_release_scope(text, json.loads((ROOT / "release-please-config.json").read_text())))
     failures.extend(check_binary_matrix(text))
     failures.extend(check_binary_gates(text))
     failures.extend(check_image_matrix(text))

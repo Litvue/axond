@@ -1,5 +1,21 @@
 # Contributing to Axond
 
+## Website and Axond CI
+
+Changes confined to `website/` and `.github/workflows/website.yml` run the website
+checks without installing Rust or starting Axond's build, test, Docker, or
+Kubernetes jobs. A small change detector and workflow-policy check still report
+`CI Success`, so branch protection does not wait on a missing workflow.
+
+PRs use the complete diff from their merge base; main pushes and merge queues
+use the full event range. Mixed website/Axond changes retain normal Rust CI.
+Release tags and manual qualification runs always execute the full suite.
+Unknown paths keep Axond checks enabled, and failed change detection fails CI.
+
+Cloudflare's GitHub app deploys the website independently. Website-only changes
+do not create Axond releases; see the [release runbook](docs/maintainers/releasing.md).
+
+
 Thanks for your interest. Axond is early — the architecture is settling, so
 opening an issue to discuss a change before a large PR is appreciated.
 

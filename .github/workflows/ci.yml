@@ -34,34 +34,22 @@ concurrency:
 
 jobs:
   changes:
-    name: Dependency changes
+    name: Changed components
     runs-on: ubuntu-latest
     outputs:
+      rust: ${{ steps.filter.outputs.rust }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - id: filter
-        name: Detect dependency policy inputs
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [[ "$EVENT_NAME" != pull_request ]]; then
-            echo "dependencies=true" >> "$GITHUB_OUTPUT"
-          else
-            # PR checkout is the merge commit: its first parent is the base.
-            git diff --name-only HEAD^1 HEAD -- Cargo.lock fuzz/Cargo.lock \
-              Cargo.toml 'crates/**/Cargo.toml' fuzz/Cargo.toml deny.toml \
-              .github/workflows/ci.yml > /tmp/dependency-changes
-            if [[ -s /tmp/dependency-changes ]]; then
-              echo "dependencies=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "dependencies=false" >> "$GITHUB_OUTPUT"
-            fi
-          fi
+        name: Detect changed components
+        run: python3 ops/ci-changes.py
 
   fmt:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     name: Format
     runs-on: ubuntu-latest
     steps:
@@ -73,6 +61,8 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     name: Clippy
     runs-on: ubuntu-latest
     steps:
@@ -89,7 +79,8 @@ jobs:
   # The pinned lanes above build on 1.97.1; consumers are only promised the
   # declared MSRV floor, so that floor is built separately rather than assumed.
   msrv:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: MSRV
     runs-on: ubuntu-latest
     steps:
@@ -108,7 +99,8 @@ jobs:
   # library is published: an intentional break needs a reviewed entry in
   # ops/api-compat-overrides.toml.
   api-compat:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Public API compatibility
     runs-on: ubuntu-latest
     steps:
@@ -134,7 +126,8 @@ jobs:
         run: ops/api-compat.py
 
   build:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Build
     runs-on: ubuntu-latest
     steps:
@@ -148,6 +141,8 @@ jobs:
       - run: cargo build --workspace --all-targets --all-features --locked
 
   tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     name: Tests
     runs-on: ubuntu-latest
     steps:
@@ -189,8 +184,9 @@ jobs:
           retention-days: 90
 
   faults:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Request-path fault matrix
-    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -231,6 +227,8 @@ jobs:
   # toolchain, under panic, time, and allocation bounds. Required, so a parser
   # that starts panicking on a known input cannot merge.
   fuzz-smoke:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     name: Fuzz smoke
     runs-on: ubuntu-latest
     steps:
@@ -283,6 +281,8 @@ jobs:
         run: cargo run --no-default-features --locked --bin fuzz-smoke
 
   sdk-compat:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     name: Provider-SDK compatibility
     runs-on: ubuntu-latest
     steps:
@@ -325,7 +325,8 @@ jobs:
   # type-checks every call against the SDKs' own definitions. Deliberately a
   # second runtime rather than a second assertion: a customer runs one of these.
   sdk-compat-ts:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Provider-SDK compatibility (TypeScript)
     runs-on: ubuntu-latest
     steps:
@@ -363,7 +364,8 @@ jobs:
   # Spectral, and typechecks a generated TypeScript client. The client is not
   # shipped from this repo.
   openapi-smoke:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: OpenAPI smoke
     runs-on: ubuntu-latest
     steps:
@@ -397,6 +399,8 @@ jobs:
         working-directory: tests/openapi-smoke
 
   docs:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     name: Documentation
     runs-on: ubuntu-latest
     steps:
@@ -491,8 +495,9 @@ jobs:
           target/deploy-venv/bin/python ops/check-deploy-manifests.py
 
   rustdoc:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Rust documentation
-    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -512,7 +517,8 @@ jobs:
   # the flattened `axond` tarball must build on its own, with versions aligned
   # and no file left behind by an `include` that drifted from the sources.
   publish-dry-run:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: crates.io packaging
     runs-on: ubuntu-latest
     steps:
@@ -556,6 +562,7 @@ jobs:
         run: |
           ops/workflow-policy.py --self-test
           python3 ops/ci-success.py --self-test
+          python3 ops/ci-changes.py --self-test
       - name: Check Action pins, least privilege, and signer restrictions
         run: ops/workflow-policy.py
       # A label Dependabot cannot find disables its whole configuration, and the
@@ -580,7 +587,8 @@ jobs:
           bash ops/install-musl-tools.sh --self-test
 
   static-binary:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Static musl binary
     runs-on: ubuntu-latest
     steps:
@@ -617,7 +625,8 @@ jobs:
   # which has no macOS or Windows equivalent) and adds the portable assertions
   # on top, so all four targets are judged against the same serving contract.
   binary-smoke:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Binary smoke ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -663,7 +672,8 @@ jobs:
         run: python ops/binary-smoke.py "target/${{ matrix.target }}/release/axond"
 
   docker-smoke:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Docker smoke
     runs-on: ubuntu-latest
     steps:
@@ -680,7 +690,8 @@ jobs:
   # tells operators to look. The release cannot catch this itself: it verifies
   # its own output with the binary that produced it.
   cosign-format:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Cosign signing format
     runs-on: ubuntu-latest
     steps:
@@ -703,7 +714,8 @@ jobs:
   # and requires the same rollout to hang, which is what keeps the first result
   # from passing for the wrong reason.
   rollout-drill:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Rollout drill (three nodes)
     runs-on: ubuntu-latest
     steps:
@@ -813,7 +825,8 @@ jobs:
         run: bash ops/stateful-persistent-drill.sh
 
   quickstart-smoke:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
     name: Compose quickstart smoke
     runs-on: ubuntu-latest
     steps:
@@ -858,6 +871,7 @@ jobs:
       - name: Require the checks for this event
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
+          CI_RUST: ${{ needs.changes.outputs.rust }}
           CI_EVENT: ${{ github.event_name }}
           CI_DEPENDENCIES: ${{ needs.changes.outputs.dependencies }}
           CI_LEGACY: ${{ inputs.run_legacy_postgres_qualification }}

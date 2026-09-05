@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "axond"
-version = "0.6.2"
+version = "0.6.1"
 dependencies = [
  "aes-kw",
  "anyhow",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-core"
-version = "0.6.2"
+version = "0.6.1"
 dependencies = [
  "base64",
  "regex",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-transport"
-version = "0.6.2"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "futures",
