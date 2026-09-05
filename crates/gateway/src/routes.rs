@@ -2498,6 +2498,9 @@ async fn stream_with_failover(
                 if lease_index > 0 {
                     let started = attempt_started.expect("attempt start");
                     let span = attempt_span.as_ref().expect("attempt span");
+                    if let Some(error) = &walk.last_error {
+                        telemetry::record_attempt_failure(span, error);
+                    }
                     telemetry::finish_upstream_attempt(
                         span,
                         telemetry::ATTEMPT_ERROR,
@@ -2718,6 +2721,9 @@ async fn stream_with_failover(
             }
         }
         let span = attempt_span.as_ref().expect("attempt span");
+        if let Some(error) = &walk.last_error {
+            telemetry::record_attempt_failure(span, error);
+        }
         telemetry::finish_upstream_attempt(
             span,
             telemetry::ATTEMPT_ERROR,
@@ -3115,11 +3121,10 @@ fn auth_scheme(kind: ProviderKind) -> AuthScheme {
     }
 }
 
-/// Attribute a failed attempt's timeout class to its span and the timeout
-/// counter, and leave the operator the reason it failed. Only the bound reaches
-/// the span — never the upstream URL, which the transport has already kept out
-/// of the error.
+/// Record bounded failure diagnostics and any timeout class. Transport URLs
+/// stay in operator logs; provider HTTP status and message reach attempt spans.
 fn note_attempt_failure(span: &tracing::Span, target: &Target, err: &TransportError) {
+    telemetry::record_attempt_failure(span, err);
     if let Some(kind) = err.timeout_kind() {
         let bound = err
             .timeout_bound()
@@ -3196,7 +3201,7 @@ fn record_target_failure(
 /// error (no provider status) is a target-scoped dependency failure.
 fn as_provider_error(err: &TransportError) -> ProviderError {
     match err {
-        TransportError::Provider(pe) => pe.clone(),
+        TransportError::Provider(pe) | TransportError::Upstream { error: pe, .. } => pe.clone(),
         TransportError::Http(message) => ProviderError::transport("upstream", message.clone()),
         // A timeout says nothing conclusive about the target beyond "it did not
         // answer in time", which is exactly a target-scoped dependency failure.
@@ -3334,7 +3339,8 @@ async fn dispatch_over_pool(
 /// so it parks that key and falls to the next. Every other upstream failure is
 /// the target's problem, not the key's.
 fn is_credential_exhausted(err: &TransportError) -> bool {
-    matches!(err, TransportError::Provider(error) if error.is_credential_rate_limited())
+    err.provider_error()
+        .is_some_and(ProviderError::is_credential_rate_limited)
 }
 
 /// `TimeoutKind::Overall` is the one timeout no target earned: the walk's budget
@@ -12047,7 +12053,7 @@ output_microdollars_per_million = 1000000
 
         // A 4xx-class (non-retryable) error stops the walk: the error is returned
         // and the second target is never tried.
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
         assert_eq!(hits_b.load(Ordering::SeqCst), 0);
         let records = captured.0.lock().unwrap();
@@ -12117,6 +12123,116 @@ output_microdollars_per_million = 1000000
         let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured)];
         AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn provider_refusals_keep_their_class_and_export_bounded_attempt_diagnostics() {
+        use tracing::instrument::WithSubscriber as _;
+        crate::telemetry::testing::keep_callsites_answerable();
+        for (kind, path) in [
+            ("anthropic", "/messages"),
+            ("openai", "/chat/completions"),
+            ("openai", "/responses"),
+        ] {
+            for stream in [false, true] {
+                for (upstream_status, message, status, code) in [
+                    (
+                        400,
+                        "input_schema does not support oneOf",
+                        400,
+                        "invalid_request",
+                    ),
+                    (422, "invalid field", 400, "invalid_request"),
+                    (
+                        400,
+                        "context window exceeded",
+                        400,
+                        "context_window_exceeded",
+                    ),
+                    (404, "requested model not found", 502, "model_unavailable"),
+                    (429, "quota exhausted", 502, "provider_dependency_failed"),
+                    (
+                        503,
+                        "provider overloaded",
+                        502,
+                        "provider_dependency_failed",
+                    ),
+                ] {
+                    let diagnostic =
+                        format!("{message}; rejected key sk-test; {}", "界".repeat(1800));
+                    let answer = (
+                        StatusCode::from_u16(upstream_status).unwrap(),
+                        Json(json!({"error": {"message": diagnostic}})),
+                    )
+                        .into_response();
+                    let (base_url, received) = native_upstream(path, answer).await;
+                    let state = native_state(kind, &base_url, CapturingSink::default());
+                    let exporter = InMemorySpanExporter::default();
+                    let provider = SdkTracerProvider::builder()
+                        .with_simple_exporter(exporter.clone())
+                        .build();
+                    let subscriber = tracing_subscriber::registry().with(
+                        tracing_opentelemetry::layer()
+                            .with_tracer(provider.tracer("upstream-errors")),
+                    );
+                    let request = authorized(&format!("/v1{path}"))
+                        .header("anthropic-version", "2023-06-01")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model": "p/upstream-model", "stream": stream, "max_tokens": 16,
+                                "messages": [{"role": "user", "content": "hello"}], "input": "hello"
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap();
+                    let response = router(state)
+                        .oneshot(request)
+                        .with_subscriber(subscriber)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status().as_u16(),
+                        status,
+                        "{path} stream={stream} upstream={upstream_status}"
+                    );
+                    let body = response.into_body().collect().await.unwrap().to_bytes();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["error"]["type"], code);
+                    assert!(!body.to_string().contains("sk-test"));
+                    assert_eq!(received.lock().unwrap().len(), 1);
+                    provider.force_flush().unwrap();
+                    let spans = exporter.get_finished_spans().unwrap();
+                    let attempts: Vec<_> = spans
+                        .iter()
+                        .filter(|span| span.name == "axond.upstream.attempt")
+                        .collect();
+                    assert_eq!(attempts.len(), 1, "{path} stream={stream}");
+                    let attempt = attempts[0];
+                    let attribute = |key: &str| {
+                        attempt
+                            .attributes
+                            .iter()
+                            .find(|item| item.key.as_str() == key)
+                            .map(|item| item.value.to_string())
+                            .expect(key)
+                    };
+                    assert_eq!(
+                        attribute("axond.upstream.status"),
+                        upstream_status.to_string()
+                    );
+                    assert_eq!(attribute("axond.status"), "error");
+                    assert!(matches!(
+                        attempt.status,
+                        opentelemetry::trace::Status::Error { .. }
+                    ));
+                    let recorded = attribute("axond.upstream.message");
+                    assert!(recorded.starts_with(message));
+                    assert!(recorded.contains("[REDACTED]"));
+                    assert!(recorded.len() <= gateway_core::MAX_DIAGNOSTIC_BYTES);
+                    assert!(!format!("{spans:?}").contains("sk-test"));
+                }
+            }
+        }
     }
 
     /// The point of serving the native wire: a body a translation would mangle

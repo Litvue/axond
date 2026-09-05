@@ -234,7 +234,10 @@ impl GatewayError {
             | Self::MintClaimsNotNarrowing
             | Self::MintEpochNotUsable { .. } => StatusCode::FORBIDDEN,
             Self::UnsupportedWire { .. } => StatusCode::BAD_REQUEST,
-            Self::Provider(e) => match e {
+            Self::Provider(e)
+            | Self::Transport(
+                TransportError::Provider(e) | TransportError::Upstream { error: e, .. },
+            ) => match e {
                 ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
                 ProviderError::ContextWindowExceeded(_) => StatusCode::BAD_REQUEST,
                 ProviderError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
@@ -247,7 +250,6 @@ impl GatewayError {
                 ProviderError::RateLimitedStream(_) => StatusCode::BAD_GATEWAY,
                 ProviderError::AllCircuitsOpen(_) => StatusCode::SERVICE_UNAVAILABLE,
             },
-            Self::Transport(TransportError::Provider(_)) => StatusCode::BAD_GATEWAY,
             Self::Transport(TransportError::Http(_)) => StatusCode::BAD_GATEWAY,
             // A bound the gateway itself imposed, not a provider verdict: the
             // upstream never answered in time, which is what 504 means.
@@ -298,7 +300,9 @@ impl GatewayError {
             Self::MintEpochNotUsable { .. } => "mint_epoch_not_usable",
             Self::UnsupportedWire { .. } => "unsupported_wire",
             Self::Provider(e) => e.code(),
-            Self::Transport(TransportError::Provider(e)) => e.code(),
+            Self::Transport(
+                TransportError::Provider(e) | TransportError::Upstream { error: e, .. },
+            ) => e.code(),
             Self::Transport(TransportError::Http(_)) => "upstream_transport",
             // One code for every phase: the phase is in the message and on the
             // attempt span, so callers get a stable type to match on.

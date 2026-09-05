@@ -110,14 +110,32 @@ parked credential.
 | Span | Key attributes |
 | --- | --- |
 | `http.server.request` | `http.request.method`, `http.route`, `http.response.status_code`, `axond.request_id`, `axond.namespace`, `axond.subject`, `gen_ai.request.model`, `axond.target.*`, `axond.credential_source`, `axond.status`, `axond.retry_count`, `gen_ai.usage.*`, `axond.cost_microdollars`, `axond.latency_ms`, `axond.ttft_ms` |
-| `axond.upstream.attempt` | `axond.attempt` (zero-based), `axond.target.provider`, `axond.target.model`, `axond.credential_source`, `axond.status`, `axond.latency_ms`, `axond.ttft_ms`, `axond.timeout` (which phase stalled, when one did), `axond.timeout.bound` (`phase` or `walk_budget`) |
+| `axond.upstream.attempt` | `axond.attempt` (zero-based), `axond.target.provider`, `axond.target.model`, `axond.credential_source`, `axond.status`, `axond.latency_ms`, `axond.ttft_ms`, `axond.upstream.status` (provider HTTP refusal code), `axond.upstream.message` (bounded failure diagnostic), `axond.timeout` (which phase stalled, when one did), `axond.timeout.bound` (`phase` or `walk_budget`) |
 | `axond.credential.lease` | `axond.credential.id`, `axond.credential_source`, `axond.credential.index`, `axond.status` (`served`, `rate_limited`, `error`, `parked`) |
 | `axond.config.reload` | `axond.reload.trigger`, `axond.reload.outcome`, `axond.config.generation` |
 | `axond.revision.converge` | `axond.revision.trigger` (`boot`, `polled`, `notified`, or `pricing-boundary`), outcome, active/desired revision, lag, and generation |
 
 An inbound `traceparent` is **joined**, not replaced, and the context is
-injected into the upstream request, so a caller's trace runs end to end. Spans
-never carry credentials, prompts, or completions.
+injected into the upstream request, so a caller's trace runs end to end.
+
+Failed attempt spans have OpenTelemetry error status. For a provider HTTP
+refusal, `axond.upstream.status` is the original upstream code, even when the
+gateway maps it to a different response status. `axond.upstream.message` holds
+the provider's extracted error message, capped at 4 KiB on a UTF-8 boundary.
+The outbound API key is removed before classification and truncation. These
+diagnostics travel with traces and do not require OTLP log export. Transport
+failures without a response have no upstream HTTP status.
+
+Axond does not attach request bodies, authentication headers, or successful
+response bodies to spans. A provider's error message may echo caller input;
+trace access and retention should follow the deployment's diagnostic-data
+policy. Diagnostics are span attributes, never metric labels.
+
+Provider invalid-request and context-window errors return HTTP 400 on both
+buffered requests and stream-open failures. Provider dependency and model
+availability failures keep their gateway error classification; their original
+HTTP status is available on the attempt span. Once a stream has opened, errors
+remain in-band SSE events because its HTTP status has already been sent.
 
 A streamed response outlives its server span: the span records where the stream
 was routed before dispatch, and the final tokens/cost land on the metrics and

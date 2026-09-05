@@ -97,6 +97,8 @@ pub fn upstream_attempt_span(
         axond.target.model = target_model,
         axond.credential_source = credential_source,
         axond.status = Empty,
+        axond.upstream.status = Empty,
+        axond.upstream.message = Empty,
         axond.latency_ms = Empty,
         axond.ttft_ms = Empty,
         axond.timeout = Empty,
@@ -132,10 +134,47 @@ pub fn finish_upstream_attempt(
     ttft_ms: Option<u64>,
 ) {
     span.record("axond.status", status);
+    if status == ATTEMPT_ERROR {
+        span.set_status(opentelemetry::trace::Status::error(
+            "upstream attempt failed",
+        ));
+    }
     span.record("axond.latency_ms", latency_ms);
     if let Some(ttft_ms) = ttft_ms {
         span.record("axond.ttft_ms", ttft_ms);
     }
+}
+
+/// Bounded provider diagnostics on the attempt that failed. HTTP status is
+/// carried by the transport, not guessed from the gateway's error class.
+pub fn record_attempt_failure(span: &Span, error: &gateway_transport::TransportError) {
+    use gateway_core::ProviderError;
+    if let gateway_transport::TransportError::Upstream { status, .. } = error {
+        span.record("axond.upstream.status", u64::from(*status));
+    }
+    let message = match error.provider_error() {
+        Some(ProviderError::ModelUnavailable(failures) | ProviderError::Dependency(failures)) => {
+            failures
+                .first()
+                .map(|failure| failure.message.clone())
+                .unwrap_or_else(|| error.to_string())
+        }
+        Some(
+            ProviderError::InvalidRequest(message)
+            | ProviderError::ContextWindowExceeded(message)
+            | ProviderError::Unsupported(message)
+            | ProviderError::InvalidStream(message)
+            | ProviderError::RateLimitedStream(message),
+        ) => message.clone(),
+        _ => crate::error::transport_caller_message(error),
+    };
+    // Apply the core bound even to errors constructed locally rather than by
+    // the HTTP parser. Truncate on a UTF-8 boundary before exporting.
+    let mut end = message.len().min(gateway_core::MAX_DIAGNOSTIC_BYTES);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    span.record("axond.upstream.message", &message[..end]);
 }
 
 pub fn credential_lease_span(

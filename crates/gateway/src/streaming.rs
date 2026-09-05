@@ -153,7 +153,8 @@ pub struct RotationHandle {
 }
 
 fn is_stream_rate_limited(err: &TransportError) -> bool {
-    matches!(err, TransportError::Provider(error) if error.is_credential_rate_limited())
+    err.provider_error()
+        .is_some_and(|error| error.is_credential_rate_limited())
 }
 
 impl RotationHandle {
@@ -4286,7 +4287,7 @@ output_microdollars_per_million = 2000000
             .await
             .expect("response");
 
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let record = settled(&ledger).await;
         assert_eq!(record["target_provider"], "openai");
         assert_eq!(record["attempts"], 1);

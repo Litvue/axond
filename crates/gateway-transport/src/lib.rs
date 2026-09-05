@@ -234,6 +234,10 @@ fn timeout_message(kind: TimeoutKind, bound: TimeoutBound, budget_ms: u64) -> St
 pub enum TransportError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// A provider HTTP refusal, retaining the status even when classification
+    /// (for example, InvalidRequest) does not carry one.
+    #[error("{error}")]
+    Upstream { status: u16, error: ProviderError },
     #[error("transport: {0}")]
     Http(String),
     /// A bound was exceeded. The message names the phase, whose bound it was,
@@ -249,6 +253,20 @@ pub enum TransportError {
 }
 
 impl TransportError {
+    pub fn provider_error(&self) -> Option<&ProviderError> {
+        match self {
+            Self::Provider(error) | Self::Upstream { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+
+    pub fn from_upstream(provider: &str, status: u16, body: &str) -> Self {
+        Self::Upstream {
+            status,
+            error: ProviderError::from_upstream(provider, status, body),
+        }
+    }
+
     /// The phase that ran out of time, when this failure is a timeout.
     pub fn timeout_kind(&self) -> Option<TimeoutKind> {
         match self {
@@ -264,6 +282,18 @@ impl TransportError {
             _ => None,
         }
     }
+}
+
+fn upstream_failure(
+    provider: &str,
+    upstream: &Upstream,
+    status: u16,
+    body: &str,
+) -> TransportError {
+    // A provider may echo the credential it rejected. Remove known material
+    // before classification/truncation so neither callers nor spans receive it.
+    let body = body.replace(upstream.api_key.expose_secret(), "[REDACTED]");
+    TransportError::from_upstream(provider, status, &body)
 }
 
 /// A transport failure, described without the upstream URL's credential-bearing
@@ -461,9 +491,12 @@ impl HttpDispatcher {
         let status = resp.status();
         if !status.is_success() {
             let text = self.error_body(resp, deadline).await;
-            return Err(
-                ProviderError::from_upstream(adapter.name(), status.as_u16(), &text).into(),
-            );
+            return Err(upstream_failure(
+                adapter.name(),
+                upstream,
+                status.as_u16(),
+                &text,
+            ));
         }
         let text = self.buffered_body(resp, deadline).await?;
 
@@ -497,7 +530,7 @@ impl HttpDispatcher {
         let status = resp.status();
         if !status.is_success() {
             let text = self.error_body(resp, deadline).await;
-            return Err(ProviderError::from_upstream(provider, status.as_u16(), &text).into());
+            return Err(upstream_failure(provider, upstream, status.as_u16(), &text));
         }
         let text = self.buffered_body(resp, deadline).await?;
         serde_json::from_str(&text)
@@ -520,7 +553,12 @@ impl HttpDispatcher {
         let status = resp.status();
         if !status.is_success() {
             let text = self.error_body(resp, deadline).await;
-            return Err(ProviderError::from_upstream(call.provider, status.as_u16(), &text).into());
+            return Err(upstream_failure(
+                call.provider,
+                upstream,
+                status.as_u16(),
+                &text,
+            ));
         }
         let text = self.buffered_body(resp, deadline).await?;
         serde_json::from_str(&text)
@@ -542,7 +580,12 @@ impl HttpDispatcher {
         let status = resp.status();
         if !status.is_success() {
             let text = self.error_body(resp, deadline).await;
-            return Err(ProviderError::from_upstream(call.provider, status.as_u16(), &text).into());
+            return Err(upstream_failure(
+                call.provider,
+                upstream,
+                status.as_u16(),
+                &text,
+            ));
         }
         Ok(self.idle_bounded_stream(resp))
     }
@@ -610,9 +653,12 @@ impl HttpDispatcher {
         let status = resp.status();
         if !status.is_success() {
             let text = self.error_body(resp, deadline).await;
-            return Err(
-                ProviderError::from_upstream(adapter.name(), status.as_u16(), &text).into(),
-            );
+            return Err(upstream_failure(
+                adapter.name(),
+                upstream,
+                status.as_u16(),
+                &text,
+            ));
         }
 
         Ok(self.idle_bounded_stream(resp))
