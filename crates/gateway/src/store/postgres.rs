@@ -7,9 +7,10 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
-    BudgetAdmit, BudgetRecord, NamespaceRecord, NamespaceResolve, ProviderModels, Store,
-    StoreError, UsageAppend, UsageSummaryRow, admit_from_ledger, from_sql_amount, sql_amount,
-    sql_amount_saturating,
+    BudgetAdmit, BudgetCadence, BudgetClock, BudgetPolicy, BudgetRecord, NamespaceRecord,
+    NamespaceResolve, ProviderModels, Store, StoreError, UsageAppend, UsageSummaryRow,
+    admit_from_ledger, from_sql_amount, monthly_period_key, sql_amount, sql_amount_saturating,
+    validate_timezone,
 };
 use crate::backends::health::{BackendHealth, PostgresHealth};
 
@@ -17,6 +18,7 @@ const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
 const INCARNATION_DDL: &str = include_str!("../../sql/store_namespace_incarnation_v1.sql");
 const USAGE_DDL: &str = include_str!("../../sql/store_usage_v1.sql");
 const MODELS_DDL: &str = include_str!("../../sql/store_provider_models_v1.sql");
+const CADENCE_DDL: &str = include_str!("../../sql/store_budget_cadence_v1.sql");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
 const POOL_SIZE: usize = 32;
@@ -36,6 +38,7 @@ pub struct PostgresStore {
     /// Caps live + idle sessions. Waiters queue here instead of opening more.
     slots: Arc<Semaphore>,
     health: Arc<PostgresHealth>,
+    clock: Arc<dyn BudgetClock>,
 }
 
 impl PostgresStore {
@@ -50,6 +53,7 @@ impl PostgresStore {
             config,
             idle: Mutex::new(Vec::new()),
             slots: Arc::new(Semaphore::new(POOL_SIZE)),
+            clock: Arc::new(super::SystemClock),
         };
         let mut client = store.connect_client().await?;
         if create_table {
@@ -78,11 +82,22 @@ impl PostgresStore {
                 .batch_execute(MODELS_DDL)
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            client
+                .batch_execute(CADENCE_DDL)
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
         }
         probe_schema(&client).await?;
         sweep_expired_holds(&client).await?;
         store.checkin(client).await;
         Ok(store)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn BudgetClock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     async fn connect_client(&self) -> Result<Client, StoreError> {
@@ -190,7 +205,20 @@ async fn probe_schema(client: &Client) -> Result<(), StoreError> {
         )
         .await
         .map_err(|e| {
-            StoreError::Unavailable(format!("budget schema missing or incompatible: {e}"))
+            StoreError::Unavailable(format!(
+                "axond_store_budget schema missing or incompatible (apply ops/postgres/store_budget_cadence_v1.sql): {e}"
+            ))
+        })?;
+    client
+        .batch_execute(
+            "SELECT namespace, cadence, limit_microdollars, timezone
+             FROM axond_store_budget_cadence LIMIT 0",
+        )
+        .await
+        .map_err(|e| {
+            StoreError::Unavailable(format!(
+                "axond_store_budget_cadence schema missing or incompatible (apply ops/postgres/store_budget_cadence_v1.sql): {e}"
+            ))
         })?;
     client
         .batch_execute(
@@ -550,17 +578,17 @@ async fn read_budget(
     client: &impl GenericClient,
     namespace: &str,
     period: &str,
+    clock: &Arc<dyn BudgetClock>,
 ) -> Result<Option<BudgetRecord>, StoreError> {
     let row = client
         .query_opt(
             "SELECT
                  b.limit_microdollars,
                  b.spent_microdollars,
-                 EXISTS (
-                     SELECT 1 FROM axond_store_budget_active a
-                     WHERE a.namespace = b.namespace AND a.period = b.period
-                 )
+                 c.cadence,
+                 c.timezone
              FROM axond_store_budget b
+             LEFT JOIN axond_store_budget_cadence c ON c.namespace = b.namespace
              WHERE b.namespace = $1 AND b.period = $2",
             &[&namespace, &period],
         )
@@ -569,13 +597,117 @@ async fn read_budget(
     let Some(row) = row else {
         return Ok(None);
     };
+    let active = if row.get::<_, Option<String>>(2).as_deref() == Some("monthly") {
+        let timezone = row
+            .get::<_, Option<String>>(3)
+            .unwrap_or_else(|| super::DEFAULT_TIMEZONE.into());
+        let tz = validate_timezone(&timezone)?;
+        monthly_period_key(clock.now(), &tz) == period
+    } else {
+        client
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM axond_store_budget_active
+                     WHERE namespace = $1 AND period = $2
+                 )",
+                &[&namespace, &period],
+            )
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?
+            .get(0)
+    };
     Ok(Some(BudgetRecord::new(
         namespace,
         period,
         from_sql_amount(row.get(0)),
         from_sql_amount(row.get(1)),
-        row.get(2),
+        active,
     )))
+}
+
+async fn read_budget_policy(
+    client: &impl GenericClient,
+    namespace: &str,
+    clock: &Arc<dyn BudgetClock>,
+) -> Result<Option<BudgetPolicy>, StoreError> {
+    let cadence = client
+        .query_opt(
+            "SELECT cadence, limit_microdollars, timezone
+             FROM axond_store_budget_cadence WHERE namespace = $1",
+            &[&namespace],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let Some(cadence_row) = cadence else {
+        let Some(active) = client
+            .query_opt(
+                "SELECT a.period, b.limit_microdollars, b.spent_microdollars
+                 FROM axond_store_budget_active a
+                 JOIN axond_store_budget b
+                   ON b.namespace = a.namespace AND b.period = a.period
+                 WHERE a.namespace = $1",
+                &[&namespace],
+            )
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let period: String = active.get(0);
+        let limit = from_sql_amount(active.get(1));
+        let spent = from_sql_amount(active.get(2));
+        return Ok(Some(BudgetPolicy {
+            namespace: namespace.into(),
+            cadence: BudgetCadence::Fixed,
+            limit_microdollars: limit,
+            timezone: super::DEFAULT_TIMEZONE.into(),
+            period,
+            spent_microdollars: spent,
+            reserved_microdollars: 0,
+            remaining_microdollars: limit.saturating_sub(spent),
+            active: true,
+        }));
+    };
+    let cadence = BudgetCadence::parse(cadence_row.get(0))
+        .ok_or_else(|| StoreError::Unavailable("invalid budget cadence".into()))?;
+    let timezone: String = cadence_row.get(2);
+    let tz = validate_timezone(&timezone)?;
+    let period = if cadence == BudgetCadence::Monthly {
+        monthly_period_key(clock.now(), &tz)
+    } else {
+        client
+            .query_opt(
+                "SELECT period FROM axond_store_budget_active WHERE namespace = $1",
+                &[&namespace],
+            )
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?
+            .map(|row| row.get(0))
+            .unwrap_or_default()
+    };
+    let spend = client
+        .query_opt(
+            "SELECT limit_microdollars, spent_microdollars
+             FROM axond_store_budget WHERE namespace = $1 AND period = $2",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let policy_limit = from_sql_amount(cadence_row.get(1));
+    let (limit, spent) = spend
+        .map(|row| (from_sql_amount(row.get(0)), from_sql_amount(row.get(1))))
+        .unwrap_or((policy_limit, 0));
+    Ok(Some(BudgetPolicy {
+        namespace: namespace.into(),
+        cadence,
+        limit_microdollars: limit,
+        timezone,
+        period,
+        spent_microdollars: spent,
+        reserved_microdollars: 0,
+        remaining_microdollars: limit.saturating_sub(spent),
+        active: true,
+    }))
 }
 
 #[async_trait]
@@ -644,8 +776,19 @@ impl Store for PostgresStore {
 
     async fn resolve_namespace(&self, id: &str) -> Result<Option<NamespaceResolve>, StoreError> {
         let id = id.to_owned();
-        self.with_client(async move |client| resolve_namespace_on(client, &id).await)
-            .await
+        let clock = Arc::clone(&self.clock);
+        self.with_client(async move |client| {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            let resolved = resolve_namespace_on(&tx, &id, &clock).await?;
+            tx.commit()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(resolved)
+        })
+        .await
     }
 
     async fn list_namespaces(
@@ -763,12 +906,13 @@ impl Store for PostgresStore {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
         let limit = sql_amount(limit_microdollars)?;
+        let clock = Arc::clone(&self.clock);
         self.with_client(async move |client| {
             let tx = client
                 .transaction()
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            let rec = put_budget_tx(&tx, &namespace, &period, limit).await?;
+            let rec = put_budget_tx(&tx, &namespace, &period, limit, &clock).await?;
             tx.commit()
                 .await
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -784,14 +928,134 @@ impl Store for PostgresStore {
     ) -> Result<Option<BudgetRecord>, StoreError> {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
-        self.with_client(async move |client| read_budget(client, &namespace, &period).await)
+        let clock = Arc::clone(&self.clock);
+        self.with_client(async move |client| read_budget(client, &namespace, &period, &clock).await)
             .await
+    }
+
+    async fn put_budget_policy(
+        &self,
+        namespace: &str,
+        cadence: BudgetCadence,
+        limit_microdollars: u64,
+        timezone: &str,
+        fixed_period: Option<&str>,
+    ) -> Result<BudgetPolicy, StoreError> {
+        let namespace = namespace.to_owned();
+        let timezone = timezone.to_owned();
+        let fixed_period = fixed_period.map(str::to_owned);
+        let limit = sql_amount(limit_microdollars)?;
+        let tz = validate_timezone(&timezone)?;
+        let clock = Arc::clone(&self.clock);
+        self.with_client(async move |client| {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            lock_namespace_id(&tx, &namespace).await?;
+            let exists = tx
+                .query_opt(
+                    "SELECT 1 FROM axond_namespace WHERE id = $1 FOR UPDATE",
+                    &[&namespace],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?
+                .is_some();
+            if !exists {
+                return Err(StoreError::NotFound(namespace));
+            }
+            let period = match cadence {
+                BudgetCadence::Monthly => monthly_period_key(clock.now(), &tz),
+                BudgetCadence::Fixed => match fixed_period {
+                    Some(period) => period,
+                    None => tx
+                        .query_opt(
+                            "SELECT period FROM axond_store_budget_active WHERE namespace = $1",
+                            &[&namespace],
+                        )
+                        .await
+                        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+                        .map(|row| row.get(0))
+                        .ok_or_else(|| {
+                            StoreError::Invalid(
+                                "fixed cadence needs a period: the namespace has no active period"
+                                    .into(),
+                            )
+                        })?,
+                },
+            };
+            tx.execute(
+                "INSERT INTO axond_store_budget_cadence
+                    (namespace, cadence, limit_microdollars, timezone)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (namespace) DO UPDATE SET
+                    cadence = excluded.cadence,
+                    limit_microdollars = excluded.limit_microdollars,
+                    timezone = excluded.timezone",
+                &[&namespace, &cadence.as_str(), &limit, &timezone],
+            )
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            if cadence == BudgetCadence::Fixed {
+                tx.execute(
+                    "INSERT INTO axond_store_budget_active (namespace, period) VALUES ($1, $2)
+                     ON CONFLICT (namespace) DO UPDATE SET period = excluded.period",
+                    &[&namespace, &period],
+                )
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            }
+            tx.execute(
+                "INSERT INTO axond_store_budget
+                    (namespace, period, limit_microdollars, spent_microdollars)
+                 VALUES ($1, $2, $3, 0)
+                 ON CONFLICT (namespace, period) DO UPDATE SET
+                    limit_microdollars = excluded.limit_microdollars",
+                &[&namespace, &period, &limit],
+            )
+            .await
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            let policy = read_budget_policy(&tx, &namespace, &clock).await?;
+            tx.commit()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            policy.ok_or_else(|| StoreError::Unavailable("budget policy missing after put".into()))
+        })
+        .await
+    }
+
+    async fn get_budget_policy(&self, namespace: &str) -> Result<Option<BudgetPolicy>, StoreError> {
+        let namespace = namespace.to_owned();
+        let clock = Arc::clone(&self.clock);
+        self.with_client(async move |client| {
+            let exists = client
+                .query_opt("SELECT 1 FROM axond_namespace WHERE id = $1", &[&namespace])
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?
+                .is_some();
+            if !exists {
+                return Err(StoreError::NotFound(namespace));
+            }
+            read_budget_policy(client, &namespace, &clock).await
+        })
+        .await
     }
 
     async fn admit_budget(&self, namespace: &str) -> Result<BudgetAdmit, StoreError> {
         let namespace = namespace.to_owned();
-        self.with_client(async move |client| admit_budget_on(client, &namespace).await)
-            .await
+        let clock = Arc::clone(&self.clock);
+        self.with_client(async move |client| {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            let admit = admit_budget_on(&tx, &namespace, &clock).await?;
+            tx.commit()
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(admit)
+        })
+        .await
     }
 
     async fn charge_budget(
@@ -1052,6 +1316,12 @@ async fn delete_namespace_tx(tx: &Transaction<'_>, id: &str) -> Result<bool, Sto
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    tx.execute(
+        "DELETE FROM axond_store_budget_cadence WHERE namespace = $1",
+        &[&id],
+    )
+    .await
+    .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     let n = tx
         .execute("DELETE FROM axond_namespace WHERE id = $1", &[&id])
         .await
@@ -1077,6 +1347,7 @@ async fn put_budget_tx(
     namespace: &str,
     period: &str,
     limit: i64,
+    clock: &Arc<dyn BudgetClock>,
 ) -> Result<BudgetRecord, StoreError> {
     lock_namespace_id(tx, namespace).await?;
     let exists = tx
@@ -1106,7 +1377,7 @@ async fn put_budget_tx(
     )
     .await
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    read_budget(tx, namespace, period)
+    read_budget(tx, namespace, period, clock)
         .await?
         .ok_or_else(|| StoreError::Unavailable("budget row missing after put".into()))
 }
@@ -1141,19 +1412,88 @@ async fn charge_budget_on(
     Ok(())
 }
 
-async fn admit_budget_on(
-    client: &impl GenericClient,
+async fn admit_monthly(
+    client: &Transaction<'_>,
     namespace: &str,
+    cadence_limit: Option<i64>,
+    timezone: Option<String>,
+    incarnation: i64,
+    clock: &Arc<dyn BudgetClock>,
+) -> Result<BudgetAdmit, StoreError> {
+    let timezone = timezone.unwrap_or_else(|| super::DEFAULT_TIMEZONE.into());
+    let tz = validate_timezone(&timezone)?;
+    let period = monthly_period_key(clock.now(), &tz);
+    if let Some(spend) = client
+        .query_opt(
+            "SELECT limit_microdollars, spent_microdollars
+             FROM axond_store_budget WHERE namespace = $1 AND period = $2",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+    {
+        return Ok(admit_from_ledger(
+            Some(period),
+            Some(spend.get(0)),
+            Some(spend.get(1)),
+            incarnation,
+        ));
+    }
+
+    let cadence_limit = cadence_limit
+        .ok_or_else(|| StoreError::Unavailable("monthly cadence limit missing".into()))?;
+    lock_namespace_id(client, namespace).await?;
+    let namespace_exists = client
+        .query_opt("SELECT 1 FROM axond_namespace WHERE id = $1", &[&namespace])
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .is_some();
+    if !namespace_exists {
+        return Ok(BudgetAdmit::Exceeded);
+    }
+    client
+        .execute(
+            "INSERT INTO axond_store_budget
+                (namespace, period, limit_microdollars, spent_microdollars)
+             VALUES ($1, $2, $3, 0)
+             ON CONFLICT (namespace, period) DO NOTHING",
+            &[&namespace, &period, &cadence_limit],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let spend = client
+        .query_opt(
+            "SELECT limit_microdollars, spent_microdollars
+             FROM axond_store_budget WHERE namespace = $1 AND period = $2",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    Ok(admit_from_ledger(
+        Some(period),
+        spend.as_ref().map(|row| row.get(0)),
+        spend.as_ref().map(|row| row.get(1)),
+        incarnation,
+    ))
+}
+
+async fn admit_budget_on(
+    client: &Transaction<'_>,
+    namespace: &str,
+    clock: &Arc<dyn BudgetClock>,
 ) -> Result<BudgetAdmit, StoreError> {
     let Some(row) = client
         .query_opt(
-            "SELECT a.period, b.limit_microdollars, b.spent_microdollars,
+            "SELECT c.cadence, c.limit_microdollars, c.timezone,
+                    a.period, b.limit_microdollars, b.spent_microdollars,
                     COALESCE(i.n, 1)
-             FROM axond_store_budget_active a
-             JOIN axond_store_budget b
+             FROM axond_namespace n
+             LEFT JOIN axond_store_budget_cadence c ON c.namespace = n.id
+             LEFT JOIN axond_store_budget_active a ON a.namespace = n.id
+             LEFT JOIN axond_store_budget b
                ON b.namespace = a.namespace AND b.period = a.period
-             LEFT JOIN axond_namespace_incarnation i ON i.id = a.namespace
-             WHERE a.namespace = $1",
+             LEFT JOIN axond_namespace_incarnation i ON i.id = n.id
+             WHERE n.id = $1",
             &[&namespace],
         )
         .await
@@ -1161,24 +1501,28 @@ async fn admit_budget_on(
     else {
         return Ok(BudgetAdmit::Exceeded);
     };
-    Ok(admit_from_ledger(
-        Some(row.get(0)),
-        Some(row.get(1)),
-        Some(row.get(2)),
-        row.get(3),
-    ))
+    let cadence: Option<String> = row.get(0);
+    let result = if cadence.as_deref() == Some("monthly") {
+        admit_monthly(client, namespace, row.get(1), row.get(2), row.get(6), clock).await?
+    } else {
+        admit_from_ledger(row.get(3), row.get(4), row.get(5), row.get(6))
+    };
+    Ok(result)
 }
 
 async fn resolve_namespace_on(
-    client: &impl GenericClient,
+    client: &Transaction<'_>,
     id: &str,
+    clock: &Arc<dyn BudgetClock>,
 ) -> Result<Option<NamespaceResolve>, StoreError> {
     let Some(row) = client
         .query_opt(
             "SELECT n.id, n.attrs, n.blocklist,
+                    c.cadence, c.limit_microdollars, c.timezone,
                     a.period, b.limit_microdollars, b.spent_microdollars,
                     COALESCE(i.n, 1)
              FROM axond_namespace n
+             LEFT JOIN axond_store_budget_cadence c ON c.namespace = n.id
              LEFT JOIN axond_store_budget_active a ON a.namespace = n.id
              LEFT JOIN axond_store_budget b
                ON b.namespace = a.namespace AND b.period = a.period
@@ -1191,9 +1535,15 @@ async fn resolve_namespace_on(
     else {
         return Ok(None);
     };
+    let cadence: Option<String> = row.get(3);
+    let admit = if cadence.as_deref() == Some("monthly") {
+        admit_monthly(client, id, row.get(4), row.get(5), row.get(9), clock).await?
+    } else {
+        admit_from_ledger(row.get(6), row.get(7), row.get(8), row.get(9))
+    };
     Ok(Some(NamespaceResolve {
         record: record_from(row.get(0), row.get(1), row.get(2))?,
-        admit: admit_from_ledger(row.get(3), row.get(4), row.get(5), row.get(6)),
+        admit,
     }))
 }
 
@@ -1206,6 +1556,7 @@ impl PostgresStore {
             config,
             idle: Mutex::new(Vec::new()),
             slots,
+            clock: Arc::new(super::SystemClock),
         }
     }
 
@@ -1232,6 +1583,64 @@ impl PostgresStore {
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?
                 .get(0);
             Ok(count)
+        })
+        .await
+    }
+
+    pub(super) async fn budget_row_count(
+        &self,
+        namespace: &str,
+        period: &str,
+    ) -> Result<i64, StoreError> {
+        let namespace = namespace.to_owned();
+        let period = period.to_owned();
+        self.with_client(async move |client| {
+            client
+                .query_one(
+                    "SELECT count(*)::bigint FROM axond_store_budget
+                     WHERE namespace = $1 AND period = $2",
+                    &[&namespace, &period],
+                )
+                .await
+                .map(|row| row.get(0))
+                .map_err(|error| StoreError::Unavailable(error.to_string()))
+        })
+        .await
+    }
+
+    pub(super) async fn cadence_row_count(&self, namespace: &str) -> Result<i64, StoreError> {
+        let namespace = namespace.to_owned();
+        self.with_client(async move |client| {
+            client
+                .query_one(
+                    "SELECT count(*)::bigint FROM axond_store_budget_cadence
+                     WHERE namespace = $1",
+                    &[&namespace],
+                )
+                .await
+                .map(|row| row.get(0))
+                .map_err(|error| StoreError::Unavailable(error.to_string()))
+        })
+        .await
+    }
+
+    pub(super) async fn delete_budget_row(
+        &self,
+        namespace: &str,
+        period: &str,
+    ) -> Result<(), StoreError> {
+        let namespace = namespace.to_owned();
+        let period = period.to_owned();
+        self.with_client(async move |client| {
+            client
+                .execute(
+                    "DELETE FROM axond_store_budget
+                     WHERE namespace = $1 AND period = $2",
+                    &[&namespace, &period],
+                )
+                .await
+                .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+            Ok(())
         })
         .await
     }

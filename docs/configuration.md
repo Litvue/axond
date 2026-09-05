@@ -55,7 +55,7 @@ missing or unreachable store is a boot failure.
 | `[[usage_sink]] kind = "postgres"` | Durable usage rows (optional sink; the Store already has a usage index). |
 | `[usage_journal]` omitted or `backend = "none"` | Telemetry-grade usage delivery. |
 | `[usage_journal] backend = "postgres"` | Durable usage outbox on the request path. |
-| `[budget]` | Hold TTL only. `backend = "redis"\|"postgres"\|"in-memory"` is a boot error. Caps are `PUT /api/v1/namespaces/{ns}/budgets/{period}`. |
+| `[budget]` | Hold TTL only. `backend = "redis"\|"postgres"\|"in-memory"` is a boot error. Caps are `PUT /api/v1/namespaces/{ns}/budget` (monthly) or `PUT /api/v1/namespaces/{ns}/budgets/{period}` (fixed). |
 | `[rate_limit]` | Optional per-replica or Redis in-flight limiter. Not a budget backend. |
 | `/healthz`, `/readyz` | Unauthenticated liveness / readiness. |
 
@@ -190,14 +190,15 @@ until restart — the live `Store` is opened once.
 | `backend` | `sqlite` \| `postgres` | `sqlite` | SQLite WAL for a single replica; Postgres for HA. |
 | `path` | string | — | SQLite file path. Required for `sqlite`. `:memory:` is refused by `Config::load`. |
 | `dsn_env` | env-var name | — | Postgres DSN environment variable. Required for `postgres`. The DSN's `sslmode` selects TLS. |
-| `create_table` | bool | `true` | Apply namespace and `axond_store_budget*` DDL at connect. Postgres deployments that migrate out of band set `false`. |
+| `create_table` | bool | `true` | Apply namespace and `axond_store_budget*` DDL (including `axond_store_budget_cadence`) at connect. Postgres deployments that migrate out of band set `false` and apply `ops/postgres/store_budget_cadence_v1.sql` alongside the other files. |
 | `on_unavailable` | `deny` \| `allow` | `deny` | When the Store cannot reserve: `deny` answers `503 budget_unavailable`; `allow` serves without a hold. |
 
 SQLite rejects a set `dsn_env`; Postgres rejects a set `path`.
 
 Postgres Store budget tables are `axond_store_budget`,
 `axond_store_budget_active`, and `axond_store_budget_reservation`
-(`ops/postgres/store_budget_v1.sql`). They do not reuse the withdrawn
+(`ops/postgres/store_budget_v1.sql`) plus `axond_store_budget_cadence`
+(`ops/postgres/store_budget_cadence_v1.sql`, ADR 0065). They do not reuse the withdrawn
 `[budget] backend = "postgres"` names (`axond_budget*`). A database that
 already has those leftover tables keeps them; spend is not migrated (subject
 vs period). Connect still creates the Store tables and boots. An earlier
@@ -893,6 +894,39 @@ and under-records that request.
 A successful PUT marks that period as the namespace's active period. Inference
 does not carry a period. Plan change is PUT the same period with a new limit;
 a new billing period is PUT a new period key.
+
+### Cadence budgets (ADR 0065)
+
+A monthly plan does not need a caller to PUT `YYYY-MM` every month:
+
+```text
+PUT /api/v1/namespaces/{ns}/budget
+{ "cadence": "monthly", "limit_microdollars": 50000000, "timezone": "Europe/Berlin" }
+```
+
+`timezone` is an IANA name (default `UTC`), validated against a tz database
+bundled in the binary — the distroless image needs no `/usr/share/zoneinfo`.
+At admission the gateway derives the period key `YYYY-MM` from its clock in
+that timezone and creates the `(namespace, period)` spend row with the cadence
+limit on the first request of the month; concurrent first requests create one
+row. Previous months stay readable through `GET …/budgets/{YYYY-MM}` and
+`GET …/usage?period=YYYY-MM`. A new limit applies to the current month onward
+(spend preserved); earlier months keep their limit.
+
+`GET /api/v1/namespaces/{ns}/budget` returns `cadence`, `limit_microdollars`,
+`timezone`, the current `period`, `spent_microdollars`,
+`reserved_microdollars` (always `0`), `remaining_microdollars`, and `active`.
+It never writes; before the first request of a month it reports `spent: 0`.
+
+**Precedence.** While a `monthly` cadence budget exists the
+`PUT …/budgets/{period}` active-period marker is ignored by admission — a
+cadence budget wins. The legacy route keeps working: it still writes the spend
+row, and a PUT on the current `YYYY-MM` overrides that month's limit.
+`cadence: "fixed"` restores the chosen-period rule (`"period"` in the body
+selects the active period; omitted, it re-limits the current one). A namespace
+without a cadence budget behaves exactly as before, and `GET …/budget` then
+synthesizes the `fixed` view of its active period (`404 unknown_budget` when
+there is none).
 
 ## `[rate_limit]` — opt-in inbound concurrency enforcement
 

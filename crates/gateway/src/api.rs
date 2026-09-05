@@ -19,8 +19,8 @@ use utoipa::{Modify, OpenApi, ToSchema};
 use crate::error::GatewayError;
 use crate::state::AppState;
 use crate::store::{
-    BudgetRecord, NamespaceRecord, ProviderModels, Store, StoreError, UsageSummary, validate_attrs,
-    validate_namespace_id, validate_period,
+    BudgetCadence, BudgetPolicy, BudgetRecord, NamespaceRecord, ProviderModels, Store, StoreError,
+    UsageSummary, validate_attrs, validate_namespace_id, validate_period, validate_timezone,
 };
 
 /// Bound for the whole management request body. Attrs alone are capped at
@@ -45,6 +45,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/namespaces/{ns}/budgets/{period}",
             get(get_budget).put(put_budget),
+        )
+        .route(
+            "/api/v1/namespaces/{ns}/budget",
+            get(get_budget_policy).put(put_budget_policy),
         )
         .route("/api/v1/namespaces/{ns}/usage", get(get_usage))
         .route("/api/v1/providers/models", get(list_provider_models))
@@ -101,6 +105,8 @@ impl Modify for GatewayKeySecurity {
         delete_namespace,
         put_budget,
         get_budget,
+        put_budget_policy,
+        get_budget_policy,
         get_usage,
         list_provider_models,
         get_provider_models
@@ -160,6 +166,17 @@ struct UsageQuery {
 #[serde(deny_unknown_fields)]
 struct PutBudgetBody {
     limit_microdollars: u64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct PutBudgetPolicyBody {
+    cadence: BudgetCadence,
+    limit_microdollars: u64,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    period: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -458,6 +475,90 @@ async fn get_budget(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/v1/namespaces/{ns}/budget",
+    tag = "budgets",
+    params(("ns" = String, Path, description = "Namespace id")),
+    request_body = PutBudgetPolicyBody,
+    responses(
+        (status = 200, description = "Budget policy", body = BudgetPolicy),
+        (status = 400, description = "Malformed body, timezone, or period", body = ErrorEnvelope),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 404, description = "`unknown_namespace`", body = ErrorEnvelope),
+        (status = 413, description = "`request_too_large`", body = ErrorEnvelope),
+        (status = 415, description = "`unsupported_media_type`", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
+async fn put_budget_policy(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+    body: Result<Json<PutBudgetPolicyBody>, JsonRejection>,
+) -> Result<Json<BudgetPolicy>, GatewayError> {
+    let body = json_body(body)?;
+    let timezone = body
+        .timezone
+        .as_deref()
+        .unwrap_or(crate::store::DEFAULT_TIMEZONE);
+    validate_timezone(timezone).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
+    if let Some(period) = body.period.as_deref() {
+        validate_period(period).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
+        if body.cadence == BudgetCadence::Monthly {
+            return Err(GatewayError::BadRequest(
+                "period is derived for cadence \"monthly\"".into(),
+            ));
+        }
+    }
+    match store(&state)?
+        .put_budget_policy(
+            &ns,
+            body.cadence,
+            body.limit_microdollars,
+            timezone,
+            body.period.as_deref(),
+        )
+        .await
+    {
+        Ok(policy) => Ok(Json(policy)),
+        Err(StoreError::NotFound(_)) => Err(GatewayError::UnknownNamespace),
+        Err(StoreError::Invalid(msg)) => Err(GatewayError::BadRequest(msg)),
+        Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
+        Err(StoreError::Duplicate(_)) => Err(GatewayError::NamespaceConflict),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/namespaces/{ns}/budget",
+    tag = "budgets",
+    params(("ns" = String, Path, description = "Namespace id")),
+    responses(
+        (status = 200, description = "Budget policy", body = BudgetPolicy),
+        (status = 401, description = "Missing or wrong gateway key", body = ErrorEnvelope),
+        (status = 404, description = "`unknown_namespace` or `unknown_budget`", body = ErrorEnvelope),
+        (status = 503, description = "`store_unavailable`", body = ErrorEnvelope)
+    )
+)]
+async fn get_budget_policy(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<Json<BudgetPolicy>, GatewayError> {
+    let store = store(&state)?;
+    match store.get_namespace(&ns).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(GatewayError::UnknownNamespace),
+        Err(StoreError::Unavailable(_)) => return Err(GatewayError::StoreUnavailable),
+        Err(err) => return Err(GatewayError::BadRequest(err.to_string())),
+    }
+    match store.get_budget_policy(&ns).await {
+        Ok(Some(policy)) => Ok(Json(policy)),
+        Ok(None) => Err(GatewayError::UnknownBudget),
+        Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
+        Err(err) => Err(GatewayError::BadRequest(err.to_string())),
+    }
+}
+
 /// List namespaces, cursor-paginated.
 #[utoipa::path(
     get,
@@ -640,6 +741,7 @@ mod tests {
             "/api/v1/namespaces",
             "/api/v1/namespaces/{ns}",
             "/api/v1/namespaces/{ns}/budgets/{period}",
+            "/api/v1/namespaces/{ns}/budget",
             "/api/v1/namespaces/{ns}/usage",
             "/api/v1/providers/{id}/models",
             "/api/v1/providers/models",
@@ -651,6 +753,8 @@ mod tests {
         assert!(paths["/api/v1/namespaces/{ns}"].get("get").is_some());
         assert!(paths["/api/v1/namespaces/{ns}"].get("put").is_some());
         assert!(paths["/api/v1/namespaces/{ns}"].get("delete").is_some());
+        assert!(paths["/api/v1/namespaces/{ns}/budget"].get("get").is_some());
+        assert!(paths["/api/v1/namespaces/{ns}/budget"].get("put").is_some());
         assert!(
             paths["/api/v1/namespaces/{ns}/budgets/{period}"]["get"]["responses"]
                 .get("400")

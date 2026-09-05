@@ -55,6 +55,92 @@ async fn get_budget(http: &reqwest::Client, gateway: &Axond, ns: &str, period: &
     response.json().await.expect("budget json")
 }
 
+async fn put_policy(
+    http: &reqwest::Client,
+    gateway: &Axond,
+    ns: &str,
+    body: Value,
+) -> reqwest::Response {
+    http.put(gateway.url(&format!("/api/v1/namespaces/{ns}/budget")))
+        .bearer_auth(GATEWAY_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("put policy")
+}
+
+async fn get_policy(http: &reqwest::Client, gateway: &Axond, ns: &str) -> reqwest::Response {
+    http.get(gateway.url(&format!("/api/v1/namespaces/{ns}/budget")))
+        .bearer_auth(GATEWAY_KEY)
+        .send()
+        .await
+        .expect("get policy")
+}
+
+#[tokio::test]
+async fn cadence_budget_policy_round_trips_and_validates_inputs() {
+    let (_upstream, gateway) = boot().await;
+    let http = client();
+    create_namespace(&http, &gateway, "wsp_cadence").await;
+
+    let response = put_policy(
+        &http,
+        &gateway,
+        "wsp_cadence",
+        json!({"cadence": "monthly", "limit_microdollars": 1_000}),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let policy: Value = response.json().await.expect("policy json");
+    assert_eq!(policy["cadence"], "monthly");
+    assert_eq!(policy["limit_microdollars"], 1_000);
+    assert_eq!(policy["spent_microdollars"], 0);
+    assert_eq!(policy["remaining_microdollars"], 1_000);
+    assert_eq!(policy["active"], true);
+    assert_eq!(policy["period"].as_str().unwrap().len(), 7);
+
+    let response = get_policy(&http, &gateway, "wsp_cadence").await;
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let got: Value = response.json().await.expect("policy json");
+    assert_eq!(got["cadence"], "monthly");
+    assert_eq!(got["limit_microdollars"], 1_000);
+
+    let response = put_policy(
+        &http,
+        &gateway,
+        "wsp_cadence",
+        json!({"cadence": "monthly", "limit_microdollars": 1, "timezone": "Mars/Olympus"}),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+
+    let response = put_policy(
+        &http,
+        &gateway,
+        "wsp_cadence",
+        json!({"cadence": "monthly", "limit_microdollars": 1, "period": "p"}),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let error: Value = response.json().await.expect("error json");
+    assert_eq!(error["error"]["type"], "bad_request");
+}
+
+#[tokio::test]
+async fn cadence_budget_policy_reports_missing_budget_and_namespace() {
+    let (_upstream, gateway) = boot().await;
+    let http = client();
+    create_namespace(&http, &gateway, "wsp_no_cadence").await;
+    assert_eq!(
+        get_policy(&http, &gateway, "wsp_no_cadence").await.status(),
+        404
+    );
+    assert_eq!(
+        get_policy(&http, &gateway, "wsp_missing").await.status(),
+        404
+    );
+}
+
 async fn complete(
     http: &reqwest::Client,
     gateway: &Axond,

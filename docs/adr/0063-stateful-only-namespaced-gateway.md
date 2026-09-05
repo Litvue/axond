@@ -229,6 +229,13 @@ static key. Plan change = PUT the same period with a new limit. New
 billing period = PUT a new period key, which switches admission; the old
 period’s spend is retained and still GET-able.
 
+> **Amended by [ADR 0065](./0065-cadence-budgets.md).** A namespace with a
+> `monthly` cadence budget (`PUT /api/v1/namespaces/{ns}/budget`) derives
+> its active period as `YYYY-MM` in the budget's timezone at admission and
+> creates the spend row itself; the chosen-period marker above is ignored
+> while such a budget exists (a cadence budget wins). Without one, or with
+> `cadence: "fixed"`, this rule applies unchanged.
+
 A namespace with **no** budget row yet is fail-closed:
 `429 budget_exceeded` (nothing was published to spend against). Litvue
 PUTs on workspace create.
@@ -263,6 +270,7 @@ is the integration surface; Litvue generates a TypeScript client from it
 | `PUT` | `/api/v1/namespaces/{ns}` | replace `attrs` / `blocklist`; id immutable |
 | `DELETE` | `/api/v1/namespaces/{ns}` | idempotent remove (own slice) |
 | `PUT`/`GET` | `/api/v1/namespaces/{ns}/budgets/{period}` | as above |
+| `PUT`/`GET` | `/api/v1/namespaces/{ns}/budget` | cadence budget (`monthly` \| `fixed`), [ADR 0065](./0065-cadence-budgets.md) |
 | `GET` | `/api/v1/namespaces/{ns}/usage?period=` | summary by `model` and `status` for that period (`period` required) |
 | `GET` | `/api/v1/providers/{id}/models` | upstream discovery, cached |
 | `GET` | `/api/v1/providers/models` | fan-out of the same |

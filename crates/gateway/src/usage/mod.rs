@@ -1162,6 +1162,22 @@ mod tests {
         ) -> Result<Option<crate::store::BudgetRecord>, crate::store::StoreError> {
             Ok(None)
         }
+        async fn put_budget_policy(
+            &self,
+            _: &str,
+            _: crate::store::BudgetCadence,
+            _: u64,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<crate::store::BudgetPolicy, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable("unused".into()))
+        }
+        async fn get_budget_policy(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::store::BudgetPolicy>, crate::store::StoreError> {
+            Ok(None)
+        }
         async fn admit_budget(
             &self,
             _: &str,
@@ -1251,6 +1267,22 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<Option<crate::store::BudgetRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn put_budget_policy(
+            &self,
+            _: &str,
+            _: crate::store::BudgetCadence,
+            _: u64,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<crate::store::BudgetPolicy, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable("unused".into()))
+        }
+        async fn get_budget_policy(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::store::BudgetPolicy>, crate::store::StoreError> {
             Ok(None)
         }
         async fn admit_budget(
