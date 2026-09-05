@@ -38,12 +38,17 @@ npm run build
 npm run deploy
 ```
 
-Authenticate locally with `npx wrangler login`. GitHub Actions checks website PRs
-and deploys changes merged into `main` when website files, either root installer,
-or the website workflow change. Manual workflow runs deploy only from `main`.
-Configure repository secret `CLOUDFLARE_API_TOKEN` and repository variable
-`CLOUDFLARE_ACCOUNT_ID` for CI. Never commit credentials.
+Authenticate locally with `npx wrangler login`. GitHub Actions checks the build;
+Cloudflare Workers Builds handles production deployment through its GitHub app.
+No Cloudflare credentials are stored in GitHub Actions.
 
-The token needs Workers Scripts Edit for the Litvue account, and Workers Routes
-Edit plus Zone Read for the axond.dev zone. Keep the checkout at repository root:
-the build copies the root installers into the static output.
+Connect the existing `axond-website` Worker to `Litvue/axond` in Cloudflare:
+
+- Production branch: `main`
+- Root directory: `website`
+- Build command: `npm run check && npm run build`
+- Deploy command: `npx wrangler deploy`
+- Node version: `24` (set `NODE_VERSION` in build variables)
+- Build watch paths: `website/**`, `install.sh`, `install.ps1`
+
+Keep the full repository checkout: `prebuild` copies the root installers.
