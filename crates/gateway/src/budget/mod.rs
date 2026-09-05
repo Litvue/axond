@@ -148,11 +148,9 @@ pub(crate) fn admission_from_store(admit: BudgetAdmit) -> Admission {
             period,
             incarnation,
         } => Admission::Allowed(Reservation {
-            id: Reservation::next_id(),
-            estimate_microdollars: 0,
-            generation: None,
             period: Some(period),
             incarnation: Some(incarnation),
+            ..Reservation::unheld()
         }),
         BudgetAdmit::Exceeded => Admission::Denied(Denial::Exceeded),
     }
