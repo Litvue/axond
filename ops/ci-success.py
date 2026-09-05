@@ -19,11 +19,16 @@ RELEASE = {
 LEGACY = {"stateful-deploy-drill", "stateful-persistent-drill"}
 
 
-def failures(needs, event, dependencies, legacy):
+def expected_results(event, dependencies, legacy):
     expected = {job: "success" for job in COMMON}
     expected.update({job: "skipped" if event == "pull_request" else "success" for job in RELEASE})
     expected.update({job: "success" if event == "workflow_dispatch" and legacy == "true" else "skipped" for job in LEGACY})
     expected["dependency-policy"] = "success" if dependencies == "true" else "skipped"
+    return expected
+
+
+def failures(needs, event, dependencies, legacy):
+    expected = expected_results(event, dependencies, legacy)
     errors = []
     if dependencies not in {"true", "false"} or (event != "pull_request" and dependencies != "true"):
         errors.append("dependency change detection must succeed; non-PR runs must check dependencies")

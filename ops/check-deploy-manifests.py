@@ -33,6 +33,7 @@ from __future__ import annotations
 import copy
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -735,23 +736,38 @@ def check_supported_backends(
 
 
 def unblocked_lane(jobs: dict[str, Any], lane: str) -> str | None:
-    """Why a lane would not block a merge, or `None` when it would.
+    """Why a drill would not block its selected CI event (ADR 0004).
 
-    Listing a lane in `CI-Success`'s `needs` is not what makes it required:
-    that job runs `if: always()`, so it is reached whatever the lane did. What
-    blocks the merge is the explicit `needs.<lane>.result` assertion in its own
-    step — deleting only that line leaves a green `CI-Success` over a failed
-    drill, so both halves are checked.
+    The aggregate delegates to ci-success.py. Check both its workflow wiring
+    and that a failed drill actually fails that event's gate, including the
+    explicit manual opt-in for legacy drills.
     """
     success = jobs["CI-Success"]
     if lane not in success["needs"]:
         return f"CI-Success does not require {lane}"
-    assertion = f"needs.{lane}.result"
-    if not any(assertion in str(step.get("run", "")) for step in success["steps"]):
-        return (
-            f"CI-Success needs {lane} but never asserts {assertion}, and it runs with "
-            "`if: always()`, so it succeeds over a failed lane"
-        )
+    required_env = {
+        "CI_NEEDS": "${{ toJSON(needs) }}",
+        "CI_EVENT": "${{ github.event_name }}",
+        "CI_DEPENDENCIES": "${{ needs.changes.outputs.dependencies }}",
+        "CI_LEGACY": "${{ inputs.run_legacy_postgres_qualification }}",
+    }
+    if not any(
+        str(step.get("run", "")).strip() == "python3 ops/ci-success.py"
+        and all(step.get("env", {}).get(key) == value for key, value in required_env.items())
+        for step in success["steps"]
+    ):
+        return f"CI-Success does not pass the job results and event to the gate for {lane}"
+    gate = runpy.run_path(str(ROOT / "ops/ci-success.py"))
+    event = "workflow_dispatch" if lane in gate["LEGACY"] else "push"
+    expected = gate["expected_results"](event, "true", "true")
+    if expected.get(lane) != "success":
+        return f"CI-Success does not require a successful {lane} on {event}"
+    needs = {job: {"result": result} for job, result in expected.items()}
+    if gate["failures"](needs, event, "true", "true"):
+        return f"CI-Success cannot pass the selected {event} lanes"
+    needs[lane]["result"] = "failure"
+    if not gate["failures"](needs, event, "true", "true"):
+        return f"CI-Success accepts a failed {lane} on {event}"
     return None
 
 
@@ -1915,9 +1931,7 @@ def self_test() -> int:
     unasserted_rollout = copy.deepcopy(workflow)
     for step in unasserted_rollout["jobs"]["CI-Success"]["steps"]:
         if "run" in step:
-            step["run"] = re.sub(
-                r"^.*needs\.rollout-drill\.result.*$", "", step["run"], flags=re.MULTILINE
-            )
+            step["run"] = "true"
     expect_failure(
         "a needed rollout lane CI-Success never asserts",
         check_rollout_drill(unasserted_rollout, kubernetes_page, rollout),
@@ -1939,9 +1953,7 @@ def self_test() -> int:
     unasserted_stateful = copy.deepcopy(workflow)
     for step in unasserted_stateful["jobs"]["CI-Success"]["steps"]:
         if "run" in step:
-            step["run"] = re.sub(
-                r"^.*needs\.stateful-deploy-drill\.result.*$", "", step["run"], flags=re.MULTILINE
-            )
+            step["run"] = "true"
     expect_failure(
         "a needed stateful lane CI-Success never asserts",
         check_stateful_drill(unasserted_stateful, kubernetes_page, stateful_drill),
@@ -1981,12 +1993,7 @@ def self_test() -> int:
     unasserted_persistent = copy.deepcopy(workflow)
     for step in unasserted_persistent["jobs"]["CI-Success"]["steps"]:
         if "run" in step:
-            step["run"] = re.sub(
-                r"^.*needs\.stateful-persistent-drill\.result.*$",
-                "",
-                step["run"],
-                flags=re.MULTILINE,
-            )
+            step["run"] = "true"
     expect_failure(
         "a needed stateful persistent lane CI-Success never asserts",
         check_stateful_persistent_drill(
