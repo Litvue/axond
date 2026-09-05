@@ -1,0 +1,76 @@
+---
+interface Props {
+  entries: Record<string, string>;
+  name: string;
+}
+const { entries, name } = Astro.props;
+const items = Object.entries(entries);
+---
+<code-tabs class="code-window">
+  <div class="code-toolbar">
+    <div class="code-tabs" role="tablist" aria-label={name === 'sdk' ? 'Client language' : 'Command format'}>
+      {items.map(([label], index) => (
+        <button id={`${name}-tab-${index}`} role="tab" aria-selected={index === 0 ? 'true' : 'false'} aria-controls={`${name}-panel-${index}`} tabindex={index === 0 ? 0 : -1}>{label}</button>
+      ))}
+    </div>
+    <button class="copy-button" aria-label="Copy code" data-copy>
+      <span aria-hidden="true" class="copy-icon"></span>
+      <span aria-live="polite" data-copy-label>Copy</span>
+    </button>
+  </div>
+  {items.map(([, value], index) => (
+    <div role="tabpanel" id={`${name}-panel-${index}`} aria-labelledby={`${name}-tab-${index}`} tabindex="0" hidden={index !== 0} data-code={value}>
+      <pre><code>{value.split('\n').map((line, number) => (
+        <span class="code-line"><span class="line-number" aria-hidden="true">{number + 1}</span><span data-line>{line}</span></span>
+      ))}</code></pre>
+    </div>
+  ))}
+  {name === 'install' && <p class="code-footnote">Downloads the latest release binary and verifies its SHA-256 checksum. No Rust toolchain or Docker required.</p>}
+</code-tabs>
+
+<script>
+  class CodeTabs extends HTMLElement {
+    connectedCallback() {
+      const tabs = Array.from(this.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+      const panels = Array.from(this.querySelectorAll<HTMLElement>('[role="tabpanel"]'));
+      const copy = this.querySelector<HTMLButtonElement>('[data-copy]')!;
+      const label = this.querySelector<HTMLElement>('[data-copy-label]')!;
+      let selected = 0;
+      let reset: ReturnType<typeof setTimeout>;
+      const select = (index: number) => {
+        selected = index;
+        clearTimeout(reset);
+        label.textContent = 'Copy';
+        tabs.forEach((tab, i) => {
+          tab.setAttribute('aria-selected', String(i === index));
+          tab.tabIndex = i === index ? 0 : -1;
+          panels[i].hidden = i !== index;
+        });
+      };
+      tabs.forEach((tab, index) => {
+        tab.addEventListener('click', () => select(index));
+        tab.addEventListener('keydown', event => {
+          if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+          event.preventDefault();
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+          select(next);
+          tabs[next].focus();
+        });
+      });
+      copy.addEventListener('click', async () => {
+        clearTimeout(reset);
+        try {
+          await navigator.clipboard.writeText(panels[selected].dataset.code ?? '');
+          label.textContent = 'Copied';
+        } catch {
+          label.textContent = 'Select to copy';
+        }
+        reset = setTimeout(() => { label.textContent = 'Copy'; }, 2400);
+      });
+    }
+  }
+  customElements.define('code-tabs', CodeTabs);
+</script>
+<style>
+  code-tabs { display: block; min-width: 0; }
+</style>
