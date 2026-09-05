@@ -4,6 +4,8 @@ const {
   title = 'Axond — Open-source AI model router',
   description = 'A completely open-source, MIT-licensed AI model router built in Rust. Self-host native OpenAI and Anthropic requests with namespace budgets, provider credentials, and usage metering.',
 } = Astro.props;
+const socialImage = new URL("/og.png", Astro.site);
+const socialImageAlt = "Axond — Open-source AI model router. MIT licensed. axond.dev.";
 ---
 <!doctype html>
 <html lang="en">
@@ -11,6 +13,11 @@ const {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{title}</title>
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any" />
+    <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
+    <meta name="theme-color" content="#ffffff" />
     <link rel="canonical" href={new URL(Astro.url.pathname, Astro.site)} />
     <meta property="og:url" content={new URL(Astro.url.pathname, Astro.site)} />
     <meta name="description" content={description} />
@@ -18,7 +25,15 @@ const {
     <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Axond" />
-    <meta name="twitter:card" content="summary" />
+    <meta property="og:image" content={socialImage} />
+    <meta property="og:image:secure_url" content={socialImage} />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={socialImageAlt} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content={socialImage} />
+    <meta name="twitter:image:alt" content={socialImageAlt} />
     <meta name="twitter:title" content={title} />
     <meta name="twitter:description" content={description} />
   </head>
