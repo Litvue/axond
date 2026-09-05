@@ -234,6 +234,12 @@ impl GatewayError {
             | Self::MintClaimsNotNarrowing
             | Self::MintEpochNotUsable { .. } => StatusCode::FORBIDDEN,
             Self::UnsupportedWire { .. } => StatusCode::BAD_REQUEST,
+            // Provider credentials belong to the operator. The provider parser
+            // groups these refusals with invalid requests, but their original
+            // HTTP status distinguishes them from caller validation failures.
+            Self::Transport(TransportError::Upstream {
+                status: 401 | 403, ..
+            }) => StatusCode::BAD_GATEWAY,
             Self::Provider(e)
             | Self::Transport(
                 TransportError::Provider(e) | TransportError::Upstream { error: e, .. },

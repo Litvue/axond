@@ -131,8 +131,10 @@ response bodies to spans. A provider's error message may echo caller input;
 trace access and retention should follow the deployment's diagnostic-data
 policy. Diagnostics are span attributes, never metric labels.
 
-Provider invalid-request and context-window errors return HTTP 400 on both
-buffered requests and stream-open failures. Provider dependency and model
+Provider request-validation and context-window errors return HTTP 400 on both
+buffered requests and stream-open failures. Upstream 401/403 credential refusals
+remain HTTP 502 even though the provider parser labels them `invalid_request`;
+these require an operator to correct provider access. Provider dependency and model
 availability failures keep their gateway error classification; their original
 HTTP status is available on the attempt span. Once a stream has opened, errors
 remain in-band SSE events because its HTTP status has already been sent.

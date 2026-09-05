@@ -12143,6 +12143,8 @@ output_microdollars_per_million = 1000000
                         "invalid_request",
                     ),
                     (422, "invalid field", 400, "invalid_request"),
+                    (401, "invalid provider credentials", 502, "invalid_request"),
+                    (403, "provider access denied", 502, "invalid_request"),
                     (
                         400,
                         "context window exceeded",
