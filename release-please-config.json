@@ -3,6 +3,7 @@
   "packages": {
     ".": {
       "release-type": "simple",
+      "exclude-paths": ["website", ".github"],
       "package-name": "axond",
       "initial-version": "0.1.0",
       "changelog-path": "CHANGELOG.md",
