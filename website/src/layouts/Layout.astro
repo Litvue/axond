@@ -1,0 +1,26 @@
+---
+import '../styles/global.css';
+const {
+  title = 'Axond — Open-source AI model router',
+  description = 'A completely open-source, MIT-licensed AI model router built in Rust. Self-host native OpenAI and Anthropic requests with namespace budgets, provider credentials, and usage metering.',
+} = Astro.props;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <link rel="canonical" href={new URL(Astro.url.pathname, Astro.site)} />
+    <meta property="og:url" content={new URL(Astro.url.pathname, Astro.site)} />
+    <meta name="description" content={description} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Axond" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+  </head>
+  <body><slot /></body>
+</html>

@@ -1,0 +1,154 @@
+---
+import Layout from '../layouts/Layout.astro';
+import CodeTabs from '../components/CodeTabs.astro';
+import Mark from '../components/Mark.astro';
+import Arrow from '../components/Arrow.astro';
+const repo = "https://github.com/Litvue/axond";
+const docs = repo + "/blob/main/docs/";
+const samples = {
+  Python:
+    'from openai import OpenAI\n\nclient = OpenAI(\n    base_url="http://localhost:8080/ns/platform/v1",\n    api_key="quickstart-platform-key",\n)\n\nresponse = client.chat.completions.create(\n    model="openai/gpt-4o",\n    messages=[{"role": "user", "content": "Hello, Axond."}],\n)\n\nprint(response.choices[0].message.content)',
+  TypeScript:
+    'import OpenAI from "openai";\n\nconst client = new OpenAI({\n  baseURL: "http://localhost:8080/ns/platform/v1",\n  apiKey: "quickstart-platform-key",\n});\n\nconst response = await client.chat.completions.create({\n  model: "openai/gpt-4o",\n  messages: [{ role: "user", content: "Hello, Axond." }],\n});\n\nconsole.log(response.choices[0].message.content);',
+  curl: 'curl http://localhost:8080/ns/platform/v1/chat/completions \\\n  -H "Authorization: Bearer quickstart-platform-key" \\\n  -H "Content-Type: application/json" \\\n  -d \'{\n    "model": "openai/gpt-4o",\n    "messages": [\n      {"role": "user", "content": "Hello, Axond."}\n    ]\n  }\'',
+};
+const setup = {
+  "macOS/Linux": "curl -fsSL https://axond.dev/install.sh | sh",
+  Windows: "irm https://axond.dev/install.ps1 | iex",
+};
+---
+<Layout>
+<a class="skip-link" href="#main">
+        Skip to content
+      </a>
+      <div class="site-shell">
+        <header class="site-header">
+          <a class="wordmark" href="#" aria-label="Axond home">
+            <Mark />
+            axond
+          </a>
+          <nav aria-label="Main navigation">
+            <a href={docs + "index.md"}>Docs</a>
+            <a href={repo + "/blob/main/LICENSE-MIT"}>MIT license</a>
+            <a href={repo}>
+              GitHub <Arrow />
+            </a>
+          </nav>
+        </header>
+        <main id="main">
+          <section class="hero">
+            <p class="eyebrow">OPEN SOURCE · MIT LICENSED</p>
+            <h1>
+              An open-source
+              <br />
+              <span>AI model router.</span>
+            </h1>
+            <p class="hero-description">
+              Route OpenAI and Anthropic requests through one self-hosted Rust
+              binary. Manage provider keys, namespace budgets, and usage in one
+              place.
+            </p>
+            <p class="ownership">
+              Completely open source. Use it, modify it, and run it on your own
+              infrastructure.
+            </p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="#get-started">
+                Install Axond <span aria-hidden="true">↓</span>
+              </a>
+              <a class="source-link" href={repo}>
+                Read the source <Arrow />
+              </a>
+            </div>
+            <p class="release-note">
+              Currently in beta. 
+              <a href={docs + "compatibility.md"}>
+                See the compatibility contract.
+              </a>
+            </p>
+          </section>
+
+          <section class="capabilities" aria-label="What Axond does">
+            <article>
+              <h2>Native APIs</h2>
+              <p>
+                OpenAI and Anthropic wire formats, including streaming. Keep
+                your existing SDK.
+              </p>
+            </article>
+            <article>
+              <h2>Scoped controls</h2>
+              <p>
+                Namespace credentials, period budgets, usage metering, and
+                OpenTelemetry.
+              </p>
+            </article>
+            <article>
+              <h2>Your deployment</h2>
+              <p>
+                A single binary with SQLite or Postgres. Run locally, in a
+                container, or on your servers.
+              </p>
+            </article>
+          </section>
+
+          <section id="get-started" class="guide-section">
+            <div class="guide-copy">
+              <p class="eyebrow">01 / INSTALL</p>
+              <h2>Install with one command.</h2>
+              <p>
+                The installer detects your platform and downloads the prebuilt
+                binary. Then configure your provider key and start Axond.
+              </p>
+              <a class="text-link" href="/quickstart">
+                Configure and run Axond <Arrow />
+              </a>
+              <p class="installer-links">
+                <a href="/install.sh">Read the shell script</a> · 
+                <a href="/install.ps1">PowerShell script</a>
+              </p>
+              <a class="secondary-link" href={docs + "installation.md"}>
+                Other installation options <Arrow />
+              </a>
+            </div>
+            <CodeTabs entries={setup} name="install" />
+          </section>
+
+          <section id="examples" class="guide-section">
+            <div class="guide-copy">
+              <p class="eyebrow">02 / SEND A REQUEST</p>
+              <h2>Use your existing SDK.</h2>
+              <p>
+                Set the base URL to your namespace and use a provider-prefixed
+                model ID, such as <code>openai/gpt-4o</code>.
+              </p>
+              <p>
+                These examples use the local quickstart key. Configure a real
+                provider key and budget first.
+              </p>
+              <a class="text-link" href={docs + "clients/anthropic.md"}>
+                Using Anthropic? See its client guide <Arrow />
+              </a>
+              <p class="technical-note">
+                Requests keep their native wire format. Axond does not translate
+                between OpenAI and Anthropic APIs.
+              </p>
+            </div>
+            <CodeTabs entries={samples} name="sdk" />
+          </section>
+        </main>
+        <footer>
+          <p>
+            <a href={repo + "/blob/main/LICENSE-MIT"}>MIT licensed.</a> Made by
+            the team behind <a href="https://litvue.com">Litvue</a>.
+          </p>
+          <div>
+            <a href={docs + "index.md"}>Documentation</a>
+            <a href={repo + "/releases"}>Releases</a>
+            <a href={repo}>
+              Source code <Arrow />
+            </a>
+          </div>
+        </footer>
+      </div>
+</Layout>
