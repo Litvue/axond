@@ -748,6 +748,7 @@ def unblocked_lane(jobs: dict[str, Any], lane: str) -> str | None:
     required_env = {
         "CI_NEEDS": "${{ toJSON(needs) }}",
         "CI_EVENT": "${{ github.event_name }}",
+        "CI_RUST": "${{ needs.changes.outputs.rust }}",
         "CI_DEPENDENCIES": "${{ needs.changes.outputs.dependencies }}",
         "CI_LEGACY": "${{ inputs.run_legacy_postgres_qualification }}",
     }
@@ -759,14 +760,14 @@ def unblocked_lane(jobs: dict[str, Any], lane: str) -> str | None:
         return f"CI-Success does not pass the job results and event to the gate for {lane}"
     gate = runpy.run_path(str(ROOT / "ops/ci-success.py"))
     event = "workflow_dispatch" if lane in gate["LEGACY"] else "push"
-    expected = gate["expected_results"](event, "true", "true")
+    expected = gate["expected_results"](event, "true", "true", "true")
     if expected.get(lane) != "success":
         return f"CI-Success does not require a successful {lane} on {event}"
     needs = {job: {"result": result} for job, result in expected.items()}
-    if gate["failures"](needs, event, "true", "true"):
+    if gate["failures"](needs, event, "true", "true", "true"):
         return f"CI-Success cannot pass the selected {event} lanes"
     needs[lane]["result"] = "failure"
-    if not gate["failures"](needs, event, "true", "true"):
+    if not gate["failures"](needs, event, "true", "true", "true"):
         return f"CI-Success accepts a failed {lane} on {event}"
     return None
 
