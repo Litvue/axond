@@ -854,6 +854,65 @@ fn sqlite_provider_models(
     })
 }
 
+fn admit_monthly(
+    conn: &mut Connection,
+    namespace: &str,
+    cadence_limit: Option<i64>,
+    timezone: Option<String>,
+    incarnation: i64,
+    clock: &Arc<dyn BudgetClock>,
+) -> Result<BudgetAdmit, StoreError> {
+    let timezone = timezone.unwrap_or_else(|| super::DEFAULT_TIMEZONE.into());
+    let tz = validate_timezone(&timezone)?;
+    let period = monthly_period_key(clock.now(), &tz);
+    if let Some((limit, spent)) = conn
+        .query_row(
+            "SELECT limit_microdollars, spent_microdollars
+             FROM axond_store_budget WHERE namespace = ?1 AND period = ?2",
+            params![namespace, period],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(unavailable)?
+    {
+        return Ok(admit_from_ledger(
+            Some(period),
+            Some(limit),
+            Some(spent),
+            incarnation,
+        ));
+    }
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(unavailable)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO axond_store_budget
+            (namespace, period, limit_microdollars, spent_microdollars)
+         VALUES (?1, ?2, ?3, 0)",
+        params![
+            namespace,
+            period,
+            cadence_limit
+                .ok_or_else(|| StoreError::Unavailable("monthly cadence limit missing".into()))?
+        ],
+    )
+    .map_err(unavailable)?;
+    let row = tx
+        .query_row(
+            "SELECT limit_microdollars, spent_microdollars
+             FROM axond_store_budget WHERE namespace = ?1 AND period = ?2",
+            params![namespace, period],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(unavailable)?;
+    let (limit, spent) = row.unwrap_or((None, None));
+    let result = admit_from_ledger(Some(period), limit, spent, incarnation);
+    tx.commit().map_err(unavailable)?;
+    Ok(result)
+}
+
 fn admit_budget_on(
     conn: &mut Connection,
     namespace: &str,
@@ -890,38 +949,7 @@ fn admit_budget_on(
         return Ok(BudgetAdmit::Exceeded);
     };
     let result = if cadence.as_deref() == Some("monthly") {
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(unavailable)?;
-        let timezone = timezone.unwrap_or_else(|| super::DEFAULT_TIMEZONE.into());
-        let tz = validate_timezone(&timezone)?;
-        let period = monthly_period_key(clock.now(), &tz);
-        tx.execute(
-            "INSERT OR IGNORE INTO axond_store_budget
-                (namespace, period, limit_microdollars, spent_microdollars)
-             VALUES (?1, ?2, ?3, 0)",
-            params![
-                namespace,
-                period,
-                cadence_limit.ok_or_else(|| {
-                    StoreError::Unavailable("monthly cadence limit missing".into())
-                })?
-            ],
-        )
-        .map_err(unavailable)?;
-        let row = tx
-            .query_row(
-                "SELECT limit_microdollars, spent_microdollars
-                 FROM axond_store_budget WHERE namespace = ?1 AND period = ?2",
-                params![namespace, period],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(unavailable)?;
-        let (limit, spent) = row.unwrap_or((None, None));
-        let result = admit_from_ledger(Some(period), limit, spent, incarnation);
-        tx.commit().map_err(unavailable)?;
-        result
+        admit_monthly(conn, namespace, cadence_limit, timezone, incarnation, clock)?
     } else {
         admit_from_ledger(period, limit, spent, incarnation)
     };
@@ -980,38 +1008,7 @@ fn resolve_namespace_on(
         return Ok(None);
     };
     let admit = if cadence.as_deref() == Some("monthly") {
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(unavailable)?;
-        let timezone = timezone.unwrap_or_else(|| super::DEFAULT_TIMEZONE.into());
-        let tz = validate_timezone(&timezone)?;
-        let period = monthly_period_key(clock.now(), &tz);
-        tx.execute(
-            "INSERT OR IGNORE INTO axond_store_budget
-                (namespace, period, limit_microdollars, spent_microdollars)
-             VALUES (?1, ?2, ?3, 0)",
-            params![
-                id,
-                period,
-                cadence_limit.ok_or_else(|| {
-                    StoreError::Unavailable("monthly cadence limit missing".into())
-                })?
-            ],
-        )
-        .map_err(unavailable)?;
-        let row = tx
-            .query_row(
-                "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget
-                 WHERE namespace = ?1 AND period = ?2",
-                params![id, period],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(unavailable)?;
-        let (limit, spent) = row.unwrap_or((None, None));
-        let admit = admit_from_ledger(Some(period), limit, spent, incarnation);
-        tx.commit().map_err(unavailable)?;
-        admit
+        admit_monthly(conn, &id, cadence_limit, timezone, incarnation, clock)?
     } else {
         admit_from_ledger(period, limit, spent, incarnation)
     };

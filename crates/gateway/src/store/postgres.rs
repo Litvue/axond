@@ -1412,6 +1412,62 @@ async fn charge_budget_on(
     Ok(())
 }
 
+async fn admit_monthly(
+    client: &Transaction<'_>,
+    namespace: &str,
+    cadence_limit: Option<i64>,
+    timezone: Option<String>,
+    incarnation: i64,
+    clock: &Arc<dyn BudgetClock>,
+) -> Result<BudgetAdmit, StoreError> {
+    let timezone = timezone.unwrap_or_else(|| super::DEFAULT_TIMEZONE.into());
+    let tz = validate_timezone(&timezone)?;
+    let period = monthly_period_key(clock.now(), &tz);
+    if let Some(spend) = client
+        .query_opt(
+            "SELECT limit_microdollars, spent_microdollars
+             FROM axond_store_budget WHERE namespace = $1 AND period = $2",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+    {
+        return Ok(admit_from_ledger(
+            Some(period),
+            Some(spend.get(0)),
+            Some(spend.get(1)),
+            incarnation,
+        ));
+    }
+
+    let cadence_limit = cadence_limit
+        .ok_or_else(|| StoreError::Unavailable("monthly cadence limit missing".into()))?;
+    client
+        .execute(
+            "INSERT INTO axond_store_budget
+                (namespace, period, limit_microdollars, spent_microdollars)
+             VALUES ($1, $2, $3, 0)
+             ON CONFLICT (namespace, period) DO NOTHING",
+            &[&namespace, &period, &cadence_limit],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    let spend = client
+        .query_opt(
+            "SELECT limit_microdollars, spent_microdollars
+             FROM axond_store_budget WHERE namespace = $1 AND period = $2",
+            &[&namespace, &period],
+        )
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+    Ok(admit_from_ledger(
+        Some(period),
+        spend.as_ref().map(|row| row.get(0)),
+        spend.as_ref().map(|row| row.get(1)),
+        incarnation,
+    ))
+}
+
 async fn admit_budget_on(
     client: &Transaction<'_>,
     namespace: &str,
@@ -1438,38 +1494,7 @@ async fn admit_budget_on(
     };
     let cadence: Option<String> = row.get(0);
     let result = if cadence.as_deref() == Some("monthly") {
-        let timezone = row
-            .get::<_, Option<String>>(2)
-            .unwrap_or_else(|| super::DEFAULT_TIMEZONE.into());
-        let tz = validate_timezone(&timezone)?;
-        let period = monthly_period_key(clock.now(), &tz);
-        let cadence_limit: i64 = row
-            .get::<_, Option<i64>>(1)
-            .ok_or_else(|| StoreError::Unavailable("monthly cadence limit missing".into()))?;
-        client
-            .execute(
-                "INSERT INTO axond_store_budget
-                    (namespace, period, limit_microdollars, spent_microdollars)
-                 VALUES ($1, $2, $3, 0)
-                 ON CONFLICT (namespace, period) DO NOTHING",
-                &[&namespace, &period, &cadence_limit],
-            )
-            .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        let spend = client
-            .query_opt(
-                "SELECT limit_microdollars, spent_microdollars
-                 FROM axond_store_budget WHERE namespace = $1 AND period = $2",
-                &[&namespace, &period],
-            )
-            .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        admit_from_ledger(
-            Some(period),
-            spend.as_ref().map(|row| row.get(0)),
-            spend.as_ref().map(|row| row.get(1)),
-            row.get(6),
-        )
+        admit_monthly(client, namespace, row.get(1), row.get(2), row.get(6), clock).await?
     } else {
         admit_from_ledger(row.get(3), row.get(4), row.get(5), row.get(6))
     };
@@ -1503,38 +1528,7 @@ async fn resolve_namespace_on(
     };
     let cadence: Option<String> = row.get(3);
     let admit = if cadence.as_deref() == Some("monthly") {
-        let timezone = row
-            .get::<_, Option<String>>(5)
-            .unwrap_or_else(|| super::DEFAULT_TIMEZONE.into());
-        let tz = validate_timezone(&timezone)?;
-        let period = monthly_period_key(clock.now(), &tz);
-        let cadence_limit: i64 = row
-            .get::<_, Option<i64>>(4)
-            .ok_or_else(|| StoreError::Unavailable("monthly cadence limit missing".into()))?;
-        client
-            .execute(
-                "INSERT INTO axond_store_budget
-                    (namespace, period, limit_microdollars, spent_microdollars)
-                 VALUES ($1, $2, $3, 0)
-                 ON CONFLICT (namespace, period) DO NOTHING",
-                &[&id, &period, &cadence_limit],
-            )
-            .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        let spend = client
-            .query_opt(
-                "SELECT limit_microdollars, spent_microdollars
-                 FROM axond_store_budget WHERE namespace = $1 AND period = $2",
-                &[&id, &period],
-            )
-            .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        admit_from_ledger(
-            Some(period),
-            spend.as_ref().map(|row| row.get(0)),
-            spend.as_ref().map(|row| row.get(1)),
-            row.get(9),
-        )
+        admit_monthly(client, id, row.get(4), row.get(5), row.get(9), clock).await?
     } else {
         admit_from_ledger(row.get(6), row.get(7), row.get(8), row.get(9))
     };

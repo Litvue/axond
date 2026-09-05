@@ -33,16 +33,21 @@ pub const MAX_ATTRS_BYTES: usize = 4 * 1024;
 
 /// Opaque billing-period keys share the namespace id charset and bound.
 pub const MAX_PERIOD_LEN: usize = 128;
+/// Default timezone used for synthesized fixed policies and omitted settings.
 pub const DEFAULT_TIMEZONE: &str = "UTC";
 
+/// Budget period rollover strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BudgetCadence {
+    /// Derive the active period from the gateway clock.
     Monthly,
+    /// Use an explicitly selected opaque period.
     Fixed,
 }
 
 impl BudgetCadence {
+    /// Return the cadence value stored in the database.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Monthly => "monthly",
@@ -50,6 +55,7 @@ impl BudgetCadence {
         }
     }
 
+    /// Parse a cadence value stored in the database.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "monthly" => Some(Self::Monthly),
@@ -59,23 +65,36 @@ impl BudgetCadence {
     }
 }
 
+/// Namespace-level budget policy returned by the management API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct BudgetPolicy {
+    /// Namespace governed by this policy.
     pub namespace: String,
+    /// Period rollover strategy.
     pub cadence: BudgetCadence,
+    /// Budget limit in microdollars.
     pub limit_microdollars: u64,
+    /// IANA timezone used for monthly period derivation.
     pub timezone: String,
+    /// Period currently used for admission and charging.
     pub period: String,
+    /// Settled spend in the current period.
     pub spent_microdollars: u64,
+    /// Reserved spend in the current period.
     pub reserved_microdollars: u64,
+    /// Saturating limit minus spent and reserved spend.
     pub remaining_microdollars: u64,
+    /// Whether this policy period is currently active.
     pub active: bool,
 }
 
+/// Clock used to derive cadence periods.
 pub trait BudgetClock: Send + Sync {
+    /// Return the current instant.
     fn now(&self) -> Timestamp;
 }
 
+/// Production wall clock for cadence period derivation.
 pub struct SystemClock;
 
 impl BudgetClock for SystemClock {
@@ -85,6 +104,7 @@ impl BudgetClock for SystemClock {
 }
 
 #[cfg(test)]
+/// Test clock whose instant can be advanced at month boundaries.
 pub struct FixedClock(pub std::sync::Mutex<Timestamp>);
 
 #[cfg(test)]
@@ -101,11 +121,13 @@ impl BudgetClock for FixedClock {
     }
 }
 
+/// Resolve an IANA timezone or return a typed validation error.
 pub fn validate_timezone(name: &str) -> Result<jiff::tz::TimeZone, StoreError> {
     jiff::tz::TimeZone::get(name)
         .map_err(|_| StoreError::Invalid(format!("unknown timezone `{name}`")))
 }
 
+/// Format the instant as the `YYYY-MM` period in the given timezone.
 pub fn monthly_period_key(now: Timestamp, tz: &jiff::tz::TimeZone) -> String {
     let zoned = now.to_zoned(tz.clone());
     format!("{:04}-{:02}", zoned.year(), zoned.month())
@@ -325,22 +347,14 @@ pub trait Store: Send + Sync {
 
     async fn put_budget_policy(
         &self,
-        _: &str,
-        _: BudgetCadence,
-        _: u64,
-        _: &str,
-        _: Option<&str>,
-    ) -> Result<BudgetPolicy, StoreError> {
-        Err(StoreError::Unavailable(
-            "cadence budgets are unsupported".into(),
-        ))
-    }
+        namespace: &str,
+        cadence: BudgetCadence,
+        limit_microdollars: u64,
+        timezone: &str,
+        fixed_period: Option<&str>,
+    ) -> Result<BudgetPolicy, StoreError>;
 
-    async fn get_budget_policy(&self, _: &str) -> Result<Option<BudgetPolicy>, StoreError> {
-        Err(StoreError::Unavailable(
-            "cadence budgets are unsupported".into(),
-        ))
-    }
+    async fn get_budget_policy(&self, namespace: &str) -> Result<Option<BudgetPolicy>, StoreError>;
 
     /// Read-only: does the active period have room (`spent < limit`)?
     /// No budget row is [`BudgetAdmit::Exceeded`] (fail closed). Does not
@@ -642,7 +656,7 @@ pub(crate) fn from_sql_amount(value: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{sync::Mutex, time::Duration};
 
     #[test]
     fn monthly_period_key_respects_timezone_boundaries() {
@@ -664,8 +678,6 @@ mod tests {
             Err(StoreError::Invalid(_))
         ));
     }
-    use std::time::Duration;
-
     #[test]
     fn sql_amount_rejects_unrepresentable_limit() {
         assert!(sql_amount(u64::MAX).is_err());
@@ -2053,10 +2065,6 @@ mod tests {
             .batch_execute(include_str!("../../sql/store_namespace_incarnation_v1.sql"))
             .await
             .expect("incarnation v1");
-        setup
-            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
-            .await
-            .expect("provider models");
         let store = PostgresStore::connect(&scoped, false)
             .await
             .expect("connect false after draft rename");
