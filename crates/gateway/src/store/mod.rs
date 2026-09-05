@@ -69,14 +69,10 @@ impl BudgetRecord {
             spent_microdollars,
             // Holds are gone (ADR 0064). Field stays on the wire as zero.
             reserved_microdollars: 0,
-            remaining_microdollars: remaining(limit_microdollars, spent_microdollars, 0),
+            remaining_microdollars: limit_microdollars.saturating_sub(spent_microdollars),
             active,
         }
     }
-}
-
-pub fn remaining(limit: u64, spent: u64, reserved: u64) -> u64 {
-    limit.saturating_sub(spent).saturating_sub(reserved)
 }
 
 /// One usage event as the Store indexes it for `GET .../usage`.
@@ -858,7 +854,13 @@ mod tests {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 10_000).await.expect("put");
-        store.admit_budget("wsp_x").await.expect("hold");
+        let BudgetAdmit::Allowed {
+            period,
+            incarnation,
+        } = store.admit_budget("wsp_x").await.expect("admit")
+        else {
+            panic!("budget has room");
+        };
         assert!(store.delete_namespace("wsp_x").await.expect("delete"));
         seeded(&store).await;
         let rec = store
@@ -868,7 +870,7 @@ mod tests {
         assert_eq!(rec.spent_microdollars, 0);
         assert_eq!(rec.reserved_microdollars, 0);
         store
-            .charge_budget("wsp_x", "p", 1, 77)
+            .charge_budget("wsp_x", &period, incarnation, 77)
             .await
             .expect("late settle");
         let got = store
@@ -878,64 +880,24 @@ mod tests {
             .expect("row");
         assert_eq!(got.spent_microdollars, 0);
         assert_eq!(got.reserved_microdollars, 0);
-    }
-
-    #[tokio::test]
-    async fn sqlite_delete_recreate_expires_any_incarnation_hold() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        seeded(&store).await;
-        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
-        store.admit_budget("wsp_x").await.expect("hold");
-        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        seeded(&store).await;
+        let BudgetAdmit::Allowed {
+            period,
+            incarnation: current,
+        } = store.admit_budget("wsp_x").await.expect("admit recreated")
+        else {
+            panic!("recreated budget has room");
+        };
+        assert_ne!(current, incarnation);
         store
-            .put_budget("wsp_x", "p", 10_000)
+            .charge_budget("wsp_x", &period, current, 11)
             .await
-            .expect("recreate");
-        match store.admit_budget("wsp_x").await.expect("expire path") {
-            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
-            other => panic!("{other:?}"),
-        }
-        store
-            .charge_budget("wsp_x", "p", 1, 10)
-            .await
-            .expect("late settle after TTL");
+            .expect("current charge");
         let got = store
-            .get_budget("wsp_x", "p")
+            .get_budget("wsp_x", &period)
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 0);
-    }
-
-    #[tokio::test]
-    async fn sqlite_late_settle_after_two_reserves_still_charges_this_incarnation() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        seeded(&store).await;
-        store.put_budget("wsp_x", "p", 10_000).await.expect("put");
-        store.admit_budget("wsp_x").await.expect("hold");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        match store.admit_budget("wsp_x").await.expect("second") {
-            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
-            other => panic!("{other:?}"),
-        }
-        match store.admit_budget("wsp_x").await.expect("third") {
-            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
-            other => panic!("{other:?}"),
-        }
-        store
-            .charge_budget("wsp_x", "p", 1, 40)
-            .await
-            .expect("late settle");
-        let got = store
-            .get_budget("wsp_x", "p")
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(got.spent_microdollars, 40);
-        assert_eq!(got.reserved_microdollars, 0);
+        assert_eq!(got.spent_microdollars, 11);
     }
 
     #[tokio::test]
@@ -992,7 +954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_settle_saturates_oversized_actual_and_releases_the_hold() {
+    async fn sqlite_charge_saturates_oversized_actual() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         seeded(&store).await;
         store.put_budget("wsp_x", "p", 10_000).await.expect("put");
@@ -1022,31 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_expired_hold_does_not_block_and_later_settle_still_charges() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        seeded(&store).await;
-        store.put_budget("wsp_x", "p", 100).await.expect("put");
-        store.admit_budget("wsp_x").await.expect("hold");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        match store.admit_budget("wsp_x").await.expect("after expiry") {
-            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
-            other => panic!("{other:?}"),
-        }
-        store
-            .charge_budget("wsp_x", "p", 1, 11)
-            .await
-            .expect("late settle");
-        let got = store
-            .get_budget("wsp_x", "p")
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(got.spent_microdollars, 11);
-        assert_eq!(got.reserved_microdollars, 0);
-    }
-
-    #[tokio::test]
-    async fn postgres_two_connections_cannot_both_reserve_the_last_dollar() {
+    async fn postgres_two_connections_can_both_admit_before_charge() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
@@ -1306,41 +1244,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_delete_recreate_expires_any_incarnation_hold() {
-        let Some(dsn) = crate::test_services::postgres_dsn() else {
-            return;
-        };
-        let (store, ns) = postgres_seeded(&dsn).await;
-        store.put_budget(&ns, "p", 10_000).await.expect("put");
-        store.admit_budget(&ns).await.expect("hold");
-        assert!(store.delete_namespace(&ns).await.expect("delete"));
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        store
-            .put_namespace(NamespaceRecord {
-                id: ns.clone(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("recreate");
-        store
-            .put_budget(&ns, "p", 10_000)
-            .await
-            .expect("new ledger");
-        match store.admit_budget(&ns).await.expect("expire path") {
-            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
-            other => panic!("{other:?}"),
-        }
-        store
-            .charge_budget(&ns, "p", 1, 10)
-            .await
-            .expect("late settle after TTL");
-        let got = store.get_budget(&ns, "p").await.expect("get").expect("row");
-        assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 0);
-    }
-
-    #[tokio::test]
     async fn postgres_expired_tombstone_is_not_vacuumed_on_admit() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
@@ -1407,7 +1310,6 @@ mod tests {
             .await
             .expect("second client");
         a.put_budget(&ns, "p", 10_000).await.expect("put");
-        let _rid = format!("once_{ns}");
         match a.admit_budget(&ns).await.expect("hold") {
             BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "p"),
             other => panic!("{other:?}"),
@@ -1469,15 +1371,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_put_races_reserve_and_settle_without_deadlock() {
+    async fn postgres_put_races_admit_and_charge_without_deadlock() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
         let (putter, ns) = postgres_seeded(&dsn).await;
         putter.put_budget(&ns, "p", 10_000).await.expect("budget");
-        let reserver = PostgresStore::connect(&dsn, true).await.expect("connect b");
+        let charger = PostgresStore::connect(&dsn, true).await.expect("connect b");
         let ns_put = ns.clone();
-        let ns_res = ns.clone();
+        let ns_charge = ns.clone();
         let raced = tokio::time::timeout(Duration::from_secs(10), async move {
             let puts = tokio::spawn(async move {
                 for i in 0..80u64 {
@@ -1487,30 +1389,32 @@ mod tests {
                         .expect("put");
                 }
             });
-            let holds = tokio::spawn(async move {
-                for i in 0..80 {
-                    let _id = format!("r{i}");
-                    match reserver.admit_budget(&ns_res).await.expect("reserve") {
-                        BudgetAdmit::Allowed { period, .. } => {
+            let charges = tokio::spawn(async move {
+                for _ in 0..80 {
+                    match charger.admit_budget(&ns_charge).await.expect("admit") {
+                        BudgetAdmit::Allowed {
+                            period,
+                            incarnation,
+                        } => {
                             assert_eq!(period, "p");
-                            reserver
-                                .charge_budget(&ns_res, "p", 1, 1)
+                            charger
+                                .charge_budget(&ns_charge, &period, incarnation, 1)
                                 .await
-                                .expect("settle");
+                                .expect("charge");
                         }
                         BudgetAdmit::Exceeded => {}
                     }
                 }
             });
             puts.await.expect("put join");
-            holds.await.expect("hold join");
+            charges.await.expect("charge join");
         })
         .await;
-        assert!(raced.is_ok(), "PUT vs reserve/settle deadlocked");
+        assert!(raced.is_ok(), "PUT vs admit/charge deadlocked");
     }
 
     #[tokio::test]
-    async fn postgres_get_does_not_mix_spend_and_reserved_across_a_settlement() {
+    async fn postgres_get_returns_consistent_spend_and_remaining_during_charge() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
@@ -1538,11 +1442,7 @@ mod tests {
         for rec in samples {
             assert_eq!(
                 rec.remaining_microdollars,
-                remaining(
-                    rec.limit_microdollars,
-                    rec.spent_microdollars,
-                    rec.reserved_microdollars
-                )
+                rec.limit_microdollars - rec.spent_microdollars
             );
             assert!(
                 rec.spent_microdollars == 0 || rec.spent_microdollars == 60,
@@ -1581,14 +1481,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_reserve_expires_holds_from_old_periods() {
+    async fn postgres_admit_uses_the_new_active_period_without_holds() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
         let (store, ns) = postgres_seeded(&dsn).await;
         store.put_budget(&ns, "old", 10_000).await.expect("old");
-        store.admit_budget(&ns).await.expect("stale");
-        tokio::time::sleep(Duration::from_millis(5)).await;
         store.put_budget(&ns, "new", 10_000).await.expect("new");
         match store.admit_budget(&ns).await.expect("live") {
             BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "new"),
@@ -1602,7 +1500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_denied_reserve_still_drops_expired_holds() {
+    async fn postgres_admit_at_cap_is_denied_without_holds() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };

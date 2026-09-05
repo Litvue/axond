@@ -527,15 +527,8 @@ impl Store for SqliteStore {
         let namespace = namespace.to_string();
         let period = period.to_string();
         let actual = sql_amount_saturating(actual_microdollars);
-        self.with_conn(move |conn| {
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(unavailable)?;
-            charge_budget_on(&tx, &namespace, &period, incarnation, actual)?;
-            tx.commit().map_err(unavailable)?;
-            Ok(())
-        })
-        .await
+        self.with_conn(move |conn| charge_budget_on(conn, &namespace, &period, incarnation, actual))
+            .await
     }
 
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
@@ -875,7 +868,6 @@ fn read_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn corrupt_attrs_are_unavailable() {
@@ -974,69 +966,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserve_expires_old_period_holds_for_the_namespace() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_x".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("ns");
-        store.put_budget("wsp_x", "old", 10_000).await.expect("old");
-        store.admit_budget("wsp_x").await.expect("stale hold");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        store.put_budget("wsp_x", "new", 10_000).await.expect("new");
-        match store.admit_budget("wsp_x").await.expect("live") {
-            BudgetAdmit::Allowed { period, .. } => assert_eq!(period, "new"),
-            other => panic!("{other:?}"),
-        }
-        let n: i64 = {
-            let conn = store.conn.lock().expect("lock");
-            conn.query_row(
-                "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count")
-        };
-        assert_eq!(n, 0, "admit does not write reservation rows");
-    }
-
-    #[tokio::test]
-    async fn denied_reserve_still_drops_expired_holds() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_x".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("ns");
-        store.put_budget("wsp_x", "p", 100).await.expect("budget");
-        store
-            .charge_budget("wsp_x", "p", 1, 100)
-            .await
-            .expect("fill");
-        assert!(matches!(
-            store.admit_budget("wsp_x").await.expect("at cap"),
-            BudgetAdmit::Exceeded
-        ));
-        let n: i64 = {
-            let conn = store.conn.lock().expect("lock");
-            conn.query_row(
-                "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count")
-        };
-        assert_eq!(n, 0, "admit does not write reservation rows");
-    }
-
-    #[tokio::test]
     async fn delete_drops_budget_tables_and_keeps_usage_rows() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         store
@@ -1126,207 +1055,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settle_after_recreate_does_not_charge_new_budget() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_x".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("ns");
-        store
-            .put_budget("wsp_x", "p", 10_000)
-            .await
-            .expect("budget");
-        store.admit_budget("wsp_x").await.expect("hold");
-        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_x".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("recreate");
-        let rec = store
-            .put_budget("wsp_x", "p", 10_000)
-            .await
-            .expect("new ledger");
-        assert_eq!(rec.spent_microdollars, 0);
-        assert_eq!(rec.reserved_microdollars, 0);
-        store
-            .charge_budget("wsp_x", "p", 1, 77)
-            .await
-            .expect("late settle");
-        let got = store
-            .get_budget("wsp_x", "p")
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 0);
-        let holds: i64 = {
-            let conn = store.conn.lock().expect("lock");
-            conn.query_row(
-                "SELECT count(*) FROM axond_store_budget_reservation WHERE id = 'r1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count")
-        };
-        assert_eq!(holds, 0, "old hold is dropped even when spend is skipped");
-    }
-
-    #[tokio::test]
-    async fn reserve_reclaims_expired_holds_of_any_incarnation() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_x".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("ns");
-        store
-            .put_budget("wsp_x", "p", 10_000)
-            .await
-            .expect("budget");
-        store.admit_budget("wsp_x").await.expect("hold");
-        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_x".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("recreate");
-        store
-            .put_budget("wsp_x", "p", 10_000)
-            .await
-            .expect("new ledger");
-        store.admit_budget("wsp_x").await.expect("expire path");
-        let (old, n): (i64, i64) = {
-            let conn = store.conn.lock().expect("lock");
-            let count = |sql: &str| conn.query_row(sql, [], |row| row.get(0)).expect("count");
-            (
-                count("SELECT count(*) FROM axond_store_budget_reservation WHERE id = 'old'"),
-                count(
-                    "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
-                ),
-            )
-        };
-        assert_eq!(old, 0);
-        assert_eq!(n, 0, "admit does not write reservation rows");
-        store
-            .charge_budget("wsp_x", "p", 1, 10)
-            .await
-            .expect("late settle");
-        let got = store
-            .get_budget("wsp_x", "p")
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 0);
-    }
-
-    #[tokio::test]
-    async fn unexpired_prior_incarnation_hold_survives_reserve() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_x".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("ns");
-        store
-            .put_budget("wsp_x", "p", 10_000)
-            .await
-            .expect("budget");
-        store.admit_budget("wsp_x").await.expect("hold");
-        assert!(store.delete_namespace("wsp_x").await.expect("delete"));
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_x".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("recreate");
-        store
-            .put_budget("wsp_x", "p", 10_000)
-            .await
-            .expect("new ledger");
-        store.admit_budget("wsp_x").await.expect("live hold");
-        let n: i64 = {
-            let conn = store.conn.lock().expect("lock");
-            conn.query_row(
-                "SELECT count(*) FROM axond_store_budget_reservation WHERE namespace = 'wsp_x'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count")
-        };
-        assert_eq!(n, 0, "admit does not write reservation rows");
-        store
-            .charge_budget("wsp_x", "p", 1, 10)
-            .await
-            .expect("late settle");
-        let got = store
-            .get_budget("wsp_x", "p")
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 0);
-    }
-
-    #[tokio::test]
-    async fn unknown_reservation_settle_is_a_noop() {
-        let store = SqliteStore::open(":memory:").expect("memory sqlite");
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_x".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("ns");
-        store
-            .put_budget("wsp_x", "p", 10_000)
-            .await
-            .expect("budget");
-        store.admit_budget("wsp_x").await.expect("hold");
-        {
-            let conn = store.conn.lock().expect("lock");
-            conn.execute(
-                "DELETE FROM axond_store_budget_reservation WHERE id = 'r1'",
-                [],
-            )
-            .expect("drop hold");
-        }
-        store
-            .charge_budget("wsp_x", "p", 99, 11)
-            .await
-            .expect("wrong incarnation");
-        let got = store
-            .get_budget("wsp_x", "p")
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(got.spent_microdollars, 0);
-        assert_eq!(got.reserved_microdollars, 0);
-    }
-
-    #[tokio::test]
-    async fn expired_tombstone_is_not_vacuumed_on_admit() {
+    async fn admission_is_read_only_and_leaves_legacy_tombstones_untouched() {
         let store = SqliteStore::open(":memory:").expect("memory sqlite");
         store
             .put_namespace(NamespaceRecord {
@@ -1348,10 +1077,21 @@ mod tests {
                 [],
             )
             .expect("past tombstone");
+            conn.execute_batch("PRAGMA query_only = ON")
+                .expect("read only");
         }
-        store.admit_budget("wsp_x").await.expect("reserve vacuums");
+        let admit = store.admit_budget("wsp_x").await.expect("read-only admit");
+        assert!(matches!(admit, BudgetAdmit::Allowed { .. }));
+        let resolved = store
+            .resolve_namespace("wsp_x")
+            .await
+            .expect("read-only resolve")
+            .expect("namespace");
+        assert_eq!(resolved.admit, admit);
         let leftover: i64 = {
             let conn = store.conn.lock().expect("lock");
+            conn.execute_batch("PRAGMA query_only = OFF")
+                .expect("writable");
             conn.query_row(
                 "SELECT count(*) FROM axond_store_budget_reservation_tombstone
                  WHERE id = 'stale'",

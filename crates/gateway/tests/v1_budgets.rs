@@ -198,26 +198,22 @@ async fn in_flight_does_not_hold_cancel_charges_consumed() {
     }
     assert!(saw_body, "stream produced no bytes to cancel");
     drop(stream);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let got = get_budget(&http, &gateway, "wsp_hold", "p").await;
-        if got["reserved_microdollars"].as_u64() == Some(0)
-            && got["spent_microdollars"].as_u64().unwrap_or(0) > 0
-        {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("charge never landed: {got}");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
+    // Accounting charges before publishing usage, so both records are the
+    // completion signal. A nonzero balance alone could be just the concurrent
+    // buffered request and would not prove the cancelled stream was charged.
     let records = gateway.await_usage_records(2).await;
     let cancelled = records
         .iter()
         .find(|record| record["status"] == json!("client_cancelled"))
         .expect("cancelled usage");
     assert!(cancelled["cost_microdollars"].as_u64().unwrap_or(0) > 0);
+    let charged: u64 = records
+        .iter()
+        .map(|record| record["cost_microdollars"].as_u64().expect("priced usage"))
+        .sum();
+    let got = get_budget(&http, &gateway, "wsp_hold", "p").await;
+    assert_eq!(got["spent_microdollars"], json!(charged));
+    assert_eq!(got["reserved_microdollars"], json!(0));
 }
 
 #[tokio::test]
