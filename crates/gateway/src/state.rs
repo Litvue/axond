@@ -2221,6 +2221,22 @@ namespace = "platform"
         ) -> Result<Option<crate::store::BudgetRecord>, StoreError> {
             Ok(None)
         }
+        async fn put_budget_policy(
+            &self,
+            _: &str,
+            _: crate::store::BudgetCadence,
+            _: u64,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<crate::store::BudgetPolicy, StoreError> {
+            Err(StoreError::Unavailable("down".into()))
+        }
+        async fn get_budget_policy(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::store::BudgetPolicy>, StoreError> {
+            Err(StoreError::Unavailable("down".into()))
+        }
         async fn admit_budget(&self, _: &str) -> Result<crate::store::BudgetAdmit, StoreError> {
             Err(StoreError::Unavailable("unused".into()))
         }

@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
@@ -32,6 +33,83 @@ pub const MAX_ATTRS_BYTES: usize = 4 * 1024;
 
 /// Opaque billing-period keys share the namespace id charset and bound.
 pub const MAX_PERIOD_LEN: usize = 128;
+pub const DEFAULT_TIMEZONE: &str = "UTC";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetCadence {
+    Monthly,
+    Fixed,
+}
+
+impl BudgetCadence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Monthly => "monthly",
+            Self::Fixed => "fixed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "monthly" => Some(Self::Monthly),
+            "fixed" => Some(Self::Fixed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BudgetPolicy {
+    pub namespace: String,
+    pub cadence: BudgetCadence,
+    pub limit_microdollars: u64,
+    pub timezone: String,
+    pub period: String,
+    pub spent_microdollars: u64,
+    pub reserved_microdollars: u64,
+    pub remaining_microdollars: u64,
+    pub active: bool,
+}
+
+pub trait BudgetClock: Send + Sync {
+    fn now(&self) -> Timestamp;
+}
+
+pub struct SystemClock;
+
+impl BudgetClock for SystemClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
+    }
+}
+
+#[cfg(test)]
+pub struct FixedClock(pub std::sync::Mutex<Timestamp>);
+
+#[cfg(test)]
+impl FixedClock {
+    pub fn set(&self, timestamp: Timestamp) {
+        *self.0.lock().expect("clock lock") = timestamp;
+    }
+}
+
+#[cfg(test)]
+impl BudgetClock for FixedClock {
+    fn now(&self) -> Timestamp {
+        *self.0.lock().expect("clock lock")
+    }
+}
+
+pub fn validate_timezone(name: &str) -> Result<jiff::tz::TimeZone, StoreError> {
+    jiff::tz::TimeZone::get(name)
+        .map_err(|_| StoreError::Invalid(format!("unknown timezone `{name}`")))
+}
+
+pub fn monthly_period_key(now: Timestamp, tz: &jiff::tz::TimeZone) -> String {
+    let zoned = now.to_zoned(tz.clone());
+    format!("{:04}-{:02}", zoned.year(), zoned.month())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct NamespaceRecord {
@@ -245,6 +323,25 @@ pub trait Store: Send + Sync {
         period: &str,
     ) -> Result<Option<BudgetRecord>, StoreError>;
 
+    async fn put_budget_policy(
+        &self,
+        _: &str,
+        _: BudgetCadence,
+        _: u64,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<BudgetPolicy, StoreError> {
+        Err(StoreError::Unavailable(
+            "cadence budgets are unsupported".into(),
+        ))
+    }
+
+    async fn get_budget_policy(&self, _: &str) -> Result<Option<BudgetPolicy>, StoreError> {
+        Err(StoreError::Unavailable(
+            "cadence budgets are unsupported".into(),
+        ))
+    }
+
     /// Read-only: does the active period have room (`spent < limit`)?
     /// No budget row is [`BudgetAdmit::Exceeded`] (fail closed). Does not
     /// write a hold.
@@ -379,6 +476,19 @@ impl Store for UnavailableStore {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn get_budget(&self, _: &str, _: &str) -> Result<Option<BudgetRecord>, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn put_budget_policy(
+        &self,
+        _: &str,
+        _: BudgetCadence,
+        _: u64,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<BudgetPolicy, StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn get_budget_policy(&self, _: &str) -> Result<Option<BudgetPolicy>, StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn admit_budget(&self, _: &str) -> Result<BudgetAdmit, StoreError> {
@@ -532,6 +642,28 @@ pub(crate) fn from_sql_amount(value: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn monthly_period_key_respects_timezone_boundaries() {
+        let utc = validate_timezone("UTC").expect("UTC");
+        let auckland = validate_timezone("Pacific/Auckland").expect("Auckland");
+        let los_angeles = validate_timezone("America/Los_Angeles").expect("Los Angeles");
+        let september = "2026-09-30T23:30:00Z".parse().expect("timestamp");
+        assert_eq!(monthly_period_key(september, &utc), "2026-09");
+        assert_eq!(monthly_period_key(september, &auckland), "2026-10");
+        let october = "2026-10-01T03:00:00Z".parse().expect("timestamp");
+        assert_eq!(monthly_period_key(october, &utc), "2026-10");
+        assert_eq!(monthly_period_key(october, &los_angeles), "2026-09");
+        let new_year = "2026-12-31T23:59:59Z".parse().expect("timestamp");
+        assert_eq!(monthly_period_key(new_year, &utc), "2026-12");
+        let next_year = "2027-01-01T00:00:00Z".parse().expect("timestamp");
+        assert_eq!(monthly_period_key(next_year, &utc), "2027-01");
+        assert!(matches!(
+            validate_timezone("Mars/Olympus"),
+            Err(StoreError::Invalid(_))
+        ));
+    }
     use std::time::Duration;
 
     #[test]
@@ -1028,6 +1160,51 @@ mod tests {
             (2, 0),
             "admit is a spent read; both replicas pass before anyone charges: {results:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_monthly_first_request_race_creates_one_row() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let ns = unique_ns("wsp_monthly_race");
+        let clock = Arc::new(FixedClock(Mutex::new(
+            "2026-09-30T23:30:00Z".parse().expect("timestamp"),
+        )));
+        let a = PostgresStore::connect(&dsn, true)
+            .await
+            .expect("connect a")
+            .with_clock(Arc::clone(&clock) as Arc<dyn BudgetClock>);
+        let b = PostgresStore::connect(&dsn, true)
+            .await
+            .expect("connect b")
+            .with_clock(Arc::clone(&clock) as Arc<dyn BudgetClock>);
+        a.put_namespace(NamespaceRecord {
+            id: ns.clone(),
+            attrs: serde_json::json!({}),
+            blocklist: None,
+        })
+        .await
+        .expect("namespace");
+        a.put_budget_policy(&ns, BudgetCadence::Monthly, 1_000, "UTC", None)
+            .await
+            .expect("policy");
+        let first = tokio::spawn({
+            let ns = ns.clone();
+            async move { a.admit_budget(&ns).await }
+        });
+        let second = tokio::spawn({
+            let ns = ns.clone();
+            async move { b.admit_budget(&ns).await }
+        });
+        let results = [first.await.expect("join a"), second.await.expect("join b")];
+        assert!(results.iter().all(
+            |result| matches!(result, Ok(BudgetAdmit::Allowed { period, .. }) if period == "2026-09")
+        ));
+        let check = PostgresStore::connect(&dsn, false).await.expect("check");
+        let count = check.budget_row_count(&ns, "2026-09").await.expect("count");
+        assert_eq!(count, 1);
+        check.delete_namespace(&ns).await.expect("delete");
     }
 
     fn unique_ns(prefix: &str) -> String {
@@ -1545,6 +1722,10 @@ mod tests {
             ))
             .await
             .expect("schema");
+        setup
+            .batch_execute(include_str!("../../sql/store_budget_cadence_v1.sql"))
+            .await
+            .expect("cadence schema");
         let sep = if dsn.contains('?') { '&' } else { '?' };
         (format!("{dsn}{sep}options=-csearch_path%3D{schema}"), setup)
     }
@@ -1872,6 +2053,10 @@ mod tests {
             .batch_execute(include_str!("../../sql/store_namespace_incarnation_v1.sql"))
             .await
             .expect("incarnation v1");
+        setup
+            .batch_execute(include_str!("../../sql/store_provider_models_v1.sql"))
+            .await
+            .expect("provider models");
         let store = PostgresStore::connect(&scoped, false)
             .await
             .expect("connect false after draft rename");
