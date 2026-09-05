@@ -338,29 +338,18 @@ pub fn binary_meta_at_with_version_fallback(
 
 #[cfg(all(test, unix))]
 mod binary_meta_tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
 
     #[test]
     fn a_checksum_pinned_legacy_binary_may_lack_version_self_report() {
-        let directory =
-            std::env::temp_dir().join(format!("axond-legacy-binary-meta-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).expect("the test directory is writable");
-        let binary = directory.join("axond-v0.3.40");
-        std::fs::write(&binary, "#!/bin/sh\nexit 2\n").expect("the test executable is written");
-        let mut permissions = std::fs::metadata(&binary)
-            .expect("the test executable exists")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&binary, permissions).expect("the test executable is runnable");
+        // Libtest rejects --version. Reuse its already-built executable so the
+        // fallback test never races execution against a temporary-file write.
+        let binary = std::env::current_exe().expect("the test executable exists");
 
         let metadata = binary_meta_at_with_version_fallback(&binary, Some("0.3.40"));
         assert_eq!(metadata.version, "0.3.40");
         assert_eq!(metadata.path, binary.display().to_string());
         assert_eq!(metadata.sha256.len(), 64);
-
-        std::fs::remove_dir_all(directory).expect("the test directory is removable");
     }
 }
 

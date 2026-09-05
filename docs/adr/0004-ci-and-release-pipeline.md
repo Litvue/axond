@@ -102,6 +102,35 @@ dirty worktree — and the signing identity is pinned to this workflow on
 - The pipeline currently publishes a single `linux/amd64` image; multi-arch is a
   later addition, not a rewrite.
 
+## Amendment (2026-09-04): separate PR checks from artifact qualification
+
+Every pull request runs Format, Clippy, locked workspace tests, fuzz smoke,
+the Python SDK compatibility lane, documentation/drift checks, and workflow
+policy. Dependency policy runs when a lockfile, dependency manifest, deny
+configuration, or the CI workflow changes. The test job runs
+`cargo test --workspace --locked`; the release-profile fault rebuild has its
+own job.
+
+Pushes to `main`, `v*` tags, and `merge_group` events run that subset plus the
+full artifact bar: static musl, every published binary target's smoke,
+Docker and Compose smokes, the three-node rollout, OpenAPI and TypeScript SDK
+compatibility, release fault qualification and fresh evidence checks,
+crates.io packaging, cosign format, MSRV, build, public API compatibility,
+and Rust documentation. Dependency policy always runs on these events.
+Manual runs use the same bar, with the existing explicit opt-in for legacy
+Postgres overlay drills.
+
+`CI Success` remains the single branch-protection check. It requires success
+from every lane selected for the event, and accepts skipped jobs only where
+this split deliberately excludes them. Missing jobs, failed change detection,
+cancellations, and unexpected skips fail the gate. Only PR runs cancel an
+older run on a new push; main and release qualification are allowed to finish.
+
+The release workflow still boots the exact binaries and images it publishes
+before signing or attesting them. This amendment changes contributor wait
+time, not the evidence attached to a GitHub Release. It adds no runtime state
+or storage requirement.
+
 ## Amendment (2026-08-12): ARM64 archives and a multi-architecture image
 
 The original decision left multi-arch as "a later addition, not a rewrite". This

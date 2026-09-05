@@ -537,6 +537,15 @@ already converged onto.
 
 ## 5. Persistence, migrations, telemetry, and usage
 
+Provider failure diagnostics on attempt spans are bounded to 4 KiB and omit
+the known outbound API key before truncation. The gateway does not attach
+request or successful-response bodies, but provider error messages can echo
+caller input; trace access is therefore diagnostic-data access. The regression
+`provider_refusals_keep_their_class_and_export_bounded_attempt_diagnostics`
+checks actual upstream status, error classification, OpenTelemetry error
+status, the UTF-8 byte bound, and credential omission across buffered and
+streamed OpenAI and Anthropic calls.
+
 **Fires on** any change to durable shape or emitted data: files under
 `ops/postgres/` or `crates/gateway/sql/`, the sinks and row shapes in
 `crates/gateway/src/usage/`, the control-plane journal and revision schema, span
