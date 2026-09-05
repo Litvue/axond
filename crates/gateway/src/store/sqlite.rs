@@ -886,6 +886,9 @@ fn admit_monthly(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(unavailable)?;
+    if !namespace_exists(&tx, namespace)? {
+        return Ok(BudgetAdmit::Exceeded);
+    }
     tx.execute(
         "INSERT OR IGNORE INTO axond_store_budget
             (namespace, period, limit_microdollars, spent_microdollars)
@@ -1359,6 +1362,69 @@ mod tests {
             )
             .expect("count");
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_first_monthly_admission_racing_delete_leaves_no_rows() {
+        let (store, _) = cadence_store();
+        let store = Arc::new(store);
+        for attempt in 0..5 {
+            let ns = format!("monthly_delete_race_{attempt}");
+            add_namespace(&store, &ns).await;
+            store
+                .put_budget_policy(&ns, BudgetCadence::Monthly, 1_000, "UTC", None)
+                .await
+                .expect("policy");
+            {
+                let conn = store.conn.lock().expect("lock");
+                conn.execute(
+                    "DELETE FROM axond_store_budget
+                     WHERE namespace = ?1 AND period = ?2",
+                    params![ns, "2026-09"],
+                )
+                .expect("remove current row");
+            }
+            let admit_store = Arc::clone(&store);
+            let delete_store = Arc::clone(&store);
+            let admit_ns = ns.clone();
+            let delete_ns = ns.clone();
+            let (admit, deleted) = tokio::join!(
+                tokio::spawn(async move { admit_store.admit_budget(&admit_ns).await }),
+                tokio::spawn(async move { delete_store.delete_namespace(&delete_ns).await }),
+            );
+            let admit = admit.expect("admit task");
+            assert!(
+                matches!(
+                    admit,
+                    Ok(BudgetAdmit::Allowed { .. } | BudgetAdmit::Exceeded)
+                ),
+                "unexpected admit result: {admit:?}"
+            );
+            assert!(deleted.expect("delete task").expect("delete"));
+            let (budget_rows, cadence_rows) = {
+                let conn = store.conn.lock().expect("lock");
+                let budget_rows: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM axond_store_budget
+                         WHERE namespace = ?1 AND period = ?2",
+                        params![ns, "2026-09"],
+                        |row| row.get(0),
+                    )
+                    .expect("budget count");
+                let cadence_rows: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM axond_store_budget_cadence
+                         WHERE namespace = ?1",
+                        params![ns],
+                        |row| row.get(0),
+                    )
+                    .expect("cadence count");
+                (budget_rows, cadence_rows)
+            };
+            assert_eq!(budget_rows, 0);
+            assert_eq!(cadence_rows, 0);
+            assert!(store.get_namespace(&ns).await.expect("namespace").is_none());
+        }
     }
 
     #[tokio::test]

@@ -1219,6 +1219,70 @@ mod tests {
         check.delete_namespace(&ns).await.expect("delete");
     }
 
+    #[tokio::test]
+    async fn postgres_first_monthly_admission_racing_delete_leaves_no_rows() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let clock = Arc::new(FixedClock(Mutex::new(
+            "2026-09-30T23:30:00Z".parse().expect("timestamp"),
+        )));
+        for _ in 0..5 {
+            let ns = unique_ns("wsp_monthly_delete_race");
+            let a = PostgresStore::connect(&dsn, true)
+                .await
+                .expect("connect a")
+                .with_clock(Arc::clone(&clock) as Arc<dyn BudgetClock>);
+            let b = PostgresStore::connect(&dsn, true)
+                .await
+                .expect("connect b")
+                .with_clock(Arc::clone(&clock) as Arc<dyn BudgetClock>);
+            a.put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("namespace");
+            a.put_budget_policy(&ns, BudgetCadence::Monthly, 1_000, "UTC", None)
+                .await
+                .expect("policy");
+            a.delete_budget_row(&ns, "2026-09")
+                .await
+                .expect("remove current row");
+            let admit = tokio::spawn({
+                let ns = ns.clone();
+                async move { a.admit_budget(&ns).await }
+            });
+            let delete = tokio::spawn({
+                let ns = ns.clone();
+                async move { b.delete_namespace(&ns).await }
+            });
+            let admit = admit.await.expect("admit task");
+            assert!(
+                matches!(
+                    admit,
+                    Ok(BudgetAdmit::Allowed { .. } | BudgetAdmit::Exceeded)
+                ),
+                "unexpected admit result: {admit:?}"
+            );
+            assert!(delete.await.expect("delete task").expect("delete"));
+            let check = PostgresStore::connect(&dsn, false).await.expect("check");
+            assert_eq!(
+                check
+                    .budget_row_count(&ns, "2026-09")
+                    .await
+                    .expect("budget count"),
+                0
+            );
+            assert_eq!(
+                check.cadence_row_count(&ns).await.expect("cadence count"),
+                0
+            );
+            assert!(check.get_namespace(&ns).await.expect("namespace").is_none());
+        }
+    }
+
     fn unique_ns(prefix: &str) -> String {
         format!(
             "{prefix}_{}_{}",

@@ -1442,6 +1442,15 @@ async fn admit_monthly(
 
     let cadence_limit = cadence_limit
         .ok_or_else(|| StoreError::Unavailable("monthly cadence limit missing".into()))?;
+    lock_namespace_id(client, namespace).await?;
+    let namespace_exists = client
+        .query_opt("SELECT 1 FROM axond_namespace WHERE id = $1", &[&namespace])
+        .await
+        .map_err(|e| StoreError::Unavailable(e.to_string()))?
+        .is_some();
+    if !namespace_exists {
+        return Ok(BudgetAdmit::Exceeded);
+    }
     client
         .execute(
             "INSERT INTO axond_store_budget
@@ -1595,6 +1604,43 @@ impl PostgresStore {
                 .await
                 .map(|row| row.get(0))
                 .map_err(|error| StoreError::Unavailable(error.to_string()))
+        })
+        .await
+    }
+
+    pub(super) async fn cadence_row_count(&self, namespace: &str) -> Result<i64, StoreError> {
+        let namespace = namespace.to_owned();
+        self.with_client(async move |client| {
+            client
+                .query_one(
+                    "SELECT count(*)::bigint FROM axond_store_budget_cadence
+                     WHERE namespace = $1",
+                    &[&namespace],
+                )
+                .await
+                .map(|row| row.get(0))
+                .map_err(|error| StoreError::Unavailable(error.to_string()))
+        })
+        .await
+    }
+
+    pub(super) async fn delete_budget_row(
+        &self,
+        namespace: &str,
+        period: &str,
+    ) -> Result<(), StoreError> {
+        let namespace = namespace.to_owned();
+        let period = period.to_owned();
+        self.with_client(async move |client| {
+            client
+                .execute(
+                    "DELETE FROM axond_store_budget
+                     WHERE namespace = $1 AND period = $2",
+                    &[&namespace, &period],
+                )
+                .await
+                .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+            Ok(())
         })
         .await
     }
