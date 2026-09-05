@@ -2,7 +2,7 @@ services:
   axond:
     # Pull-first for evaluators. Development and CI add docker-compose.build.yml
     # to build the checked-out tree instead.
-    image: ${AXOND_IMAGE:-ghcr.io/litvue/axond:0.6.1} # x-release-please-version
+    image: ${AXOND_IMAGE:-ghcr.io/litvue/axond:0.6.2} # x-release-please-version
     # The pinned tag above is a multi-architecture index, so there is no default
     # pin: Docker resolves the native child on either architecture. An explicit
     # `linux/arm64`/`linux/amd64` forces one platform, emulated if the host

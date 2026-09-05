@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.2](https://github.com/Litvue/axond/compare/v0.6.1...v0.6.2) (2026-09-05)
+
+
+### Features
+
+* **website:** add favicon and social preview image ([#451](https://github.com/Litvue/axond/issues/451)) ([0ee4653](https://github.com/Litvue/axond/commit/0ee46539c89ef34bbd6431036d249d8b54c1c65c))
+* **website:** launch axond.dev with Astro and native installers ([#450](https://github.com/Litvue/axond/issues/450)) ([b99ac8d](https://github.com/Litvue/axond/commit/b99ac8d1e3425b59d5111d0c67a792b632950154))
+
 ## [0.6.1](https://github.com/Litvue/axond/compare/v0.6.0...v0.6.1) (2026-09-05)
 
 
