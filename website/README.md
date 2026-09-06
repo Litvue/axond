@@ -4,6 +4,9 @@ Static Astro 7 pages with plain CSS. No React, server runtime, or hosting adapte
 
 ## Local development
 
+Use Node 24, selected by `.nvmrc` for local development, GitHub CI, and
+Cloudflare Workers Builds.
+
 ```sh
 npm ci
 npm run dev -- --host 127.0.0.1 --port 3000
@@ -48,7 +51,7 @@ Connect the existing `axond-website` Worker to `Litvue/axond` in Cloudflare:
 - Root directory: `website`
 - Build command: `npm run check && npm run build`
 - Deploy command: `npx wrangler deploy`
-- Node version: `24` (set `NODE_VERSION` in build variables)
+- Node version: read from `.nvmrc`; remove a conflicting `NODE_VERSION` override
 - Build watch paths: `website/**`, `install.sh`, `install.ps1`
 
 Keep the full repository checkout: `prebuild` copies the root installers.
