@@ -24,6 +24,7 @@ REQUIRED_METHODS = {
     "/api/v1/namespaces": {"get", "post"},
     "/api/v1/namespaces/{ns}": {"get", "put", "delete"},
     "/api/v1/namespaces/{ns}/budgets/{period}": {"get", "put"},
+    "/api/v1/namespaces/{ns}/budget": {"get", "put"},
     "/api/v1/namespaces/{ns}/usage": {"get"},
     "/api/v1/providers/{id}/models": {"get"},
     "/api/v1/providers/models": {"get"},
@@ -126,6 +127,17 @@ def self_test() -> int:
     assert any(
         "missing DELETE" in f and "/api/v1/namespaces/{ns}" in f for f in found
     ), found
+
+    # The cadence policy route is distinct from an individual period ledger.
+    # Both methods must remain documented; arbitrary extra routes stay rejected.
+    policy_path = "/api/v1/namespaces/{ns}/budget"
+    missing_policy = json.loads(json.dumps(good))
+    del missing_policy["paths"][policy_path]
+    assert f"missing path {policy_path}" in check(missing_policy)
+    for method in ("get", "put"):
+        missing_method = json.loads(json.dumps(good))
+        del missing_method["paths"][policy_path][method]
+        assert f"missing {method.upper()} {policy_path}" in check(missing_method)
 
     extra_path = json.loads(json.dumps(good))
     extra_path["paths"]["/api/v1/extra"] = {"get": {}}
