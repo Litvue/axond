@@ -155,41 +155,21 @@ if ! curl -fsS --max-time 1 "http://${BIND}/healthz" >/dev/null 2>&1; then
 fi
 
 BASE_URL="http://${BIND}"
-cat >"${RUN_DIR}/run.env" <<EOF
-AXOND_VERIFY_RUN=${RUN_ID}
-AXOND_VERIFY_BASE_URL=${BASE_URL}
-AXOND_VERIFY_BIND=${BIND}
-AXOND_VERIFY_GATEWAY_PORT=${GATEWAY_PORT}
-AXOND_VERIFY_UPSTREAM_PORT=${UPSTREAM_PORT}
-AXOND_VERIFY_UPSTREAM_URL=${UPSTREAM_URL}
-AXOND_VERIFY_GATEWAY_KEY=${INBOUND_KEY}
-AXOND_VERIFY_UPSTREAM_KEY=${UPSTREAM_KEY}
-AXOND_VERIFY_NAMESPACE=platform
-AXOND_VERIFY_CHAT_MODEL=fixture-openai/fixture-chat
-AXOND_VERIFY_MESSAGES_MODEL=fixture-anthropic/fixture-messages
-AXOND_VERIFY_BINARY=${VERIFY_AXOND_BINARY}
-AXOND_VERIFY_VERSION=${VERSION}
-AXOND_VERIFY_CONFIG=${CONFIG}
-AXOND_VERIFY_SQLITE=${SQLITE}
-AXOND_VERIFY_RUN_DIR=${RUN_DIR}
-AXOND_VERIFY_EVIDENCE_DIR=${EVIDENCE_DIR}
-AXOND_VERIFY_AXOND_PID=${AXOND_PID}
-AXOND_VERIFY_UPSTREAM_PID=${UPSTREAM_PID}
-AXOND_CONFIG=${CONFIG}
-GW_VERIFY_INBOUND_KEY=${INBOUND_KEY}
-GW_VERIFY_UPSTREAM_KEY=${UPSTREAM_KEY}
-EOF
+python3 - "$RUN_DIR" "$RUN_ID" "$BASE_URL" "$VERSION" "$AXOND_PID" "$UPSTREAM_PID" \
+  "$GATEWAY_PORT" "$UPSTREAM_PORT" "$CONFIG" "$SQLITE" "$VERIFY_AXOND_BINARY" \
+  "$EVIDENCE_DIR" "$INBOUND_KEY" "$UPSTREAM_KEY" "$BIND" "$UPSTREAM_URL" <<'PY'
+import json, shlex, sys
 
-python3 - "$RUN_DIR" "$RUN_ID" "$BASE_URL" "$VERSION" "$AXOND_PID" "$UPSTREAM_PID" "$GATEWAY_PORT" "$UPSTREAM_PORT" "$CONFIG" "$SQLITE" "$VERIFY_AXOND_BINARY" "$EVIDENCE_DIR" <<'PY'
-import json, sys
 (
     run_dir, run_id, base_url, version, axond_pid, upstream_pid,
     gateway_port, upstream_port, config, sqlite, binary, evidence,
+    inbound_key, upstream_key, bind, upstream_url,
 ) = sys.argv[1:]
+
 payload = {
     "run_id": run_id,
     "base_url": base_url,
-    "bind": f"127.0.0.1:{gateway_port}",
+    "bind": bind,
     "gateway_port": int(gateway_port),
     "upstream_port": int(upstream_port),
     "version": version,
@@ -206,6 +186,34 @@ payload = {
 with open(f"{run_dir}/run.json", "w", encoding="utf-8") as handle:
     json.dump(payload, handle, indent=2)
     handle.write("\n")
+
+env = {
+    "AXOND_VERIFY_RUN": run_id,
+    "AXOND_VERIFY_BASE_URL": base_url,
+    "AXOND_VERIFY_BIND": bind,
+    "AXOND_VERIFY_GATEWAY_PORT": gateway_port,
+    "AXOND_VERIFY_UPSTREAM_PORT": upstream_port,
+    "AXOND_VERIFY_UPSTREAM_URL": upstream_url,
+    "AXOND_VERIFY_GATEWAY_KEY": inbound_key,
+    "AXOND_VERIFY_UPSTREAM_KEY": upstream_key,
+    "AXOND_VERIFY_NAMESPACE": "platform",
+    "AXOND_VERIFY_CHAT_MODEL": "fixture-openai/fixture-chat",
+    "AXOND_VERIFY_MESSAGES_MODEL": "fixture-anthropic/fixture-messages",
+    "AXOND_VERIFY_BINARY": binary,
+    "AXOND_VERIFY_VERSION": version,
+    "AXOND_VERIFY_CONFIG": config,
+    "AXOND_VERIFY_SQLITE": sqlite,
+    "AXOND_VERIFY_RUN_DIR": run_dir,
+    "AXOND_VERIFY_EVIDENCE_DIR": evidence,
+    "AXOND_VERIFY_AXOND_PID": axond_pid,
+    "AXOND_VERIFY_UPSTREAM_PID": upstream_pid,
+    "AXOND_CONFIG": config,
+    "GW_VERIFY_INBOUND_KEY": inbound_key,
+    "GW_VERIFY_UPSTREAM_KEY": upstream_key,
+}
+with open(f"{run_dir}/run.env", "w", encoding="utf-8") as handle:
+    for key, value in env.items():
+        handle.write(f"{key}={shlex.quote(str(value))}\n")
 PY
 
 echo "AXOND_VERIFY_RUN=${RUN_ID}"

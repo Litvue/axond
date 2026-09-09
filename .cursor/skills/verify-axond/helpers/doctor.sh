@@ -41,7 +41,7 @@ if [[ "$cmdline" == *pkill* || "$cmdline" == *curl* ]]; then
 fi
 
 if [[ -r "/proc/${AXOND_VERIFY_AXOND_PID}/environ" ]]; then
-  env_config="$(tr '\0' '\n' <"/proc/${AXOND_VERIFY_AXOND_PID}/environ" | awk -F= '/^AXOND_CONFIG=/{print substr($0,13); exit}')"
+  env_config="$(tr '\0' '\n' <"/proc/${AXOND_VERIFY_AXOND_PID}/environ" | awk -F= '/^AXOND_CONFIG=/{print substr($0, length("AXOND_CONFIG=")+1); exit}')"
   if [[ -n "$env_config" && "$env_config" != "$AXOND_VERIFY_CONFIG" ]]; then
     fail "pid ${AXOND_VERIFY_AXOND_PID} AXOND_CONFIG=${env_config} != ${AXOND_VERIFY_CONFIG}"
   fi
