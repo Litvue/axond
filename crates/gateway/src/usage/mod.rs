@@ -633,7 +633,7 @@ struct IndexWorkerReport {
 
 /// What one graceful usage-index drain achieved.
 ///
-/// Unlike the usage journal, leftovers here are not durable: they live only in
+/// Unlike the usage journal [`journal::DrainReport`], leftovers here are not durable: they live only in
 /// the in-memory queue. A crash still loses them (best effort, as before). A
 /// healthy shutdown with budget left writes what was queued and reports the
 /// rest. `leftover: 0` is a count only when [`reported`](Self::reported) is
@@ -1440,7 +1440,7 @@ async fn async_usage_index_worker(
         let queue_age_ms = oldest_queue_age_ms(&batch);
         match tokio::time::timeout(settings.write_timeout, store.append_usage_batch(events)).await {
             Ok(Ok(())) => {
-                written = written.saturating_add(events.len() as u64);
+                written = written.saturating_add(batch.len() as u64);
                 telemetry.wrote(&batch, IndexOutcome::Accepted, None, queue_age_ms);
             }
             Ok(Err(error)) => {

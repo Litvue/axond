@@ -1075,16 +1075,17 @@ async fn serve() -> anyhow::Result<()> {
     // outbox drain cannot starve index writes (or the reverse). Index leftovers
     // are in-memory and lost at exit; journal leftovers are durable.
     let share = (until(flush_by) / 2).checked_sub(usage::DRAIN_MARGIN);
-    let (journal_drain, index_drain) = match (usage_worker, share) {
-        (Some(worker), Some(budget)) => {
-            let (journal, index) =
-                tokio::join!(worker.drain(budget), resources.0.usage.drain_index(budget));
-            (Some(journal), index)
-        }
-        (Some(worker), None) => (Some(worker.abandon()), resources.0.usage.abandon_index()),
-        (None, Some(budget)) => (None, resources.0.usage.drain_index(budget).await),
-        (None, None) => (None, resources.0.usage.abandon_index()),
-    };
+    let (journal_drain, index_drain): (Option<usage::DrainReport>, usage::IndexDrainReport) =
+        match (usage_worker, share) {
+            (Some(worker), Some(budget)) => {
+                let (journal, index) =
+                    tokio::join!(worker.drain(budget), resources.0.usage.drain_index(budget));
+                (Some(journal), index)
+            }
+            (Some(worker), None) => (Some(worker.abandon()), resources.0.usage.abandon_index()),
+            (None, Some(budget)) => (None, resources.0.usage.drain_index(budget).await),
+            (None, None) => (None, resources.0.usage.abandon_index()),
+        };
     if let Some(report) = journal_drain.as_ref() {
         report.log();
     }
