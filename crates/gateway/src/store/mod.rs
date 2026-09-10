@@ -483,21 +483,15 @@ pub trait Store: Send + Sync {
     /// `request_id` is ignored (at-least-once).
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError>;
 
-    /// Index a batch of usage events in one write. The batch is atomic: either
-    /// every row that was not already present lands, or none does, so a
-    /// repeated batch after a failure inserts each `request_id` exactly once.
-    /// Rows already present are skipped, never rewritten, with the same null
-    /// `cost_microdollars` / `period` semantics as [`Self::append_usage`].
+    /// Index a batch of usage events in one write. Implementations **must** be
+    /// atomic: either every row that was not already present lands, or none
+    /// does, so a repeated batch after a failure inserts each `request_id`
+    /// exactly once. Duplicate `request_id`s are skipped, never rewritten, with
+    /// the same null `cost_microdollars` / `period` semantics as
+    /// [`Self::append_usage`]. There is no sequential-walk default: a per-row
+    /// walk that returns on the first error would leave a committed prefix.
     /// Callers bound `events.len()` by [`MAX_USAGE_INDEX_BATCH`].
-    ///
-    /// The default is a sequential walk, which is right for a store whose
-    /// write is already per-row; SQLite and Postgres override it.
-    async fn append_usage_batch(&self, events: Vec<UsageAppend>) -> Result<(), StoreError> {
-        for event in events {
-            self.append_usage(event).await?;
-        }
-        Ok(())
-    }
+    async fn append_usage_batch(&self, events: Vec<UsageAppend>) -> Result<(), StoreError>;
 
     /// When true, [`Self::append_usage`] runs blocking I/O inside `spawn_blocking`
     /// and dropping its future cannot cancel the work. The usage-index worker
@@ -516,13 +510,11 @@ pub trait Store: Send + Sync {
     }
 
     /// [`Self::append_usage_batch`] on the caller's thread, with the same
-    /// atomicity and deduplication contract. SQLite only.
-    fn append_usage_batch_sync(&self, events: &[UsageAppend]) -> Result<(), StoreError> {
-        for event in events {
-            self.append_usage_sync(event.clone())?;
-        }
-        Ok(())
-    }
+    /// atomicity and deduplication contract (duplicate `request_id` skipped,
+    /// not rewritten). SQLite only; other stores return
+    /// [`StoreError::Unavailable`]. No sequential-walk default: a per-row
+    /// walk that returns on the first error would leave a committed prefix.
+    fn append_usage_batch_sync(&self, events: &[UsageAppend]) -> Result<(), StoreError>;
 
     /// Per-model per-status counts and cost totals for `namespace`+`period`.
     async fn summarize_usage(
@@ -639,6 +631,12 @@ impl Store for UnavailableStore {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn append_usage(&self, _: UsageAppend) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn append_usage_batch(&self, _: Vec<UsageAppend>) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    fn append_usage_batch_sync(&self, _: &[UsageAppend]) -> Result<(), StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn summarize_usage(&self, _: &str, _: &str) -> Result<Vec<UsageSummaryRow>, StoreError> {

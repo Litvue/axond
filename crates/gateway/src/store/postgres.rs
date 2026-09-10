@@ -1236,6 +1236,12 @@ impl Store for PostgresStore {
         .await
     }
 
+    fn append_usage_batch_sync(&self, _: &[UsageAppend]) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "this store has no synchronous usage-index path".into(),
+        ))
+    }
+
     async fn summarize_usage(
         &self,
         namespace: &str,

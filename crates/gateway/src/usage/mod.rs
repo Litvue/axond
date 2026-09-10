@@ -1498,6 +1498,20 @@ mod tests {
         ) -> Result<(), crate::store::StoreError> {
             std::future::pending().await
         }
+        async fn append_usage_batch(
+            &self,
+            _: Vec<crate::store::UsageAppend>,
+        ) -> Result<(), crate::store::StoreError> {
+            std::future::pending().await
+        }
+        fn append_usage_batch_sync(
+            &self,
+            _: &[crate::store::UsageAppend],
+        ) -> Result<(), crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable(
+                "this store has no synchronous usage-index path".into(),
+            ))
+        }
         async fn summarize_usage(
             &self,
             _: &str,
@@ -1635,6 +1649,12 @@ mod tests {
             _: crate::store::UsageAppend,
         ) -> Result<(), crate::store::StoreError> {
             Ok(())
+        }
+        async fn append_usage_batch(
+            &self,
+            events: Vec<crate::store::UsageAppend>,
+        ) -> Result<(), crate::store::StoreError> {
+            self.append_usage_batch_sync(&events)
         }
         fn blocking_usage_index(&self) -> bool {
             true

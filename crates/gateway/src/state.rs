@@ -2252,6 +2252,20 @@ namespace = "platform"
         async fn append_usage(&self, _: crate::store::UsageAppend) -> Result<(), StoreError> {
             Ok(())
         }
+        async fn append_usage_batch(
+            &self,
+            _: Vec<crate::store::UsageAppend>,
+        ) -> Result<(), StoreError> {
+            // In-memory fake: no durable prefix; a mid-batch failure cannot
+            // leave earlier rows committed.
+            Ok(())
+        }
+        fn append_usage_batch_sync(
+            &self,
+            _: &[crate::store::UsageAppend],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
         async fn summarize_usage(
             &self,
             _: &str,
