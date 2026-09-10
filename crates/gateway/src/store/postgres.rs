@@ -103,12 +103,12 @@ impl PostgresStore {
     }
 
     async fn connect_client(&self) -> Result<Client, StoreError> {
-        metrics::record_store_connection_opened(STORE_BACKEND_POSTGRES);
         let (client, connection) = self
             .config
             .connect(crate::usage::tls_connector())
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        metrics::record_store_connection_opened(STORE_BACKEND_POSTGRES);
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::warn!(error = %e, "postgres store connection closed");

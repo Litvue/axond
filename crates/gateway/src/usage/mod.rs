@@ -26,7 +26,7 @@ mod postgres;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -477,6 +477,10 @@ pub struct UsageDelivery {
     /// Bounded queue into the usage-index worker. `append_store` only
     /// `try_send`s; a full queue drops the event rather than spawning work.
     index_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<QueuedIndexEvent>>,
+    /// Occupied slots in `index_tx`. Senders increment on an accepted enqueue
+    /// and the worker decrements on receive or shutdown drain, so the histogram
+    /// observes the depth this event produced rather than a later `capacity()`.
+    index_depth: Arc<AtomicU64>,
     /// Set on drop so the worker abandons queued items after the in-flight write.
     index_stop: Arc<AtomicBool>,
     /// Test-only witness for [`UsageDelivery::count_unheard_refusal`]: the loss
@@ -514,6 +518,7 @@ impl UsageDelivery {
             on_undurable: UndurablePolicy::Serve,
             store: std::sync::OnceLock::new(),
             index_tx: std::sync::OnceLock::new(),
+            index_depth: Arc::new(AtomicU64::new(0)),
             index_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
@@ -531,6 +536,7 @@ impl UsageDelivery {
             on_undurable,
             store: std::sync::OnceLock::new(),
             index_tx: std::sync::OnceLock::new(),
+            index_depth: Arc::new(AtomicU64::new(0)),
             index_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
@@ -546,10 +552,11 @@ impl UsageDelivery {
         }
         let (tx, rx) = tokio::sync::mpsc::channel(Self::STORE_INDEX_QUEUE);
         let stop = Arc::clone(&self.index_stop);
+        let depth = Arc::clone(&self.index_depth);
         if store.blocking_usage_index() {
             match std::thread::Builder::new()
                 .name("axond-usage-index".into())
-                .spawn(move || sqlite_usage_index_worker(store, rx, stop))
+                .spawn(move || sqlite_usage_index_worker(store, rx, stop, depth))
             {
                 Ok(handle) => drop(handle),
                 Err(error) => {
@@ -561,7 +568,9 @@ impl UsageDelivery {
                 }
             }
         } else if tokio::runtime::Handle::try_current().is_ok() {
-            drop(tokio::spawn(async_usage_index_worker(store, rx, stop)));
+            drop(tokio::spawn(async_usage_index_worker(
+                store, rx, stop, depth,
+            )));
         } else {
             tracing::error!("store usage-index worker needs a tokio runtime");
             return;
@@ -599,11 +608,8 @@ impl UsageDelivery {
             event,
         }) {
             Ok(()) => {
-                // The depth the event found the queue at, this send included.
-                // `capacity` is what is left of the bound, so the difference is
-                // exact rather than sampled.
-                let depth = Self::STORE_INDEX_QUEUE.saturating_sub(tx.capacity());
-                crate::telemetry::metrics::record_usage_index_enqueued(depth as u64);
+                let depth = self.index_depth.fetch_add(1, Ordering::AcqRel) + 1;
+                crate::telemetry::metrics::record_usage_index_enqueued(depth);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 tracing::error!(
@@ -814,9 +820,12 @@ fn sqlite_usage_index_worker(
     store: Arc<dyn crate::store::Store>,
     mut rx: tokio::sync::mpsc::Receiver<QueuedIndexEvent>,
     stop: Arc<AtomicBool>,
+    depth: Arc<AtomicU64>,
 ) {
     while let Some(queued) = rx.blocking_recv() {
+        take_index_slot(&depth);
         if stop.load(Ordering::Acquire) {
+            drain_index_queue(&mut rx, &depth);
             break;
         }
         let event = queued.dequeue();
@@ -840,9 +849,12 @@ async fn async_usage_index_worker(
     store: Arc<dyn crate::store::Store>,
     mut rx: tokio::sync::mpsc::Receiver<QueuedIndexEvent>,
     stop: Arc<AtomicBool>,
+    depth: Arc<AtomicU64>,
 ) {
     while let Some(queued) = rx.recv().await {
+        take_index_slot(&depth);
         if stop.load(Ordering::Acquire) {
+            drain_index_queue(&mut rx, &depth);
             break;
         }
         let event = queued.dequeue();
@@ -871,6 +883,16 @@ async fn async_usage_index_worker(
             }
         };
         crate::telemetry::metrics::record_usage_index_append(outcome);
+    }
+}
+
+fn take_index_slot(depth: &AtomicU64) {
+    depth.fetch_sub(1, Ordering::AcqRel);
+}
+
+fn drain_index_queue(rx: &mut tokio::sync::mpsc::Receiver<QueuedIndexEvent>, depth: &AtomicU64) {
+    while rx.try_recv().is_ok() {
+        take_index_slot(depth);
     }
 }
 

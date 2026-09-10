@@ -159,7 +159,11 @@ impl SqliteStore {
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
             let acquired = Instant::now();
             let result = f(&mut guard);
-            Ok::<_, StoreError>((acquired, result))
+            // Capture execution time before this closure returns and drops the
+            // mutex. Measuring after `spawn_blocking` joins would fold runtime
+            // poll delay into `query_duration`.
+            let finished = Instant::now();
+            Ok::<_, StoreError>((acquired, finished, result))
         };
         let outcome = if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::spawn_blocking(run)
@@ -170,8 +174,7 @@ impl SqliteStore {
             run()
         };
         match outcome {
-            Ok((acquired, result)) => {
-                let finished = Instant::now();
+            Ok((acquired, finished, result)) => {
                 metrics::record_store_operation(
                     STORE_BACKEND_SQLITE,
                     op,

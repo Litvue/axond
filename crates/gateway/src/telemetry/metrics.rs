@@ -1103,9 +1103,9 @@ pub(crate) fn record_store_operation(
     );
 }
 
-/// One Store connection opened. On Postgres this is a session the pool had to
-/// create because nothing idle was available; a rate that tracks request bursts
-/// is connection churn.
+/// One Store connection opened. Counted only after Postgres `connect()`
+/// succeeds: a failed handshake is not a session. A rate that tracks request
+/// bursts is connection churn.
 pub(crate) fn record_store_connection_opened(backend: &'static str) {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
@@ -1115,10 +1115,10 @@ pub(crate) fn record_store_connection_opened(backend: &'static str) {
         .add(1, &[KeyValue::new("axond.store.backend", backend)]);
 }
 
-/// One usage event enqueued for the background index worker, with the exact
-/// depth the queue then had. Label-free, like the admission queue depth: the
-/// histogram retains the peak between exports, and a peak at the bound is a
-/// queue about to drop.
+/// One usage event enqueued for the background index worker, with the occupied
+/// slot count after this send (senders and the worker share an atomic). Label-free,
+/// like the admission queue depth: the histogram retains the peak between
+/// exports, and a peak at the bound is a queue about to drop.
 pub(crate) fn record_usage_index_enqueued(depth: u64) {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
