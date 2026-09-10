@@ -204,6 +204,18 @@ rolled back. The usage-index worker writes on its own thread and does not
 consume the slot. `busy_timeout` still bounds SQLite lock waits inside a
 statement, not this queue.
 
+Postgres Store uses a process-local pool of at most 32 sessions (`POOL_SIZE`).
+A semaphore bounds live plus idle at that number. Idle retention is the same
+32, so a burst that fits in the pool reuses sessions instead of opening a new
+TLS handshake on every wave. There is no second connection budget and no
+`[storage]` key for pool size: raising replica count is how a deployment uses
+more connections, at `N × 32`. Size `max_connections` on the database for that
+product, plus other roles that share the instance. Checkout waits 2 s for a
+permit (50 ms in tests) and then returns `StoreError::Unavailable` with "pool
+saturated", the same typed failure as SQLite dispatch saturation. Cancelling
+the caller while waiting, while connecting, or during a query releases the
+permit and does not leak a session.
+
 Postgres Store budget tables are `axond_store_budget`,
 `axond_store_budget_active`, and `axond_store_budget_reservation`
 (`ops/postgres/store_budget_v1.sql`) plus `axond_store_budget_cadence`

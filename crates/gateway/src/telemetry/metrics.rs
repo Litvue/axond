@@ -113,6 +113,9 @@ struct Instruments {
     store_query_duration: Histogram<f64>,
     store_operations: Counter<u64>,
     store_connections_opened: Counter<u64>,
+    store_connections_reused: Counter<u64>,
+    store_connections_discarded: Counter<u64>,
+    store_pool_sessions: Gauge<u64>,
     usage_index_queue_depth: Histogram<u64>,
     usage_index_queue_wait: Histogram<f64>,
     admission_in_flight: UpDownCounter<i64>,
@@ -524,7 +527,28 @@ impl Instruments {
                 .u64_counter("axond.store.connections_opened")
                 .with_description(
                     "Store connections opened, by backend. On Postgres each one is a fresh \
-                     session because no idle one was available: connection churn under burst.",
+                     session because no idle one was available. A count that rises with each \
+                     traffic burst is idle retention shedding sessions between waves.",
+                )
+                .build(),
+            store_connections_reused: meter
+                .u64_counter("axond.store.connections_reused")
+                .with_description(
+                    "Store checkouts that took a healthy idle session instead of connecting.",
+                )
+                .build(),
+            store_connections_discarded: meter
+                .u64_counter("axond.store.connections_discarded")
+                .with_description(
+                    "Store sessions dropped at checkin or found closed in the idle list, \
+                     by backend. Includes cancelled checkouts that never returned the session.",
+                )
+                .build(),
+            store_pool_sessions: meter
+                .u64_gauge("axond.store.pool.sessions")
+                .with_description(
+                    "Postgres Store sessions currently checked out (`live`) or sitting idle. \
+                     The semaphore bounds live plus idle at the pool size.",
                 )
                 .build(),
             usage_index_queue_depth: meter
@@ -1277,6 +1301,55 @@ pub(crate) fn record_store_connection_opened(backend: &'static str) {
     instruments
         .store_connections_opened
         .add(1, &[KeyValue::new("axond.store.backend", backend)]);
+}
+
+/// One checkout that took a healthy idle session instead of calling `connect()`.
+pub(crate) fn record_store_connection_reused(backend: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .store_connections_reused
+        .add(1, &[KeyValue::new("axond.store.backend", backend)]);
+}
+
+/// One session dropped: idle cap, a closed backend, a cancelled checkout, or
+/// a typed-error path that refuses reuse.
+pub(crate) fn record_store_connection_discarded(backend: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .store_connections_discarded
+        .add(1, &[KeyValue::new("axond.store.backend", backend)]);
+}
+
+/// Current Postgres pool occupancy. `live` is checked out; `idle` is retained
+/// under the idle cap. The two series share `axond.store.backend`.
+pub(crate) fn record_store_pool_sessions(backend: &'static str, live: u64, idle: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.store_pool_sessions.record(
+        live,
+        &[
+            KeyValue::new("axond.store.backend", backend),
+            KeyValue::new(
+                "axond.store.pool.state",
+                crate::store::STORE_POOL_STATE_LIVE,
+            ),
+        ],
+    );
+    instruments.store_pool_sessions.record(
+        idle,
+        &[
+            KeyValue::new("axond.store.backend", backend),
+            KeyValue::new(
+                "axond.store.pool.state",
+                crate::store::STORE_POOL_STATE_IDLE,
+            ),
+        ],
+    );
 }
 
 /// One usage event enqueued for the background index worker, with the channel's
