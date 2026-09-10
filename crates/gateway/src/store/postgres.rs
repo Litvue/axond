@@ -278,7 +278,7 @@ impl PostgresStore {
             Err(error) => Self::keep_session(error) && !session.client_mut().is_closed(),
         };
         if reuse {
-            let client = session.into_idle();
+            let client = session.take_client();
             self.checkin(client).await;
         }
         result
@@ -294,7 +294,7 @@ enum Checkout {
     Failed(StoreError),
 }
 
-/// A checked-out session. `client` is `Some` until [`Session::into_idle`] or
+/// A checked-out session. `client` is `Some` until [`Session::take_client`] or
 /// Drop. Dropping a session that still holds the client closes the backend,
 /// releases the permit, and counts the session discarded so a cancelled caller
 /// cannot leak occupancy.
@@ -309,7 +309,7 @@ impl Session {
         self.client.as_mut().expect("pooled session")
     }
 
-    fn into_idle(&mut self) -> Client {
+    fn take_client(&mut self) -> Client {
         self.stats.live.fetch_sub(1, Ordering::SeqCst);
         self.client.take().expect("pooled session")
     }
@@ -1848,7 +1848,7 @@ impl PostgresStore {
         let started = Instant::now();
         let mut session = self.checkout().await.map_err(StoreError::from)?;
         let elapsed = started.elapsed();
-        let client = session.into_idle();
+        let client = session.take_client();
         self.checkin(client).await;
         Ok(elapsed)
     }
@@ -2163,7 +2163,7 @@ mod tests {
         );
 
         for mut session in held {
-            let client = session.into_idle();
+            let client = session.take_client();
             store.checkin(client).await;
         }
         let after_return = store.pool_snapshot();
@@ -2219,7 +2219,7 @@ mod tests {
                 store.pool_snapshot().discarded
             );
             for mut session in held {
-                let client = session.into_idle();
+                let client = session.take_client();
                 store.checkin(client).await;
             }
         }
@@ -2249,7 +2249,7 @@ mod tests {
         let after_hold = store.pool_snapshot();
         let recovery_opened = after_hold.opened.saturating_sub(opened_before);
         for mut session in held {
-            let client = session.into_idle();
+            let client = session.take_client();
             store.checkin(client).await;
         }
         let after_recovery = store.pool_snapshot();
@@ -2331,7 +2331,7 @@ mod tests {
             held.push(session);
         }
         for mut session in held {
-            let client = session.into_idle();
+            let client = session.take_client();
             store.checkin(client).await;
         }
 
