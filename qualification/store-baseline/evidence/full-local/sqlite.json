@@ -1,0 +1,2635 @@
+{
+  "schema_version": 1,
+  "run": {
+    "started_at_unix_ms": 1789007216370,
+    "elapsed_ms": 148679,
+    "harness": "axond store latency baseline",
+    "harness_version": "0.6.1"
+  },
+  "tier": "full",
+  "backend": "sqlite",
+  "repetitions": 3,
+  "environment": {
+    "binary": {
+      "path": "/tmp/wt-462-target/release/axond",
+      "sha256": "58e067cf036aa91c7e0c47edeb15d56e70784bea754bf4ac05e737413e85e160",
+      "size_bytes": 25658184,
+      "version": "0.6.1"
+    },
+    "config": {
+      "sha256": "3914e0851559037b684725d6ac4f53fb8dbe20e5eb8ae3aa41f86881d992bb39",
+      "normalized_toml": "\n[server]\nbind = \"127.0.0.1:GATEWAY_PORT\"\n\n[storage]\nbackend = \"sqlite\"\npath = \"STORE_SQLITE_PATH\"\n\n[[namespace]]\nid = \"platform\"\ndefault = true\n\n[[provider]]\nid = \"fake-openai\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:UPSTREAM_PORT\"\n\n[[provider]]\nid = \"fake-anthropic\"\nkind = \"anthropic\"\nbase_url = \"http://127.0.0.1:UPSTREAM_PORT\"\n\n[[credential]]\nnamespace = \"platform\"\nprovider = \"fake-openai\"\nenv = \"GW_FAKE_OPENAI_KEY\"\nid = \"fake-openai-primary\"\n\n[[credential]]\nnamespace = \"platform\"\nprovider = \"fake-anthropic\"\nenv = \"GW_FAKE_ANTHROPIC_KEY\"\nid = \"fake-anthropic-primary\"\n\n[[gateway_key]]\nenv = \"GW_INBOUND_KEY\"\nnamespace = \"platform\"\n\n[[price]]\nprovider = \"fake-openai\"\nmodel = \"*\"\ninput_microdollars_per_million = 2500000\noutput_microdollars_per_million = 10000000\n\n[[price]]\nprovider = \"fake-anthropic\"\nmodel = \"*\"\ninput_microdollars_per_million = 2500000\noutput_microdollars_per_million = 10000000\n\n\n[failover]\nmax_attempts = 1\noverall_timeout_ms = 60000\nfailure_threshold = 3\ncooldown_seconds = 30\n\n[transport]\nconnect_timeout_ms = 10000\nresponse_header_timeout_ms = 30000\nbuffered_body_timeout_ms = 30000\nstream_idle_timeout_ms = 30000\nmax_response_bytes = 33554432\nmax_error_bytes = 65536\n\n[admission]\nmax_request_bytes = 1048576\nmax_in_flight = 8192\nmax_in_flight_streams = 8192\nmax_in_flight_per_tenant = 0\nqueue_capacity = 0\nqueue_wait_ms = 0\nmax_prompt_tokens = 0\nmax_output_tokens = 0\nmax_stream_duration_ms = 0\nmax_stream_bytes = 0\n\n\n\n\n[[namespace]]\nid = \"boot_83528_7\"\n"
+    },
+    "manifest": {
+      "path": "crates/gateway/tests/support/capacity/store_baseline.rs",
+      "sha256": "7afa42d835c0858aae5a5833be21af3efe4f3e77ae2f510dfe86634523d01f0f"
+    },
+    "fixtures": [
+      {
+        "path": "tests/fixtures/README.md",
+        "sha256": "fb2526c1ed22650bd92e139fb75d7385b32ceacab12dbc3a5f1dd431ab8b2633"
+      },
+      {
+        "path": "tests/fixtures/anthropic/message_thinking_tool_use.json",
+        "sha256": "19e22d1e105dcd4c0f3c541c3396a1cefafff6fc0f98c979c5a931fd81122a89"
+      },
+      {
+        "path": "tests/fixtures/anthropic/message_thinking_tool_use.sse",
+        "sha256": "263e485bfc919b14c7ad24120098b968e0c9b2b4cc3522356772acd2e74d5cdf"
+      },
+      {
+        "path": "tests/fixtures/openai/chat_completion.json",
+        "sha256": "a29535e61139b9055a9d8aad11fb2b7a190a809b9136a7799cb07e201f6d725e"
+      },
+      {
+        "path": "tests/fixtures/openai/chat_completion.sse",
+        "sha256": "04e9d2fc6297e8d113d1a14a7d11e906baa778accb2b1ff1e824064a06fda4d7"
+      },
+      {
+        "path": "tests/fixtures/openai/embeddings.json",
+        "sha256": "04ec818411b50378face0954252aed5bd0e28a49e591b1d6aaf838bf2d2060af"
+      },
+      {
+        "path": "tests/fixtures/openai/responses.json",
+        "sha256": "24fc6eadb86e8158f80394921f8a14dc2ca02b35b5f9e98bdc5741bbda1a28b9"
+      },
+      {
+        "path": "tests/fixtures/openai/responses.sse",
+        "sha256": "d7ddb81e456c6e0eb4925985fe4bc47a7883abc01056e7540eee06817d8af973"
+      }
+    ],
+    "hardware": {
+      "os": "linux",
+      "arch": "x86_64",
+      "kernel": "6.12.94+",
+      "cpus": 4,
+      "cpu_model": "Intel(R) Xeon(R) Processor",
+      "total_memory_kib": 16398384,
+      "containerized": false
+    },
+    "toolchain": {
+      "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+      "cargo_profile": "release"
+    },
+    "source": {
+      "crate_version": "0.6.1",
+      "git_commit": "e3dd018807cf8d62fa833dd229d009974aaff678",
+      "git_dirty": false
+    }
+  },
+  "caveat": "Latency, throughput, and CPU are informational: they measure the host as much as the gateway. Compare artifacts only when environment.hardware, environment.toolchain.cargo_profile, and environment.config.sha256 agree, and read docs/operations/store-latency-baseline.md before comparing two commits.",
+  "scenarios": [
+    {
+      "id": "steady-buffered",
+      "description": "Closed-loop buffered chat completions: one namespace+admit join and one charge per request.",
+      "scale": {
+        "arrival": {
+          "kind": "closed_loop"
+        },
+        "concurrency": 32,
+        "requests": 3000,
+        "warmup_requests": 300,
+        "summary_readers": 0,
+        "seeded_usage_rows": 0,
+        "payload_bytes": 0
+      },
+      "store": {
+        "backend": "sqlite",
+        "version": "3.46.0",
+        "usage_rows": 9300,
+        "data_bytes": 5906008
+      },
+      "warmup": {
+        "offered": 300,
+        "accepted": 300
+      },
+      "repetitions": [
+        {
+          "offered": 3000,
+          "accepted": 3000,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 5045,
+          "accepted_rps": 594.5629435344429,
+          "latency_ms": {
+            "count": 3000,
+            "min": 2.14606,
+            "p50": 48.99538,
+            "p95": 94.21628199999999,
+            "p99": 115.18622,
+            "max": 172.559664,
+            "mean": 53.65284823666662
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 3000
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 239,
+            "rss_kib": {
+              "baseline": 25940,
+              "peak": 27812,
+              "settled": 27772
+            },
+            "sockets": {
+              "baseline": 69,
+              "peak": 70,
+              "settled": 70
+            },
+            "cpu_seconds": 1.55,
+            "cpu_utilization": 0.3071908541594621,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 3000,
+            "observed": 3000,
+            "missing": 0
+          },
+          "summaries": null
+        },
+        {
+          "offered": 3000,
+          "accepted": 3000,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 6174,
+          "accepted_rps": 485.8874435789687,
+          "latency_ms": {
+            "count": 3000,
+            "min": 2.0423720000000003,
+            "p50": 62.982468,
+            "p95": 109.113985,
+            "p99": 134.374197,
+            "max": 179.35057500000002,
+            "mean": 65.58380957100005
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 3000
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 292,
+            "rss_kib": {
+              "baseline": 27772,
+              "peak": 28580,
+              "settled": 28540
+            },
+            "sockets": {
+              "baseline": 70,
+              "peak": 70,
+              "settled": 70
+            },
+            "cpu_seconds": 1.59,
+            "cpu_utilization": 0.25752034509685345,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 3000,
+            "observed": 3000,
+            "missing": 0
+          },
+          "summaries": null
+        },
+        {
+          "offered": 3000,
+          "accepted": 3000,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 5167,
+          "accepted_rps": 580.5327139014186,
+          "latency_ms": {
+            "count": 3000,
+            "min": 1.336112,
+            "p50": 53.197314000000006,
+            "p95": 89.781323,
+            "p99": 105.57236999999999,
+            "max": 141.238834,
+            "mean": 54.71568199000002
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 3000
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 245,
+            "rss_kib": {
+              "baseline": 28540,
+              "peak": 29476,
+              "settled": 29476
+            },
+            "sockets": {
+              "baseline": 70,
+              "peak": 70,
+              "settled": 70
+            },
+            "cpu_seconds": 1.54,
+            "cpu_utilization": 0.29800679313606154,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 3000,
+            "observed": 3000,
+            "missing": 0
+          },
+          "summaries": null
+        }
+      ],
+      "control": {
+        "offered": 3000,
+        "accepted": 3000,
+        "elapsed_ms": 32,
+        "accepted_rps": 92926.5833528221,
+        "latency_ms": {
+          "count": 3000,
+          "min": 0.049104999999999996,
+          "p50": 0.309195,
+          "p95": 0.56807,
+          "p99": 0.754307,
+          "max": 1.2774660000000002,
+          "mean": 0.3310054609999996
+        },
+        "ttft_ms": null
+      },
+      "overhead_ms": {
+        "p50": 52.888119,
+        "p95": 89.213253,
+        "p99": 104.818063,
+        "ttft_p50": null,
+        "ttft_p95": null
+      },
+      "store_evidence": {
+        "includes_warmup": true,
+        "backend_label": "sqlite",
+        "operations": {
+          "budget_charge": {
+            "calls": 9300,
+            "outcomes": {
+              "ok": 9300
+            },
+            "acquire_wait": {
+              "count": 9300,
+              "sum_ms": 262490.2148619993,
+              "mean_ms": 28.224754286236486,
+              "min_ms": 0.001228,
+              "max_ms": 168.431833,
+              "p50_le_ms": 50.0,
+              "p95_le_ms": 100.0,
+              "p99_le_ms": 100.0
+            },
+            "query_duration": {
+              "count": 9300,
+              "sum_ms": 9099.539609999973,
+              "mean_ms": 0.9784451193548358,
+              "min_ms": 0.192964,
+              "max_ms": 26.141567000000002,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "budget_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.028317000000000002,
+              "mean_ms": 0.014158500000000001,
+              "min_ms": 0.007948,
+              "max_ms": 0.020369,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 4.1248830000000005,
+              "mean_ms": 2.0624415000000003,
+              "min_ms": 1.9598060000000002,
+              "max_ms": 2.165077,
+              "p50_le_ms": 2.5,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 2.5
+            }
+          },
+          "namespace_read": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.02351,
+              "mean_ms": 0.011755,
+              "min_ms": 0.011665,
+              "max_ms": 0.011845,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 0.14738600000000002,
+              "mean_ms": 0.07369300000000001,
+              "min_ms": 0.067946,
+              "max_ms": 0.07944,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 0.1,
+              "p99_le_ms": 0.1
+            }
+          },
+          "namespace_resolve": {
+            "calls": 9300,
+            "outcomes": {
+              "ok": 9300
+            },
+            "acquire_wait": {
+              "count": 9300,
+              "sum_ms": 269410.5213250006,
+              "mean_ms": 28.968873260752755,
+              "min_ms": 0.001574,
+              "max_ms": 136.737242,
+              "p50_le_ms": 50.0,
+              "p95_le_ms": 100.0,
+              "p99_le_ms": 100.0
+            },
+            "query_duration": {
+              "count": 9300,
+              "sum_ms": 1024.7525100000034,
+              "mean_ms": 0.11018844193548424,
+              "min_ms": 0.017963,
+              "max_ms": 26.353738,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.5
+            }
+          },
+          "namespace_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.26013800000000004,
+              "mean_ms": 0.13006900000000002,
+              "min_ms": 0.014195999999999999,
+              "max_ms": 0.24594200000000002,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 2.8520730000000003,
+              "mean_ms": 1.4260365000000002,
+              "min_ms": 0.8252510000000001,
+              "max_ms": 2.026822,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 2.5
+            }
+          },
+          "provider_models": {
+            "calls": 4,
+            "outcomes": {
+              "ok": 4
+            },
+            "acquire_wait": {
+              "count": 4,
+              "sum_ms": 0.058426,
+              "mean_ms": 0.0146065,
+              "min_ms": 0.013039,
+              "max_ms": 0.018418,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 4,
+              "sum_ms": 2.1799920000000004,
+              "mean_ms": 0.5449980000000001,
+              "min_ms": 0.021155,
+              "max_ms": 1.225413,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 2.5
+            }
+          },
+          "usage_append": {
+            "calls": 9300,
+            "outcomes": {
+              "ok": 9300
+            },
+            "acquire_wait": {
+              "count": 9300,
+              "sum_ms": 8905.413771999376,
+              "mean_ms": 0.9575713733332663,
+              "min_ms": 0.000029999999999999997,
+              "max_ms": 50.503174,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 10.0,
+              "p99_le_ms": 25.0
+            },
+            "query_duration": {
+              "count": 9300,
+              "sum_ms": 7511.768452000017,
+              "mean_ms": 0.8077170378494641,
+              "min_ms": 0.168341,
+              "max_ms": 6.804908999999999,
+              "p50_le_ms": 0.5,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 5.0
+            }
+          }
+        },
+        "connections_opened": 0,
+        "index_queue": {
+          "depth_observations": 9300,
+          "max_depth": 62.0,
+          "wait": {
+            "count": 9300,
+            "sum_ms": 136581.31523799978,
+            "mean_ms": 14.68616292881718,
+            "min_ms": 0.004673,
+            "max_ms": 84.796169,
+            "p50_le_ms": 25.0,
+            "p95_le_ms": 50.0,
+            "p99_le_ms": 100.0
+          }
+        }
+      }
+    },
+    {
+      "id": "steady-streamed",
+      "description": "Closed-loop paced SSE streams read to completion; TTFT measured at the first relayed byte.",
+      "scale": {
+        "arrival": {
+          "kind": "closed_loop"
+        },
+        "concurrency": 32,
+        "requests": 600,
+        "warmup_requests": 64,
+        "summary_readers": 0,
+        "seeded_usage_rows": 0,
+        "payload_bytes": 0
+      },
+      "store": {
+        "backend": "sqlite",
+        "version": "3.46.0",
+        "usage_rows": 1864,
+        "data_bytes": 4554304
+      },
+      "warmup": {
+        "offered": 64,
+        "accepted": 64
+      },
+      "repetitions": [
+        {
+          "offered": 600,
+          "accepted": 600,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 5189,
+          "accepted_rps": 115.60797515050042,
+          "latency_ms": {
+            "count": 600,
+            "min": 253.798264,
+            "p50": 264.671174,
+            "p95": 314.52428399999997,
+            "p99": 317.348472,
+            "max": 334.226066,
+            "mean": 270.1734767766666
+          },
+          "ttft_ms": {
+            "count": 600,
+            "min": 30.350088,
+            "p50": 51.56936,
+            "p95": 99.36782,
+            "p99": 102.927009,
+            "max": 125.713541,
+            "mean": 55.80014927833328
+          },
+          "by_status": {
+            "200": 600
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 245,
+            "rss_kib": {
+              "baseline": 26556,
+              "peak": 27448,
+              "settled": 27448
+            },
+            "sockets": {
+              "baseline": 69,
+              "peak": 70,
+              "settled": 70
+            },
+            "cpu_seconds": 1.02,
+            "cpu_utilization": 0.1965335577558507,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 600,
+            "observed": 600,
+            "missing": 0
+          },
+          "summaries": null
+        },
+        {
+          "offered": 600,
+          "accepted": 600,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 5152,
+          "accepted_rps": 116.44550905708542,
+          "latency_ms": {
+            "count": 600,
+            "min": 253.44290600000002,
+            "p50": 267.307276,
+            "p95": 288.897573,
+            "p99": 302.60098899999997,
+            "max": 310.440611,
+            "mean": 269.7425580449999
+          },
+          "ttft_ms": {
+            "count": 600,
+            "min": 7.979618000000001,
+            "p50": 54.924797999999996,
+            "p95": 74.202448,
+            "p99": 92.56273,
+            "max": 92.714387,
+            "mean": 55.5253985616667
+          },
+          "by_status": {
+            "200": 600
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 244,
+            "rss_kib": {
+              "baseline": 27448,
+              "peak": 27848,
+              "settled": 27848
+            },
+            "sockets": {
+              "baseline": 70,
+              "peak": 70,
+              "settled": 70
+            },
+            "cpu_seconds": 0.97,
+            "cpu_utilization": 0.18825357297562142,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 600,
+            "observed": 600,
+            "missing": 0
+          },
+          "summaries": null
+        },
+        {
+          "offered": 600,
+          "accepted": 600,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 5116,
+          "accepted_rps": 117.27766927961255,
+          "latency_ms": {
+            "count": 600,
+            "min": 252.45837100000003,
+            "p50": 264.242351,
+            "p95": 289.225563,
+            "p99": 296.917848,
+            "max": 297.185906,
+            "mean": 266.70239195833364
+          },
+          "ttft_ms": {
+            "count": 600,
+            "min": 6.762128,
+            "p50": 52.900839,
+            "p95": 78.791935,
+            "p99": 84.20219399999999,
+            "max": 84.447244,
+            "mean": 53.29412496500003
+          },
+          "by_status": {
+            "200": 600
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 242,
+            "rss_kib": {
+              "baseline": 27848,
+              "peak": 28284,
+              "settled": 28284
+            },
+            "sockets": {
+              "baseline": 70,
+              "peak": 70,
+              "settled": 70
+            },
+            "cpu_seconds": 0.96,
+            "cpu_utilization": 0.18764427084738008,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 600,
+            "observed": 600,
+            "missing": 0
+          },
+          "summaries": null
+        }
+      ],
+      "control": {
+        "offered": 600,
+        "accepted": 600,
+        "elapsed_ms": 4910,
+        "accepted_rps": 122.19577966195651,
+        "latency_ms": {
+          "count": 600,
+          "min": 252.244895,
+          "p50": 257.979969,
+          "p95": 263.131083,
+          "p99": 265.827271,
+          "max": 266.066192,
+          "mean": 258.06898507833364
+        },
+        "ttft_ms": {
+          "count": 600,
+          "min": 40.193747,
+          "p50": 42.805761999999994,
+          "p95": 47.162084,
+          "p99": 48.222428,
+          "max": 48.321562,
+          "mean": 43.155121546666685
+        }
+      },
+      "overhead_ms": {
+        "p50": 6.691205000000025,
+        "p95": 51.393200999999976,
+        "p99": 51.52120100000002,
+        "ttft_p50": 8.763598000000009,
+        "ttft_p95": 52.205735999999995
+      },
+      "store_evidence": {
+        "includes_warmup": true,
+        "backend_label": "sqlite",
+        "operations": {
+          "budget_charge": {
+            "calls": 1864,
+            "outcomes": {
+              "ok": 1864
+            },
+            "acquire_wait": {
+              "count": 1864,
+              "sum_ms": 18236.363648999974,
+              "mean_ms": 9.783456893240329,
+              "min_ms": 0.006748,
+              "max_ms": 77.754642,
+              "p50_le_ms": 10.0,
+              "p95_le_ms": 50.0,
+              "p99_le_ms": 50.0
+            },
+            "query_duration": {
+              "count": 1864,
+              "sum_ms": 2851.354459000002,
+              "mean_ms": 1.5296965981759667,
+              "min_ms": 0.224769,
+              "max_ms": 7.066463000000001,
+              "p50_le_ms": 2.5,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "budget_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.029655,
+              "mean_ms": 0.0148275,
+              "min_ms": 0.014694,
+              "max_ms": 0.014961,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 6.7655270000000005,
+              "mean_ms": 3.3827635000000003,
+              "min_ms": 3.2505110000000004,
+              "max_ms": 3.515016,
+              "p50_le_ms": 5.0,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "namespace_read": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.037281,
+              "mean_ms": 0.0186405,
+              "min_ms": 0.015177999999999999,
+              "max_ms": 0.022103,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 0.15170299999999998,
+              "mean_ms": 0.07585149999999999,
+              "min_ms": 0.07002,
+              "max_ms": 0.08168299999999999,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 0.1,
+              "p99_le_ms": 0.1
+            }
+          },
+          "namespace_resolve": {
+            "calls": 1864,
+            "outcomes": {
+              "ok": 1864
+            },
+            "acquire_wait": {
+              "count": 1864,
+              "sum_ms": 23770.109347,
+              "mean_ms": 12.75220458530043,
+              "min_ms": 0.001735,
+              "max_ms": 79.34817,
+              "p50_le_ms": 10.0,
+              "p95_le_ms": 50.0,
+              "p99_le_ms": 100.0
+            },
+            "query_duration": {
+              "count": 1864,
+              "sum_ms": 432.67448199999984,
+              "mean_ms": 0.23212150321888403,
+              "min_ms": 0.021284,
+              "max_ms": 27.699769,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.5
+            }
+          },
+          "namespace_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.11531100000000001,
+              "mean_ms": 0.057655500000000005,
+              "min_ms": 0.013852,
+              "max_ms": 0.10145900000000001,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 3.8854670000000002,
+              "mean_ms": 1.9427335000000001,
+              "min_ms": 1.242183,
+              "max_ms": 2.643284,
+              "p50_le_ms": 2.5,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "provider_models": {
+            "calls": 4,
+            "outcomes": {
+              "ok": 4
+            },
+            "acquire_wait": {
+              "count": 4,
+              "sum_ms": 0.302521,
+              "mean_ms": 0.07563025,
+              "min_ms": 0.011876,
+              "max_ms": 0.155829,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 4,
+              "sum_ms": 3.428976,
+              "mean_ms": 0.857244,
+              "min_ms": 0.03474,
+              "max_ms": 1.648005,
+              "p50_le_ms": 0.25,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 2.5
+            }
+          },
+          "usage_append": {
+            "calls": 1864,
+            "outcomes": {
+              "ok": 1864
+            },
+            "acquire_wait": {
+              "count": 1864,
+              "sum_ms": 1878.0973539999984,
+              "mean_ms": 1.0075629581545056,
+              "min_ms": 0.000029999999999999997,
+              "max_ms": 59.386753,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 10.0,
+              "p99_le_ms": 25.0
+            },
+            "query_duration": {
+              "count": 1864,
+              "sum_ms": 2069.9060529999983,
+              "mean_ms": 1.1104646207081537,
+              "min_ms": 0.18620799999999998,
+              "max_ms": 5.8407279999999995,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          }
+        },
+        "connections_opened": 0,
+        "index_queue": {
+          "depth_observations": 1864,
+          "max_depth": 31.0,
+          "wait": {
+            "count": 1864,
+            "sum_ms": 13639.771799999979,
+            "mean_ms": 7.31747414163089,
+            "min_ms": 0.0049830000000000004,
+            "max_ms": 58.857358999999995,
+            "p50_le_ms": 5.0,
+            "p95_le_ms": 50.0,
+            "p99_le_ms": 50.0
+          }
+        }
+      }
+    },
+    {
+      "id": "burst",
+      "description": "Waves of simultaneous buffered requests separated by a pause, so the pool fills and drains each wave.",
+      "scale": {
+        "arrival": {
+          "kind": "burst",
+          "wave": 128
+        },
+        "concurrency": 128,
+        "requests": 1024,
+        "warmup_requests": 128,
+        "summary_readers": 0,
+        "seeded_usage_rows": 0,
+        "payload_bytes": 0
+      },
+      "store": {
+        "backend": "sqlite",
+        "version": "3.46.0",
+        "usage_rows": 3200,
+        "data_bytes": 4820616
+      },
+      "warmup": {
+        "offered": 128,
+        "accepted": 128
+      },
+      "repetitions": [
+        {
+          "offered": 1024,
+          "accepted": 1024,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 3889,
+          "accepted_rps": 263.2694959833355,
+          "latency_ms": {
+            "count": 1024,
+            "min": 5.839613,
+            "p50": 94.52816899999999,
+            "p95": 229.93977500000003,
+            "p99": 275.911409,
+            "max": 436.997699,
+            "mean": 110.08924061132811
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 1024
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 182,
+            "rss_kib": {
+              "baseline": 33812,
+              "peak": 36116,
+              "settled": 36116
+            },
+            "sockets": {
+              "baseline": 209,
+              "peak": 210,
+              "settled": 210
+            },
+            "cpu_seconds": 0.43,
+            "cpu_utilization": 0.1105526203836272,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 1024,
+            "observed": 1024,
+            "missing": 0
+          },
+          "summaries": null
+        },
+        {
+          "offered": 1024,
+          "accepted": 1024,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 3571,
+          "accepted_rps": 286.6939893896509,
+          "latency_ms": {
+            "count": 1024,
+            "min": 3.6476170000000003,
+            "p50": 97.32675400000001,
+            "p95": 220.98806,
+            "p99": 254.07308,
+            "max": 308.81215899999995,
+            "mean": 104.38854662792967
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 1024
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 168,
+            "rss_kib": {
+              "baseline": 36116,
+              "peak": 37036,
+              "settled": 37036
+            },
+            "sockets": {
+              "baseline": 210,
+              "peak": 210,
+              "settled": 210
+            },
+            "cpu_seconds": 0.46,
+            "cpu_utilization": 0.12878831554613224,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 1024,
+            "observed": 1024,
+            "missing": 0
+          },
+          "summaries": null
+        },
+        {
+          "offered": 1024,
+          "accepted": 1024,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 3625,
+          "accepted_rps": 282.4600895037464,
+          "latency_ms": {
+            "count": 1024,
+            "min": 4.981641,
+            "p50": 96.522862,
+            "p95": 192.937098,
+            "p99": 262.230523,
+            "max": 297.825485,
+            "mean": 100.70504030371092
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 1024
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 170,
+            "rss_kib": {
+              "baseline": 37036,
+              "peak": 37492,
+              "settled": 37484
+            },
+            "sockets": {
+              "baseline": 210,
+              "peak": 210,
+              "settled": 210
+            },
+            "cpu_seconds": 0.47,
+            "cpu_utilization": 0.1296447676433211,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 1024,
+            "observed": 1024,
+            "missing": 0
+          },
+          "summaries": null
+        }
+      ],
+      "control": {
+        "offered": 1024,
+        "accepted": 1024,
+        "elapsed_ms": 1778,
+        "accepted_rps": 575.9163860474238,
+        "latency_ms": {
+          "count": 1024,
+          "min": 0.356814,
+          "p50": 1.298998,
+          "p95": 1.828778,
+          "p99": 2.020652,
+          "max": 2.153194,
+          "mean": 1.3077636269531259
+        },
+        "ttft_ms": null
+      },
+      "overhead_ms": {
+        "p50": 95.223864,
+        "p95": 191.10832,
+        "p99": 260.209871,
+        "ttft_p50": null,
+        "ttft_p95": null
+      },
+      "store_evidence": {
+        "includes_warmup": true,
+        "backend_label": "sqlite",
+        "operations": {
+          "budget_charge": {
+            "calls": 3200,
+            "outcomes": {
+              "ok": 3200
+            },
+            "acquire_wait": {
+              "count": 3200,
+              "sum_ms": 268824.85728600004,
+              "mean_ms": 84.00776790187501,
+              "min_ms": 0.001346,
+              "max_ms": 368.576126,
+              "p50_le_ms": 100.0,
+              "p95_le_ms": 250.0,
+              "p99_le_ms": 250.0
+            },
+            "query_duration": {
+              "count": 3200,
+              "sum_ms": 3454.137188999995,
+              "mean_ms": 1.0794178715624985,
+              "min_ms": 0.188932,
+              "max_ms": 7.082171,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "budget_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.16726,
+              "mean_ms": 0.08363,
+              "min_ms": 0.01453,
+              "max_ms": 0.15273,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 6.1333020000000005,
+              "mean_ms": 3.0666510000000002,
+              "min_ms": 2.805177,
+              "max_ms": 3.328125,
+              "p50_le_ms": 5.0,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "namespace_read": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.020922999999999997,
+              "mean_ms": 0.010461499999999999,
+              "min_ms": 0.008133,
+              "max_ms": 0.01279,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 0.121951,
+              "mean_ms": 0.0609755,
+              "min_ms": 0.058643,
+              "max_ms": 0.063308,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 0.1,
+              "p99_le_ms": 0.1
+            }
+          },
+          "namespace_resolve": {
+            "calls": 3200,
+            "outcomes": {
+              "ok": 3200
+            },
+            "acquire_wait": {
+              "count": 3200,
+              "sum_ms": 64140.241225000005,
+              "mean_ms": 20.0438253828125,
+              "min_ms": 0.000804,
+              "max_ms": 253.28235700000002,
+              "p50_le_ms": 25.0,
+              "p95_le_ms": 50.0,
+              "p99_le_ms": 250.0
+            },
+            "query_duration": {
+              "count": 3200,
+              "sum_ms": 426.6230919999993,
+              "mean_ms": 0.13331971624999978,
+              "min_ms": 0.017759999999999998,
+              "max_ms": 1.647085,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 0.5,
+              "p99_le_ms": 1.0
+            }
+          },
+          "namespace_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.358001,
+              "mean_ms": 0.1790005,
+              "min_ms": 0.136503,
+              "max_ms": 0.221498,
+              "p50_le_ms": 0.25,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 5.7065719999999995,
+              "mean_ms": 2.8532859999999998,
+              "min_ms": 1.515179,
+              "max_ms": 4.191393,
+              "p50_le_ms": 2.5,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "provider_models": {
+            "calls": 4,
+            "outcomes": {
+              "ok": 4
+            },
+            "acquire_wait": {
+              "count": 4,
+              "sum_ms": 0.270854,
+              "mean_ms": 0.0677135,
+              "min_ms": 0.01508,
+              "max_ms": 0.213415,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 4,
+              "sum_ms": 7.5327280000000005,
+              "mean_ms": 1.8831820000000001,
+              "min_ms": 0.142726,
+              "max_ms": 3.816188,
+              "p50_le_ms": 0.25,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "usage_append": {
+            "calls": 3200,
+            "outcomes": {
+              "ok": 3200
+            },
+            "acquire_wait": {
+              "count": 3200,
+              "sum_ms": 3340.7477479999534,
+              "mean_ms": 1.0439836712499855,
+              "min_ms": 0.000029999999999999997,
+              "max_ms": 217.014079,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 100.0
+            },
+            "query_duration": {
+              "count": 3200,
+              "sum_ms": 2743.1010229999997,
+              "mean_ms": 0.8572190696875,
+              "min_ms": 0.17571199999999998,
+              "max_ms": 6.412939000000001,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          }
+        },
+        "connections_opened": 0,
+        "index_queue": {
+          "depth_observations": 3200,
+          "max_depth": 119.0,
+          "wait": {
+            "count": 3200,
+            "sum_ms": 209196.27508099994,
+            "mean_ms": 65.37383596281248,
+            "min_ms": 0.005072,
+            "max_ms": 215.134355,
+            "p50_le_ms": 100.0,
+            "p95_le_ms": 250.0,
+            "p99_le_ms": 250.0
+          }
+        }
+      }
+    },
+    {
+      "id": "summaries",
+      "description": "Steady buffered load while concurrent management readers summarise usage over a small index.",
+      "scale": {
+        "arrival": {
+          "kind": "closed_loop"
+        },
+        "concurrency": 32,
+        "requests": 2000,
+        "warmup_requests": 200,
+        "summary_readers": 4,
+        "seeded_usage_rows": 0,
+        "payload_bytes": 0
+      },
+      "store": {
+        "backend": "sqlite",
+        "version": "3.46.0",
+        "usage_rows": 6200,
+        "data_bytes": 5361216
+      },
+      "warmup": {
+        "offered": 200,
+        "accepted": 200
+      },
+      "repetitions": [
+        {
+          "offered": 2000,
+          "accepted": 2000,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 3608,
+          "accepted_rps": 554.1757487643799,
+          "latency_ms": {
+            "count": 2000,
+            "min": 2.066177,
+            "p50": 53.688387,
+            "p95": 99.688777,
+            "p99": 121.728177,
+            "max": 161.45788199999998,
+            "mean": 57.42821972900005
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 2000
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 171,
+            "rss_kib": {
+              "baseline": 26000,
+              "peak": 27884,
+              "settled": 27864
+            },
+            "sockets": {
+              "baseline": 63,
+              "peak": 68,
+              "settled": 68
+            },
+            "cpu_seconds": 1.13,
+            "cpu_utilization": 0.31310929805187465,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 2000,
+            "observed": 2000,
+            "missing": 0
+          },
+          "summaries": {
+            "readers": 4,
+            "requests": 273,
+            "ok": 273,
+            "errors": 0,
+            "by_status": {
+              "200": 273
+            },
+            "latency_ms": {
+              "count": 273,
+              "min": 0.281083,
+              "p50": 50.209466,
+              "p95": 101.25647599999999,
+              "p99": 110.038407,
+              "max": 159.135469,
+              "mean": 53.02892367399266
+            },
+            "requests_per_second": 75.64498970633787
+          }
+        },
+        {
+          "offered": 2000,
+          "accepted": 2000,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 3722,
+          "accepted_rps": 537.2658935929456,
+          "latency_ms": {
+            "count": 2000,
+            "min": 1.088452,
+            "p50": 55.206786,
+            "p95": 99.624697,
+            "p99": 119.89473000000001,
+            "max": 162.31869400000002,
+            "mean": 59.17806362349992
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 2000
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 176,
+            "rss_kib": {
+              "baseline": 27864,
+              "peak": 28340,
+              "settled": 28340
+            },
+            "sockets": {
+              "baseline": 68,
+              "peak": 68,
+              "settled": 68
+            },
+            "cpu_seconds": 1.24,
+            "cpu_utilization": 0.3331048540276263,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 2000,
+            "observed": 2000,
+            "missing": 0
+          },
+          "summaries": {
+            "readers": 4,
+            "requests": 276,
+            "ok": 276,
+            "errors": 0,
+            "by_status": {
+              "200": 276
+            },
+            "latency_ms": {
+              "count": 276,
+              "min": 0.630488,
+              "p50": 50.791056,
+              "p95": 95.247181,
+              "p99": 116.763186,
+              "max": 123.486501,
+              "mean": 54.045722565217396
+            },
+            "requests_per_second": 74.1426933158265
+          }
+        },
+        {
+          "offered": 2000,
+          "accepted": 2000,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 2849,
+          "accepted_rps": 701.9485437006111,
+          "latency_ms": {
+            "count": 2000,
+            "min": 0.781124,
+            "p50": 41.113838,
+            "p95": 75.73010400000001,
+            "p99": 101.54363199999999,
+            "max": 171.96935499999998,
+            "mean": 44.79155401800005
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 2000
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 135,
+            "rss_kib": {
+              "baseline": 28340,
+              "peak": 28948,
+              "settled": 28884
+            },
+            "sockets": {
+              "baseline": 68,
+              "peak": 68,
+              "settled": 68
+            },
+            "cpu_seconds": 1.27,
+            "cpu_utilization": 0.44573732524988807,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 2000,
+            "observed": 2000,
+            "missing": 0
+          },
+          "summaries": {
+            "readers": 4,
+            "requests": 281,
+            "ok": 281,
+            "errors": 0,
+            "by_status": {
+              "200": 281
+            },
+            "latency_ms": {
+              "count": 281,
+              "min": 0.876487,
+              "p50": 39.110189,
+              "p95": 69.918387,
+              "p99": 89.570074,
+              "max": 104.22508900000001,
+              "mean": 40.64827585409251
+            },
+            "requests_per_second": 98.62377038993587
+          }
+        }
+      ],
+      "control": null,
+      "overhead_ms": null,
+      "store_evidence": {
+        "includes_warmup": true,
+        "backend_label": "sqlite",
+        "operations": {
+          "budget_charge": {
+            "calls": 6200,
+            "outcomes": {
+              "ok": 6200
+            },
+            "acquire_wait": {
+              "count": 6200,
+              "sum_ms": 151168.87428100003,
+              "mean_ms": 24.38207649693549,
+              "min_ms": 0.0009490000000000001,
+              "max_ms": 114.78583,
+              "p50_le_ms": 25.0,
+              "p95_le_ms": 100.0,
+              "p99_le_ms": 100.0
+            },
+            "query_duration": {
+              "count": 6200,
+              "sum_ms": 5373.248950999992,
+              "mean_ms": 0.866653056612902,
+              "min_ms": 0.19528500000000001,
+              "max_ms": 5.461126,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 5.0
+            }
+          },
+          "budget_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.17855100000000002,
+              "mean_ms": 0.08927550000000001,
+              "min_ms": 0.017249,
+              "max_ms": 0.161302,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 5.748434,
+              "mean_ms": 2.874217,
+              "min_ms": 2.271086,
+              "max_ms": 3.477348,
+              "p50_le_ms": 2.5,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "namespace_read": {
+            "calls": 832,
+            "outcomes": {
+              "ok": 832
+            },
+            "acquire_wait": {
+              "count": 832,
+              "sum_ms": 20535.723671,
+              "mean_ms": 24.682360181490385,
+              "min_ms": 0.002022,
+              "max_ms": 104.658833,
+              "p50_le_ms": 25.0,
+              "p95_le_ms": 100.0,
+              "p99_le_ms": 100.0
+            },
+            "query_duration": {
+              "count": 832,
+              "sum_ms": 50.00193500000002,
+              "mean_ms": 0.06009847956730771,
+              "min_ms": 0.012402999999999999,
+              "max_ms": 0.577887,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            }
+          },
+          "namespace_resolve": {
+            "calls": 6200,
+            "outcomes": {
+              "ok": 6200
+            },
+            "acquire_wait": {
+              "count": 6200,
+              "sum_ms": 174791.38511299985,
+              "mean_ms": 28.192158889193525,
+              "min_ms": 0.001718,
+              "max_ms": 118.286761,
+              "p50_le_ms": 50.0,
+              "p95_le_ms": 100.0,
+              "p99_le_ms": 100.0
+            },
+            "query_duration": {
+              "count": 6200,
+              "sum_ms": 504.561435999999,
+              "mean_ms": 0.08138087677419338,
+              "min_ms": 0.017204,
+              "max_ms": 0.912243,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            }
+          },
+          "namespace_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.259836,
+              "mean_ms": 0.129918,
+              "min_ms": 0.014494,
+              "max_ms": 0.245342,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 4.168635,
+              "mean_ms": 2.0843175,
+              "min_ms": 2.047631,
+              "max_ms": 2.121004,
+              "p50_le_ms": 2.5,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 2.5
+            }
+          },
+          "provider_models": {
+            "calls": 4,
+            "outcomes": {
+              "ok": 4
+            },
+            "acquire_wait": {
+              "count": 4,
+              "sum_ms": 0.061935,
+              "mean_ms": 0.01548375,
+              "min_ms": 0.010818999999999999,
+              "max_ms": 0.019851,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 4,
+              "sum_ms": 4.290547,
+              "mean_ms": 1.07263675,
+              "min_ms": 0.020221,
+              "max_ms": 2.5410519999999996,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "usage_append": {
+            "calls": 6200,
+            "outcomes": {
+              "ok": 6200
+            },
+            "acquire_wait": {
+              "count": 6200,
+              "sum_ms": 5754.723217999875,
+              "mean_ms": 0.9281811641935281,
+              "min_ms": 0.000029999999999999997,
+              "max_ms": 46.819265,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 10.0,
+              "p99_le_ms": 25.0
+            },
+            "query_duration": {
+              "count": 6200,
+              "sum_ms": 4351.570782999999,
+              "mean_ms": 0.7018662553225805,
+              "min_ms": 0.17106000000000002,
+              "max_ms": 5.587893,
+              "p50_le_ms": 0.5,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 5.0
+            }
+          },
+          "usage_summary": {
+            "calls": 830,
+            "outcomes": {
+              "ok": 830
+            },
+            "acquire_wait": {
+              "count": 830,
+              "sum_ms": 19625.705588999965,
+              "mean_ms": 23.645428420481885,
+              "min_ms": 0.002813,
+              "max_ms": 86.053081,
+              "p50_le_ms": 25.0,
+              "p95_le_ms": 100.0,
+              "p99_le_ms": 100.0
+            },
+            "query_duration": {
+              "count": 830,
+              "sum_ms": 474.74198400000006,
+              "mean_ms": 0.5719782939759037,
+              "min_ms": 0.06662900000000001,
+              "max_ms": 1.338876,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 1.0,
+              "p99_le_ms": 2.5
+            }
+          }
+        },
+        "connections_opened": 0,
+        "index_queue": {
+          "depth_observations": 6200,
+          "max_depth": 40.0,
+          "wait": {
+            "count": 6200,
+            "sum_ms": 85560.14438500033,
+            "mean_ms": 13.80002328790328,
+            "min_ms": 0.004436000000000001,
+            "max_ms": 47.975375,
+            "p50_le_ms": 25.0,
+            "p95_le_ms": 50.0,
+            "p99_le_ms": 50.0
+          }
+        }
+      }
+    },
+    {
+      "id": "slow-store",
+      "description": "Steady buffered load while concurrent management readers summarise usage over a pre-seeded large index.",
+      "scale": {
+        "arrival": {
+          "kind": "closed_loop"
+        },
+        "concurrency": 32,
+        "requests": 2000,
+        "warmup_requests": 200,
+        "summary_readers": 4,
+        "seeded_usage_rows": 200000,
+        "payload_bytes": 0
+      },
+      "store": {
+        "backend": "sqlite",
+        "version": "3.46.0",
+        "usage_rows": 206200,
+        "data_bytes": 29576864
+      },
+      "warmup": {
+        "offered": 200,
+        "accepted": 200
+      },
+      "repetitions": [
+        {
+          "offered": 2000,
+          "accepted": 2000,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 16802,
+          "accepted_rps": 119.03324943168609,
+          "latency_ms": {
+            "count": 2000,
+            "min": 1.732421,
+            "p50": 267.995373,
+            "p95": 399.688042,
+            "p99": 506.793321,
+            "max": 727.641138,
+            "mean": 266.2965918855001
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 2000
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 791,
+            "rss_kib": {
+              "baseline": 25984,
+              "peak": 29448,
+              "settled": 29328
+            },
+            "sockets": {
+              "baseline": 69,
+              "peak": 74,
+              "settled": 74
+            },
+            "cpu_seconds": 12.11,
+            "cpu_utilization": 0.7207463253088593,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 2000,
+            "observed": 2000,
+            "missing": 0
+          },
+          "summaries": {
+            "readers": 4,
+            "requests": 286,
+            "ok": 286,
+            "errors": 0,
+            "by_status": {
+              "200": 286
+            },
+            "latency_ms": {
+              "count": 286,
+              "min": 37.724369,
+              "p50": 239.14874799999998,
+              "p95": 362.887199,
+              "p99": 425.322248,
+              "max": 440.344816,
+              "mean": 236.72210459440558
+            },
+            "requests_per_second": 17.021754668731113
+          }
+        },
+        {
+          "offered": 2000,
+          "accepted": 2000,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 15516,
+          "accepted_rps": 128.89384381371624,
+          "latency_ms": {
+            "count": 2000,
+            "min": 3.6283600000000003,
+            "p50": 249.12337200000002,
+            "p95": 389.112659,
+            "p99": 476.306275,
+            "max": 584.052797,
+            "mean": 246.36600966500026
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 2000
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 730,
+            "rss_kib": {
+              "baseline": 29324,
+              "peak": 29628,
+              "settled": 29612
+            },
+            "sockets": {
+              "baseline": 74,
+              "peak": 74,
+              "settled": 74
+            },
+            "cpu_seconds": 11.8,
+            "cpu_utilization": 0.760473678500926,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 2000,
+            "observed": 2000,
+            "missing": 0
+          },
+          "summaries": {
+            "readers": 4,
+            "requests": 277,
+            "ok": 277,
+            "errors": 0,
+            "by_status": {
+              "200": 277
+            },
+            "latency_ms": {
+              "count": 277,
+              "min": 38.209078,
+              "p50": 236.23433,
+              "p95": 343.104598,
+              "p99": 392.65874099999996,
+              "max": 502.24339699999996,
+              "mean": 225.60185906859203
+            },
+            "requests_per_second": 17.8517973681997
+          }
+        },
+        {
+          "offered": 2000,
+          "accepted": 2000,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 16075,
+          "accepted_rps": 124.410207309433,
+          "latency_ms": {
+            "count": 2000,
+            "min": 1.142442,
+            "p50": 250.940416,
+            "p95": 390.752568,
+            "p99": 472.827667,
+            "max": 627.332366,
+            "mean": 254.2501604449998
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 2000
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 756,
+            "rss_kib": {
+              "baseline": 29612,
+              "peak": 29852,
+              "settled": 29836
+            },
+            "sockets": {
+              "baseline": 74,
+              "peak": 74,
+              "settled": 74
+            },
+            "cpu_seconds": 12.62,
+            "cpu_utilization": 0.7850284081225222,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 2000,
+            "observed": 2000,
+            "missing": 0
+          },
+          "summaries": {
+            "readers": 4,
+            "requests": 289,
+            "ok": 289,
+            "errors": 0,
+            "by_status": {
+              "200": 289
+            },
+            "latency_ms": {
+              "count": 289,
+              "min": 38.809243,
+              "p50": 229.223975,
+              "p95": 342.348618,
+              "p99": 427.50104799999997,
+              "max": 495.052287,
+              "mean": 223.9002981141869
+            },
+            "requests_per_second": 17.97727495621307
+          }
+        }
+      ],
+      "control": null,
+      "overhead_ms": null,
+      "store_evidence": {
+        "includes_warmup": true,
+        "backend_label": "sqlite",
+        "operations": {
+          "budget_charge": {
+            "calls": 6200,
+            "outcomes": {
+              "ok": 6200
+            },
+            "acquire_wait": {
+              "count": 6200,
+              "sum_ms": 719911.3423600042,
+              "mean_ms": 116.11473263871035,
+              "min_ms": 0.001446,
+              "max_ms": 671.878736,
+              "p50_le_ms": 250.0,
+              "p95_le_ms": 250.0,
+              "p99_le_ms": 1000.0
+            },
+            "query_duration": {
+              "count": 6200,
+              "sum_ms": 9447.179000000031,
+              "mean_ms": 1.5237385483871018,
+              "min_ms": 0.19302,
+              "max_ms": 7.556834,
+              "p50_le_ms": 2.5,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "budget_write": {
+            "calls": 3,
+            "outcomes": {
+              "ok": 3
+            },
+            "acquire_wait": {
+              "count": 3,
+              "sum_ms": 0.268169,
+              "mean_ms": 0.08938966666666666,
+              "min_ms": 0.011729999999999999,
+              "max_ms": 0.12897599999999998,
+              "p50_le_ms": 0.25,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 3,
+              "sum_ms": 1.720688,
+              "mean_ms": 0.5735626666666667,
+              "min_ms": 0.061853000000000005,
+              "max_ms": 1.25215,
+              "p50_le_ms": 0.5,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 2.5
+            }
+          },
+          "namespace_read": {
+            "calls": 854,
+            "outcomes": {
+              "ok": 854
+            },
+            "acquire_wait": {
+              "count": 854,
+              "sum_ms": 83077.47139300004,
+              "mean_ms": 97.28041146721317,
+              "min_ms": 0.007942,
+              "max_ms": 284.647563,
+              "p50_le_ms": 100.0,
+              "p95_le_ms": 250.0,
+              "p99_le_ms": 1000.0
+            },
+            "query_duration": {
+              "count": 854,
+              "sum_ms": 73.57591800000004,
+              "mean_ms": 0.08615447072599537,
+              "min_ms": 0.018033,
+              "max_ms": 0.383001,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.5
+            }
+          },
+          "namespace_resolve": {
+            "calls": 6200,
+            "outcomes": {
+              "ok": 6200
+            },
+            "acquire_wait": {
+              "count": 6200,
+              "sum_ms": 818731.5124719993,
+              "mean_ms": 132.05346975354826,
+              "min_ms": 0.0022500000000000003,
+              "max_ms": 516.651451,
+              "p50_le_ms": 250.0,
+              "p95_le_ms": 1000.0,
+              "p99_le_ms": 1000.0
+            },
+            "query_duration": {
+              "count": 6200,
+              "sum_ms": 895.3063249999992,
+              "mean_ms": 0.14440424596774182,
+              "min_ms": 0.021302,
+              "max_ms": 25.800809,
+              "p50_le_ms": 0.25,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.5
+            }
+          },
+          "namespace_write": {
+            "calls": 2,
+            "outcomes": {
+              "error": 1,
+              "ok": 1
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.37293699999999996,
+              "mean_ms": 0.18646849999999998,
+              "min_ms": 0.155622,
+              "max_ms": 0.21731499999999998,
+              "p50_le_ms": 0.25,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 6.813244999999999,
+              "mean_ms": 3.4066224999999997,
+              "min_ms": 0.278134,
+              "max_ms": 6.535111,
+              "p50_le_ms": 0.5,
+              "p95_le_ms": 10.0,
+              "p99_le_ms": 10.0
+            }
+          },
+          "provider_models": {
+            "calls": 4,
+            "outcomes": {
+              "ok": 4
+            },
+            "acquire_wait": {
+              "count": 4,
+              "sum_ms": 0.046985,
+              "mean_ms": 0.01174625,
+              "min_ms": 0.007242,
+              "max_ms": 0.014987,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 4,
+              "sum_ms": 3.8787749999999996,
+              "mean_ms": 0.9696937499999999,
+              "min_ms": 0.049282,
+              "max_ms": 2.2811049999999997,
+              "p50_le_ms": 0.1,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 2.5
+            }
+          },
+          "usage_append": {
+            "calls": 6200,
+            "outcomes": {
+              "ok": 6200
+            },
+            "acquire_wait": {
+              "count": 6200,
+              "sum_ms": 39365.71667599982,
+              "mean_ms": 6.349309141290294,
+              "min_ms": 0.000029999999999999997,
+              "max_ms": 314.181299,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 100.0,
+              "p99_le_ms": 250.0
+            },
+            "query_duration": {
+              "count": 6200,
+              "sum_ms": 6566.385437999981,
+              "mean_ms": 1.059094425483868,
+              "min_ms": 0.15696100000000002,
+              "max_ms": 6.77066,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "usage_summary": {
+            "calls": 852,
+            "outcomes": {
+              "ok": 852
+            },
+            "acquire_wait": {
+              "count": 852,
+              "sum_ms": 78506.27598900009,
+              "mean_ms": 92.14351641901419,
+              "min_ms": 0.0024549999999999997,
+              "max_ms": 302.824818,
+              "p50_le_ms": 100.0,
+              "p95_le_ms": 250.0,
+              "p99_le_ms": 250.0
+            },
+            "query_duration": {
+              "count": 852,
+              "sum_ms": 32936.24457900003,
+              "mean_ms": 38.65756405985919,
+              "min_ms": 37.248841,
+              "max_ms": 48.564681,
+              "p50_le_ms": 50.0,
+              "p95_le_ms": 50.0,
+              "p99_le_ms": 50.0
+            }
+          }
+        },
+        "connections_opened": 0,
+        "index_queue": {
+          "depth_observations": 6200,
+          "max_depth": 60.0,
+          "wait": {
+            "count": 6200,
+            "sum_ms": 443723.32025600015,
+            "mean_ms": 71.56827746064519,
+            "min_ms": 0.004966000000000001,
+            "max_ms": 367.01725400000004,
+            "p50_le_ms": 100.0,
+            "p95_le_ms": 250.0,
+            "p99_le_ms": 250.0
+          }
+        }
+      }
+    },
+    {
+      "id": "large-payload",
+      "description": "Buffered requests with a large native prompt relaying a 256 KiB answer.",
+      "scale": {
+        "arrival": {
+          "kind": "closed_loop"
+        },
+        "concurrency": 16,
+        "requests": 600,
+        "warmup_requests": 64,
+        "summary_readers": 0,
+        "seeded_usage_rows": 0,
+        "payload_bytes": 262144
+      },
+      "store": {
+        "backend": "sqlite",
+        "version": "3.46.0",
+        "usage_rows": 1864,
+        "data_bytes": 4578904
+      },
+      "warmup": {
+        "offered": 64,
+        "accepted": 64
+      },
+      "repetitions": [
+        {
+          "offered": 600,
+          "accepted": 600,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 1207,
+          "accepted_rps": 496.9287237407747,
+          "latency_ms": {
+            "count": 600,
+            "min": 6.248132,
+            "p50": 30.142438000000002,
+            "p95": 59.550923999999995,
+            "p99": 73.03827799999999,
+            "max": 92.276837,
+            "mean": 31.52917043833334
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 600
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 58,
+            "rss_kib": {
+              "baseline": 50192,
+              "peak": 61176,
+              "settled": 54080
+            },
+            "sockets": {
+              "baseline": 34,
+              "peak": 36,
+              "settled": 36
+            },
+            "cpu_seconds": 0.9,
+            "cpu_utilization": 0.7453930856111621,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 600,
+            "observed": 600,
+            "missing": 0
+          },
+          "summaries": null
+        },
+        {
+          "offered": 600,
+          "accepted": 600,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 1082,
+          "accepted_rps": 554.4331815573731,
+          "latency_ms": {
+            "count": 600,
+            "min": 3.527818,
+            "p50": 26.588572000000003,
+            "p95": 49.745909999999995,
+            "p99": 64.330022,
+            "max": 79.237966,
+            "mean": 28.184569575000005
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 600
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 52,
+            "rss_kib": {
+              "baseline": 54080,
+              "peak": 64256,
+              "settled": 62224
+            },
+            "sockets": {
+              "baseline": 36,
+              "peak": 36,
+              "settled": 36
+            },
+            "cpu_seconds": 0.87,
+            "cpu_utilization": 0.803928113258191,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 600,
+            "observed": 600,
+            "missing": 0
+          },
+          "summaries": null
+        },
+        {
+          "offered": 600,
+          "accepted": 600,
+          "rejected": 0,
+          "errors": 0,
+          "transport_failures": 0,
+          "reconciled": true,
+          "elapsed_ms": 1143,
+          "accepted_rps": 524.5356158992556,
+          "latency_ms": {
+            "count": 600,
+            "min": 3.8214059999999996,
+            "p50": 28.905151,
+            "p95": 50.345531,
+            "p99": 60.451214,
+            "max": 67.238477,
+            "mean": 29.57819400166667
+          },
+          "ttft_ms": null,
+          "by_status": {
+            "200": 600
+          },
+          "rejections_by_error_type": {},
+          "errors_by_error_type": {},
+          "resources": {
+            "sampled": true,
+            "procfs": true,
+            "samples": 55,
+            "rss_kib": {
+              "baseline": 62224,
+              "peak": 66192,
+              "settled": 61176
+            },
+            "sockets": {
+              "baseline": 36,
+              "peak": 36,
+              "settled": 36
+            },
+            "cpu_seconds": 0.88,
+            "cpu_utilization": 0.7693189033189083,
+            "user_hz": 100.0
+          },
+          "usage_records": {
+            "expected": 600,
+            "observed": 600,
+            "missing": 0
+          },
+          "summaries": null
+        }
+      ],
+      "control": {
+        "offered": 600,
+        "accepted": 600,
+        "elapsed_ms": 104,
+        "accepted_rps": 5715.078477314496,
+        "latency_ms": {
+          "count": 600,
+          "min": 0.304478,
+          "p50": 1.711742,
+          "p95": 5.285785000000001,
+          "p99": 7.254181999999999,
+          "max": 9.406046,
+          "mean": 2.1684489066666663
+        },
+        "ttft_ms": null
+      },
+      "overhead_ms": {
+        "p50": 27.193409,
+        "p95": 45.059746000000004,
+        "p99": 53.197032,
+        "ttft_p50": null,
+        "ttft_p95": null
+      },
+      "store_evidence": {
+        "includes_warmup": true,
+        "backend_label": "sqlite",
+        "operations": {
+          "budget_charge": {
+            "calls": 1864,
+            "outcomes": {
+              "ok": 1864
+            },
+            "acquire_wait": {
+              "count": 1864,
+              "sum_ms": 23600.985522999963,
+              "mean_ms": 12.661472920064357,
+              "min_ms": 0.003468,
+              "max_ms": 52.71467,
+              "p50_le_ms": 25.0,
+              "p95_le_ms": 50.0,
+              "p99_le_ms": 50.0
+            },
+            "query_duration": {
+              "count": 1864,
+              "sum_ms": 1931.1077200000004,
+              "mean_ms": 1.0360019957081548,
+              "min_ms": 0.19186799999999998,
+              "max_ms": 5.335495,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 5.0,
+              "p99_le_ms": 5.0
+            }
+          },
+          "budget_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.26946499999999995,
+              "mean_ms": 0.13473249999999998,
+              "min_ms": 0.009082,
+              "max_ms": 0.260383,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.5,
+              "p99_le_ms": 0.5
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 3.802875,
+              "mean_ms": 1.9014375,
+              "min_ms": 1.8282839999999998,
+              "max_ms": 1.974591,
+              "p50_le_ms": 2.5,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 2.5
+            }
+          },
+          "namespace_read": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.032320999999999996,
+              "mean_ms": 0.016160499999999998,
+              "min_ms": 0.013557999999999999,
+              "max_ms": 0.018763,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 0.09386900000000001,
+              "mean_ms": 0.046934500000000004,
+              "min_ms": 0.032816,
+              "max_ms": 0.061053,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.1,
+              "p99_le_ms": 0.1
+            }
+          },
+          "namespace_resolve": {
+            "calls": 1864,
+            "outcomes": {
+              "ok": 1864
+            },
+            "acquire_wait": {
+              "count": 1864,
+              "sum_ms": 25531.85353000001,
+              "mean_ms": 13.697346314377688,
+              "min_ms": 0.002812,
+              "max_ms": 51.546087,
+              "p50_le_ms": 25.0,
+              "p95_le_ms": 50.0,
+              "p99_le_ms": 50.0
+            },
+            "query_duration": {
+              "count": 1864,
+              "sum_ms": 312.03775,
+              "mean_ms": 0.1674022263948498,
+              "min_ms": 0.032595,
+              "max_ms": 1.839665,
+              "p50_le_ms": 0.25,
+              "p95_le_ms": 0.5,
+              "p99_le_ms": 1.0
+            }
+          },
+          "namespace_write": {
+            "calls": 2,
+            "outcomes": {
+              "ok": 2
+            },
+            "acquire_wait": {
+              "count": 2,
+              "sum_ms": 0.11673700000000001,
+              "mean_ms": 0.058368500000000004,
+              "min_ms": 0.006922,
+              "max_ms": 0.10981500000000001,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.25,
+              "p99_le_ms": 0.25
+            },
+            "query_duration": {
+              "count": 2,
+              "sum_ms": 1.313331,
+              "mean_ms": 0.6566655,
+              "min_ms": 0.615816,
+              "max_ms": 0.697515,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 1.0,
+              "p99_le_ms": 1.0
+            }
+          },
+          "provider_models": {
+            "calls": 4,
+            "outcomes": {
+              "ok": 4
+            },
+            "acquire_wait": {
+              "count": 4,
+              "sum_ms": 0.053721000000000005,
+              "mean_ms": 0.013430250000000001,
+              "min_ms": 0.012427,
+              "max_ms": 0.01504,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 0.05,
+              "p99_le_ms": 0.05
+            },
+            "query_duration": {
+              "count": 4,
+              "sum_ms": 1.7613809999999999,
+              "mean_ms": 0.44034524999999997,
+              "min_ms": 0.158644,
+              "max_ms": 0.813672,
+              "p50_le_ms": 0.25,
+              "p95_le_ms": 1.0,
+              "p99_le_ms": 1.0
+            }
+          },
+          "usage_append": {
+            "calls": 1864,
+            "outcomes": {
+              "ok": 1864
+            },
+            "acquire_wait": {
+              "count": 1864,
+              "sum_ms": 1817.2530909999984,
+              "mean_ms": 0.9749211861587974,
+              "min_ms": 0.000029999999999999997,
+              "max_ms": 21.641163000000002,
+              "p50_le_ms": 0.05,
+              "p95_le_ms": 10.0,
+              "p99_le_ms": 25.0
+            },
+            "query_duration": {
+              "count": 1864,
+              "sum_ms": 1490.4523940000001,
+              "mean_ms": 0.7995989238197425,
+              "min_ms": 0.16966,
+              "max_ms": 4.920229,
+              "p50_le_ms": 1.0,
+              "p95_le_ms": 2.5,
+              "p99_le_ms": 5.0
+            }
+          }
+        },
+        "connections_opened": 0,
+        "index_queue": {
+          "depth_observations": 1864,
+          "max_depth": 23.0,
+          "wait": {
+            "count": 1864,
+            "sum_ms": 15459.386244000018,
+            "mean_ms": 8.293662148068679,
+            "min_ms": 0.004698,
+            "max_ms": 30.974015,
+            "p50_le_ms": 10.0,
+            "p95_le_ms": 25.0,
+            "p99_le_ms": 50.0
+          }
+        }
+      }
+    }
+  ]
+}

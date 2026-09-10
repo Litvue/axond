@@ -232,9 +232,141 @@ The retained records are under
 source; the tables below are read from them. **This is a shared cloud VM with
 4 vCPUs, not a controlled runner**: the repetitions' spread and the negative
 overheads on some rows are what that costs, and the numbers are the shape of
-the Store's contribution rather than a promise about any of them.
+the Store's contribution rather than a promise about any of them. Postgres ran
+on the same host over loopback (`sslmode=disable`), so its phase numbers carry
+no network round trip; other builds were running on the host during both arms.
+The binary both arms booted is the one the artifacts hash
+(`environment.binary.sha256`), built in release from the commit they name with
+a clean tree.
 
-<!-- BASELINE_TABLES -->
+- `sqlite`: commit `e3dd018807cf8d62fa833dd229d009974aaff678`, release profile, rustc 1.97.1 (8bab26f4f 2026-07-14), 4 vCPU Intel(R) Xeon(R) Processor, 16014 MiB, linux 6.12.94+; Store 3.46.0; 3 repetitions per scenario; run took 149 s.
+- `postgres`: commit `e3dd018807cf8d62fa833dd229d009974aaff678`, release profile, rustc 1.97.1 (8bab26f4f 2026-07-14), 4 vCPU Intel(R) Xeon(R) Processor, 16014 MiB, linux 6.12.94+; Store PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit; 3 repetitions per scenario; run took 96 s.
+
+### Request path (median repetition, release build)
+
+| Scenario | Backend | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Overhead p50 / p95 vs control | CPU cores | Peak RSS | Shed / errors / usage missing |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `steady-buffered` | sqlite | 581 | 53.2 ms | 89.8 ms | 105.6 ms | — | 52.9 ms / 89.2 ms | 0.30 | 28 MiB | 0 / 0 / 0 |
+| `steady-buffered` | postgres | 816 | 28.1 ms | 112.1 ms | 182.5 ms | — | 27.7 ms / 111.5 ms | 0.43 | 26 MiB | 0 / 0 / 0 |
+| `steady-streamed` | sqlite | 116 | 264.7 ms | 314.5 ms | 317.3 ms | 99.4 ms | 6.7 ms / 51.4 ms | 0.20 | 26 MiB | 0 / 0 / 0 |
+| `steady-streamed` | postgres | 121 | 257.4 ms | 272.4 ms | 286.7 ms | 55.3 ms | -0.607 ms / 10.5 ms | 0.21 | 26 MiB | 0 / 0 / 0 |
+| `burst` | sqlite | 282 | 96.5 ms | 192.9 ms | 262.2 ms | — | 95.2 ms / 191.1 ms | 0.13 | 36 MiB | 0 / 0 / 0 |
+| `burst` | postgres | 341 | 91.2 ms | 150.5 ms | 168.5 ms | — | 90.0 ms / 148.7 ms | 0.18 | 35 MiB | 0 / 0 / 0 |
+| `summaries` | sqlite | 554 | 53.7 ms | 99.7 ms | 121.7 ms | — | — | 0.31 | 27 MiB | 0 / 0 / 0 |
+| `summaries` | postgres | 861 | 25.7 ms | 105.9 ms | 167.0 ms | — | — | 0.61 | 26 MiB | 0 / 0 / 0 |
+| `slow-store` | sqlite | 124 | 250.9 ms | 390.8 ms | 472.8 ms | — | — | 0.79 | 29 MiB | 0 / 0 / 0 |
+| `slow-store` | postgres | 783 | 30.5 ms | 110.9 ms | 164.8 ms | — | — | 0.29 | 28 MiB | 0 / 0 / 0 |
+| `large-payload` | sqlite | 525 | 28.9 ms | 50.3 ms | 60.5 ms | — | 27.2 ms / 45.1 ms | 0.77 | 64 MiB | 0 / 0 / 0 |
+| `large-payload` | postgres | 702 | 17.1 ms | 53.8 ms | 78.9 ms | — | 15.3 ms / 48.2 ms | 0.99 | 62 MiB | 0 / 0 / 0 |
+
+### Store phases (cumulative over each scenario's process, warmup included)
+
+| Scenario | Backend | `namespace_resolve` wait mean / p95 ≤ / max | `namespace_resolve` query mean | `budget_charge` wait mean / max | `budget_charge` query mean / max | `usage_summary` query mean / max | Connections opened |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `steady-buffered` | sqlite | 29.0 ms / 100.0 ms / 136.7 ms | 0.110 ms | 28.2 ms / 168.4 ms | 0.978 ms / 26.1 ms | — | 0 |
+| `steady-buffered` | postgres | 0.596 ms / 2.5 ms / 41.8 ms | 0.588 ms | 0.300 ms / 6.4 ms | 36.9 ms / 360.1 ms | — | 111 |
+| `steady-streamed` | sqlite | 12.8 ms / 50.0 ms / 79.3 ms | 0.232 ms | 9.8 ms / 77.8 ms | 1.5 ms / 7.1 ms | — | 0 |
+| `steady-streamed` | postgres | 2.2 ms / 25.0 ms / 40.3 ms | 1.6 ms | 0.378 ms / 18.4 ms | 4.4 ms / 43.9 ms | — | 488 |
+| `burst` | sqlite | 20.0 ms / 50.0 ms / 253.3 ms | 0.133 ms | 84.0 ms / 368.6 ms | 1.1 ms / 7.1 ms | — | 0 |
+| `burst` | postgres | 19.6 ms / 50.0 ms / 47.9 ms | 4.9 ms | 40.2 ms / 106.4 ms | 25.2 ms / 144.2 ms | — | 619 |
+| `summaries` | sqlite | 28.2 ms / 100.0 ms / 118.3 ms | 0.081 ms | 24.4 ms / 114.8 ms | 0.867 ms / 5.5 ms | 0.572 ms / 1.3 ms | 0 |
+| `summaries` | postgres | 1.2 ms / 2.5 ms / 47.9 ms | 0.865 ms | 0.884 ms / 12.2 ms | 33.7 ms / 295.7 ms | 0.797 ms / 10.9 ms | 118 |
+| `slow-store` | sqlite | 132.1 ms / 1000.0 ms / 516.7 ms | 0.144 ms | 116.1 ms / 671.9 ms | 1.5 ms / 7.6 ms | 38.7 ms / 48.6 ms | 0 |
+| `slow-store` | postgres | 2.8 ms / 10.0 ms / 48.5 ms | 2.0 ms | 2.2 ms / 26.5 ms | 31.8 ms / 271.0 ms | 106.7 ms / 167.7 ms | 184 |
+| `large-payload` | sqlite | 13.7 ms / 50.0 ms / 51.5 ms | 0.167 ms | 12.7 ms / 52.7 ms | 1.0 ms / 5.3 ms | — | 0 |
+| `large-payload` | postgres | 0.214 ms / 0.050 ms / 12.9 ms | 1.0 ms | 0.027 ms / 6.8 ms | 17.7 ms / 117.7 ms | — | 53 |
+
+### Management summaries and the background index
+
+| Scenario | Backend | Summary req/s | Summary p50 / p95 | Usage rows at end | Store bytes at end | Accepted (incl. warmup) | Index enqueued / appended | Dropped at the queue bound | Index queue max depth | Index wait mean / max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `steady-buffered` | sqlite | — | — | 9300 | 5906008 | 9300 | 9300 / 9300 | 0 | 62 | 14.7 ms / 84.8 ms |
+| `steady-buffered` | postgres | — | — | 7214 | 1957888 | 9300 | 7214 / 7214 | 2086 | 256 | 388.0 ms / 486.6 ms |
+| `steady-streamed` | sqlite | — | — | 1864 | 4554304 | 1864 | 1864 / 1864 | 0 | 31 | 7.3 ms / 58.9 ms |
+| `steady-streamed` | postgres | — | — | 1864 | 573440 | 1864 | 1864 / 1864 | 0 | 18 | 2.4 ms / 30.0 ms |
+| `burst` | sqlite | — | — | 3200 | 4820616 | 3200 | 3200 / 3200 | 0 | 119 | 65.4 ms / 215.1 ms |
+| `burst` | postgres | — | — | 3200 | 884736 | 3200 | 3200 / 3200 | 0 | 202 | 106.8 ms / 258.2 ms |
+| `summaries` | sqlite | 75.6 | 50.2 ms / 101.3 ms | 6200 | 5361216 | 6200 | 6200 / 6200 | 0 | 40 | 13.8 ms / 48.0 ms |
+| `summaries` | postgres | 1227.2 | 3.2 ms / 4.5 ms | 3252 | 1130496 | 6200 | 3252 / 3252 | 2948 | 256 | 552.7 ms / 755.6 ms |
+| `slow-store` | sqlite | 18.0 | 229.2 ms / 342.3 ms | 206200 | 29576864 | 6200 | 6200 / 6200 | 0 | 60 | 71.6 ms / 367.0 ms |
+| `slow-store` | postgres | 36.0 | 110.9 ms / 141.2 ms | 202141 | 34496512 | 6200 | 2141 / 2141 | 4059 | 256 | 901.7 ms / 1426.1 ms |
+| `large-payload` | sqlite | — | — | 1864 | 4578904 | 1864 | 1864 / 1864 | 0 | 23 | 8.3 ms / 31.0 ms |
+| `large-payload` | postgres | — | — | 1759 | 532480 | 1864 | 1759 / 1759 | 105 | 256 | 280.4 ms / 447.3 ms |
+
+### Reading it
+
+- **Reconciliation held everywhere.** Every repetition of every scenario on
+  both backends offered exactly the scale's count, accepted all of it, shed and
+  errored nothing, and settled one usage record per accepted request
+  (`usage_records.missing = 0`). The one `error=1` under `namespace_write` in
+  `slow-store` is the second boot of that scenario's process hitting the
+  insert-only `put_namespace` with a `Duplicate`, which boot ignores by design.
+- **Repetitions agree to within the host's noise.** The three p50s per scenario
+  sit within roughly ±15% on SQLite (`steady-buffered`: 49.0 / 63.0 / 53.2 ms)
+  and ±5% on Postgres (28.5 / 27.8 / 28.1 ms). The negative overhead on
+  Postgres `steady-streamed` (−0.6 ms at p50) is that noise: a stream's latency
+  is the fake upstream's pacing, and the gateway's contribution there is below
+  what this host resolves.
+- **The controls are near zero.** The fake upstream answers a buffered request
+  in well under a millisecond over loopback, so `overhead_ms` is, to within
+  noise, the gateway's whole latency; where a control exists, read the
+  request-path p50 as the overhead.
+
+What the phases say, on this host:
+
+- **On SQLite the acquire wait *is* the Store's cost, and it is most of the
+  request.** In `steady-buffered` at 32 concurrency, `namespace_resolve` waits
+  29.0 ms for the connection and runs in 0.11 ms; `budget_charge` waits 28.2 ms
+  and runs in 0.98 ms. Two waits per request add to ~57 ms, which is the 53 ms
+  p50 and the 52.9 ms overhead against the control. The connection mutex behind
+  `spawn_blocking` is the queue [#463](https://github.com/Litvue/axond/issues/463)
+  bounds; the wait, not the query, is what it must move.
+- **On SQLite a large index turns that wait into a cliff.** `slow-store` (200 000
+  seeded rows, 4 readers) puts `usage_summary` at 38.7 ms of held connection per
+  call, and inference's `namespace_resolve` wait rises to 132 ms mean with a p95
+  in the 250–1000 ms bucket: throughput falls from 581 to 124 req/s and p99
+  from 106 to 473 ms. Over a small index (`summaries`) the same readers cost
+  almost nothing (554 req/s, resolve wait 28 ms). The coupling is the held
+  connection, not the number of summaries — the mechanism
+  [#464](https://github.com/Litvue/axond/issues/464) breaks.
+- **On Postgres the pool isolates inference from summaries, and the charge is
+  the cost.** `slow-store` leaves `namespace_resolve` at 2.8 ms wait / 2.0 ms
+  query and inference at 783 req/s while each summary holds a session for
+  107 ms. What Postgres pays instead is `budget_charge`: 0.3 ms of wait and
+  **36.9 ms of query** (max 360 ms) in `steady-buffered`, against 0.6 ms for
+  the resolve. Every request in this harness charges the same namespace and
+  period, so the 32 concurrent `UPDATE`s serialise on one budget row inside the
+  database; the query time halves at 16 concurrency (`large-payload`, 17.7 ms).
+  This is a real single-tenant-hot-row cost and **no subissue of #459 owns
+  it** — it is recorded here so the epic can decide whether to.
+- **On Postgres bursts pay for connects, exactly as the pool is shaped.**
+  `burst` opened 619 sessions for 3 200 requests in waves of 128: the pool
+  holds 32 and keeps 8 idle, so every wave reconnects ~24 sessions, and
+  `namespace_resolve` waits 19.6 ms mean (0.6 ms in `steady-buffered`) with the
+  connect inside the wait. `steady-streamed` shows the same churn at low rate
+  (488 connects for 1 864 requests): a stream holds no session while it
+  streams, so the idle cap drains between the resolve and the charge. This is
+  [#465](https://github.com/Litvue/axond/issues/465)'s mechanism, observed.
+- **On Postgres the background index drops under steady load; on SQLite it does
+  not.** The usage-index queue (bound 256) reached its bound in every buffered
+  Postgres scenario and dropped 22% of `steady-buffered`'s records, 48% of
+  `summaries`', and 65% of `slow-store`'s before they were indexed, with records
+  waiting 0.4–0.9 s to be taken. SQLite's dedicated index thread never exceeded
+  depth 119 and dropped nothing. Billing is unaffected — every accepted request
+  settled its usage record, which is what the reconciliation asserts — but a
+  Postgres deployment's management summaries under-count sustained load. The
+  Postgres worker appends one row per event through the same pool the charges
+  hold; at ~800 req/s it cannot keep pace. Whichever issue takes the index
+  writer must be measured on `steady-buffered`/Postgres with
+  *dropped at the queue bound* = 0 as the bar.
+- **The large payload's cost is not visible in the Store phases.** At 16
+  concurrency `large-payload`'s phases are what `steady-buffered` would be at
+  that concurrency (SQLite resolve wait 13.7 ms; Postgres charge 17.7 ms), and
+  its RSS is the payload (62–64 MiB against 26–28 MiB). Its overhead against the
+  control (27 ms SQLite, 15 ms Postgres) is therefore mostly Store wait on this
+  host; [#466](https://github.com/Litvue/axond/issues/466) is measured against
+  the control with the Store phases held as the invariant, and needs the
+  controlled runner to resolve its own effect above them.
 
 ## Recommended workloads and thresholds for the optimisation issues
 
@@ -248,23 +380,4 @@ change must move it by more than the noise floor of the paired baseline runs.
 | [#464](https://github.com/Litvue/axond/issues/464) usage summaries at scale | `slow-store`, SQLite, with `seeded_usage_rows` raised (edit the scale or add a tier; the artifact records the row count and file size) | `operations.usage_summary.query_duration`, `summaries.latency_ms`, and — the interference — `operations.namespace_resolve.acquire_wait` while readers run, against the same scenario's `steady-buffered` sibling | `usage_summary.query_duration` mean and p95 fall at 200 000 rows and keep falling as rows grow; the `namespace_resolve.acquire_wait` gap between `slow-store` and `steady-buffered` narrows; summary results are byte-identical to the fold they replace on the parity fixtures the issue lists. |
 | [#465](https://github.com/Litvue/axond/issues/465) Postgres burst connection churn | `burst`, Postgres, with the database at production network distance for the network-latency question | `store_evidence.connections_opened`, `operations.namespace_resolve.acquire_wait` p95 ≤, request-path p95/p99 per wave, and `axond.store.operations{outcome="saturated"}` | `connections_opened` per wave falls to the configured idle retention rather than tracking wave size; `namespace_resolve.acquire_wait` p95 no longer carries a connect; no `saturated` outcome appears at the scale the pool is sized for; the session cap the design states is not exceeded — read it from the database, not the artifact. |
 | [#466](https://github.com/Litvue/axond/issues/466) payload clones across credential attempts | `large-payload`, either backend (the Store is the control here, not the subject), plus a variant with several credentials configured so an attempt retries | `overhead_ms.p50` and `.p95` against the control, `resources.cpu_utilization`, `resources.rss_kib.peak`, and TTFT on the streamed sibling | Overhead p50/p95 and CPU per accepted request fall at 256 KiB with the Store phases unchanged; the wire-compatibility tests the issue lists still pass; no phase in `store_evidence` moves, which proves the saving was in the transport and not the Store. |
-
-What the baseline already says about the order of work, on this host:
-
-- **On SQLite, the acquire wait is the Store's cost.** Across the inference
-  operations, `query_duration` means stay well under a millisecond while
-  `acquire_wait` means are several milliseconds and grow with concurrency and
-  with readers present; the connection mutex behind `spawn_blocking` is the
-  queue #463 bounds, and `slow-store` is the workload that shows it.
-- **On Postgres, the acquire wait carries connects.** `burst` opens sessions
-  in proportion to the wave rather than to the idle cap, and its
-  `namespace_resolve.acquire_wait` is an order of magnitude above the steady
-  scenarios'; that is #465's mechanism, observed rather than inferred.
-- **Summaries interfere by holding the connection**, not by being many:
-  `usage_summary.query_duration` grows with seeded rows and the inference
-  operations' acquire wait grows with it, while summary request counts stay
-  small. #464 is measured by whether that coupling breaks.
-- **The large payload's cost is not in the Store.** `large-payload`'s Store
-  phases match `steady-buffered`'s while its overhead against the control is
-  the largest of the scenarios with one; #466 is measured against the control,
-  and the Store phases are its invariant.
+| Postgres index writer (no subissue yet; see the findings above) | `steady-buffered` and `slow-store`, Postgres | `store_evidence.index_queue.max_depth`, the *dropped at the queue bound* difference between accepted requests and `index_queue.depth_observations`, `index_queue.wait`, and `store.usage_rows` at the end against accepted requests | Dropped at the queue bound is 0 and `store.usage_rows` equals the accepted count; `index_queue.wait` mean falls below the request-path p50; `budget_charge.query_duration` does not rise, so the index did not buy its throughput by contending harder for the sessions the charges hold. |
