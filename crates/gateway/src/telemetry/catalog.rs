@@ -369,6 +369,8 @@ const STORE_BACKEND: Label = Label::closed("axond.store.backend", crate::store::
 const STORE_OPERATION: Label =
     Label::closed("axond.store.operation", crate::store::STORE_OPERATIONS);
 const STORE_LABELS: &[Label] = &[STORE_BACKEND, STORE_OPERATION];
+const STORE_POOL_STATE: Label =
+    Label::closed("axond.store.pool.state", crate::store::STORE_POOL_STATES);
 
 const REVISION_TRIGGER: Label = Label::closed(
     "axond.revision.trigger",
@@ -856,6 +858,24 @@ pub const CATALOG: &[MetricSpec] = &[
         labels: &[STORE_BACKEND],
     },
     MetricSpec {
+        name: "axond.store.connections_reused",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[STORE_BACKEND],
+    },
+    MetricSpec {
+        name: "axond.store.connections_discarded",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[STORE_BACKEND],
+    },
+    MetricSpec {
+        name: "axond.store.pool.sessions",
+        kind: InstrumentKind::Gauge,
+        unit: None,
+        labels: &[STORE_BACKEND, STORE_POOL_STATE],
+    },
+    MetricSpec {
         name: "axond.usage.index.queue.depth",
         kind: InstrumentKind::Histogram,
         unit: None,
@@ -1305,6 +1325,26 @@ mod tests {
             "axond.usage.index.queue.wait",
         ] {
             assert!(spec(metric).expect("catalogued").labels.is_empty());
+        }
+        for metric in [
+            "axond.store.connections_opened",
+            "axond.store.connections_reused",
+            "axond.store.connections_discarded",
+        ] {
+            let spec = spec(metric).expect("catalogued");
+            assert_eq!(spec.kind, InstrumentKind::Counter);
+            validate_label_value(
+                metric,
+                "axond.store.backend",
+                crate::store::STORE_BACKEND_POSTGRES,
+            )
+            .expect("connection counters carry the backend");
+        }
+        let occupancy = spec("axond.store.pool.sessions").expect("catalogued");
+        assert_eq!(occupancy.kind, InstrumentKind::Gauge);
+        for state in crate::store::STORE_POOL_STATES {
+            validate_label_value("axond.store.pool.sessions", "axond.store.pool.state", state)
+                .expect("pool occupancy states are catalogued");
         }
     }
 

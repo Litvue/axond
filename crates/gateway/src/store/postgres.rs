@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::Mutex as OccupancyLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -23,8 +25,14 @@ const MODELS_DDL: &str = include_str!("../../sql/store_provider_models_v1.sql");
 const CADENCE_DDL: &str = include_str!("../../sql/store_budget_cadence_v1.sql");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
+/// Hard cap on live plus idle sessions. Fleet budget is this times replica count.
 const POOL_SIZE: usize = 32;
-const IDLE_CAP: usize = 8;
+/// Idle sessions kept after checkin. Equal to [`POOL_SIZE`]: the semaphore
+/// already bounds live plus idle, so retaining every healthy session does not
+/// raise the deployment connection budget. A burst that fits in the pool
+/// reuses instead of paying connect again.
+const IDLE_CAP: usize = POOL_SIZE;
+const _: () = assert!(IDLE_CAP <= POOL_SIZE);
 /// Same order as `lock_timeout` / `statement_timeout`: fail 503 rather than hang.
 #[cfg(not(test))]
 const POOL_WAIT: Duration = Duration::from_secs(2);
@@ -39,8 +47,22 @@ pub struct PostgresStore {
     idle: Mutex<Vec<Client>>,
     /// Caps live + idle sessions. Waiters queue here instead of opening more.
     slots: Arc<Semaphore>,
+    stats: Arc<PoolStats>,
     health: Arc<PostgresHealth>,
     clock: Arc<dyn BudgetClock>,
+}
+
+/// Opened / reused / discarded plus occupancy. Shared with [`Session`] so a
+/// dropped checkout still accounts the permit and the live count.
+struct PoolStats {
+    opened: AtomicU64,
+    reused: AtomicU64,
+    discarded: AtomicU64,
+    live: AtomicUsize,
+    idle: AtomicUsize,
+    /// Occupancy gauges load `live` and `idle` under this lock so an older
+    /// checkout cannot publish after a newer one has already recorded.
+    occupancy: OccupancyLock<()>,
 }
 
 impl PostgresStore {
@@ -55,6 +77,7 @@ impl PostgresStore {
             config,
             idle: Mutex::new(Vec::new()),
             slots: Arc::new(Semaphore::new(POOL_SIZE)),
+            stats: Arc::new(PoolStats::default()),
             clock: Arc::new(super::SystemClock),
         };
         let mut client = store.connect_client().await?;
@@ -108,23 +131,57 @@ impl PostgresStore {
             .connect(crate::usage::tls_connector())
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        self.stats.opened.fetch_add(1, Ordering::SeqCst);
         metrics::record_store_connection_opened(STORE_BACKEND_POSTGRES);
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::warn!(error = %e, "postgres store connection closed");
             }
         });
-        client
+        // The handshake already opened a session. If setup fails or this
+        // future is cancelled, Drop records the discard the Session guard
+        // would have recorded had checkout finished.
+        let mut opened = OpenedClient {
+            stats: Arc::clone(&self.stats),
+            client: Some(client),
+        };
+        opened
+            .client
+            .as_ref()
+            .expect("just opened")
             .batch_execute("SET lock_timeout = '2s'; SET statement_timeout = '5s'")
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        Ok(client)
+        Ok(opened.take())
+    }
+
+    fn record_occupancy(&self) {
+        self.stats.record_occupancy();
+    }
+
+    fn discard_session(&self) {
+        self.stats.discarded.fetch_add(1, Ordering::SeqCst);
+        metrics::record_store_connection_discarded(STORE_BACKEND_POSTGRES);
+        self.record_occupancy();
+    }
+
+    async fn take_idle(&self) -> Option<Client> {
+        let mut idle = self.idle.lock().await;
+        while let Some(client) = idle.pop() {
+            self.stats.idle.store(idle.len(), Ordering::SeqCst);
+            if !client.is_closed() {
+                return Some(client);
+            }
+            self.stats.discarded.fetch_add(1, Ordering::SeqCst);
+            metrics::record_store_connection_discarded(STORE_BACKEND_POSTGRES);
+        }
+        None
     }
 
     /// A pooled session, or why none was had. `Err(Saturated)` is the pool's
     /// wait bound expiring with every slot taken — the outcome the metrics tell
     /// apart from a query that ran and failed.
-    async fn checkout(&self) -> Result<(Client, OwnedSemaphorePermit), Checkout> {
+    async fn checkout(&self) -> Result<Session, Checkout> {
         let permit = match tokio::time::timeout(POOL_WAIT, self.slots.clone().acquire_owned()).await
         {
             Ok(Ok(permit)) => permit,
@@ -135,27 +192,38 @@ impl PostgresStore {
             }
             Err(_) => return Err(Checkout::Saturated),
         };
-        {
-            let mut idle = self.idle.lock().await;
-            while let Some(client) = idle.pop() {
-                if !client.is_closed() {
-                    return Ok((client, permit));
-                }
+        let client = if let Some(client) = self.take_idle().await {
+            self.stats.reused.fetch_add(1, Ordering::SeqCst);
+            metrics::record_store_connection_reused(STORE_BACKEND_POSTGRES);
+            client
+        } else {
+            match self.connect_client().await {
+                Ok(client) => client,
+                Err(error) => return Err(Checkout::Failed(error)),
             }
-        }
-        match self.connect_client().await {
-            Ok(client) => Ok((client, permit)),
-            Err(error) => Err(Checkout::Failed(error)),
-        }
+        };
+        self.stats.live.fetch_add(1, Ordering::SeqCst);
+        self.record_occupancy();
+        Ok(Session {
+            client: Some(client),
+            permit: Some(permit),
+            stats: Arc::clone(&self.stats),
+        })
     }
 
     async fn checkin(&self, client: Client) {
         if client.is_closed() {
+            self.discard_session();
             return;
         }
         let mut idle = self.idle.lock().await;
         if idle.len() < IDLE_CAP {
             idle.push(client);
+            self.stats.idle.store(idle.len(), Ordering::SeqCst);
+            self.record_occupancy();
+        } else {
+            drop(client);
+            self.discard_session();
         }
     }
 
@@ -179,7 +247,7 @@ impl PostgresStore {
         operation: impl AsyncFnOnce(&mut Client) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         let called = Instant::now();
-        let (mut client, permit) = match self.checkout().await {
+        let mut session = match self.checkout().await {
             Ok(checked_out) => checked_out,
             Err(saturated @ Checkout::Saturated) => {
                 metrics::record_store_operation(
@@ -203,7 +271,7 @@ impl PostgresStore {
             }
         };
         let acquired = Instant::now();
-        let result = operation(&mut client).await;
+        let result = operation(session.client_mut()).await;
         metrics::record_store_operation(
             STORE_BACKEND_POSTGRES,
             op,
@@ -216,23 +284,108 @@ impl PostgresStore {
             },
         );
         let reuse = match &result {
-            Ok(_) => !client.is_closed(),
-            Err(error) => Self::keep_session(error) && !client.is_closed(),
+            Ok(_) => !session.client_mut().is_closed(),
+            Err(error) => Self::keep_session(error) && !session.client_mut().is_closed(),
         };
         if reuse {
+            let client = session.take_client();
             self.checkin(client).await;
         }
-        drop(permit);
         result
     }
 }
 
 /// Why a checkout returned no session.
+#[derive(Debug)]
 enum Checkout {
     /// Every slot was held for the whole wait bound.
     Saturated,
     /// The pool is closed, or a fresh connection could not be made.
     Failed(StoreError),
+}
+
+/// A checked-out session. `client` is `Some` until [`Session::take_client`] or
+/// Drop. Dropping a session that still holds the client closes the backend,
+/// releases the permit, and counts the session discarded so a cancelled caller
+/// cannot leak occupancy.
+struct Session {
+    client: Option<Client>,
+    permit: Option<OwnedSemaphorePermit>,
+    stats: Arc<PoolStats>,
+}
+
+impl Session {
+    fn client_mut(&mut self) -> &mut Client {
+        self.client.as_mut().expect("pooled session")
+    }
+
+    fn take_client(&mut self) -> Client {
+        self.stats.live.fetch_sub(1, Ordering::SeqCst);
+        self.client.take().expect("pooled session")
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.client.take().is_some() {
+            self.stats.live.fetch_sub(1, Ordering::SeqCst);
+            self.stats.discarded.fetch_add(1, Ordering::SeqCst);
+            metrics::record_store_connection_discarded(STORE_BACKEND_POSTGRES);
+            self.stats.record_occupancy();
+        }
+        self.permit.take();
+    }
+}
+
+/// A client that has been opened but is not yet a pooled [`Session`].
+///
+/// Drop records `discarded` unless [`OpenedClient::take`] disarms it.
+struct OpenedClient {
+    stats: Arc<PoolStats>,
+    client: Option<Client>,
+}
+
+impl OpenedClient {
+    fn take(&mut self) -> Client {
+        self.client.take().expect("opened client")
+    }
+}
+
+impl Drop for OpenedClient {
+    fn drop(&mut self) {
+        if self.client.take().is_some() {
+            self.stats.discarded.fetch_add(1, Ordering::SeqCst);
+            metrics::record_store_connection_discarded(STORE_BACKEND_POSTGRES);
+            self.stats.record_occupancy();
+        }
+    }
+}
+
+impl PoolStats {
+    fn record_occupancy(&self) {
+        let _publish = self
+            .occupancy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        metrics::record_store_pool_sessions(
+            STORE_BACKEND_POSTGRES,
+            self.live.load(Ordering::SeqCst) as u64,
+            self.idle.load(Ordering::SeqCst) as u64,
+        );
+    }
+}
+
+impl Default for PoolStats {
+    fn default() -> Self {
+        Self {
+            opened: AtomicU64::new(0),
+            reused: AtomicU64::new(0),
+            discarded: AtomicU64::new(0),
+            live: AtomicUsize::new(0),
+            idle: AtomicUsize::new(0),
+            occupancy: OccupancyLock::new(()),
+        }
+    }
 }
 
 impl From<Checkout> for StoreError {
@@ -246,6 +399,24 @@ impl From<Checkout> for StoreError {
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolSnapshot {
+    opened: u64,
+    reused: u64,
+    discarded: u64,
+    live: usize,
+    idle: usize,
+    available: usize,
+}
+
+#[cfg(test)]
+impl PoolSnapshot {
+    fn within_budget(&self) -> bool {
+        self.live + self.idle <= POOL_SIZE && self.live + self.available == POOL_SIZE
+    }
 }
 
 /// Bind parameters per usage-index row: `request_id, namespace, period, model,
@@ -1693,24 +1864,56 @@ async fn resolve_namespace_on(
 #[cfg(test)]
 impl PostgresStore {
     fn test_pool(slots: Arc<Semaphore>) -> Self {
-        let config = tokio_postgres::Config::new();
+        Self::test_store(tokio_postgres::Config::new(), slots)
+    }
+
+    fn test_store(config: tokio_postgres::Config, slots: Arc<Semaphore>) -> Self {
         Self {
             health: Arc::new(PostgresHealth::new("store", config.clone(), PROBE_BOUND)),
             config,
             idle: Mutex::new(Vec::new()),
             slots,
+            stats: Arc::new(PoolStats::default()),
             clock: Arc::new(super::SystemClock),
         }
     }
 
+    fn pool_snapshot(&self) -> PoolSnapshot {
+        PoolSnapshot {
+            opened: self.stats.opened.load(Ordering::SeqCst),
+            reused: self.stats.reused.load(Ordering::SeqCst),
+            discarded: self.stats.discarded.load(Ordering::SeqCst),
+            live: self.stats.live.load(Ordering::SeqCst),
+            idle: self.stats.idle.load(Ordering::SeqCst),
+            available: self.slots.available_permits(),
+        }
+    }
+
+    async fn checkout_duration(&self) -> Result<Duration, StoreError> {
+        let started = Instant::now();
+        let mut session = self.checkout().await.map_err(StoreError::from)?;
+        let elapsed = started.elapsed();
+        let client = session.take_client();
+        self.checkin(client).await;
+        Ok(elapsed)
+    }
+
+    async fn backend_pid(client: &Client) -> Result<i32, StoreError> {
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .map(|row| row.get(0))
+            .map_err(|e| StoreError::Unavailable(e.to_string()))
+    }
+
     /// Kill the next idle session so the following Store call must reconnect.
     pub(super) async fn drop_idle_connection(&self) -> Result<(), StoreError> {
-        let (client, permit) = self.checkout().await.map_err(StoreError::from)?;
-        let _ = client
+        let mut session = self.checkout().await.map_err(StoreError::from)?;
+        let _ = session
+            .client_mut()
             .execute("SELECT pg_terminate_backend(pg_backend_pid())", &[])
             .await;
-        self.checkin(client).await;
-        drop(permit);
+        drop(session);
         Ok(())
     }
 
@@ -1858,6 +2061,10 @@ impl PostgresStore {
 mod tests {
     use super::*;
 
+    /// Heavy tests share one Postgres. They take this lock so they do not
+    /// hold a wave of sessions at the same time as each other.
+    static POOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn checkout_times_out_when_pool_is_saturated() {
         let slots = Arc::new(Semaphore::new(POOL_SIZE));
@@ -1876,6 +2083,382 @@ mod tests {
             "{err:?}"
         );
         drop(held);
+        let snap = store.pool_snapshot();
+        assert_eq!(snap.live, 0);
+        assert_eq!(snap.available, POOL_SIZE);
+        assert!(snap.within_budget());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiting_checkout_releases_the_permit() {
+        let slots = Arc::new(Semaphore::new(1));
+        let held = slots.clone().acquire_owned().await.expect("permit");
+        let store = Arc::new(PostgresStore::test_pool(Arc::clone(&slots)));
+        let waiting = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.checkout().await })
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        waiting.abort();
+        match waiting.await {
+            Err(err) => assert!(err.is_cancelled()),
+            Ok(Ok(_)) => panic!("waiting checkout finished before abort"),
+            Ok(Err(e)) => panic!("waiting checkout failed before abort: {e:?}"),
+        }
+        drop(held);
+        let recovered =
+            tokio::time::timeout(Duration::from_millis(50), slots.clone().acquire_owned())
+                .await
+                .expect("permit recovered")
+                .expect("semaphore open");
+        drop(recovered);
+        let snap = store.pool_snapshot();
+        assert_eq!(snap.live, 0);
+        assert_eq!(snap.available, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_connect_releases_the_permit() {
+        let mut config = tokio_postgres::Config::new();
+        config.host("192.0.2.1");
+        config.port(5432);
+        config.connect_timeout(CONNECT_TIMEOUT);
+        let slots = Arc::new(Semaphore::new(1));
+        let store = Arc::new(PostgresStore::test_store(config, Arc::clone(&slots)));
+        let connecting = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.checkout().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        connecting.abort();
+        let _ = connecting.await;
+        let recovered =
+            tokio::time::timeout(Duration::from_millis(50), slots.clone().acquire_owned())
+                .await
+                .expect("permit recovered")
+                .expect("semaphore open");
+        drop(recovered);
+        let snap = store.pool_snapshot();
+        assert_eq!(snap.live, 0);
+        assert_eq!(snap.available, 1);
+    }
+
+    async fn seeded_store() -> Option<PostgresStore> {
+        let dsn = crate::test_services::postgres_dsn()?;
+        Some(
+            PostgresStore::connect(&dsn, true)
+                .await
+                .expect("postgres store"),
+        )
+    }
+
+    fn percentile(sorted: &[Duration], p: f64) -> Duration {
+        assert!(!sorted.is_empty());
+        let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    fn report_latencies(label: &str, samples: &[Duration]) -> (Duration, Duration) {
+        let mut sorted = samples.to_vec();
+        sorted.sort();
+        let p95 = percentile(&sorted, 0.95);
+        let p99 = percentile(&sorted, 0.99);
+        println!(
+            "pool {label}: n={} p50={:?} p95={:?} p99={:?} max={:?}",
+            sorted.len(),
+            percentile(&sorted, 0.50),
+            p95,
+            p99,
+            sorted.last().copied().unwrap()
+        );
+        (p95, p99)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_pool_reports_cold_warm_burst_and_recovery() {
+        let _guard = POOL_TEST_LOCK.lock().await;
+        let Some(store) = seeded_store().await else {
+            return;
+        };
+        let store = Arc::new(store);
+        let cold_n = 12;
+        let mut held = Vec::with_capacity(cold_n);
+        let mut cold = Vec::with_capacity(cold_n);
+        for _ in 0..cold_n {
+            let started = Instant::now();
+            let session = store
+                .checkout()
+                .await
+                .unwrap_or_else(|e| panic!("cold checkout: {e:?}"));
+            cold.push(started.elapsed());
+            held.push(session);
+        }
+        let after_cold = store.pool_snapshot();
+        assert!(after_cold.within_budget());
+        assert_eq!(after_cold.live, cold_n);
+        assert_eq!(after_cold.available, POOL_SIZE - cold_n);
+        let (cold_p95, cold_p99) = report_latencies("cold", &cold);
+        println!(
+            "pool cold sessions opened={} reused={} discarded={} live={} idle={}",
+            after_cold.opened,
+            after_cold.reused,
+            after_cold.discarded,
+            after_cold.live,
+            after_cold.idle
+        );
+
+        for mut session in held {
+            let client = session.take_client();
+            store.checkin(client).await;
+        }
+        let after_return = store.pool_snapshot();
+        assert_eq!(after_return.live, 0);
+        assert_eq!(after_return.available, POOL_SIZE);
+        assert!(after_return.idle <= IDLE_CAP);
+        assert!(after_return.within_budget());
+
+        let mut warm = Vec::with_capacity(12);
+        for _ in 0..12 {
+            warm.push(store.checkout_duration().await.expect("warm checkout"));
+        }
+        let after_warm = store.pool_snapshot();
+        let (p95, p99) = report_latencies("warm", &warm);
+        println!(
+            "pool warm sessions opened={} reused={} discarded={} idle={}",
+            after_warm.opened, after_warm.reused, after_warm.discarded, after_warm.idle
+        );
+        assert!(after_warm.within_budget());
+        assert_eq!(after_warm.live, 0);
+        let (warm_p95, warm_p99) = (p95, p99);
+
+        let wave = 12;
+        let mut burst_opened = Vec::new();
+        let mut burst_latencies = Vec::new();
+        for wave_i in 0..3 {
+            let opened_before = store.pool_snapshot().opened;
+            let mut tasks = Vec::with_capacity(wave);
+            for _ in 0..wave {
+                let store = Arc::clone(&store);
+                tasks.push(tokio::spawn(async move {
+                    let started = Instant::now();
+                    let session = store
+                        .checkout()
+                        .await
+                        .unwrap_or_else(|e| panic!("burst checkout: {e:?}"));
+                    (started.elapsed(), session)
+                }));
+            }
+            let mut held = Vec::with_capacity(wave);
+            for task in tasks {
+                let (elapsed, session) = task.await.expect("join");
+                burst_latencies.push(elapsed);
+                held.push(session);
+            }
+            let opened_after = store.pool_snapshot().opened;
+            burst_opened.push(opened_after.saturating_sub(opened_before));
+            println!(
+                "pool burst wave {wave_i}: opened_delta={} live={} idle={} discarded={}",
+                burst_opened[wave_i],
+                store.pool_snapshot().live,
+                store.pool_snapshot().idle,
+                store.pool_snapshot().discarded
+            );
+            for mut session in held {
+                let client = session.take_client();
+                store.checkin(client).await;
+            }
+        }
+        let (burst_p95, burst_p99) = report_latencies("burst", &burst_latencies);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let opened_before = store.pool_snapshot().opened;
+        let mut recovery = Vec::with_capacity(wave);
+        let mut tasks = Vec::with_capacity(wave);
+        for _ in 0..wave {
+            let store = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move {
+                let started = Instant::now();
+                let session = store
+                    .checkout()
+                    .await
+                    .unwrap_or_else(|e| panic!("recovery checkout: {e:?}"));
+                (started.elapsed(), session)
+            }));
+        }
+        let mut held = Vec::with_capacity(wave);
+        for task in tasks {
+            let (elapsed, session) = task.await.expect("join");
+            recovery.push(elapsed);
+            held.push(session);
+        }
+        let after_hold = store.pool_snapshot();
+        let recovery_opened = after_hold.opened.saturating_sub(opened_before);
+        for mut session in held {
+            let client = session.take_client();
+            store.checkin(client).await;
+        }
+        let after_recovery = store.pool_snapshot();
+        let (recovery_p95, recovery_p99) = report_latencies("recovery", &recovery);
+        println!(
+            "pool recovery opened_delta={recovery_opened} snapshot={after_recovery:?} \
+             cold_p95={cold_p95:?} cold_p99={cold_p99:?} \
+             warm_p95={warm_p95:?} warm_p99={warm_p99:?} \
+             burst_p95={burst_p95:?} burst_p99={burst_p99:?} \
+             recovery_p95={recovery_p95:?} recovery_p99={recovery_p99:?} \
+             burst_opened_per_wave={burst_opened:?} idle_cap={IDLE_CAP} pool_size={POOL_SIZE}"
+        );
+        assert!(after_recovery.within_budget());
+        assert_eq!(after_recovery.live, 0);
+        assert_eq!(after_recovery.available, POOL_SIZE);
+        assert!(after_recovery.idle <= IDLE_CAP);
+        assert!(
+            burst_opened.iter().all(|delta| *delta == 0),
+            "burst waves must reuse retained idle sessions, not reconnect: {burst_opened:?}"
+        );
+        assert_eq!(
+            recovery_opened, 0,
+            "recovery after a pause must not reconnect when idle retention is the pool size"
+        );
+        assert_eq!(
+            after_recovery.discarded, 0,
+            "a healthy burst must not drop sessions: {after_recovery:?}"
+        );
+        assert!(
+            warm_p95 < cold_p95 || warm_p95 < Duration::from_millis(5),
+            "warm p95 {warm_p95:?} should beat cold p95 {cold_p95:?} once sessions exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_dead_idle_session_reconnects_without_leaking_permits() {
+        let _guard = POOL_TEST_LOCK.lock().await;
+        let Some(store) = seeded_store().await else {
+            return;
+        };
+        store.checkout_duration().await.expect("warmup");
+        store.drop_idle_connection().await.expect("drop");
+        store.checkout_duration().await.expect("reconnect");
+        let snap = store.pool_snapshot();
+        assert!(snap.within_budget(), "{snap:?}");
+        assert_eq!(snap.live, 0, "{snap:?}");
+        assert_eq!(snap.available, POOL_SIZE, "{snap:?}");
+        assert!(
+            snap.discarded >= 1,
+            "the terminated idle session is discarded: {snap:?}"
+        );
+        assert!(snap.opened >= 2, "a replacement session opened: {snap:?}");
+    }
+
+    #[tokio::test]
+    async fn postgres_db_restart_does_not_leak_permits_or_sessions() {
+        let _guard = POOL_TEST_LOCK.lock().await;
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let store = Arc::new(
+            PostgresStore::connect(&dsn, true)
+                .await
+                .expect("postgres store"),
+        );
+        let hold = 4;
+        let mut held = Vec::with_capacity(hold);
+        let mut pids = Vec::with_capacity(hold);
+        for _ in 0..hold {
+            let mut session = store
+                .checkout()
+                .await
+                .unwrap_or_else(|e| panic!("hold: {e:?}"));
+            pids.push(
+                PostgresStore::backend_pid(session.client_mut())
+                    .await
+                    .expect("pid"),
+            );
+            held.push(session);
+        }
+        for mut session in held {
+            let client = session.take_client();
+            store.checkin(client).await;
+        }
+
+        let (side, connection) = tokio_postgres::connect(&dsn, crate::usage::tls_connector())
+            .await
+            .expect("side channel");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        for pid in &pids {
+            let _ = side
+                .execute("SELECT pg_terminate_backend($1)", &[pid])
+                .await;
+        }
+
+        let mut tasks = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move {
+                store.checkout_duration().await.expect("after restart")
+            }));
+        }
+        for task in tasks {
+            task.await.expect("join");
+        }
+        let snap = store.pool_snapshot();
+        assert!(snap.within_budget(), "{snap:?}");
+        assert_eq!(snap.live, 0);
+        assert_eq!(snap.available, POOL_SIZE);
+        assert!(snap.idle <= IDLE_CAP);
+        let remaining: i64 = side
+            .query_one(
+                "SELECT count(*)::bigint FROM pg_stat_activity
+                 WHERE pid = ANY($1)",
+                &[&pids],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(remaining, 0, "terminated backends must not remain");
+        assert!(
+            snap.idle + snap.live <= POOL_SIZE,
+            "restart must not exceed the session budget: {snap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_cancelling_an_in_flight_query_releases_the_permit() {
+        let _guard = POOL_TEST_LOCK.lock().await;
+        let Some(store) = seeded_store().await else {
+            return;
+        };
+        let store = Arc::new(store);
+        let task = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .with_client(StoreOp::NamespaceRead, async move |client| {
+                        client
+                            .batch_execute("SELECT pg_sleep(10)")
+                            .await
+                            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+        store
+            .checkout_duration()
+            .await
+            .expect("checkout after cancel");
+        let snap = store.pool_snapshot();
+        assert!(snap.within_budget(), "{snap:?}");
+        assert_eq!(snap.live, 0);
+        assert_eq!(snap.available, POOL_SIZE);
+        assert!(
+            snap.discarded >= 1,
+            "the cancelled in-flight session is discarded, not returned idle"
+        );
     }
 
     /// Coexist with leftover `budget_v1.sql` is exercised when

@@ -115,6 +115,11 @@ pub const STORE_BACKEND_SQLITE: &str = "sqlite";
 pub const STORE_BACKEND_POSTGRES: &str = "postgres";
 pub const STORE_BACKENDS: &[&str] = &[STORE_BACKEND_SQLITE, STORE_BACKEND_POSTGRES];
 
+/// Occupancy of the Postgres session pool. SQLite does not record this gauge.
+pub const STORE_POOL_STATE_LIVE: &str = "live";
+pub const STORE_POOL_STATE_IDLE: &str = "idle";
+pub const STORE_POOL_STATES: &[&str] = &[STORE_POOL_STATE_LIVE, STORE_POOL_STATE_IDLE];
+
 /// The `axond.store.outcome` label values: the call ran and returned `Ok`, ran
 /// and returned an error, or never got a connection inside the pool's wait
 /// bound — which is the one outcome that says the pool rather than the query is
