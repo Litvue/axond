@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.6.2](https://github.com/Litvue/axond/compare/v0.6.1...v0.6.2) (2026-09-10)
+
+
+### Features
+
+* **budgets:** cadence-aware budgets roll monthly periods without caller PUTs ([#455](https://github.com/Litvue/axond/issues/455)) ([33cb523](https://github.com/Litvue/axond/commit/33cb523536e1343b2ffbe6ebf7f9079eadb47214))
+
+
+### Bug Fixes
+
+* **runtime:** bound settlement work and make completion tracking cancellation-safe ([#474](https://github.com/Litvue/axond/issues/474)) ([46ea80d](https://github.com/Litvue/axond/commit/46ea80db719ff3a32b3053db119325c84764d0c1))
+* **usage:** drain the Store usage-index worker on graceful shutdown ([#478](https://github.com/Litvue/axond/issues/478)) ([db55189](https://github.com/Litvue/axond/commit/db551892b1e5e0a115c142f22a89d38b1aef1776))
+
+
+### Performance
+
+* baseline Store-backed latency and expose phase-level contention ([#476](https://github.com/Litvue/axond/issues/476)) ([99d17c0](https://github.com/Litvue/axond/commit/99d17c0caac9fa15bc6b18b0bbab9f7335c551d6))
+* **store:** bound SQLite spawn_blocking behind a dispatch slot ([#479](https://github.com/Litvue/axond/issues/479)) ([9c650a8](https://github.com/Litvue/axond/commit/9c650a8a51f7977b81ac42c3facf611efa576a28))
+* **usage:** batch Store usage-index appends and report queue pressure accurately ([#475](https://github.com/Litvue/axond/issues/475)) ([7c05964](https://github.com/Litvue/axond/commit/7c05964318b8b7426600a8eb0a100141a9e5fc11))
+
+
+### Tests
+
+* **openapi:** cover the cadence budget policy route ([#456](https://github.com/Litvue/axond/issues/456)) ([1cff16d](https://github.com/Litvue/axond/commit/1cff16d47c20cc5aef04939617f88f3b5a54d8c5))
+
 ## [0.6.1](https://github.com/Litvue/axond/compare/v0.6.0...v0.6.1) (2026-09-05)
 
 
