@@ -575,7 +575,8 @@ impl IndexOutcome {
     }
 }
 
-/// [`IndexOutcome::ALL`] as the strings the metric catalogue enumerates.
+/// Every [`IndexOutcome`], as the strings the metric catalogue enumerates. A
+/// test holds it to the enum.
 pub const INDEX_OUTCOMES: &[&str] = &["accepted", "saturated", "closed", "failed", "timeout"];
 
 /// One event waiting for the index worker, stamped so the worker can report how

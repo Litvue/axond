@@ -227,7 +227,6 @@ impl PostgresStore {
     }
 }
 
-<<<<<<< HEAD
 /// Why a checkout returned no session.
 enum Checkout {
     /// Every slot was held for the whole wait bound.
@@ -247,7 +246,8 @@ impl From<Checkout> for StoreError {
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
-=======
+}
+
 /// Bind parameters per usage-index row: `request_id, namespace, period, model,
 /// status, cost_microdollars`. `recorded_at` is the server's `now()`.
 const USAGE_COLUMNS: usize = 6;
@@ -277,7 +277,6 @@ fn usage_insert_sql(rows: usize) -> String {
     }
     sql.push_str(" ON CONFLICT (request_id) DO NOTHING");
     sql
->>>>>>> 7ab96c2 (perf(usage): batch Store usage-index appends and classify queue outcomes)
 }
 
 async fn probe_schema(client: &Client) -> Result<(), StoreError> {

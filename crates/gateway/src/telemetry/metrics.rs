@@ -24,13 +24,12 @@ const ADMISSION_QUEUE_DEPTH_BOUNDARIES: [f64; 11] = [
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
 ];
 
-<<<<<<< HEAD
-/// The usage-index worker queue holds at most
-/// [`crate::usage::UsageDelivery::STORE_INDEX_QUEUE`] events, so the depth
-/// histogram's top bucket is that bound and the buckets below it are exact
-/// powers of two.
-const USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES: [f64; 9] =
-    [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+/// Occupied slots in the usage-index queue. Top bucket matches the default
+/// `[storage.usage_index] buffer_capacity` (1024); a larger configured
+/// capacity still records in that top bucket.
+const USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES: [f64; 11] = [
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+];
 
 /// Store wait and service time, in milliseconds. Sub-millisecond buckets
 /// because a healthy SQLite read is tens of microseconds and a saturated pool
@@ -38,12 +37,12 @@ const USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES: [f64; 9] =
 /// acquire wait first becomes visible.
 const STORE_DURATION_BOUNDARIES: [f64; 14] = [
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1000.0, 5000.0,
-=======
+];
+
 /// Powers of two up to [`crate::store::MAX_USAGE_INDEX_BATCH`], so a batch of
 /// one (the unbatched baseline) and a full batch land in distinct buckets.
 const USAGE_INDEX_BATCH_SIZE_BOUNDARIES: [f64; 13] = [
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
->>>>>>> 7ab96c2 (perf(usage): batch Store usage-index appends and classify queue outcomes)
 ];
 
 struct Instruments {
