@@ -1,23 +1,42 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::{
     BudgetAdmit, BudgetCadence, BudgetClock, BudgetPolicy, BudgetRecord, NamespaceRecord,
     NamespaceResolve, ProviderModels, STORE_BACKEND_SQLITE, STORE_OUTCOME_ERROR, STORE_OUTCOME_OK,
-    Store, StoreError, StoreOp, UsageAppend, UsageSummaryRow, admit_from_ledger, from_sql_amount,
-    monthly_period_key, sql_amount, sql_amount_saturating, validate_timezone,
+    STORE_OUTCOME_SATURATED, Store, StoreError, StoreOp, UsageAppend, UsageSummaryRow,
+    admit_from_ledger, from_sql_amount, monthly_period_key, sql_amount, sql_amount_saturating,
+    validate_timezone,
 };
 use crate::telemetry::metrics;
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
     clock: Arc<dyn BudgetClock>,
+    /// At most one async operation is in `spawn_blocking` at a time. Waiters
+    /// queue on this permit, not on Tokio's blocking pool; the usage-index
+    /// thread takes the connection mutex directly and does not consume a slot.
+    slots: Arc<Semaphore>,
+    /// Live `spawn_blocking` closures from [`Self::with_conn`]. Tested under
+    /// overload; production metrics already cover wait vs execute.
+    inflight_blocking: Arc<AtomicUsize>,
+    max_inflight_blocking: Arc<AtomicUsize>,
 }
+
+/// One connection, one blocking dispatch. Extra async callers wait here.
+const DISPATCH_SLOTS: usize = 1;
+/// Same order as Postgres `POOL_WAIT`: fail 503 rather than grow the blocking pool.
+#[cfg(not(test))]
+const DISPATCH_WAIT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const DISPATCH_WAIT: Duration = Duration::from_millis(50);
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS axond_namespace (
@@ -98,6 +117,9 @@ impl SqliteStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             clock: Arc::new(super::SystemClock),
+            slots: Arc::new(Semaphore::new(DISPATCH_SLOTS)),
+            inflight_blocking: Arc::new(AtomicUsize::new(0)),
+            max_inflight_blocking: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -105,6 +127,25 @@ impl SqliteStore {
     pub(crate) fn with_clock(mut self, clock: Arc<dyn BudgetClock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    #[cfg(test)]
+    async fn hold_dispatch(&self) -> OwnedSemaphorePermit {
+        self.slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("dispatch slot")
+    }
+
+    #[cfg(test)]
+    fn inflight_blocking(&self) -> usize {
+        self.inflight_blocking.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn max_inflight_blocking(&self) -> usize {
+        self.max_inflight_blocking.load(Ordering::SeqCst)
     }
 
     /// Seed TOML `[[namespace]]` rows without `spawn_blocking`.
@@ -139,21 +180,80 @@ impl SqliteStore {
         Ok(())
     }
 
+    async fn checkout_dispatch(
+        &self,
+        op: StoreOp,
+        called: Instant,
+    ) -> Result<OwnedSemaphorePermit, StoreError> {
+        match tokio::time::timeout(DISPATCH_WAIT, self.slots.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => {
+                metrics::record_store_operation(
+                    STORE_BACKEND_SQLITE,
+                    op,
+                    millis(called.elapsed()),
+                    None,
+                    STORE_OUTCOME_ERROR,
+                );
+                Err(StoreError::Unavailable(
+                    "sqlite store dispatch is closed".into(),
+                ))
+            }
+            Err(_) => {
+                metrics::record_store_operation(
+                    STORE_BACKEND_SQLITE,
+                    op,
+                    millis(called.elapsed()),
+                    None,
+                    STORE_OUTCOME_SATURATED,
+                );
+                Err(StoreError::Unavailable(
+                    "sqlite store dispatch saturated".into(),
+                ))
+            }
+        }
+    }
+
     /// Run `f` on the one connection, off the async runtime when there is one.
     ///
     /// Two phases are timed and recorded as `axond.store.acquire_wait` and
-    /// `axond.store.query_duration` under `op`: the wait — blocking-pool
-    /// dispatch plus the connection mutex — and the execution once the mutex is
-    /// held. On SQLite the mutex is the pool: a wait that grows with load is
-    /// callers queueing on one connection, which is what #463 bounds.
+    /// `axond.store.query_duration` under `op`: the wait — dispatch-slot plus
+    /// the connection mutex — and the execution once the mutex is held. The
+    /// slot is acquired **before** `spawn_blocking`, so overload waits in async
+    /// tasks and then answers `Unavailable`, rather than occupying one blocking
+    /// thread per waiter. A caller that drops its future before the slot is
+    /// granted is skipped. After dispatch, the slot stays with the blocking
+    /// task until SQLite returns, even if the caller is cancelled, so a
+    /// cancellation storm cannot pile waiters onto the blocking pool. The
+    /// statement is not rolled back. The usage-index thread does not take a slot.
     async fn with_conn<T, F>(&self, op: StoreOp, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
         let conn = Arc::clone(&self.conn);
+        let inflight = Arc::clone(&self.inflight_blocking);
+        let max_inflight = Arc::clone(&self.max_inflight_blocking);
         let called = Instant::now();
+        let permit = if tokio::runtime::Handle::try_current().is_ok() {
+            match self.checkout_dispatch(op, called).await {
+                Ok(permit) => Some(permit),
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
         let run = move || {
+            inflight.fetch_add(1, Ordering::SeqCst);
+            let current = inflight.load(Ordering::SeqCst);
+            max_inflight.fetch_max(current, Ordering::SeqCst);
+            struct Decr(Arc<AtomicUsize>);
+            impl Drop for Decr {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _inflight = Decr(inflight);
             let mut guard = conn
                 .lock()
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -165,11 +265,25 @@ impl SqliteStore {
             let finished = Instant::now();
             Ok::<_, StoreError>((acquired, finished, result))
         };
-        let outcome = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::spawn_blocking(run)
-                .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))
-                .and_then(|inner| inner)
+        let outcome = if let Some(permit) = permit {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Own the permit on this task, not on `with_conn`: dropping the
+            // caller must not let another waiter `spawn_blocking` while this
+            // closure still holds (or waits for) the connection mutex.
+            tokio::spawn(async move {
+                let outcome = tokio::task::spawn_blocking(run)
+                    .await
+                    .map_err(|e| StoreError::Unavailable(e.to_string()))
+                    .and_then(|inner| inner);
+                drop(permit);
+                let _ = tx.send(outcome);
+            });
+            match rx.await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(StoreError::Unavailable(
+                    "sqlite store dispatch task ended before reporting".into(),
+                )),
+            }
         } else {
             run()
         };
@@ -2215,5 +2329,222 @@ mod tests {
             .append_usage_batch_sync(&events)
             .expect("repeat after success");
         assert_eq!(usage_rows(&store).len(), events.len());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn async_dispatch_times_out_when_the_slot_is_held() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let _held = store.hold_dispatch().await;
+        let started = Instant::now();
+        let err = store
+            .get_namespace("missing")
+            .await
+            .expect_err("a held slot saturates");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "waited {:?}, longer than the dispatch bound",
+            started.elapsed()
+        );
+        assert!(
+            matches!(err, StoreError::Unavailable(ref message) if message.contains("dispatch saturated")),
+            "{err:?}"
+        );
+        assert_eq!(
+            store.inflight_blocking(),
+            0,
+            "saturated callers never spawn_blocking"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_locked_connection_keeps_async_spawn_blocking_to_one() {
+        let store = Arc::new(SqliteStore::open(":memory:").expect("memory sqlite"));
+        let holder = Arc::clone(&store);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || {
+            let _guard = holder.conn.lock().expect("conn");
+            entered_tx.send(()).expect("entered");
+            let _ = release_rx.recv();
+        });
+        entered_rx.recv().expect("parked");
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move { store.get_namespace("ns").await }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.inflight_blocking() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            store.inflight_blocking(),
+            1,
+            "one waiter reached spawn_blocking"
+        );
+        tokio::time::sleep(DISPATCH_WAIT + Duration::from_millis(30)).await;
+
+        let mut saturated = 0u32;
+        let mut still_running = 0u32;
+        let mut rest = Vec::new();
+        for task in tasks {
+            if task.is_finished() {
+                match task.await {
+                    Ok(Err(StoreError::Unavailable(message)))
+                        if message.contains("dispatch saturated") =>
+                    {
+                        saturated += 1;
+                    }
+                    other => panic!("unexpected finished outcome: {other:?}"),
+                }
+            } else {
+                still_running += 1;
+                rest.push(task);
+            }
+        }
+        assert!(
+            saturated >= 6,
+            "queued waiters must saturate, got {saturated}"
+        );
+        assert_eq!(
+            still_running, 1,
+            "one spawn_blocking still waits on the mutex"
+        );
+        assert_eq!(store.max_inflight_blocking(), 1);
+        drop(release_tx);
+        parked.join().expect("holder");
+        for task in rest {
+            task.await
+                .expect("join")
+                .expect("the in-flight read finishes after the lock drops");
+        }
+        assert_eq!(store.inflight_blocking(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_queued_dispatch_does_not_start_sqlite_work() {
+        let store = Arc::new(SqliteStore::open(":memory:").expect("memory sqlite"));
+        let _held = store.hold_dispatch().await;
+        let waiter = Arc::clone(&store);
+        let task = tokio::spawn(async move { waiter.get_namespace("ns").await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(store.inflight_blocking(), 0);
+        assert_eq!(store.max_inflight_blocking(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_started_sqlite_write_finishes_after_the_caller_is_cancelled() {
+        let store = Arc::new(SqliteStore::open(":memory:").expect("memory sqlite"));
+        let holder = Arc::clone(&store);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || {
+            let _guard = holder.conn.lock().expect("conn");
+            entered_tx.send(()).expect("entered");
+            let _ = release_rx.recv();
+        });
+        entered_rx.recv().expect("parked");
+
+        let writer = Arc::clone(&store);
+        let task = tokio::spawn(async move {
+            writer
+                .put_namespace(NamespaceRecord {
+                    id: "kept".into(),
+                    attrs: serde_json::json!({}),
+                    blocklist: None,
+                })
+                .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.inflight_blocking() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(store.inflight_blocking(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(release_tx);
+        parked.join().expect("holder");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.inflight_blocking() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(store.inflight_blocking(), 0);
+        assert!(
+            store.get_namespace("kept").await.expect("read").is_some(),
+            "a write that entered spawn_blocking is not rolled back by cancelling the waiter"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_in_flight_dispatch_keeps_the_slot_until_sqlite_returns() {
+        let store = Arc::new(SqliteStore::open(":memory:").expect("memory sqlite"));
+        let holder = Arc::clone(&store);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || {
+            let _guard = holder.conn.lock().expect("conn");
+            entered_tx.send(()).expect("entered");
+            let _ = release_rx.recv();
+        });
+        entered_rx.recv().expect("parked");
+
+        let writer = Arc::clone(&store);
+        let task = tokio::spawn(async move {
+            writer
+                .put_namespace(NamespaceRecord {
+                    id: "kept".into(),
+                    attrs: serde_json::json!({}),
+                    blocklist: None,
+                })
+                .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.inflight_blocking() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(store.inflight_blocking(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            store.inflight_blocking(),
+            1,
+            "blocking work still owns the slot"
+        );
+
+        let started = Instant::now();
+        let err = store
+            .get_namespace("other")
+            .await
+            .expect_err("a held slot still saturates after the waiter is cancelled");
+        assert!(
+            matches!(err, StoreError::Unavailable(ref message) if message.contains("dispatch saturated")),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(store.max_inflight_blocking(), 1);
+
+        drop(release_tx);
+        parked.join().expect("holder");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.inflight_blocking() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(store.inflight_blocking(), 0);
+        assert!(store.get_namespace("kept").await.expect("read").is_some());
+    }
+
+    #[tokio::test]
+    async fn usage_index_sync_writes_do_not_take_a_dispatch_slot() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let _held = store.hold_dispatch().await;
+        let events = super::super::tests::usage_events("wsp_x", "req", 3);
+        store
+            .append_usage_batch_sync(&events)
+            .expect("index writer is not the async dispatch");
+        assert_eq!(usage_rows(&store).len(), 3);
+        assert_eq!(store.inflight_blocking(), 0);
     }
 }
