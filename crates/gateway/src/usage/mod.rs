@@ -619,7 +619,9 @@ impl IndexQueue {
 /// Handle on the one index worker `attach_store` started. SQLite runs on an OS
 /// thread whose join is not cancellable; Postgres is a task that can be aborted.
 enum IndexWorker {
-    Blocking(std::thread::JoinHandle<IndexWorkerReport>),
+    /// SQLite: the OS thread is detached at spawn. Completion is this channel
+    /// so a drain timeout cannot park Tokio's blocking pool on `JoinHandle::join`.
+    Blocking(tokio::sync::oneshot::Receiver<IndexWorkerReport>),
     Async(tokio::task::JoinHandle<IndexWorkerReport>),
 }
 
@@ -920,12 +922,19 @@ impl UsageDelivery {
         let telemetry = Arc::clone(&self.index);
         let (tx, rx) = tokio::sync::mpsc::channel(settings.capacity);
         if store.blocking_usage_index() {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             match std::thread::Builder::new()
                 .name("axond-usage-index".into())
-                .spawn(move || sqlite_usage_index_worker(store, rx, stop, settings, telemetry))
-            {
+                .spawn(move || {
+                    let report = sqlite_usage_index_worker(store, rx, stop, settings, telemetry);
+                    let _ = done_tx.send(report);
+                }) {
                 Ok(handle) => {
-                    *lock_mutex(&self.index_worker) = Some(IndexWorker::Blocking(handle));
+                    // Detach: holding the join across a drain timeout would keep a
+                    // `spawn_blocking` task alive until SQLite returned, and the
+                    // runtime would wait for that task at process exit.
+                    drop(handle);
+                    *lock_mutex(&self.index_worker) = Some(IndexWorker::Blocking(done_rx));
                 }
                 Err(error) => {
                     tracing::error!(
@@ -1177,9 +1186,10 @@ impl UsageDelivery {
     /// the worker to write what remains.
     ///
     /// Does not set the crash-stop flag: the worker treats a closed channel as
-    /// "finish the queue". A join that overruns is abandoned rather than
-    /// allowed to hold the runtime on an uninterruptible SQLite write; leftovers
-    /// are then unknown and are not counted as index `appends`.
+    /// "finish the queue". A wait that overruns drops the completion receiver
+    /// (the SQLite thread is already detached) rather than `join`ing it on
+    /// Tokio's blocking pool; leftovers are then unknown and are not counted as
+    /// index `appends`.
     ///
     /// Crash (`Drop`) and [`abandon_index`](Self::abandon_index) stay
     /// best-effort: they signal stop, drop the sender, and do not join.
@@ -1215,31 +1225,20 @@ impl UsageDelivery {
         };
         let bound = budget.saturating_add(DRAIN_MARGIN);
         match worker {
-            IndexWorker::Blocking(handle) => {
-                match tokio::time::timeout(
-                    bound,
-                    tokio::task::spawn_blocking(move || handle.join()),
-                )
-                .await
-                {
-                    Ok(Ok(Ok(report))) => report.into_drain(),
-                    Ok(Ok(Err(_panic))) => {
-                        tracing::error!("usage-index worker panicked");
-                        self.unreported_index()
-                    }
-                    Ok(Err(error)) => {
-                        tracing::error!(error = %error, "usage-index join task failed");
-                        self.unreported_index()
-                    }
-                    Err(_) => {
-                        tracing::error!(
-                            "usage-index worker did not stop inside its bound; the SQLite                              thread was not joined"
-                        );
-                        self.index_stop.store(true, Ordering::Release);
-                        self.unreported_index()
-                    }
+            IndexWorker::Blocking(done) => match tokio::time::timeout(bound, done).await {
+                Ok(Ok(report)) => report.into_drain(),
+                Ok(Err(_)) => {
+                    tracing::error!("usage-index worker panicked");
+                    self.unreported_index()
                 }
-            }
+                Err(_) => {
+                    tracing::error!(
+                        "usage-index worker did not stop inside its bound; the SQLite                          thread was already detached"
+                    );
+                    self.index_stop.store(true, Ordering::Release);
+                    self.unreported_index()
+                }
+            },
             IndexWorker::Async(mut handle) => {
                 match tokio::time::timeout(bound, &mut handle).await {
                     Ok(Ok(report)) => report.into_drain(),
