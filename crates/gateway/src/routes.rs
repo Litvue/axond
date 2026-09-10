@@ -1405,32 +1405,6 @@ struct Wire {
 }
 
 impl Wire {
-    /// Reject an alias whose targets cannot speak the route's wire *before*
-    /// anything is reserved or dispatched: no route translates between wires,
-    /// and failing over into a target that cannot serve the shape would turn a
-    /// config mistake into a confusing upstream `404`.
-    #[allow(dead_code)]
-    fn check_targets(
-        &self,
-        cfg: &crate::config::Config,
-        model: &Model,
-        alias: &str,
-    ) -> Result<(), GatewayError> {
-        for target in &model.targets {
-            let Some(provider) = cfg.provider(&target.provider) else {
-                continue;
-            };
-            if !self.route.serves(provider.kind) {
-                return Err(GatewayError::UnsupportedWire {
-                    route: self.route.label(),
-                    alias: alias.to_owned(),
-                    provider: provider.id.clone(),
-                });
-            }
-        }
-        Ok(())
-    }
-
     fn call(&self, body: Value, provider: &'static str) -> NativeCall {
         NativeCall::new(
             provider,
@@ -1777,16 +1751,6 @@ async fn serve(
     let mut middleware_request = ProviderRequest {
         model: alias.clone(),
         body,
-    };
-    #[cfg(not(test))]
-    let middleware = snapshot.middleware(&caller.namespace);
-    // Primitive tests can install a process-local override. Production has no
-    // such field: its chain is always owned by the captured serving snapshot.
-    #[cfg(test)]
-    let middleware = if state.0.middleware.is_empty() {
-        snapshot.middleware(&caller.namespace)
-    } else {
-        &state.0.middleware
     };
     let mut protected_values = wire
         .headers
@@ -3333,10 +3297,7 @@ async fn dispatch_over_pool(
         let upstream = Upstream {
             base_url: provider.base_url.clone(),
             api_key: lease.secret.clone(),
-            auth: match provider.kind {
-                ProviderKind::Anthropic => AuthScheme::Header("x-api-key"),
-                ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
-            },
+            auth: auth_scheme(provider.kind),
         };
         if prepared.is_none() {
             match prepare_pool_call(
