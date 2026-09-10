@@ -477,9 +477,9 @@ pub struct UsageDelivery {
     /// Bounded queue into the usage-index worker. `append_store` only
     /// `try_send`s; a full queue drops the event rather than spawning work.
     index_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<QueuedIndexEvent>>,
-    /// Occupied slots in `index_tx`. Senders increment on an accepted enqueue
-    /// and the worker decrements on receive or shutdown drain, so the histogram
-    /// observes the depth this event produced rather than a later `capacity()`.
+    /// Occupied slots in `index_tx` (reserved permits plus queued events).
+    /// Incremented after `try_reserve` succeeds and decremented when the worker
+    /// receives or drains, so the histogram cannot wrap or exceed the bound.
     index_depth: Arc<AtomicU64>,
     /// Set on drop so the worker abandons queued items after the in-flight write.
     index_stop: Arc<AtomicBool>,
@@ -603,16 +603,19 @@ impl UsageDelivery {
             crate::telemetry::metrics::record_usage_index_append("failed");
             return;
         };
-        let depth = self.index_depth.fetch_add(1, Ordering::AcqRel) + 1;
-        match tx.try_send(QueuedIndexEvent {
-            enqueued: Instant::now(),
-            event,
-        }) {
-            Ok(()) => {
+        match tx.try_reserve() {
+            Ok(permit) => {
+                // The permit occupies a real slot, so the worker cannot recv
+                // this event until `send` below. Depth is then occupied slots,
+                // not in-flight send attempts.
+                let depth = self.index_depth.fetch_add(1, Ordering::AcqRel) + 1;
+                permit.send(QueuedIndexEvent {
+                    enqueued: Instant::now(),
+                    event,
+                });
                 crate::telemetry::metrics::record_usage_index_enqueued(depth);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                take_index_slot(&self.index_depth);
                 tracing::error!(
                     request_id = %request_id,
                     "store usage append timed out"
@@ -623,7 +626,6 @@ impl UsageDelivery {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                take_index_slot(&self.index_depth);
                 tracing::error!(
                     request_id = %request_id,
                     "store usage append failed"
