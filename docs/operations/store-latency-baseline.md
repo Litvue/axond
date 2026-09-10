@@ -332,9 +332,12 @@ What the phases say, on this host:
   almost nothing (554 req/s, resolve wait 28 ms). The coupling is the held
   connection, not the number of summaries. [#464](https://github.com/Litvue/axond/issues/464)
   breaks that coupling: `summarize_usage` opens a second, read-only connection
-  (`PRAGMA query_only=ON`) to the same WAL file and has its own dispatch slot.
-  `EXPLAIN QUERY PLAN` of the summary `SELECT` is `SEARCH axond_store_usage USING INDEX sqlite_autoindex_axond_store_usage_1 (namespace=? AND period=?)`.
-  That is the unique `(namespace, period, request_id)` index, not a covering
+  (`SQLITE_OPEN_READ_ONLY` plus `PRAGMA query_only=ON`) to the same WAL file
+  and has its own dispatch slot. The reader attaches to the writer's file path
+  from `PRAGMA database_list`, so a URI `mode=rw` / `mode=rwc` on the writer
+  path cannot make the reader fail to boot.
+  `EXPLAIN QUERY PLAN` of the summary `SELECT` is `SEARCH axond_store_usage USING INDEX axond_store_usage_ns_period (namespace=? AND period=?)`.
+  That is the `(namespace, period)` index, not a covering
   `(namespace, period, model, status)` index. A covering index would speed the
   fold (29 ms vs 38 ms at 200 000 rows in a release microbench) and would add a
   second b-tree insert on every usage append. The reader lane is what keeps

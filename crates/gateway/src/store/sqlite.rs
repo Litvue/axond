@@ -133,7 +133,7 @@ impl SqliteStore {
         migrate_tombstone_expires_at(&conn)?;
         migrate_provider_models_source(&conn)?;
         sweep_expired_holds(&conn)?;
-        let reader = open_reader(&conn, path)?;
+        let reader = open_reader(&conn)?;
         Ok(Self {
             writer: Lane::new(conn),
             reader,
@@ -388,7 +388,7 @@ fn unavailable(err: rusqlite::Error) -> StoreError {
 /// memory index exist for the read-only connection to attach to. The writer's
 /// `PRAGMA database_list` reports an empty file for `:memory:` and for
 /// `mode=memory` URIs alike, whichever spelling `path` used.
-fn open_reader(writer: &Connection, path: &str) -> Result<Option<Lane>, StoreError> {
+fn open_reader(writer: &Connection) -> Result<Option<Lane>, StoreError> {
     let file: String = writer
         .query_row(
             "SELECT file FROM pragma_database_list WHERE name = 'main'",
@@ -399,13 +399,15 @@ fn open_reader(writer: &Connection, path: &str) -> Result<Option<Lane>, StoreErr
     if file.is_empty() {
         return Ok(None);
     }
+    // `file` is the WAL's filesystem path. Opening `path` again would reuse a
+    // URI `mode=rw` / `mode=rwc` that SQLITE_OPEN_READ_ONLY then refuses.
     let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_URI,
+        &file,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| StoreError::Unavailable(format!("sqlite usage reader: {error}")))?;
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(unavailable)?;
     conn.pragma_update(None, "busy_timeout", 5000)
         .map_err(unavailable)?;
     Ok(Some(Lane::new(conn)))
@@ -2692,6 +2694,24 @@ mod tests {
                 cost_microdollars: *cost,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_file_uri_with_mode_rwc_still_opens_a_summary_reader() {
+        let db = TempDb::new("summary-uri");
+        let uri = format!("file:{}?mode=rwc", db.0.display());
+        let store = SqliteStore::open(&uri).expect("uri open");
+        add_namespace(&store, "wsp_x").await;
+        store
+            .append_usage_batch(three_rows("wsp_x"))
+            .await
+            .expect("append");
+        let _held = store.hold_dispatch().await;
+        let rows = store
+            .summarize_usage("wsp_x", "p")
+            .await
+            .expect("reader attached despite URI mode=rwc");
+        assert_eq!(rows, summary_rows(&THREE_ROWS_SUMMARY));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
