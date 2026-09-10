@@ -338,6 +338,27 @@ const ADMISSION_RESOURCE: Label = Label::closed(
         crate::admission::RESOURCE_QUEUE,
         crate::admission::RESOURCE_DIAGNOSTIC,
         crate::admission::RESOURCE_DIAGNOSTIC_AUTH,
+        crate::admission::RESOURCE_SETTLEMENT,
+    ],
+);
+
+const SETTLEMENT_STAGE: Label = Label::closed(
+    "axond.settlement.stage",
+    &[
+        crate::settlement::STAGE_RESERVED,
+        crate::settlement::STAGE_QUEUED,
+        crate::settlement::STAGE_EXECUTING,
+    ],
+);
+
+const SETTLEMENT_REASON: Label = Label::closed(
+    "axond.settlement.reason",
+    &[
+        crate::settlement::FAILURE_QUEUE_TIMEOUT,
+        crate::settlement::FAILURE_EXECUTION_TIMEOUT,
+        crate::settlement::FAILURE_PANICKED,
+        crate::settlement::FAILURE_CANCELLED,
+        crate::settlement::FAILURE_REFUSED,
     ],
 );
 
@@ -637,6 +658,36 @@ pub const CATALOG: &[MetricSpec] = &[
         labels: &[],
     },
     MetricSpec {
+        name: "axond.shutdown.abandoned_settlements",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[],
+    },
+    MetricSpec {
+        name: "axond.settlement.in_flight",
+        kind: InstrumentKind::UpDownCounter,
+        unit: None,
+        labels: &[SETTLEMENT_STAGE],
+    },
+    MetricSpec {
+        name: "axond.settlement.queue_wait",
+        kind: InstrumentKind::Histogram,
+        unit: Some("ms"),
+        labels: &[],
+    },
+    MetricSpec {
+        name: "axond.settlement.oldest_pending_age",
+        kind: InstrumentKind::Gauge,
+        unit: Some("ms"),
+        labels: &[],
+    },
+    MetricSpec {
+        name: "axond.settlement.failures",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[SETTLEMENT_REASON],
+    },
+    MetricSpec {
         name: "axond.config.reloads",
         kind: InstrumentKind::Counter,
         unit: None,
@@ -832,6 +883,7 @@ pub const CATALOG: &[MetricSpec] = &[
                     "admission_queue_full",
                     "admission_queue_timeout",
                     "diagnostic_concurrency_exceeded",
+                    "settlement_capacity_exhausted",
                 ],
             ),
         ],
@@ -1247,6 +1299,20 @@ mod tests {
             "axond.usage.index.queue.wait",
         ] {
             assert!(spec(metric).expect("catalogued").labels.is_empty());
+        }
+    }
+
+    /// Every reason a settlement can fail for is a value the failure counter
+    /// declares, so a new exit path cannot mint an uncatalogued series.
+    #[test]
+    fn every_settlement_failure_reason_is_catalogued() {
+        for reason in crate::settlement::FAILURE_REASONS {
+            validate_label_value(
+                "axond.settlement.failures",
+                "axond.settlement.reason",
+                reason,
+            )
+            .expect("every settlement failure reason is catalogued");
         }
     }
 

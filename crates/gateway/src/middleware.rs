@@ -33,6 +33,7 @@ use crate::config::Config;
 use crate::desired_state::ContentMiddlewareRegistration;
 use crate::error::GatewayError;
 use crate::rate_limit::{RateLimitError, RateLimitKey, RateLimitPermit};
+use crate::settlement::SettlementReservation;
 use crate::state::AppState;
 use crate::store::BudgetAdmit;
 
@@ -957,6 +958,10 @@ pub struct MiddlewareExecution {
     surface: Option<MiddlewareSurface>,
     core_rate_limit_permit: Option<RateLimitPermit>,
     core_budget: Option<CoreBudgetHold>,
+    /// The settlement capacity the request reserved at admission, carried here
+    /// because this owner already follows the request into buffered completion
+    /// or streaming accounting — wherever its one settlement is spawned from.
+    settlement: Option<SettlementReservation>,
 }
 
 struct InvocationCapacity {
@@ -999,6 +1004,7 @@ impl MiddlewareExecution {
             surface,
             core_rate_limit_permit: None,
             core_budget: None,
+            settlement: None,
         }
     }
 
@@ -1015,7 +1021,21 @@ impl MiddlewareExecution {
             surface: None,
             core_rate_limit_permit: None,
             core_budget: None,
+            settlement: None,
         }
+    }
+
+    /// Hold the settlement capacity admission reserved for this request until
+    /// the path that settles it takes it back with [`Self::take_settlement`].
+    pub(crate) fn reserve_settlement(&mut self, reservation: SettlementReservation) {
+        self.settlement = Some(reservation);
+    }
+
+    /// The reserved settlement capacity, for the one settlement this request
+    /// spawns. `None` once taken, or when nothing was reserved (tests that build
+    /// the execution directly).
+    pub(crate) fn take_settlement(&mut self) -> Option<SettlementReservation> {
+        self.settlement.take()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1606,9 +1626,19 @@ impl Drop for CoreBudgetHold {
         };
         let state = self.state.clone();
         let key = self.key.clone();
-        crate::streaming::spawn_settlement(async move {
-            state.0.budget.release(&key, &reservation).await;
-        });
+        // A release settles zero, which the Store ledger records as nothing. It
+        // takes settlement capacity only if some is free: under saturation the
+        // request's own reservation is still with its owner, and skipping a
+        // zero-charge write loses no spend.
+        let settlements = self.state.0.settlements.clone();
+        if settlements
+            .try_spawn(async move {
+                state.0.budget.release(&key, &reservation).await;
+            })
+            .is_err()
+        {
+            tracing::debug!("zero-charge budget release skipped at settlement capacity");
+        }
     }
 }
 

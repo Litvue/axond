@@ -75,6 +75,7 @@ mod routes;
 // rotation, failure, retirement — is safe for requests in flight.
 #[cfg(test)]
 mod secret_redaction;
+mod settlement;
 mod shutdown;
 mod state;
 // The authenticated status contract (#199). Stateful `serve` constructs the
@@ -1030,15 +1031,24 @@ async fn serve() -> anyhow::Result<()> {
     // Abandoned responses settle as they end, so the settlements queued by the
     // requests that just finished have to land before the sinks are flushed.
     let stuck = lifecycle.quiesce(until(settle_by)).await;
-    let unsettled = streaming::await_settlements(until(settle_by)).await;
+    let leftovers = resources.0.settlements.await_idle(until(settle_by)).await;
+    let unsettled = leftovers.unsettled();
     if stuck > 0 || unsettled > 0 {
         // Counted as abandoned here as well as at the deadline: work that
         // outlives the settle window is work whose spend this process will
         // never record, whether or not the deadline was what cut it.
         telemetry::metrics::record_shutdown_abandoned(stuck);
+        telemetry::metrics::record_shutdown_abandoned_settlements(unsettled);
         tracing::error!(
             in_flight = stuck,
             unsettled,
+            settlements_queued = leftovers.queued,
+            settlements_executing = leftovers.executing,
+            settlements_reserved = leftovers.reserved,
+            oldest_settlement_ms = leftovers
+                .oldest_age
+                .map(|age| age.as_millis() as u64)
+                .unwrap_or(0),
             settle_share_ms = plan.settle_share().as_millis() as u64,
             "some spend could not be settled within the settle share of the flush budget"
         );

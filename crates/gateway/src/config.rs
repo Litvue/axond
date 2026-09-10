@@ -1504,6 +1504,28 @@ pub struct AdmissionConfig {
     /// token allowance can (a provider need not honor `max_tokens`). `0`
     /// disables it.
     pub max_stream_bytes: u64,
+    /// Requests whose spend this replica is still carrying toward the Store:
+    /// admitted and not yet settled, settlements queued for an execution slot,
+    /// and settlements executing. Reserved at admission (no ledger write) and
+    /// released when the settlement finishes, so a slow Store pushes back on
+    /// new admissions with `503 settlement_capacity_exhausted` rather than
+    /// accumulating detached work. Defaults to four times `max_in_flight`,
+    /// so the ceiling only binds when settlement falls behind serving. `0`
+    /// disables the ceiling.
+    pub max_pending_settlements: usize,
+    #[doc(hidden)]
+    pub max_pending_settlements_explicit: bool,
+    /// Settlements executing against the Store at once. Bounds the charge
+    /// concurrency one replica presents to the ledger. `0` disables it.
+    pub max_in_flight_settlements: usize,
+    /// How long a settlement waits for one of those execution slots before it
+    /// is abandoned — counted in `axond.settlement.failures`, never retried.
+    /// `0` waits without bound (shutdown still bounds it).
+    pub settlement_queue_wait_ms: u64,
+    /// How long one settlement may run once it has a slot: the charge plus the
+    /// usage append. One that overruns is abandoned and counted, never retried,
+    /// because a budget charge is not idempotent. `0` disables it.
+    pub settlement_timeout_ms: u64,
 }
 
 /// The `[admission]` section as written, before an unset sub-ceiling is clamped
@@ -1532,6 +1554,14 @@ struct AdmissionConfigWire {
     max_output_tokens: u64,
     #[serde(default = "default_max_stream_bytes")]
     max_stream_bytes: u64,
+    #[serde(default)]
+    max_pending_settlements: Option<usize>,
+    #[serde(default = "default_max_in_flight_settlements")]
+    max_in_flight_settlements: usize,
+    #[serde(default = "default_settlement_queue_wait_ms")]
+    settlement_queue_wait_ms: u64,
+    #[serde(default = "default_settlement_timeout_ms")]
+    settlement_timeout_ms: u64,
 }
 
 impl<'de> Deserialize<'de> for AdmissionConfig {
@@ -1565,6 +1595,14 @@ impl<'de> Deserialize<'de> for AdmissionConfig {
                 }
                 None => (default_max_in_flight_per_tenant(), false),
             };
+        // Every admitted request reserves one settlement, so a defaulted
+        // settlement ceiling follows the global one rather than sitting below a
+        // raised `max_in_flight` and refusing requests the operator sized for.
+        let (max_pending_settlements, max_pending_settlements_explicit) =
+            match wire.max_pending_settlements {
+                Some(value) => (value, true),
+                None => (default_max_pending_settlements(wire.max_in_flight), false),
+            };
         Ok(Self {
             max_request_bytes: wire.max_request_bytes,
             max_in_flight: wire.max_in_flight,
@@ -1579,6 +1617,11 @@ impl<'de> Deserialize<'de> for AdmissionConfig {
             max_prompt_tokens: wire.max_prompt_tokens,
             max_output_tokens: wire.max_output_tokens,
             max_stream_bytes: wire.max_stream_bytes,
+            max_pending_settlements,
+            max_pending_settlements_explicit,
+            max_in_flight_settlements: wire.max_in_flight_settlements,
+            settlement_queue_wait_ms: wire.settlement_queue_wait_ms,
+            settlement_timeout_ms: wire.settlement_timeout_ms,
         })
     }
 }
@@ -1599,6 +1642,11 @@ impl Default for AdmissionConfig {
             max_prompt_tokens: default_max_prompt_tokens(),
             max_output_tokens: default_max_output_tokens(),
             max_stream_bytes: default_max_stream_bytes(),
+            max_pending_settlements: default_max_pending_settlements(default_max_in_flight()),
+            max_pending_settlements_explicit: false,
+            max_in_flight_settlements: default_max_in_flight_settlements(),
+            settlement_queue_wait_ms: default_settlement_queue_wait_ms(),
+            settlement_timeout_ms: default_settlement_timeout_ms(),
         }
     }
 }
@@ -1625,6 +1673,39 @@ fn default_max_in_flight_per_tenant() -> usize {
 
 fn default_max_tenants() -> usize {
     1_024
+}
+
+/// Four settlements per admitted request: room for the Store to fall three
+/// requests' worth behind serving before admission pushes back. Tied to the
+/// global ceiling so that raising `max_in_flight` alone never leaves a lower
+/// settlement ceiling to shed at; with the global ceiling off, the shipped
+/// default's four times.
+fn default_max_pending_settlements(max_in_flight: usize) -> usize {
+    let base = if max_in_flight > 0 {
+        max_in_flight
+    } else {
+        default_max_in_flight()
+    };
+    base.saturating_mul(4).min(MAX_PERMITS)
+}
+
+/// Charges the ledger sees from one replica at once. Well above what a Store
+/// connection pool serves in parallel, so it bounds a stampede without
+/// throttling normal settlement.
+fn default_max_in_flight_settlements() -> usize {
+    64
+}
+
+/// Long enough to ride out a Store hiccup, short enough that a charge is
+/// abandoned — and counted — rather than held indefinitely behind an outage.
+fn default_settlement_queue_wait_ms() -> u64 {
+    10_000
+}
+
+/// Above the Store's own operation timeouts, so a settlement is only ever cut
+/// here after its writes have already been refused or timed out by the Store.
+fn default_settlement_timeout_ms() -> u64 {
+    10_000
 }
 
 /// Immediate rejection by default: a queue that is not tuned for a deployment's
@@ -4295,6 +4376,14 @@ impl Config {
                 admission.max_in_flight_streams,
             ),
             ("admission.queue_capacity", admission.queue_capacity),
+            (
+                "admission.max_pending_settlements",
+                admission.max_pending_settlements,
+            ),
+            (
+                "admission.max_in_flight_settlements",
+                admission.max_in_flight_settlements,
+            ),
         ] {
             if value > MAX_PERMITS {
                 return Err(ConfigError::Invalid(format!(
@@ -4318,6 +4407,21 @@ impl Config {
                  the global ceiling is off"
                     .into(),
             ));
+        }
+        // Every admitted request reserves one settlement, so a settlement
+        // ceiling below the global one would shed at the lower number with the
+        // wrong verdict. Only a written one can contradict: a defaulted one
+        // follows `max_in_flight`.
+        if admission.max_in_flight > 0
+            && admission.max_pending_settlements_explicit
+            && admission.max_pending_settlements > 0
+            && admission.max_pending_settlements < admission.max_in_flight
+        {
+            return Err(ConfigError::Invalid(format!(
+                "admission.max_pending_settlements ({}) must be at least admission.max_in_flight \
+                 ({}): every admitted request reserves one settlement",
+                admission.max_pending_settlements, admission.max_in_flight
+            )));
         }
         Ok(())
     }

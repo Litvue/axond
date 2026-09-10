@@ -17,7 +17,6 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -1530,7 +1529,8 @@ impl Accounting {
         let budget_key = self.ctx.budget_key.clone();
         let reservation = self.ctx.reservation.clone();
         let core_budget = self.middleware_execution.take_core_budget();
-        spawn_settlement(async move {
+        let settlements = self.state.0.settlements.clone();
+        let settlement = async move {
             // The hold first, as on the buffered path: a stream cannot be
             // refused after it has been relayed, so the record cannot change
             // what the caller gets, while a durable append bounded by the
@@ -1549,7 +1549,17 @@ impl Accounting {
                     .await;
             }
             state.0.usage.record_terminal(&record).await;
-        });
+        };
+        // The capacity reserved at admission is what makes this unconditional:
+        // a stream that has been relayed cannot be refused its charge.
+        match self.middleware_execution.take_settlement() {
+            Some(reserved) => settlements.spawn(reserved, settlement),
+            None => {
+                if settlements.try_spawn(settlement).is_err() {
+                    settlements.refuse("stream settlement");
+                }
+            }
+        }
     }
 }
 
@@ -1557,54 +1567,6 @@ impl Drop for Accounting {
     fn drop(&mut self) {
         self.settle(Status::ClientCancelled);
     }
-}
-
-/// Settlements spawned and not yet finished. Tracked because shutdown has to
-/// wait for them: a stream cut short at the deadline settles *after* its body is
-/// dropped, and flushing the sinks before that ran would lose exactly the spend
-/// the drain was protecting.
-static OUTSTANDING_SETTLEMENTS: AtomicU64 = AtomicU64::new(0);
-/// Bumped when a settlement finishes. A `watch` channel rather than a `Notify`
-/// because a `Notify` waiter only enqueues on its first poll, so a wake-up
-/// racing the count check would be lost and the shutdown wait would sleep out
-/// its whole budget instead of noticing the work was already done.
-static SETTLED: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
-    std::sync::LazyLock::new(|| tokio::sync::watch::Sender::new(0));
-
-/// Settlement outlives the request body, so it runs detached. Outside a
-/// runtime (process teardown) there is nothing left to settle onto.
-pub(crate) fn spawn_settlement<F>(future: F)
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        OUTSTANDING_SETTLEMENTS.fetch_add(1, Ordering::AcqRel);
-        handle.spawn(async move {
-            future.await;
-            if OUTSTANDING_SETTLEMENTS.fetch_sub(1, Ordering::AcqRel) == 1 {
-                SETTLED.send_modify(|version| *version += 1);
-            }
-        });
-    }
-}
-
-/// Wait up to `bound` for detached settlements to reach the sinks, and report
-/// how many are still outstanding. Called once on the shutdown path, before the
-/// sinks are flushed.
-pub(crate) async fn await_settlements(bound: Duration) -> u64 {
-    let _ = tokio::time::timeout(bound, async {
-        // Subscribed before the count is read, so a settlement finishing in
-        // between bumps a version this receiver has not seen and `changed()`
-        // returns at once rather than sleeping on a wake-up that already fired.
-        let mut settled = SETTLED.subscribe();
-        while OUTSTANDING_SETTLEMENTS.load(Ordering::Acquire) != 0 {
-            if settled.changed().await.is_err() {
-                return;
-            }
-        }
-    })
-    .await;
-    OUTSTANDING_SETTLEMENTS.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
