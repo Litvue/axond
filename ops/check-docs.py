@@ -205,7 +205,13 @@ def check_stale_claims(files: list[Path]) -> list[str]:
 
 
 def check_route_contract() -> list[str]:
-    source = (ROOT / "crates/gateway/src/routes.rs").read_text(encoding="utf-8")
+    routes = ROOT / "crates/gateway/src/routes"
+    if routes.is_dir():
+        source = "\n".join(
+            path.read_text(encoding="utf-8") for path in sorted(routes.glob("*.rs"))
+        )
+    else:
+        source = (ROOT / "crates/gateway/src/routes.rs").read_text(encoding="utf-8")
     documented = (ROOT / "docs/compatibility.md").read_text(encoding="utf-8")
     registered = set(re.findall(r'path:\s*"(/[^"]+)"', source))
     return [

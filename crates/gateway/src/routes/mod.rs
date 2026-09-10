@@ -28,11 +28,11 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, RawQuery, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -40,46 +40,45 @@ use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use gateway_core::{
-    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareScope,
-    MiddlewareSurface, ModelPrice, ModelUsage, NativeMessagesDecoder, ProviderAdapter,
-    ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder, Surface, Usage,
-    serialized_json_len,
+    FailoverTarget, MiddlewareScope, MiddlewareSurface, ModelPrice, ModelUsage, ProviderRequest,
+    Usage,
 };
-use gateway_transport::{
-    AuthScheme, Deadline, EncodedJson, NativeCall, TimeoutBound, TimeoutKind, TransportError,
-    Upstream,
-};
+use gateway_transport::NativeCall;
 use http_body::Body as HttpBody;
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{Instrument, debug, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::admission::{AdmissionPermit, DiagnosticCredential, RequestKind};
+use crate::admission::RequestKind;
 use crate::aliases::AliasScope;
-use crate::budget::{Admission, BudgetKey, Denial, Reservation, admission_from_store};
+use crate::budget::{Admission, BudgetKey, Denial, admission_from_store};
 use crate::config::{
-    Config, CoreAccountingMode, Model, Provider, ProviderKind, ProviderWire, Target, UnpricedModels,
+    Config, CoreAccountingMode, Model, ProviderKind, ProviderWire, Target, UnpricedModels,
 };
-use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
+use crate::credentials::CredentialStatusView;
 use crate::desired_state::policy::BufferedResponseRoute;
 use crate::error::GatewayError;
-use crate::middleware::{CoreBudgetHold, MiddlewareChain, MiddlewareExecution};
+use crate::middleware::{MiddlewareChain, MiddlewareExecution};
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
-use crate::namespace::NamespaceId;
-use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
-use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
-use crate::rate_limit::{RateLimitKey, RateLimitPermit};
-use crate::settlement::{SettlementReservation, SettlementSlot};
+use crate::pricing::{AliasPrices, RequestPrice};
+use crate::principals::{Capability, TokenVerificationError};
+use crate::rate_limit::RateLimitKey;
 use crate::shutdown::Phase;
-use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
+use crate::state::{AppState, ConfigSnapshot, InboundKey};
 use crate::status::{StatusResponse, StatusScope};
 use crate::store::{BudgetAdmit, NamespaceRecord, StoreError};
-use crate::streaming::{self, Framing, StreamContext, StreamDelivery};
+use crate::streaming::{Framing, StreamDelivery};
 use crate::telemetry;
+use crate::usage::Status;
 use crate::usage::identity::EventIdentity;
-use crate::usage::{Status, UsageRecord};
+
+mod accounting;
+mod auth;
+mod dispatch;
+
+use accounting::*;
+use auth::*;
+use dispatch::*;
 
 pub fn router(state: AppState) -> Router {
     let specs = route_specs(false);
@@ -134,12 +133,12 @@ pub fn diagnostic_router(state: AppState) -> Router {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RouteAuthority {
+pub(super) enum RouteAuthority {
     Global,
     Namespaced,
 }
 
-fn mount(specs: Vec<RouteSpec>, state: AppState, authority: RouteAuthority) -> Router {
+pub(super) fn mount(specs: Vec<RouteSpec>, state: AppState, authority: RouteAuthority) -> Router {
     // The inbound body bound is declared rather than inherited: axum's own
     // default would otherwise be the process's real memory ceiling per request.
     let max_request_bytes = state.0.admission.limits().max_request_bytes;
@@ -241,7 +240,7 @@ pub fn unconverged_router(reason: &'static str) -> Router {
 /// pass inbound authentication before its handler can run — and if so, whether
 /// it is served work or asked about the replica serving it.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AuthPosture {
+pub(super) enum AuthPosture {
     LivenessProbe,
     Authenticated,
     Diagnostic,
@@ -269,7 +268,7 @@ impl AuthPosture {
 /// A route's complete registration: adding a route requires declaring its
 /// authentication posture here rather than silently omitting the layer.
 #[derive(Clone, Copy)]
-struct RouteSpec {
+pub(super) struct RouteSpec {
     path: &'static str,
     namespace_scoped: bool,
     auth: AuthPosture,
@@ -279,7 +278,7 @@ struct RouteSpec {
 
 /// The single route table: its posture is the source of truth for registration
 /// and for the sweep test that keeps the unauthenticated set closed.
-fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
+pub(super) fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
     let mut routes = vec![
         RouteSpec {
             path: "/healthz",
@@ -352,7 +351,7 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MintTokenRequest {
+pub(super) struct MintTokenRequest {
     sub: String,
     ttl_seconds: Option<u64>,
     scope: Option<Vec<String>>,
@@ -360,9 +359,9 @@ struct MintTokenRequest {
     max_request_microdollars: Option<u64>,
 }
 
-const MAX_MINT_SUBJECT_LENGTH: usize = 128;
+pub(super) const MAX_MINT_SUBJECT_LENGTH: usize = 128;
 
-async fn mint_tokens(
+pub(super) async fn mint_tokens(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     body: Result<Json<MintTokenRequest>, axum::extract::rejection::JsonRejection>,
@@ -515,7 +514,7 @@ async fn mint_tokens(
     ))
 }
 
-fn caller_can_mint_capability(
+pub(super) fn caller_can_mint_capability(
     caller: &InboundKey,
     snapshot: &ConfigSnapshot,
     capability: Capability,
@@ -537,79 +536,7 @@ fn caller_can_mint_capability(
 /// taking a per-subject rate-limit permit would put the rate-limit store on the
 /// path of a read whose whole purpose is to be answerable while that store is
 /// down — the outage the fail-closed limiter turns into a denial.
-async fn diagnostic_middleware(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, GatewayError> {
-    let _permit = state.0.admission.admit_diagnostic()?;
-    Ok(next.run(request).await)
-}
-
-/// Bound the work of *authenticating* a diagnostic read.
-///
-/// The ceiling above is inside authentication, so it bounds the answer rather
-/// than the signature verification and revocation lookup that precede it. This
-/// one is outside, and is wide enough that only a flood reaches it: the two
-/// together mean neither an anonymous flood can close the route to operators
-/// nor a credentialled one can spend the replica's CPU and revocation store
-/// without limit.
-///
-/// Which partition of it a request may take is decided here, from the shape of
-/// the credential alone — the only thing known before the credential is spent.
-/// A token's verification can block on the revocation store, so tokens are held
-/// to their own share and cannot fill the share that resolves in memory: the
-/// operator's static key is the credential the runbook sends through a
-/// revocation outage, and a store that is slow rather than down must not be
-/// able to refuse it. Callers presenting nothing at all are held to a third
-/// share for the same reason — a flood needs no credential to mount.
-async fn diagnostic_authentication_middleware(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, GatewayError> {
-    let credential = presented_credential(request.headers()).map_or(
-        DiagnosticCredential::Anonymous,
-        |credential| {
-            state
-                .config()
-                .diagnostic_credential(&Presented { credential })
-        },
-    );
-    let permit = state
-        .0
-        .admission
-        .admit_diagnostic_authentication(credential)?;
-    let mut request = request;
-    request
-        .extensions_mut()
-        .insert(AuthenticatingPermit(Arc::new(permit)));
-    Ok(next.run(request).await)
-}
-
-/// The pre-authentication permit, carried on the request so that
-/// [`authenticate_middleware`] can give it back the moment the credential is
-/// settled.
-///
-/// Holding it to the end of the response would make the share drain at the speed
-/// of *answering*, not of authenticating, which is the opposite of what it is
-/// for: sixteen slow readers would then close the in-memory share against the
-/// static key, and the inner ceiling already bounds the answering.
-#[derive(Clone)]
-struct AuthenticatingPermit(Arc<crate::admission::DiagnosticPermit>);
-
-impl AuthenticatingPermit {
-    /// Give the permit back. Dropping the extension would do it too, but only
-    /// once the request itself is dropped, which is the timing this exists to
-    /// avoid.
-    fn release(self) {
-        drop(self.0);
-    }
-}
-
-/// Reserve a slot for a request and hold it until the response body is fully
-/// delivered, so an open SSE stream counts as in-flight for as long as it runs.
-async fn admission_middleware(
+pub(super) async fn admission_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
@@ -666,7 +593,7 @@ async fn admission_middleware(
     Ok(Response::from_parts(parts, body))
 }
 
-async fn healthz() -> &'static str {
+pub(super) async fn healthz() -> &'static str {
     "ok"
 }
 
@@ -674,7 +601,7 @@ async fn healthz() -> &'static str {
 /// fails as soon as the drain begins, before admission closes, so a load
 /// balancer can stop routing while the replica is still able to serve. Real
 /// dependency readiness (config loaded, credentials present) is a follow-up.
-async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
+pub(super) async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
     if state
         .revision_report()
         .is_some_and(|report| report.active.is_none())
@@ -687,7 +614,7 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
     }
 }
 
-fn convergence_refusal() -> Response {
+pub(super) fn convergence_refusal() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
@@ -700,7 +627,7 @@ fn convergence_refusal() -> Response {
         .into_response()
 }
 
-async fn convergence_middleware(
+pub(super) async fn convergence_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
@@ -730,7 +657,7 @@ async fn convergence_middleware(
 /// budget store is down, because removing healthy replicas from service is how a
 /// dependency outage becomes a fleet outage.
 ///
-async fn replica_status(
+pub(super) async fn replica_status(
     State(state): State<AppState>,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
@@ -755,7 +682,7 @@ async fn replica_status(
 /// Replica-local Tier 0 credential status. Presence is expressed by each
 /// configured entry (boot resolves it or boot fails), never by an always-true
 /// field. Credential ids are attribution labels only; secrets remain write-only.
-async fn list_credentials(
+pub(super) async fn list_credentials(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     RawQuery(raw_query): RawQuery,
@@ -790,11 +717,16 @@ async fn list_credentials(
 /// asks whether the caller *is* the operator. The rule itself lives with
 /// authentication ([`InboundKey::holds_direct_operator_authority`]), which is
 /// also what decides an authenticated status caller's scope.
-fn caller_holds_direct_operator_authority(caller: &InboundKey, snapshot: &ConfigSnapshot) -> bool {
+pub(super) fn caller_holds_direct_operator_authority(
+    caller: &InboundKey,
+    snapshot: &ConfigSnapshot,
+) -> bool {
     caller.holds_direct_operator_authority(snapshot.config.default_namespace())
 }
 
-fn parse_credential_query(raw_query: Option<&str>) -> Result<Option<String>, GatewayError> {
+pub(super) fn parse_credential_query(
+    raw_query: Option<&str>,
+) -> Result<Option<String>, GatewayError> {
     let mut namespaces = None;
     for pair in raw_query.unwrap_or_default().split('&') {
         if pair.is_empty() {
@@ -815,7 +747,7 @@ fn parse_credential_query(raw_query: Option<&str>) -> Result<Option<String>, Gat
     Ok(namespaces)
 }
 
-fn decode_query_component(value: &str) -> Result<String, GatewayError> {
+pub(super) fn decode_query_component(value: &str) -> Result<String, GatewayError> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -859,7 +791,7 @@ pub(crate) fn fuzz_parse_credential_query(
     parse_credential_query(raw_query)
 }
 
-fn hex_digit(byte: u8) -> Option<u8> {
+pub(super) fn hex_digit(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -874,7 +806,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 /// Listed from the Store's discovery cache as `provider-id/model-id`, minus the
 /// effective blocklist (deployment default ∪ namespace extras). Never calls
 /// upstream: a background timer in `serve` refreshes the cache.
-async fn list_models(
+pub(super) async fn list_models(
     State(state): State<AppState>,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(_caller): Extension<InboundKey>,
@@ -911,253 +843,12 @@ async fn list_models(
     Ok(Json(json!({ "object": "list", "data": data })))
 }
 
-/// The credential a request presents, before anything is known about whether it
-/// is one.
-///
-/// It travels as `Authorization: Bearer` or, because that is what an Anthropic
-/// SDK pointed at the gateway sends, as `x-api-key`. Both name the same gateway
-/// key; the scheme is the client's, not a second credential space. Shared with
-/// the diagnostic pre-authentication ceiling, which has to partition on the same
-/// string authentication will later resolve.
-fn presented_credential(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
-}
-
-/// Resolve the caller's namespace + subject from the inbound key. Every request
-/// must present a configured gateway key: authentication fails closed, and a
-/// snapshot with no key never reaches a request (ADR 0013).
-async fn authenticate(
-    snapshot: &ConfigSnapshot,
-    headers: &HeaderMap,
-) -> Result<InboundKey, GatewayError> {
-    let credential = presented_credential(headers).ok_or(GatewayError::Unauthorized)?;
-    if credential.starts_with("axt1.") {
-        return Err(GatewayError::Unauthorized);
-    }
-    let presented = Presented { credential };
-    let store = snapshot.principal_store_name(&presented);
-    let principal = match snapshot.resolve_principal(&presented).await {
-        Ok(principal) => principal,
-        Err(PrincipalStoreError::Unauthorized(error)) => {
-            debug!(
-                store,
-                error = %error,
-                "token rejected during principal resolution"
-            );
-            return Err(GatewayError::TokenUnauthorized(error));
-        }
-        Err(PrincipalStoreError::Forbidden(error)) => {
-            debug!(
-                store,
-                error = %error,
-                "token rejected during principal resolution"
-            );
-            return Err(GatewayError::TokenForbidden(error));
-        }
-        Err(error) => {
-            // A layer error is terminal by design; it must not fall through to
-            // another authority just because the owning layer is unavailable.
-            warn!(
-                store,
-                error = %error,
-                "principal store resolution failed"
-            );
-            return Err(GatewayError::Unauthorized);
-        }
-    };
-    principal.ok_or(GatewayError::Unauthorized)
-}
-
-/// Authenticate once per request, before handler extractors, and carry the
-/// resolved snapshot and caller into the handler. A reload landing mid-request
-/// therefore cannot change what this request resolved. Invalid callers return
-/// `401` first; a valid caller on a replica with no active projected revision
-/// gets the typed `503` convergence refusal before the handler runs.
-async fn authenticate_middleware(
-    State((state, capability, authority)): State<(AppState, Option<Capability>, RouteAuthority)>,
-    headers: HeaderMap,
-    mut request: Request,
-    next: Next,
-) -> Result<Response, GatewayError> {
-    let snapshot = state.config();
-    let mut caller = authenticate(&snapshot, &headers).await?;
-    if let Some(jti) = &caller.jti {
-        match state.0.revocation.is_revoked(jti).await {
-            Ok(true) => {
-                crate::telemetry::metrics::record_revocation_denial();
-                return Err(GatewayError::TokenUnauthorized(
-                    TokenVerificationError::Revoked,
-                ));
-            }
-            Ok(false) => {}
-            Err(crate::revocation::RevocationError::Unavailable { .. }) => {
-                crate::telemetry::metrics::record_revocation_unavailable_denial();
-                return Err(GatewayError::RevocationUnavailable);
-            }
-            Err(error) => {
-                warn!(error = %error, "revocation store check failed");
-                crate::telemetry::metrics::record_revocation_unavailable_denial();
-                return Err(GatewayError::RevocationUnavailable);
-            }
-        }
-    }
-    // The path selects the namespace. Perform this intersection after inbound
-    // authentication but before convergence disclosure or any handler
-    // extractor: anonymous callers receive `401`, and an existing namespace
-    // outside the grant is indistinguishable from an absent namespace.
-    if authority == RouteAuthority::Namespaced {
-        let path = request
-            .extensions()
-            .get::<OriginalUri>()
-            .map_or_else(|| request.uri().path(), |original| original.path());
-        let namespace = namespace_from_canonical_path(path)?;
-        let grant = caller
-            .namespace_grant()
-            .map_err(|_| GatewayError::NamespaceNotAuthorized)?;
-        let authorized = grant.permits(&namespace);
-        let missing = if !authorized {
-            GatewayError::NamespaceNotAuthorized
-        } else {
-            GatewayError::UnknownNamespace
-        };
-        let reuse_admit = match (state.store(), state.0.budget.store_ledger()) {
-            (Some(namespaces), Some(ledger)) => Arc::ptr_eq(namespaces, ledger),
-            _ => false,
-        };
-        let record = if reuse_admit {
-            let resolved = match state.store() {
-                Some(store) => store
-                    .resolve_namespace(namespace.as_str())
-                    .await
-                    .map_err(GatewayError::from)?,
-                None => None,
-            }
-            .ok_or(missing)?;
-            request.extensions_mut().insert(resolved.admit);
-            resolved.record
-        } else {
-            match state.store() {
-                Some(store) => store
-                    .get_namespace(namespace.as_str())
-                    .await
-                    .map_err(GatewayError::from)?,
-                None => None,
-            }
-            .ok_or(missing)?
-        };
-        if !authorized {
-            debug!(
-                namespace = %namespace,
-                subject = %caller.subject,
-                signer_kid = ?caller.signer_kid,
-                "namespace route denied"
-            );
-            return Err(GatewayError::NamespaceNotAuthorized);
-        }
-
-        // Downstream code reads one effective namespace from the caller
-        // context. Replacing it here makes the path authoritative when a later
-        // grant implementation permits a set or all namespaces. Attrs are
-        // copied at admission so usage records carry the workspace metadata
-        // Litvue stored (ADR 0063). When the budget ledger is this Store,
-        // admit is loaded in the same round trip so inference does not hit
-        // Postgres again before dispatch.
-        caller.namespace = namespace.to_string();
-        caller.attrs = Some(record.attrs.clone());
-        request.extensions_mut().insert(namespace);
-        request.extensions_mut().insert(record);
-    }
-    // Route capability is evaluated only after the canonical path has selected
-    // the effective namespace. That ordering prevents an outside-grant path
-    // from learning whether its requested wire is servable in the caller's
-    // original namespace and prepares this boundary for set/all grants.
-    if let Some(capability) = capability
-        && let Some(scope) = caller.scope.as_ref()
-        && (!scope.contains(&capability)
-            || !namespace_allows(&snapshot, &caller.namespace, capability))
-    {
-        debug!(
-            namespace = %caller.namespace,
-            subject = %caller.subject,
-            signer_kid = ?caller.signer_kid,
-            %capability,
-            "token scope denied route"
-        );
-        return Err(GatewayError::ScopeInsufficient(capability));
-    }
-    // Keep the serving boundary here as well as in the route layer. The route
-    // table currently adds `convergence_middleware` to every authenticated
-    // inference route, but putting the invariant after successful
-    // authentication means a future authenticated route cannot accidentally
-    // serve the keyless stateful bootstrap by omitting that layer. Diagnostic
-    // status is intentionally exempt: it is the operator's view of why the
-    // replica is not ready, not inference traffic.
-    if !matches!(capability, Some(Capability::Status))
-        && state
-            .revision_report()
-            .is_some_and(|report| report.active.is_none())
-    {
-        request.extensions_mut().remove::<AuthenticatingPermit>();
-        return Ok(convergence_refusal());
-    }
-    // Authentication is over, whatever it cost, so the permit that bounded it
-    // goes back before the handler runs rather than after.
-    if let Some(permit) = request.extensions_mut().remove::<AuthenticatingPermit>() {
-        permit.release();
-    }
-    request.extensions_mut().insert(snapshot);
-    request.extensions_mut().insert(caller);
-    Ok(next.run(request).await)
-}
-
-/// Parse the raw namespace segment from the original URI. A nested axum router
-/// may rewrite the active URI; accepting a decoded equivalent such as `%61cme`
-/// would give one namespace several URL spellings and make routing ambiguous.
-fn namespace_from_canonical_path(path: &str) -> Result<NamespaceId, GatewayError> {
-    let rest = path
-        .strip_prefix("/ns/")
-        .or_else(|| path.strip_prefix("/namespaces/"))
-        .ok_or(GatewayError::InvalidNamespace)?;
-    let (namespace, suffix) = rest.split_once('/').ok_or(GatewayError::InvalidNamespace)?;
-    if suffix.is_empty() {
-        return Err(GatewayError::InvalidNamespace);
-    }
-    NamespaceId::parse(namespace).map_err(|_| GatewayError::InvalidNamespace)
-}
-
-fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capability) -> bool {
-    let route = match capability {
-        Capability::Chat => Some(Route::ChatCompletions),
-        Capability::Messages => Some(Route::NativeMessages),
-        Capability::Embeddings => Some(Route::Embeddings),
-        Capability::Responses => Some(Route::Responses),
-        Capability::Models => None,
-        Capability::Credentials | Capability::CredentialsAll => None,
-        // Status reports on the replica's own dependencies, so it is not
-        // gated on a namespace having a servable model.
-        Capability::Status => None,
-    };
-    let Some(route) = route else {
-        return true;
-    };
-    snapshot.config.provider.iter().any(|provider| {
-        route.serves(provider.kind)
-            && snapshot
-                .credentials
-                .is_present(&snapshot.config, namespace, &provider.id)
-    })
-}
-
 /// The wire shape a route speaks, which is the only thing that differs between
 /// the routes: the upstream path, which provider kinds can serve it, and how
 /// usage is read out of the provider's answer. Everything else — aliasing,
 /// failover, credential pools, budgets, usage — is shared.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Route {
+pub(super) enum Route {
     /// OpenAI-shaped chat, dispatched through the provider adapter to an
     /// OpenAI-family target's `/chat/completions`.
     ChatCompletions,
@@ -1358,7 +1049,7 @@ impl Route {
 /// routes need the opt-in even for validation-only middleware; mutation selects
 /// reconstructed output while validation-only chains retain the original bytes.
 /// Response-only middleware belongs to the non-streaming path.
-fn stream_delivery(
+pub(super) fn stream_delivery(
     cfg: &Config,
     namespace: &str,
     route: Route,
@@ -1399,7 +1090,7 @@ fn stream_delivery(
 /// A route plus the wire headers this request carries upstream, threaded through
 /// the shared failover walk so both dispatch shapes reuse one request path.
 #[derive(Clone)]
-struct Wire {
+pub(super) struct Wire {
     route: Route,
     headers: Vec<(&'static str, String)>,
 }
@@ -1415,12 +1106,12 @@ impl Wire {
     }
 }
 
-struct ServeNs {
+pub(super) struct ServeNs {
     record: NamespaceRecord,
     admit: Option<BudgetAdmit>,
 }
 
-fn serve_ns(
+pub(super) fn serve_ns(
     record: Option<Extension<NamespaceRecord>>,
     admit: Option<Extension<BudgetAdmit>>,
 ) -> Option<ServeNs> {
@@ -1434,7 +1125,9 @@ fn serve_ns(
 /// gateway imposed (`413`), a wrong media type is `415` as axum's extractor
 /// already answered it, and a malformed one is the caller's (`400`); no
 /// response echoes the body it read.
-fn inbound_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, GatewayError> {
+pub(super) fn inbound_body(
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Value, GatewayError> {
     match body {
         Ok(Json(body)) => Ok(body),
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
@@ -1449,7 +1142,7 @@ fn inbound_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Gatew
     }
 }
 
-async fn chat_completions(
+pub(super) async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
@@ -1474,7 +1167,7 @@ async fn chat_completions(
 /// wire, so it is forwarded to the provider's `/messages` untouched but for the
 /// `model` alias — which is what keeps signed thinking and tool-use blocks
 /// intact through the gateway (ADR 0012).
-async fn native_messages(
+pub(super) async fn native_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
@@ -1495,7 +1188,7 @@ async fn native_messages(
     .await
 }
 
-async fn embeddings(
+pub(super) async fn embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
@@ -1516,7 +1209,7 @@ async fn embeddings(
     .await
 }
 
-async fn responses(
+pub(super) async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
@@ -1543,7 +1236,7 @@ async fn responses(
 /// one usage record.
 /// Routes differ only in the wire they speak — where the body goes upstream and
 /// how usage is read back out (see [`Route`]).
-async fn serve(
+pub(super) async fn serve(
     state: AppState,
     headers: HeaderMap,
     body: Value,
@@ -2020,1078 +1713,13 @@ async fn serve(
     }
 }
 
-struct BoundedJsonCounter {
-    bytes: u64,
-    limit: u64,
-}
-
-impl std::io::Write for BoundedJsonCounter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let bytes = u64::try_from(buffer.len())
-            .map_err(|_| std::io::Error::other("serialized response length overflow"))?;
-        let next = self
-            .bytes
-            .checked_add(bytes)
-            .ok_or_else(|| std::io::Error::other("serialized response length overflow"))?;
-        if next > self.limit {
-            return Err(std::io::Error::other(
-                "serialized response exceeds configured limit",
-            ));
-        }
-        self.bytes = next;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn json_fits_response_limit(body: &Value, limit: u64) -> bool {
-    serde_json::to_writer(BoundedJsonCounter { bytes: 0, limit }, body).is_ok()
-}
-
-/// The target that produced the outcome (served it, or made the last attempt),
-/// carried out of the failover walk so the caller can price and attribute it.
-struct ServedTarget {
-    provider: String,
-    model: String,
-    price: RequestPrice,
-    source: CredentialSource,
-    credential_id: String,
-}
-
-/// The result of the buffered failover walk: the terminating attempt's result,
-/// the target that produced it, and the attempt/timing attribution.
-struct FailoverOutcome {
-    result: Result<ProviderResponse, TransportError>,
-    served: ServedTarget,
-    attempts: u32,
-    latency_ms: u64,
-    ttft_ms: Option<u64>,
-}
-
-/// Walk an alias's targets in order, dispatching the credential pool at each and
-/// advancing on a retryable upstream failure. This is the outer loop that #7's
-/// native routes build on: per-target circuit gating and the attempt/wall-clock
-/// bounds live here, while `dispatch_over_pool` owns credential rotation within
-/// one target.
-///
-/// A `Return`/`Ok` outcome that actually dispatched carries a `ServedTarget` so
-/// the handler can price and attribute it. A walk that never dispatched (every
-/// target skipped by an open circuit, or none had a credential) is a typed
-/// error rather than an outcome — nothing reached a provider, so there is no
-/// usage to record.
-async fn dispatch_with_failover(
-    state: &AppState,
-    snapshot: &ConfigSnapshot,
-    caller: &InboundKey,
-    model: &Model,
-    prices: &AliasPrices,
-    body: &Value,
-    wire: &Wire,
-) -> Result<FailoverOutcome, GatewayError> {
-    let cfg = &snapshot.config;
-    let policy = FailoverPolicy;
-    let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
-    let max_attempts = wire.route.max_attempts(cfg.failover.max_attempts);
-    let pinned = wire.route.pins_affinity();
-    let continuation = wire.route.is_continuation(body);
-
-    let mut walk = FailoverWalk::new(caller, model.targets.len());
-    for (index, target) in model.targets.iter().enumerate() {
-        if pinned && index > 0 {
-            break;
-        }
-        if walk.attempts >= max_attempts || Instant::now() >= deadline {
-            break;
-        }
-        // An ineligible target is skipped exactly like one behind an open
-        // circuit: it is configured and discoverable, but nothing approved says
-        // what it costs, so it cannot be dispatched under a budget hold.
-        let Some(price) = prices.get(index) else {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            walk.note_unpriced(&model.name, prices.ineligible(index));
-            continue;
-        };
-        let Some(provider) = cfg.provider(&target.provider) else {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            continue;
-        };
-        let circuit_key = target_key(target);
-        if let CircuitDecision::Skip = snapshot.target_circuits.allow(&circuit_key) {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            walk.skipped_open.push(circuit_key);
-            continue;
-        }
-        let Some(plan) = (if pinned {
-            snapshot
-                .credentials
-                .plan_pinned(cfg, &caller.namespace, &provider.id)
-        } else {
-            snapshot
-                .credentials
-                .plan(cfg, &caller.namespace, &provider.id)
-        }) else {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            walk.note_missing_credential(&provider.id);
-            continue;
-        };
-
-        let mut req_body = body.clone();
-        req_body["model"] = Value::String(target.model.clone());
-        let attempt_span = telemetry::upstream_attempt_span(
-            walk.attempts,
-            &target.provider,
-            &target.model,
-            UsageRecord::credential_source_str(plan.source),
-        );
-        let started = Instant::now();
-        let attempt = dispatch_over_pool(
-            state,
-            snapshot,
-            provider,
-            &plan,
-            &target.model,
-            req_body,
-            wire,
-            Deadline::at(deadline),
-        )
-        .instrument(attempt_span.clone())
-        .await;
-        let latency_ms = started.elapsed().as_millis() as u64;
-        // A non-streamed response arrives whole, so the first token lands with
-        // the last one; the streaming relay reports the real first chunk.
-        let ttft_ms = attempt.result.is_ok().then_some(latency_ms);
-        if let Err(err) = &attempt.result {
-            note_attempt_failure(&attempt_span, target, err);
-        }
-        telemetry::finish_upstream_attempt(
-            &attempt_span,
-            if attempt.result.is_ok() {
-                telemetry::ATTEMPT_OK
-            } else {
-                telemetry::ATTEMPT_ERROR
-            },
-            latency_ms,
-            ttft_ms,
-        );
-        walk.attempts += 1;
-
-        let served = ServedTarget {
-            provider: target.provider.clone(),
-            model: target.model.clone(),
-            price,
-            source: plan.source,
-            credential_id: attempt.credential_id.clone(),
-        };
-        match attempt.result {
-            Ok(response) => {
-                record_target_success(snapshot, target, &circuit_key);
-                return Ok(FailoverOutcome {
-                    result: Ok(response),
-                    served,
-                    attempts: walk.attempts,
-                    latency_ms,
-                    ttft_ms,
-                });
-            }
-            Err(err) => {
-                record_target_failure(snapshot, target, &circuit_key, &err);
-                let has_next = index + 1 < walk.total
-                    && walk.attempts < max_attempts
-                    && Instant::now() < deadline;
-                let decision = policy.decide(&as_provider_error(&err), has_next);
-                walk.last = Some((err, served, latency_ms, ttft_ms));
-                if decision == FailoverDecision::Return {
-                    let (err, served, latency_ms, ttft_ms) = walk.last.take().expect("just set");
-                    return Ok(FailoverOutcome {
-                        result: Err(err),
-                        served,
-                        attempts: walk.attempts,
-                        latency_ms,
-                        ttft_ms,
-                    });
-                }
-            }
-        }
-    }
-
-    if let Some((err, served, latency_ms, ttft_ms)) = walk.last {
-        return Ok(FailoverOutcome {
-            result: Err(err),
-            served,
-            attempts: walk.attempts,
-            latency_ms,
-            ttft_ms,
-        });
-    }
-    Err(walk.into_error())
-}
-
-enum StreamLeaseParent<'a> {
-    Attempt(&'a tracing::Span),
-    Rotation(opentelemetry::Context),
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn open_stream_lease(
-    state: &AppState,
-    ctx: &StreamContext,
-    provider: &Provider,
-    target: &Target,
-    body: &Value,
-    wire: &Wire,
-    lease: &CredentialLease,
-    lease_index: usize,
-    parent: StreamLeaseParent<'_>,
-    deadline: Deadline,
-) -> Result<
-    (
-        Box<dyn ProviderStreamDecoder>,
-        gateway_transport::ByteStream,
-    ),
-    TransportError,
-> {
-    let adapter = adapter_for(provider.kind);
-    let decoder = match wire.route {
-        Route::ChatCompletions => adapter
-            .stream_decoder(Surface::ChatCompletions)
-            .map_err(TransportError::Provider)?,
-        Route::Responses => adapter
-            .stream_decoder(Surface::Responses)
-            .map_err(TransportError::Provider)?,
-        _ => Box::new(NativeMessagesDecoder::new()) as Box<dyn ProviderStreamDecoder>,
-    };
-    let upstream = Upstream {
-        base_url: provider.base_url.clone(),
-        api_key: lease.secret.clone(),
-        auth: auth_scheme(provider.kind),
-    };
-    let mut request_body = body.clone();
-    request_body["model"] = Value::String(target.model.clone());
-    let opened = match wire.route {
-        Route::ChatCompletions => {
-            let request = ProviderRequest {
-                model: target.model.clone(),
-                body: request_body,
-            };
-            match parent {
-                StreamLeaseParent::Attempt(span) => {
-                    streaming::open_stream_with_attempt_span(
-                        ctx,
-                        span,
-                        &lease.id,
-                        lease_index,
-                        state.0.dispatcher.dispatch_stream(
-                            adapter.as_ref(),
-                            &upstream,
-                            Surface::ChatCompletions,
-                            request,
-                            deadline,
-                        ),
-                    )
-                    .await?
-                }
-                StreamLeaseParent::Rotation(parent) => {
-                    let open = state.0.dispatcher.dispatch_stream(
-                        adapter.as_ref(),
-                        &upstream,
-                        Surface::ChatCompletions,
-                        request,
-                        deadline,
-                    );
-                    streaming::open_stream_with_lease_parent(
-                        ctx,
-                        &lease.id,
-                        lease_index,
-                        open,
-                        parent,
-                    )
-                    .await?
-                }
-            }
-        }
-        _ => {
-            let call = wire.call(request_body, adapter.name());
-            match parent {
-                StreamLeaseParent::Attempt(span) => {
-                    streaming::open_stream_with_attempt_span(
-                        ctx,
-                        span,
-                        &lease.id,
-                        lease_index,
-                        state.0.dispatcher.send_stream(&upstream, &call, deadline),
-                    )
-                    .await?
-                }
-                StreamLeaseParent::Rotation(parent) => {
-                    let open = state.0.dispatcher.send_stream(&upstream, &call, deadline);
-                    streaming::open_stream_with_lease_parent(
-                        ctx,
-                        &lease.id,
-                        lease_index,
-                        open,
-                        parent,
-                    )
-                    .await?
-                }
-            }
-        }
-    };
-    Ok((decoder, opened))
-}
-
-/// Walk targets and their credential pools for a streamed request. HTTP
-/// open-time 429s rotate on both wires. The relay receives remaining leases for
-/// OpenAI-normalized framing, where a rate-limit event before content can be
-/// retried without splicing bytes already sent to the caller.
-async fn stream_with_failover(
-    state: &AppState,
-    snapshot: Arc<ConfigSnapshot>,
-    caller: &InboundKey,
-    model: &Model,
-    attrs: Option<Value>,
-    request: StreamRequest<'_>,
-) -> Result<Response, GatewayError> {
-    let StreamRequest {
-        alias,
-        body,
-        prices,
-        wire,
-        identity,
-        mut middleware_execution,
-        delivery,
-        mut hold,
-    } = request;
-    let mut reservation_guard = middleware_execution
-        .core_budget_context()
-        .is_none()
-        .then(|| {
-            BudgetReservation::new(
-                state.clone(),
-                hold.key.clone(),
-                hold.reservation.clone(),
-                middleware_execution.settlement_slot(),
-            )
-        });
-    let cfg = &snapshot.config;
-    let policy = FailoverPolicy;
-    let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
-    let max_attempts = wire.route.max_attempts(cfg.failover.max_attempts);
-    let pinned = wire.route.pins_affinity();
-    let continuation = wire.route.is_continuation(&body);
-
-    let mut walk = FailoverWalk::new(caller, model.targets.len());
-    let mut last_ctx: Option<(StreamContext, Instant)> = None;
-    'targets: for (index, target) in model.targets.iter().enumerate() {
-        if pinned && index > 0 {
-            break;
-        }
-        if walk.attempts >= max_attempts || Instant::now() >= deadline {
-            break;
-        }
-        // Ineligible: discoverable, but not dispatchable under a budget hold.
-        let Some(price) = prices.get(index) else {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            walk.note_unpriced(&model.name, prices.ineligible(index));
-            continue;
-        };
-        let Some(provider) = cfg.provider(&target.provider) else {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            continue;
-        };
-        let circuit_key = target_key(target);
-        if let CircuitDecision::Skip = snapshot.target_circuits.allow(&circuit_key) {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            walk.skipped_open.push(circuit_key);
-            continue;
-        }
-        let Some(plan) = (if pinned {
-            snapshot
-                .credentials
-                .plan_pinned(cfg, &caller.namespace, &provider.id)
-        } else {
-            snapshot
-                .credentials
-                .plan(cfg, &caller.namespace, &provider.id)
-        }) else {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            walk.note_missing_credential(&provider.id);
-            continue;
-        };
-        if plan.attempts.is_empty() {
-            walk.note_missing_credential(&provider.id);
-            continue;
-        }
-        let target_attempt = walk.attempts;
-        let mut attempt_started: Option<Instant> = None;
-        let mut attempt_span: Option<tracing::Span> = None;
-        for (lease_index, lease) in plan.attempts.iter().enumerate() {
-            if Instant::now() >= deadline {
-                if lease_index > 0 {
-                    let started = attempt_started.expect("attempt start");
-                    let span = attempt_span.as_ref().expect("attempt span");
-                    if let Some(error) = &walk.last_error {
-                        telemetry::record_attempt_failure(span, error);
-                    }
-                    telemetry::finish_upstream_attempt(
-                        span,
-                        telemetry::ATTEMPT_ERROR,
-                        started.elapsed().as_millis() as u64,
-                        None,
-                    );
-                    walk.attempts += 1;
-                }
-                break 'targets;
-            }
-            if attempt_span.is_none() {
-                let span = telemetry::upstream_attempt_span(
-                    target_attempt,
-                    &target.provider,
-                    &target.model,
-                    UsageRecord::credential_source_str(plan.source),
-                );
-                for (index, skipped) in plan.parked.iter().enumerate() {
-                    let lease_span = span.in_scope(|| {
-                        telemetry::credential_lease_span(
-                            &skipped.id,
-                            UsageRecord::credential_source_str(plan.source),
-                            index,
-                        )
-                    });
-                    telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_PARKED);
-                }
-                attempt_started = Some(Instant::now());
-                attempt_span = Some(span);
-            }
-            let span = attempt_span.as_ref().expect("attempt span");
-            let mut ctx = StreamContext {
-                namespace: caller.namespace.clone(),
-                attrs: attrs.clone().or_else(|| caller.attrs.clone()),
-                subject: caller.subject.clone(),
-                signer_kid: caller.signer_kid.clone(),
-                alias: alias.clone(),
-                target_provider: target.provider.clone(),
-                target_model: target.model.clone(),
-                source: plan.source,
-                credential_id: lease.id.clone(),
-                identity: identity.clone(),
-                price,
-                budget_key: hold.key.clone(),
-                reservation: hold.reservation.clone(),
-                rate_limit_permit: None,
-                admission_permit: None,
-                estimated_input_tokens: hold.estimated_input_tokens,
-                attempts: 0,
-            };
-            let started = Instant::now();
-            let opened = open_stream_lease(
-                state,
-                &ctx,
-                provider,
-                target,
-                &body,
-                wire,
-                lease,
-                plan.parked.len() + lease_index,
-                StreamLeaseParent::Attempt(span),
-                Deadline::at(deadline),
-            )
-            .await;
-            ctx.attempts = target_attempt + 1;
-            match opened {
-                Ok((decoder, bytes)) => {
-                    if let Some(guard) = reservation_guard.take() {
-                        guard.disarm();
-                    }
-                    telemetry::finish_upstream_attempt(
-                        span,
-                        telemetry::ATTEMPT_OK,
-                        attempt_started
-                            .expect("attempt start")
-                            .elapsed()
-                            .as_millis() as u64,
-                        None,
-                    );
-                    ctx.rate_limit_permit = hold.permit.take();
-                    ctx.admission_permit = hold.admission.take();
-                    record_target_success(&snapshot, target, &circuit_key);
-                    telemetry::record_routing(
-                        &ctx.namespace,
-                        &ctx.subject,
-                        &ctx.alias,
-                        &ctx.target_provider,
-                        &ctx.target_model,
-                        UsageRecord::credential_source_str(ctx.source),
-                    );
-                    let remaining = plan.attempts[lease_index + 1..].to_vec();
-                    let state_for_open = state.clone();
-                    let provider_for_open = Arc::new(provider.clone());
-                    let target_for_open = target.clone();
-                    let wire_for_open = wire.clone();
-                    let body_for_open = body.clone();
-                    let caller_for_open = caller.clone();
-                    let alias_for_open = alias.clone();
-                    let hold_key_for_open = hold.key.clone();
-                    let reservation_for_open = hold.reservation.clone();
-                    let estimate_for_open = hold.estimated_input_tokens;
-                    let source_for_open = plan.source;
-                    let identity_for_open = identity.clone();
-                    let attrs_for_open = attrs.clone();
-                    let parent_context_for_open =
-                        attempt_span.as_ref().expect("attempt span").context();
-                    let opener =
-                        move |next_lease: CredentialLease, _attempt: u32, lease_index: usize| {
-                            let state = state_for_open.clone();
-                            let provider = provider_for_open.clone();
-                            let target = target_for_open.clone();
-                            let wire = wire_for_open.clone();
-                            let body = body_for_open.clone();
-                            let caller = caller_for_open.clone();
-                            let alias = alias_for_open.clone();
-                            let budget_key = hold_key_for_open.clone();
-                            let reservation = reservation_for_open.clone();
-                            let parent_context = parent_context_for_open.clone();
-                            let identity = identity_for_open.clone();
-                            let attrs = attrs_for_open.clone();
-                            Box::pin(async move {
-                                let ctx = StreamContext {
-                                    namespace: caller.namespace,
-                                    attrs: attrs.or(caller.attrs),
-                                    subject: caller.subject,
-                                    signer_kid: caller.signer_kid,
-                                    alias,
-                                    target_provider: target.provider.clone(),
-                                    target_model: target.model.clone(),
-                                    source: source_for_open,
-                                    credential_id: next_lease.id.clone(),
-                                    // The rotation serves the same request, so it
-                                    // carries the same event identity rather than
-                                    // re-reading a span it no longer runs under.
-                                    identity,
-                                    // The same immutable pricing the request
-                                    // opened under: a rotation changes the
-                                    // credential, never what the request costs.
-                                    price,
-                                    budget_key,
-                                    reservation,
-                                    rate_limit_permit: None,
-                                    // Rotation re-opens upstream for a relay that
-                                    // already holds the request's permits.
-                                    admission_permit: None,
-                                    estimated_input_tokens: estimate_for_open,
-                                    attempts: 0,
-                                };
-                                open_stream_lease(
-                                    &state,
-                                    &ctx,
-                                    provider.as_ref(),
-                                    &target,
-                                    &body,
-                                    &wire,
-                                    &next_lease,
-                                    lease_index,
-                                    StreamLeaseParent::Rotation(parent_context),
-                                    Deadline::at(deadline),
-                                )
-                                .await
-                                .map(|(decoder, bytes)| streaming::OpenedStream { decoder, bytes })
-                            }) as futures::future::BoxFuture<'static, _>
-                        };
-                    let snapshot_for_health = snapshot.clone();
-                    let rotation = streaming::RotationHandle::new_with_deadline(
-                        remaining,
-                        lease.clone(),
-                        plan.parked.len() + lease_index + 1,
-                        opener,
-                        Some(deadline),
-                        move |lease| snapshot_for_health.credentials.record_failure(lease),
-                        {
-                            let snapshot = snapshot.clone();
-                            move |lease| snapshot.credentials.record_success(lease)
-                        },
-                    );
-                    return Ok(streaming::relay_opened_with_middleware(
-                        state.clone(),
-                        ctx,
-                        streaming::OpenedStream { decoder, bytes },
-                        started,
-                        wire.route.framing(),
-                        Some(rotation),
-                        streaming::StreamMiddleware::new(middleware_execution, delivery),
-                    ));
-                }
-                Err(err) if is_credential_exhausted(&err) => {
-                    snapshot.credentials.record_failure(lease);
-                    last_ctx = Some((ctx, started));
-                    walk.last_error = Some(err);
-                    continue;
-                }
-                Err(err) => {
-                    note_attempt_failure(span, target, &err);
-                    record_target_failure(&snapshot, target, &circuit_key, &err);
-                    let has_next = index + 1 < walk.total
-                        && walk.attempts < max_attempts
-                        && Instant::now() < deadline;
-                    let decision = policy.decide(&as_provider_error(&err), has_next);
-                    last_ctx = Some((ctx, started));
-                    walk.last_error = Some(err);
-                    if decision == FailoverDecision::Return {
-                        telemetry::finish_upstream_attempt(
-                            span,
-                            telemetry::ATTEMPT_ERROR,
-                            attempt_started
-                                .expect("attempt start")
-                                .elapsed()
-                                .as_millis() as u64,
-                            None,
-                        );
-                        walk.attempts += 1;
-                        break 'targets;
-                    }
-                    break;
-                }
-            }
-        }
-        let span = attempt_span.as_ref().expect("attempt span");
-        if let Some(error) = &walk.last_error {
-            telemetry::record_attempt_failure(span, error);
-        }
-        telemetry::finish_upstream_attempt(
-            span,
-            telemetry::ATTEMPT_ERROR,
-            attempt_started
-                .expect("attempt start")
-                .elapsed()
-                .as_millis() as u64,
-            None,
-        );
-        walk.attempts += 1;
-    }
-
-    if let Some(err) = walk.last_error.take() {
-        if let Some((mut ctx, started)) = last_ctx {
-            if let Some(guard) = reservation_guard.take() {
-                guard.disarm();
-            }
-            ctx.attempts = walk.attempts;
-            ctx.rate_limit_permit = hold.permit.take();
-            ctx.admission_permit = hold.admission.take();
-            streaming::settle_upstream_error_with_middleware(
-                state.clone(),
-                ctx,
-                started,
-                middleware_execution,
-            );
-        } else {
-            if !middleware_execution.release_core_budget().await {
-                reservation_guard
-                    .take()
-                    .expect("legacy budget guard")
-                    .release()
-                    .await;
-            }
-        }
-        return Err(err.into());
-    }
-    if !middleware_execution.release_core_budget().await {
-        reservation_guard
-            .take()
-            .expect("legacy budget guard")
-            .release()
-            .await;
-    }
-    Err(walk.into_error())
-}
-
-/// One streamed request as the failover walk sees it: the alias it resolved,
-/// the body to forward, the wire it speaks, and the budget hold it was admitted
-/// under.
-struct StreamRequest<'a> {
-    alias: String,
-    body: Value,
-    /// What each target is charged at under the snapshot the request started
-    /// with, resolved before admission so the relay's settlement cannot depend on
-    /// a price book published while the stream was open.
-    prices: &'a AliasPrices,
-    wire: &'a Wire,
-    /// The identity of the usage event this request will settle as, minted at
-    /// admission and cloned into every stream context the walk builds — including
-    /// a credential rotation's — so a stream that rotates, ends, is cancelled, or
-    /// never opens all report the same event.
-    identity: EventIdentity,
-    /// Pinned chain plus request-scope state, moved into the relay's
-    /// response-lifetime accounting owner when a stream opens.
-    middleware_execution: MiddlewareExecution,
-    delivery: StreamDelivery,
-    hold: BudgetHold,
-}
-
-/// The budget reservation a request is dispatched under, plus the input-token
-/// estimate it was priced from. The streaming relay needs both: the hold to
-/// settle, and the estimate to price a stream that ends before the provider
-/// reports authoritative usage.
-struct BudgetHold {
-    key: BudgetKey,
-    reservation: Reservation,
-    estimated_input_tokens: u64,
-    permit: Option<RateLimitPermit>,
-    /// The admission capacity the request was let in under. Moved into the
-    /// stream context that ends up owning the relay, so an open stream keeps
-    /// occupying a slot for exactly as long as it is open — and a walk that
-    /// never opens one drops it here.
-    admission: Option<AdmissionPermit>,
-}
-
-/// A buffered request's reservation must be reconciled even when its handler is
-/// dropped while the upstream request is in flight. Streaming `Accounting`
-/// covers cancellation once the relay exists; this guard covers the buffered path.
-struct BudgetReservation {
-    state: AppState,
-    key: BudgetKey,
-    reservation: Option<Reservation>,
-    settlement: SettlementSlot,
-}
-
-impl BudgetReservation {
-    fn new(
-        state: AppState,
-        key: BudgetKey,
-        reservation: Reservation,
-        settlement: SettlementSlot,
-    ) -> Self {
-        Self {
-            state,
-            key,
-            reservation: Some(reservation),
-            settlement,
-        }
-    }
-
-    /// Disarm before awaiting so the explicit release and the drop fallback
-    /// cannot both reconcile the same hold.
-    async fn release(mut self) {
-        let reservation = self
-            .reservation
-            .take()
-            .expect("budget reservation guard must be armed");
-        self.state.0.budget.release(&self.key, &reservation).await;
-    }
-
-    fn disarm(mut self) {
-        self.reservation.take();
-    }
-
-    fn into_response_accounting(
-        mut self,
-        record: UsageRecord,
-        ttft_ms: Option<u64>,
-        attempts: u32,
-        settlement: Option<SettlementReservation>,
-    ) -> BufferedResponseAccounting {
-        BufferedResponseAccounting {
-            state: self.state.clone(),
-            hold: Some(BufferedBudgetHold::Legacy {
-                key: self.key.clone(),
-                reservation: self
-                    .reservation
-                    .take()
-                    .expect("budget reservation guard must be armed"),
-            }),
-            record: Some(record),
-            ttft_ms,
-            attempts,
-            settlement,
-        }
-    }
-}
-
-impl Drop for BudgetReservation {
-    fn drop(&mut self) {
-        let Some(reservation) = self.reservation.take() else {
-            return;
-        };
-        let state = self.state.clone();
-        let key = self.key.clone();
-        // Same transfer as `CoreBudgetHold`: consume the request's reserved slot
-        // so a zero-charge release is not refused because that slot still
-        // occupies capacity.
-        self.state.0.settlements.spawn_reserved(
-            self.settlement.take(),
-            async move {
-                state.0.budget.release(&key, &reservation).await;
-            },
-            "zero-charge budget release",
-        );
-    }
-}
-
-/// Owns known provider spend while buffered response middleware runs.
-///
-/// `client_cancelled` is recorded when this owner drops before middleware
-/// produces a terminal outcome. Once middleware has returned, `finish` makes one durable
-/// `ok`/`rejected` decision before any accounting await. That status describes
-/// the request outcome, not an unknowable proof that the peer received the HTTP
-/// response: changing it after an ambiguously acknowledged durable commit would
-/// conflict with the immutable event under the same request identity.
-struct BufferedResponseAccounting {
-    state: AppState,
-    hold: Option<BufferedBudgetHold>,
-    record: Option<UsageRecord>,
-    ttft_ms: Option<u64>,
-    attempts: u32,
-    /// The settlement capacity reserved at admission, spent by whichever of
-    /// `finish` and `Drop` spawns the one settlement.
-    settlement: Option<SettlementReservation>,
-}
-
-enum BufferedBudgetHold {
-    Legacy {
-        key: BudgetKey,
-        reservation: Reservation,
-    },
-    Core(CoreBudgetHold),
-}
-
-impl BufferedResponseAccounting {
-    fn from_core(
-        state: AppState,
-        hold: CoreBudgetHold,
-        record: UsageRecord,
-        ttft_ms: Option<u64>,
-        attempts: u32,
-        settlement: Option<SettlementReservation>,
-    ) -> Self {
-        Self {
-            state,
-            hold: Some(BufferedBudgetHold::Core(hold)),
-            record: Some(record),
-            ttft_ms,
-            attempts,
-            settlement,
-        }
-    }
-
-    async fn finish(mut self, status: Status) -> Result<(), GatewayError> {
-        let hold = self
-            .hold
-            .take()
-            .expect("buffered response accounting must own its budget hold");
-        let mut record = self
-            .record
-            .take()
-            .expect("buffered response accounting must own its record");
-        record.status = status;
-        let decided = spawn_buffered_response_accounting(
-            self.state.clone(),
-            hold,
-            record,
-            self.ttft_ms,
-            self.attempts,
-            self.settlement.take(),
-        );
-        match decided.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(GatewayError::UsageNotDurable {
-                reason: error.reason,
-            }),
-            // The settlement was abandoned before it reported: its execution
-            // deadline expired, or the runtime stopped under it.
-            Err(_) => Err(GatewayError::UsageNotDurable {
-                reason: "the settlement did not report before it was abandoned",
-            }),
-        }
-    }
-}
-
-impl Drop for BufferedResponseAccounting {
-    fn drop(&mut self) {
-        let Some(hold) = self.hold.take() else {
-            return;
-        };
-        let mut record = self
-            .record
-            .take()
-            .expect("armed buffered response accounting must own its record");
-        record.status = Status::ClientCancelled;
-        drop(spawn_buffered_response_accounting(
-            self.state.clone(),
-            hold,
-            record,
-            self.ttft_ms,
-            self.attempts,
-            self.settlement.take(),
-        ));
-    }
-}
-
-fn spawn_buffered_response_accounting(
-    state: AppState,
-    hold: BufferedBudgetHold,
-    record: UsageRecord,
-    ttft_ms: Option<u64>,
-    attempts: u32,
-    settlement: Option<SettlementReservation>,
-) -> tokio::sync::oneshot::Receiver<Result<(), crate::usage::NotDurable>> {
-    let (verdict, decided) = tokio::sync::oneshot::channel();
-    let settlements = state.0.settlements.clone();
-    let accounting = async move {
-        match hold {
-            BufferedBudgetHold::Legacy { key, reservation } => {
-                state
-                    .0
-                    .budget
-                    .settle(&key, &reservation, record.settle_cost())
-                    .await;
-            }
-            BufferedBudgetHold::Core(hold) => {
-                hold.settle(record.settle_cost()).await;
-            }
-        }
-        telemetry::record_request(&record, ttft_ms, attempts);
-        let result = state.0.usage.record(&record).await;
-        if let Err(Err(unheard)) = verdict.send(result) {
-            state.0.usage.count_unheard_refusal(&unheard);
-        }
-    };
-    // Known provider spend: the reservation taken at admission is what lets it
-    // be spawned unconditionally. Without one (a caller that never reserved),
-    // the work is refused loudly rather than run past the bound; the dropped
-    // verdict then answers `usage_not_durable`.
-    match settlement {
-        Some(reserved) => settlements.spawn(reserved, accounting),
-        None => {
-            if settlements.try_spawn(accounting).is_err() {
-                settlements.refuse("buffered response accounting");
-            }
-        }
-    }
-    decided
-}
-
-/// Mutable bookkeeping shared by the buffered and streaming failover walks: how
-/// many upstream attempts have been made, which targets were circuit-skipped,
-/// and the reason to surface if nothing ever dispatched.
-struct FailoverWalk {
-    namespace: String,
-    total: usize,
-    attempts: u32,
-    skipped_open: Vec<String>,
-    no_credential: Option<GatewayError>,
-    /// The refusal for a target skipped because nothing approved prices it,
-    /// carried so a walk pinned to that target reports the pricing refusal
-    /// instead of a generic "nothing to attempt" request error.
-    unpriced: Option<GatewayError>,
-    /// The last buffered attempt's error + attribution, carried so a walk that
-    /// exhausts its targets still returns a real upstream error.
-    last: Option<(TransportError, ServedTarget, u64, Option<u64>)>,
-    /// The last streaming open error (the streaming context is carried
-    /// separately since it is consumed to settle the usage record).
-    last_error: Option<TransportError>,
-}
-
-impl FailoverWalk {
-    fn new(caller: &InboundKey, total: usize) -> Self {
-        Self {
-            namespace: caller.namespace.clone(),
-            total,
-            attempts: 0,
-            skipped_open: Vec::new(),
-            no_credential: None,
-            unpriced: None,
-            last: None,
-            last_error: None,
-        }
-    }
-
-    /// Remember that a candidate was skipped for want of an approved price. The
-    /// operator-facing identity of the book stays in the log; the walk keeps only
-    /// the stable redacted reason a caller may be told (#147).
-    fn note_unpriced(&mut self, alias: &str, refusal: Option<&Ineligible>) {
-        let Some(refusal) = refusal else {
-            return;
-        };
-        if self.unpriced.is_none() {
-            tracing::warn!(
-                model = %alias,
-                detail = %refusal.detail(),
-                "skipping a target with no approved price"
-            );
-            self.unpriced = Some(GatewayError::ModelNotPriced {
-                alias: alias.to_owned(),
-                reason: refusal.reason().to_owned(),
-            });
-        }
-    }
-
-    fn note_missing_credential(&mut self, provider: &str) {
-        self.no_credential
-            .get_or_insert_with(|| GatewayError::NoCredential {
-                namespace: self.namespace.clone(),
-                provider: provider.to_owned(),
-            });
-    }
-
-    /// The error for a walk that never dispatched: an open circuit on every
-    /// candidate is a distinct, retriable condition from having no credential.
-    fn into_error(self) -> GatewayError {
-        if !self.skipped_open.is_empty() {
-            return ProviderError::AllCircuitsOpen(self.skipped_open).into();
-        }
-        self.no_credential
-            .or(self.unpriced)
-            .unwrap_or_else(|| ProviderError::InvalidRequest("no attemptable target".into()).into())
-    }
-}
-
 /// The circuit-breaker key for a target: its qualified `provider/model`, so two
 /// aliases pointing at the same concrete target share one breaker.
 pub(crate) fn target_key(target: &Target) -> String {
     FailoverTarget::new(&target.provider, &target.model).qualified_model()
 }
 
-const UNPRICED_TARGET: ModelPrice = ModelPrice {
+pub(super) const UNPRICED_TARGET: ModelPrice = ModelPrice {
     input_microdollars_per_million: 0,
     output_microdollars_per_million: 0,
     reasoning_microdollars_per_million: None,
@@ -3103,7 +1731,7 @@ const UNPRICED_TARGET: ModelPrice = ModelPrice {
 /// Gateway-key `alias_scope` matches the prefixed request id or the bare
 /// upstream id, the same union blocklists use. A scope written as `gpt-4o` or
 /// `gpt-*` still permits `openai/gpt-4o`.
-fn alias_scope_permits(scope: &AliasScope, model: &str) -> bool {
+pub(super) fn alias_scope_permits(scope: &AliasScope, model: &str) -> bool {
     if scope.permits(model) {
         return true;
     }
@@ -3112,7 +1740,7 @@ fn alias_scope_permits(scope: &AliasScope, model: &str) -> bool {
         .is_some_and(|(_, bare)| !bare.is_empty() && scope.permits(bare))
 }
 
-fn split_model_id(model: &str) -> Result<(&str, &str), GatewayError> {
+pub(super) fn split_model_id(model: &str) -> Result<(&str, &str), GatewayError> {
     let Some((provider, id)) = model.split_once('/') else {
         return Err(GatewayError::ModelUnprefixed(model.to_owned()));
     };
@@ -3127,462 +1755,11 @@ fn split_model_id(model: &str) -> Result<(&str, &str), GatewayError> {
     Ok((provider, id))
 }
 
-fn auth_scheme(kind: ProviderKind) -> AuthScheme {
-    match kind {
-        ProviderKind::Anthropic => AuthScheme::Header("x-api-key"),
-        ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
-    }
-}
-
-/// Record bounded failure diagnostics and any timeout class. Transport URLs
-/// stay in operator logs; provider HTTP status and message reach attempt spans.
-fn note_attempt_failure(span: &tracing::Span, target: &Target, err: &TransportError) {
-    telemetry::record_attempt_failure(span, err);
-    if let Some(kind) = err.timeout_kind() {
-        let bound = err
-            .timeout_bound()
-            .map(TimeoutBound::label)
-            .unwrap_or_default();
-        telemetry::record_attempt_timeout(
-            span,
-            &target.provider,
-            &target.model,
-            kind.label(),
-            bound,
-        );
-        warn!(
-            provider = %target.provider,
-            model = %target.model,
-            timeout = kind.label(),
-            timeout_bound = bound,
-            "upstream attempt exceeded a transport bound"
-        );
-        return;
-    }
-    // An `Http` failure is the one the caller is told only that the transport
-    // failed, so this line is the one place its reason survives: a DNS failure,
-    // a refused connect, and a TLS handshake failure are the same answer and
-    // different incidents. The endpoint stays here, in the operator's log, where
-    // it is already credential-redacted and where the operator configured it. A
-    // provider's own verdict reaches the caller intact and is not repeated here.
-    if matches!(err, TransportError::Http(_)) {
-        warn!(
-            provider = %target.provider,
-            model = %target.model,
-            error = %err,
-            "upstream attempt failed on the transport"
-        );
-    }
-}
-
-fn record_target_success(snapshot: &ConfigSnapshot, target: &Target, circuit_key: &str) {
-    snapshot.target_circuits.record_success(circuit_key);
-    telemetry::metrics::record_circuit_state(
-        &target.provider,
-        &target.model,
-        snapshot.target_circuits.state(circuit_key),
-    );
-}
-
-/// A target failure trips its circuit only when it reflects on the *target*'s
-/// health. A `429` that exhausted the pool is credential-scoped (ADR 0006) and a
-/// `404` names a missing deployment, not an unhealthy target — both fail over
-/// without opening the target's breaker. A walk budget spent before this target
-/// was ever dispatched to belongs in the same category; a target that was given
-/// time and stalled does not, however short that time was.
-fn record_target_failure(
-    snapshot: &ConfigSnapshot,
-    target: &Target,
-    circuit_key: &str,
-    err: &TransportError,
-) {
-    if as_provider_error(err).affects_provider_health()
-        && !is_credential_exhausted(err)
-        && !was_never_dispatched(err)
-    {
-        snapshot.target_circuits.record_failure(circuit_key);
-        telemetry::metrics::record_circuit_state(
-            &target.provider,
-            &target.model,
-            snapshot.target_circuits.state(circuit_key),
-        );
-    }
-}
-
-/// View a transport error through the core retryability taxonomy so the failover
-/// policy and the breaker share one definition of "retryable". A transport-level
-/// error (no provider status) is a target-scoped dependency failure.
-fn as_provider_error(err: &TransportError) -> ProviderError {
-    match err {
-        TransportError::Provider(pe) | TransportError::Upstream { error: pe, .. } => pe.clone(),
-        TransportError::Http(message) => ProviderError::transport("upstream", message.clone()),
-        // A timeout says nothing conclusive about the target beyond "it did not
-        // answer in time", which is exactly a target-scoped dependency failure.
-        // An oversized body is the same: the target produced something this
-        // gateway will not serve.
-        TransportError::Timeout { .. } | TransportError::BodyTooLarge { .. } => {
-            ProviderError::transport("upstream", err.to_string())
-        }
-    }
-}
-
-/// The upstream attempt that terminated the request, plus the credential that
-/// made it (for attribution).
-struct PooledAttempt {
-    result: Result<ProviderResponse, TransportError>,
-    credential_id: String,
-}
-
-enum PreparedPoolCall {
-    Adapter(EncodedJson),
-    Native(NativeCall),
-}
-
-fn prepare_pool_call(
-    adapter: &dyn ProviderAdapter,
-    wire: &Wire,
-    target_model: &str,
-    body: Value,
-) -> Result<PreparedPoolCall, TransportError> {
-    match wire.route {
-        Route::ChatCompletions => adapter
-            .encode_request(
-                Surface::ChatCompletions,
-                ProviderRequest {
-                    model: target_model.to_string(),
-                    body,
-                },
-            )
-            .map(|encoded| PreparedPoolCall::Adapter(EncodedJson::from_value(&encoded)))
-            .map_err(TransportError::from),
-        _ => Ok(PreparedPoolCall::Native(wire.call(body, adapter.name()))),
-    }
-}
-
-/// Walk the credential pool: dispatch with the first credential, and on a
-/// credential-scoped failure (rate limit / quota) park that credential and
-/// retry the *same* target with the next one. Target-level failover is a
-/// separate concern and is not attempted here.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_over_pool(
-    state: &AppState,
-    snapshot: &ConfigSnapshot,
-    provider: &Provider,
-    plan: &CredentialPlan,
-    target_model: &str,
-    body: Value,
-    wire: &Wire,
-    deadline: Deadline,
-) -> PooledAttempt {
-    let adapter = adapter_for(provider.kind);
-    let mut exhausted: Option<PooledAttempt> = None;
-    let mut body = Some(body);
-    let mut prepared: Option<PreparedPoolCall> = None;
-
-    for (index, skipped) in plan.parked.iter().enumerate() {
-        let span = telemetry::credential_lease_span(
-            &skipped.id,
-            UsageRecord::credential_source_str(plan.source),
-            index,
-        );
-        telemetry::finish_credential_lease(&span, telemetry::LEASE_PARKED);
-    }
-
-    for (index, lease) in plan.attempts.iter().enumerate() {
-        let lease_span = telemetry::credential_lease_span(
-            &lease.id,
-            UsageRecord::credential_source_str(plan.source),
-            plan.parked.len() + index,
-        );
-        let upstream = Upstream {
-            base_url: provider.base_url.clone(),
-            api_key: lease.secret.clone(),
-            auth: auth_scheme(provider.kind),
-        };
-        if prepared.is_none() {
-            match prepare_pool_call(
-                adapter.as_ref(),
-                wire,
-                target_model,
-                body.take().expect("request body is prepared once"),
-            ) {
-                Ok(call) => prepared = Some(call),
-                Err(err) => {
-                    telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_ERROR);
-                    return PooledAttempt {
-                        result: Err(err),
-                        credential_id: lease.id.clone(),
-                    };
-                }
-            }
-        }
-        let prepared = prepared.as_ref().expect("prepared on first attempt");
-        let result = async {
-            match prepared {
-                PreparedPoolCall::Adapter(encoded) => {
-                    state
-                        .0
-                        .dispatcher
-                        .dispatch_encoded(
-                            adapter.as_ref(),
-                            &upstream,
-                            Surface::ChatCompletions,
-                            encoded,
-                            deadline,
-                        )
-                        .await
-                }
-                PreparedPoolCall::Native(call) => state
-                    .0
-                    .dispatcher
-                    .send(&upstream, call, deadline)
-                    .await
-                    .map(|body| ProviderResponse {
-                        usage: wire.route.native_usage(&body),
-                        body,
-                    }),
-            }
-        }
-        .instrument(lease_span.clone())
-        .await;
-        match result {
-            Ok(response) => {
-                telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_SERVED);
-                snapshot.credentials.record_success(lease);
-                return PooledAttempt {
-                    result: Ok(response),
-                    credential_id: lease.id.clone(),
-                };
-            }
-            Err(err) if is_credential_exhausted(&err) => {
-                telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_RATE_LIMITED);
-                snapshot.credentials.record_failure(lease);
-                tracing::warn!(
-                    provider = %provider.id,
-                    credential = %lease.id,
-                    "credential is rate-limited or out of quota; trying the next in the pool"
-                );
-                exhausted = Some(PooledAttempt {
-                    result: Err(err),
-                    credential_id: lease.id.clone(),
-                });
-            }
-            Err(err) => {
-                telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_ERROR);
-                return PooledAttempt {
-                    result: Err(err),
-                    credential_id: lease.id.clone(),
-                };
-            }
-        }
-    }
-
-    exhausted.unwrap_or_else(|| PooledAttempt {
-        result: Err(ProviderError::InvalidRequest("empty credential pool".into()).into()),
-        credential_id: String::new(),
-    })
-}
-
-/// A `429` (rate limit or exhausted quota) is attributable to the *credential*,
-/// so it parks that key and falls to the next. Every other upstream failure is
-/// the target's problem, not the key's.
-fn is_credential_exhausted(err: &TransportError) -> bool {
-    err.provider_error()
-        .is_some_and(ProviderError::is_credential_rate_limited)
-}
-
-/// `TimeoutKind::Overall` is the one timeout no target earned: the walk's budget
-/// was already spent, so nothing was dispatched and there is no evidence about
-/// this target to record. Parking a target the gateway never called would let
-/// one slow target take healthy ones out of rotation.
-///
-/// Every other timeout names the phase that stalled — including one cut short by
-/// what was left of `failover.overall_timeout_ms` — because a target that
-/// accepted a request and produced nothing in the time it was given *is*
-/// evidence, and treating a late-in-the-walk stall as the gateway's own problem
-/// would keep a black-holing target's breaker closed forever.
-fn was_never_dispatched(err: &TransportError) -> bool {
-    err.timeout_kind() == Some(TimeoutKind::Overall)
-}
-
-fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
-    Usage {
-        input_tokens: u.input_tokens,
-        output_tokens: u.output_tokens,
-        reasoning_tokens: u.reasoning_tokens,
-        cache_read_tokens: u.cache_read_tokens,
-        cache_write_tokens: u.cache_write_tokens,
-    }
-}
-
-/// Conservative pre-dispatch usage estimate: input tokens from the request body
-/// (~4 chars/token) plus an output allowance (`max_tokens` when present, else a
-/// default). Used for `max_request_microdollars` and as a fallback when the
-/// provider reports no usage. Not held against the namespace cap (ADR 0064).
-fn estimate_usage(body: &Value) -> (Usage, usize) {
-    const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1_024;
-    let body_bytes = serialized_json_len(body).unwrap_or(0);
-    let input_tokens = (body_bytes / 4) as u64;
-    let output_tokens = requested_output_tokens(body).unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-    (
-        Usage {
-            input_tokens,
-            output_tokens,
-            reasoning_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-        },
-        body_bytes,
-    )
-}
-
-/// Apply the request-derived prompt/output ceilings to one estimate. This is
-/// called twice by `serve`: once before admission as a cheap fail-fast for the
-/// arriving body, and once after the middleware chain as the authoritative
-/// check for the body that will actually be sent upstream.
-fn check_estimate_bounds(
-    body: &Value,
-    estimate: Usage,
-    limits: crate::admission::AdmissionLimits,
-) -> Result<(), GatewayError> {
-    if let Some(limit_tokens) = limits.max_prompt_tokens
-        && estimate.input_tokens > limit_tokens
-    {
-        return Err(GatewayError::PromptTooLarge { limit_tokens });
-    }
-    if let Some(limit_tokens) = limits.max_output_tokens
-        && let Some(requested_tokens) = requested_output_tokens(body)
-        && requested_tokens > limit_tokens
-    {
-        return Err(GatewayError::OutputLimitExceeded {
-            requested_tokens,
-            limit_tokens,
-        });
-    }
-    Ok(())
-}
-
-/// The output allowance a request asked for, in whichever spelling its surface
-/// uses. `None` when the caller left it to the provider.
-///
-/// A body carrying several spellings takes the largest of them, because a
-/// present-but-unusable field (`null`, a string) must not hide a usable one from
-/// the ceiling or from the hold: whichever field the provider honors, the answer
-/// here is never below it.
-fn requested_output_tokens(body: &Value) -> Option<u64> {
-    ["max_tokens", "max_completion_tokens", "max_output_tokens"]
-        .into_iter()
-        .filter_map(|field| body.get(field).and_then(Value::as_u64))
-        .max()
-}
-
-struct RecordArgs<'a> {
-    /// The event identity minted when the request was accepted, so the record
-    /// carries the id the rest of the request already referred to rather than
-    /// one invented at settlement.
-    identity: &'a EventIdentity,
-    caller: &'a InboundKey,
-    alias: &'a str,
-    target_provider: &'a str,
-    target_model: &'a str,
-    source: CredentialSource,
-    credential_id: &'a str,
-    status: Status,
-    input_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    output_tokens: u64,
-    cost_microdollars: Option<u64>,
-    /// The pricing the cost was computed at, so the row names the immutable
-    /// state it was charged against rather than "whatever is approved now".
-    price: RequestPrice,
-    latency_ms: u64,
-    /// Time to the first token, when one was produced.
-    ttft_ms: Option<u64>,
-    /// Upstream attempts made; the retry count is one less.
-    attempts: u32,
-    attrs: Option<serde_json::Value>,
-    period: Option<String>,
-}
-
-/// Record where the request is already ending for another reason, so a failure
-/// to journal can only be reported and counted.
-async fn record_usage_terminal(
-    state: &AppState,
-    settlement: Option<SettlementReservation>,
-    args: RecordArgs<'_>,
-) {
-    let (record, ttft_ms, attempts) = build_record(args);
-    telemetry::record_request(&record, ttft_ms, attempts);
-    if !state.0.usage.appends() {
-        state.0.usage.record_terminal(&record).await;
-        return;
-    }
-    // Detached for the same reason [`record_usage`] is: the request this
-    // describes already failed, so nothing here changes the response, but a
-    // caller hanging up must not be what decides whether the attempt was
-    // recorded. Awaited anyway while the handler lives, so an uncancelled
-    // request still reaches its sinks before it answers.
-    let (done, recorded) = tokio::sync::oneshot::channel();
-    let recording = state.clone();
-    let record_terminal = async move {
-        recording.0.usage.record_terminal(&record).await;
-        let _ = done.send(());
-    };
-    match settlement {
-        Some(reserved) => state.0.settlements.spawn(reserved, record_terminal),
-        None => {
-            // Nothing was reserved for this record. At capacity it is written
-            // inline instead of dropped: the handler is awaiting it anyway, and
-            // a cancelled caller losing a zero-charge failure record is the
-            // lesser loss.
-            if let Err(record_terminal) = state.0.settlements.try_spawn(record_terminal) {
-                record_terminal.await;
-                return;
-            }
-        }
-    }
-    let _ = recorded.await;
-}
-
-fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
-    let ttft_ms = args.ttft_ms;
-    let attempts = args.attempts;
-    let record = UsageRecord {
-        schema_version: UsageRecord::SCHEMA_VERSION,
-        request_id: args.identity.request_id.to_string(),
-        trace_id: args.identity.trace_id.clone(),
-        namespace: args.caller.namespace.clone(),
-        attrs: args.attrs.clone().or_else(|| args.caller.attrs.clone()),
-        period: args.period.clone(),
-        subject: args.caller.subject.clone(),
-        signer_kid: args.caller.signer_kid.clone(),
-        model: args.alias.to_string(),
-        target_provider: args.target_provider.to_string(),
-        target_model: args.target_model.to_string(),
-        credential_source: UsageRecord::credential_source_str(args.source),
-        credential_id: args.credential_id.to_string(),
-        status: args.status,
-        input_tokens: args.input_tokens,
-        cache_read_tokens: args.cache_read_tokens,
-        cache_write_tokens: args.cache_write_tokens,
-        output_tokens: args.output_tokens,
-        cost_microdollars: args.cost_microdollars,
-        catalog_version: args.price.catalog_version(),
-        price_book: args.price.identity().map(|id| id.book()),
-        price_book_checksum: args.price.identity().map(|id| id.checksum()),
-        price_catalog: args.price.identity().map(|id| id.catalog()),
-        latency_ms: args.latency_ms,
-        attempts,
-    };
-    (record, ttft_ms, attempts)
-}
-
 /// Keep request-local content-middleware state alive until the caller finishes
 /// or drops a buffered response body. The handler has already transformed the
 /// JSON value, but the opaque owner follows the same response-lifetime contract
 /// as streamed middleware state and admission capacity.
-fn attach_middleware_owner(response: Response, owner: MiddlewareExecution) -> Response {
+pub(super) fn attach_middleware_owner(response: Response, owner: MiddlewareExecution) -> Response {
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
@@ -3596,7 +1773,7 @@ fn attach_middleware_owner(response: Response, owner: MiddlewareExecution) -> Re
 /// Frame-transparent body ownership. In particular, wrapping middleware state
 /// must not discard trailers or turn an exact-length JSON body into an
 /// unknown-length stream.
-struct MiddlewareOwnedBody {
+pub(super) struct MiddlewareOwnedBody {
     inner: Body,
     owner: Option<MiddlewareExecution>,
 }
@@ -3628,12 +1805,14 @@ impl HttpBody for MiddlewareOwnedBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::DiagnosticCredential;
     use crate::aliases::AliasScope;
     use crate::backends::catalog::ProviderId;
-    use crate::budget::NoBudget;
+    use crate::budget::{NoBudget, Reservation};
     use crate::config::{Config, NamespacePolicy, ProjectIdentity, UndurablePolicy};
     use crate::convergence::status::testing::ManualClock;
     use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
+    use crate::credentials::CredentialSource;
     use crate::desired_state::fixtures::{
         approved_pricing_snapshot, policy_body, project_id, revision_id, tenant_id,
     };
@@ -3642,14 +1821,14 @@ mod tests {
     };
     use crate::middleware::MiddlewareChain;
     use crate::pricing::PriceIdentity;
-    use crate::principals::PrincipalAuthority;
+    use crate::principals::{Presented, PrincipalAuthority};
     use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
     use crate::state::ReplicaObservability;
     use crate::status::registry::{CachedStatusRegistry, StatusRefresher, StatusSettings};
     use crate::status::{Component, ComponentObservation, ComponentState, StatusReason};
     use crate::usage::identity::RequestId;
     use crate::usage::journal::{self, UsageJournal as _};
-    use crate::usage::{StdoutSink, UsageDelivery, UsageFanout, UsageSink};
+    use crate::usage::{StdoutSink, UsageDelivery, UsageFanout, UsageRecord, UsageSink};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -3657,8 +1836,9 @@ mod tests {
         DeterministicGuardrail, GuardrailAction, GuardrailRule, Middleware, MiddlewareDeclaration,
         MiddlewareFailurePosture, MiddlewareOutcome, MiddlewarePhase, MiddlewareRefusal,
         MiddlewareResult, MiddlewareScope, MiddlewareState, MiddlewareStateBag,
-        ProviderStreamEvent,
+        ProviderStreamEvent, serialized_json_len,
     };
+    use gateway_transport::{TimeoutBound, TimeoutKind, TransportError};
     use http_body_util::BodyExt;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use opentelemetry::trace::TracerProvider as _;

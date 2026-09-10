@@ -46,7 +46,7 @@ unnoticed one.
 
 | Change touches | Trigger |
 | --- | --- |
-| `routes.rs` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
+| `routes/` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
 | Namespace resolution, `credentials.rs` pool lookup, `allow_platform_fallback`, budget/rate-limit keys, operator views | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
 | `backends/secrets.rs`, `backends/secrets/blob_envelope.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
 | `backends/catalog.rs`, `aliases.rs`, `availability/`, `desired_state/models.rs`, `desired_state/pricing.rs`, `/v1/models`, alias scope and ownership, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
@@ -60,7 +60,7 @@ adds a Postgres table fires two, and owes both sets.
 ## 1. Authentication, token claims, and authorization
 
 **Fires on** any change to how a request is authenticated or what it is then
-allowed to do: the `authenticate` path in `crates/gateway/src/routes.rs`; minting
+allowed to do: the `authenticate` path in `crates/gateway/src/routes/auth.rs`; minting
 and verification in `crates/gateway/src/mint.rs`; principal resolution and shape
 ownership in `crates/gateway/src/principals.rs`; the capability set and its
 mapping to routes; a new or renamed claim, scope, audience, or epoch rule; a new
