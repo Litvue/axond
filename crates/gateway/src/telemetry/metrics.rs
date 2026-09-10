@@ -1162,8 +1162,8 @@ pub(crate) fn record_store_connection_opened(backend: &'static str) {
         .add(1, &[KeyValue::new("axond.store.backend", backend)]);
 }
 
-/// One usage event enqueued for the background index worker, with the occupied
-/// slot count after this send (senders and the worker share an atomic). Label-free,
+/// One usage event enqueued for the background index worker, with the channel's
+/// occupied slot count after this send (`max_capacity - remaining`). Label-free,
 /// like the admission queue depth: the histogram retains the peak between
 /// exports, and a peak at the bound is a queue about to drop.
 pub(crate) fn record_usage_index_enqueued(depth: u64) {
