@@ -98,14 +98,9 @@ pub struct Inner {
     /// registry is filled by a background refresher, so a status request reads a
     /// map rather than a backend (ADR 0031).
     pub status: Arc<CachedStatusRegistry>,
-    /// This replica's convergence state, when it converges against a control
-    /// plane at all. `None` in the stateless posture, where a replica serves the
-    /// file it booted from and there is no revision to lag behind — and `None`
-    /// in every shipped binary today, because no release constructs a
-    /// reconciler at all (#142). The slice that does must hand *its* status
-    /// handle here and to
-    /// [`AdminApi::with_convergence`](crate::admin::router::AdminApi::with_convergence):
-    /// two instances would let one replica tell two convergence stories.
+    /// This replica's convergence state. Always `None`: the store-backed
+    /// gateway serves the file it booted from and constructs no reconciler
+    /// (ADR 0063), so there is no revision to lag behind.
     pub revision: Option<Arc<RevisionStatus>>,
     /// What the background catalogue import last reported, when this deployment
     /// imports one at all. A read of a mutex over a bounded report: the request

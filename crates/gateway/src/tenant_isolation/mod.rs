@@ -12,10 +12,6 @@
 //! * [`database`] — PostgreSQL row-level security, asserted as an ordinary login
 //!   role rather than the schema owner: what a session pinned to one tenant can
 //!   read and write if the service layer above it has a bug.
-//! * [`control_plane`] — the administrative service over a real journal: a
-//!   tenant-scoped grant cannot publish into another tenant or read a
-//!   deployment-wide projection, the refusal it receives names nothing of that
-//!   tenant, and nothing durable moves.
 //! * [`catalogue`] — the typed projections every later reader goes through:
 //!   credentials, models and policy, resolved from a revision that carries two
 //!   tenants who enable the same offering.
@@ -54,7 +50,6 @@
 //! runtime and admin slices.
 
 mod catalogue;
-mod control_plane;
 mod database;
 mod harness;
 mod projection;

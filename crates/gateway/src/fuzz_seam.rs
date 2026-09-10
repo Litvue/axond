@@ -24,7 +24,6 @@
 #![allow(dead_code, unused_imports)]
 
 // Keep this list identical to `main.rs`. `tests/fuzz_seam.rs` fails if it drifts.
-mod admin;
 mod admission;
 mod aliases;
 mod api;
