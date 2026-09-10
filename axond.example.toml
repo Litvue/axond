@@ -172,6 +172,8 @@ max_error_bytes = 65536
 #   503 stream_capacity_exhausted           no stream slot is free
 #   503 admission_queue_full / _timeout     queued, then shed (see below)
 #   503 admission_tenant_capacity_exhausted more tenants than `max_tenants`
+#   503 settlement_capacity_exhausted        the Store has fallen `max_pending_settlements`
+#                                           charges behind serving (see below)
 #   413 request_too_large / prompt_too_large
 #   400 output_limit_exceeded
 #
@@ -181,6 +183,14 @@ max_error_bytes = 65536
 #
 # The ceilings own semaphores built at boot, so a reload validates `[admission]`
 # and warns; a change takes effect on restart, exactly like `[transport]`.
+#
+# Spend is charged after the response (ADR 0064), in a detached settlement. The
+# `*_settlements` keys bound that background work: every admitted request
+# reserves one settlement slot (no ledger write), so when the Store falls behind
+# by `max_pending_settlements` charges new requests are refused rather than the
+# charges of served ones dropped. `max_pending_settlements` defaults to four
+# times `max_in_flight`. A settlement that misses its queue wait or its timeout is
+# counted in `axond.settlement.failures` and never retried.
 #
 # `max_prompt_tokens` is checked against an estimate of four bytes per token, so
 # it only binds below `max_request_bytes / 4`: with the values below the body
@@ -199,6 +209,10 @@ queue_capacity = 0
 queue_wait_ms = 0
 max_stream_duration_ms = 3600000
 max_stream_bytes = 67108864
+max_pending_settlements = 4096
+max_in_flight_settlements = 64
+settlement_queue_wait_ms = 10000
+settlement_timeout_ms = 10000
 
 # ── Credentials ───────────────────────────────────────────────────────────────
 # Explicit (namespace, provider) → env-var binding. Never inferred from the

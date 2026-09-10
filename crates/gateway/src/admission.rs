@@ -48,6 +48,9 @@ pub const RESOURCE_STREAM: &str = "stream";
 pub const RESOURCE_TENANT: &str = "tenant";
 pub const RESOURCE_QUEUE: &str = "queue";
 pub const RESOURCE_DIAGNOSTIC: &str = "diagnostic";
+/// The bounded background-accounting capacity a request reserves at admission
+/// ([`crate::settlement`]): a settlement slot, not a ledger hold.
+pub const RESOURCE_SETTLEMENT: &str = "settlement";
 /// The ceiling on *authenticating* a diagnostic, which is a different ceiling
 /// with a different size: one read that reaches its handler holds one of each,
 /// so publishing both under one label would report every reader twice against a
@@ -184,6 +187,12 @@ pub enum AdmissionRejection {
     /// the operator splitting refusals sees which ceiling refused.
     #[error("concurrent diagnostic authentication limit exceeded")]
     DiagnosticsAuthenticating,
+    /// The process is carrying as many unsettled charges as it will hold
+    /// (`admission.max_pending_settlements`). Refused before dispatch so that a
+    /// slow Store pushes back on new admissions rather than dropping the
+    /// charge of a request already served.
+    #[error("settlement capacity exhausted")]
+    Settlement,
 }
 
 impl AdmissionRejection {
@@ -191,7 +200,7 @@ impl AdmissionRejection {
     /// assert it declares each one rather than discovering the drift in a
     /// dashboard that a new refusal silently falls outside of.
     #[cfg(test)]
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Tenant,
         Self::TenantCapacity,
         Self::Streams,
@@ -200,6 +209,7 @@ impl AdmissionRejection {
         Self::QueueTimeout,
         Self::Diagnostics,
         Self::DiagnosticsAuthenticating,
+        Self::Settlement,
     ];
 
     /// The stable machine-readable error type a caller matches on.
@@ -214,6 +224,7 @@ impl AdmissionRejection {
             Self::Diagnostics | Self::DiagnosticsAuthenticating => {
                 "diagnostic_concurrency_exceeded"
             }
+            Self::Settlement => "settlement_capacity_exhausted",
         }
     }
 
@@ -236,7 +247,8 @@ impl AdmissionRejection {
             | Self::QueueFull
             | Self::QueueTimeout
             | Self::Diagnostics
-            | Self::DiagnosticsAuthenticating => Some(1),
+            | Self::DiagnosticsAuthenticating
+            | Self::Settlement => Some(1),
             Self::TenantCapacity => None,
         }
     }
@@ -250,6 +262,7 @@ impl AdmissionRejection {
             Self::QueueFull | Self::QueueTimeout => RESOURCE_QUEUE,
             Self::Diagnostics => RESOURCE_DIAGNOSTIC,
             Self::DiagnosticsAuthenticating => RESOURCE_DIAGNOSTIC_AUTH,
+            Self::Settlement => RESOURCE_SETTLEMENT,
         }
     }
 }

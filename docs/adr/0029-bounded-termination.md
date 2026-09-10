@@ -147,7 +147,11 @@ keep their existing state choices; no existing deployment's tier is raised.
   still drops its rows, as `shutdown` drops.
 - Half of `flush_timeout_ms` is the most the settle waits can spend, so a
   settlement that would have landed just after that cap is abandoned and counted
-  in `axond.shutdown.abandoned_requests` rather than allowed to cost the buffered
-  records their write.
+  in `axond.shutdown.abandoned_settlements` (requests still in flight at the cap
+  in `axond.shutdown.abandoned_requests`) rather than allowed to cost the
+  buffered records their write. Settlement capacity is bounded and tracked by
+  the runtime (`admission.max_pending_settlements`), so the count of leftovers
+  is exact — a settlement that panicked or was aborted has already released its
+  tracking — and the log line breaks them down by stage.
 - Shutdown diagnostics name signals and phases only. No endpoint, DSN, URL, or
   credential appears in a shutdown log line.

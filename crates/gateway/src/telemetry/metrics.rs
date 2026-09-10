@@ -15,7 +15,7 @@
 use std::sync::OnceLock;
 
 use gateway_core::CircuitState;
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, ObservableGauge, UpDownCounter};
 use opentelemetry::{KeyValue, global};
 
 use crate::usage::UsageRecord;
@@ -80,6 +80,13 @@ struct Instruments {
     shutdown_phase: Gauge<u64>,
     shutdown_rejections: Counter<u64>,
     shutdown_abandoned: Counter<u64>,
+    shutdown_abandoned_settlements: Counter<u64>,
+    settlement_in_flight: UpDownCounter<i64>,
+    settlement_queue_wait: Histogram<f64>,
+    /// Held so the collection callback stays registered for the process lifetime.
+    #[allow(dead_code)]
+    settlement_oldest_pending_age: ObservableGauge<u64>,
+    settlement_failures: Counter<u64>,
     config_reloads: Counter<u64>,
     config_generation: Gauge<u64>,
     revision_attempts: Counter<u64>,
@@ -323,6 +330,45 @@ impl Instruments {
                 .u64_counter("axond.shutdown.abandoned_requests")
                 .with_description(
                     "Requests still in flight when the shutdown deadline expired, and dropped.",
+                )
+                .build(),
+            shutdown_abandoned_settlements: meter
+                .u64_counter("axond.shutdown.abandoned_settlements")
+                .with_description(
+                    "Settlements still queued or executing when the shutdown settle share \
+                     expired; their charges may be unrecorded.",
+                )
+                .build(),
+            settlement_in_flight: meter
+                .i64_up_down_counter("axond.settlement.in_flight")
+                .with_description(
+                    "Background accounting held right now, by stage: reserved by an admitted \
+                     request, queued for an execution slot, or executing against the Store.",
+                )
+                .build(),
+            settlement_queue_wait: meter
+                .f64_histogram("axond.settlement.queue_wait")
+                .with_unit("ms")
+                .with_description(
+                    "Time a settlement waited for an execution slot: the backlog age each \
+                     charge saw before it reached the Store.",
+                )
+                .build(),
+            settlement_oldest_pending_age: meter
+                .u64_observable_gauge("axond.settlement.oldest_pending_age")
+                .with_unit("ms")
+                .with_description(
+                    "Age of the oldest settlement still queued or executing; 0 when none is.",
+                )
+                .with_callback(|observer| {
+                    observer.observe(crate::settlement::oldest_pending_age_ms(), &[]);
+                })
+                .build(),
+            settlement_failures: meter
+                .u64_counter("axond.settlement.failures")
+                .with_description(
+                    "Settlements that did not complete, by reason. None is retried: each is a \
+                     charge that may be unrecorded.",
                 )
                 .build(),
             config_reloads: meter
@@ -936,6 +982,58 @@ pub fn record_shutdown_abandoned(count: u64) {
     if count > 0 {
         instruments.shutdown_abandoned.add(count, &[]);
     }
+}
+
+/// Settlements left queued or executing when the shutdown settle share ran out.
+/// Each is a charge this process will not record.
+pub fn record_shutdown_abandoned_settlements(count: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    if count > 0 {
+        instruments.shutdown_abandoned_settlements.add(count, &[]);
+    }
+}
+
+/// One settlement entered `stage`. `stage` is the closed vocabulary in
+/// [`crate::settlement`]; the counter carries no request dimension.
+pub fn record_settlement_stage_entered(stage: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .settlement_in_flight
+        .add(1, &[KeyValue::new("axond.settlement.stage", stage)]);
+}
+
+/// One settlement left `stage`. Called from guards' `Drop`, so it pairs with
+/// [`record_settlement_stage_entered`] on every exit path.
+pub fn record_settlement_stage_left(stage: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .settlement_in_flight
+        .add(-1, &[KeyValue::new("axond.settlement.stage", stage)]);
+}
+
+/// How long one settlement waited for an execution slot before it started.
+pub fn record_settlement_queue_wait(ms: f64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.settlement_queue_wait.record(ms, &[]);
+}
+
+/// One settlement that did not complete. `reason` is the closed vocabulary in
+/// [`crate::settlement`].
+pub fn record_settlement_failure(reason: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .settlement_failures
+        .add(1, &[KeyValue::new("axond.settlement.reason", reason)]);
 }
 
 /// Publish a reload attempt and the generation now serving. A rejected

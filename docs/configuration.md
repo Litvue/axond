@@ -496,8 +496,44 @@ many may be in flight at once.
 | `queue_wait_ms` | integer | `0` | How long a queued request waits before it is shed. Must be set together with `queue_capacity`, and queueing requires a finite `max_in_flight`. |
 | `max_stream_duration_ms` | integer | `3600000` | Total lifetime of one stream, however productive. Distinct from `transport.stream_idle_timeout_ms`, which bounds silence: this is the bound on a stream that never stops talking. Applies to a stream the caller is draining — see below. `0` disables. |
 | `max_stream_bytes` | integer | `67108864` | Raw upstream bytes one stream may relay before it is ended. `0` disables this configured ceiling. Reconstructed output from response-mutating middleware, and streams held for policy validation, still have a 64 MiB rendered-output safety ceiling. Ordinary and block-only OpenAI re-emission remains unlimited when this is `0`. |
+| `max_pending_settlements` | integer | 4 × `max_in_flight` | Requests whose spend this replica is still carrying toward the Store: admitted and not yet settled, settlements queued for an execution slot, and settlements executing. Every admitted request reserves one slot (no ledger write) and the settlement it spawns releases it, so a Store that has fallen this far behind serving refuses new requests with `503 settlement_capacity_exhausted` rather than accumulating detached work. `0` disables. See below. |
+| `max_in_flight_settlements` | integer | `64` | Settlements executing against the Store at once; bounds the charge concurrency one replica presents to the ledger. `0` disables. |
+| `settlement_queue_wait_ms` | integer | `10000` | How long a spawned settlement waits for one of those execution slots before it is abandoned. `0` waits without bound (shutdown still bounds it). |
+| `settlement_timeout_ms` | integer | `10000` | How long one settlement may run once it has a slot: the budget charge plus the usage append. `0` disables. |
 
 Except for `max_request_bytes`, `0` means "this ceiling is off".
+
+**Settlement is bounded work, not a queue that grows.** Spend is charged after
+the response (ADR 0064) in a detached settlement, so a caller hanging up cannot
+cancel its own charge. Detached work is only safe when it is bounded, and a slow
+or unavailable Store is exactly the condition under which it stops being so:
+responses keep being served at upstream speed while their charges pile up behind
+the Store. The `*_settlements` keys bound that work, with two properties worth
+knowing:
+
+- **Saturation refuses new admissions; it never drops an admitted charge.** The
+  settlement slot is reserved at admission, alongside the request's concurrency
+  permit and before the rate-limit store, the budget reservation, and the
+  provider call. A request that cannot reserve one is refused with
+  `503 settlement_capacity_exhausted` and `Retry-After: 1`, having cost nothing
+  upstream. A request that *was* admitted always gets its settlement spawned.
+- **A settlement that misses its bound is counted, never retried.** One that
+  outlives `settlement_queue_wait_ms` waiting for a slot never starts, so this
+  replica does not record its spend. One that outlives `settlement_timeout_ms`
+  once running is counted in
+  `axond.settlement.failures{axond.settlement.reason}` the same way, but the
+  replica keeps the execution slot until the settlement future ends — including
+  SQLite `spawn_blocking` work that dropping the future cannot cancel — so a
+  late budget charge cannot land without its usage append or bypass
+  `max_in_flight_settlements`. It is not retried because a budget charge is not
+  idempotent: a retry after a Store that accepted the write but answered late
+  would charge twice. Alert on that counter.
+
+The default `max_pending_settlements` is four times `max_in_flight` (four times
+the shipped `max_in_flight` when the global ceiling is off), so it only binds
+once settlement has fallen three requests' worth behind serving. Watch
+`axond.settlement.in_flight{axond.settlement.stage}` and
+`axond.settlement.oldest_pending_age` before the refusals start.
 
 Lowering `max_in_flight` alone is enough. The two sub-ceilings default below the
 shipped global one, so a config that only writes `max_in_flight = 16` would
@@ -561,6 +597,7 @@ replica spends no round trips to say no. Each answer is typed and stable:
 | `503` | `admission_queue_full` | The queue is at `queue_capacity`. |
 | `503` | `admission_queue_timeout` | Queued, then `queue_wait_ms` elapsed. |
 | `503` | `admission_tenant_capacity_exhausted` | More distinct namespaces in flight than `max_tenants`. |
+| `503` | `settlement_capacity_exhausted` | The replica is carrying `max_pending_settlements` charges its Store has not yet settled. |
 | `413` | `request_too_large` / `prompt_too_large` | A per-request size bound. |
 | `400` | `output_limit_exceeded` | A requested output allowance above the ceiling. |
 

@@ -66,6 +66,7 @@ use crate::principals::{
 use crate::rate_limit::NoLimit;
 use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
+use crate::settlement::Settlements;
 use crate::shutdown::Lifecycle;
 use crate::status::Component;
 use crate::status::probes::{BackendProbe, CatalogProbe, ControlPlaneProbe};
@@ -93,6 +94,9 @@ pub struct Inner {
     /// Process-level ceilings. Like the HTTP client's bounds these own state
     /// built at boot, so a reloaded `[admission]` section applies on restart.
     pub admission: AdmissionControl,
+    /// Bounded capacity for the background accounting every admitted request
+    /// leaves behind. Process-level like `admission`, whose section sizes it.
+    pub settlements: Settlements,
     pub rate_limiter: Box<dyn RateLimiter>,
     pub revocation: Box<dyn RevocationStore>,
     /// The stateful policy this replica is enforcing, and the holds outstanding
@@ -1925,6 +1929,7 @@ impl AppState {
         let stream_terminal_grace =
             Duration::from_millis(config.transport.stream_terminal_grace_ms);
         let admission = AdmissionControl::from_config(&config.admission);
+        let settlements = Settlements::from_config(&config.admission);
         let snapshot = if config.is_stateful() {
             ConfigSnapshot::build_bootstrap(config, env, 0)?
         } else {
@@ -1950,6 +1955,7 @@ impl AppState {
             usage,
             budget,
             admission,
+            settlements,
             rate_limiter,
             revocation,
             policy,

@@ -69,6 +69,7 @@ use crate::namespace::NamespaceId;
 use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
+use crate::settlement::{SettlementReservation, SettlementSlot};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::status::{StatusResponse, StatusScope};
@@ -1734,6 +1735,12 @@ async fn serve(
             },
         )
         .await?;
+    // The settlement this request will leave behind is admitted with it: a slot
+    // in the process's bounded background-accounting capacity, not a ledger
+    // write (ADR 0064). A replica whose Store has fallen that far behind refuses
+    // here, before any dependency work, rather than dropping the charge of a
+    // request it has already served.
+    let settlement_reservation = state.0.settlements.reserve()?;
 
     // The migration gate retains the previous straight-line owner as an
     // immediate operational rollback. The default fixed-core path places the
@@ -1748,6 +1755,7 @@ async fn serve(
         &state.0.middleware_runtime,
         Some(route.middleware_surface()),
     );
+    middleware_execution.reserve_settlement(settlement_reservation);
     let mut legacy_rate_limit_permit = match accounting_mode {
         CoreAccountingMode::Middleware => {
             middleware_execution
@@ -1916,8 +1924,14 @@ async fn serve(
         .await;
     }
 
-    let mut reservation_guard = (accounting_mode == CoreAccountingMode::Legacy)
-        .then(|| BudgetReservation::new(state.clone(), budget_key, reservation));
+    let mut reservation_guard = (accounting_mode == CoreAccountingMode::Legacy).then(|| {
+        BudgetReservation::new(
+            state.clone(),
+            budget_key,
+            reservation,
+            middleware_execution.settlement_slot(),
+        )
+    });
     let outcome = match dispatch_with_failover(
         &state, &snapshot, &caller, model, &prices, &body, &wire,
     )
@@ -1967,6 +1981,7 @@ async fn serve(
                 attrs: attrs.clone(),
                 period: period.clone(),
             });
+            let settlement = middleware_execution.take_settlement();
             let accounting = match middleware_execution.take_core_budget() {
                 Some(hold) => BufferedResponseAccounting::from_core(
                     state.clone(),
@@ -1974,11 +1989,12 @@ async fn serve(
                     record,
                     ttft_ms,
                     attempts,
+                    settlement,
                 ),
                 None => reservation_guard
                     .take()
                     .expect("legacy budget guard")
-                    .into_response_accounting(record, ttft_ms, attempts),
+                    .into_response_accounting(record, ttft_ms, attempts, settlement),
             };
             let mut middleware_result = middleware_execution.response(&mut response).await;
             // Upstream buffering enforced the same configured ceiling before
@@ -2025,6 +2041,7 @@ async fn serve(
             // provider error that actually ended the request.
             record_usage_terminal(
                 &state,
+                middleware_execution.take_settlement(),
                 RecordArgs {
                     identity: &identity,
                     caller: &caller,
@@ -2420,7 +2437,14 @@ async fn stream_with_failover(
     let mut reservation_guard = middleware_execution
         .core_budget_context()
         .is_none()
-        .then(|| BudgetReservation::new(state.clone(), hold.key.clone(), hold.reservation.clone()));
+        .then(|| {
+            BudgetReservation::new(
+                state.clone(),
+                hold.key.clone(),
+                hold.reservation.clone(),
+                middleware_execution.settlement_slot(),
+            )
+        });
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
@@ -2817,14 +2841,21 @@ struct BudgetReservation {
     state: AppState,
     key: BudgetKey,
     reservation: Option<Reservation>,
+    settlement: SettlementSlot,
 }
 
 impl BudgetReservation {
-    fn new(state: AppState, key: BudgetKey, reservation: Reservation) -> Self {
+    fn new(
+        state: AppState,
+        key: BudgetKey,
+        reservation: Reservation,
+        settlement: SettlementSlot,
+    ) -> Self {
         Self {
             state,
             key,
             reservation: Some(reservation),
+            settlement,
         }
     }
 
@@ -2847,6 +2878,7 @@ impl BudgetReservation {
         record: UsageRecord,
         ttft_ms: Option<u64>,
         attempts: u32,
+        settlement: Option<SettlementReservation>,
     ) -> BufferedResponseAccounting {
         BufferedResponseAccounting {
             state: self.state.clone(),
@@ -2860,6 +2892,7 @@ impl BudgetReservation {
             record: Some(record),
             ttft_ms,
             attempts,
+            settlement,
         }
     }
 }
@@ -2871,9 +2904,16 @@ impl Drop for BudgetReservation {
         };
         let state = self.state.clone();
         let key = self.key.clone();
-        streaming::spawn_settlement(async move {
-            state.0.budget.release(&key, &reservation).await;
-        });
+        // Same transfer as `CoreBudgetHold`: consume the request's reserved slot
+        // so a zero-charge release is not refused because that slot still
+        // occupies capacity.
+        self.state.0.settlements.spawn_reserved(
+            self.settlement.take(),
+            async move {
+                state.0.budget.release(&key, &reservation).await;
+            },
+            "zero-charge budget release",
+        );
     }
 }
 
@@ -2891,6 +2931,9 @@ struct BufferedResponseAccounting {
     record: Option<UsageRecord>,
     ttft_ms: Option<u64>,
     attempts: u32,
+    /// The settlement capacity reserved at admission, spent by whichever of
+    /// `finish` and `Drop` spawns the one settlement.
+    settlement: Option<SettlementReservation>,
 }
 
 enum BufferedBudgetHold {
@@ -2908,6 +2951,7 @@ impl BufferedResponseAccounting {
         record: UsageRecord,
         ttft_ms: Option<u64>,
         attempts: u32,
+        settlement: Option<SettlementReservation>,
     ) -> Self {
         Self {
             state,
@@ -2915,6 +2959,7 @@ impl BufferedResponseAccounting {
             record: Some(record),
             ttft_ms,
             attempts,
+            settlement,
         }
     }
 
@@ -2934,14 +2979,17 @@ impl BufferedResponseAccounting {
             record,
             self.ttft_ms,
             self.attempts,
+            self.settlement.take(),
         );
         match decided.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(GatewayError::UsageNotDurable {
                 reason: error.reason,
             }),
+            // The settlement was abandoned before it reported: its execution
+            // deadline expired, or the runtime stopped under it.
             Err(_) => Err(GatewayError::UsageNotDurable {
-                reason: "the durable append did not report before the runtime stopped",
+                reason: "the settlement did not report before it was abandoned",
             }),
         }
     }
@@ -2963,6 +3011,7 @@ impl Drop for BufferedResponseAccounting {
             record,
             self.ttft_ms,
             self.attempts,
+            self.settlement.take(),
         ));
     }
 }
@@ -2973,9 +3022,11 @@ fn spawn_buffered_response_accounting(
     record: UsageRecord,
     ttft_ms: Option<u64>,
     attempts: u32,
+    settlement: Option<SettlementReservation>,
 ) -> tokio::sync::oneshot::Receiver<Result<(), crate::usage::NotDurable>> {
     let (verdict, decided) = tokio::sync::oneshot::channel();
-    streaming::spawn_settlement(async move {
+    let settlements = state.0.settlements.clone();
+    let accounting = async move {
         match hold {
             BufferedBudgetHold::Legacy { key, reservation } => {
                 state
@@ -2993,7 +3044,19 @@ fn spawn_buffered_response_accounting(
         if let Err(Err(unheard)) = verdict.send(result) {
             state.0.usage.count_unheard_refusal(&unheard);
         }
-    });
+    };
+    // Known provider spend: the reservation taken at admission is what lets it
+    // be spawned unconditionally. Without one (a caller that never reserved),
+    // the work is refused loudly rather than run past the bound; the dropped
+    // verdict then answers `usage_not_durable`.
+    match settlement {
+        Some(reserved) => settlements.spawn(reserved, accounting),
+        None => {
+            if settlements.try_spawn(accounting).is_err() {
+                settlements.refuse("buffered response accounting");
+            }
+        }
+    }
     decided
 }
 
@@ -3459,7 +3522,11 @@ struct RecordArgs<'a> {
 
 /// Record where the request is already ending for another reason, so a failure
 /// to journal can only be reported and counted.
-async fn record_usage_terminal(state: &AppState, args: RecordArgs<'_>) {
+async fn record_usage_terminal(
+    state: &AppState,
+    settlement: Option<SettlementReservation>,
+    args: RecordArgs<'_>,
+) {
     let (record, ttft_ms, attempts) = build_record(args);
     telemetry::record_request(&record, ttft_ms, attempts);
     if !state.0.usage.appends() {
@@ -3473,10 +3540,23 @@ async fn record_usage_terminal(state: &AppState, args: RecordArgs<'_>) {
     // request still reaches its sinks before it answers.
     let (done, recorded) = tokio::sync::oneshot::channel();
     let recording = state.clone();
-    crate::streaming::spawn_settlement(async move {
+    let record_terminal = async move {
         recording.0.usage.record_terminal(&record).await;
         let _ = done.send(());
-    });
+    };
+    match settlement {
+        Some(reserved) => state.0.settlements.spawn(reserved, record_terminal),
+        None => {
+            // Nothing was reserved for this record. At capacity it is written
+            // inline instead of dropped: the handler is awaiting it anyway, and
+            // a cancelled caller losing a zero-charge failure record is the
+            // lesser loss.
+            if let Err(record_terminal) = state.0.settlements.try_spawn(record_terminal) {
+                record_terminal.await;
+                return;
+            }
+        }
+    }
     let _ = recorded.await;
 }
 
@@ -8416,6 +8496,7 @@ output_microdollars_per_million = 1000000
             Arc::clone(&release),
         ));
 
+        let settlements = state.0.settlements.clone();
         let request = tokio::spawn(async move { router(state).oneshot(chat_request()).await });
         tokio::time::timeout(Duration::from_secs(1), async {
             while active.load(Ordering::Acquire) == 0 {
@@ -8432,7 +8513,7 @@ output_microdollars_per_million = 1000000
                 .is_cancelled()
         );
         release.store(true, Ordering::Release);
-        crate::streaming::await_settlements(Duration::from_secs(2)).await;
+        settlements.await_idle(Duration::from_secs(2)).await;
 
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let records = captured.0.lock().expect("records");
@@ -8471,6 +8552,7 @@ output_microdollars_per_million = 1000000
             Box::new(budget),
         );
 
+        let capacity = state.0.settlements.clone();
         let request = tokio::spawn(async move { router(state).oneshot(chat_request()).await });
         tokio::time::timeout(Duration::from_secs(1), async {
             while !entered.load(Ordering::Acquire) {
@@ -8487,7 +8569,7 @@ output_microdollars_per_million = 1000000
                 .is_cancelled()
         );
         release.store(true, Ordering::Release);
-        crate::streaming::await_settlements(Duration::from_secs(2)).await;
+        capacity.await_idle(Duration::from_secs(2)).await;
 
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -8499,6 +8581,155 @@ output_microdollars_per_million = 1000000
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, Status::Ok);
         assert_eq!(records[0].cost_microdollars, Some(15));
+    }
+
+    /// A ledger that stalls every charge until told otherwise, and counts how
+    /// many charges are stalled inside it: the sustained slow-Store scenario.
+    #[derive(Clone, Default)]
+    struct StalledLedger {
+        entered: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for StalledLedger {
+        fn name(&self) -> &'static str {
+            "stalled-ledger"
+        }
+
+        async fn reserve(&self, _key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+            Admission::Allowed(Reservation {
+                id: "stalled".to_owned(),
+                estimate_microdollars: estimated_microdollars,
+                generation: None,
+                period: None,
+                incarnation: None,
+            })
+        }
+
+        async fn settle(&self, _key: &BudgetKey, _reservation: &Reservation, _actual: u64) {
+            self.entered.fetch_add(1, Ordering::AcqRel);
+            while !self.release.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// The acceptance criterion for #467: with the Store stalled, the process
+    /// carries a bounded number of settlements, refuses further admissions with
+    /// a typed `503` while it is at that bound, and admits again once the
+    /// stalled settlements land — none of which were dropped.
+    #[tokio::test]
+    async fn a_stalled_store_bounds_settlements_and_sheds_new_admissions() {
+        let (base_url, hits) = controllable_upstream(
+            Arc::new(AtomicBool::new(true)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let captured = CapturingSink::default();
+        let ledger = StalledLedger::default();
+        let state = two_target_state_with_budget(
+            &base_url,
+            &base_url,
+            "[admission]\nmax_in_flight = 2\nmax_in_flight_per_tenant = 0\n\
+             max_pending_settlements = 2\nmax_in_flight_settlements = 1\n",
+            captured.clone(),
+            Box::new(ledger.clone()),
+        );
+        let settlements = state.0.settlements.clone();
+
+        // Two served requests whose charges are now stalled in the Store. The
+        // callers hang up; the settlements carry on, holding the two slots.
+        let mut served = Vec::new();
+        for _ in 0..2 {
+            let state = state.clone();
+            served.push(tokio::spawn(async move {
+                router(state).oneshot(chat_request()).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // One execution slot: one charge is inside the ledger, the other
+            // is queued behind it.
+            while ledger.entered.load(Ordering::Acquire) < 1 || settlements.backlog().queued < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both settlements are spawned and bounded to one execution");
+        for request in served {
+            request.abort();
+            let _ = request.await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let backlog = settlements.backlog();
+        assert_eq!(
+            (backlog.executing, backlog.queued, backlog.reserved),
+            (1, 1, 0),
+            "at the bound: one executing, one queued, nothing more admitted"
+        );
+
+        // The bound: a third request is refused before it reaches a provider,
+        // with the stable code and retry guidance, rather than admitted with a
+        // charge nowhere to go.
+        let refused = router(state.clone())
+            .oneshot(chat_request())
+            .await
+            .expect("response");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            refused
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(refused.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        assert_eq!(body["error"]["type"], "settlement_capacity_exhausted");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the refused request cost nothing upstream"
+        );
+        assert_eq!(
+            settlements.backlog().reserved,
+            0,
+            "a refused request holds no capacity"
+        );
+
+        // The Store recovers: every stalled charge lands, the capacity returns,
+        // and the next request is served.
+        ledger.release.store(true, Ordering::Release);
+        let idle = settlements.await_idle(Duration::from_secs(2)).await;
+        assert_eq!(idle.unsettled(), 0);
+        assert_eq!(
+            ledger.entered.load(Ordering::Acquire),
+            2,
+            "no admitted charge was dropped"
+        );
+        let served = router(state.clone())
+            .oneshot(chat_request())
+            .await
+            .expect("response");
+        assert_eq!(served.status(), StatusCode::OK);
+        settlements.await_idle(Duration::from_secs(2)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(ledger.entered.load(Ordering::Acquire), 3);
+        let records = captured.0.lock().expect("records");
+        assert_eq!(
+            records.len(),
+            3,
+            "every admitted request produced its record"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.cost_microdollars == Some(15))
+        );
     }
 
     impl Middleware for StreamMarkerMiddleware {
@@ -11594,6 +11825,7 @@ output_microdollars_per_million = 1000000
         });
         let state = billing_state(&url, outbox.clone());
 
+        let settlements = state.0.settlements.clone();
         let request = tokio::spawn(async move { router(state).oneshot(chat_request()).await });
         tokio::time::timeout(Duration::from_secs(1), async {
             while !entered.load(Ordering::Acquire) {
@@ -11610,7 +11842,7 @@ output_microdollars_per_million = 1000000
                 .is_cancelled()
         );
         release.store(true, Ordering::Release);
-        crate::streaming::await_settlements(Duration::from_secs(2)).await;
+        settlements.await_idle(Duration::from_secs(2)).await;
 
         let consumer = journal::ConsumerId::parse("billing").unwrap();
         let claimed = outbox
