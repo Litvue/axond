@@ -198,7 +198,8 @@ SQLite rejects a set `dsn_env`; Postgres rejects a set `path`.
 SQLite has one connection. Async Store calls take a single dispatch slot
 before `spawn_blocking` (2 s wait, then `StoreError::Unavailable`, same
 vocabulary as a saturated Postgres pool). Cancelling the caller before the
-slot is granted skips the work; a statement that has already started is not
+slot is granted skips the work. After dispatch the slot stays with the blocking
+task until SQLite returns, even if the caller is cancelled; the statement is not
 rolled back. The usage-index worker writes on its own thread and does not
 consume the slot. `busy_timeout` still bounds SQLite lock waits inside a
 statement, not this queue.

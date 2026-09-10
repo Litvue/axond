@@ -222,9 +222,10 @@ impl SqliteStore {
     /// slot is acquired **before** `spawn_blocking`, so overload waits in async
     /// tasks and then answers `Unavailable`, rather than occupying one blocking
     /// thread per waiter. A caller that drops its future before the slot is
-    /// granted is skipped; a write that has already entered `spawn_blocking`
-    /// runs to completion even if that future is cancelled (the statement is
-    /// not rolled back). The usage-index thread does not take a slot.
+    /// granted is skipped. After dispatch, the slot stays with the blocking
+    /// task until SQLite returns, even if the caller is cancelled, so a
+    /// cancellation storm cannot pile waiters onto the blocking pool. The
+    /// statement is not rolled back. The usage-index thread does not take a slot.
     async fn with_conn<T, F>(&self, op: StoreOp, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
@@ -264,15 +265,28 @@ impl SqliteStore {
             let finished = Instant::now();
             Ok::<_, StoreError>((acquired, finished, result))
         };
-        let outcome = if permit.is_some() {
-            tokio::task::spawn_blocking(run)
-                .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))
-                .and_then(|inner| inner)
+        let outcome = if let Some(permit) = permit {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Own the permit on this task, not on `with_conn`: dropping the
+            // caller must not let another waiter `spawn_blocking` while this
+            // closure still holds (or waits for) the connection mutex.
+            tokio::spawn(async move {
+                let outcome = tokio::task::spawn_blocking(run)
+                    .await
+                    .map_err(|e| StoreError::Unavailable(e.to_string()))
+                    .and_then(|inner| inner);
+                drop(permit);
+                let _ = tx.send(outcome);
+            });
+            match rx.await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(StoreError::Unavailable(
+                    "sqlite store dispatch task ended before reporting".into(),
+                )),
+            }
         } else {
             run()
         };
-        drop(permit);
         match outcome {
             Ok((acquired, finished, result)) => {
                 metrics::record_store_operation(
@@ -2462,6 +2476,64 @@ mod tests {
             store.get_namespace("kept").await.expect("read").is_some(),
             "a write that entered spawn_blocking is not rolled back by cancelling the waiter"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_in_flight_dispatch_keeps_the_slot_until_sqlite_returns() {
+        let store = Arc::new(SqliteStore::open(":memory:").expect("memory sqlite"));
+        let holder = Arc::clone(&store);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || {
+            let _guard = holder.conn.lock().expect("conn");
+            entered_tx.send(()).expect("entered");
+            let _ = release_rx.recv();
+        });
+        entered_rx.recv().expect("parked");
+
+        let writer = Arc::clone(&store);
+        let task = tokio::spawn(async move {
+            writer
+                .put_namespace(NamespaceRecord {
+                    id: "kept".into(),
+                    attrs: serde_json::json!({}),
+                    blocklist: None,
+                })
+                .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.inflight_blocking() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(store.inflight_blocking(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            store.inflight_blocking(),
+            1,
+            "blocking work still owns the slot"
+        );
+
+        let started = Instant::now();
+        let err = store
+            .get_namespace("other")
+            .await
+            .expect_err("a held slot still saturates after the waiter is cancelled");
+        assert!(
+            matches!(err, StoreError::Unavailable(ref message) if message.contains("dispatch saturated")),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(store.max_inflight_blocking(), 1);
+
+        drop(release_tx);
+        parked.join().expect("holder");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.inflight_blocking() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(store.inflight_blocking(), 0);
+        assert!(store.get_namespace("kept").await.expect("read").is_some());
     }
 
     #[tokio::test]
