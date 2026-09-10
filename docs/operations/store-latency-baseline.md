@@ -358,11 +358,19 @@ What the phases say, on this host:
   three waves plus a 100 ms recovery pause. Before idle retention matched
   `POOL_SIZE`, each wave after the first opened 4 sessions (12 minus 8) and burst
   checkout p95 was 74.6 ms (the reconnects). After retaining 32 idle sessions,
-  the same 12-wide waves opened 0 extra sessions (`burst_opened_per_wave=[0, 0,
-  0]`, recovery opened 0, discarded 0, idle 12, live+idle at most 32). Burst p95
-  fell from 74.6 ms to 38 µs. Recovery p95 fell from 55.0 ms to 24 µs. Cold fill is
-  unchanged (p95 about 39 ms, 12 opens). The deployment connection budget is still 32
-  per replica. Fleet budget is `N × 32`. A controlled-runner `burst` replay
+  those waves open 0 extra sessions. One loopback run (Postgres 16,
+  `sslmode=disable`) printed:
+
+  - cold: p95 38.4 ms, p99 43.3 ms, opened 12, reused 1, live 12, idle 0
+  - warm: p95 10.3 µs, p99 63.6 µs, opened 12, idle 12
+  - burst (3 × 12): p95 57 µs, p99 73 µs, opened-per-wave `[0, 0, 0]`
+  - recovery: p95 69 µs, p99 73 µs, opened 0, discarded 0, idle 12, available 32
+
+  Cold p95 is connect time and moves with host load. Session counts and
+  opened-per-wave are the invariant: discarded 0, live plus idle at most 32,
+  available 32 after return. Burst p95 fell from 74.6 ms to microseconds.
+  Recovery after the pause opened 0. The deployment connection budget is still
+  32 per replica. Fleet budget is `N × 32`. A controlled-runner `burst` replay
   should now show `connections_opened` tracking pool fill, not wave size.
 - **On Postgres the background index drops under steady load; on SQLite it does
   not.** The usage-index queue (bound 256) reached its bound in every buffered
@@ -395,6 +403,6 @@ change must move it by more than the noise floor of the paired baseline runs.
 | --- | --- | --- | --- |
 | [#463](https://github.com/Litvue/axond/issues/463) bound SQLite work admission | `slow-store` and `burst`, SQLite | `store_evidence.operations.namespace_resolve.acquire_wait` (p95 ≤ and max), `budget_charge.acquire_wait`, `index_queue.wait`, and the request-path p99 | Acquire-wait p95 and max for `namespace_resolve` and `budget_charge` fall; `query_duration` for both does not rise; `usage_records.missing` stays 0; any new `saturated`-style outcome appears as a typed `503` counted under `rejected`, so the reconciliation still holds. A design that trades tail latency for dropped index writes fails on `usage_records.missing`. |
 | [#464](https://github.com/Litvue/axond/issues/464) usage summaries at scale | `slow-store`, SQLite, with `seeded_usage_rows` raised (edit the scale or add a tier; the artifact records the row count and file size) | `operations.usage_summary.query_duration`, `summaries.latency_ms`, and — the interference — `operations.namespace_resolve.acquire_wait` while readers run, against the same scenario's `steady-buffered` sibling | `usage_summary.query_duration` mean and p95 fall at 200 000 rows and keep falling as rows grow; the `namespace_resolve.acquire_wait` gap between `slow-store` and `steady-buffered` narrows; summary results are byte-identical to the fold they replace on the parity fixtures the issue lists. |
-| [#465](https://github.com/Litvue/axond/issues/465) Postgres burst connection churn | `burst`, Postgres, with the database at production network distance for the network-latency question; the pool unit test is the loopback mechanism check | `store_evidence.connections_opened`, `operations.namespace_resolve.acquire_wait` p95, request-path p95/p99 per wave, and `axond.store.operations{outcome="saturated"}`; pool unit test cold/warm/burst/recovery p95/p99 plus `opened`/`reused`/`discarded`/`live`/`idle` | `connections_opened` per wave falls to the configured idle retention rather than tracking wave size; `namespace_resolve.acquire_wait` p95 no longer carries a connect; no `saturated` outcome appears at the scale the pool is sized for; the session cap the design states is not exceeded (32 per replica, `N × 32` in the fleet, read live+idle from `axond.store.pool.sessions` and from `pg_stat_activity`). The pool unit test on this change: burst opened-per-wave `[0,0,0]`, discarded 0, burst p95 74.6 ms to 38 µs. |
+| [#465](https://github.com/Litvue/axond/issues/465) Postgres burst connection churn | `burst`, Postgres, with the database at production network distance for the network-latency question; the pool unit test is the loopback mechanism check | `store_evidence.connections_opened`, `operations.namespace_resolve.acquire_wait` p95, request-path p95/p99 per wave, and `axond.store.operations{outcome="saturated"}`; pool unit test cold/warm/burst/recovery p95/p99 plus `opened`/`reused`/`discarded`/`live`/`idle` | `connections_opened` per wave falls to the configured idle retention rather than tracking wave size; `namespace_resolve.acquire_wait` p95 no longer carries a connect; no `saturated` outcome appears at the scale the pool is sized for; the session cap the design states is not exceeded (32 per replica, `N × 32` in the fleet, read live+idle from `axond.store.pool.sessions` and from `pg_stat_activity`). The pool unit test on this change: burst opened-per-wave `[0,0,0]`, discarded 0, burst p95 74.6 ms to microseconds. |
 | [#466](https://github.com/Litvue/axond/issues/466) payload clones across credential attempts | `large-payload`, either backend (the Store is the control here, not the subject), plus a variant with several credentials configured so an attempt retries | `overhead_ms.p50` and `.p95` against the control, `resources.cpu_utilization`, `resources.rss_kib.peak`, and TTFT on the streamed sibling | Overhead p50/p95 and CPU per accepted request fall at 256 KiB with the Store phases unchanged; the wire-compatibility tests the issue lists still pass; no phase in `store_evidence` moves, which proves the saving was in the transport and not the Store. |
 | Postgres index writer (no subissue yet; see the findings above) | `steady-buffered` and `slow-store`, Postgres | `store_evidence.index_queue.max_depth`, the *dropped at the queue bound* difference between accepted requests and `index_queue.depth_observations`, `index_queue.wait`, and `store.usage_rows` at the end against accepted requests | Dropped at the queue bound is 0 and `store.usage_rows` equals the accepted count; `index_queue.wait` mean falls below the request-path p50; `budget_charge.query_duration` does not rise, so the index did not buy its throughput by contending harder for the sessions the charges hold. |

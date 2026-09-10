@@ -2118,7 +2118,7 @@ mod tests {
         sorted.sort();
         let p95 = percentile(&sorted, 0.95);
         let p99 = percentile(&sorted, 0.99);
-        eprintln!(
+        println!(
             "pool {label}: n={} p50={:?} p95={:?} p99={:?} max={:?}",
             sorted.len(),
             percentile(&sorted, 0.50),
@@ -2153,7 +2153,7 @@ mod tests {
         assert_eq!(after_cold.live, cold_n);
         assert_eq!(after_cold.available, POOL_SIZE - cold_n);
         let (cold_p95, cold_p99) = report_latencies("cold", &cold);
-        eprintln!(
+        println!(
             "pool cold sessions opened={} reused={} discarded={} live={} idle={}",
             after_cold.opened,
             after_cold.reused,
@@ -2178,7 +2178,7 @@ mod tests {
         }
         let after_warm = store.pool_snapshot();
         let (p95, p99) = report_latencies("warm", &warm);
-        eprintln!(
+        println!(
             "pool warm sessions opened={} reused={} discarded={} idle={}",
             after_warm.opened, after_warm.reused, after_warm.discarded, after_warm.idle
         );
@@ -2211,7 +2211,7 @@ mod tests {
             }
             let opened_after = store.pool_snapshot().opened;
             burst_opened.push(opened_after.saturating_sub(opened_before));
-            eprintln!(
+            println!(
                 "pool burst wave {wave_i}: opened_delta={} live={} idle={} discarded={}",
                 burst_opened[wave_i],
                 store.pool_snapshot().live,
@@ -2254,7 +2254,7 @@ mod tests {
         }
         let after_recovery = store.pool_snapshot();
         let (recovery_p95, recovery_p99) = report_latencies("recovery", &recovery);
-        eprintln!(
+        println!(
             "pool recovery opened_delta={recovery_opened} snapshot={after_recovery:?} \
              cold_p95={cold_p95:?} cold_p99={cold_p99:?} \
              warm_p95={warm_p95:?} warm_p99={warm_p99:?} \
