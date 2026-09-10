@@ -139,6 +139,10 @@ struct Shared {
     /// wake-up racing the count check would be lost and the shutdown wait
     /// would sleep out its whole budget.
     finished: watch::Sender<u64>,
+    /// Immediate `execution_timeout` signals, recorded when the deadline fires
+    /// rather than when blocking work later ends.
+    #[cfg(test)]
+    deadline_misses: AtomicU64,
 }
 
 /// What is outstanding right now, for the shutdown report and for tests.
@@ -178,6 +182,8 @@ impl Settlements {
                 sequence: AtomicU64::new(0),
                 finished: watch::Sender::new(0),
                 limits,
+                #[cfg(test)]
+                deadline_misses: AtomicU64::new(0),
             }),
         };
         register_age_source(&settlements.shared);
@@ -186,6 +192,11 @@ impl Settlements {
 
     pub fn from_config(config: &AdmissionConfig) -> Self {
         Self::new(SettlementLimits::from(config))
+    }
+
+    #[cfg(test)]
+    fn deadline_misses(&self) -> u64 {
+        self.shared.deadline_misses.load(Ordering::Acquire)
     }
 
     /// Reserve settlement capacity for one request being admitted, or shed the
@@ -254,17 +265,23 @@ impl Settlements {
                 Some(deadline) => match tokio::time::timeout(deadline, run.as_mut()).await {
                     Ok(Ok(())) => Outcome::Completed,
                     Ok(Err(_panic)) => Outcome::Panicked,
-                    Err(_) => match run.await {
-                        Ok(()) => Outcome::ExecutionTimeout,
-                        Err(_panic) => Outcome::Panicked,
-                    },
+                    Err(_) => {
+                        // Report the miss now: a stalled Store must increment
+                        // the timeout counter even if the join never returns,
+                        // and a later panic must not replace that signal.
+                        guard.note_execution_timeout();
+                        let _ = run.await;
+                        Outcome::ExecutionTimeout
+                    }
                 },
                 None => match run.await {
                     Ok(()) => Outcome::Completed,
                     Err(_panic) => Outcome::Panicked,
                 },
             };
-            guard.outcome = Some(outcome);
+            if guard.outcome.is_none() {
+                guard.outcome = Some(outcome);
+            }
         });
     }
 
@@ -505,6 +522,9 @@ struct Guard {
     enqueued: Instant,
     stage: Stage,
     outcome: Option<Outcome>,
+    /// True once a failure metric has been emitted, so Drop does not count
+    /// the same settlement twice after an immediate timeout report.
+    failure_recorded: bool,
 }
 
 impl Guard {
@@ -527,6 +547,7 @@ impl Guard {
             enqueued,
             stage: Stage::Queued,
             outcome: None,
+            failure_recorded: false,
         }
     }
 
@@ -537,6 +558,22 @@ impl Guard {
         metrics::record_settlement_stage_entered(STAGE_EXECUTING);
         metrics::record_settlement_queue_wait(self.enqueued.elapsed().as_secs_f64() * 1_000.0);
         self.stage = Stage::Executing;
+    }
+
+    fn note_execution_timeout(&mut self) {
+        self.outcome = Some(Outcome::ExecutionTimeout);
+        if self.failure_recorded {
+            return;
+        }
+        metrics::record_settlement_failure(FAILURE_EXECUTION_TIMEOUT);
+        tracing::error!(
+            reason = FAILURE_EXECUTION_TIMEOUT,
+            waited_ms = self.enqueued.elapsed().as_millis() as u64,
+            "settlement missed its execution deadline; the slot is held until Store work ends"
+        );
+        self.failure_recorded = true;
+        #[cfg(test)]
+        self.shared.deadline_misses.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -560,12 +597,14 @@ impl Drop for Guard {
             .expect("settlement backlog")
             .remove(&self.sequence);
         if let Some(reason) = outcome.failure_reason() {
-            metrics::record_settlement_failure(reason);
-            tracing::error!(
-                reason,
-                waited_ms = self.enqueued.elapsed().as_millis() as u64,
-                "settlement did not complete; its charge is not retried and may be unrecorded"
-            );
+            if !self.failure_recorded {
+                metrics::record_settlement_failure(reason);
+                tracing::error!(
+                    reason,
+                    waited_ms = self.enqueued.elapsed().as_millis() as u64,
+                    "settlement did not complete; its charge is not retried and may be unrecorded"
+                );
+            }
         }
         // After the counts, so a waiter woken by this sees them already
         // decremented. The permit drops with `self`, after this runs, which is
@@ -905,6 +944,11 @@ mod tests {
         started_rx.await.expect("the blocking closure started");
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(
+            settlements.deadline_misses(),
+            1,
+            "the timeout is counted when the deadline fires, not when blocking work ends"
+        );
+        assert_eq!(
             settlements.backlog().executing,
             1,
             "the deadline counted a timeout without releasing the slot"
@@ -919,5 +963,10 @@ mod tests {
         settlements
             .reserve()
             .expect("capacity returns only after the blocking work ends");
+        assert_eq!(
+            settlements.deadline_misses(),
+            1,
+            "draining the join must not record the timeout a second time"
+        );
     }
 }
