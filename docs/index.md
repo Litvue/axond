@@ -83,6 +83,9 @@ disk as records.
   evidence after ADR 0063: what is harnessed, what is retained, what is gone.
 - [Capacity qualification](./operations/capacity.md) — per-replica envelopes
   on SQLite + `/ns/{ns}/v1`.
+- [Store latency baseline](./operations/store-latency-baseline.md) — the
+  Store's share of request cost on SQLite and Postgres, acquire wait apart from
+  query time, and the controlled-runner comparison procedure.
 - [Fault qualification](./operations/fault-qualification.md) — provider and
   transport faults on SQLite; Redis rows skipped (ADR 0063).
 - [Endurance qualification](./operations/endurance.md) — mixed-workload soak

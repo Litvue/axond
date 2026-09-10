@@ -1072,11 +1072,15 @@ fn measurement(
     }
 }
 
+/// One management read as a reader saw it: the status it got, or `None` for a
+/// transport failure, and how long it took.
+type SummaryObservation = (Option<u16>, f64);
+
 /// Management readers looping over `GET /api/v1/namespaces/platform/usage`
 /// until told to stop.
 struct SummaryReaders {
     stop: Arc<AtomicBool>,
-    tasks: Vec<tokio::task::JoinHandle<Vec<(Option<u16>, f64)>>>,
+    tasks: Vec<tokio::task::JoinHandle<Vec<SummaryObservation>>>,
     readers: usize,
 }
 

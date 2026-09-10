@@ -1351,7 +1351,11 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
         );
-        assert!(STORE_DURATION_BOUNDARIES[0] <= 0.05);
+        assert!(
+            STORE_DURATION_BOUNDARIES
+                .first()
+                .is_some_and(|lowest| *lowest <= 0.05)
+        );
         assert!(
             STORE_DURATION_BOUNDARIES
                 .windows(2)
