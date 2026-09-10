@@ -603,15 +603,16 @@ impl UsageDelivery {
             crate::telemetry::metrics::record_usage_index_append("failed");
             return;
         };
+        let depth = self.index_depth.fetch_add(1, Ordering::AcqRel) + 1;
         match tx.try_send(QueuedIndexEvent {
             enqueued: Instant::now(),
             event,
         }) {
             Ok(()) => {
-                let depth = self.index_depth.fetch_add(1, Ordering::AcqRel) + 1;
                 crate::telemetry::metrics::record_usage_index_enqueued(depth);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                take_index_slot(&self.index_depth);
                 tracing::error!(
                     request_id = %request_id,
                     "store usage append timed out"
@@ -622,6 +623,7 @@ impl UsageDelivery {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                take_index_slot(&self.index_depth);
                 tracing::error!(
                     request_id = %request_id,
                     "store usage append failed"
