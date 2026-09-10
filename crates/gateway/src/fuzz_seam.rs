@@ -51,6 +51,7 @@ mod redis_support;
 mod reload;
 mod revocation;
 mod routes;
+mod settlement;
 mod shutdown;
 mod state;
 mod status;

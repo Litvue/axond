@@ -596,15 +596,15 @@ impl Drop for Guard {
             .lock()
             .expect("settlement backlog")
             .remove(&self.sequence);
-        if let Some(reason) = outcome.failure_reason() {
-            if !self.failure_recorded {
-                metrics::record_settlement_failure(reason);
-                tracing::error!(
-                    reason,
-                    waited_ms = self.enqueued.elapsed().as_millis() as u64,
-                    "settlement did not complete; its charge is not retried and may be unrecorded"
-                );
-            }
+        if let Some(reason) = outcome.failure_reason()
+            && !self.failure_recorded
+        {
+            metrics::record_settlement_failure(reason);
+            tracing::error!(
+                reason,
+                waited_ms = self.enqueued.elapsed().as_millis() as u64,
+                "settlement did not complete; its charge is not retried and may be unrecorded"
+            );
         }
         // After the counts, so a waiter woken by this sees them already
         // decremented. The permit drops with `self`, after this runs, which is
