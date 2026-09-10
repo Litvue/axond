@@ -515,7 +515,12 @@ means something is holding requests open — usually a long stream — or the
 orchestrator is not removing the endpoint. Sustained
 `axond_shutdown_rejected_requests` volume means callers are not honouring
 readiness; abandoned requests mean the deadline cut work, so lengthen the drain
-or shorten `max_stream_duration_ms`.
+or shorten `max_stream_duration_ms`. A rising `axond_shutdown_abandoned_settlements`
+is a different cut: the requests ended, but their charges were still queued or
+executing against the Store when the settle share of `flush_timeout_ms` ran out,
+and that spend was never recorded. The shutdown log line breaks the leftovers
+down by stage (`settlements_queued`, `settlements_executing`,
+`settlements_reserved`) and names the oldest one's age.
 
 `GET /admin/v1/status` still answers in both phases and reports the phase it is
 in, including `closing`: it authenticates but sits outside admission, and takes
