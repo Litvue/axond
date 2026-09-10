@@ -233,9 +233,9 @@ batching keys. Boot-owned, like the rest of `[storage]`.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `buffer_capacity` | integer | `1024` | Events queued ahead of the worker before the request path drops. Must be ≥ 1. Bounds memory during an outage. |
+| `buffer_capacity` | integer | `1024` | Events queued ahead of the worker before the request path drops. Must be ≥ 1 and at most Tokio's semaphore permit limit (`usize::MAX >> 3`). Bounds memory during an outage. |
 | `max_batch` | integer | `256` | Rows per Store transaction. Must be ≥ 1, no greater than `buffer_capacity`, and at most `4096`. Bounds how long SQLite's single connection is held away from admits and charges. |
-| `flush_interval_ms` | integer | `50` | How long a partial batch waits for more events before it is written anyway. `0` writes whatever has queued as soon as the worker is free. |
+| `flush_interval_ms` | integer | `50` | How long a partial batch waits for more events before it is written anyway. `0` writes whatever has queued as soon as the worker is free. At most `86400000` (24h), so the worker deadline cannot overflow. |
 
 `axond.usage.index.batches`, `axond.usage.index.batch_size`, and
 `axond.usage.index.queue_age` show the batch size the deployment achieves and how

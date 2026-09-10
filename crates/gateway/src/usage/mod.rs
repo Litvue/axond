@@ -598,8 +598,11 @@ impl IndexQueue {
     fn try_enqueue(&self, item: QueuedAppend) -> Result<u64, IndexOutcome> {
         match self.0.try_reserve() {
             Ok(permit) => {
+                // Sample before `send`: the permit already occupies a slot, and
+                // the worker cannot recv this item until we publish it.
+                let occupied = (self.0.max_capacity() - self.0.capacity()) as u64;
                 permit.send(item);
-                Ok((self.0.max_capacity() - self.0.capacity()) as u64)
+                Ok(occupied)
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(IndexOutcome::Saturated),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(IndexOutcome::Closed),
@@ -1100,7 +1103,9 @@ fn sqlite_usage_index_worker(
             return;
         }
         batch.push(first);
-        let deadline = Instant::now() + settings.flush_interval;
+        let deadline = Instant::now()
+            .checked_add(settings.flush_interval)
+            .unwrap_or_else(Instant::now);
         while batch.len() < settings.max_batch {
             match rx.try_recv() {
                 Ok(item) => batch.push(item.take()),
@@ -1153,7 +1158,9 @@ async fn async_usage_index_worker(
             return;
         }
         batch.push(first);
-        let deadline = tokio::time::Instant::now() + settings.flush_interval;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(settings.flush_interval)
+            .unwrap_or_else(tokio::time::Instant::now);
         while batch.len() < settings.max_batch {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(item)) => batch.push(item.take()),

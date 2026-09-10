@@ -838,8 +838,8 @@ fn default_storage_create_table() -> bool {
 
 /// How usage events reach the Store's management index (`GET .../usage`).
 ///
-/// The index is best effort and off the request path: the request `try_send`s
-/// onto a bounded queue and one worker writes what has queued in bounded
+/// The index is best effort and off the request path: the request `try_reserve`s
+/// a slot on a bounded queue and one worker writes what has queued in bounded
 /// batches, so a Store outage costs index rows (counted on
 /// `axond.usage.index.appends`) rather than latency. Same vocabulary as the
 /// `[[usage_sink]]` batching keys.
@@ -870,6 +870,16 @@ fn default_usage_index_max_batch() -> usize {
 fn default_usage_index_flush_interval_ms() -> u64 {
     50
 }
+
+/// Tokio's bounded channel panics above this; the queue is a semaphore.
+fn max_usage_index_buffer_capacity() -> usize {
+    tokio::sync::Semaphore::MAX_PERMITS
+}
+
+/// Ceiling on `[storage.usage_index] flush_interval_ms`. Larger values cannot
+/// form a worker deadline (`Instant + Duration` overflows) and would stall the
+/// only index writer for longer than a batch is worth.
+pub(crate) const MAX_USAGE_INDEX_FLUSH_INTERVAL_MS: u64 = 86_400_000;
 
 impl Default for UsageIndexConfig {
     fn default() -> Self {
@@ -3031,6 +3041,13 @@ impl Config {
                 "`[storage.usage_index]` buffer_capacity must be at least 1".into(),
             ));
         }
+        if index.buffer_capacity > max_usage_index_buffer_capacity() {
+            return Err(ConfigError::Invalid(format!(
+                "`[storage.usage_index]` buffer_capacity ({}) must not exceed {}",
+                index.buffer_capacity,
+                max_usage_index_buffer_capacity()
+            )));
+        }
         if index.max_batch == 0 {
             return Err(ConfigError::Invalid(
                 "`[storage.usage_index]` max_batch must be at least 1".into(),
@@ -3047,6 +3064,12 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "`[storage.usage_index]` max_batch ({}) must not exceed buffer_capacity ({})",
                 index.max_batch, index.buffer_capacity
+            )));
+        }
+        if index.flush_interval_ms > MAX_USAGE_INDEX_FLUSH_INTERVAL_MS {
+            return Err(ConfigError::Invalid(format!(
+                "`[storage.usage_index]` flush_interval_ms ({}) must not exceed {} (24h)",
+                index.flush_interval_ms, MAX_USAGE_INDEX_FLUSH_INTERVAL_MS
             )));
         }
         match storage.backend {
@@ -4995,6 +5018,14 @@ namespace = "platform"
                 "buffer_capacity = 100000\nmax_batch = 5000",
                 "must not exceed 4096",
             ),
+            (
+                &format!(
+                    "buffer_capacity = {}",
+                    tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1)
+                ),
+                "must not exceed",
+            ),
+            ("flush_interval_ms = 86400001", "flush_interval_ms"),
         ] {
             let err = Config::from_toml_str(&VALID.replace(
                 "path = \":memory:\"",
