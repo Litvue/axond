@@ -45,7 +45,6 @@
 //! [`object_store::ObjectStore`] is a provider-neutral storage primitive for a
 //! future control-plane implementation, not a ninth business responsibility.
 
-pub mod azure_blob;
 pub mod catalog;
 pub mod catalog_pins;
 pub mod catalog_projection;

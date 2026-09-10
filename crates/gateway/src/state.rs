@@ -31,29 +31,16 @@ use crate::backends::catalog::CatalogReport;
 use crate::backends::catalog_runtime::CatalogStatus;
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::health::BackendHealth;
-use crate::backends::secrets::SecretMaterial;
 use crate::budget::BudgetStore;
-use crate::config::{
-    Config, GatewayVerifierAlgorithm, Namespace, NamespacePolicy, NamespaceStaticPolicy,
-    ProjectIdentity, ProjectedPrincipal, ProviderKind, StorageBackend,
-};
+use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind, StorageBackend};
 use crate::convergence::SystemClock;
-use crate::convergence::secrets::{MaterialLedger, ResolvedSecretBinding, ResolvedSecrets};
+use crate::convergence::secrets::{ResolvedSecretBinding, ResolvedSecrets};
 use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
 use crate::desired_state::mutation::Actor;
-use crate::desired_state::policy::{
-    BudgetPolicy, BufferedResponseRoute, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope,
-    RevocationPolicy,
-};
-use crate::desired_state::pricing::{
-    Approval, EffectiveInstant, EffectiveInterval, PricedTarget, PricingSnapshot,
-};
-use crate::desired_state::tenancy::DisplayName;
-use crate::desired_state::{
-    AuthorizationSnapshot, Checksum, ResourceId, ResourceKind, ResourceRef, ResourceVersionNumber,
-};
-use crate::desired_state::{ProjectId, RevisionId, SecretRef, TenantId, WorkloadKey};
+use crate::desired_state::policy::PolicyScope;
+use crate::desired_state::pricing::{Approval, PricingSnapshot};
+use crate::desired_state::{AuthorizationSnapshot, RevisionId, WorkloadKey};
 use crate::key_material::{self, KeyMaterialError};
 use crate::middleware::{MiddlewareChain, MiddlewarePlan, MiddlewarePlanError, MiddlewareRuntime};
 use crate::policy::{PolicyRuntime, PolicyView};
@@ -111,14 +98,9 @@ pub struct Inner {
     /// registry is filled by a background refresher, so a status request reads a
     /// map rather than a backend (ADR 0031).
     pub status: Arc<CachedStatusRegistry>,
-    /// This replica's convergence state, when it converges against a control
-    /// plane at all. `None` in the stateless posture, where a replica serves the
-    /// file it booted from and there is no revision to lag behind — and `None`
-    /// in every shipped binary today, because no release constructs a
-    /// reconciler at all (#142). The slice that does must hand *its* status
-    /// handle here and to
-    /// [`AdminApi::with_convergence`](crate::admin::router::AdminApi::with_convergence):
-    /// two instances would let one replica tell two convergence stories.
+    /// This replica's convergence state. Always `None`: the store-backed
+    /// gateway serves the file it booted from and constructs no reconciler
+    /// (ADR 0063), so there is no revision to lag behind.
     pub revision: Option<Arc<RevisionStatus>>,
     /// What the background catalogue import last reported, when this deployment
     /// imports one at all. A read of a mutex over a bounded report: the request
@@ -194,13 +176,6 @@ impl ReplicaObservability {
             },
             Some(refresher),
         )
-    }
-
-    /// Attach the one convergence report the reconciler writes.
-    #[must_use]
-    pub fn with_revision(mut self, revision: Arc<RevisionStatus>) -> Self {
-        self.revision = Some(revision);
-        self
     }
 
     /// The plan a deployment's own stores imply: one probe per dependency that
@@ -773,377 +748,14 @@ impl ConfigSnapshot {
             pricing: self.pricing.as_ref().map(cached_pricing),
         }
     }
-
-    /// Rebuild a compiled snapshot over the current bootstrap-owned settings.
-    /// Every durable field is parsed and the ordinary compiled snapshot gate is
-    /// run again before the value can be published.
-    pub(crate) fn from_cached_serving(
-        mut bootstrap: Config,
-        env: &HashMap<String, String>,
-        cached: CachedServingSnapshot,
-    ) -> Result<(RevisionId, Self), String> {
-        let flat_v2 = cached.flat_v2();
-        if cached.credential_bearing_flat_v2() {
-            return Err(
-                "credential-bearing flat-v2 compiled snapshots are not eligible for cold restoration until an authenticated monotonic revision/tombstone floor exists"
-                    .to_owned(),
-            );
-        }
-        verify_cached_guardrail_keys(&cached, env)?;
-        let revision = RevisionId::parse(&cached.revision).map_err(|error| error.to_string())?;
-        let restored_namespaces = cached
-            .namespaces
-            .into_iter()
-            .map(|namespace| cached_namespace(namespace, revision))
-            .collect::<Result<Vec<_>, _>>()?;
-        bootstrap.namespace = restored_namespaces
-            .iter()
-            .map(|(namespace, _)| namespace.clone())
-            .collect();
-        bootstrap.gateway_token_epoch = restored_namespaces
-            .into_iter()
-            .filter_map(|(namespace, minimum_token_epoch)| {
-                minimum_token_epoch.map(|min_iat| crate::config::GatewayTokenEpoch {
-                    namespace: namespace.id,
-                    subject: None,
-                    min_iat,
-                })
-            })
-            .collect();
-        let file_unpriced: HashMap<String, crate::config::UnpricedModels> = bootstrap
-            .provider
-            .iter()
-            .map(|provider| (provider.id.clone(), provider.unpriced_models))
-            .collect();
-        bootstrap.provider = cached
-            .providers
-            .into_iter()
-            .map(|provider| {
-                let kind = match provider.kind.as_str() {
-                    "openai" => ProviderKind::Openai,
-                    "anthropic" => ProviderKind::Anthropic,
-                    "openai-compatible" => ProviderKind::OpenaiCompatible,
-                    other => return Err(format!("cached provider kind `{other}` is unsupported")),
-                };
-                Ok(crate::config::Provider {
-                    unpriced_models: file_unpriced
-                        .get(&provider.id)
-                        .copied()
-                        .unwrap_or(provider.unpriced_models),
-                    id: provider.id,
-                    kind,
-                    base_url: provider.base_url,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        // Cached alias tables are not a serving graph (ADR 0063). The current
-        // file's [[price]] / [blocklist] stay on `bootstrap`; do not resurrect
-        // leftover [[model]] rows from a previous revision.
-        let _ = cached.models;
-        bootstrap.credential = cached
-            .credentials
-            .into_iter()
-            .map(|credential| {
-                Ok(crate::config::Credential {
-                    namespace: credential.namespace,
-                    provider: credential.provider,
-                    env: credential.env,
-                    secret: credential
-                        .secret
-                        .as_deref()
-                        .map(SecretRef::parse)
-                        .transpose()
-                        .map_err(|error| error.to_string())?,
-                    id: credential.id,
-                    weight: credential.weight,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        bootstrap.projected_principals = cached
-            .principals
-            .into_iter()
-            .map(|principal| {
-                Ok(ProjectedPrincipal {
-                    namespace: principal.namespace.clone(),
-                    subject: principal.subject,
-                    digest: Checksum::parse(&principal.digest)
-                        .map_err(|error| error.to_string())?,
-                    grant: if principal.all_namespaces {
-                        Some(crate::namespace::NamespaceGrant::all())
-                    } else if principal.namespaces.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            crate::namespace::NamespaceGrant::set(
-                                principal
-                                    .namespaces
-                                    .iter()
-                                    .map(|namespace| {
-                                        crate::namespace::NamespaceId::parse(namespace)
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()
-                                    .map_err(|error| error.to_string())?,
-                            )
-                            .map_err(|error| error.to_string())?,
-                        )
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        bootstrap
-            .validate_compiled()
-            .map_err(|error| error.to_string())?;
-        let mut expected_secret_owners = HashMap::new();
-        if flat_v2 {
-            for credential in &bootstrap.credential {
-                let Some(reference) = credential.secret else {
-                    continue;
-                };
-                if let Some(first) =
-                    expected_secret_owners.insert(reference, credential.namespace.clone())
-                    && first != credential.namespace
-                {
-                    return Err(format!(
-                        "compiled cache shares secret {reference} between namespaces `{first}` and `{}`",
-                        credential.namespace
-                    ));
-                }
-            }
-        }
-        let materials = cached
-            .secrets
-            .into_iter()
-            .map(|mut secret| {
-                let reference =
-                    SecretRef::parse(&secret.reference).map_err(|error| error.to_string())?;
-                if flat_v2 && !expected_secret_owners.contains_key(&reference) {
-                    return Err(format!(
-                        "compiled cache contains unreferenced secret {reference}"
-                    ));
-                }
-                let binding = match secret.binding {
-                    CachedSecretBinding::Legacy => ResolvedSecretBinding::Legacy,
-                    CachedSecretBinding::Namespace { .. } => {
-                        return Err(format!(
-                            "compiled cache carries namespace-bound secret {reference}; flat-v2 credential material is not eligible for cold restoration"
-                        ));
-                    }
-                };
-                let material = std::mem::take(&mut secret.material);
-                Ok((reference, SecretMaterial::new(material), binding))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        if flat_v2 && materials.len() != expected_secret_owners.len() {
-            return Err(format!(
-                "compiled cache contains {} secret materials for {} referenced versions",
-                materials.len(),
-                expected_secret_owners.len()
-            ));
-        }
-        let secrets = ResolvedSecrets::from_cached(MaterialLedger::new(), materials)?;
-        let mut snapshot = Self::build_compiled_with(bootstrap, env, cached.generation, secrets)
-            .map_err(|error| error.to_string())?;
-        if let Some(pricing) = cached.pricing {
-            snapshot = snapshot.with_pricing(pricing_snapshot(pricing)?);
-        }
-        Ok((revision, snapshot))
-    }
-}
-
-fn verify_cached_guardrail_keys(
-    cached: &CachedServingSnapshot,
-    env: &HashMap<String, String>,
-) -> Result<(), String> {
-    for namespace in &cached.namespaces {
-        let identity = namespace.project.as_ref().map_or_else(
-            || namespace.id.clone(),
-            |project| format!("{}/{}", project.tenant, project.project),
-        );
-        let registrations = namespace
-            .static_policy
-            .as_ref()
-            .map(|policy| policy.content_middleware.as_slice())
-            .or_else(|| {
-                namespace
-                    .policy
-                    .as_ref()
-                    .map(|policy| policy.content_middleware.as_slice())
-            })
-            .unwrap_or_default();
-        for registration in registrations {
-            let Some(guardrail) = &registration.guardrail else {
-                continue;
-            };
-            let actual =
-                crate::middleware::guardrail_key_fingerprint(&identity, &guardrail.key_env, env)
-                    .map_err(|error| error.to_string())?;
-            if actual != guardrail.key_fingerprint {
-                return Err(format!(
-                    "cached guardrail key reference `{}` for namespace `{}` resolves to different material",
-                    guardrail.key_env, namespace.id
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn restore_cached_middleware(
-    registrations: Vec<CachedContentMiddleware>,
-) -> Result<Vec<crate::desired_state::ContentMiddlewareRegistration>, String> {
-    registrations
-        .into_iter()
-        .map(|registration| {
-            let middleware = crate::desired_state::ContentMiddlewareRegistration::new(
-                registration.id,
-                registration.scopes,
-                registration.failure_posture,
-                registration.max_duration_milliseconds,
-            )
-            .map_err(|error| error.to_string())?;
-            let Some(guardrail) = registration.guardrail else {
-                return Ok(middleware);
-            };
-            let guardrail = crate::desired_state::policy::ContentGuardrailRegistration::new(
-                guardrail.key_env,
-                guardrail.rules,
-            )
-            .map_err(|error| error.to_string())?;
-            middleware
-                .with_guardrail(guardrail)
-                .map_err(|error| error.to_string())
-        })
-        .collect()
-}
-
-fn restore_cached_buffered_routes(routes: &[String]) -> Result<Vec<BufferedResponseRoute>, String> {
-    routes
-        .iter()
-        .map(|route| BufferedResponseRoute::parse(route).map_err(|error| error.to_string()))
-        .collect()
 }
 
 impl CachedServingSnapshot {
-    fn flat_v2(&self) -> bool {
-        self.namespaces
-            .iter()
-            .any(|namespace| namespace.static_policy.is_some())
-    }
-
-    fn credential_bearing_flat_v2(&self) -> bool {
-        self.flat_v2()
-            && self
-                .credentials
-                .iter()
-                .any(|credential| credential.secret.is_some())
-    }
-
     pub(crate) fn zeroize_secrets(&mut self) {
         for secret in &mut self.secrets {
             secret.material.zeroize();
         }
     }
-}
-
-fn cached_namespace(
-    namespace: CachedNamespace,
-    revision: RevisionId,
-) -> Result<(Namespace, Option<u64>), String> {
-    let has_static_policy = namespace.static_policy.is_some();
-    let project = namespace
-        .project
-        .map(|identity| -> Result<ProjectIdentity, String> {
-            Ok(ProjectIdentity {
-                tenant: TenantId::parse(&identity.tenant).map_err(|error| error.to_string())?,
-                project: ProjectId::parse(&identity.project).map_err(|error| error.to_string())?,
-            })
-        })
-        .transpose()?;
-    let policy = namespace
-        .policy
-        .map(|policy| -> Result<(NamespacePolicy, u64), String> {
-            let scope = match policy.scope {
-                CachedPolicyScope::Namespace { resource } => PolicyScope::Namespace(
-                    crate::desired_state::ResourceId::parse(&resource)
-                        .map_err(|error| error.to_string())?,
-                ),
-                CachedPolicyScope::Tenant { tenant } => PolicyScope::Tenant(
-                    TenantId::parse(&tenant).map_err(|error| error.to_string())?,
-                ),
-                CachedPolicyScope::Project { tenant, project } => PolicyScope::Project {
-                    tenant: TenantId::parse(&tenant).map_err(|error| error.to_string())?,
-                    project: ProjectId::parse(&project).map_err(|error| error.to_string())?,
-                },
-            };
-            let minimum_token_epoch = policy.minimum_token_epoch;
-            let content_middleware = restore_cached_middleware(policy.content_middleware)?;
-            let buffered_response_routes =
-                restore_cached_buffered_routes(&policy.buffered_response_routes)?;
-            let body = PolicyBody::new(
-                scope,
-                PolicyEpoch::new(policy.epoch).map_err(|error| error.to_string())?,
-                BudgetPolicy::stored(
-                    policy.subject_limit_microdollars,
-                    policy.namespace_limit_microdollars,
-                    policy.reservation_ttl_seconds,
-                )
-                .map_err(|error| error.to_string())?,
-                ConcurrencyPolicy::new(policy.max_in_flight_per_subject, policy.lease_ttl_seconds)
-                    .map_err(|error| error.to_string())?,
-                RevocationPolicy::new(policy.minimum_token_epoch),
-            )
-            .with_content_middleware(content_middleware)
-            .map_err(|error| error.to_string())?
-            .with_buffered_response_routes(buffered_response_routes)
-            .map_err(|error| error.to_string())?;
-            let generation = body.generation(revision);
-            Ok((NamespacePolicy { body, generation }, minimum_token_epoch))
-        })
-        .transpose()?;
-    let static_policy = namespace
-        .static_policy
-        .map(|policy| {
-            Ok::<_, String>(NamespaceStaticPolicy {
-                content_middleware: restore_cached_middleware(policy.content_middleware)?,
-                buffered_response_routes: restore_cached_buffered_routes(
-                    &policy.buffered_response_routes,
-                )?,
-            })
-        })
-        .transpose()?;
-    let policy_token_epoch = policy.as_ref().and_then(|(_, minimum)| {
-        matches!(
-            policy.as_ref().map(|(policy, _)| policy.body.scope()),
-            Some(PolicyScope::Namespace(_))
-        )
-        .then_some(*minimum)
-    });
-    if has_static_policy && namespace.token_epoch.is_none() {
-        return Err(format!(
-            "compiled cache omits the token epoch for flat-v2 namespace `{}`",
-            namespace.id
-        ));
-    }
-    if let (Some(explicit), Some(policy)) = (namespace.token_epoch, policy_token_epoch)
-        && explicit != policy
-    {
-        return Err(format!(
-            "compiled cache gives namespace `{}` conflicting token epochs {explicit} and {policy}",
-            namespace.id
-        ));
-    }
-    let minimum_token_epoch = namespace.token_epoch.or(policy_token_epoch);
-    Ok((
-        Namespace {
-            id: namespace.id,
-            default: namespace.default,
-            allow_platform_fallback: namespace.allow_platform_fallback,
-            project,
-            policy: policy.map(|(policy, _)| policy),
-            static_policy,
-        },
-        minimum_token_epoch,
-    ))
 }
 
 fn cached_pricing(pricing: &PricingSnapshot) -> CachedPricing {
@@ -1190,98 +802,6 @@ fn cached_actor(actor: &Actor) -> CachedActor {
             component: component.clone(),
         },
     }
-}
-
-fn restore_actor(actor: CachedActor) -> Result<Actor, String> {
-    Ok(match actor {
-        CachedActor::Human { issuer, subject } => Actor::Human { issuer, subject },
-        CachedActor::Breakglass => Actor::Breakglass,
-        CachedActor::Workload { tenant, principal } => Actor::Workload {
-            tenant: TenantId::parse(&tenant).map_err(|error| error.to_string())?,
-            principal: crate::desired_state::PrincipalId::parse(&principal)
-                .map_err(|error| error.to_string())?,
-        },
-        CachedActor::System { component } => Actor::System { component },
-    })
-}
-
-fn parse_resource_reference(text: &str) -> Result<ResourceRef, String> {
-    let (kind, rest) = text
-        .split_once('/')
-        .ok_or_else(|| "cached price-book reference has no kind separator".to_owned())?;
-    let (id, version) = rest
-        .rsplit_once('@')
-        .ok_or_else(|| "cached price-book reference has no version".to_owned())?;
-    let kind = ResourceKind::ALL
-        .iter()
-        .copied()
-        .find(|candidate| candidate.as_str() == kind)
-        .ok_or_else(|| format!("cached price-book kind `{kind}` is unsupported"))?;
-    let id = ResourceId::parse(id).map_err(|error| error.to_string())?;
-    let version = version
-        .strip_prefix('v')
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(ResourceVersionNumber::new)
-        .ok_or_else(|| "cached price-book version is invalid".to_owned())?;
-    Ok(ResourceRef::new(kind, id, version))
-}
-
-fn pricing_snapshot(cached: CachedPricing) -> Result<PricingSnapshot, String> {
-    let approval = match cached.approval {
-        CachedApproval::Draft => Approval::Draft,
-        CachedApproval::Approved {
-            actor,
-            at,
-            citation,
-        } => Approval::Approved {
-            by: restore_actor(actor)?,
-            at: EffectiveInstant::from_millis(at),
-            citation: citation
-                .as_deref()
-                .map(DisplayName::parse)
-                .transpose()
-                .map_err(|error| error.to_string())?,
-        },
-    };
-    let effective = match cached.effective_until {
-        Some(until) => EffectiveInterval::bounded(
-            EffectiveInstant::from_millis(cached.effective_from),
-            EffectiveInstant::from_millis(until),
-        )
-        .map_err(|error| error.to_string())?,
-        None => EffectiveInterval::from(EffectiveInstant::from_millis(cached.effective_from)),
-    };
-    let targets = cached
-        .targets
-        .into_iter()
-        .map(|target| {
-            Ok((
-                PricedTarget::new(
-                    crate::backends::catalog::ProviderId::parse(&target.provider)
-                        .map_err(|error| error.to_string())?,
-                    target.published_model_id,
-                ),
-                target.price,
-            ))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
-    Ok(PricingSnapshot::from_cached(
-        parse_resource_reference(&cached.book)?,
-        Checksum::parse(&cached.checksum).map_err(|error| error.to_string())?,
-        crate::backends::catalog::CatalogContentId::from_checksum(
-            Checksum::parse(&cached.catalog).map_err(|error| error.to_string())?,
-        ),
-        match cached.catalog_version {
-            None => None,
-            Some(version) => Some(
-                ResourceVersionNumber::new(version)
-                    .ok_or_else(|| "cached catalogue version is zero".to_owned())?,
-            ),
-        },
-        approval,
-        effective,
-        targets,
-    ))
 }
 
 /// Why a config could not become a servable snapshot. Names the offending
@@ -1759,12 +1279,6 @@ impl ConfigSnapshot {
         self.pricing.as_ref()
     }
 
-    /// The immutable administrative authorization view compiled with this
-    /// snapshot, if the snapshot came from a typed stateful revision.
-    pub fn admin_authorization_handle(&self) -> Option<Arc<AuthorizationSnapshot>> {
-        self.admin_authorization.clone()
-    }
-
     /// Attach the administrative authorization view before publication.
     #[must_use]
     pub fn with_admin_authorization(mut self, authorization: Arc<AuthorizationSnapshot>) -> Self {
@@ -2116,9 +1630,12 @@ mod tests {
     use super::*;
     use crate::availability::{AvailabilityKey, AvailabilityRecord, ScopeRef, TargetRef};
     use crate::budget::NoBudget;
+    use crate::config::NamespacePolicy;
     use crate::desired_state::ContentMiddlewareRegistration;
-    use crate::desired_state::fixtures::{policy_body, revision_id, secret_ref, tenant_id};
-    use crate::desired_state::policy::{ContentGuardrailRegistration, PolicyScope};
+    use crate::desired_state::fixtures::{policy_body, revision_id, tenant_id};
+    use crate::desired_state::policy::{
+        BufferedResponseRoute, ContentGuardrailRegistration, PolicyScope,
+    };
     use crate::desired_state::{TenantId, Uuid7};
     use crate::store::{Store, StoreError};
     use crate::usage::UsageSink;
@@ -2517,231 +2034,6 @@ namespace = "platform"
             .publish(ConfigSnapshot::build(rollback, &env, 4).expect("rollback compiles"))
             .expect("publish");
         assert_eq!(state.config().middleware("platform").len(), 1);
-    }
-
-    #[test]
-    fn cached_snapshot_restores_registered_middleware_and_refuses_missing_code() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let mut config = config_with(PLATFORM_KEY);
-        config.namespace[0].policy = Some(middleware_policy(1, "test.policy-marker"));
-        let snapshot = ConfigSnapshot::build(config, &env, 7).expect("snapshot compiles");
-        let revision = revision_id(7);
-
-        let cached = snapshot.cached_serving(revision);
-        let (restored_revision, restored) =
-            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
-                .expect("registered middleware restores");
-        assert_eq!(restored_revision, revision);
-        assert_eq!(restored.middleware("platform").len(), 1);
-        assert_eq!(
-            restored.config.namespace[0]
-                .policy
-                .as_ref()
-                .unwrap()
-                .body
-                .buffered_response_routes(),
-            [
-                BufferedResponseRoute::Messages,
-                BufferedResponseRoute::Responses,
-            ]
-        );
-
-        let mut unavailable = snapshot.cached_serving(revision);
-        unavailable.namespaces[0]
-            .policy
-            .as_mut()
-            .unwrap()
-            .content_middleware[0]
-            .id = "test.not-compiled".to_owned();
-        let error =
-            match ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, unavailable)
-            {
-                Ok(_) => panic!("cache cannot silently drop unavailable middleware"),
-                Err(error) => error,
-            };
-        assert!(
-            error.contains("not compiled into this axond build"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn from_cached_serving_drops_cached_models_and_keeps_file_billing_controls() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let snapshot =
-            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 7).expect("snapshot compiles");
-        let mut cached = snapshot.cached_serving(revision_id(7));
-        cached.models.push(CachedModel {
-            name: "legacy-alias".to_owned(),
-            namespace: None,
-            targets: vec![CachedTarget {
-                provider: "openai".to_owned(),
-                model: "gpt-4o".to_owned(),
-                price: gateway_core::ModelPrice {
-                    input_microdollars_per_million: 1,
-                    output_microdollars_per_million: 1,
-                    reasoning_microdollars_per_million: None,
-                    cache_read_microdollars_per_million: None,
-                    cache_write_microdollars_per_million: None,
-                },
-                catalog: None,
-            }],
-        });
-        let mut bootstrap = config_with(PLATFORM_KEY);
-        bootstrap.provider[0].unpriced_models = crate::config::UnpricedModels::Allow;
-        bootstrap.blocklist.models = vec!["*-preview".to_owned()];
-        bootstrap.price[0].price.input_microdollars_per_million = 99;
-        let (_, restored) = ConfigSnapshot::from_cached_serving(bootstrap.clone(), &env, cached)
-            .expect("restores without resurrecting aliases");
-        assert!(
-            restored.config.model.is_empty(),
-            "cached [[model]] rows are not a serving graph"
-        );
-        assert_eq!(restored.config.price, bootstrap.price);
-        assert_eq!(restored.config.blocklist, bootstrap.blocklist);
-        assert_eq!(
-            restored.config.provider[0].unpriced_models,
-            crate::config::UnpricedModels::Allow
-        );
-    }
-
-    #[test]
-    fn legacy_cache_restores_one_tenant_key_shared_across_namespaces() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let snapshot =
-            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 7).expect("snapshot compiles");
-        let revision = revision_id(7);
-        let reference = secret_ref(991);
-        let mut cached = snapshot.cached_serving(revision);
-        let mut sibling = cached.namespaces[0].clone();
-        sibling.id = "sibling".to_owned();
-        sibling.default = false;
-        cached.namespaces.push(sibling);
-        cached.credentials = ["platform", "sibling"]
-            .into_iter()
-            .map(|namespace| CachedCredential {
-                namespace: namespace.to_owned(),
-                provider: "openai".to_owned(),
-                env: None,
-                id: Some("tenant-default".to_owned()),
-                weight: 1,
-                secret: Some(reference.to_string()),
-            })
-            .collect();
-        cached.secrets.push(CachedSecret {
-            reference: reference.to_string(),
-            binding: CachedSecretBinding::Legacy,
-            material: "shared-provider-key".to_owned(),
-        });
-
-        let (_, restored) =
-            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
-                .expect("legacy shared tenant material remains recoverable");
-        assert_eq!(restored.config.credential.len(), 2);
-        assert!(restored.secrets.get(reference).is_some());
-    }
-
-    #[test]
-    fn legacy_cache_restores_staged_material_not_in_the_serving_pool() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let snapshot =
-            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 7).expect("snapshot compiles");
-        let revision = revision_id(7);
-        let reference = secret_ref(992);
-        let mut cached = snapshot.cached_serving(revision);
-        cached.secrets.push(CachedSecret {
-            reference: reference.to_string(),
-            binding: CachedSecretBinding::Legacy,
-            material: "staged-provider-key".to_owned(),
-        });
-
-        let (_, restored) =
-            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
-                .expect("legacy staged material remains recoverable");
-        assert!(restored.secrets.get(reference).is_some());
-        assert_eq!(restored.cached_serving(revision).secrets.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn cached_snapshot_restores_guardrail_rules_and_key_reference() {
-        let env = HashMap::from([
-            ("AXOND_KEY".to_owned(), "platform-secret".to_owned()),
-            ("GW_GUARDRAIL_KEY".to_owned(), STANDARD.encode([7_u8; 32])),
-        ]);
-        let mut config = config_with(PLATFORM_KEY);
-        config.namespace[0].policy = Some(redaction_policy(1));
-        let snapshot = ConfigSnapshot::build(config, &env, 7).expect("guardrail compiles");
-        let revision = revision_id(7);
-        let cached = snapshot.cached_serving(revision);
-        let missing_key_env =
-            HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let error = match ConfigSnapshot::from_cached_serving(
-            config_with(PLATFORM_KEY),
-            &missing_key_env,
-            cached.clone(),
-        ) {
-            Ok(_) => panic!("a cache cannot bypass guardrail key resolution"),
-            Err(error) => error,
-        };
-        assert!(error.contains("GW_GUARDRAIL_KEY"), "{error}");
-        let rotated_env = HashMap::from([
-            ("AXOND_KEY".to_owned(), "platform-secret".to_owned()),
-            ("GW_GUARDRAIL_KEY".to_owned(), STANDARD.encode([8_u8; 32])),
-        ]);
-        let error = match ConfigSnapshot::from_cached_serving(
-            config_with(PLATFORM_KEY),
-            &rotated_env,
-            cached.clone(),
-        ) {
-            Ok(_) => panic!("a cache cannot silently change guardrail key identity"),
-            Err(error) => error,
-        };
-        assert!(error.contains("resolves to different material"), "{error}");
-        let (_, restored) =
-            ConfigSnapshot::from_cached_serving(config_with(PLATFORM_KEY), &env, cached)
-                .expect("guardrail cache restores");
-        let registration = &restored.config.namespace[0]
-            .policy
-            .as_ref()
-            .unwrap()
-            .body
-            .content_middleware()[0];
-        let guardrail = registration.guardrail().expect("guardrail configuration");
-        assert_eq!(guardrail.key_env(), "GW_GUARDRAIL_KEY");
-        assert_eq!(guardrail.rules()[0].id, "email");
-
-        let mut request = gateway_core::ProviderRequest {
-            model: "alias".to_owned(),
-            body: serde_json::json!({"messages": [{
-                "role": "user",
-                "content": "alice@example.com"
-            }]}),
-        };
-        let mut execution = restored
-            .middleware("platform")
-            .start_with_protected_values(
-                &MiddlewareRuntime::default(),
-                &mut request,
-                &[],
-                gateway_core::MiddlewareSurface::ChatCompletions,
-            )
-            .await
-            .expect("restored guardrail masks");
-        assert_ne!(request.body["messages"][0]["content"], "alice@example.com");
-        let mut response = gateway_core::ProviderResponse {
-            body: serde_json::json!({"choices": [{"message": {
-                "content": request.body["messages"][0]["content"].clone()
-            }}]}),
-            usage: gateway_core::ModelUsage::default(),
-        };
-        execution
-            .response(&mut response)
-            .await
-            .expect("restored guardrail unmasks");
-        assert_eq!(
-            response.body["choices"][0]["message"]["content"],
-            "alice@example.com"
-        );
     }
 
     #[test]
