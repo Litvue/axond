@@ -49,7 +49,7 @@ unnoticed one.
 | `routes.rs` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
 | Namespace resolution, `credentials.rs` pool lookup, `allow_platform_fallback`, budget/rate-limit keys, operator views | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
 | `backends/secrets.rs`, `backends/secrets/blob_envelope.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
-| `backends/catalog.rs`, `aliases.rs`, `availability/`, `admin/catalogue.rs`, `desired_state/models.rs`, `desired_state/pricing.rs`, `/v1/models`, alias scope and ownership, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
+| `backends/catalog.rs`, `aliases.rs`, `availability/`, `desired_state/models.rs`, `desired_state/pricing.rs`, `/v1/models`, alias scope and ownership, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `usage/`, `telemetry/`, control-plane journal | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
 | `desired_state/access.rs`, `desired_state/tenancy.rs`, control-plane tenancy/principal projection, `/admin/v1` authorization, denial records | [Control-plane tenancy, principals, and administrative authorization](#7-control-plane-tenancy-principals-and-administrative-authorization) |
@@ -354,9 +354,10 @@ evaluation in `crates/gateway/src/availability/`, the durable enablement and
 alias bodies and their publication rules in
 `crates/gateway/src/desired_state/models.rs`, pricing metadata, approved pricing
 in `crates/gateway/src/desired_state/pricing.rs`, alias ownership in
-`crates/gateway/src/config.rs`, the administrative catalogue projection in
-`crates/gateway/src/admin/catalogue.rs`, and any new route that exposes
-model or provider metadata.
+`crates/gateway/src/config.rs`, and any new route that exposes
+model or provider metadata. ADR 0063 unmounted `/admin/v1`; a change that
+reintroduces an administrative catalogue or availability HTTP read fires this
+trigger and trigger 7.
 
 **Regression tests.** Pattern semantics are the entitlement boundary:
 `patterns_match_case_sensitively_and_union`, `prefix_does_not_subsume_other_globs`,
@@ -370,17 +371,13 @@ namespace's alone, in the catalogue and in resolution:
 namespace must exist in the store, and the models list is that path's
 catalogue. Configured `[[model]]` aliases (and the file-level owner checks
 that went with them) were withdrawn in ADR 0063; routing is
-`provider-id/model-id`. The
-administrative catalogue answers within one scope and says what it could not
-consult: `a_tenant_read_is_isolated_and_explains_each_entry`,
-`a_tenant_read_does_not_enumerate_a_projects_overrides`,
-`a_project_of_another_tenant_yields_nothing`,
-`a_read_names_the_facts_it_could_not_consult`,
-`the_management_catalogue_reports_what_a_tenant_published`,
-`a_catalogue_read_outside_the_grant_is_forbidden`, and
-`a_catalogue_filter_that_cannot_be_parsed_is_refused` — a filter this build
-cannot evaluate is refused rather than silently ignored, because an answer a
-caller believes was narrowed is an entitlement claim it did not make.
+`provider-id/model-id`. The former management-catalogue HTTP read is unmounted
+with the rest of `/admin/v1`: `admin_v1_is_unmounted` holds that
+`GET /admin/v1/status` and `GET /admin/v1/tenants` are 404 even with an operator
+bearer, and `the_withdrawn_commands_are_not_parsed` holds that `axond admin`
+is unknown to clap rather than accepted and inert. Tenant isolation for what
+remains discoverable is the `/v1/models` and `/ns/{ns}/v1` tests above, not a
+second catalogue projection.
 
 Ingestion must stay inert:
 `observed_pricing_is_metadata_not_activation`,
@@ -451,12 +448,10 @@ restored row decides nothing until a revision supplies the dimensions, while
 `saving_a_record_replaces_the_evidence_it_held`, and
 `one_tenants_discovery_evidence_is_not_another_tenants` hold the ordering,
 mis-filing, replacement, and tenant-isolation rules against the database itself.
-The read surface is scoped and answered from memory:
-`an_availability_read_is_confined_to_the_scope_the_grant_encloses`,
-`an_availability_read_must_name_the_tenant_it_asks_about`,
-`an_availability_read_reaches_no_control_plane`,
-`an_availability_read_distinguishes_deriving_nothing_from_finding_nothing`, and
-`an_availability_read_overlays_this_replicas_own_health`. A discovery outage costs
+The former HTTP read (`GET /admin/v1/availability`) is unmounted with the rest
+of `/admin/v1`; `admin_v1_is_unmounted` is the floor that it stays gone, and
+the projection tests above remain the isolation floor for derived evidence.
+A discovery outage costs
 freshness and nothing else —
 `a_discovery_outage_ages_a_verdict_without_touching_convergence` and
 `discovery_evidence_survives_the_revisions_published_over_it`.
@@ -516,10 +511,11 @@ constructs an index, `/v1/models` and readiness are unchanged, and no request
 reads a verdict, so a release carrying only the contracts changes no observable
 behaviour and needs no migration note. The projection slice adds a forward-only
 tenant-isolated control-plane migration for discovery observations and
-one authenticated administrative read, `GET /admin/v1/availability`; inference,
-`/v1/models`, and readiness are still unchanged, so the note a release owes is the
-migration rather than a behaviour change. The slice that wires an evaluation into
-admission does change behaviour, and it fires this trigger again.
+no administrative HTTP read (ADR 0063 unmounted `GET /admin/v1/availability`);
+inference, `/v1/models`, and readiness are still unchanged, so the note a
+release owes is the migration rather than a behaviour change. The slice that
+wires an evaluation into admission does change behaviour, and it fires this
+trigger again.
 
 Entitlement changes are visible to clients: a pattern
 semantics change can silently grant or revoke access at upgrade, so it needs a
@@ -744,7 +740,8 @@ or public-API change is a minor release per the
 what they may reach: the identity and role vocabulary in
 `crates/gateway/src/desired_state/access.rs`, tenant lifecycle and project
 ownership in `crates/gateway/src/desired_state/tenancy.rs`, the authorization
-decision an `/admin/v1` handler consumes, the tenancy and principal projection
+decision a withdrawn `/admin/v1` handler used to consume (the surface is
+unmounted; `admin_v1_is_unmounted` is the HTTP floor), the tenancy and principal projection
 written by `crates/gateway/src/backends/control_plane/postgres.rs`, the
 row-level-security policies and tenant-scoped constraints in
 `crates/gateway/sql/control_plane_0002_tenancy_access.sql` and the deferred rules
