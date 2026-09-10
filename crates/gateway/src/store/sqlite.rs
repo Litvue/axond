@@ -729,8 +729,10 @@ impl Store for SqliteStore {
     }
 
     async fn append_usage_batch(&self, events: Vec<UsageAppend>) -> Result<(), StoreError> {
-        self.with_conn(StoreOp::UsageAppend, move |conn| insert_usage_batch(conn, &events))
-            .await
+        self.with_conn(StoreOp::UsageAppend, move |conn| {
+            insert_usage_batch(conn, &events)
+        })
+        .await
     }
 
     fn blocking_usage_index(&self) -> bool {

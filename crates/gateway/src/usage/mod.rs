@@ -477,6 +477,10 @@ pub struct UsageDelivery {
     /// Bounded queue into the usage-index worker. `append_store` only
     /// `try_send`s; a full queue drops the event rather than spawning work.
     index_tx: std::sync::OnceLock<IndexQueue>,
+    /// Occupied slots in `index_tx` (reserved permits plus queued events).
+    /// Incremented after a slot is taken and decremented when the worker
+    /// receives or drains, so the histogram cannot wrap or exceed the bound.
+    index_depth: Arc<AtomicU64>,
     /// Set on drop so the worker abandons queued items after the in-flight write.
     index_stop: Arc<AtomicBool>,
     /// Counters and rate-limited logs shared with the index worker.
@@ -595,16 +599,31 @@ enum IndexQueue {
 }
 
 impl IndexQueue {
-    fn try_send(&self, item: QueuedAppend) -> Result<(), IndexOutcome> {
+    /// Occupy one slot and hand the event to the worker. Returns the occupied
+    /// slot count after this send, matching `axond.usage.index.queue.depth`.
+    fn try_enqueue(&self, item: QueuedAppend, depth: &AtomicU64) -> Result<u64, IndexOutcome> {
         match self {
-            Self::Blocking(tx) => tx.try_send(item).map_err(|error| match error {
-                std::sync::mpsc::TrySendError::Full(_) => IndexOutcome::Saturated,
-                std::sync::mpsc::TrySendError::Disconnected(_) => IndexOutcome::Closed,
-            }),
-            Self::Async(tx) => tx.try_send(item).map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => IndexOutcome::Saturated,
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => IndexOutcome::Closed,
-            }),
+            Self::Blocking(tx) => {
+                tx.try_send(item).map_err(|error| match error {
+                    std::sync::mpsc::TrySendError::Full(_) => IndexOutcome::Saturated,
+                    std::sync::mpsc::TrySendError::Disconnected(_) => IndexOutcome::Closed,
+                })?;
+                Ok(depth.fetch_add(1, Ordering::AcqRel) + 1)
+            }
+            Self::Async(tx) => match tx.try_reserve() {
+                Ok(permit) => {
+                    // The permit occupies a real slot, so the worker cannot recv
+                    // this event until `send` below. Depth is then occupied slots,
+                    // not in-flight send attempts.
+                    let occupied = depth.fetch_add(1, Ordering::AcqRel) + 1;
+                    permit.send(item);
+                    Ok(occupied)
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    Err(IndexOutcome::Saturated)
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(IndexOutcome::Closed),
+            },
         }
     }
 }
@@ -766,6 +785,7 @@ impl UsageDelivery {
             on_undurable: UndurablePolicy::Serve,
             store: std::sync::OnceLock::new(),
             index_tx: std::sync::OnceLock::new(),
+            index_depth: Arc::new(AtomicU64::new(0)),
             index_stop: Arc::new(AtomicBool::new(false)),
             index: Arc::new(IndexTelemetry::new()),
             #[cfg(test)]
@@ -782,6 +802,7 @@ impl UsageDelivery {
             on_undurable,
             store: std::sync::OnceLock::new(),
             index_tx: std::sync::OnceLock::new(),
+            index_depth: Arc::new(AtomicU64::new(0)),
             index_stop: Arc::new(AtomicBool::new(false)),
             index: Arc::new(IndexTelemetry::new()),
             #[cfg(test)]
@@ -804,12 +825,14 @@ impl UsageDelivery {
         let settings = settings.bounded();
         let stop = Arc::clone(&self.index_stop);
         let telemetry = Arc::clone(&self.index);
+        let depth = Arc::clone(&self.index_depth);
         let queue = if store.blocking_usage_index() {
             let (tx, rx) = std::sync::mpsc::sync_channel(settings.capacity);
             match std::thread::Builder::new()
                 .name("axond-usage-index".into())
-                .spawn(move || sqlite_usage_index_worker(store, rx, stop, settings, telemetry))
-            {
+                .spawn(move || {
+                    sqlite_usage_index_worker(store, rx, stop, settings, telemetry, depth)
+                }) {
                 Ok(handle) => drop(handle),
                 Err(error) => {
                     tracing::error!(
@@ -823,7 +846,7 @@ impl UsageDelivery {
         } else if tokio::runtime::Handle::try_current().is_ok() {
             let (tx, rx) = tokio::sync::mpsc::channel(settings.capacity);
             drop(tokio::spawn(async_usage_index_worker(
-                store, rx, stop, settings, telemetry,
+                store, rx, stop, settings, telemetry, depth,
             )));
             IndexQueue::Async(tx)
         } else {
@@ -854,11 +877,17 @@ impl UsageDelivery {
             self.index.dropped(IndexOutcome::Closed, &record.request_id);
             return;
         };
-        if let Err(outcome) = queue.try_send(QueuedAppend {
-            event,
-            enqueued_at: Instant::now(),
-        }) {
-            self.index.dropped(outcome, &record.request_id);
+        match queue.try_enqueue(
+            QueuedAppend {
+                event,
+                enqueued_at: Instant::now(),
+            },
+            &self.index_depth,
+        ) {
+            Ok(occupied) => {
+                crate::telemetry::metrics::record_usage_index_enqueued(occupied);
+            }
+            Err(outcome) => self.index.dropped(outcome, &record.request_id),
         }
     }
 
@@ -1061,6 +1090,20 @@ impl Drop for UsageDelivery {
     }
 }
 
+fn take_index_slot(depth: &AtomicU64) {
+    depth.fetch_sub(1, Ordering::AcqRel);
+}
+
+impl QueuedAppend {
+    fn take(self, depth: &AtomicU64) -> Self {
+        take_index_slot(depth);
+        crate::telemetry::metrics::record_usage_index_dequeued(
+            self.enqueued_at.elapsed().as_secs_f64() * 1000.0,
+        );
+        self
+    }
+}
+
 /// The blocking (SQLite) index worker: block for the first queued event, gather
 /// what else arrives within `flush_interval` up to `max_batch`, write the batch
 /// in one transaction on this thread, repeat. Exits when every sender is gone or
@@ -1072,10 +1115,15 @@ fn sqlite_usage_index_worker(
     stop: Arc<AtomicBool>,
     settings: UsageIndexSettings,
     telemetry: Arc<IndexTelemetry>,
+    depth: Arc<AtomicU64>,
 ) {
     let mut batch: Vec<QueuedAppend> = Vec::with_capacity(settings.max_batch);
     while let Ok(first) = rx.recv() {
+        let first = first.take(&depth);
         if stop.load(Ordering::Acquire) {
+            while rx.try_recv().is_ok() {
+                take_index_slot(&depth);
+            }
             return;
         }
         batch.push(first);
@@ -1088,11 +1136,14 @@ fn sqlite_usage_index_worker(
                 rx.recv_timeout(remaining).map_err(|_| ())
             };
             match next {
-                Ok(item) => batch.push(item),
+                Ok(item) => batch.push(item.take(&depth)),
                 Err(()) => break,
             }
         }
         if stop.load(Ordering::Acquire) {
+            while rx.try_recv().is_ok() {
+                take_index_slot(&depth);
+            }
             return;
         }
         let events: Vec<crate::store::UsageAppend> =
@@ -1115,21 +1166,29 @@ async fn async_usage_index_worker(
     stop: Arc<AtomicBool>,
     settings: UsageIndexSettings,
     telemetry: Arc<IndexTelemetry>,
+    depth: Arc<AtomicU64>,
 ) {
     let mut batch: Vec<QueuedAppend> = Vec::with_capacity(settings.max_batch);
     while let Some(first) = rx.recv().await {
+        let first = first.take(&depth);
         if stop.load(Ordering::Acquire) {
+            while rx.try_recv().is_ok() {
+                take_index_slot(&depth);
+            }
             return;
         }
         batch.push(first);
         let deadline = tokio::time::Instant::now() + settings.flush_interval;
         while batch.len() < settings.max_batch {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(item)) => batch.push(item),
+                Ok(Some(item)) => batch.push(item.take(&depth)),
                 Ok(None) | Err(_) => break,
             }
         }
         if stop.load(Ordering::Acquire) {
+            while rx.try_recv().is_ok() {
+                take_index_slot(&depth);
+            }
             return;
         }
         let events: Vec<crate::store::UsageAppend> =
